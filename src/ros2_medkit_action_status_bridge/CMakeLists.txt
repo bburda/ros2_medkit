@@ -113,6 +113,17 @@ if(BUILD_TESTING)
   )
   medkit_add_launch_test(test_integration test/test_integration.test.py TIMEOUT 120)
 
+  # Deterministic end-to-end regression for #467 provisional re-attribution.
+  # slow_discovery_bridge is the real ActionStatusBridgeNode with only the racy
+  # DDS-FQN resolution forced to "" for the first few rescans, so the real
+  # provisional -> supersede path runs against a real FaultManager.
+  add_executable(slow_discovery_bridge test/slow_discovery_bridge_main.cpp)
+  target_link_libraries(slow_discovery_bridge action_status_bridge_lib)
+  medkit_target_dependencies(slow_discovery_bridge rclcpp)
+  install(TARGETS slow_discovery_bridge DESTINATION lib/${PROJECT_NAME})
+
+  medkit_add_launch_test(test_reattribution_e2e test/test_reattribution_e2e.test.py TIMEOUT 120)
+
   ros2_medkit_relax_vendor_warnings()
 endif()
 
