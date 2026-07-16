@@ -152,11 +152,14 @@ class FaultStorage {
   /// @param source_id Reporting source identifier
   /// @param timestamp Current time for tracking
   /// @param config Debounce configuration to apply for this event (resolved per-entity by the node)
+  /// @param supersedes_source_id Optional source_id to remove from reporting_sources before adding
+  ///        source_id (empty = no supersede). Lets a reporter correct a provisional attribution.
   /// @return true if this is a new occurrence (new fault or reactivated CLEARED fault),
   ///         false if existing active fault was updated
   virtual bool report_fault_event(const std::string & fault_code, uint8_t event_type, uint8_t severity,
                                   const std::string & description, const std::string & source_id,
-                                  const rclcpp::Time & timestamp, const DebounceConfig & config) = 0;
+                                  const rclcpp::Time & timestamp, const DebounceConfig & config,
+                                  const std::string & supersedes_source_id = "") = 0;
 
   /// Get faults matching filter criteria
   /// @param filter_by_severity Whether to filter by severity
@@ -274,7 +277,8 @@ class InMemoryFaultStorage : public FaultStorage {
 
   bool report_fault_event(const std::string & fault_code, uint8_t event_type, uint8_t severity,
                           const std::string & description, const std::string & source_id,
-                          const rclcpp::Time & timestamp, const DebounceConfig & config) override;
+                          const rclcpp::Time & timestamp, const DebounceConfig & config,
+                          const std::string & supersedes_source_id = "") override;
 
   std::vector<ros2_medkit_msgs::msg::Fault> list_faults(bool filter_by_severity, uint8_t severity,
                                                         const std::vector<std::string> & statuses) const override;

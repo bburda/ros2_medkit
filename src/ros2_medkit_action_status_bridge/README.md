@@ -32,7 +32,13 @@ generically, by observing the goal-status topic.
   `ACTION_NAVIGATE_TO_POSE_ABORTED`. `source_id` is the action **server's node
   FQN** (resolved from the status topic's publisher, e.g. `/bt_navigator`), so
   the fault associates with that node's SOVD entity; it falls back to the action
-  name only if no publisher is visible.
+  name only if no publisher is visible. When the FQN is not yet discovered at the
+  first report, the fault fires on time under the action-name fallback and is
+  then **re-attributed** to the FQN once discovery resolves - the bridge
+  re-reports it with `ReportFault.supersedes_source_id` set to the fallback, so
+  the FaultManager drops the provisional source and the fault lands on the server
+  node's entity (the fallback source alone would keep it out under the strict-AND
+  per-entity scope filter).
 
 ## Per-action state, not per-goal
 

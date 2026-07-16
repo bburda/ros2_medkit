@@ -46,7 +46,8 @@ class SqliteFaultStorage : public FaultStorage {
 
   bool report_fault_event(const std::string & fault_code, uint8_t event_type, uint8_t severity,
                           const std::string & description, const std::string & source_id,
-                          const rclcpp::Time & timestamp, const DebounceConfig & config) override;
+                          const rclcpp::Time & timestamp, const DebounceConfig & config,
+                          const std::string & supersedes_source_id = "") override;
 
   std::vector<ros2_medkit_msgs::msg::Fault> list_faults(bool filter_by_severity, uint8_t severity,
                                                         const std::vector<std::string> & statuses) const override;

@@ -5,7 +5,8 @@ Changelog for package ros2_medkit_fault_reporter
 Forthcoming
 -----------
 * ``FaultReporter`` can now be constructed from an ``rclcpp_lifecycle::LifecycleNode`` (and from a plain ``rclcpp::Node`` reference or explicit node interfaces), enabling use inside lifecycle nodes (`#555 <https://github.com/selfpatch/ros2_medkit/issues/555>`_)
-* Contributors: @zeerekahmad
+* ``FaultReporter::report`` gains an optional ``supersedes_source_id`` argument, forwarded to the ``ReportFault`` service so a caller can drop a previously-reported source when re-reporting a fault under a corrected source. When a supersede is requested the local debounce filter is bypassed so the correcting report is never dropped as a duplicate. Empty (default) preserves the prior behavior (`#467 <https://github.com/selfpatch/ros2_medkit/issues/467>`_)
+* Contributors: @zeerekahmad, @bburda
 
 0.6.0 (2026-06-22)
 ------------------

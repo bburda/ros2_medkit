@@ -608,8 +608,9 @@ void FaultManagerNode::handle_report_fault(
 
   // Report the fault event (use wall clock time, not sim time, for proper timestamps)
   const rclcpp::Time event_time = get_wall_clock_time();
-  bool is_new = storage_->report_fault_event(request->fault_code, request->event_type, request->severity,
-                                             request->description, request->source_id, event_time, resolved_config);
+  bool is_new =
+      storage_->report_fault_event(request->fault_code, request->event_type, request->severity, request->description,
+                                   request->source_id, event_time, resolved_config, request->supersedes_source_id);
 
   response->accepted = true;
 

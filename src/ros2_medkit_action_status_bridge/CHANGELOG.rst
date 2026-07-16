@@ -2,6 +2,11 @@
 Changelog for package ros2_medkit_action_status_bridge
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+* A fault first raised before DDS discovery resolves the action server node is now corrected once the FQN becomes known, instead of staying stuck under the provisional action-interface source. The bridge records the provisional source, and on the next rescan re-reports the already-delivered fault under the resolved server FQN with ``ReportFault.supersedes_source_id`` set, so the FaultManager drops the provisional source and the fault resolves to the server node's entity under the strict-AND per-entity ``/faults`` scope filter. This refines the #466 "source fixed at first report" behavior: the source is still fixed for a fault whose server was already known, but a provisional attribution made before discovery is corrected rather than left permanently mis-scoped. A healed or not-yet-delivered fault is left untouched (`#467 <https://github.com/selfpatch/ros2_medkit/issues/467>`_)
+* Contributors: @bburda
+
 0.6.0 (2026-06-22)
 ------------------
 * Initial release: generic action-status bridge. Watches every

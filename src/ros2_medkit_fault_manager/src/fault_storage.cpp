@@ -106,10 +106,21 @@ void InMemoryFaultStorage::update_status(FaultState & state, const DebounceConfi
 
 bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, uint8_t event_type, uint8_t severity,
                                               const std::string & description, const std::string & source_id,
-                                              const rclcpp::Time & timestamp, const DebounceConfig & config) {
+                                              const rclcpp::Time & timestamp, const DebounceConfig & config,
+                                              const std::string & supersedes_source_id) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   const bool is_failed = (event_type == EventType::EVENT_FAILED);
+
+  // Drop a provisional source before adding the new one, so a reporter can correct an
+  // earlier attribution. No-op on a brand-new fault (nothing to remove) or when the
+  // superseded source equals source_id. Applied in each source-insert path below.
+  const auto add_source = [&](std::set<std::string> & sources) {
+    if (!supersedes_source_id.empty() && supersedes_source_id != source_id) {
+      sources.erase(supersedes_source_id);
+    }
+    sources.insert(source_id);
+  };
 
   auto it = faults_.find(fault_code);
   if (it == faults_.end()) {
@@ -127,7 +138,7 @@ bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, ui
     state.last_failed_time = timestamp;
     state.occurrence_count = 1;
     state.debounce_counter = -1;  // First FAILED event
-    state.reporting_sources.insert(source_id);
+    add_source(state.reporting_sources);
 
     // CRITICAL severity bypasses debounce and confirms immediately
     if (config.critical_immediate_confirm && severity == ros2_medkit_msgs::msg::Fault::SEVERITY_CRITICAL) {
@@ -156,7 +167,7 @@ bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, ui
     state.first_occurred = timestamp;
     state.last_failed_time = timestamp;
     state.last_occurred = timestamp;
-    state.reporting_sources.insert(source_id);
+    add_source(state.reporting_sources);
     if (state.occurrence_count < std::numeric_limits<uint32_t>::max()) {
       ++state.occurrence_count;
     }
@@ -190,7 +201,7 @@ bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, ui
     state.debounce_counter = clamp_debounce_counter(state.debounce_counter - 1, config);
 
     // Add source if not already present
-    state.reporting_sources.insert(source_id);
+    add_source(state.reporting_sources);
 
     // Update severity if higher
     if (severity > state.severity) {

@@ -85,6 +85,7 @@ Report a fault event (FAILED or PASSED) to the FaultManager.
 | `severity` | uint8 | Severity level (0-3, only for FAILED events) |
 | `description` | string | Human-readable description (only for FAILED events) |
 | `source_id` | string | Reporting node FQN (e.g., "/powertrain/engine/temp_sensor") |
+| `supersedes_source_id` | string | Optional. A previously-reported source to drop from `reporting_sources` before `source_id` is added (empty = no supersede). Corrects a provisional attribution so the fault resolves to the right entity under the strict-AND per-entity scope filter. |
 
 **Response:**
 | Field | Type | Description |

@@ -214,6 +214,10 @@ void ActionStatusBridgeNode::rescan_actions() {
   // arming can never strand a pending report. The fast timer is what keeps the
   // FaultManager freeze-frame contemporaneous; this is just belt-and-suspenders.
   reconcile_pending();
+
+  // Correct any faults reported under a provisional (action-name) source now that
+  // discovery has had another rescan period to resolve the server FQN.
+  reattribute_provisional();
 }
 
 void ActionStatusBridgeNode::prune_vanished(const std::map<std::string, std::string> & present_topics) {
@@ -257,11 +261,13 @@ void ActionStatusBridgeNode::prune_vanished(const std::map<std::string, std::str
         }
       }
       reporters_.erase(action_name);
+      provisional_.erase(action_name);
     }
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       last_reported_state_.erase(action_name);
       desired_state_.erase(action_name);
+      reported_canceled_.erase(action_name);
     }
     RCLCPP_INFO(get_logger(), "Action '%s' vanished; dropped (topic %s)", action_name.c_str(), topic.c_str());
     it = subs_.erase(it);
@@ -358,6 +364,9 @@ ActionStatusBridgeNode::reconcile(const std::string & action_name,
       RCLCPP_INFO(get_logger(), "Action %s -> fault %s", action_name.c_str(), code.c_str());
     }
     last_reported_state_[action_name] = ActionState::kFailed;
+    // Remember which code (aborted vs canceled) was actually raised, so a later
+    // re-attribution supersedes that exact fault, not one derived from a flipped flag.
+    reported_canceled_[action_name] = desired.canceled;
     return ActionState::kFailed;
   }
 
@@ -462,7 +471,7 @@ ros2_medkit_fault_reporter::FaultReporter * ActionStatusBridgeNode::reporter_for
   std::lock_guard<std::mutex> lock(reporters_mutex_);
   auto it = reporters_.find(action_name);
   if (it != reporters_.end()) {
-    return it->second.get();  // created on the first report; source is fixed thereafter
+    return it->second.get();  // created on the first report; source fixed until re-attributed
   }
   // First report for this action: attribute it to the action SERVER's node FQN so
   // the gateway can resolve the fault to its SOVD entity. During DDS discovery the
@@ -470,17 +479,101 @@ ros2_medkit_fault_reporter::FaultReporter * ActionStatusBridgeNode::reporter_for
   // so the fault still fires on time. Reporting the fault on time takes priority
   // over entity attribution when discovery is slow.
   //
-  // The source is NOT re-attributed later: reporting_sources is append-only on the
-  // manager side and the per-entity /faults scope filter is strict-AND, so a
-  // provisional action-name source cannot be swapped for the FQN afterwards.
-  // Correct attribution for the slow-discovery case is a separate concern (it
-  // needs a way to supersede a provisional source).
+  // A fallback (action-name) attribution is recorded as provisional and later
+  // corrected to the FQN by reattribute_provisional(): reporting_sources is
+  // append-only and the per-entity /faults scope filter is strict-AND, so the
+  // provisional source cannot merely be added-to - it is swapped for the FQN via
+  // ReportFault.supersedes_source_id once discovery resolves.
   const std::string fqn = server_fqn_for_action(action_name);
   const std::string & source_id = fqn.empty() ? action_name : fqn;
+  if (fqn.empty()) {
+    provisional_[action_name] = Provisional{action_name, nullptr};
+  }
   auto reporter = std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(this->shared_from_this(), source_id);
   auto * raw = reporter.get();
   reporters_[action_name] = std::move(reporter);
   return raw;
+}
+
+void ActionStatusBridgeNode::reattribute_provisional() {
+  // Snapshot the provisional action names, then process each without holding a lock
+  // across the per-action state read + graph query + report.
+  std::vector<std::string> actions;
+  {
+    std::lock_guard<std::mutex> lock(reporters_mutex_);
+    actions.reserve(provisional_.size());
+    for (const auto & [action_name, prov] : provisional_) {
+      actions.push_back(action_name);
+    }
+  }
+  if (actions.empty()) {
+    return;
+  }
+
+  for (const auto & action_name : actions) {
+    // Re-attribution applies only to a fault that is actually LIVE in the
+    // FaultManager under the provisional source. Read the delivered state:
+    //   - not delivered yet (no last_reported entry): the fault does not exist yet
+    //     (its FAILED is still deferred on service discovery). Keep the entry and
+    //     wait - erasing here would strand the report so it later lands under the
+    //     provisional source with nothing left to correct it.
+    //   - healed (kHealthy): nothing active to correct now, but a re-failure would
+    //     reactivate under the still-provisional source (reporter_for reuses the
+    //     frozen reporter), so keep the entry to correct it then.
+    //   - failed (kFailed): correct it.
+    // reported_canceled_ carries the canceled flag AS OF the report that raised the
+    // fault, so the supersede targets the code actually reported, not a later flip.
+    bool has_reported = false;
+    ActionState reported = ActionState::kUnknown;
+    bool reported_canceled = false;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      auto sit = last_reported_state_.find(action_name);
+      has_reported = sit != last_reported_state_.end();
+      if (has_reported) {
+        reported = sit->second;
+      }
+      auto cit = reported_canceled_.find(action_name);
+      reported_canceled = cit != reported_canceled_.end() && cit->second;
+    }
+
+    std::lock_guard<std::mutex> lock(reporters_mutex_);
+    auto pit = provisional_.find(action_name);
+    if (pit == provisional_.end()) {
+      continue;  // raced away (e.g. pruned)
+    }
+    if (!has_reported || reported != ActionState::kFailed) {
+      continue;  // not delivered yet, or healed: keep the entry, nothing to correct now
+    }
+
+    // Resolve the server FQN once, then keep the FQN reporter across ticks until
+    // its service client is ready (recreating it every tick would reset discovery).
+    if (!pit->second.fqn_reporter) {
+      const std::string fqn = server_fqn_for_action(action_name);
+      if (fqn.empty() || fqn == pit->second.old_source) {
+        continue;  // still unresolved; retry on the next rescan
+      }
+      pit->second.fqn_reporter =
+          std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(this->shared_from_this(), fqn);
+    }
+    if (!pit->second.fqn_reporter->is_service_ready()) {
+      continue;  // FaultManager service not discovered by the new client yet; retry
+    }
+
+    // Re-report the same fault (the code actually reported, per reported_canceled_)
+    // under the FQN, superseding the provisional source, so the FaultManager ends
+    // with reporting_sources = {FQN} and the fault resolves to the server node's
+    // SOVD entity under the strict-AND scope filter. The fault is still active, so this
+    // second FAILED report does not inflate occurrence_count (the store counts occurrence
+    // edges, not reports) - it only swaps the source. Happens at most once per fault.
+    const std::string code = fault_code_for(action_name, reported_canceled);
+    const std::string desc = std::string("Action ") + action_name + (reported_canceled ? " canceled" : " aborted");
+    pit->second.fqn_reporter->report(code, aborted_severity_, desc, pit->second.old_source);
+    RCLCPP_INFO(get_logger(), "Re-attributed action '%s' fault '%s' from provisional '%s' to server FQN",
+                action_name.c_str(), code.c_str(), pit->second.old_source.c_str());
+    reporters_[action_name] = std::move(pit->second.fqn_reporter);
+    provisional_.erase(pit);
+  }
 }
 
 std::string ActionStatusBridgeNode::server_fqn_from_endpoint(const std::string & node_name,
@@ -668,6 +761,27 @@ ActionStatusBridgeTestAccess::reconcile_deliverable(const std::string & action_n
 
 const void * ActionStatusBridgeTestAccess::reporter_identity(const std::string & action_name) {
   return node_->reporter_for(action_name);
+}
+
+void ActionStatusBridgeTestAccess::run_reattribute_provisional() {
+  node_->reattribute_provisional();
+}
+
+bool ActionStatusBridgeTestAccess::is_provisional(const std::string & action_name) const {
+  std::lock_guard<std::mutex> lock(node_->reporters_mutex_);
+  return node_->provisional_.count(action_name) > 0;
+}
+
+bool ActionStatusBridgeTestAccess::provisional_has_fqn_reporter(const std::string & action_name) const {
+  std::lock_guard<std::mutex> lock(node_->reporters_mutex_);
+  auto it = node_->provisional_.find(action_name);
+  return it != node_->provisional_.end() && it->second.fqn_reporter != nullptr;
+}
+
+bool ActionStatusBridgeTestAccess::reported_canceled(const std::string & action_name) const {
+  std::lock_guard<std::mutex> lock(node_->state_mutex_);
+  auto it = node_->reported_canceled_.find(action_name);
+  return it != node_->reported_canceled_.end() && it->second;
 }
 
 }  // namespace ros2_medkit_action_status_bridge

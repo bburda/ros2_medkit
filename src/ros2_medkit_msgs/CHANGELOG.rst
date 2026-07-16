@@ -2,6 +2,11 @@
 Changelog for package ros2_medkit_msgs
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+* ``ReportFault.srv`` request gains an optional ``string supersedes_source_id`` field: a reporter can drop a previously-reported source from the fault's ``reporting_sources`` when re-reporting under a corrected source, so a fault first attributed to a provisional source (an action bridge before DDS discovery resolves the server node FQN) resolves to the right entity under the strict-AND per-entity ``/faults`` scope filter. Empty (default) preserves the prior add-only behavior; out-of-tree callers must rebuild against the new message (`#467 <https://github.com/selfpatch/ros2_medkit/issues/467>`_)
+* Contributors: @bburda
+
 0.6.0 (2026-06-22)
 ------------------
 * No functional changes; version bump for the coordinated 0.6.0 release.

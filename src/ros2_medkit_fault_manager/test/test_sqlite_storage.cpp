@@ -316,6 +316,57 @@ TEST_F(SqliteFaultStorageTest, ReportingSourcesJsonHandling) {
   EXPECT_TRUE(sources.count("/special\"chars") > 0);
 }
 
+// Supersede persists through the sqlite reporting_sources JSON column: the
+// provisional source is removed from the stored set and only the FQN remains.
+TEST_F(SqliteFaultStorageTest, SupersedeReplacesProvisionalSource) {
+  rclcpp::Clock clock;
+  auto ts = clock.now();
+  storage_->report_fault_event("ACTION_ABORTED", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "aborted",
+                               "/navigate_to_pose", ts, default_config());
+  storage_->report_fault_event("ACTION_ABORTED", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "aborted",
+                               "/bt_navigator", ts, default_config(), /*supersedes=*/"/navigate_to_pose");
+
+  auto fault = storage_->get_fault("ACTION_ABORTED");
+  ASSERT_TRUE(fault.has_value());
+  const std::set<std::string> sources(fault->reporting_sources.begin(), fault->reporting_sources.end());
+  EXPECT_EQ(sources, (std::set<std::string>{"/bt_navigator"}));
+}
+
+// Backward compatibility: default (empty) supersede keeps the existing add-source behavior.
+TEST_F(SqliteFaultStorageTest, ReportWithoutSupersedeKeepsBothSources) {
+  rclcpp::Clock clock;
+  auto ts = clock.now();
+  storage_->report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d", "/a", ts,
+                               default_config());
+  storage_->report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d", "/b", ts,
+                               default_config());  // no supersede
+
+  auto fault = storage_->get_fault("F");
+  ASSERT_TRUE(fault.has_value());
+  const std::set<std::string> sources(fault->reporting_sources.begin(), fault->reporting_sources.end());
+  EXPECT_EQ(sources, (std::set<std::string>{"/a", "/b"}));
+}
+
+// A supersede requested on the FAILED report that reactivates a CLEARED fault still
+// drops the provisional source: reactivation reuses the FAILED source-merge branch.
+TEST_F(SqliteFaultStorageTest, SupersedeAppliesAcrossReactivation) {
+  rclcpp::Clock clock;
+  auto ts = clock.now();
+  storage_->report_fault_event("ACTION_ABORTED", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "aborted",
+                               "/navigate_to_pose", ts, default_config());
+  ASSERT_TRUE(storage_->clear_fault("ACTION_ABORTED"));
+  ASSERT_EQ(storage_->get_fault("ACTION_ABORTED")->status, Fault::STATUS_CLEARED);
+
+  // Reactivating FAILED report, superseding the provisional source with the FQN.
+  storage_->report_fault_event("ACTION_ABORTED", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "aborted",
+                               "/bt_navigator", clock.now(), default_config(), /*supersedes=*/"/navigate_to_pose");
+
+  auto fault = storage_->get_fault("ACTION_ABORTED");
+  ASSERT_TRUE(fault.has_value());
+  const std::set<std::string> sources(fault->reporting_sources.begin(), fault->reporting_sources.end());
+  EXPECT_EQ(sources, (std::set<std::string>{"/bt_navigator"}));  // provisional source gone
+}
+
 // Test database path accessor
 TEST_F(SqliteFaultStorageTest, DbPathAccessor) {
   EXPECT_EQ(storage_->db_path(), temp_db_path_.string());

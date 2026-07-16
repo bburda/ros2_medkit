@@ -139,8 +139,17 @@ class ActionStatusBridgeNode : public rclcpp::Node {
   /// Resolve the action server's node FQN from its status-topic publisher, for
   /// use as the fault source_id so faults associate with the gateway's SOVD
   /// entity. Returns "" if no publisher with a discovery-resolved node name is
-  /// visible yet (the caller falls back and re-resolves later).
-  std::string server_fqn_for_action(const std::string & action_name);
+  /// visible yet (the caller falls back and re-resolves later). virtual so a unit
+  /// test can drive the re-attribution path without a live action graph.
+  virtual std::string server_fqn_for_action(const std::string & action_name);
+
+  /// Re-attribute faults first reported under a provisional (action-name) source
+  /// to the resolved server FQN. For each provisional action still reported failed,
+  /// once the FQN resolves it re-reports the fault under the FQN with
+  /// supersedes_source_id set to the provisional source, so the FaultManager swaps
+  /// the source and the fault resolves to the server node's SOVD entity. A no-op
+  /// once every provisional attribution has been corrected. Runs on the rescan tick.
+  void reattribute_provisional();
 
   /// Returns true if this (goal, status) pair was not logged before, marking it
   /// logged. Bounded to avoid unbounded growth. Suppresses duplicate LOG lines
@@ -172,6 +181,17 @@ class ActionStatusBridgeNode : public rclcpp::Node {
   std::map<std::string, std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter>> reporters_;
   std::mutex reporters_mutex_;
 
+  // Actions whose fault was first reported under a provisional (action-name) source
+  // because the server node FQN was not yet discovered. reattribute_provisional()
+  // corrects each to the FQN once discovery resolves. Guarded by reporters_mutex_.
+  struct Provisional {
+    std::string old_source;  // the provisional source_id to supersede
+    // The FQN-sourced reporter, created once the FQN resolves and reused across
+    // rescan ticks until its service client is ready (avoids re-discovery churn).
+    std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter> fqn_reporter;
+  };
+  std::map<std::string, Provisional> provisional_;
+
   // Desired (latest observed) action-level state derived from status messages:
   // the source of truth the bridge tries to make the FaultManager reflect.
   // `canceled` records whether a failure was a CANCELED (vs ABORTED), to pick
@@ -187,6 +207,10 @@ class ActionStatusBridgeNode : public rclcpp::Node {
   // so reconcile_pending() retries it on the next rescan instead of dropping it.
   std::map<std::string, DesiredState> desired_state_;
   std::map<std::string, ActionState> last_reported_state_;
+  // The `canceled` flag as of the report that put each action into kFailed, so a
+  // deferred re-attribution supersedes the fault code that was actually reported
+  // (not a value that flipped afterwards). Guarded by state_mutex_.
+  std::map<std::string, bool> reported_canceled_;
   std::mutex state_mutex_;
 
   // Bounded dedup of logged (goal_id:status) keys (LOG suppression only).
@@ -250,6 +274,22 @@ class ActionStatusBridgeTestAccess {
   /// Identity of the FaultReporter for an action (created on first call). Lets a
   /// test assert the reporter is created once and never swapped out.
   const void * reporter_identity(const std::string & action_name);
+
+  /// Run the re-attribution pass (what the rescan tick fires) so a test can drive
+  /// the provisional -> FQN correction without a live rescan timer.
+  void run_reattribute_provisional();
+
+  /// True if the action currently has a provisional (action-name) attribution
+  /// pending correction to the server FQN.
+  bool is_provisional(const std::string & action_name) const;
+
+  /// True if re-attribution has resolved the FQN and created (but not yet
+  /// delivered, e.g. service not ready) the FQN-sourced reporter for this action.
+  bool provisional_has_fqn_reporter(const std::string & action_name) const;
+
+  /// The `canceled` flag captured for the action's currently-reported fault
+  /// (what a deferred re-attribution will supersede under).
+  bool reported_canceled(const std::string & action_name) const;
 
  private:
   ActionStatusBridgeNode * node_;

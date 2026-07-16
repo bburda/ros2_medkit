@@ -278,15 +278,105 @@ TEST_F(ActionStatusBridgeTest, Apply_PerActionIsolation) {
 
 // --- reporter stickiness: created once, source fixed, never swapped ---
 
-TEST_F(ActionStatusBridgeTest, ReporterFor_StickyCreatedOnceNeverSwapped) {
+TEST_F(ActionStatusBridgeTest, ReporterFor_StickyCreatedOncePerCall) {
   auto node = std::make_shared<ActionStatusBridgeNode>();
   ActionStatusBridgeTestAccess access(node.get());
   // No publisher exists, so the server FQN is unresolved and the reporter falls
-  // back to the action name. It must be created once and reused, never swapped:
-  // reporting_sources is append-only, so a provisional source cannot be undone.
+  // back to the action name. reporter_for() itself creates the reporter once and
+  // returns the same instance on repeat calls (it never swaps the source on its
+  // own). Correction to the FQN happens separately, in reattribute_provisional().
   const void * first = access.reporter_identity("/nav");
   EXPECT_NE(first, nullptr);
   EXPECT_EQ(access.reporter_identity("/nav"), first);
+}
+
+// A bridge whose server-FQN resolution is test-controlled, so re-attribution
+// (issue #467) can be driven deterministically without a live DDS action graph.
+class FqnControllableBridge : public ActionStatusBridgeNode {
+ public:
+  std::string forced_fqn;  // "" = FQN still unresolved (report falls back to the action name)
+
+ private:
+  std::string server_fqn_for_action(const std::string & /*action_name*/) override {
+    return forced_fqn;
+  }
+};
+
+// Regression (#467, HIGH): a provisional fault whose FAILED report is still DEFERRED
+// (FaultManager service not discovered) must NOT be dropped by re-attribution -
+// otherwise the later-delivered report is stranded under the action-name source with
+// nothing left to correct it. reattribute must keep the entry until the fault is live.
+TEST_F(ActionStatusBridgeTest, Reattribute_KeepsProvisionalWhileReportDeferred) {
+  auto node = std::make_shared<FqnControllableBridge>();
+  ActionStatusBridgeTestAccess access(node.get());
+  node->forced_fqn = "";  // unresolved at first report -> provisional fallback
+
+  auto * reporter = access.reporter_for("/nav");
+  ASSERT_FALSE(reporter->is_service_ready());  // no FaultManager in this unit test
+  ASSERT_TRUE(access.is_provisional("/nav"));
+
+  // ABORTED whose report cannot be delivered: pending, not delivered.
+  EXPECT_EQ(node->apply_message("/nav", one_goal(1, GoalStatus::STATUS_ABORTED), reporter), State::kUnknown);
+  ASSERT_FALSE(access.reported_failed("/nav"));
+  ASSERT_TRUE(access.pending_failed("/nav"));
+
+  // FQN is now resolvable, but the fault does not exist in the manager yet.
+  node->forced_fqn = "/bt_navigator";
+  access.run_reattribute_provisional();
+
+  EXPECT_TRUE(access.is_provisional("/nav"));                 // kept, not stranded
+  EXPECT_FALSE(access.provisional_has_fqn_reporter("/nav"));  // not corrected: nothing delivered
+}
+
+// Once the fault is delivered AND the FQN resolves, re-attribution creates the FQN
+// reporter (reused across ticks until its service is ready, no discovery churn). It
+// cannot deliver the supersede here (no FaultManager service), so the entry is kept
+// with the FQN reporter stashed; the supersede itself is proven by the storage unit
+// tests and the fault-source-supersede integration test.
+TEST_F(ActionStatusBridgeTest, Reattribute_ResolvesFqnOnceDelivered) {
+  auto node = std::make_shared<FqnControllableBridge>();
+  ActionStatusBridgeTestAccess access(node.get());
+  node->forced_fqn = "";
+
+  ASSERT_NE(access.reporter_for("/nav"), nullptr);  // provisional recorded (FQN unresolved)
+  ASSERT_TRUE(access.is_provisional("/nav"));
+  // Deliver the ABORTED (null-reporter seam stands in for a discovered service).
+  EXPECT_EQ(node->apply_message("/nav", one_goal(1, GoalStatus::STATUS_ABORTED), nullptr), State::kFailed);
+  ASSERT_TRUE(access.reported_failed("/nav"));
+  EXPECT_FALSE(access.reported_canceled("/nav"));  // aborted, not canceled -> superseded as _ABORTED
+
+  // FQN still unresolved -> cannot correct yet; entry kept, no FQN reporter.
+  access.run_reattribute_provisional();
+  EXPECT_TRUE(access.is_provisional("/nav"));
+  EXPECT_FALSE(access.provisional_has_fqn_reporter("/nav"));
+
+  // FQN resolves -> re-attribution resolves it and stashes the FQN reporter.
+  node->forced_fqn = "/bt_navigator";
+  access.run_reattribute_provisional();
+  EXPECT_TRUE(access.is_provisional("/nav"));
+  EXPECT_TRUE(access.provisional_has_fqn_reporter("/nav"));
+}
+
+// Regression (#467, HIGH): re-attribution must NOT drop the provisional entry when
+// the fault heals - a later re-failure reactivates under the still-provisional source
+// (reporter_for reuses the frozen reporter) and must be correctable then.
+TEST_F(ActionStatusBridgeTest, Reattribute_KeepsProvisionalAfterHeal) {
+  auto node = std::make_shared<FqnControllableBridge>();
+  ActionStatusBridgeTestAccess access(node.get());
+  node->forced_fqn = "";
+
+  ASSERT_NE(access.reporter_for("/nav"), nullptr);
+  ASSERT_TRUE(access.is_provisional("/nav"));
+  // Raise then heal, both delivered (null seam).
+  EXPECT_EQ(node->apply_message("/nav", one_goal(1, GoalStatus::STATUS_ABORTED), nullptr), State::kFailed);
+  EXPECT_EQ(node->apply_message("/nav", one_goal(2, GoalStatus::STATUS_SUCCEEDED), nullptr), State::kHealthy);
+  ASSERT_FALSE(access.reported_failed("/nav"));
+
+  // Re-attribution on a healed fault must keep the entry (even with the FQN now
+  // resolvable): a re-failure would need correcting, and the old code erased it here.
+  node->forced_fqn = "/bt_navigator";
+  access.run_reattribute_provisional();
+  EXPECT_TRUE(access.is_provisional("/nav"));
 }
 
 // --- deferred delivery: a fault that cannot reach the FaultManager yet (its

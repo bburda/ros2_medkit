@@ -127,6 +127,82 @@ TEST_F(FaultStorageTest, ContinuouslyActiveFaultDoesNotInflateOccurrenceCount) {
   EXPECT_EQ(fault->status, Fault::STATUS_CONFIRMED);
 }
 
+// Backward compatibility: with the supersedes_source_id argument left at its default
+// (empty), a second source is simply added - the pre-existing multi-source behavior.
+TEST_F(FaultStorageTest, ReportWithoutSupersedeKeepsBothSources) {
+  rclcpp::Clock clock;
+  storage_.report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d", "/action_name",
+                              clock.now(), default_config());
+  storage_.report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d", "/bt_navigator",
+                              clock.now(), default_config());  // no supersede arg -> default ""
+
+  auto fault = storage_.get_fault("F");
+  ASSERT_TRUE(fault.has_value());
+  const std::set<std::string> sources(fault->reporting_sources.begin(), fault->reporting_sources.end());
+  EXPECT_EQ(sources, (std::set<std::string>{"/action_name", "/bt_navigator"}));
+}
+
+// A supersede swaps the provisional source for the new one: the action-name source
+// is dropped and only the resolved FQN remains (the #467 re-attribution flow).
+TEST_F(FaultStorageTest, SupersedeReplacesProvisionalSource) {
+  rclcpp::Clock clock;
+  storage_.report_fault_event("ACTION_NAVIGATE_TO_POSE_ABORTED", ReportFault::Request::EVENT_FAILED,
+                              Fault::SEVERITY_ERROR, "aborted", "/navigate_to_pose", clock.now(), default_config());
+  bool is_new = storage_.report_fault_event("ACTION_NAVIGATE_TO_POSE_ABORTED", ReportFault::Request::EVENT_FAILED,
+                                            Fault::SEVERITY_ERROR, "aborted", "/bt_navigator", clock.now(),
+                                            default_config(), /*supersedes=*/"/navigate_to_pose");
+
+  EXPECT_FALSE(is_new);
+  auto fault = storage_.get_fault("ACTION_NAVIGATE_TO_POSE_ABORTED");
+  ASSERT_TRUE(fault.has_value());
+  const std::set<std::string> sources(fault->reporting_sources.begin(), fault->reporting_sources.end());
+  EXPECT_EQ(sources, (std::set<std::string>{"/bt_navigator"}));  // provisional source gone
+}
+
+// Superseding an absent source is a no-op erase: the new source is still added.
+TEST_F(FaultStorageTest, SupersedeAbsentSourceJustAddsNew) {
+  rclcpp::Clock clock;
+  storage_.report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d", "/a", clock.now(),
+                              default_config());
+  storage_.report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d", "/b", clock.now(),
+                              default_config(), /*supersedes=*/"/never_reported");
+
+  auto fault = storage_.get_fault("F");
+  ASSERT_TRUE(fault.has_value());
+  const std::set<std::string> sources(fault->reporting_sources.begin(), fault->reporting_sources.end());
+  EXPECT_EQ(sources, (std::set<std::string>{"/a", "/b"}));
+}
+
+// Self-supersede guard: dropping the same source that is being added would leave the
+// fault with no source at all. The store must treat supersedes == source_id as a no-op.
+TEST_F(FaultStorageTest, SelfSupersedeKeepsTheSource) {
+  rclcpp::Clock clock;
+  storage_.report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d", "/bt_navigator",
+                              clock.now(), default_config());
+  storage_.report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d", "/bt_navigator",
+                              clock.now(), default_config(), /*supersedes=*/"/bt_navigator");
+
+  auto fault = storage_.get_fault("F");
+  ASSERT_TRUE(fault.has_value());
+  const std::set<std::string> sources(fault->reporting_sources.begin(), fault->reporting_sources.end());
+  EXPECT_EQ(sources, (std::set<std::string>{"/bt_navigator"}));
+}
+
+// A supersede set on the very first report of a brand-new fault creates the fault and
+// simply adds the source: the absent provisional source erase is a harmless no-op.
+TEST_F(FaultStorageTest, SupersedeOnNewFaultJustAddsSource) {
+  rclcpp::Clock clock;
+  bool is_new = storage_.report_fault_event("F", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "d",
+                                            "/bt_navigator", clock.now(), default_config(),
+                                            /*supersedes=*/"/navigate_to_pose");
+
+  EXPECT_TRUE(is_new);
+  auto fault = storage_.get_fault("F");
+  ASSERT_TRUE(fault.has_value());
+  const std::set<std::string> sources(fault->reporting_sources.begin(), fault->reporting_sources.end());
+  EXPECT_EQ(sources, (std::set<std::string>{"/bt_navigator"}));
+}
+
 TEST_F(FaultStorageTest, ListFaultsDefaultReturnsConfirmedOnly) {
   rclcpp::Clock clock;
   auto timestamp = clock.now();

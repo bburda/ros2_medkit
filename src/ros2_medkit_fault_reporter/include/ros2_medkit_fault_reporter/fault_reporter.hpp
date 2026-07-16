@@ -121,7 +121,12 @@ class FaultReporter {
   /// @param fault_code Global fault identifier (e.g., "MOTOR_OVERHEAT")
   /// @param severity Severity level (use Fault::SEVERITY_* constants)
   /// @param description Human-readable fault description
-  void report(const std::string & fault_code, uint8_t severity, const std::string & description);
+  /// @param supersedes_source_id Optional. A previously-reported source to drop from the fault's
+  ///        reporting_sources before this reporter's source is added, so a provisional attribution
+  ///        can be corrected (empty = no supersede). Bypasses local filtering when set, since a
+  ///        re-attribution must always reach the FaultManager.
+  void report(const std::string & fault_code, uint8_t severity, const std::string & description,
+              const std::string & supersedes_source_id = "");
 
   /// Report a PASSED event (fault condition cleared)
   ///
@@ -145,7 +150,7 @@ class FaultReporter {
 
   /// Send the fault report to FaultManager (async, fire-and-forget)
   void send_report(const std::string & fault_code, uint8_t event_type, uint8_t severity,
-                   const std::string & description);
+                   const std::string & description, const std::string & supersedes_source_id = "");
 
   std::string source_id_;
   rclcpp::Client<ros2_medkit_msgs::srv::ReportFault>::SharedPtr client_;

@@ -99,6 +99,22 @@ Report that a fault condition has cleared. Use this when FaultManager is configu
 reporter_->report_passed("MOTOR_OVERHEAT");
 ```
 
+### `report(fault_code, severity, description, supersedes_source_id)` (Advanced)
+
+Pass a fourth argument to drop a previously-reported source from the fault's
+`reporting_sources` before this reporter's source is added. Use it to correct a
+provisional attribution - for example an action bridge that first reports a fault
+under an action interface name, then re-reports under the resolved server node FQN
+once discovery settles. A supersede bypasses local filtering so the correcting
+report always reaches the FaultManager.
+
+```cpp
+reporter_->report("MOTOR_OVERHEAT",
+                  ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR,
+                  "Motor temperature exceeded safe limit",
+                  "/navigate_to_pose");  // provisional source to drop
+```
+
 ## Local Filtering
 
 The reporter includes optional local filtering to reduce noise from repeated fault occurrences.

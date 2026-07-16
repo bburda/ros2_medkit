@@ -44,6 +44,8 @@ class SqliteStatement {
 
   SqliteStatement(const SqliteStatement &) = delete;
   SqliteStatement & operator=(const SqliteStatement &) = delete;
+  SqliteStatement(SqliteStatement &&) = delete;
+  SqliteStatement & operator=(SqliteStatement &&) = delete;
 
   sqlite3_stmt * get() const {
     return stmt_;
@@ -385,7 +387,8 @@ std::string SqliteFaultStorage::serialize_json_array(const std::vector<std::stri
 
 bool SqliteFaultStorage::report_fault_event(const std::string & fault_code, uint8_t event_type, uint8_t severity,
                                             const std::string & description, const std::string & source_id,
-                                            const rclcpp::Time & timestamp, const DebounceConfig & config) {
+                                            const rclcpp::Time & timestamp, const DebounceConfig & config,
+                                            const std::string & supersedes_source_id) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   int64_t timestamp_ns = timestamp.nanoseconds();
@@ -429,9 +432,12 @@ bool SqliteFaultStorage::report_fault_event(const std::string & fault_code, uint
 
     if (is_failed) {
       // FAILED event
-      // Parse existing sources and add new one
+      // Parse existing sources, drop a superseded one, then add the new source.
       std::vector<std::string> sources = parse_json_array(sources_json);
       std::set<std::string> sources_set(sources.begin(), sources.end());
+      if (!supersedes_source_id.empty() && supersedes_source_id != source_id) {
+        sources_set.erase(supersedes_source_id);
+      }
       sources_set.insert(source_id);
       sources.assign(sources_set.begin(), sources_set.end());
 

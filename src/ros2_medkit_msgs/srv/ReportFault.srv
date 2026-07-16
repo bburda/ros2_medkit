@@ -49,6 +49,14 @@ string description
 # including namespace (e.g., "/powertrain/engine/temp_sensor").
 # This value is added to the fault's reporting_sources array for multi-source tracking.
 string source_id
+
+# Optional. A previously-reported source_id to drop from this fault's reporting_sources
+# before source_id is added. Empty = no supersede (default). Lets a reporter correct a
+# provisional attribution - e.g. an action bridge that first reports a fault under the
+# action interface name, then re-reports it under the resolved server node FQN once DDS
+# discovery settles - so the fault resolves to the right entity under the strict-AND
+# per-entity /faults scope filter. Only meaningful for FAILED events on an existing fault.
+string supersedes_source_id
 ---
 # Response fields
 

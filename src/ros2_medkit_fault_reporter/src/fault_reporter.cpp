@@ -107,20 +107,24 @@ void FaultReporter::load_parameters(const rclcpp::node_interfaces::NodeParameter
                config.default_threshold, config.default_window_sec, config.bypass_severity);
 }
 
-void FaultReporter::report(const std::string & fault_code, uint8_t severity, const std::string & description) {
+void FaultReporter::report(const std::string & fault_code, uint8_t severity, const std::string & description,
+                           const std::string & supersedes_source_id) {
   // Validate fault_code
   if (fault_code.empty()) {
     RCLCPP_WARN(logger_, "Attempted to report fault with empty fault_code, ignoring");
     return;
   }
 
-  // Check if filter allows forwarding
-  if (!filter_.should_forward(fault_code, severity)) {
+  // A supersede is a re-attribution of an already-reported fault, not a fresh
+  // occurrence, so it must always reach the FaultManager - never drop it to the
+  // local filter (which would leave the provisional source in place).
+  if (supersedes_source_id.empty() && !filter_.should_forward(fault_code, severity)) {
     RCLCPP_DEBUG(logger_, "Fault '%s' filtered (threshold not met)", fault_code.c_str());
     return;
   }
 
-  send_report(fault_code, ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED, severity, description);
+  send_report(fault_code, ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED, severity, description,
+              supersedes_source_id);
 }
 
 void FaultReporter::report_passed(const std::string & fault_code) {
@@ -142,7 +146,7 @@ bool FaultReporter::is_service_ready() const {
 }
 
 void FaultReporter::send_report(const std::string & fault_code, uint8_t event_type, uint8_t severity,
-                                const std::string & description) {
+                                const std::string & description, const std::string & supersedes_source_id) {
   if (!client_->service_is_ready()) {
     // Use WARN level for high-severity faults that would bypass filtering
     if (event_type == ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED &&
@@ -160,6 +164,7 @@ void FaultReporter::send_report(const std::string & fault_code, uint8_t event_ty
   request->severity = severity;
   request->description = description;
   request->source_id = source_id_;
+  request->supersedes_source_id = supersedes_source_id;
 
   // Fire and forget - don't block on response
   client_->async_send_request(request);

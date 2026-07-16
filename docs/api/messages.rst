@@ -179,12 +179,20 @@ Report a fault event to the FaultManager.
    uint8 severity      # Fault.SEVERITY_* constant (for FAILED events)
    string description  # Human-readable description
    string source_id    # Fully qualified node name (e.g., "/powertrain/temp_sensor")
+   string supersedes_source_id  # Optional: a prior source_id to drop before source_id is added
 
 **Response:**
 
 .. code-block:: text
 
    bool accepted       # True if event was accepted
+
+Setting ``supersedes_source_id`` drops that source from the fault's
+``reporting_sources`` before ``source_id`` is added, letting a reporter correct a
+provisional attribution (for example an action bridge that first reports under the
+action interface name, then re-reports under the resolved server node FQN once DDS
+discovery settles). Empty (default) leaves the append-only behavior unchanged. Only
+meaningful for a FAILED event on an existing fault; a self-supersede is a no-op.
 
 **Example Usage:**
 
