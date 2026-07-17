@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end regression for provisional-source re-attribution (issue #467).
+"""
+End-to-end regression for provisional-source re-attribution (issue #467).
 
 This drives the REAL action_status_bridge (not a hand-rolled reporter) against a
 real FaultManager. The only substitution is a test-double executable that forces

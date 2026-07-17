@@ -496,8 +496,14 @@ ros2_medkit_fault_reporter::FaultReporter * ActionStatusBridgeNode::reporter_for
 }
 
 void ActionStatusBridgeNode::reattribute_provisional() {
-  // Snapshot the provisional action names, then process each without holding a lock
-  // across the per-action state read + graph query + report.
+  // Snapshot the provisional action names under reporters_mutex_, then release it
+  // so the per-action pass does not iterate provisional_ while it mutates the map
+  // (it erases corrected entries below). Each action's delivered state is read
+  // under state_mutex_; the graph query and re-report then run under reporters_mutex_
+  // - held while we look up, cache the FQN reporter in, and erase from provisional_,
+  // the same lock reporter_for() takes, so the correction stays atomic against
+  // concurrent status callbacks. Neither server_fqn_for_action() nor
+  // FaultReporter::report() re-acquires reporters_mutex_, so there is no deadlock.
   std::vector<std::string> actions;
   {
     std::lock_guard<std::mutex> lock(reporters_mutex_);

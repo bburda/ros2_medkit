@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright 2026 bburda
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -141,9 +142,11 @@ class TestFaultSourceSupersede(GatewayTestCase):
             'after supersede the fault must resolve to the server entity',
         )
 
-        # The corrected fault detail carries the FQN and not the provisional source.
+        # The corrected fault detail carries the FQN and not the provisional
+        # source. reporting_sources lives under the x-medkit extension object,
+        # not the SOVD "item" block (which only carries code/name/severity/status).
         detail = self.get_json(f'/apps/{OWNER_APP}/faults/{FAULT_CODE}')
-        sources = detail.get('item', {}).get('reporting_sources', [])
+        sources = detail.get('x-medkit', {}).get('reporting_sources', [])
         self.assertIn(SERVER_FQN, sources)
         self.assertNotIn(PROVISIONAL_SOURCE, sources)
 
