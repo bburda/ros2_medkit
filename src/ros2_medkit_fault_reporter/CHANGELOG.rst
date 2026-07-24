@@ -2,6 +2,11 @@
 Changelog for package ros2_medkit_fault_reporter
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+* ``FaultReporter`` can now be constructed from an ``rclcpp_lifecycle::LifecycleNode`` (and from a plain ``rclcpp::Node`` reference or explicit node interfaces), enabling use inside lifecycle nodes (`#555 <https://github.com/selfpatch/ros2_medkit/issues/555>`_)
+* Contributors: @zeerekahmad
+
 0.6.0 (2026-06-22)
 ------------------
 * No functional changes; version bump for the coordinated 0.6.0 release.

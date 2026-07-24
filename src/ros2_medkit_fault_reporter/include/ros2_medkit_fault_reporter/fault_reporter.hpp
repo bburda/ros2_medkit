@@ -46,6 +46,16 @@ namespace ros2_medkit_fault_reporter {
 ///   std::unique_ptr<FaultReporter> reporter_;
 /// };
 /// @endcode
+///
+/// Inside a lifecycle node, construct it from the node directly (no shared_from_this needed):
+/// @code
+/// class MyLifecycleNode : public rclcpp_lifecycle::LifecycleNode {
+///   CallbackReturn on_configure(const rclcpp_lifecycle::State &) {
+///     reporter_ = std::make_unique<FaultReporter>(*this, get_fully_qualified_name());
+///     return CallbackReturn::SUCCESS;
+///   }
+/// };
+/// @endcode
 class FaultReporter {
  public:
   /// Base Constructor for FaultReporter
