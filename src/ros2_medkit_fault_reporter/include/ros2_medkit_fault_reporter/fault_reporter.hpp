@@ -18,6 +18,7 @@
 #include <string>
 
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "ros2_medkit_fault_reporter/local_filter.hpp"
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
 
@@ -47,12 +48,43 @@ namespace ros2_medkit_fault_reporter {
 /// @endcode
 class FaultReporter {
  public:
-  /// Construct a FaultReporter
+  /// Base Constructor for FaultReporter
+  ///
+  /// @param node_base ROS2 Node Base Interface for creating the service client
+  /// @param node_graph ROS2 Node Graph Interface for creating the service client
+  /// @param node_services ROS2 Node Services Interface for creating the service client
+  /// @param node_params ROS2 Node Parameters Interface for loading parameters
+  /// @param logger ROS2 Node Logger for reporting logs
+  /// @param source_id Identifier for this reporter (typically node's FQN)
+  /// @param service_name Name of the ReportFault service (default: /fault_manager/report_fault)
+  FaultReporter(rclcpp::node_interfaces::NodeBaseInterface::SharedPtr node_base,
+                rclcpp::node_interfaces::NodeGraphInterface::SharedPtr node_graph,
+                rclcpp::node_interfaces::NodeServicesInterface::SharedPtr node_services,
+                rclcpp::node_interfaces::NodeParametersInterface::SharedPtr node_params, rclcpp::Logger logger,
+                const std::string & source_id, const std::string & service_name = "/fault_manager/report_fault");
+
+  /// Construct a FaultReporter via Node Shared Ptr (maintain backwards compatibiilty)
   ///
   /// @param node The ROS 2 node to use for service client and parameters
   /// @param source_id Identifier for this reporter (typically node's FQN)
   /// @param service_name Name of the ReportFault service (default: /fault_manager/report_fault)
-  FaultReporter(const rclcpp::Node::SharedPtr & node, const std::string & source_id,
+  FaultReporter(rclcpp::Node::SharedPtr node, const std::string & source_id,
+                const std::string & service_name = "/fault_manager/report_fault");
+
+  /// Construct a FaultReporter via Node
+  ///
+  /// @param node The ROS 2 node to use for service client and parameters
+  /// @param source_id Identifier for this reporter (typically node's FQN)
+  /// @param service_name Name of the ReportFault service (default: /fault_manager/report_fault)
+  FaultReporter(rclcpp::Node & node, const std::string & source_id,
+                const std::string & service_name = "/fault_manager/report_fault");
+
+  /// Construct a FaultReporter via Lifecycle Node
+  ///
+  /// @param node The ROS 2 node to use for service client and parameters
+  /// @param source_id Identifier for this reporter (typically node's FQN)
+  /// @param service_name Name of the ReportFault service (default: /fault_manager/report_fault)
+  FaultReporter(rclcpp_lifecycle::LifecycleNode & node, const std::string & source_id,
                 const std::string & service_name = "/fault_manager/report_fault");
 
   /// Report a FAILED event (fault occurrence)
@@ -83,7 +115,7 @@ class FaultReporter {
 
  private:
   /// Load filter configuration from ROS parameters
-  void load_parameters(const rclcpp::Node::SharedPtr & node);
+  void load_parameters(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr & node_params);
 
   /// Send the fault report to FaultManager (async, fire-and-forget)
   void send_report(const std::string & fault_code, uint8_t event_type, uint8_t severity,
