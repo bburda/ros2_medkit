@@ -173,10 +173,11 @@ class TestEntityFreezeFrame(GatewayTestCase):
         self.assertIn('captured_at', x_medkit)
 
     def test_route_only_plugin_fault_carries_entity_values(self):
-        """A commercial-bridge-shaped plugin (no DataProvider, no
-        FaultProvider) still carries its entity's own values, captured via
-        in-process x-plc-data dispatch and served through the fault_manager
-        fall-through.
+        """A route-only plugin fault still carries its entity's own values.
+
+        A commercial-bridge-shaped plugin (no DataProvider, no FaultProvider)
+        captures them via in-process x-plc-data dispatch, served through the
+        fault_manager fall-through.
 
         @verifies REQ_INTEROP_088
         """
