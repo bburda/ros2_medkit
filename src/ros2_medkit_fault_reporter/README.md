@@ -43,11 +43,13 @@ directly (no `shared_from_this()` needed), typically in `on_configure()`:
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "ros2_medkit_fault_reporter/fault_reporter.hpp"
 
+using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
+
 class MyLifecycleNode : public rclcpp_lifecycle::LifecycleNode {
  public:
   MyLifecycleNode() : LifecycleNode("my_node") {}
 
-  CallbackReturn on_configure(const rclcpp_lifecycle::State &) {
+  CallbackReturn on_configure(const rclcpp_lifecycle::State &) override {
     reporter_ = std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(
         *this, get_fully_qualified_name());
     return CallbackReturn::SUCCESS;
@@ -65,6 +67,7 @@ class MyLifecycleNode : public rclcpp_lifecycle::LifecycleNode {
 - `FaultReporter(rclcpp::Node & node, source_id[, service_name])`
 - `FaultReporter(rclcpp::Node::SharedPtr node, source_id[, service_name])`
 - `FaultReporter(rclcpp_lifecycle::LifecycleNode & node, source_id[, service_name])`
+- `FaultReporter(rclcpp_lifecycle::LifecycleNode::SharedPtr node, source_id[, service_name])`
 - `FaultReporter(node_base, node_graph, node_services, node_params, logger, source_id[, service_name])`
   — the interface-based constructor the others delegate to, for custom wiring.
 

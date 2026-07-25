@@ -14,22 +14,33 @@
 
 #include "ros2_medkit_fault_reporter/fault_reporter.hpp"
 
+#include "rclcpp/version.h"
+#include "rclcpp_lifecycle/lifecycle_node.hpp"
+
 namespace ros2_medkit_fault_reporter {
 
-FaultReporter::FaultReporter(rclcpp::node_interfaces::NodeBaseInterface::SharedPtr node_base,
-                             rclcpp::node_interfaces::NodeGraphInterface::SharedPtr node_graph,
-                             rclcpp::node_interfaces::NodeServicesInterface::SharedPtr node_services,
-                             rclcpp::node_interfaces::NodeParametersInterface::SharedPtr node_params,
-                             rclcpp::Logger logger, const std::string & source_id, const std::string & service_name)
+FaultReporter::FaultReporter(const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node_base,
+                             const rclcpp::node_interfaces::NodeGraphInterface::SharedPtr & node_graph,
+                             const rclcpp::node_interfaces::NodeServicesInterface::SharedPtr & node_services,
+                             const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr & node_params,
+                             const rclcpp::Logger & logger, const std::string & source_id,
+                             const std::string & service_name)
   : source_id_(source_id), logger_(logger) {
   // Validate source_id
   if (source_id_.empty()) {
     RCLCPP_WARN(logger_, "FaultReporter created with empty source_id, fault origins will be difficult to trace");
   }
 
-  // Create service client (stored as shared_ptr, independent of node lifetime)
+  // Create service client. It outlives the node handle used to construct it, but still relies on the
+  // ROS context and the node interfaces staying valid - reporting after node teardown / rclcpp shutdown
+  // is not safe.
+#if RCLCPP_VERSION_GTE(29, 0, 0)  // Kilted and later
+  client_ = rclcpp::create_client<ros2_medkit_msgs::srv::ReportFault>(node_base, node_graph, node_services,
+                                                                      service_name, rclcpp::ServicesQoS());
+#else  // Humble, Jazzy
   client_ = rclcpp::create_client<ros2_medkit_msgs::srv::ReportFault>(
       node_base, node_graph, node_services, service_name, rmw_qos_profile_services_default, nullptr);
+#endif
 
   // Load configuration from parameters (node only needed during construction)
   load_parameters(node_params);
@@ -37,7 +48,7 @@ FaultReporter::FaultReporter(rclcpp::node_interfaces::NodeBaseInterface::SharedP
   RCLCPP_DEBUG(logger_, "FaultReporter initialized for source: %s", source_id_.c_str());
 }
 
-FaultReporter::FaultReporter(rclcpp::Node::SharedPtr node, const std::string & source_id,
+FaultReporter::FaultReporter(const rclcpp::Node::SharedPtr & node, const std::string & source_id,
                              const std::string & service_name)
   : FaultReporter(node->get_node_base_interface(), node->get_node_graph_interface(),
                   node->get_node_services_interface(), node->get_node_parameters_interface(), node->get_logger(),
@@ -53,6 +64,13 @@ FaultReporter::FaultReporter(rclcpp_lifecycle::LifecycleNode & node, const std::
                              const std::string & service_name)
   : FaultReporter(node.get_node_base_interface(), node.get_node_graph_interface(), node.get_node_services_interface(),
                   node.get_node_parameters_interface(), node.get_logger(), source_id, service_name) {
+}
+
+FaultReporter::FaultReporter(const rclcpp_lifecycle::LifecycleNode::SharedPtr & node, const std::string & source_id,
+                             const std::string & service_name)
+  : FaultReporter(node->get_node_base_interface(), node->get_node_graph_interface(),
+                  node->get_node_services_interface(), node->get_node_parameters_interface(), node->get_logger(),
+                  source_id, service_name) {
 }
 
 void FaultReporter::load_parameters(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr & node_params) {

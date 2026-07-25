@@ -105,6 +105,16 @@ if(BUILD_TESTING)
     target_link_options(test_local_filter PRIVATE --coverage)
   endif()
 
+  ament_add_gtest(test_fault_reporter_construction test/test_fault_reporter_construction.cpp)
+  target_link_libraries(test_fault_reporter_construction fault_reporter_lib)
+  medkit_target_dependencies(test_fault_reporter_construction rclcpp rclcpp_lifecycle ros2_medkit_msgs)
+  medkit_set_test_domain(test_fault_reporter_construction)
+
+  if(ENABLE_COVERAGE)
+    target_compile_options(test_fault_reporter_construction PRIVATE --coverage -O0 -g)
+    target_link_options(test_fault_reporter_construction PRIVATE --coverage)
+  endif()
+
   # Integration tests
   install(DIRECTORY test
     DESTINATION share/${PROJECT_NAME}

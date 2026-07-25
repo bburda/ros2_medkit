@@ -50,9 +50,13 @@ namespace ros2_medkit_fault_reporter {
 /// Inside a lifecycle node, construct it from the node directly (no shared_from_this needed):
 /// @code
 /// class MyLifecycleNode : public rclcpp_lifecycle::LifecycleNode {
-///   CallbackReturn on_configure(const rclcpp_lifecycle::State &) {
+///  public:
+///   MyLifecycleNode() : LifecycleNode("my_node") {}
+///
+///   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+///   on_configure(const rclcpp_lifecycle::State &) override {
 ///     reporter_ = std::make_unique<FaultReporter>(*this, get_fully_qualified_name());
-///     return CallbackReturn::SUCCESS;
+///     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
 ///   }
 /// };
 /// @endcode
@@ -67,18 +71,19 @@ class FaultReporter {
   /// @param logger ROS2 Node Logger for reporting logs
   /// @param source_id Identifier for this reporter (typically node's FQN)
   /// @param service_name Name of the ReportFault service (default: /fault_manager/report_fault)
-  FaultReporter(rclcpp::node_interfaces::NodeBaseInterface::SharedPtr node_base,
-                rclcpp::node_interfaces::NodeGraphInterface::SharedPtr node_graph,
-                rclcpp::node_interfaces::NodeServicesInterface::SharedPtr node_services,
-                rclcpp::node_interfaces::NodeParametersInterface::SharedPtr node_params, rclcpp::Logger logger,
-                const std::string & source_id, const std::string & service_name = "/fault_manager/report_fault");
+  FaultReporter(const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node_base,
+                const rclcpp::node_interfaces::NodeGraphInterface::SharedPtr & node_graph,
+                const rclcpp::node_interfaces::NodeServicesInterface::SharedPtr & node_services,
+                const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr & node_params,
+                const rclcpp::Logger & logger, const std::string & source_id,
+                const std::string & service_name = "/fault_manager/report_fault");
 
-  /// Construct a FaultReporter via Node Shared Ptr (maintain backwards compatibiilty)
+  /// Construct a FaultReporter via Node Shared Ptr (maintain backwards compatibility)
   ///
   /// @param node The ROS 2 node to use for service client and parameters
   /// @param source_id Identifier for this reporter (typically node's FQN)
   /// @param service_name Name of the ReportFault service (default: /fault_manager/report_fault)
-  FaultReporter(rclcpp::Node::SharedPtr node, const std::string & source_id,
+  FaultReporter(const rclcpp::Node::SharedPtr & node, const std::string & source_id,
                 const std::string & service_name = "/fault_manager/report_fault");
 
   /// Construct a FaultReporter via Node
@@ -91,10 +96,21 @@ class FaultReporter {
 
   /// Construct a FaultReporter via Lifecycle Node
   ///
+  /// The node reference is non-const because the ROS 2 node interface getters
+  /// (get_node_base_interface() and friends) are non-const member functions.
+  ///
   /// @param node The ROS 2 node to use for service client and parameters
   /// @param source_id Identifier for this reporter (typically node's FQN)
   /// @param service_name Name of the ReportFault service (default: /fault_manager/report_fault)
   FaultReporter(rclcpp_lifecycle::LifecycleNode & node, const std::string & source_id,
+                const std::string & service_name = "/fault_manager/report_fault");
+
+  /// Construct a FaultReporter via Lifecycle Node Shared Ptr
+  ///
+  /// @param node The ROS 2 node to use for service client and parameters
+  /// @param source_id Identifier for this reporter (typically node's FQN)
+  /// @param service_name Name of the ReportFault service (default: /fault_manager/report_fault)
+  FaultReporter(const rclcpp_lifecycle::LifecycleNode::SharedPtr & node, const std::string & source_id,
                 const std::string & service_name = "/fault_manager/report_fault");
 
   /// Report a FAILED event (fault occurrence)
