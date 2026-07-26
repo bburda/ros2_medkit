@@ -14,6 +14,8 @@
 
 #include "ros2_medkit_gateway/core/http/handlers/bulkdata_handlers.hpp"
 
+#include "ros2_medkit_gateway/core/faults/fault_scope.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -109,6 +111,19 @@ std::vector<std::string> compute_bulkdata_source_filters(const ThreadSafeEntityC
     return HandlerContext::resolve_app_host_fqns(cache, cache.get_apps_for_function(entity.id));
   }
 
+  if (entity.type == EntityType::APP) {
+    // A plugin-introspected app has no ROS binding, so fqn and namespace_path
+    // are both empty and the bare-fqn path below would return no filter at all -
+    // its rosbags and logs then belong to nobody and every download 404s. Its
+    // reporting source is its bare id, exactly as fault scoping resolves it.
+    std::string source = faults::resolve_app_source_fqn(cache, entity.id);
+    if (!source.empty()) {
+      std::vector<std::string> filters;
+      filters.push_back(std::move(source));
+      return filters;
+    }
+  }
+
   if (entity.type == EntityType::COMPONENT) {
     // Synthetic / runtime-discovered components have an empty fqn / namespace_path,
     // so the bare-fqn path used to silently return zero source filters and produce
@@ -116,6 +131,13 @@ std::vector<std::string> compute_bulkdata_source_filters(const ThreadSafeEntityC
     // apps first; manifest deployments where the component groups topics rather than
     // nodes still need the namespace prefix path, so fall through if no apps host it.
     auto filters = HandlerContext::resolve_app_host_fqns(cache, cache.get_apps_for_component(entity.id));
+    // An external component reports faults under its own id too (a bridge raises
+    // PLC_COMMS_LOST there), so it owns that source as well - the same rule
+    // faults::collect_component_app_fqns already applies.
+    auto comp = cache.get_component(entity.id);
+    if (comp && comp->external.value_or(false)) {
+      filters.push_back(entity.id);
+    }
     if (!filters.empty()) {
       return filters;
     }
