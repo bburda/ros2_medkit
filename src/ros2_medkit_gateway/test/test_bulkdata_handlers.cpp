@@ -282,6 +282,25 @@ TEST_F(BulkDataSourceFiltersTest, ComponentWithHostedAppsReturnsAppFqns) {
   EXPECT_TRUE(as_set.count("/powertrain/engine/rpm_sensor"));
 }
 
+// COMPONENT hosting plugin-provided apps - those apps have no ROS binding and
+// report faults under their bare entity id, so that id must become the filter.
+// Resolving by effective_fqn() alone yielded zero filters and the download
+// ownership check answered "Bulk-data not found for this entity" for a bag that
+// existed on disk.
+TEST_F(BulkDataSourceFiltersTest, ComponentWithExternalAppsReturnsBareEntityIds) {
+  App plc_app;
+  plc_app.id = "plc_line1";
+  plc_app.name = "PLC Line 1";
+  plc_app.component_id = "plc_hw";
+  plc_app.external = true;
+  cache_.update_apps({plc_app});
+
+  auto entity = make_entity_info(EntityType::COMPONENT, "plc_hw", "", "");
+  auto filters = handlers::detail::compute_bulkdata_source_filters(cache_, entity);
+  ASSERT_EQ(filters.size(), 1u);
+  EXPECT_EQ(filters[0], "plc_line1");
+}
+
 // COMPONENT with no hosted apps but non-empty fqn falls through to fqn path
 // (manifest deployment grouping topics rather than nodes).
 TEST_F(BulkDataSourceFiltersTest, ComponentManifestOnlyFallsThroughToFqn) {

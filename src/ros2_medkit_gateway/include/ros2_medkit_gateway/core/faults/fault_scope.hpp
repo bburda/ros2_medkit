@@ -26,6 +26,13 @@ class ThreadSafeEntityCache;
 
 namespace faults {
 
+/// Resolve the single fault-reporting source an app owns, or "" when it owns
+/// none. An external app (a plugin-introspected asset with no ROS binding)
+/// reports under its bare entity id; every other app owns its `effective_fqn()`.
+/// An unbound non-external app owns nothing - granting it its bare id would let
+/// it claim faults it never reported.
+std::string resolve_app_source_fqn(const ThreadSafeEntityCache & cache, const std::string & app_id);
+
 /// Resolve the set of App effective-FQNs that fall within an entity's scope by
 /// walking the entity cache:
 ///   - APP: the app's own effective FQN

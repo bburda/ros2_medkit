@@ -307,13 +307,15 @@ class HandlerContext {
   }
 
   /**
-   * @brief Resolve a list of app IDs to their non-empty effective FQNs.
+   * @brief Resolve a list of app IDs to the fault-reporting sources they own.
    *
-   * Apps that are missing from the cache or that have an empty effective_fqn()
-   * are skipped silently. The returned vector preserves the input app_ids order
-   * (minus skipped entries) and may be empty. Apps whose effective_fqn() is
-   * already present in the result are skipped, so duplicates from manifest /
-   * runtime double-binds do not produce repeated downstream queries.
+   * Each app resolves through `faults::resolve_app_source_fqn()`: its
+   * `effective_fqn()`, or its bare entity id when the app is external (a
+   * plugin-introspected asset that reports under that id). Apps that are
+   * missing from the cache or that own no source are skipped silently. The
+   * returned vector preserves the input app_ids order (minus skipped entries)
+   * and may be empty. Duplicate sources from manifest / runtime double-binds
+   * are collapsed so they do not produce repeated downstream queries.
    *
    * Used by log_handlers and bulkdata_handlers to aggregate per-component /
    * per-function resource queries from the entity's hosted apps. Static + public
@@ -321,7 +323,7 @@ class HandlerContext {
    *
    * @param cache Entity cache to look up apps in
    * @param app_ids App IDs to resolve
-   * @return Effective FQNs for the apps that resolved
+   * @return Source FQNs for the apps that resolved
    */
   static std::vector<std::string> resolve_app_host_fqns(const ThreadSafeEntityCache & cache,
                                                         const std::vector<std::string> & app_ids);

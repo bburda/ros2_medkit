@@ -25,24 +25,8 @@ namespace faults {
 namespace {
 
 void collect_app_fqn(const ThreadSafeEntityCache & cache, const std::string & app_id, std::set<std::string> & out) {
-  auto app = cache.get_app(app_id);
-  if (!app) {
-    return;
-  }
-  // External assets introspected by a protocol plugin (e.g. a PLC over OPC UA)
-  // report faults to the fault_manager under their own entity id, so that id is
-  // their sole fault-scope owner. This must be checked before effective_fqn():
-  // a manifest may declare a stray ros_binding on an external app, and the
-  // derived FQN would otherwise shadow the bare id and drop its faults from
-  // every rollup (#517, neighbor case).
-  if (app->external.value_or(false)) {
-    out.insert(app_id);
-    return;
-  }
-  auto fqn = app->effective_fqn();
+  auto fqn = resolve_app_source_fqn(cache, app_id);
   if (fqn.empty()) {
-    // A non-external app that merely failed to bind stays skipped: granting an
-    // unbound ROS app its bare id would let it claim faults it never reported.
     return;
   }
   out.insert(std::move(fqn));
@@ -120,6 +104,25 @@ bool source_matches_scope(const std::string & src, const std::set<std::string> &
 }
 
 }  // namespace
+
+std::string resolve_app_source_fqn(const ThreadSafeEntityCache & cache, const std::string & app_id) {
+  auto app = cache.get_app(app_id);
+  if (!app) {
+    return "";
+  }
+  // External assets introspected by a protocol plugin (e.g. a PLC over OPC UA)
+  // report faults to the fault_manager under their own entity id, so that id is
+  // their sole fault-scope owner. This must be checked before effective_fqn():
+  // a manifest may declare a stray ros_binding on an external app, and the
+  // derived FQN would otherwise shadow the bare id and drop its faults from
+  // every rollup (#517, neighbor case).
+  if (app->external.value_or(false)) {
+    return app_id;
+  }
+  // A non-external app that merely failed to bind owns nothing: granting an
+  // unbound ROS app its bare id would let it claim faults it never reported.
+  return app->effective_fqn();
+}
 
 std::set<std::string> resolve_entity_source_fqns(const ThreadSafeEntityCache & cache, SovdEntityType type,
                                                  const std::string & entity_id) {

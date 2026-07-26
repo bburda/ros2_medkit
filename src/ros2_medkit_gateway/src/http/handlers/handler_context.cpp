@@ -390,11 +390,11 @@ std::vector<std::string> HandlerContext::resolve_app_host_fqns(const ThreadSafeE
   fqns.reserve(app_ids.size());
   std::unordered_set<std::string> seen;
   for (const auto & app_id : app_ids) {
-    auto app = cache.get_app(app_id);
-    if (!app) {
-      continue;
-    }
-    auto fqn = app->effective_fqn();
+    // Same app -> source resolution as the fault-scope path, so a plugin app
+    // (external, no ROS binding) keeps its bare entity id here too. Resolving
+    // by effective_fqn() alone dropped it, and the empty filter set made every
+    // rosbag download and log query for its component match nothing.
+    auto fqn = faults::resolve_app_source_fqn(cache, app_id);
     if (fqn.empty()) {
       continue;
     }
