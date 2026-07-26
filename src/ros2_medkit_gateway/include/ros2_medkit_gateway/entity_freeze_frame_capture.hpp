@@ -129,9 +129,11 @@ class EntityFreezeFrameCapture {
   static nlohmann::json values_from_list_content(const nlohmann::json & content);
 
   /// True when list-data-shaped content (DataProvider::list_data or x-plc-data
-  /// route) carries real live values: not flagged disconnected, with a
-  /// non-empty items array. A PLC that is down must not freeze-frame a row
-  /// of nulls.
+  /// route) carries values at all: a non-empty items array. The entity's
+  /// `connected` flag is deliberately not consulted - a bridge serving its last
+  /// known values while the link is down is the case a loss-of-comms fault most
+  /// needs frozen. The row of nulls a cold cache yields is rejected by
+  /// values_have_data() instead.
   static bool content_has_live_data(const nlohmann::json & content);
 
   /// True when a compact values dict holds at least one non-null value.

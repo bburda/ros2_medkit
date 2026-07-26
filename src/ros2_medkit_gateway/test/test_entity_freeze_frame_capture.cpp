@@ -527,8 +527,10 @@ TEST_F(EntityFreezeFrameCaptureTest, RouteFallbackCapturesWhenPluginHasNoDataPro
 }
 
 /// @verifies REQ_INTEROP_088
-TEST_F(EntityFreezeFrameCaptureTest, RouteFallbackSkipsDisconnectedPlc) {
-  // A disconnected PLC must not freeze-frame a row of stale/null values.
+TEST_F(EntityFreezeFrameCaptureTest, RouteFallbackSkipsDisconnectedPlcWithNoValues) {
+  // A disconnected PLC with nothing cached must not freeze-frame a row of
+  // nulls. One that still serves its last known values does get a frame - see
+  // DisconnectedEntityWithLastKnownValuesIsCaptured.
   EntityFreezeFrameCapture capture(
       node_.get(), *sub_exec_,
       [](const std::string &) -> DataProvider * {
@@ -545,6 +547,27 @@ TEST_F(EntityFreezeFrameCaptureTest, RouteFallbackSkipsDisconnectedPlc) {
     std::this_thread::sleep_for(10ms);
   }
   EXPECT_TRUE(capture.frames_for("PLC_DISCONNECTED").empty());
+}
+
+/// @verifies REQ_INTEROP_088
+TEST_F(EntityFreezeFrameCaptureTest, DisconnectedEntityWithLastKnownValuesIsCaptured) {
+  // The loss-of-comms case: the bridge reports the link down and still serves
+  // the values it last read. That is what the fault is about, so it is frozen.
+  EntityFreezeFrameCapture capture(
+      node_.get(), *sub_exec_,
+      [](const std::string &) -> DataProvider * {
+        return nullptr;
+      },
+      [](const std::string &) -> std::optional<json> {
+        return json{{"connected", false},
+                    {"items", json::array({{{"name", "level"}, {"value", 42.0}, {"stale", true}}})}};
+      });
+
+  ASSERT_TRUE(publish_and_wait(capture, make_confirmed_event("PLC_COMMS_LOST", {"route_plc_app"})));
+
+  const auto frames = capture.frames_for("PLC_COMMS_LOST");
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0].values["level"], 42.0);
 }
 
 /// @verifies REQ_INTEROP_088
@@ -571,12 +594,14 @@ TEST_F(EntityFreezeFrameCaptureTest, DataProviderWinsOverRouteFallback) {
 /// @verifies REQ_INTEROP_088
 TEST_F(EntityFreezeFrameCaptureTest, DataProviderWithoutLiveValuesCapturesNothing) {
   // Same "no row = nothing captured" invariant as the route path: an empty
-  // items array (cold poll cache), all-null values (down link) or a
-  // disconnected flag must not freeze-frame a row of {} / nulls.
+  // items array (cold poll cache) or all-null values must not freeze-frame a
+  // row of {} / nulls, connected or not.
   StaticContentDataProvider cold_provider("cold_app", json{{"items", json::array()}});
   StaticContentDataProvider null_provider("null_app", json{{"items", json::array({{{"id", "level"}}})}});
-  StaticContentDataProvider down_provider(
-      "down_app", json{{"connected", false}, {"items", json::array({{{"id", "level"}, {"value", 1.0}}})}});
+  // Down AND empty: nothing to freeze. (Down with a real last known value is a
+  // capture, covered separately.)
+  StaticContentDataProvider down_provider("down_app",
+                                          json{{"connected", false}, {"items", json::array({{{"id", "level"}}})}});
   EntityFreezeFrameCapture capture(node_.get(), *sub_exec_, [&](const std::string & entity_id) -> DataProvider * {
     if (entity_id == "cold_app") {
       return &cold_provider;
@@ -617,13 +642,15 @@ TEST_F(EntityFreezeFrameCaptureTest, OldestFaultEvictedPastMaxFaults) {
   EXPECT_FALSE(capture.frames_for("PLC_EVICT_C").empty());
 }
 
-TEST(ContentHasLiveData, GatesOnConnectedAndItems) {
+TEST(ContentHasLiveData, GatesOnItemsNotOnTheLinkFlag) {
   using Capture = EntityFreezeFrameCapture;
   EXPECT_TRUE(Capture::content_has_live_data(
       json{{"connected", true}, {"items", json::array({{{"name", "a"}, {"value", 1}}})}}));
   // No "connected" field: items alone are enough (plugin-defined shape).
   EXPECT_TRUE(Capture::content_has_live_data(json{{"items", json::array({{{"name", "a"}, {"value", 1}}})}}));
-  EXPECT_FALSE(Capture::content_has_live_data(
+  // Disconnected but still serving its last known values: this is the
+  // loss-of-comms case, and those values are the point of the frame.
+  EXPECT_TRUE(Capture::content_has_live_data(
       json{{"connected", false}, {"items", json::array({{{"name", "a"}, {"value", 1}}})}}));
   EXPECT_FALSE(Capture::content_has_live_data(json{{"connected", true}, {"items", json::array()}}));
   EXPECT_FALSE(Capture::content_has_live_data(json{{"connected", true}}));

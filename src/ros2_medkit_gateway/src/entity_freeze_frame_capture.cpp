@@ -129,9 +129,11 @@ bool EntityFreezeFrameCapture::content_has_live_data(const nlohmann::json & cont
   if (!content.is_object()) {
     return false;
   }
-  if (content.contains("connected") && content["connected"].is_boolean() && !content["connected"].get<bool>()) {
-    return false;
-  }
+  // Judged on the values, not on the link flag. A bridge that serves its last
+  // known values while disconnected is exactly what a loss-of-comms fault wants
+  // frozen - refusing on `connected: false` denied a frame to the one fault
+  // where the values before the link died are the whole story. The all-null row
+  // a genuinely cold cache yields is still rejected, by values_have_data().
   return content.contains("items") && content["items"].is_array() && !content["items"].empty();
 }
 
