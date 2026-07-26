@@ -1331,6 +1331,17 @@ App make_app_with_binding(const std::string & id, const std::string & node_name,
   return a;
 }
 
+// An asset introspected by a protocol plugin (e.g. a PLC entity over OPC UA):
+// external=true, no ROS binding, so effective_fqn() is empty.
+App make_external_app(const std::string & app_id, const std::string & component_id) {
+  App a;
+  a.id = app_id;
+  a.name = app_id;
+  a.component_id = component_id;
+  a.external = true;
+  return a;
+}
+
 }  // namespace
 
 TEST(ResolveAppHostFqnsTest, EmptyAppListReturnsEmpty) {
@@ -1383,6 +1394,35 @@ TEST(ResolveAppHostFqnsTest, SkipsAppsWithEmptyEffectiveFqn) {
   auto fqns = HandlerContext::resolve_app_host_fqns(cache, {"no_binding", "temp_sensor"});
   ASSERT_EQ(fqns.size(), 1u);
   EXPECT_EQ(fqns[0], "/powertrain/engine/temp_sensor");
+}
+
+TEST(ResolveAppHostFqnsTest, ExternalAppResolvesToItsBareEntityId) {
+  // A plugin-introspected asset has no ROS binding, so effective_fqn() is empty,
+  // but it reports faults - and therefore owns its rosbags and logs - under its
+  // bare entity id. Dropping it here left the bulk-data / log filter set empty
+  // and every download for the hosting component answered "not found".
+  ThreadSafeEntityCache cache;
+  cache.update_apps({make_external_app("plc_line1", "plc_hw"),
+                     make_app_with_binding("temp_sensor", "temp_sensor", "/powertrain/engine")});
+
+  auto fqns = HandlerContext::resolve_app_host_fqns(cache, {"plc_line1", "temp_sensor"});
+  ASSERT_EQ(fqns.size(), 2u);
+  EXPECT_EQ(fqns[0], "plc_line1");
+  EXPECT_EQ(fqns[1], "/powertrain/engine/temp_sensor");
+}
+
+TEST(ResolveAppHostFqnsTest, ExternalAppWithStrayBindingStillResolvesToItsId) {
+  // Mirrors the fault-scope rule: a manifest stub may declare a ros_binding on
+  // an external app; the derived FQN must not shadow the id the plugin reports
+  // under, or the entity's bags become unreachable again.
+  ThreadSafeEntityCache cache;
+  App plc = make_external_app("plc_line1", "plc_hw");
+  plc.ros_binding = App::RosBinding{"process", "/plc", ""};
+  cache.update_apps({plc});
+
+  auto fqns = HandlerContext::resolve_app_host_fqns(cache, {"plc_line1"});
+  ASSERT_EQ(fqns.size(), 1u);
+  EXPECT_EQ(fqns[0], "plc_line1");
 }
 
 TEST(ResolveAppHostFqnsTest, AllAppsMissingReturnsEmpty) {
@@ -1443,17 +1483,6 @@ App make_owned_app(const std::string & app_id, const std::string & component_id,
                    const std::string & ns) {
   App a = make_app_with_binding(app_id, node_name, ns);
   a.component_id = component_id;
-  return a;
-}
-
-// An asset introspected by a protocol plugin (e.g. a PLC entity over OPC UA):
-// external=true, no ROS binding, so effective_fqn() is empty.
-App make_external_app(const std::string & app_id, const std::string & component_id) {
-  App a;
-  a.id = app_id;
-  a.name = app_id;
-  a.component_id = component_id;
-  a.external = true;
   return a;
 }
 
