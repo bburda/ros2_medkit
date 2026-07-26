@@ -1816,6 +1816,46 @@ void GatewayNode::init_entity_freeze_frame_capture(ros2_common::Ros2Subscription
       // as the capture fallback.
       [this](const std::string & entity_id) -> std::optional<nlohmann::json> {
         return plugin_mgr_ ? plugin_mgr_->fetch_entity_data_via_route(entity_id) : std::nullopt;
+      },
+      256,  // retained-frame bound (constructor default)
+      // Plugins start polling - and reporting - while this object is still
+      // being wired, and a device that is in fault when the box boots confirms
+      // immediately, to nobody. The capture asks for those on its own thread,
+      // which it joins on destruction, so the service wait cannot outlive the
+      // node it waits on.
+      [this]() {
+        std::vector<EntityFreezeFrameCapture::StandingFault> standing;
+        if (!fault_service_transport_ || !fault_service_transport_->wait_for_services(std::chrono::seconds(10))) {
+          return standing;
+        }
+        auto result = fault_service_transport_->list_faults("", false, true, false, false, false, false);
+        if (!result.success || !result.data.is_object()) {
+          return standing;
+        }
+        // ListFaults answers under "faults" (see Ros2FaultServiceTransport).
+        const auto faults = result.data.find("faults");
+        if (faults == result.data.end() || !faults->is_array()) {
+          return standing;
+        }
+        for (const auto & item : *faults) {
+          if (!item.is_object()) {
+            continue;
+          }
+          const auto code = item.find("fault_code");
+          const auto sources = item.find("reporting_sources");
+          if (code == item.end() || !code->is_string() || sources == item.end() || !sources->is_array()) {
+            continue;
+          }
+          EntityFreezeFrameCapture::StandingFault fault;
+          fault.fault_code = code->get<std::string>();
+          for (const auto & src : *sources) {
+            if (src.is_string()) {
+              fault.reporting_sources.push_back(src.get<std::string>());
+            }
+          }
+          standing.push_back(std::move(fault));
+        }
+        return standing;
       });
 }
 

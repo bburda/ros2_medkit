@@ -40,11 +40,12 @@ std::string string_field(const nlohmann::json & item, const char * field) {
 
 EntityFreezeFrameCapture::EntityFreezeFrameCapture(rclcpp::Node * node, ros2_common::Ros2SubscriptionExecutor & exec,
                                                    DataProviderResolver resolver, RouteDataFetcher route_fetcher,
-                                                   size_t max_faults)
+                                                   size_t max_faults, StandingFaultLister standing_lister)
   : resolver_(std::move(resolver))
   , route_fetcher_(std::move(route_fetcher))
   , logger_(node->get_logger())
-  , max_faults_(max_faults > 0 ? max_faults : 1) {
+  , max_faults_(max_faults > 0 ? max_faults : 1)
+  , standing_lister_(std::move(standing_lister)) {
   // Resolve the topic from the gateway node (it owns fault_manager.namespace);
   // the subscription itself is created on the executor's dedicated _sub node so
   // it never races rcl's hash-map on the main node (issue #375).
@@ -209,7 +210,45 @@ void EntityFreezeFrameCapture::on_fault_event(const ros2_medkit_msgs::msg::Fault
   queue_cv_.notify_one();
 }
 
+void EntityFreezeFrameCapture::capture_standing_faults() {
+  if (!standing_lister_) {
+    return;
+  }
+  // The lister blocks until the fault services answer, so it runs here rather
+  // than on a thread of its own: this thread is joined by the destructor, which
+  // is what keeps that wait from outliving the node it waits on.
+  const auto standing = standing_lister_();
+  size_t framed = 0;
+  for (const auto & fault : standing) {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (stop_) {
+        return;
+      }
+    }
+    if (fault.fault_code.empty() || fault.reporting_sources.empty()) {
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (frames_.count(fault.fault_code) != 0) {
+        continue;  // the live event beat us to it
+      }
+    }
+    ros2_medkit_msgs::msg::FaultEvent event;
+    event.event_type = ros2_medkit_msgs::msg::FaultEvent::EVENT_CONFIRMED;
+    event.fault.fault_code = fault.fault_code;
+    event.fault.reporting_sources = fault.reporting_sources;
+    capture_for_event(event);
+    ++framed;
+  }
+  if (framed > 0) {
+    RCLCPP_INFO(logger_, "Entity freeze-frame: captured %zu fault(s) that were already confirmed at startup", framed);
+  }
+}
+
 void EntityFreezeFrameCapture::capture_worker() {
+  capture_standing_faults();
   for (;;) {
     ros2_medkit_msgs::msg::FaultEvent::ConstSharedPtr event;
     {
