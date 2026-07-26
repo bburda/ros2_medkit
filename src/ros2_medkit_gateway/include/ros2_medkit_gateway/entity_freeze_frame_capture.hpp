@@ -79,6 +79,18 @@ class EntityFreezeFrameCapture {
   /// same route - dispatched handlers must be thread-safe.
   using RouteDataFetcher = std::function<std::optional<nlohmann::json>(const std::string & entity_id)>;
 
+  /// One standing fault: its code and the entities that reported it.
+  struct StandingFault {
+    std::string fault_code;
+    std::vector<std::string> reporting_sources;
+  };
+
+  /// Lists the faults that are already confirmed when this object starts, so
+  /// their missed confirm edge can still be framed. Called once, on the capture
+  /// thread (it may block on a service becoming available), never after the
+  /// destructor has joined that thread - so it must not outlive its owner.
+  using StandingFaultLister = std::function<std::vector<StandingFault>()>;
+
   /**
    * @param node ROS 2 node used to resolve the fault-events topic name and logger
    * @param exec shared subscription executor; the fault-events subscription is
@@ -92,7 +104,7 @@ class EntityFreezeFrameCapture {
    */
   EntityFreezeFrameCapture(rclcpp::Node * node, ros2_common::Ros2SubscriptionExecutor & exec,
                            DataProviderResolver resolver, RouteDataFetcher route_fetcher = nullptr,
-                           size_t max_faults = 256);
+                           size_t max_faults = 256, StandingFaultLister standing_lister = nullptr);
 
   ~EntityFreezeFrameCapture();
 
@@ -127,6 +139,13 @@ class EntityFreezeFrameCapture {
 
   /// capture_thread_ main loop: drains queued confirm events.
   void capture_worker();
+
+  /// Frame the faults that were already confirmed when this object came up:
+  /// plugins start reporting while the gateway is still wiring the capture, so
+  /// a device that is in fault at boot confirms to nobody. Frames are
+  /// process-local, so this restores what the missed edge would have produced
+  /// rather than duplicating anything. Runs on capture_thread_.
+  void capture_standing_faults();
 
   /// Per-event capture (all plugin calls happen here, on capture_thread_).
   void capture_for_event(const ros2_medkit_msgs::msg::FaultEvent & event);
@@ -168,6 +187,9 @@ class EntityFreezeFrameCapture {
   std::deque<ros2_medkit_msgs::msg::FaultEvent::ConstSharedPtr> queue_;
   bool stop_{false};
   std::thread capture_thread_;
+
+  /// Lists faults already confirmed at construction; run once on that thread.
+  StandingFaultLister standing_lister_;
 };
 
 }  // namespace ros2_medkit_gateway

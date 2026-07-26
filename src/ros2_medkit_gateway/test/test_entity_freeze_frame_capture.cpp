@@ -247,6 +247,102 @@ TEST_F(EntityFreezeFrameCaptureTest, NonConfirmedEventsAreIgnored) {
 }
 
 /// @verifies REQ_INTEROP_088
+TEST_F(EntityFreezeFrameCaptureTest, StandingFaultsAreFramedWithoutAnyEvent) {
+  // The startup case: the fault confirmed before this object subscribed, so no
+  // event will ever arrive for it. The lister supplies it instead.
+  EntityFreezeFrameCapture capture(
+      node_.get(), *sub_exec_,
+      [](const std::string &) -> DataProvider * {
+        return nullptr;
+      },
+      [](const std::string &) -> std::optional<json> {
+        return json{{"connected", true}, {"items", json::array({{{"name", "level"}, {"value", 7.0}}})}};
+      },
+      256,
+      []() -> std::vector<EntityFreezeFrameCapture::StandingFault> {
+        return {{"PLC_STANDING", {"route_plc_app"}}};
+      });
+
+  // No publish at all - the frame must appear from the catch-up alone.
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (capture.frames_for("PLC_STANDING").empty() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(20ms);
+  }
+  const auto frames = capture.frames_for("PLC_STANDING");
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0].entity_id, "route_plc_app");
+  EXPECT_DOUBLE_EQ(frames[0].values.value("level", 0.0), 7.0);
+}
+
+/// @verifies REQ_INTEROP_088
+TEST_F(EntityFreezeFrameCaptureTest, LiveConfirmFrameWinsOverStandingCatchUp) {
+  // Both paths carry the same fault code. The catch-up runs first, on the
+  // capture thread, and the confirm that arrived meanwhile is drained by the
+  // same thread afterwards - so the live frame is the one that survives.
+  // Distinct entity ids make the winner unambiguous.
+  std::atomic<bool> published{false};
+  std::atomic<bool> standing_sampled{false};
+  EntityFreezeFrameCapture capture(
+      node_.get(), *sub_exec_,
+      [](const std::string &) -> DataProvider * {
+        return nullptr;
+      },
+      [&standing_sampled](const std::string & entity_id) -> std::optional<json> {
+        double level = 0.0;
+        if (entity_id == "route_live_app") {
+          level = 99.0;
+        } else if (entity_id == "route_standing_app") {
+          level = 1.0;
+          standing_sampled.store(true);
+        } else {
+          return std::nullopt;
+        }
+        return json{{"connected", true}, {"items", json::array({{{"name", "level"}, {"value", level}}})}};
+      },
+      256,
+      [&published]() -> std::vector<EntityFreezeFrameCapture::StandingFault> {
+        // Hold the catch-up until the live confirm is in flight so the two
+        // genuinely overlap instead of running far apart.
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!published.load() && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(10ms);
+        }
+        std::this_thread::sleep_for(200ms);  // let the event reach the queue
+        return {{"PLC_BOTH_PATHS", {"route_standing_app"}}};
+      });
+
+  ASSERT_TRUE(wait_for_match());
+  const auto live = make_confirmed_event("PLC_BOTH_PATHS", {"route_live_app"});
+  publisher_->publish(live);
+  published.store(true);
+
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  std::vector<EntityFreezeFrameCapture::Frame> frames;
+  while (std::chrono::steady_clock::now() < deadline) {
+    frames = capture.frames_for("PLC_BOTH_PATHS");
+    if (!frames.empty() && frames[0].entity_id == "route_live_app") {
+      break;
+    }
+    publisher_->publish(live);
+    std::this_thread::sleep_for(20ms);
+  }
+
+  // The catch-up precedes the drain loop, so it has necessarily sampled by the
+  // time the live frame lands.
+  EXPECT_TRUE(standing_sampled.load());
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0].entity_id, "route_live_app");
+  EXPECT_DOUBLE_EQ(frames[0].values.value("level", 0.0), 99.0);
+
+  // ...and nothing may overwrite it afterwards either.
+  std::this_thread::sleep_for(500ms);
+  const auto settled = capture.frames_for("PLC_BOTH_PATHS");
+  ASSERT_EQ(settled.size(), 1u);
+  EXPECT_EQ(settled[0].entity_id, "route_live_app");
+  EXPECT_DOUBLE_EQ(settled[0].values.value("level", 0.0), 99.0);
+}
+
+/// @verifies REQ_INTEROP_088
 TEST_F(EntityFreezeFrameCaptureTest, FramesRetainedAcrossClearAndOverwrittenOnReconfirm) {
   EntityFreezeFrameCapture capture(node_.get(), *sub_exec_, [this](const std::string & entity_id) -> DataProvider * {
     return entity_id == "plc_app" ? provider_.get() : nullptr;
