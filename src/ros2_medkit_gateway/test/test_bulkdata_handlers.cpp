@@ -301,6 +301,46 @@ TEST_F(BulkDataSourceFiltersTest, ComponentWithExternalAppsReturnsBareEntityIds)
   EXPECT_EQ(filters[0], "plc_line1");
 }
 
+// APP provided by a protocol plugin - no ROS binding, so fqn and namespace_path
+// are empty and the generic path returned no filter at all: the rosbag the fault
+// detail advertises under /apps/<id>/bulk-data/rosbags/<code> belonged to nobody
+// and every download 404'd. Its bare id is its reporting source.
+TEST_F(BulkDataSourceFiltersTest, ExternalAppResolvesToItsBareEntityId) {
+  App device;
+  device.id = "twincat_runtime_device";
+  device.name = "TwinCAT 3 Runtime (device)";
+  device.component_id = "twincat_runtime";
+  device.external = true;
+  cache_.update_apps({device});
+
+  auto entity = make_entity_info(EntityType::APP, "twincat_runtime_device", "", "");
+  auto filters = handlers::detail::compute_bulkdata_source_filters(cache_, entity);
+  ASSERT_EQ(filters.size(), 1u);
+  EXPECT_EQ(filters[0], "twincat_runtime_device");
+}
+
+// An external COMPONENT reports faults under its own id as well (a bridge raises
+// PLC_COMMS_LOST there), so it owns that source alongside its hosted apps.
+TEST_F(BulkDataSourceFiltersTest, ExternalComponentAlsoOwnsItsOwnId) {
+  Component plc;
+  plc.id = "plc_hw2";
+  plc.name = "PLC";
+  plc.external = true;
+  cache_.update_components({plc});
+  App child;
+  child.id = "plc_hw2_device";
+  child.name = "PLC (device)";
+  child.component_id = "plc_hw2";
+  child.external = true;
+  cache_.update_apps({child});
+
+  auto entity = make_entity_info(EntityType::COMPONENT, "plc_hw2", "", "");
+  auto filters = handlers::detail::compute_bulkdata_source_filters(cache_, entity);
+  std::set<std::string> as_set(filters.begin(), filters.end());
+  EXPECT_TRUE(as_set.count("plc_hw2_device"));
+  EXPECT_TRUE(as_set.count("plc_hw2"));
+}
+
 // COMPONENT with no hosted apps but non-empty fqn falls through to fqn path
 // (manifest deployment grouping topics rather than nodes).
 TEST_F(BulkDataSourceFiltersTest, ComponentManifestOnlyFallsThroughToFqn) {
