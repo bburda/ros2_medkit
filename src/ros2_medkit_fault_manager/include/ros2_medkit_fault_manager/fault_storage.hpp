@@ -226,12 +226,15 @@ class FaultStorage {
   /// @return Rosbag file info if exists, nullopt otherwise
   virtual std::optional<RosbagFileInfo> get_rosbag_file(const std::string & fault_code) const = 0;
 
-  /// Delete rosbag file record and the actual file for a fault
+  /// Delete rosbag file record and the actual file for a fault. Faults from one
+  /// burst can share a recording; the file is unlinked only with the last record
+  /// that references it.
   /// @param fault_code The fault code to delete rosbag for
   /// @return true if record was deleted, false if not found
   virtual bool delete_rosbag_file(const std::string & fault_code) = 0;
 
-  /// Get total size of all stored rosbag files in bytes
+  /// Get total size of all stored rosbag files in bytes, counting a shared
+  /// recording once regardless of how many faults reference it
   /// @return Total size in bytes
   virtual size_t get_total_rosbag_storage_bytes() const = 0;
 
@@ -310,6 +313,11 @@ class InMemoryFaultStorage : public FaultStorage {
  private:
   /// Update fault status based on debounce counter and given config
   void update_status(FaultState & state, const DebounceConfig & config);
+
+  /// Whether a fault other than @p fault_code still references @p file_path.
+  /// One recording can back several faults of the same burst, so the bag must
+  /// only be unlinked once the last of them is gone. Caller holds mutex_.
+  bool path_shared_with_other_fault(const std::string & file_path, const std::string & fault_code) const;
 
   mutable std::mutex mutex_;
   std::map<std::string, FaultState> faults_;

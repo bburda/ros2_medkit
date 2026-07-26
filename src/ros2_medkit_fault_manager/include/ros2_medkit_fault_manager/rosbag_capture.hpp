@@ -91,7 +91,9 @@ class RosbagCapture {
   /// @param fault_code The fault code that entered PREFAILED
   void on_fault_prefailed(const std::string & fault_code);
 
-  /// Called when a fault is confirmed - flushes buffer to bag file
+  /// Called when a fault is confirmed - flushes buffer to bag file. A fault that
+  /// confirms while the previous fault's post-roll is still running is attached
+  /// to that recording (same burst, same window) rather than losing its bag.
   /// @param fault_code The fault code that was confirmed
   void on_fault_confirmed(const std::string & fault_code);
 
@@ -112,6 +114,14 @@ class RosbagCapture {
   /// Whether a topic is a high-bandwidth sensor stream (image/points/depth/compressed),
   /// auto-excluded from broad-mode capture. Static + public so it is directly testable.
   static bool is_high_bandwidth_topic(const std::string & topic);
+
+  /// Delete oldest bags from @p storage until its accounted total fits @p max_bytes.
+  /// A bag shared by a burst of correlated faults is evicted as one unit: every row
+  /// referencing it goes together and its bytes are freed once, so the running total
+  /// tracks what is really on disk instead of drifting below it.
+  /// @return Paths of the evicted bags, oldest first.
+  /// Static + public so the quota arithmetic is testable without a live recording.
+  static std::vector<std::string> evict_bags_over_quota(FaultStorage * storage, size_t max_bytes);
 
  private:
   /// Initialize subscriptions for configured topics
@@ -158,6 +168,17 @@ class RosbagCapture {
   /// Timer callback for post-fault recording
   void post_fault_timer_callback();
 
+  /// Close the in-flight post-fault recording, store its metadata (for the
+  /// triggering fault and every fault attached to it) and clear the recording
+  /// state. Idempotent - a no-op when no post-roll is running, so the post-fault
+  /// timer and stop() can both call it.
+  void finalize_post_fault_recording();
+
+  /// Attach @p fault_code to the in-flight post-fault recording, if there is one.
+  /// Returns true when the fault was handled (attached, already recording, or the
+  /// attachment cap was hit) and the caller must not open a second bag.
+  bool attach_to_active_recording(const std::string & fault_code);
+
   /// Try to subscribe to a single topic
   /// @param topic The topic to subscribe to
   /// @return True if subscription was created, false if type couldn't be determined
@@ -196,12 +217,19 @@ class RosbagCapture {
   /// Running state
   std::atomic<bool> running_{false};
 
+  /// Upper bound on how many extra faults one recording is registered for.
+  static constexpr size_t kMaxAttachedFaults = 32;
+
   /// Post-fault recording state
   std::string current_fault_code_;
   std::string current_bag_path_;
-  /// Protects post_fault_timer_ against concurrent assignment in
-  /// on_fault_confirmed() (service thread) and reset in
-  /// post_fault_timer_callback() / stop() (executor thread).
+  /// Faults confirmed while the post-roll was already running. They share the
+  /// recording window (one root cause, one burst), so each gets a metadata row
+  /// pointing at the same bag when it finalises.
+  std::set<std::string> attached_fault_codes_;
+  /// Protects post_fault_timer_, the recording_post_fault_ transitions and the
+  /// state above against concurrent access from on_fault_confirmed() (service
+  /// thread) and post_fault_timer_callback() / stop() (executor thread).
   std::mutex post_fault_timer_mutex_;
   rclcpp::TimerBase::SharedPtr post_fault_timer_;
   std::atomic<bool> recording_post_fault_{false};

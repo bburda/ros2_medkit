@@ -901,7 +901,7 @@ void SqliteFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
     query_stmt.bind_text(1, info.fault_code);
     if (query_stmt.step() == SQLITE_ROW) {
       std::string old_path = query_stmt.column_text(0);
-      if (old_path != info.file_path) {
+      if (old_path != info.file_path && !path_shared_with_other_fault(old_path, info.fault_code)) {
         std::error_code ec;
         std::filesystem::remove_all(old_path, ec);
         // Ignore errors - file may already be deleted
@@ -957,13 +957,18 @@ bool SqliteFaultStorage::delete_rosbag_file(const std::string & fault_code) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   // First get the file path so we can delete the actual file
-  SqliteStatement select_stmt(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ?");
-  select_stmt.bind_text(1, fault_code);
+  std::string file_path;
+  {
+    SqliteStatement select_stmt(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ?");
+    select_stmt.bind_text(1, fault_code);
+    if (select_stmt.step() == SQLITE_ROW) {
+      file_path = select_stmt.column_text(0);
+    }
+  }
 
-  if (select_stmt.step() == SQLITE_ROW) {
-    std::string file_path = select_stmt.column_text(0);
-
-    // Try to delete the actual file/directory
+  // Try to delete the actual file/directory, unless a sibling fault still
+  // points at it. Checked before the DELETE so the exclusion is explicit.
+  if (!file_path.empty() && !path_shared_with_other_fault(file_path, fault_code)) {
     std::error_code ec;
     std::filesystem::remove_all(file_path, ec);
     // Ignore errors - file may already be deleted
@@ -979,10 +984,23 @@ bool SqliteFaultStorage::delete_rosbag_file(const std::string & fault_code) {
   return sqlite3_changes(db_) > 0;
 }
 
+bool SqliteFaultStorage::path_shared_with_other_fault(const std::string & file_path,
+                                                      const std::string & fault_code) const {
+  SqliteStatement stmt(db_, "SELECT COUNT(*) FROM rosbag_files WHERE file_path = ? AND fault_code != ?");
+  stmt.bind_text(1, file_path);
+  stmt.bind_text(2, fault_code);
+  return stmt.step() == SQLITE_ROW && stmt.column_int64(0) > 0;
+}
+
 size_t SqliteFaultStorage::get_total_rosbag_storage_bytes() const {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  SqliteStatement stmt(db_, "SELECT COALESCE(SUM(size_bytes), 0) FROM rosbag_files");
+  // Sum per bag, not per fault: one recording can back a burst of correlated
+  // faults, and double-counting it would evict bags that still fit the quota.
+  SqliteStatement stmt(
+      db_,
+      "SELECT COALESCE(SUM(size_bytes), 0) FROM (SELECT MAX(size_bytes) AS size_bytes FROM rosbag_files "
+      "GROUP BY file_path)");
 
   if (stmt.step() != SQLITE_ROW) {
     return 0;
