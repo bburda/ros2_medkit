@@ -88,6 +88,11 @@ class SqliteFaultStorage : public FaultStorage {
   /// Initialize database schema
   void initialize_schema();
 
+  /// Whether a fault other than @p fault_code still references @p file_path.
+  /// One recording can back several faults of the same burst, so the bag must
+  /// only be unlinked once the last of them is gone. Caller holds mutex_.
+  bool path_shared_with_other_fault(const std::string & file_path, const std::string & fault_code) const;
+
   /// Parse JSON array string to vector of strings
   static std::vector<std::string> parse_json_array(const std::string & json_str);
 

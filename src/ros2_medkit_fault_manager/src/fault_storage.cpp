@@ -387,7 +387,8 @@ void InMemoryFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
   // Delete existing bag file if present (prevent orphaned files on re-confirm)
   auto it = rosbag_files_.find(info.fault_code);
   if (it != rosbag_files_.end()) {
-    if (it->second.file_path != info.file_path) {
+    if (it->second.file_path != info.file_path &&
+        !path_shared_with_other_fault(it->second.file_path, info.fault_code)) {
       std::error_code ec;
       std::filesystem::remove_all(it->second.file_path, ec);
       // Ignore errors - file may already be deleted
@@ -415,21 +416,42 @@ bool InMemoryFaultStorage::delete_rosbag_file(const std::string & fault_code) {
     return false;
   }
 
-  // Try to delete the actual file
-  std::error_code ec;
-  std::filesystem::remove_all(it->second.file_path, ec);
-  // Ignore errors - file may already be deleted
-
+  const std::string file_path = it->second.file_path;
   rosbag_files_.erase(it);
+
+  // Try to delete the actual file, unless a sibling fault still points at it
+  if (!path_shared_with_other_fault(file_path, fault_code)) {
+    std::error_code ec;
+    std::filesystem::remove_all(file_path, ec);
+    // Ignore errors - file may already be deleted
+  }
   return true;
+}
+
+bool InMemoryFaultStorage::path_shared_with_other_fault(const std::string & file_path,
+                                                        const std::string & fault_code) const {
+  return std::any_of(rosbag_files_.begin(), rosbag_files_.end(), [&](const auto & entry) {
+    return entry.first != fault_code && entry.second.file_path == file_path;
+  });
 }
 
 size_t InMemoryFaultStorage::get_total_rosbag_storage_bytes() const {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  size_t total = 0;
+  // Sum per bag, not per fault: one recording can back a burst of correlated
+  // faults, and double-counting it would evict bags that still fit the quota.
+  // Rows sharing a path can disagree on size while a recording is being
+  // finalised, so take the largest - matching the SQLite backend's MAX() and
+  // never under-reporting what is on disk.
+  std::map<std::string, size_t> bytes_per_path;
   for (const auto & [code, info] : rosbag_files_) {
-    total += info.size_bytes;
+    auto & bytes = bytes_per_path[info.file_path];
+    bytes = std::max(bytes, info.size_bytes);
+  }
+
+  size_t total = 0;
+  for (const auto & [path, bytes] : bytes_per_path) {
+    total += bytes;
   }
   return total;
 }

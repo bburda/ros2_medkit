@@ -26,6 +26,7 @@
 #include <rosbag2_storage/storage_options.hpp>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 #include "ros2_medkit_fault_manager/time_utils.hpp"
@@ -196,14 +197,12 @@ void RosbagCapture::stop() {
 
   running_.store(false);
 
-  // Cancel any pending post-fault timer
-  {
-    std::lock_guard<std::mutex> lock(post_fault_timer_mutex_);
-    if (post_fault_timer_) {
-      post_fault_timer_->cancel();
-      post_fault_timer_.reset();
-    }
-  }
+  // A post-roll in flight owns an open writer and a bag that has no metadata row
+  // yet. Finalise it instead of just cancelling the timer: the faults of that
+  // burst keep their black box, the writer is closed, and the recording state is
+  // cleared so a confirmation after a restart opens its own bag rather than
+  // attaching to a recording whose timer is gone.
+  finalize_post_fault_recording();
 
   if (discovery_retry_timer_) {
     discovery_retry_timer_->cancel();
@@ -240,15 +239,39 @@ void RosbagCapture::on_fault_prefailed(const std::string & fault_code) {
   }
 }
 
+bool RosbagCapture::attach_to_active_recording(const std::string & fault_code) {
+  std::lock_guard<std::mutex> lock(post_fault_timer_mutex_);
+  if (!recording_post_fault_.load()) {
+    return false;
+  }
+  if (fault_code == current_fault_code_) {
+    return true;
+  }
+  // Cap the attachment set: a flapping detector must not grow it without bound
+  // between two post-roll windows. Past the cap the burst is already recorded,
+  // only the per-fault lookup key is missing.
+  if (attached_fault_codes_.size() >= kMaxAttachedFaults) {
+    RCLCPP_WARN(node_->get_logger(), "Post-fault recording already covers %zu faults, not attaching '%s'",
+                attached_fault_codes_.size(), fault_code.c_str());
+    return true;
+  }
+  if (attached_fault_codes_.insert(fault_code).second) {
+    RCLCPP_INFO(node_->get_logger(), "Fault '%s' confirmed during post-fault recording, attaching it to bag for '%s'",
+                fault_code.c_str(), current_fault_code_.c_str());
+  }
+  return true;
+}
+
 void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
   if (!config_.enabled || !running_.load()) {
     return;
   }
 
-  // Don't start a new recording if we're already recording post-fault
-  if (recording_post_fault_.load()) {
-    RCLCPP_WARN(node_->get_logger(), "Already recording post-fault data, skipping confirmation for '%s'",
-                fault_code.c_str());
+  // Faults arrive in bursts from one root cause, so a confirmation landing inside
+  // an in-flight post-roll is exactly the correlated fault whose black box matters
+  // most. It shares the recording window, so attach it to the running bag instead
+  // of leaving it with no recording at all.
+  if (attach_to_active_recording(fault_code)) {
     return;
   }
 
@@ -267,14 +290,16 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
 
   // If duration_after_sec > 0, continue recording
   if (config_.duration_after_sec > 0.0) {
-    current_fault_code_ = fault_code;
-    current_bag_path_ = bag_path;
-    recording_post_fault_.store(true);
-
-    // Create timer for post-fault recording
+    // Create timer for post-fault recording. The recording state is published
+    // under the same lock attach_to_active_recording() takes, so a concurrent
+    // confirmation either attaches to this bag or starts its own - never both.
     auto duration = std::chrono::duration<double>(config_.duration_after_sec);
     {
       std::lock_guard<std::mutex> lock(post_fault_timer_mutex_);
+      current_fault_code_ = fault_code;
+      current_bag_path_ = bag_path;
+      attached_fault_codes_.clear();
+      recording_post_fault_.store(true);
       post_fault_timer_ =
           node_->create_wall_timer(std::chrono::duration_cast<std::chrono::nanoseconds>(duration), [this]() {
             post_fault_timer_callback();
@@ -896,46 +921,82 @@ size_t RosbagCapture::calculate_bag_size(const std::string & bag_path) const {
   return total_size;
 }
 
-void RosbagCapture::enforce_storage_limits() {
-  size_t max_bytes = config_.max_total_storage_mb * 1024 * 1024;
-  size_t current_bytes = storage_->get_total_rosbag_storage_bytes();
-
+std::vector<std::string> RosbagCapture::evict_bags_over_quota(FaultStorage * storage, size_t max_bytes) {
+  size_t current_bytes = storage->get_total_rosbag_storage_bytes();
   if (current_bytes <= max_bytes) {
-    return;
+    return {};
   }
 
-  // Get all bags sorted by creation time (oldest first)
-  auto all_bags = storage_->get_all_rosbag_files();
+  // get_all_rosbag_files() is one row per fault, and a burst of correlated faults
+  // shares one recording. Group the rows back into bags first: deleting a single
+  // row of a shared bag leaves the directory on disk (a sibling still points at
+  // it), so freeing its bytes per row would drop the running total below the real
+  // one and stop the eviction while the quota is still blown.
+  std::vector<std::string> paths_oldest_first;
+  std::unordered_map<std::string, std::vector<std::string>> codes_by_path;
+  std::unordered_map<std::string, size_t> bytes_by_path;
+  for (const auto & bag : storage->get_all_rosbag_files()) {
+    auto & codes = codes_by_path[bag.file_path];
+    if (codes.empty()) {
+      paths_oldest_first.push_back(bag.file_path);
+    }
+    codes.push_back(bag.fault_code);
+    // Mirror the storage accounting, which takes the largest row per path.
+    auto & bytes = bytes_by_path[bag.file_path];
+    bytes = std::max(bytes, bag.size_bytes);
+  }
 
-  for (const auto & bag : all_bags) {
+  std::vector<std::string> evicted;
+  for (const auto & path : paths_oldest_first) {
     if (current_bytes <= max_bytes) {
       break;
     }
 
-    RCLCPP_INFO(node_->get_logger(), "Deleting old bag file for fault '%s' to enforce storage limit",
-                bag.fault_code.c_str());
+    for (const auto & code : codes_by_path[path]) {
+      storage->delete_rosbag_file(code);
+    }
+    // Saturate rather than wrap: the quota must never be satisfied by underflow.
+    current_bytes -= std::min(current_bytes, bytes_by_path[path]);
+    evicted.push_back(path);
+  }
 
-    current_bytes -= bag.size_bytes;
-    storage_->delete_rosbag_file(bag.fault_code);
+  return evicted;
+}
+
+void RosbagCapture::enforce_storage_limits() {
+  for (const auto & path : evict_bags_over_quota(storage_, config_.max_total_storage_mb * 1024 * 1024)) {
+    RCLCPP_INFO(node_->get_logger(), "Deleted old bag '%s' to enforce storage limit", path.c_str());
   }
 }
 
 void RosbagCapture::post_fault_timer_callback() {
-  if (!recording_post_fault_.load()) {
-    return;
-  }
+  finalize_post_fault_recording();
+}
 
-  // Cancel timer (one-shot)
+void RosbagCapture::finalize_post_fault_recording() {
+  // Cancel timer (one-shot) and stop post-fault recording (no more direct writes
+  // to bag). Clearing the guard under the lock is what makes the attach decision
+  // race-free: a confirmation from now on opens its own bag rather than joining
+  // a recording that is already being finalised. Testing the guard under the same
+  // lock also settles a timer firing concurrently with stop() - the loser sees the
+  // recording already claimed and returns.
+  std::set<std::string> attached;
+  std::string fault_code;
+  std::string bag_path;
   {
     std::lock_guard<std::mutex> lock(post_fault_timer_mutex_);
+    if (!recording_post_fault_.load()) {
+      return;
+    }
     if (post_fault_timer_) {
       post_fault_timer_->cancel();
       post_fault_timer_.reset();
     }
+    recording_post_fault_.store(false);
+    attached.swap(attached_fault_codes_);
+    fault_code.swap(current_fault_code_);
+    bag_path.swap(current_bag_path_);
   }
-
-  // Stop post-fault recording (no more direct writes to bag)
-  recording_post_fault_.store(false);
 
   // Close the writer (messages were written directly during post-fault period)
   {
@@ -945,24 +1006,28 @@ void RosbagCapture::post_fault_timer_callback() {
   }
 
   // Calculate final size and store metadata
-  size_t bag_size = calculate_bag_size(current_bag_path_);
+  size_t bag_size = calculate_bag_size(bag_path);
 
   RosbagFileInfo info;
-  info.fault_code = current_fault_code_;
-  info.file_path = current_bag_path_;
+  info.fault_code = fault_code;
+  info.file_path = bag_path;
   info.format = config_.format;
   info.duration_sec = config_.duration_sec + config_.duration_after_sec;
   info.size_bytes = bag_size;
   info.created_at_ns = get_wall_clock_ns();
 
   storage_->store_rosbag_file(info);
+  // One recording, one row per fault it covers: the correlated faults that
+  // confirmed inside this window each need their own lookup key to serve it.
+  for (const auto & code : attached) {
+    info.fault_code = code;
+    storage_->store_rosbag_file(info);
+  }
   enforce_storage_limits();
 
-  RCLCPP_INFO(node_->get_logger(), "Bag file completed: %s (%.2f MB, %.1fs)", current_bag_path_.c_str(),
-              static_cast<double>(bag_size) / (1024.0 * 1024.0), info.duration_sec);
+  RCLCPP_INFO(node_->get_logger(), "Bag file completed: %s (%.2f MB, %.1fs, %zu attached fault(s))", bag_path.c_str(),
+              static_cast<double>(bag_size) / (1024.0 * 1024.0), info.duration_sec, attached.size());
 
-  current_fault_code_.clear();
-  current_bag_path_.clear();
   {
     std::lock_guard<std::mutex> lock(capture_topics_mutex_);
     active_capture_topics_.clear();

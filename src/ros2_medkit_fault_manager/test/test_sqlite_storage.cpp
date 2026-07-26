@@ -1184,6 +1184,63 @@ TEST_F(SqliteFaultStorageTest, GetAllRosbagFilesReturnsSortedByCreatedAt) {
   EXPECT_EQ(all_rosbags[1].fault_code, "FAULT_B");
 }
 
+// Shared-recording tests: a burst of correlated faults confirming inside one
+// post-roll window all reference the same bag, so the file must outlive every
+// record but one, and the quota must not count it once per fault.
+
+TEST_F(SqliteFaultStorageTest, SharedRosbagSurvivesUntilTheLastFaultIsDeleted) {
+  using ros2_medkit_fault_manager::RosbagFileInfo;
+
+  auto bag_path = temp_db_path_.string() + "_shared_bag";
+  std::filesystem::create_directories(bag_path);
+
+  RosbagFileInfo info;
+  info.fault_code = "ROOT_CAUSE";
+  info.file_path = bag_path;
+  info.format = "mcap";
+  info.duration_sec = 5.0;
+  info.size_bytes = 4096;
+  info.created_at_ns = 1000;
+  storage_->store_rosbag_file(info);
+
+  info.fault_code = "CORRELATED";
+  storage_->store_rosbag_file(info);
+
+  EXPECT_TRUE(storage_->delete_rosbag_file("CORRELATED"));
+  EXPECT_TRUE(std::filesystem::exists(bag_path));
+  EXPECT_TRUE(storage_->get_rosbag_file("ROOT_CAUSE").has_value());
+
+  EXPECT_TRUE(storage_->delete_rosbag_file("ROOT_CAUSE"));
+  EXPECT_FALSE(std::filesystem::exists(bag_path));
+}
+
+TEST_F(SqliteFaultStorageTest, SharedRosbagCountsOnceTowardsStorageTotal) {
+  using ros2_medkit_fault_manager::RosbagFileInfo;
+
+  RosbagFileInfo shared;
+  shared.fault_code = "ROOT_CAUSE";
+  shared.file_path = "/tmp/shared.mcap";
+  shared.format = "mcap";
+  shared.duration_sec = 5.0;
+  shared.size_bytes = 1000;
+  shared.created_at_ns = 1000;
+  storage_->store_rosbag_file(shared);
+
+  shared.fault_code = "CORRELATED";
+  storage_->store_rosbag_file(shared);
+
+  RosbagFileInfo other;
+  other.fault_code = "UNRELATED";
+  other.file_path = "/tmp/other.mcap";
+  other.format = "mcap";
+  other.duration_sec = 5.0;
+  other.size_bytes = 500;
+  other.created_at_ns = 2000;
+  storage_->store_rosbag_file(other);
+
+  EXPECT_EQ(storage_->get_total_rosbag_storage_bytes(), 1500u);
+}
+
 // =============================================================================
 // Snapshot limit tests (issue #308)
 // =============================================================================

@@ -161,7 +161,7 @@ if(BUILD_TESTING)
   # Rosbag capture tests
   ament_add_gtest(test_rosbag_capture test/test_rosbag_capture.cpp)
   target_link_libraries(test_rosbag_capture fault_manager_lib)
-  medkit_target_dependencies(test_rosbag_capture rclcpp ros2_medkit_msgs)
+  medkit_target_dependencies(test_rosbag_capture rclcpp ros2_medkit_msgs std_msgs)
   medkit_set_test_domain(test_rosbag_capture)
 
   # Correlation config parser tests
