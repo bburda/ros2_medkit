@@ -14,31 +14,26 @@
 
 // Contract coverage for Ros2ParameterTransport's teardown ordering.
 //
-// HONEST SCOPE: these two tests do NOT reproduce the abort they describe - they pass
-// with and without the fix. A single-node process tears down cleanly either way; the
-// abort needs the real multi-node + executor teardown. The evidence for the fix is the
-// end-to-end measurement recorded in the commit message (0 aborts in 40 gateway
-// shutdowns, against a 6-in-33 baseline on the same build). What these tests DO pin is
-// the contract in both directions - transport destroyed after context shutdown, and
-// before it - so a future refactor that reorders this teardown has something to fail
-// against. Do not read them as proof the abort is gone.
+// HONEST SCOPE: these tests do NOT reproduce the SIGABRT that motivated the pre-shutdown
+// callback, and they are not expected to. They pass with and without it. The abort needs a
+// first-ever graph use to race the GraphListener's shutdown so the node ends up
+// half-registered (see the header comment on context_ / pre_shutdown_handle_), and this
+// single-threaded sequence cannot produce that race. Destroying a FULLY registered node
+// after rclcpp::shutdown() is a clean operation in rclcpp, so nothing here can abort.
 //
-// Ros2ParameterTransport owns an internal rclcpp::Node ("_param_client_node"). rclcpp's
-// ~NodeGraph calls GraphListener::remove_node(), which throws NodeNotFoundError once the
-// context has been shut down and the listener has dropped its node list. ~NodeGraph is
-// implicitly noexcept, so that throw is an immediate std::terminate - the process dies
-// with SIGABRT and no try/catch at any call site can intercept it.
-//
-// This is reachable whenever an owner outlives rclcpp::shutdown(): the gateway's own
-// managers, and any plugin whose objects are destroyed from ~GatewayNode (which runs
-// after rclcpp::shutdown() in main.cpp's teardown). In the field it surfaced as an
-// intermittent exit -6 on Ctrl+C, because whether the listener had already cleared its
-// list by then is a race. Here it is deterministic: rclcpp::shutdown() has returned, so
-// the listener is definitely down before the transport is dropped.
+// What these tests do pin is the teardown order in both directions - transport destroyed
+// after context shutdown, and before it - so a refactor that reorders it has something to
+// fail against. Do not read a green run here as proof the abort is fixed, and do not
+// conclude from it that the callback is dead code. The evidence for the fix is the
+// end-to-end measurement in the commit message: 0 aborts in 40 gateway shutdowns against a
+// 6-in-33 baseline on the same build.
 //
 // This test lives in its own translation unit because it must own the whole
 // init/shutdown lifecycle of the context - it cannot share the process-wide
-// SetUpTestSuite/TearDownTestSuite bracket the other transport tests use.
+// SetUpTestSuite/TearDownTestSuite bracket the other transport tests use. It runs two
+// init/shutdown cycles in one process, which is also what makes the destructor's
+// remove_pre_shutdown_callback() observable: a callback left registered by the first cycle
+// would fire during the second one against a freed transport.
 
 #include <gtest/gtest.h>
 
@@ -59,30 +54,35 @@ TEST(Ros2ParameterTransportShutdown, DestroyingTheTransportAfterContextShutdownD
   auto owner = std::make_shared<rclcpp::Node>("param_transport_shutdown_owner");
   auto transport = std::make_unique<Ros2ParameterTransport>(owner.get(), kServiceTimeoutSec, kNegativeCacheTtlSec);
 
-  // REQUIRED to reproduce: rclcpp registers a node with the GraphListener lazily, on the
-  // first graph query - and ~NodeGraph only calls remove_node() for a node that was
-  // registered. A transport that never talked to anyone therefore tears down cleanly even
-  // without the fix. One round trip (against a node that does not exist - it just has to
-  // reach wait_for_service, bounded by kServiceTimeoutSec) puts _param_client_node in the
-  // listener, which is the state every real gateway is in by shutdown time.
+  // Required for ~NodeGraph to call remove_node() at all: rclcpp registers a node with the
+  // GraphListener lazily, on the first graph query, and ~NodeGraph only removes a node whose
+  // should_add_to_graph_listener_ flag was consumed. One round trip (against a node that
+  // does not exist - it only has to reach wait_for_service, bounded by kServiceTimeoutSec)
+  // puts _param_client_node in the listener, which is the state a real gateway is in by
+  // shutdown time. Without it this test would exercise nothing.
   transport->list_parameters("/no_such_node_for_graph_registration");
 
   // Invalidate the context while the transport still holds its internal node. The
-  // pre-shutdown callback registered in the constructor must release it here.
+  // pre-shutdown callback registered in the constructor releases it here.
   rclcpp::shutdown();
 
-  // Before the fix this dropped param_node_ with the GraphListener already down:
-  // ~NodeGraph -> remove_node() -> NodeNotFoundError -> std::terminate. The process
-  // aborted instead of reaching any assertion below.
+  // Dropping a fully registered node after shutdown is clean in rclcpp (remove_node() takes
+  // its is_shutdown() branch and erases from a list __shutdown() never touched), so this
+  // does not abort with or without the callback. It pins the order, nothing more.
   transport.reset();
   owner.reset();
   SUCCEED() << "transport destroyed after rclcpp::shutdown() without aborting";
 }
 
-// The ordinary case must keep working: the transport dies while the context is still
-// valid, so the destructor deregisters the (never-fired) pre-shutdown callback and runs
-// the real teardown itself. A stale callback left on the context would fire later
-// against freed memory.
+// The ordinary case: the transport dies while the context is still valid, so the
+// destructor deregisters its pre-shutdown callback and runs the real teardown itself.
+//
+// This test also depends on the one above having run first, and that is the point.
+// Context::shutdown() fires pre-shutdown callbacks off a copy and never erases them, and
+// the default context is a process-lifetime static that rclcpp::init() re-initializes
+// without clearing the callback lists. So the callback the first test FIRED is still
+// registered when this second init/shutdown cycle starts. If the destructor did not erase
+// it, the rclcpp::shutdown() below would invoke it on the first test's freed transport.
 TEST(Ros2ParameterTransportShutdown, DestroyingTheTransportBeforeContextShutdownIsClean) {
   rclcpp::init(0, nullptr);
   {
