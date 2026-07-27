@@ -1821,41 +1821,47 @@ void GatewayNode::init_entity_freeze_frame_capture(ros2_common::Ros2Subscription
       // Plugins start polling - and reporting - while this object is still
       // being wired, and a device that is in fault when the box boots confirms
       // immediately, to nobody. The capture asks for those on its own thread,
-      // which it joins on destruction, so the service wait cannot outlive the
-      // node it waits on.
-      [this]() {
+      // which it joins on destruction; should_abort lets that join interrupt
+      // the service wait.
+      [this](const std::function<bool()> & should_abort) {
         std::vector<EntityFreezeFrameCapture::StandingFault> standing;
-        if (!fault_service_transport_ || !fault_service_transport_->wait_for_services(std::chrono::seconds(10))) {
+        if (!fault_service_transport_) {
+          RCLCPP_WARN(get_logger(), "Standing-fault freeze-frame catch-up skipped: fault transport not initialised");
+          return standing;
+        }
+        // One deadline for the whole wait, polled in slices so shutdown can
+        // abort it (wait_for_services itself shares the slice across clients).
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        bool ready = false;
+        while (!ready && !should_abort()) {
+          const std::chrono::duration<double> remaining = deadline - std::chrono::steady_clock::now();
+          if (remaining <= std::chrono::duration<double>::zero()) {
+            break;
+          }
+          ready = fault_service_transport_->wait_for_services(std::min(std::chrono::duration<double>(0.5), remaining));
+        }
+        if (!ready) {
+          if (!should_abort()) {
+            RCLCPP_WARN(get_logger(),
+                        "Standing-fault freeze-frame catch-up skipped: fault services not available within 10s");
+          }
           return standing;
         }
         auto result = fault_service_transport_->list_faults("", false, true, false, false, false, false);
-        if (!result.success || !result.data.is_object()) {
+        if (!result.success) {
+          RCLCPP_WARN(get_logger(), "Standing-fault freeze-frame catch-up skipped: ListFaults failed: %s",
+                      result.error_message.c_str());
           return standing;
         }
-        // ListFaults answers under "faults" (see Ros2FaultServiceTransport).
-        const auto faults = result.data.find("faults");
-        if (faults == result.data.end() || !faults->is_array()) {
+        auto parsed = EntityFreezeFrameCapture::standing_faults_from_list_reply(result.data);
+        if (!parsed) {
+          RCLCPP_WARN(get_logger(), "Standing-fault freeze-frame catch-up skipped: malformed ListFaults reply");
           return standing;
         }
-        for (const auto & item : *faults) {
-          if (!item.is_object()) {
-            continue;
-          }
-          const auto code = item.find("fault_code");
-          const auto sources = item.find("reporting_sources");
-          if (code == item.end() || !code->is_string() || sources == item.end() || !sources->is_array()) {
-            continue;
-          }
-          EntityFreezeFrameCapture::StandingFault fault;
-          fault.fault_code = code->get<std::string>();
-          for (const auto & src : *sources) {
-            if (src.is_string()) {
-              fault.reporting_sources.push_back(src.get<std::string>());
-            }
-          }
-          standing.push_back(std::move(fault));
+        if (parsed->empty()) {
+          RCLCPP_INFO(get_logger(), "Standing-fault freeze-frame catch-up: no confirmed faults at startup");
         }
-        return standing;
+        return std::move(*parsed);
       });
 }
 
