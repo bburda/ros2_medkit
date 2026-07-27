@@ -558,6 +558,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_ros2_parameter_transport gateway_ros2)
   medkit_set_test_domain(test_ros2_parameter_transport)
 
+  # Separate binary: these tests own the whole rclcpp init/shutdown lifecycle (they
+  # destroy a transport AFTER rclcpp::shutdown()), so they cannot share the
+  # process-wide context bracket the tests above use.
+  ament_add_gtest(test_ros2_parameter_transport_shutdown test/test_ros2_parameter_transport_shutdown.cpp)
+  target_link_libraries(test_ros2_parameter_transport_shutdown gateway_ros2)
+  medkit_set_test_domain(test_ros2_parameter_transport_shutdown)
+
   # BoundedLruCache: pure-C++ header, no ROS - bounds the parameter transport's
   # per-node caches. No test domain (creates no ROS nodes).
   ament_add_gtest(test_bounded_lru_cache test/test_bounded_lru_cache.cpp)
@@ -1103,6 +1110,7 @@ if(BUILD_TESTING)
       test_operation_manager
       test_configuration_manager
       test_ros2_parameter_transport
+      test_ros2_parameter_transport_shutdown
       test_discovery_manager
       test_runtime_discovery
       test_tls_config

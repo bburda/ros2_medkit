@@ -46,6 +46,17 @@ Ros2ParameterTransport::Ros2ParameterTransport(rclcpp::Node * node, double servi
   options.use_global_arguments(false);
   param_node_ = std::make_shared<rclcpp::Node>("_param_client_node", options);
 
+  // Tear the node down BEFORE the context is invalidated. Without this, an owner that
+  // outlives rclcpp::shutdown() (the gateway's own managers, or a plugin whose objects
+  // are destroyed from ~GatewayNode) drops param_node_ after the GraphListener has
+  // already cleared its node list, and ~NodeGraph's remove_node() throws
+  // NodeNotFoundError out of a noexcept destructor -> std::terminate, exit -6. It is a
+  // race, so it shows up as an intermittent abort on Ctrl+C rather than a reliable one.
+  context_ = param_node_->get_node_base_interface()->get_context();
+  pre_shutdown_handle_ = context_->add_pre_shutdown_callback([this] {
+    shutdown();
+  });
+
   // Store own node FQN for self-query detection.
   own_node_fqn_ = node_->get_fully_qualified_name();
 
@@ -54,7 +65,13 @@ Ros2ParameterTransport::Ros2ParameterTransport(rclcpp::Node * node, double servi
 }
 
 Ros2ParameterTransport::~Ros2ParameterTransport() {
-  shutdown();
+  // Deregister first: the callback captures `this`, and once we return the object is
+  // gone. remove_pre_shutdown_callback() is a no-op if the callback already ran during a
+  // normal rclcpp shutdown, and Context serializes it against a callback in flight.
+  if (context_) {
+    context_->remove_pre_shutdown_callback(pre_shutdown_handle_);
+  }
+  shutdown();  // idempotent: a no-op when the pre-shutdown callback already ran
 }
 
 void Ros2ParameterTransport::shutdown() {

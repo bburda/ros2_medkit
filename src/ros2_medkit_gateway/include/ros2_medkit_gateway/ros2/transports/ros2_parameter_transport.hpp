@@ -214,6 +214,18 @@ class Ros2ParameterTransport : public ParameterTransport {
   /// Created once in constructor - must be in DDS graph early for fast service discovery.
   std::shared_ptr<rclcpp::Node> param_node_;
 
+  /// Context of param_node_, plus the handle of the pre-shutdown callback registered on
+  /// it. param_node_ MUST be destroyed while the context is still valid: rclcpp's
+  /// ~NodeGraph calls GraphListener::remove_node(), which throws NodeNotFoundError once
+  /// the context has been shut down and the listener has dropped its node list. That
+  /// throw escapes an implicitly-noexcept destructor, so it is an immediate
+  /// std::terminate (SIGABRT) that no try/catch at the call site can intercept - the
+  /// only fix is to not be holding the node by then. The callback runs shutdown() ahead
+  /// of context invalidation; the destructor deregisters it and calls the (idempotent)
+  /// shutdown() for the ordinary case where the transport dies first.
+  std::shared_ptr<rclcpp::Context> context_;
+  rclcpp::PreShutdownCallbackHandle pre_shutdown_handle_;
+
   /// Cached AsyncParametersClient per target node, bounded by LRU eviction.
   mutable std::mutex clients_mutex_;
   BoundedLruCache<std::string, std::shared_ptr<rclcpp::AsyncParametersClient>> param_clients_;
