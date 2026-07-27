@@ -1,59 +1,58 @@
 # ros2_medkit_roxsie_msgs
 
-Message definitions for the ROXSIE integration: PLC alarm events into ROS 2, and aggregate
-diagnostics state back into the PLC.
+Messages for the ROXSIE integration: PLC alarm events into ROS 2, and aggregate diagnostics
+state back into the PLC.
 
 ## Overview
 
-Siemens SIMATIC ROS Connector (ROXSIE) generates, from a YAML configuration, both the
-PLC-side blocks and a ROS 2 package that exchange declared data between a SIMATIC PLC and
-ROS 2. Its configuration surface today covers data topics. Alarms are the gap: a machine
-that combines a PLC and ROS 2 still has two fault stories that never meet. The PLC has a
-mature alarm system - numbered alarms, coming and going states, acknowledgement, values
-latched at the moment the alarm fired. ROS 2 has faults, freeze-frames and a diagnostics
-tree.
+ROXSIE generates the PLC blocks and a ROS 2 package for the data you declare in the YAML
+config. That covers process values. It does not cover alarms, because alarms live in the CPU
+message system and not in a data block.
 
-This package defines the two messages that close that gap. Alarms declared in the TIA
-project reach ROS 2 as structured events and become faults with freeze-frames; the
-diagnostics side sends back one small status word for the signal column and for machine
+So on a machine with a SIMATIC PLC and ROS 2 you still have two separate lists of what is
+wrong. To join them today you either read alarm bits over a protocol and rebuild their
+meaning from an engineering export, or someone copies the alarms by hand into a second list
+on the panel. Both drift.
+
+This package holds the two message definitions for that exchange. Alarms declared in the TIA
+project arrive in ROS 2 as faults, with the values the alarm system latched when the alarm
+fired. Back the other way, the PLC gets four numbers for the signal column and for machine
 logic.
 
-Two directions, deliberately asymmetric:
+The two directions are not the same size, on purpose. Every alarm goes out with its full
+context. Back the other way we send four numbers.
 
-- **Alarms flow out in full** - every alarm event becomes an `AlarmEvent` message.
-- **Only a status word flows back in** - `DiagnosticsStatus` carries four fixed values, no
-  fault list and no strings the PLC would have to build.
+Alarm text has no fixed length and changes with the project. A PLC that handles strings
+loses determinism, and determinism is why it is there. Writing the fault list into the PLC
+would give us two lists, and two lists drift.
 
-Fault text is dynamic and unbounded, and string handling inside a PLC costs determinism. A
-fault list inside the PLC would also be a second copy that drifts from the first. What the
-machine needs from the diagnostics side is a condition it can act on; everything richer is
-read over REST by whoever needs it.
+The PLC only needs something it can switch on: a lamp for the operator, a bit for an
+interlock. Whoever wants the detail reads it over REST.
 
 ## Messages
 
 ### AlarmEvent.msg
 
-One alarm event from the PLC alarm system, published by the ROXSIE generated node.
+One alarm event from the CPU alarm system, published by the ROXSIE generated node.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `alarm_id` | uint32 | Numeric alarm identifier from the TIA project |
 | `source` | string | Block or instance that declared the alarm |
-| `alarm_class` | string | Alarm class from the project, e.g. whether acknowledgement is required |
+| `alarm_class` | string | Alarm class from the project, e.g. whether it needs an ack |
 | `state` | uint8 | `STATE_COMING` / `STATE_GOING` |
 | `ack_state` | uint8 | `ACK_UNACKNOWLEDGED` / `ACK_ACKNOWLEDGED` |
 | `plc_timestamp` | builtin_interfaces/Time | Event time from the PLC clock, UTC |
-| `associated_values` | float64[] | Values latched when the alarm fired |
+| `associated_values` | float64[] | Values the alarm system latched when the alarm fired |
 
-Alarm texts are not carried at runtime. The generator emits a static alarm number to text
-table next to the generated code, and the bridge resolves the text on the ROS 2 side.
+Alarm text does not travel at runtime. The generator writes an alarm number to text table
+next to the code, and the bridge looks the text up on the ROS 2 side.
 
-A `STATE_GOING` event is not a delete. It moves the fault towards healing, the same way the
-alarm system keeps a condition until it is acknowledged, so history survives for the audit
-trail.
+`STATE_GOING` moves the fault towards healing. We keep the fault, so the history stays for
+the audit trail, the same way the alarm system keeps a condition until someone acks it.
 
-`ack_state` is the shared acknowledgement state. Whoever acknowledges first, every other
-consumer sees the same value rather than keeping a private copy.
+`ack_state` is one shared value. The operator acks on the panel or a client acks over REST,
+and both sides see the same thing.
 
 ### DiagnosticsStatus.msg
 
@@ -68,8 +67,8 @@ written into a consumed data block.
 | `class_bitmask` | uint16 | Coarse fault classes for machine logic |
 | `scope` | string | Which entity in the SOVD tree this status covers |
 
-A stalled `heartbeat` lets a watchdog in the PLC program raise its own alarm, so the plant
-sees that diagnostics are offline instead of a stale healthy state.
+When `heartbeat` stops, a watchdog in the PLC program raises its own alarm. The plant sees
+that diagnostics are down instead of a green light that means nothing.
 
 `scope` lets one diagnostics instance serve several cells without them seeing each other's
 faults.

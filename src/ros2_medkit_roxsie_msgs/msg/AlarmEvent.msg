@@ -18,11 +18,11 @@
 # Published by the ROXSIE generated node, consumed by ros2_medkit_roxsie_bridge,
 # which maps each event onto a SOVD fault with a freeze-frame and an audit trail.
 #
-# Design intent: the payload is fixed-size and free of runtime strings that the
-# PLC would have to build. Alarm texts are not carried here. The generator emits
-# a static alarm_id -> text table next to the generated code, and the bridge
-# resolves the text on the ROS 2 side. String handling in a PLC costs
-# determinism, and alarm texts do not change while the machine runs.
+# The payload is fixed-size and carries no strings the PLC would have to build.
+# Alarm text stays out of it: the generator writes an alarm_id -> text table next
+# to the code, and the bridge looks the text up on the ROS 2 side. A PLC that
+# handles strings loses determinism, and alarm text does not change while the
+# machine runs.
 
 # Numeric alarm identifier as declared in the TIA project.
 #
@@ -43,27 +43,25 @@ string alarm_class
 
 # Whether the alarm condition appeared or disappeared. Use STATE_* constants.
 #
-# The event is not a level: a GOING event does not delete the fault, it moves it
-# towards healing. The fault stays visible for the audit trail until it is
-# cleared, which mirrors how the PLC alarm system latches conditions.
+# This is an event, not a level. GOING moves the fault towards healing; we keep
+# the fault until it is cleared, so the history stays for the audit trail. The
+# alarm system latches conditions the same way.
 uint8 state
 uint8 STATE_COMING = 0
 uint8 STATE_GOING = 1
 
 # Acknowledgement state as seen by the PLC alarm system. Use ACK_* constants.
 #
-# This is the shared acknowledgement truth. Whoever acknowledges first - an
-# operator on the panel or a client on the ROS 2 side - every other consumer
-# sees the same state instead of keeping a private copy.
+# One shared value. The operator acks on the panel or a client acks over REST,
+# and both sides see the same thing.
 uint8 ack_state
 uint8 ACK_UNACKNOWLEDGED = 0
 uint8 ACK_ACKNOWLEDGED = 1
 
 # Time of the event taken from the PLC clock, in UTC.
 #
-# Deliberately the source time, not the time the message was published. A
-# consumer can compare it against its own clock to detect a PLC that is not
-# time-synchronised, which is common on plant networks.
+# The source time, so a consumer can compare it against its own clock and spot a
+# PLC that is not time-synchronised. That happens often on plant networks.
 builtin_interfaces/Time plc_timestamp
 
 # Values latched by the alarm system at the moment the alarm fired, the

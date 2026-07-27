@@ -17,16 +17,16 @@
 # Published by ros2_medkit_roxsie_bridge, consumed by the ROXSIE generated node,
 # which writes the values into a consumed data block the PLC program reads.
 #
-# Design intent: this is the whole of what the diagnostics side puts inside the
-# PLC. Faults stay on the ROS 2 side and are read over REST by whoever needs
-# them. What the PLC genuinely needs is a lamp and, optionally, a condition it
-# can interlock on. Four fixed words, no strings, no lists.
+# This is everything we put inside the PLC. Faults stay on the ROS 2 side and
+# whoever wants them reads them over REST. The PLC only needs something it can
+# switch on: a lamp, and a bit it can interlock on. Four numbers, no strings,
+# no lists.
 
 # Liveness counter of the diagnostics layer, incremented about once per second.
 #
-# A watchdog in the PLC program turns a stalled counter into its own alarm, so
-# the plant sees "diagnostics offline" instead of a stale healthy state. The
-# failure mode of the diagnostics layer must never look like a healthy machine.
+# When it stops, a watchdog in the PLC program raises its own alarm. The plant
+# then sees that diagnostics are down instead of a green light that means
+# nothing.
 uint16 heartbeat
 
 # Highest severity among the active faults in scope.

@@ -6,52 +6,43 @@ This section contains design documentation for the ros2_medkit_roxsie_msgs packa
 Overview
 --------
 
-Siemens SIMATIC ROS Connector (ROXSIE) generates, from a YAML configuration, both the
-PLC-side blocks and a ROS 2 package that exchange declared data between a SIMATIC PLC
-and ROS 2 over shared memory on the host. The generated node sits on the ROS 2 graph,
-so anything already listening to that graph can consume the data.
+ROXSIE generates the PLC blocks and a ROS 2 package for the data you declare in the YAML
+config, exchanged over shared memory on the host. The generated node sits on the ROS 2
+graph, so anything already listening to that graph can read the data.
 
-Alarms are the gap. The configuration surface covers declared data topics, while the
-alarm system is a separate mechanism inside the CPU: numbered alarms, coming and going
-states, acknowledgement, and values latched at the moment the alarm fired. A machine
-that combines a SIMATIC PLC with ROS 2 therefore still keeps two fault stories that
-never meet, and joining them today means reading alarm bits over a protocol and
-rebuilding their meaning from an engineering export, or copying alarms by hand into a
-second list on the panel.
+That covers process values. It does not cover alarms, because alarms live in the CPU
+message system and not in a data block: numbered alarms, coming and going states,
+acknowledgement, and the values the alarm system latched when the alarm fired.
 
-This package defines the two messages that close the gap. It has no runtime code - only
-``.msg`` definitions compiled by ``rosidl`` into C++ and Python bindings.
+So on a machine with a SIMATIC PLC and ROS 2 you still have two separate lists of what is
+wrong. To join them today you either read alarm bits over a protocol and rebuild their
+meaning from an engineering export, or someone copies the alarms by hand into a second
+list on the panel. Both drift.
+
+This package holds the two message definitions for that exchange. It has no runtime code,
+only ``.msg`` definitions that ``rosidl`` compiles into C++ and Python bindings.
 
 Design
 ------
 
-Two directions, deliberately asymmetric.
+The two directions are not the same size, on purpose. Every alarm goes out with its full
+context as ``AlarmEvent``: which alarm, coming or going, acked or not, the PLC timestamp,
+and the latched values. The bridge turns each event into a fault with a freeze-frame and
+an audit trail. Back the other way we send four numbers as ``DiagnosticsStatus``, and the
+generated node writes them into a consumed data block.
 
-**Alarms flow out in full.** Every alarm event the CPU alarm system produces is published
-as ``AlarmEvent``: which alarm, coming or going, acknowledged or not, the PLC's own
-timestamp, and the values latched when it fired. The bridge turns each event into a fault
-with a freeze-frame and an audit trail.
+Alarm text has no fixed length and changes with the project. A PLC that handles strings
+loses determinism, and determinism is why it is there. Writing the fault list into the PLC
+would give us two lists, and two lists drift.
 
-**Only a status word flows back in.** The diagnostics side does not push faults into the
-PLC. It publishes ``DiagnosticsStatus``, four fixed values that the generated node writes
-into a consumed data block: heartbeat, worst severity, active count, coarse class bits.
+The PLC only needs something it can switch on: a lamp for the operator, a bit for an
+interlock. Whoever wants the detail reads it over REST.
 
-The asymmetry is the point:
+Alarm text does not travel at runtime. The generator writes an alarm number to text table
+next to the code, and the bridge looks the text up on the ROS 2 side.
 
-* Fault text is dynamic and unbounded. String handling inside a PLC costs determinism,
-  which is the one property a PLC exists to provide.
-* A fault list inside the PLC would be a second copy of the fault list, and two copies
-  drift apart. The value of one source of truth disappears the moment it is duplicated.
-* What the machine needs from the diagnostics side is a condition it can act on: a lamp
-  for the operator, a bit for an interlock. Everything richer is read over REST by
-  whoever needs it, at the moment they need it.
-
-Alarm texts never travel at runtime. The generator emits a static alarm number to text
-table next to the generated code, and the bridge resolves the text on the ROS 2 side.
-
-Acknowledgement is one shared state. Whoever acknowledges first - an operator on the
-panel or a client on the ROS 2 side - every other consumer sees the same value rather
-than keeping a private copy.
+Acknowledgement is one shared value. The operator acks on the panel or a client acks over
+REST, and both sides see the same thing.
 
 Architecture
 ------------
@@ -93,33 +84,26 @@ Architecture
 
    @enduml
 
-Deployment note: the generated node exchanges data with the PLC over shared memory on
-the same host, but publishes on the ROS 2 graph over the host network. The diagnostics
-side therefore does not have to run on the controller; it subscribes like any other ROS 2
-participant.
+The generated node talks to the PLC over shared memory on the same host, but publishes on
+the ROS 2 graph over the network. So the diagnostics side does not have to run on the
+controller. It subscribes like any other ROS 2 participant.
 
 What the Generator Has to Provide
 ---------------------------------
 
-The messages describe the wire. The generated code is what makes the alarms reachable at
-all, so its obligations are part of the contract:
+The messages only describe the wire. The generated code is what gets the alarms out, so
+these belong to the contract:
 
-* **Observe the alarm system, not a data block mirror.** Alarm events live in the CPU
-  message system, not in ordinary data blocks. Reaching them needs either a native
-  subscription or program code that reads pending alarms and forwards them.
-* **Latch values at trigger time.** ``associated_values`` must be what the alarm system
-  captured when the alarm fired. Re-reading them afterwards produces a plausible but
-  wrong freeze-frame.
-* **Timestamp at the source.** ``plc_timestamp`` comes from the PLC clock in UTC, not
-  from the moment of publishing.
-* **Re-publish pending alarms after a restart.** A node that starts fresh must send the
-  alarms that are currently active, otherwise an active alarm silently disappears from
-  the diagnostics side for as long as it stays active.
-* **Emit the alarm number to text table.** Generated once from the TIA project alongside
-  the code, consumed on the ROS 2 side. The table travels with the deployment, not with
-  each event.
-* **Write the consumed status block.** Four values into the data block, so that a
-  watchdog in the PLC program can turn a stalled heartbeat into its own alarm.
+* **Read the CPU message system, not a data block mirror.** That is where alarm events
+  are.
+* **Put the latched values into the message.** If you read them again later, the
+  freeze-frame looks right and is wrong.
+* **Use the PLC clock for** ``plc_timestamp``, not the publish time.
+* **After a restart, send the alarms that are still active.** Otherwise an active alarm
+  disappears from our side until it goes away by itself.
+* **Emit the alarm number to text table** when you generate the code.
+* **Write the four values into the consumed data block**, so a watchdog in the program
+  can raise its own alarm when the heartbeat stops.
 
 Message Definitions
 -------------------
@@ -140,8 +124,7 @@ Message Definitions
 Lifecycle
 ---------
 
-A PLC alarm and a medkit fault already model the same thing, so the mapping is direct
-rather than invented.
+A PLC alarm and a medkit fault model the same thing, so the mapping is direct.
 
 .. list-table::
    :header-rows: 1
@@ -176,8 +159,7 @@ Failure Behaviour
      - Currently pending alarms are re-published, so a restart does not silently lose
        active alarms
 
-The first row is the load-bearing one: the failure mode of the diagnostics layer must
-never be indistinguishable from a healthy machine.
+The first row matters most. If our layer dies, the plant has to see it.
 
 Open Questions
 --------------
