@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>ros2_medkit_plc_msgs</name>
+  <name>ros2_medkit_roxsie_msgs</name>
   <version>0.6.0</version>
-  <description>Message definitions for exchanging PLC alarms and aggregate diagnostics state with ROS 2</description>
+  <description>Message definitions for the ROXSIE integration: PLC alarm events into ROS 2 and aggregate diagnostics state back into the PLC</description>
 
   <maintainer email="michal.faferek@selfpatch.ai">mfaferek93</maintainer>
   <license>Apache-2.0</license>

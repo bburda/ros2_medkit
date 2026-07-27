@@ -13,7 +13,7 @@
 # limitations under the License.
 
 cmake_minimum_required(VERSION 3.8)
-project(ros2_medkit_plc_msgs)
+project(ros2_medkit_roxsie_msgs)
 
 # Note: ROS2MedkitWarnings is intentionally NOT included here.
 # rosidl-generated code triggers strict warnings we cannot fix.
@@ -22,8 +22,8 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/PlcAlarm.msg"
-  "msg/PlcDiagnosticsStatus.msg"
+  "msg/AlarmEvent.msg"
+  "msg/DiagnosticsStatus.msg"
   DEPENDENCIES builtin_interfaces
 )
 
