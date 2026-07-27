@@ -60,7 +60,7 @@ Architecture
 
    package "PLC" {
        [Alarm system] as AS
-       [Vendor bridge or\ngenerated glue code] as GLUE
+       [PLC-side producer\n(e.g. ROXSIE generated node)] as GLUE
        [Status data block] as DB
        [Signal column\nMachine interlocks] as SIG
    }
@@ -85,6 +85,45 @@ Architecture
    GW --> CONS : HTTPS
 
    @enduml
+
+Producer Requirements
+---------------------
+
+The interface only describes the wire. The publishing side runs on or next to the
+PLC and is what makes the alarms reachable at all, so its obligations are part of
+the contract:
+
+* **Observe the alarm system, not a tag mirror.** Alarm events live in the CPU
+  message system, not in ordinary data blocks. The producer needs a path to them,
+  either a native subscription or program code that reads pending alarms and
+  forwards them.
+* **Latch values at trigger time.** ``associated_values`` must be the values the
+  alarm system captured when the alarm fired, not values read later. Re-reading
+  them afterwards produces a plausible but wrong freeze-frame.
+* **Timestamp at the source.** ``plc_timestamp`` comes from the PLC clock in UTC.
+  It is not the publish time.
+* **Re-publish pending alarms after a restart.** A producer that starts fresh must
+  send the alarms that are currently active, otherwise an active alarm silently
+  disappears from the diagnostics side for as long as it stays active.
+* **Ship the alarm number to text table.** Exported once from the engineering
+  project, consumed on the ROS 2 side. The table travels with the deployment, not
+  with each event.
+* **Write the status block and let the PLC watch it.** The consumer side writes the
+  four values into a data block; a watchdog in the PLC program turns a stalled
+  heartbeat into its own alarm.
+
+**First target: Siemens SIMATIC ROS Connector (ROXSIE).** It is a code generator
+that, from a YAML configuration, produces both the PLC blocks and a ROS 2 package
+for exchanging declared data between a SIMATIC PLC and ROS 2. The generated node
+already sits on the ROS 2 graph on the host network, so it is the natural place to
+publish alarm events and to consume the status message. Its configuration surface
+today covers declared data topics; carrying alarm events is an addition on that
+side, which is why this interface defines only the wire and leaves the production
+of the events to the generator.
+
+Nothing in the messages depends on that generator. Any producer that can meet the
+obligations above interoperates, which is the point of keeping the definitions
+vendor-neutral.
 
 Message Definitions
 -------------------

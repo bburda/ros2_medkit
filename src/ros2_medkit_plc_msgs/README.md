@@ -13,6 +13,14 @@ This package defines the interface between them. Alarms declared in a PLC projec
 in ROS 2 as structured events and become faults; the diagnostics side sends back one small
 status word for the signal column and for machine logic.
 
+The first target on the PLC side is Siemens SIMATIC ROS Connector (ROXSIE), a code
+generator that already produces the PLC blocks and the ROS 2 package for exchanging
+declared data between a SIMATIC PLC and ROS 2. Its generated node sits on the ROS 2 graph
+already, so it is the natural place to publish alarm events and consume the status
+message. Nothing in the definitions depends on it: any producer that can observe a PLC
+alarm system interoperates. See the design note for what the publishing side has to
+provide.
+
 Two directions, deliberately asymmetric:
 
 - **Alarms flow out in full** - every alarm event becomes a `PlcAlarm` message.

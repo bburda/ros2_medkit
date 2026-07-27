@@ -14,8 +14,15 @@
 #
 # PlcAlarm.msg - one alarm event as reported by a PLC alarm system.
 #
-# Published by a vendor bridge or by generated PLC glue code, consumed by
+# Published by whatever runs on the PLC side and can observe its alarm system:
+# generated glue code, a protocol bridge, or a hand-written node. Consumed by
 # ros2_medkit_plc_bridge, which maps each event onto a SOVD fault.
+#
+# The first target is Siemens SIMATIC ROS Connector (ROXSIE), a code generator
+# that already produces the PLC blocks and the ROS 2 package for exchanging
+# declared data between a SIMATIC PLC and ROS 2. Its generated node is the
+# natural place to publish these events. See the design note for what the
+# publishing side has to provide.
 #
 # Design intent: the payload is fixed-size and free of runtime strings that the
 # PLC would have to build. Alarm texts are not carried here. A generator or an
