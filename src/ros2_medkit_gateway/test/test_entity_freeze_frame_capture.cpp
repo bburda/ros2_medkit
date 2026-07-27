@@ -552,7 +552,8 @@ TEST_F(EntityFreezeFrameCaptureTest, RouteFallbackSkipsDisconnectedPlcWithNoValu
 /// @verifies REQ_INTEROP_088
 TEST_F(EntityFreezeFrameCaptureTest, DisconnectedEntityWithLastKnownValuesIsCaptured) {
   // The loss-of-comms case: the bridge reports the link down and still serves
-  // the values it last read. That is what the fault is about, so it is frozen.
+  // the values it last read. That is what the fault is about, so it is frozen,
+  // with the payload's link flag and own timestamp carried as provenance.
   EntityFreezeFrameCapture capture(
       node_.get(), *sub_exec_,
       [](const std::string &) -> DataProvider * {
@@ -560,7 +561,8 @@ TEST_F(EntityFreezeFrameCaptureTest, DisconnectedEntityWithLastKnownValuesIsCapt
       },
       [](const std::string &) -> std::optional<json> {
         return json{{"connected", false},
-                    {"items", json::array({{{"name", "level"}, {"value", 42.0}, {"stale", true}}})}};
+                    {"items", json::array({{{"name", "level"}, {"value", 42.0}}})},
+                    {"timestamp", 1234567890}};
       });
 
   ASSERT_TRUE(publish_and_wait(capture, make_confirmed_event("PLC_COMMS_LOST", {"route_plc_app"})));
@@ -568,6 +570,9 @@ TEST_F(EntityFreezeFrameCaptureTest, DisconnectedEntityWithLastKnownValuesIsCapt
   const auto frames = capture.frames_for("PLC_COMMS_LOST");
   ASSERT_EQ(frames.size(), 1u);
   EXPECT_EQ(frames[0].values["level"], 42.0);
+  ASSERT_TRUE(frames[0].connected.has_value());
+  EXPECT_FALSE(*frames[0].connected);
+  EXPECT_EQ(frames[0].source_timestamp, 1234567890);
 }
 
 /// @verifies REQ_INTEROP_088
@@ -597,10 +602,7 @@ TEST_F(EntityFreezeFrameCaptureTest, DataProviderWithoutLiveValuesCapturesNothin
   // items array (cold poll cache) or all-null values must not freeze-frame a
   // row of {} / nulls, connected or not.
   StaticContentDataProvider cold_provider("cold_app", json{{"items", json::array()}});
-  StaticContentDataProvider null_provider("null_app", json{{"items", json::array({{{"id", "level"}}})}});
-  // Down AND empty: nothing to freeze. (Down with a real last known value is a
-  // capture, covered separately.)
-  StaticContentDataProvider down_provider("down_app",
+  StaticContentDataProvider null_provider("null_app",
                                           json{{"connected", false}, {"items", json::array({{{"id", "level"}}})}});
   EntityFreezeFrameCapture capture(node_.get(), *sub_exec_, [&](const std::string & entity_id) -> DataProvider * {
     if (entity_id == "cold_app") {
@@ -609,19 +611,37 @@ TEST_F(EntityFreezeFrameCaptureTest, DataProviderWithoutLiveValuesCapturesNothin
     if (entity_id == "null_app") {
       return &null_provider;
     }
-    if (entity_id == "down_app") {
-      return &down_provider;
-    }
     return nullptr;
   });
 
   ASSERT_TRUE(wait_for_match());
-  auto event = make_confirmed_event("PLC_NO_LIVE_DATA", {"cold_app", "null_app", "down_app"});
+  auto event = make_confirmed_event("PLC_NO_LIVE_DATA", {"cold_app", "null_app"});
   for (int i = 0; i < 25; ++i) {
     publisher_->publish(event);
     std::this_thread::sleep_for(10ms);
   }
   EXPECT_TRUE(capture.frames_for("PLC_NO_LIVE_DATA").empty());
+}
+
+/// @verifies REQ_INTEROP_088
+TEST_F(EntityFreezeFrameCaptureTest, DisconnectedDataProviderWithLastKnownValuesIsCaptured) {
+  // DataProvider flavour of the loss-of-comms case: list_data flags the link
+  // down but still serves the last known values - captured, with the link
+  // state on the frame.
+  StaticContentDataProvider down_provider(
+      "down_app", json{{"connected", false}, {"items", json::array({{{"id", "level"}, {"value", 5.5}}})}});
+  EntityFreezeFrameCapture capture(node_.get(), *sub_exec_, [&](const std::string & entity_id) -> DataProvider * {
+    return entity_id == "down_app" ? &down_provider : nullptr;
+  });
+
+  ASSERT_TRUE(publish_and_wait(capture, make_confirmed_event("PLC_PROVIDER_COMMS_LOST", {"down_app"})));
+
+  const auto frames = capture.frames_for("PLC_PROVIDER_COMMS_LOST");
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0].values["level"], 5.5);
+  ASSERT_TRUE(frames[0].connected.has_value());
+  EXPECT_FALSE(*frames[0].connected);
+  EXPECT_TRUE(frames[0].source_timestamp.is_null());  // provider content has no timestamp field
 }
 
 /// @verifies REQ_INTEROP_088
@@ -655,6 +675,24 @@ TEST(ContentHasLiveData, GatesOnItemsNotOnTheLinkFlag) {
   EXPECT_FALSE(Capture::content_has_live_data(json{{"connected", true}, {"items", json::array()}}));
   EXPECT_FALSE(Capture::content_has_live_data(json{{"connected", true}}));
   EXPECT_FALSE(Capture::content_has_live_data(json::array()));
+}
+
+TEST(ContentReportsDisconnected, TriggerPathGateDiscriminatesFromFreezeFramePath) {
+  using Capture = EntityFreezeFrameCapture;
+  // The loss-of-comms payload: link down, last known values still served.
+  const json down_with_values{{"connected", false}, {"items", json::array({{{"name", "a"}, {"value", 1}}})}};
+  // The freeze-frame path (content_has_live_data alone) captures it...
+  EXPECT_TRUE(Capture::content_has_live_data(down_with_values));
+  // ...while the trigger value fetcher (gateway_node) also requires the link
+  // up, so it yields nullopt and threshold rules hold state on the outage
+  // instead of firing on a frozen number.
+  EXPECT_TRUE(Capture::content_reports_disconnected(down_with_values));
+  EXPECT_FALSE(Capture::content_reports_disconnected(
+      json{{"connected", true}, {"items", json::array({{{"name", "a"}, {"value", 1}}})}}));
+  // No flag (DataProvider list_data shape) or a non-boolean flag: not down.
+  EXPECT_FALSE(Capture::content_reports_disconnected(json{{"items", json::array()}}));
+  EXPECT_FALSE(Capture::content_reports_disconnected(json{{"connected", "no"}}));
+  EXPECT_FALSE(Capture::content_reports_disconnected(json::array()));
 }
 
 TEST(ValuesHaveData, RejectsEmptyAndAllNull) {
@@ -800,6 +838,41 @@ TEST(MergeEntityFreezeFrames, NoFramesNoChange) {
   json env_data = {{"snapshots", json::array()}};
   auto merged = FaultHandlers::merge_entity_freeze_frames(env_data, {});
   EXPECT_EQ(merged, env_data);
+}
+
+TEST(MergeEntityFreezeFrames, CarriesLinkStateAndSourceTimestampWhenKnown) {
+  // Loss-of-comms provenance: the payload's link flag and own timestamp ride
+  // the snapshot entry through to the wire x-medkit block - and only when the
+  // plugin actually reported them.
+  json env_data = {{"snapshots", json::array()}};
+  EntityFreezeFrameCapture::Frame down_frame;
+  down_frame.entity_id = "plc_app";
+  down_frame.values = {{"level", 42.0}};
+  down_frame.captured_at_ns = 1234;
+  down_frame.connected = false;
+  down_frame.source_timestamp = 1234567890;
+  EntityFreezeFrameCapture::Frame bare_frame;
+  bare_frame.entity_id = "other_app";
+  bare_frame.values = {{"temperature", 42.5}};
+  bare_frame.captured_at_ns = 5678;
+
+  auto merged = FaultHandlers::merge_entity_freeze_frames(env_data, {down_frame, bare_frame});
+  ASSERT_EQ(merged["snapshots"].size(), 2u);
+  EXPECT_EQ(merged["snapshots"][0]["connected"], false);
+  EXPECT_EQ(merged["snapshots"][0]["source_timestamp"], 1234567890);
+  EXPECT_FALSE(merged["snapshots"][1].contains("connected"));
+  EXPECT_FALSE(merged["snapshots"][1].contains("source_timestamp"));
+
+  // And onto the wire: build_sovd_fault_response surfaces them in x-medkit.
+  const auto detail = FaultHandlers::build_sovd_fault_response(
+      json{{"fault_code", "PLC_COMMS_LOST"}, {"status", "CONFIRMED"}}, merged, "/apps/plc_app");
+  ASSERT_TRUE(detail.environment_data.snapshots.has_value());
+  const auto & wire = *detail.environment_data.snapshots;
+  ASSERT_EQ(wire.size(), 2u);
+  EXPECT_EQ(wire[0]["x-medkit"]["connected"], false);
+  EXPECT_EQ(wire[0]["x-medkit"]["source_timestamp"], 1234567890);
+  EXPECT_FALSE(wire[1]["x-medkit"].contains("connected"));
+  EXPECT_FALSE(wire[1]["x-medkit"].contains("source_timestamp"));
 }
 
 int main(int argc, char ** argv) {

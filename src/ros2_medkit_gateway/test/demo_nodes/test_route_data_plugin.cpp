@@ -40,6 +40,8 @@ using namespace ros2_medkit_gateway;
 class TestRouteDataPlugin : public GatewayPlugin, public IntrospectionProvider {
  public:
   static constexpr const char * kAppId = "test_route_plc_app";
+  /// Loss-of-comms twin: reports connected=false while serving last known values.
+  static constexpr const char * kDownAppId = "test_route_plc_down_app";
 
   std::string name() const override {
     return "test_route_data";
@@ -90,6 +92,15 @@ class TestRouteDataPlugin : public GatewayPlugin, public IntrospectionProvider {
     app.source = "plugin";
     result.new_entities.apps.push_back(std::move(app));
 
+    App down_app;
+    down_app.id = kDownAppId;
+    down_app.name = "Test Route PLC Down Process";
+    down_app.component_id = "test_route_plc";
+    down_app.external = true;
+    down_app.is_online = true;
+    down_app.source = "plugin";
+    result.new_entities.apps.push_back(std::move(down_app));
+
     return result;
   }
 
@@ -103,6 +114,15 @@ class TestRouteDataPlugin : public GatewayPlugin, public IntrospectionProvider {
       if (!entity) {
         return;
       }
+    }
+    if (entity_id == kDownAppId) {
+      // Loss-of-comms shape: link down, last known values still served.
+      res.send_json({{"connected", false},
+                     {"entity_id", entity_id},
+                     {"items", nlohmann::json::array({{{"name", "level"}, {"value", 42.0}, {"unit", "mm"}},
+                                                      {{"name", "alarm"}, {"value", false}}})},
+                     {"timestamp", 1234567800}});
+      return;
     }
     if (entity_id != kAppId) {
       res.send_error(404, ERR_RESOURCE_NOT_FOUND, "No PLC data mapped for entity: " + entity_id);

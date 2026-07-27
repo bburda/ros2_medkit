@@ -1787,7 +1787,10 @@ void GatewayNode::init_fault_trigger_engine() {
       return std::nullopt;
     }
     const auto content = plugin_mgr_->fetch_entity_data_via_route(app_id);
-    if (!content || !EntityFreezeFrameCapture::content_has_live_data(*content)) {
+    // A down link serves frozen last-known values; nullopt holds rule state
+    // (fault_trigger_engine) instead of firing on a stale number all outage.
+    if (!content || !EntityFreezeFrameCapture::content_has_live_data(*content) ||
+        EntityFreezeFrameCapture::content_reports_disconnected(*content)) {
       return std::nullopt;
     }
     const auto values = EntityFreezeFrameCapture::values_from_list_content(*content);

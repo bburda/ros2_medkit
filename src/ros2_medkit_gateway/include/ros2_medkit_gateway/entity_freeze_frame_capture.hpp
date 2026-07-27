@@ -61,6 +61,8 @@ namespace ros2_medkit_gateway {
 class EntityFreezeFrameCapture {
  public:
   /// One captured frame: the entity's data values at fault-confirm time.
+  /// captured_at_ns dates the capture, not the values - a disconnected entity
+  /// serves its last known values, whose age is bounded only by the outage.
   struct Frame {
     std::string entity_id;
     nlohmann::json values;  ///< compact {resource_id: value} dict
@@ -68,6 +70,8 @@ class EntityFreezeFrameCapture {
     /// True when the frame comes from the startup catch-up: captured_at_ns is
     /// then the gateway's start, possibly long after the fault confirmed.
     bool startup_catchup{false};
+    std::optional<bool> connected;    ///< payload's top-level link flag, when reported
+    nlohmann::json source_timestamp;  ///< payload's own "timestamp" field verbatim (null when absent)
   };
 
   /// Resolves an entity id to its owning plugin's DataProvider (nullptr when
@@ -135,6 +139,13 @@ class EntityFreezeFrameCapture {
   /// needs frozen. The row of nulls a cold cache yields is rejected by
   /// values_have_data() instead.
   static bool content_has_live_data(const nlohmann::json & content);
+
+  /// True when the payload's top-level `connected` flag reports the link down.
+  /// Consulted only by the gateway's fault-trigger value fetcher: a down link
+  /// serves frozen last-known values, and a threshold rule must hold state on
+  /// them (fetcher yields nullopt) instead of firing on a stale number for the
+  /// whole outage. The freeze-frame paths deliberately ignore this flag.
+  static bool content_reports_disconnected(const nlohmann::json & content);
 
   /// True when a compact values dict holds at least one non-null value.
   /// Rejects the {} / all-null rows a cold poll cache or dead link yields.

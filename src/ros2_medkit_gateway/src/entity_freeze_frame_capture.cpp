@@ -137,6 +137,11 @@ bool EntityFreezeFrameCapture::content_has_live_data(const nlohmann::json & cont
   return content.contains("items") && content["items"].is_array() && !content["items"].empty();
 }
 
+bool EntityFreezeFrameCapture::content_reports_disconnected(const nlohmann::json & content) {
+  return content.is_object() && content.contains("connected") && content["connected"].is_boolean() &&
+         !content["connected"].get<bool>();
+}
+
 bool EntityFreezeFrameCapture::values_have_data(const nlohmann::json & values) {
   if (values.is_object()) {
     for (const auto & entry : values.items()) {
@@ -185,7 +190,7 @@ std::optional<EntityFreezeFrameCapture::Frame>
 EntityFreezeFrameCapture::frame_from_content(const std::string & entity_id, const std::string & fault_code,
                                              const nlohmann::json & content) {
   if (!content_has_live_data(content)) {
-    log_fallback_failure_once(fault_code, "entity '" + entity_id + "' reported no live values");
+    log_fallback_failure_once(fault_code, "entity '" + entity_id + "' returned no data items");
     return std::nullopt;
   }
   Frame frame;
@@ -196,6 +201,15 @@ EntityFreezeFrameCapture::frame_from_content(const std::string & entity_id, cons
     // ids): still a dead/cold row - no frame, same invariant as above.
     log_fallback_failure_once(fault_code, "entity '" + entity_id + "' values are all null");
     return std::nullopt;
+  }
+  // Provenance for the snapshot's x-medkit block: the payload's link flag and
+  // its own timestamp, when the plugin reports them. captured_at_ns dates the
+  // capture; a disconnected entity's values may be much older.
+  if (content.contains("connected") && content["connected"].is_boolean()) {
+    frame.connected = content["connected"].get<bool>();
+  }
+  if (content.contains("timestamp")) {
+    frame.source_timestamp = content["timestamp"];
   }
   frame.captured_at_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();

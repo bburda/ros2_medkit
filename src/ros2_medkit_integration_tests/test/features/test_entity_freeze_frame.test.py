@@ -27,6 +27,9 @@ proven end to end:
    shape): the demo route-data plugin exports only introspection + fault
    providers and serves live values through its registered x-plc-data route.
    The gateway captures the freeze-frame by dispatching that route in-process.
+   The plugin's second entity reports its link down (connected=false) while
+   still serving last known values - the loss-of-comms fault must freeze
+   those values and mark the frame disconnected in x-medkit.
 3. ROS-backed entity: a fault reported under a demo node's FQN carries a
    freeze-frame of that node's own published topics, captured by the fault
    manager's entity-default fallback.
@@ -53,6 +56,8 @@ PLUGIN_APP = 'test_plc_app'
 PLUGIN_FAULT_CODE = 'PLC_OVERPRESSURE'
 ROUTE_PLUGIN_APP = 'test_route_plc_app'
 ROUTE_PLUGIN_FAULT_CODE = 'PLC_ROUTE_LEVEL_HIGH'
+DOWN_PLUGIN_APP = 'test_route_plc_down_app'
+DOWN_PLUGIN_FAULT_CODE = 'PLC_ROUTE_COMMS_LOST'
 ROS_APP = 'temp_sensor'
 ROS_SOURCE = '/powertrain/engine/temp_sensor'
 ROS_FAULT_CODE = 'ENGINE_TEMP_SENSOR_DEGRADED'
@@ -91,8 +96,8 @@ def generate_test_description():
 class TestEntityFreezeFrame(GatewayTestCase):
     """Faults carry the faulting entity's own data with zero snapshot config."""
 
-    MIN_EXPECTED_APPS = 3
-    REQUIRED_APPS = {PLUGIN_APP, ROUTE_PLUGIN_APP, ROS_APP}
+    MIN_EXPECTED_APPS = 4
+    REQUIRED_APPS = {PLUGIN_APP, ROUTE_PLUGIN_APP, DOWN_PLUGIN_APP, ROS_APP}
 
     @classmethod
     def setUpClass(cls):
@@ -173,10 +178,11 @@ class TestEntityFreezeFrame(GatewayTestCase):
         self.assertIn('captured_at', x_medkit)
 
     def test_route_only_plugin_fault_carries_entity_values(self):
-        """A commercial-bridge-shaped plugin (no DataProvider, no
-        FaultProvider) still carries its entity's own values, captured via
-        in-process x-plc-data dispatch and served through the fault_manager
-        fall-through.
+        """Freeze-frame a commercial-bridge-shaped plugin entity.
+
+        With no DataProvider and no FaultProvider the entity still carries
+        its own values, captured via in-process x-plc-data dispatch and
+        served through the fault_manager fall-through.
 
         @verifies REQ_INTEROP_088
         """
@@ -213,6 +219,34 @@ class TestEntityFreezeFrame(GatewayTestCase):
             f'{ROUTE_PLUGIN_FAULT_CODE}',
             timeout=5)
         self.assertIn(clear_resp.status_code, (200, 204))
+
+    def test_route_only_plugin_disconnected_entity_carries_last_known_values(self):
+        """Freeze-frame a route-only plugin entity that reports its link down.
+
+        The last known values it serves are the point of a loss-of-comms
+        fault, and x-medkit marks the frame disconnected with the payload's
+        own timestamp.
+
+        @verifies REQ_INTEROP_088
+        """
+        self._report_fault(DOWN_PLUGIN_FAULT_CODE, DOWN_PLUGIN_APP)
+
+        frames = self._wait_for_freeze_frame(
+            f'/apps/{DOWN_PLUGIN_APP}', DOWN_PLUGIN_FAULT_CODE)
+        frame = next(
+            (f for f in frames if f.get('name') == DOWN_PLUGIN_APP), None)
+        self.assertIsNotNone(
+            frame, f'No frame named {DOWN_PLUGIN_APP} in {frames}')
+
+        # The plugin serves these as its last known values with connected=false.
+        self.assertEqual(frame['data'].get('level'), 42.0)
+        self.assertEqual(frame['data'].get('alarm'), False)
+
+        x_medkit = frame.get('x-medkit', {})
+        self.assertIn('full_data', x_medkit)
+        self.assertIn('captured_at', x_medkit)
+        self.assertEqual(x_medkit.get('connected'), False)
+        self.assertEqual(x_medkit.get('source_timestamp'), 1234567800)
 
     def test_ros_entity_fault_carries_own_topic_data(self):
         """A ROS-node fault carries the node's own published topic data.
