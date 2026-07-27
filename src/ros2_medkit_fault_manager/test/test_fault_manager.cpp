@@ -1551,6 +1551,64 @@ TEST(InMemoryFreezeFrameTest, SurvivesClearFault) {
   EXPECT_EQ(retrieved->data, frame.data);
 }
 
+// --- InMemoryFaultStorage shared-rosbag re-store tests ---
+// A fault re-confirming stores a row with a new path; the old bag must be
+// unlinked only when no sibling fault of the burst still references it.
+
+TEST(InMemoryRosbagRestoreTest, RestoreWithNewPathUnlinksTheOldExclusiveBag) {
+  InMemoryFaultStorage storage;
+
+  const auto old_path = (std::filesystem::temp_directory_path() / "medkit_restore_exclusive_bag").string();
+  std::filesystem::create_directories(old_path);
+
+  ros2_medkit_fault_manager::RosbagFileInfo info;
+  info.fault_code = "X";
+  info.file_path = old_path;
+  info.format = "mcap";
+  info.duration_sec = 5.0;
+  info.size_bytes = 100;
+  info.created_at_ns = 1000;
+  storage.store_rosbag_file(info);
+
+  info.file_path = old_path + "_new";
+  storage.store_rosbag_file(info);
+
+  EXPECT_FALSE(std::filesystem::exists(old_path)) << "nobody references the old bag, it must be unlinked";
+  auto row = storage.get_rosbag_file("X");
+  ASSERT_TRUE(row.has_value());
+  EXPECT_EQ(row->file_path, old_path + "_new");
+}
+
+TEST(InMemoryRosbagRestoreTest, RestoreWithNewPathKeepsTheBagASiblingStillReferences) {
+  InMemoryFaultStorage storage;
+
+  const auto shared_path = (std::filesystem::temp_directory_path() / "medkit_restore_shared_bag").string();
+  std::filesystem::create_directories(shared_path);
+
+  ros2_medkit_fault_manager::RosbagFileInfo info;
+  info.file_path = shared_path;
+  info.format = "mcap";
+  info.duration_sec = 5.0;
+  info.size_bytes = 100;
+  info.created_at_ns = 1000;
+  info.fault_code = "X";
+  storage.store_rosbag_file(info);
+  info.fault_code = "Y";
+  storage.store_rosbag_file(info);
+
+  info.fault_code = "X";
+  info.file_path = shared_path + "_new";
+  storage.store_rosbag_file(info);
+
+  EXPECT_TRUE(std::filesystem::exists(shared_path)) << "the sibling fault still owns the shared bag";
+  auto sibling = storage.get_rosbag_file("Y");
+  ASSERT_TRUE(sibling.has_value());
+  EXPECT_EQ(sibling->file_path, shared_path);
+
+  std::error_code ec;
+  std::filesystem::remove_all(shared_path, ec);
+}
+
 // =============================================================================
 // Snapshot recapture cooldown test
 // =============================================================================

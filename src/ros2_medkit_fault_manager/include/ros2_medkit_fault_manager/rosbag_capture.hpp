@@ -97,7 +97,10 @@ class RosbagCapture {
   /// @param fault_code The fault code that was confirmed
   void on_fault_confirmed(const std::string & fault_code);
 
-  /// Called when a fault is cleared - deletes bag file if auto_cleanup
+  /// Called when a fault is cleared - deletes its bag record if auto_cleanup.
+  /// A shared bag survives until its last referencing fault clears; a fault
+  /// cleared during its burst's post-roll is dropped from the in-flight
+  /// recording state and never gets a record.
   /// @param fault_code The fault code that was cleared
   void on_fault_cleared(const std::string & fault_code);
 
@@ -141,9 +144,19 @@ class RosbagCapture {
   /// (falls back to SensorDataQoS when no publisher is known or qos_match is off)
   rclcpp::QoS resolve_topic_qos(const std::string & topic) const;
 
+  /// Compute the entity topic set for a fault (the faulting source node's
+  /// pub/sub topics + /tf, intersected with the subscribed set). Empty set =
+  /// scope unresolved. Never throws; failures degrade to an empty set.
+  std::set<std::string> compute_entity_topics(const std::string & fault_code);
+
   /// In "entity" mode, compute the set of topics to write for a confirmed fault
   /// (the faulting source node's pub/sub topics + /tf). Empty set = write all.
   void resolve_entity_topics(const std::string & fault_code);
+
+  /// In "entity" mode, union an attached fault's entity topics into the active
+  /// capture filter so its data reaches the shared bag from the attach onwards
+  /// (empty resolution widens to all topics). Caller holds post_fault_timer_mutex_.
+  void widen_capture_filter_for(const std::string & fault_code);
 
   /// Whether a topic should be written to the bag given the active entity filter
   bool should_capture_topic(const std::string & topic) const;

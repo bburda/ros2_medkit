@@ -71,8 +71,10 @@ class SqliteFaultStorage : public FaultStorage {
   std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const override;
 
   void store_rosbag_file(const RosbagFileInfo & info) override;
+  void store_rosbag_files(const std::vector<RosbagFileInfo> & infos) override;
   std::optional<RosbagFileInfo> get_rosbag_file(const std::string & fault_code) const override;
   bool delete_rosbag_file(const std::string & fault_code) override;
+  size_t delete_rosbag_files(const std::vector<std::string> & fault_codes) override;
   size_t get_total_rosbag_storage_bytes() const override;
   std::vector<RosbagFileInfo> get_all_rosbag_files() const override;
   std::vector<RosbagFileInfo> list_rosbags_for_entity(const std::string & entity_fqn) const override;
@@ -92,6 +94,15 @@ class SqliteFaultStorage : public FaultStorage {
   /// One recording can back several faults of the same burst, so the bag must
   /// only be unlinked once the last of them is gone. Caller holds mutex_.
   bool path_shared_with_other_fault(const std::string & file_path, const std::string & fault_code) const;
+
+  /// Whether any fault at all still references @p file_path. Caller holds mutex_.
+  bool path_referenced(const std::string & file_path) const;
+
+  /// store_rosbag_file body without taking mutex_. Caller holds mutex_.
+  void store_rosbag_file_locked(const RosbagFileInfo & info);
+
+  /// Run a plain SQL statement or throw with the SQLite error. Caller holds mutex_.
+  void exec_or_throw(const char * sql);
 
   /// Parse JSON array string to vector of strings
   static std::vector<std::string> parse_json_array(const std::string & json_str);

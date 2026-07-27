@@ -19,6 +19,7 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "ros2_medkit_fault_manager/sqlite_fault_storage.hpp"
@@ -1217,28 +1218,143 @@ TEST_F(SqliteFaultStorageTest, SharedRosbagSurvivesUntilTheLastFaultIsDeleted) {
 TEST_F(SqliteFaultStorageTest, SharedRosbagCountsOnceTowardsStorageTotal) {
   using ros2_medkit_fault_manager::RosbagFileInfo;
 
-  RosbagFileInfo shared;
-  shared.fault_code = "ROOT_CAUSE";
-  shared.file_path = "/tmp/shared.mcap";
-  shared.format = "mcap";
-  shared.duration_sec = 5.0;
-  shared.size_bytes = 1000;
-  shared.created_at_ns = 1000;
-  storage_->store_rosbag_file(shared);
+  // Rows of one recording can transiently disagree on size while it is being
+  // finalised, so the total takes MAX(size_bytes) per path. Two shared bags
+  // with opposite insert orderings, so neither first- nor last-write-wins can
+  // fake the MAX (mirrors the in-memory SharedBagTotalTakesTheLargestRowPerPath).
+  auto store = [this](const char * code, const char * path, size_t bytes) {
+    RosbagFileInfo info;
+    info.fault_code = code;
+    info.file_path = path;
+    info.format = "mcap";
+    info.duration_sec = 5.0;
+    info.size_bytes = bytes;
+    info.created_at_ns = 1000;
+    storage_->store_rosbag_file(info);
+  };
 
-  shared.fault_code = "CORRELATED";
-  storage_->store_rosbag_file(shared);
+  store("BIG_FIRST", "/tmp/shared_a.mcap", 1000);
+  store("SMALL_SECOND", "/tmp/shared_a.mcap", 300);
+  store("SMALL_FIRST", "/tmp/shared_b.mcap", 200);
+  store("BIG_SECOND", "/tmp/shared_b.mcap", 800);
+  store("UNRELATED", "/tmp/other.mcap", 500);
 
-  RosbagFileInfo other;
-  other.fault_code = "UNRELATED";
-  other.file_path = "/tmp/other.mcap";
-  other.format = "mcap";
-  other.duration_sec = 5.0;
-  other.size_bytes = 500;
-  other.created_at_ns = 2000;
-  storage_->store_rosbag_file(other);
+  EXPECT_EQ(storage_->get_total_rosbag_storage_bytes(), 1000u + 800u + 500u);
+}
 
-  EXPECT_EQ(storage_->get_total_rosbag_storage_bytes(), 1500u);
+// Re-store guard: a fault re-confirming stores a row with a new path, and the
+// old bag must be unlinked only when no sibling fault still references it.
+
+TEST_F(SqliteFaultStorageTest, RestoreWithNewPathUnlinksTheOldExclusiveBag) {
+  using ros2_medkit_fault_manager::RosbagFileInfo;
+
+  const auto old_path = temp_db_path_.string() + "_exclusive_bag";
+  std::filesystem::create_directories(old_path);
+
+  RosbagFileInfo info;
+  info.fault_code = "X";
+  info.file_path = old_path;
+  info.format = "mcap";
+  info.duration_sec = 5.0;
+  info.size_bytes = 100;
+  info.created_at_ns = 1000;
+  storage_->store_rosbag_file(info);
+
+  info.file_path = old_path + "_new";
+  storage_->store_rosbag_file(info);
+
+  EXPECT_FALSE(std::filesystem::exists(old_path)) << "nobody references the old bag, it must be unlinked";
+  auto row = storage_->get_rosbag_file("X");
+  ASSERT_TRUE(row.has_value());
+  EXPECT_EQ(row->file_path, old_path + "_new");
+}
+
+TEST_F(SqliteFaultStorageTest, RestoreWithNewPathKeepsTheBagASiblingStillReferences) {
+  using ros2_medkit_fault_manager::RosbagFileInfo;
+
+  const auto shared_path = temp_db_path_.string() + "_shared_bag";
+  std::filesystem::create_directories(shared_path);
+
+  RosbagFileInfo info;
+  info.file_path = shared_path;
+  info.format = "mcap";
+  info.duration_sec = 5.0;
+  info.size_bytes = 100;
+  info.created_at_ns = 1000;
+  info.fault_code = "X";
+  storage_->store_rosbag_file(info);
+  info.fault_code = "Y";
+  storage_->store_rosbag_file(info);
+
+  info.fault_code = "X";
+  info.file_path = shared_path + "_new";
+  storage_->store_rosbag_file(info);
+
+  EXPECT_TRUE(std::filesystem::exists(shared_path)) << "the sibling fault still owns the shared bag";
+  auto sibling = storage_->get_rosbag_file("Y");
+  ASSERT_TRUE(sibling.has_value());
+  EXPECT_EQ(sibling->file_path, shared_path);
+
+  std::error_code ec;
+  std::filesystem::remove_all(shared_path, ec);
+}
+
+// Burst-level batch operations (one SQLite transaction per burst).
+
+TEST_F(SqliteFaultStorageTest, BulkStoreRegistersEveryFaultOfTheBurst) {
+  using ros2_medkit_fault_manager::RosbagFileInfo;
+
+  RosbagFileInfo info;
+  info.file_path = "/tmp/burst_bag";
+  info.format = "mcap";
+  info.duration_sec = 6.0;
+  info.size_bytes = 4096;
+  info.created_at_ns = 1000;
+
+  std::vector<RosbagFileInfo> rows;
+  for (const char * code : {"ROOT_CAUSE", "CORRELATED_A", "CORRELATED_B"}) {
+    info.fault_code = code;
+    rows.push_back(info);
+  }
+  storage_->store_rosbag_files(rows);
+
+  for (const char * code : {"ROOT_CAUSE", "CORRELATED_A", "CORRELATED_B"}) {
+    auto row = storage_->get_rosbag_file(code);
+    ASSERT_TRUE(row.has_value()) << code;
+    EXPECT_EQ(row->file_path, "/tmp/burst_bag");
+  }
+  EXPECT_EQ(storage_->get_total_rosbag_storage_bytes(), 4096u);
+}
+
+TEST_F(SqliteFaultStorageTest, BulkDeleteRemovesTheBurstAndUnlinksTheBagOnce) {
+  using ros2_medkit_fault_manager::RosbagFileInfo;
+
+  const auto bag_path = temp_db_path_.string() + "_burst_bag";
+  std::filesystem::create_directories(bag_path);
+
+  RosbagFileInfo info;
+  info.file_path = bag_path;
+  info.format = "mcap";
+  info.duration_sec = 6.0;
+  info.size_bytes = 4096;
+  info.created_at_ns = 1000;
+  std::vector<RosbagFileInfo> rows;
+  for (const char * code : {"ROOT_CAUSE", "CORRELATED_A", "CORRELATED_B"}) {
+    info.fault_code = code;
+    rows.push_back(info);
+  }
+  storage_->store_rosbag_files(rows);
+
+  // A partial delete leaves the bag on disk for the remaining fault.
+  EXPECT_EQ(storage_->delete_rosbag_files({"CORRELATED_A", "CORRELATED_B", "NEVER_STORED"}), 2u);
+  EXPECT_TRUE(std::filesystem::exists(bag_path));
+  EXPECT_TRUE(storage_->get_rosbag_file("ROOT_CAUSE").has_value());
+  EXPECT_FALSE(storage_->get_rosbag_file("CORRELATED_A").has_value());
+
+  // The last reference going away unlinks the directory.
+  EXPECT_EQ(storage_->delete_rosbag_files({"ROOT_CAUSE"}), 1u);
+  EXPECT_FALSE(std::filesystem::exists(bag_path));
+  EXPECT_EQ(storage_->get_total_rosbag_storage_bytes(), 0u);
 }
 
 // =============================================================================

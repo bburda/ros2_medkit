@@ -258,8 +258,38 @@ bool RosbagCapture::attach_to_active_recording(const std::string & fault_code) {
   if (attached_fault_codes_.insert(fault_code).second) {
     RCLCPP_INFO(node_->get_logger(), "Fault '%s' confirmed during post-fault recording, attaching it to bag for '%s'",
                 fault_code.c_str(), current_fault_code_.c_str());
+    widen_capture_filter_for(fault_code);
   }
   return true;
+}
+
+void RosbagCapture::widen_capture_filter_for(const std::string & fault_code) {
+  // Entity mode scoped the in-flight writes to the first fault's topics; an
+  // attached fault needs its own topics in the bag from the attach onwards, or
+  // its row would serve a recording with none of its data. Union them in, and
+  // degrade to writing everything when its scope cannot be resolved.
+  if (config_.topics != "entity") {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(capture_topics_mutex_);
+    if (active_capture_topics_.empty()) {
+      return;  // already writing everything
+    }
+  }
+  auto topics = compute_entity_topics(fault_code);
+  std::lock_guard<std::mutex> lock(capture_topics_mutex_);
+  if (active_capture_topics_.empty()) {
+    return;
+  }
+  if (topics.empty()) {
+    RCLCPP_WARN(node_->get_logger(),
+                "Entity scope unresolved for attached fault '%s'; widening the recording to all topics",
+                fault_code.c_str());
+    active_capture_topics_.clear();
+    return;
+  }
+  active_capture_topics_.insert(topics.begin(), topics.end());
 }
 
 void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
@@ -339,6 +369,19 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
 void RosbagCapture::on_fault_cleared(const std::string & fault_code) {
   if (!config_.enabled || !config_.auto_cleanup) {
     return;
+  }
+
+  // A fault of the in-flight burst has no row yet: drop it from the recording
+  // state so the finalize never writes one. A leftover row for a cleared fault
+  // would keep the shared bag referenced forever and break the burst's cleanup.
+  {
+    std::lock_guard<std::mutex> lock(post_fault_timer_mutex_);
+    if (recording_post_fault_.load()) {
+      attached_fault_codes_.erase(fault_code);
+      if (fault_code == current_fault_code_) {
+        current_fault_code_.clear();
+      }
+    }
   }
 
   // Delete the bag file for this fault
@@ -670,74 +713,82 @@ rclcpp::QoS RosbagCapture::resolve_topic_qos(const std::string & topic) const {
   return qos;
 }
 
+std::set<std::string> RosbagCapture::compute_entity_topics(const std::string & fault_code) {
+  std::set<std::string> topics;
+
+  // The whole resolution is guarded: this runs on a detached capture thread with
+  // no outer catch, and storage_->get_fault() can throw on the sqlite backend
+  // (e.g. SQLITE_BUSY). A throw here would terminate the process - the exact crash
+  // the crash-safety work removed - so any failure degrades to "write everything".
+  try {
+    auto fault = storage_->get_fault(fault_code);
+    if (fault && !fault->reporting_sources.empty()) {
+      // reporting_sources hold the reporting node's FQN (e.g. "/planner_server").
+      // Split each into (name, namespace) to match against topic endpoints.
+      std::set<std::pair<std::string, std::string>> wanted;
+      for (const auto & source : fault->reporting_sources) {
+        std::string ns = "/";
+        std::string name = source;
+        const auto slash = source.rfind('/');
+        if (slash != std::string::npos) {
+          name = source.substr(slash + 1);
+          ns = (slash == 0) ? "/" : source.substr(0, slash);
+        }
+        if (!name.empty()) {
+          wanted.emplace(name, ns);
+        }
+      }
+
+      // rclcpp does not expose per-node topic listing, so scan each topic's
+      // endpoints and keep the topics a wanted node publishes or subscribes to.
+      auto owned_by_wanted = [&wanted](const std::vector<rclcpp::TopicEndpointInfo> & eps) {
+        for (const auto & ep : eps) {
+          if (wanted.count({ep.node_name(), ep.node_namespace()})) {
+            return true;
+          }
+        }
+        return false;
+      };
+      for (const auto & [topic, types] : node_->get_topic_names_and_types()) {
+        if (owned_by_wanted(node_->get_publishers_info_by_topic(topic)) ||
+            owned_by_wanted(node_->get_subscriptions_info_by_topic(topic))) {
+          topics.insert(topic);
+        }
+      }
+
+      if (!topics.empty()) {
+        // Always-on context that makes a scoped bag useful for replay.
+        topics.insert("/tf");
+        topics.insert("/tf_static");
+      }
+
+      // Intersect with the actually-subscribed set so the filter never names a
+      // topic that was never buffered (an excluded/sensor topic, or one with no
+      // publisher) - which would otherwise be silently absent from the bag.
+      const auto subscribed_vec = resolve_topics();
+      const std::set<std::string> subscribed(subscribed_vec.begin(), subscribed_vec.end());
+      std::set<std::string> scoped;
+      for (const auto & t : topics) {
+        if (subscribed.count(t)) {
+          scoped.insert(t);
+        }
+      }
+      topics = std::move(scoped);
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(node_->get_logger(), "Entity scope resolution failed for fault '%s' (%s); writing full buffer",
+                fault_code.c_str(), e.what());
+    topics.clear();
+  }
+
+  return topics;
+}
+
 void RosbagCapture::resolve_entity_topics(const std::string & fault_code) {
   std::set<std::string> topics;
 
   if (config_.topics == "entity") {
-    // The whole resolution is guarded: this runs on a detached capture thread with
-    // no outer catch, and storage_->get_fault() can throw on the sqlite backend
-    // (e.g. SQLITE_BUSY). A throw here would terminate the process - the exact crash
-    // the crash-safety work removed - so any failure degrades to "write everything".
-    try {
-      auto fault = storage_->get_fault(fault_code);
-      if (fault && !fault->reporting_sources.empty()) {
-        // reporting_sources hold the reporting node's FQN (e.g. "/planner_server").
-        // Split each into (name, namespace) to match against topic endpoints.
-        std::set<std::pair<std::string, std::string>> wanted;
-        for (const auto & source : fault->reporting_sources) {
-          std::string ns = "/";
-          std::string name = source;
-          const auto slash = source.rfind('/');
-          if (slash != std::string::npos) {
-            name = source.substr(slash + 1);
-            ns = (slash == 0) ? "/" : source.substr(0, slash);
-          }
-          if (!name.empty()) {
-            wanted.emplace(name, ns);
-          }
-        }
-
-        // rclcpp does not expose per-node topic listing, so scan each topic's
-        // endpoints and keep the topics a wanted node publishes or subscribes to.
-        auto owned_by_wanted = [&wanted](const std::vector<rclcpp::TopicEndpointInfo> & eps) {
-          for (const auto & ep : eps) {
-            if (wanted.count({ep.node_name(), ep.node_namespace()})) {
-              return true;
-            }
-          }
-          return false;
-        };
-        for (const auto & [topic, types] : node_->get_topic_names_and_types()) {
-          if (owned_by_wanted(node_->get_publishers_info_by_topic(topic)) ||
-              owned_by_wanted(node_->get_subscriptions_info_by_topic(topic))) {
-            topics.insert(topic);
-          }
-        }
-
-        if (!topics.empty()) {
-          // Always-on context that makes a scoped bag useful for replay.
-          topics.insert("/tf");
-          topics.insert("/tf_static");
-        }
-
-        // Intersect with the actually-subscribed set so the filter never names a
-        // topic that was never buffered (an excluded/sensor topic, or one with no
-        // publisher) - which would otherwise be silently absent from the bag.
-        const auto subscribed_vec = resolve_topics();
-        const std::set<std::string> subscribed(subscribed_vec.begin(), subscribed_vec.end());
-        std::set<std::string> scoped;
-        for (const auto & t : topics) {
-          if (subscribed.count(t)) {
-            scoped.insert(t);
-          }
-        }
-        topics = std::move(scoped);
-      }
-    } catch (const std::exception & e) {
-      RCLCPP_WARN(node_->get_logger(), "Entity scope resolution failed for fault '%s' (%s); writing full buffer",
-                  fault_code.c_str(), e.what());
-      topics.clear();
-    }
+    topics = compute_entity_topics(fault_code);
 
     if (!topics.empty()) {
       RCLCPP_INFO(node_->get_logger(), "Entity scope for fault '%s': %zu topic(s) from the faulting node(s) + /tf",
@@ -952,9 +1003,10 @@ std::vector<std::string> RosbagCapture::evict_bags_over_quota(FaultStorage * sto
       break;
     }
 
-    for (const auto & code : codes_by_path[path]) {
-      storage->delete_rosbag_file(code);
-    }
+    // One call per bag: the SQLite backend removes the whole burst's rows in a
+    // single transaction and unlinks the directory after the commit, so a crash
+    // mid-eviction cannot leave rows pointing at a removed bag.
+    storage->delete_rosbag_files(codes_by_path[path]);
     // Saturate rather than wrap: the quota must never be satisfied by underflow.
     current_bytes -= std::min(current_bytes, bytes_by_path[path]);
     evicted.push_back(path);
@@ -1009,24 +1061,46 @@ void RosbagCapture::finalize_post_fault_recording() {
   size_t bag_size = calculate_bag_size(bag_path);
 
   RosbagFileInfo info;
-  info.fault_code = fault_code;
   info.file_path = bag_path;
   info.format = config_.format;
   info.duration_sec = config_.duration_sec + config_.duration_after_sec;
   info.size_bytes = bag_size;
   info.created_at_ns = get_wall_clock_ns();
 
-  storage_->store_rosbag_file(info);
   // One recording, one row per fault it covers: the correlated faults that
   // confirmed inside this window each need their own lookup key to serve it.
+  // A fault cleared during the post-roll was dropped from the recording state
+  // (auto-cleanup) and gets no row.
+  std::vector<RosbagFileInfo> rows;
+  if (!fault_code.empty()) {
+    info.fault_code = fault_code;
+    rows.push_back(info);
+  }
   for (const auto & code : attached) {
     info.fault_code = code;
-    storage_->store_rosbag_file(info);
+    rows.push_back(info);
   }
-  enforce_storage_limits();
 
-  RCLCPP_INFO(node_->get_logger(), "Bag file completed: %s (%.2f MB, %.1fs, %zu attached fault(s))", bag_path.c_str(),
-              static_cast<double>(bag_size) / (1024.0 * 1024.0), info.duration_sec, attached.size());
+  if (rows.empty()) {
+    // Every fault of the burst was cleared while the post-roll ran; nothing
+    // references the bag, so it goes the way auto-cleanup would have taken it.
+    std::error_code ec;
+    std::filesystem::remove_all(bag_path, ec);
+    RCLCPP_INFO(node_->get_logger(), "Bag file discarded (all its faults cleared during post-roll): %s",
+                bag_path.c_str());
+  } else {
+    // Reached from noexcept destructors (~RosbagCapture -> stop()): a busy/full
+    // metadata store during shutdown must degrade to a warning, not terminate.
+    try {
+      storage_->store_rosbag_files(rows);
+      enforce_storage_limits();
+      RCLCPP_INFO(node_->get_logger(), "Bag file completed: %s (%.2f MB, %.1fs, %zu attached fault(s))",
+                  bag_path.c_str(), static_cast<double>(bag_size) / (1024.0 * 1024.0), info.duration_sec,
+                  attached.size());
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(node_->get_logger(), "Failed to store rosbag metadata for '%s': %s", bag_path.c_str(), e.what());
+    }
+  }
 
   {
     std::lock_guard<std::mutex> lock(capture_topics_mutex_);
