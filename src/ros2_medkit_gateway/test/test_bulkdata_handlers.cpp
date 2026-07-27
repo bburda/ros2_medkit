@@ -19,8 +19,10 @@
 #include <string>
 
 #include "ros2_medkit_gateway/core/discovery/models/app.hpp"
+#include "ros2_medkit_gateway/core/discovery/models/area.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/component.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/function.hpp"
+#include "ros2_medkit_gateway/core/faults/fault_scope.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/handlers/bulkdata_handlers.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
@@ -403,10 +405,103 @@ TEST_F(BulkDataSourceFiltersTest, AppWithEmptyFqnAndNamespaceReturnsEmpty) {
   EXPECT_TRUE(filters.empty());
 }
 
-// AREA entity uses fqn directly - no aggregation in this helper.
+// AREA not present in the cache (no hosted apps resolvable) falls back to fqn.
 TEST_F(BulkDataSourceFiltersTest, AreaReturnsFqnAsFilter) {
   auto entity = make_entity_info(EntityType::AREA, "powertrain", "/powertrain", "/powertrain");
   auto filters = handlers::detail::compute_bulkdata_source_filters(cache_, entity);
   ASSERT_EQ(filters.size(), 1u);
   EXPECT_EQ(filters[0], "/powertrain");
+}
+
+// AREA with hosted apps resolves them like the fault scope does, recursing
+// subareas and keeping external bare ids. The namespace fallback alone never
+// matched a bag: list_rosbags_for_entity compares reporting sources exactly,
+// so /areas/<id>/faults advertised a bulk_data_uri that 404'd.
+TEST_F(BulkDataSourceFiltersTest, AreaResolvesHostedAppsIncludingSubareas) {
+  Area cell;
+  cell.id = "plc-cell";
+  cell.name = "PLC Cell";
+  cell.namespace_path = "/plc_cell";
+  Area sub;
+  sub.id = "cabinet";
+  sub.name = "Cabinet";
+  sub.namespace_path = "/plc_cell/cabinet";
+  sub.parent_area_id = "plc-cell";
+
+  Component plc;
+  plc.id = "s7-plc";
+  plc.name = "PLC";
+  plc.area = "cabinet";
+  App proc;
+  proc.id = "plc-process";
+  proc.name = "PLC Process";
+  proc.component_id = "s7-plc";
+  proc.external = true;
+
+  ThreadSafeEntityCache cache;
+  cache.update_all({cell, sub}, {plc}, {proc}, {});
+
+  auto entity = make_entity_info(EntityType::AREA, "plc-cell", "/plc_cell", "/plc_cell");
+  auto filters = handlers::detail::compute_bulkdata_source_filters(cache, entity);
+  ASSERT_EQ(filters.size(), 1u);
+  EXPECT_EQ(filters[0], "plc-process");
+}
+
+// FUNCTION whose host is a Component (not an app) resolves the component's
+// apps. The app-index lookup dropped component hosts: the function listed the
+// fault but its bag download 404'd.
+TEST_F(BulkDataSourceFiltersTest, FunctionWithComponentHostResolvesComponentApps) {
+  Component plc;
+  plc.id = "plc_hw";
+  plc.name = "PLC";
+  App proc;
+  proc.id = "plc-process";
+  proc.name = "PLC Process";
+  proc.component_id = "plc_hw";
+  proc.external = true;
+  Function func;
+  func.id = "level-control";
+  func.name = "Level Control";
+  func.hosts = {"plc_hw"};
+
+  ThreadSafeEntityCache cache;
+  cache.update_all({}, {plc}, {proc}, {func});
+
+  auto entity = make_entity_info(EntityType::FUNCTION, "level-control", "", "");
+  auto filters = handlers::detail::compute_bulkdata_source_filters(cache, entity);
+  ASSERT_EQ(filters.size(), 1u);
+  EXPECT_EQ(filters[0], "plc-process");
+}
+
+// Download ownership uses fault_in_source_scope over the computed filters:
+// exact match or '/'-boundary prefix only. A raw prefix match (the transport's
+// get_fault(code, source) semantics) would let app id "plc" claim the bag of
+// "plc_line1".
+TEST_F(BulkDataSourceFiltersTest, DownloadOwnershipScopeRejectsPrefixSiblingApp) {
+  App plc;
+  plc.id = "plc";
+  plc.name = "PLC";
+  plc.external = true;
+  App plc_line1;
+  plc_line1.id = "plc_line1";
+  plc_line1.name = "PLC Line 1";
+  plc_line1.external = true;
+
+  ThreadSafeEntityCache cache;
+  cache.update_all({}, {}, {plc, plc_line1}, {});
+
+  auto entity = make_entity_info(EntityType::APP, "plc", "", "");
+  auto filters = handlers::detail::compute_bulkdata_source_filters(cache, entity);
+  ASSERT_EQ(filters.size(), 1u);
+  EXPECT_EQ(filters[0], "plc");
+  std::set<std::string> scope(filters.begin(), filters.end());
+
+  nlohmann::json sibling_fault = {{"reporting_sources", {"plc_line1"}}};
+  EXPECT_FALSE(faults::fault_in_source_scope(sibling_fault, scope));
+
+  nlohmann::json own_fault = {{"reporting_sources", {"plc"}}};
+  EXPECT_TRUE(faults::fault_in_source_scope(own_fault, scope));
+
+  nlohmann::json child_fault = {{"reporting_sources", {"plc/axis1"}}};
+  EXPECT_TRUE(faults::fault_in_source_scope(child_fault, scope));
 }

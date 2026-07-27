@@ -112,14 +112,14 @@ namespace detail {
  * a ``detail`` namespace to signal "not part of the public API" while still
  * being directly unit-testable without spinning up a ``GatewayNode``.
  *
- * - APP / AREA: returns the entity's FQN or namespace path (single filter).
- * - FUNCTION: aggregates non-empty ``effective_fqn()`` values across all
- *   hosted apps (no fallback - functions are pure aggregated views).
- * - COMPONENT: aggregates from hosted apps; falls back to FQN/namespace_path
- *   only when the component has no hosted apps (manifest deployments where
- *   the component groups topics rather than nodes). This avoids the
- *   synthetic-component bug where empty fqn + empty namespace_path produced
- *   zero source filters.
+ * Every entity type resolves through ``faults::resolve_entity_source_fqns``,
+ * the same rule that scopes ``GET /{entity}/faults``: an external app owns
+ * its bare entity id, every other app its ``effective_fqn()``; an external
+ * component also owns its own id; AREA recurses subareas; FUNCTION follows
+ * app and component hosts. When resolution yields nothing, APP / AREA /
+ * COMPONENT fall back to the entity's FQN or namespace path (manifest-only
+ * deployments grouping topics rather than nodes); FUNCTION never falls back
+ * (pure aggregated view).
  *
  * @param cache Entity cache to resolve hosted apps in (used for FUNCTION /
  *              COMPONENT only)
