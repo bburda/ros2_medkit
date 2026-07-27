@@ -979,6 +979,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_log_handlers test/test_log_handlers.cpp)
   target_link_libraries(test_log_handlers gateway_ros2)
 
+  # Log scope tests (entity -> log-source resolution shared by handlers and samplers)
+  ament_add_gtest(test_log_scope test/test_log_scope.cpp)
+  target_link_libraries(test_log_scope gateway_ros2)
+
   # Route descriptions tests (OpenAPI doc builder)
   ament_add_gtest(test_route_descriptions test/test_route_descriptions.cpp)
   target_link_libraries(test_route_descriptions gateway_ros2)
@@ -1155,6 +1159,7 @@ if(BUILD_TESTING)
       test_plugin_abi_conformance
       test_log_manager
       test_log_handlers
+      test_log_scope
       test_merge_pipeline
       test_runtime_linker
       test_route_descriptions
