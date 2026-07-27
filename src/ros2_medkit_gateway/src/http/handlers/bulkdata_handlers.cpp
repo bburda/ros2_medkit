@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -105,46 +106,26 @@ namespace detail {
 
 std::vector<std::string> compute_bulkdata_source_filters(const ThreadSafeEntityCache & cache,
                                                          const EntityInfo & entity) {
+  // One rule for every entity type: the same fault-scope resolution that drives
+  // GET /{entity}/faults (external app -> bare id, external component also owns
+  // its own id, AREA recurses subareas, FUNCTION follows component hosts).
+  // Rosbags are keyed by exact reporting source, so any private variant here
+  // makes a fault the entity lists advertise a bag that 404s - e.g. an
+  // area-scoped bulk_data_uri resolved through the area namespace never
+  // matched a bag stored under a hosted app's bare id.
+  auto sources = HandlerContext::resolve_entity_source_fqns(cache, entity);
+  if (!sources.empty()) {
+    return {sources.begin(), sources.end()};
+  }
+
   if (entity.type == EntityType::FUNCTION) {
-    // Functions are pure aggregated views over hosted apps - if no apps host the function,
-    // there is nothing to query. No fall-through to fqn/namespace_path.
-    return HandlerContext::resolve_app_host_fqns(cache, cache.get_apps_for_function(entity.id));
+    // Functions are pure aggregated views over hosted apps - if no apps host
+    // the function, there is nothing to query. No fall-through.
+    return {};
   }
 
-  if (entity.type == EntityType::APP) {
-    // A plugin-introspected app has no ROS binding, so fqn and namespace_path
-    // are both empty and the bare-fqn path below would return no filter at all -
-    // its rosbags and logs then belong to nobody and every download 404s. Its
-    // reporting source is its bare id, exactly as fault scoping resolves it.
-    std::string source = faults::resolve_app_source_fqn(cache, entity.id);
-    if (!source.empty()) {
-      std::vector<std::string> filters;
-      filters.push_back(std::move(source));
-      return filters;
-    }
-  }
-
-  if (entity.type == EntityType::COMPONENT) {
-    // Synthetic / runtime-discovered components have an empty fqn / namespace_path,
-    // so the bare-fqn path used to silently return zero source filters and produce
-    // empty descriptor lists plus failed ownership checks on download. Resolve hosted
-    // apps first; manifest deployments where the component groups topics rather than
-    // nodes still need the namespace prefix path, so fall through if no apps host it.
-    auto filters = HandlerContext::resolve_app_host_fqns(cache, cache.get_apps_for_component(entity.id));
-    // An external component reports faults under its own id too (a bridge raises
-    // PLC_COMMS_LOST there), so it owns that source as well - the same rule
-    // faults::collect_component_app_fqns already applies.
-    auto comp = cache.get_component(entity.id);
-    if (comp && comp->external.value_or(false)) {
-      filters.push_back(entity.id);
-    }
-    if (!filters.empty()) {
-      return filters;
-    }
-    // fall through to fqn/namespace_path
-  }
-
-  // For other entity types and manifest-only components, use FQN or namespace_path
+  // No resolvable hosted sources (manifest-only entities grouping topics rather
+  // than nodes, or apps missing from the cache): fall back to FQN or namespace_path.
   std::string filter = entity.fqn.empty() ? entity.namespace_path : entity.fqn;
   if (filter.empty()) {
     return {};
@@ -354,18 +335,15 @@ http::Result<http::BinaryResponse> BulkDataHandlers::download(const http::TypedR
           make_error(404, ERR_RESOURCE_NOT_FOUND, "Bulk-data not found", json{{"bulk_data_id", bulk_data_id}}));
     }
 
-    // Security check: verify rosbag belongs to this entity. For functions,
-    // check all hosting apps (aggregated view).
+    // Security check: the bag belongs to this entity only when the fault it
+    // was captured for is within the entity's source scope. Read the fault
+    // once and test with the shared boundary-aware matcher - the transport's
+    // get_fault(code, source) check is a raw prefix match, so app id "plc"
+    // would claim the assets of "plc_line1".
     auto source_filters = get_source_filters(entity);
-    bool fault_verified = false;
-    for (const auto & sf : source_filters) {
-      auto fault_result = fault_mgr->get_fault(fault_code, sf);
-      if (fault_result.success) {
-        fault_verified = true;
-        break;
-      }
-    }
-    if (!fault_verified) {
+    std::set<std::string> scope(source_filters.begin(), source_filters.end());
+    auto fault_result = fault_mgr->get_fault(fault_code, "");
+    if (!fault_result.success || !faults::fault_in_source_scope(fault_result.data, scope)) {
       return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "Bulk-data not found for this entity",
                                        json{{"entity_id", path_info->entity_id}}));
     }

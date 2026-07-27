@@ -33,12 +33,15 @@ namespace faults {
 /// it claim faults it never reported.
 std::string resolve_app_source_fqn(const ThreadSafeEntityCache & cache, const std::string & app_id);
 
-/// Resolve the set of App effective-FQNs that fall within an entity's scope by
-/// walking the entity cache:
-///   - APP: the app's own effective FQN
-///   - COMPONENT: every hosted app's FQN
-///   - AREA: every app under the area and its (recursive) subareas
-///   - FUNCTION: every app hosted directly or via a hosted component
+/// Resolve the set of fault-reporting sources that fall within an entity's
+/// scope by walking the entity cache. Each hosted app contributes what
+/// `resolve_app_source_fqn` yields (bare entity id for an external app,
+/// effective FQN otherwise):
+///   - APP: the app's own source, if it owns one
+///   - COMPONENT: every hosted app's source, plus the component's own id when
+///     the component is external (protocol bridges report under that id)
+///   - AREA: every source under the area and its (recursive) subareas
+///   - FUNCTION: every source hosted directly or via a hosted component
 /// Returns an empty set for SERVER / UNKNOWN.
 ///
 /// Shared by the HTTP fault handlers (`GET /{entity}/faults`) and the ROS 2
