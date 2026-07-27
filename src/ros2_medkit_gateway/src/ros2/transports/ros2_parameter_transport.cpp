@@ -46,28 +46,46 @@ Ros2ParameterTransport::Ros2ParameterTransport(rclcpp::Node * node, double servi
   options.use_global_arguments(false);
   param_node_ = std::make_shared<rclcpp::Node>("_param_client_node", options);
 
-  // Tear the node down BEFORE the context is invalidated. Without this, an owner that
-  // outlives rclcpp::shutdown() (the gateway's own managers, or a plugin whose objects
-  // are destroyed from ~GatewayNode) drops param_node_ after the GraphListener has
-  // already cleared its node list, and ~NodeGraph's remove_node() throws
-  // NodeNotFoundError out of a noexcept destructor -> std::terminate, exit -6. It is a
-  // race, so it shows up as an intermittent abort on Ctrl+C rather than a reliable one.
-  context_ = param_node_->get_node_base_interface()->get_context();
-  pre_shutdown_handle_ = context_->add_pre_shutdown_callback([this] {
-    shutdown();
-  });
-
   // Store own node FQN for self-query detection.
   own_node_fqn_ = node_->get_fully_qualified_name();
 
   RCLCPP_INFO(node_->get_logger(), "Ros2ParameterTransport initialized (timeout=%.1fs, negative_cache=%.0fs)",
               service_timeout_sec_, negative_cache_ttl_sec_);
+
+  // Release param_node_ while the GraphListener is still running. The listener is stopped
+  // from an on_shutdown callback, which Context::shutdown() runs AFTER rcl_shutdown and
+  // therefore after every pre-shutdown callback - so registering here guarantees the node
+  // is gone before the listener goes down.
+  //
+  // What that avoids is the half-registration race: NodeGraph::get_graph_event() consumes
+  // should_add_to_graph_listener_ BEFORE calling add_node(), and add_node() throws
+  // GraphListenerShutdownError once the listener is down. The flag is then spent while the
+  // node was never listed, so ~NodeGraph takes its remove_node() branch, the node is absent
+  // from node_graph_interfaces_, and NodeNotFoundError escapes a noexcept destructor ->
+  // std::terminate, exit -6. Every wait_for_service in this class runs under spin_mutex_
+  // and this callback blocks on the same mutex, so no first graph use can straddle the
+  // listener's shutdown. (A node that IS registered tears down cleanly after shutdown:
+  // GraphListener::__shutdown() never clears node_graph_interfaces_, and remove_node()
+  // erases directly once is_shutdown() is set.)
+  //
+  // MUST stay the last statement of this constructor: if anything after it throws, the
+  // destructor never runs, and pre_shutdown_handle_ is only a weak_ptr - destroying it
+  // deregisters nothing, leaving a callback that later fires on freed memory.
+  context_ = param_node_->get_node_base_interface()->get_context();
+  pre_shutdown_handle_ = context_->add_pre_shutdown_callback([this] {
+    shutdown();
+  });
 }
 
 Ros2ParameterTransport::~Ros2ParameterTransport() {
-  // Deregister first: the callback captures `this`, and once we return the object is
-  // gone. remove_pre_shutdown_callback() is a no-op if the callback already ran during a
-  // normal rclcpp shutdown, and Context serializes it against a callback in flight.
+  // Deregister first: the callback captures `this`, and once we return the object is gone.
+  // This is real work even after the callback has already fired - Context::shutdown() runs
+  // the callbacks off a copy and never erases them, so the entry is still registered. The
+  // erase is load-bearing: the default context is a process-lifetime static that a later
+  // rclcpp::init() re-initializes without clearing the callback lists, so an entry left
+  // behind would fire on the NEXT shutdown against a freed transport. Context takes the
+  // same pre_shutdown_callbacks_mutex_ it fires under, so this is serialized against a
+  // callback in flight.
   if (context_) {
     context_->remove_pre_shutdown_callback(pre_shutdown_handle_);
   }
@@ -350,6 +368,18 @@ ParameterResult Ros2ParameterTransport::list_parameters(const std::string & node
         return result;
       }
 
+      // Bail out before the blocking wait once teardown has begun. shutdown() sets this
+      // flag before it blocks on spin_mutex_, and our pre-shutdown callback runs BEFORE
+      // rcl_shutdown - so wait_for_service's own rclcpp::ok early exit never trips and it
+      // would burn its full service timeout while holding spin_mutex_, gating rcl_shutdown
+      // for the whole process. Deliberately does NOT mark the negative cache: this says
+      // nothing about whether the target node is reachable.
+      if (shutdown_requested_.load()) {
+        result.success = false;
+        result.error_message = "Parameter client unavailable (transport shut down)";
+        result.error_code = ParameterErrorCode::SHUT_DOWN;
+        return result;
+      }
       if (!client->wait_for_service(get_service_timeout())) {
         result.success = false;
         result.error_message = "Parameter service not available for node: " + node_name;
@@ -467,6 +497,13 @@ ParameterResult Ros2ParameterTransport::get_parameter(const std::string & node_n
         return result;
       }
 
+      // Teardown bail-out before the blocking wait - see list_parameters() for why.
+      if (shutdown_requested_.load()) {
+        result.success = false;
+        result.error_message = "Parameter client unavailable (transport shut down)";
+        result.error_code = ParameterErrorCode::SHUT_DOWN;
+        return result;
+      }
       if (!client->wait_for_service(get_service_timeout())) {
         result.success = false;
         result.error_message = "Parameter service not available for node: " + node_name;
@@ -641,6 +678,13 @@ ParameterResult Ros2ParameterTransport::set_parameter(const std::string & node_n
       return result;
     }
 
+    // Teardown bail-out before the blocking wait - see list_parameters() for why.
+    if (shutdown_requested_.load()) {
+      result.success = false;
+      result.error_message = "Parameter client unavailable (transport shut down)";
+      result.error_code = ParameterErrorCode::SHUT_DOWN;
+      return result;
+    }
     if (!client->wait_for_service(get_service_timeout())) {
       result.success = false;
       result.error_message = "Parameter service not available for node: " + node_name;
@@ -1094,6 +1138,12 @@ bool Ros2ParameterTransport::cache_default_values(const std::string & node_name)
       return false;  // transport shutting down, not a node-availability signal
     }
 
+    // Teardown bail-out before the blocking wait - see list_parameters() for why. Returns
+    // false so the caller treats it as "not a node-availability signal", matching the
+    // shut-down client path above.
+    if (shutdown_requested_.load()) {
+      return false;
+    }
     if (!client->wait_for_service(get_service_timeout())) {
       if (node_) {
         RCLCPP_WARN(node_->get_logger(), "Cannot cache defaults - service not available for node: '%s'",
