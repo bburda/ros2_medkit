@@ -949,7 +949,11 @@ Query and manage faults.
 
    **Snapshot Types:**
 
-   - ``freeze_frame``: Topic data captured at fault confirmation
+   - ``freeze_frame``: Topic data captured at fault confirmation. Entity
+     frames for faults that were already confirmed when the gateway started
+     are captured at gateway start instead and carry
+     ``"capture_origin": "startup"`` in their ``x-medkit`` block;
+     ``captured_at`` always stamps when the values were read.
    - ``rosbag``: Recording file available via bulk-data endpoint
 
    **Response codes:**

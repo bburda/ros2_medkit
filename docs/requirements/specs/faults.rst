@@ -56,5 +56,7 @@ Faults
    When a fault is confirmed, the system shall automatically capture diagnostic snapshots
    (freeze-frame topic data) and rosbag recordings as configured. Captured data shall be
    stored as environment data associated with the fault and accessible via the bulk-data
-   endpoints on the fault's reporting entity.
+   endpoints on the fault's reporting entity. For faults already confirmed when the
+   capturing component starts (e.g. the gateway restarts while a fault is standing), an
+   equivalent snapshot shall be captured at startup and marked with its capture origin.
 
