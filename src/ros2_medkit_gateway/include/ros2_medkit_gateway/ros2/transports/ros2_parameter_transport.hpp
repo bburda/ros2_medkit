@@ -215,14 +215,30 @@ class Ros2ParameterTransport : public ParameterTransport {
   std::shared_ptr<rclcpp::Node> param_node_;
 
   /// Context of param_node_, plus the handle of the pre-shutdown callback registered on
-  /// it. param_node_ MUST be destroyed while the context is still valid: rclcpp's
-  /// ~NodeGraph calls GraphListener::remove_node(), which throws NodeNotFoundError once
-  /// the context has been shut down and the listener has dropped its node list. That
-  /// throw escapes an implicitly-noexcept destructor, so it is an immediate
-  /// std::terminate (SIGABRT) that no try/catch at the call site can intercept - the
-  /// only fix is to not be holding the node by then. The callback runs shutdown() ahead
-  /// of context invalidation; the destructor deregisters it and calls the (idempotent)
-  /// shutdown() for the ordinary case where the transport dies first.
+  /// it. param_node_ must be released while the GraphListener is still running, and the
+  /// callback is what guarantees that: Context::shutdown() runs pre-shutdown callbacks,
+  /// then rcl_shutdown, then the on_shutdown callbacks - and the listener is stopped from
+  /// one of the latter.
+  ///
+  /// The crash this prevents is a HALF-REGISTERED node, not a late destruction.
+  /// NodeGraph::get_graph_event() consumes should_add_to_graph_listener_ before calling
+  /// GraphListener::add_node(), and add_node() throws GraphListenerShutdownError once the
+  /// listener is down. The flag is spent while the node was never listed, so ~NodeGraph
+  /// takes its remove_node() branch, the node is absent from node_graph_interfaces_, and
+  /// NodeNotFoundError escapes an implicitly-noexcept destructor: immediate std::terminate
+  /// (SIGABRT), which no try/catch at the call site can intercept. Only a first-ever graph
+  /// use racing the listener's shutdown can produce it, which is why the crash was
+  /// intermittent rather than every run.
+  ///
+  /// A node that IS registered is fine either way: GraphListener::__shutdown() only joins
+  /// its thread and finalizes the wait set, it never clears node_graph_interfaces_, and
+  /// remove_node() erases directly once is_shutdown() is set. Do not "fix" a suspected
+  /// late-destruction bug here - that path provably works.
+  ///
+  /// Every wait_for_service in this class runs under spin_mutex_ and the callback blocks
+  /// on the same mutex, so no first graph use can straddle the listener's shutdown. The
+  /// destructor deregisters the callback and calls the (idempotent) shutdown() for the
+  /// ordinary case where the transport dies first.
   std::shared_ptr<rclcpp::Context> context_;
   rclcpp::PreShutdownCallbackHandle pre_shutdown_handle_;
 
