@@ -129,6 +129,20 @@ namespace detail {
 std::vector<std::string> compute_bulkdata_source_filters(const ThreadSafeEntityCache & cache,
                                                          const EntityInfo & entity);
 
+/**
+ * @brief Shared-recording identifier for a rosbag descriptor.
+ *
+ * Faults confirmed in one burst share a single recording, and each fault gets
+ * its own descriptor with the full bag size. The bag directory basename (e.g.
+ * ``fault_MOTOR_OVERHEAT_1738662600000``) identifies the recording, so clients
+ * can group descriptors that serve the same bytes. Empty when the path is
+ * empty or has no usable basename.
+ *
+ * @param file_path Bag path as stored by the fault manager (directory)
+ * @return Basename of the bag directory, or empty string
+ */
+std::string rosbag_recording_id(const std::string & file_path);
+
 }  // namespace detail
 
 }  // namespace handlers

@@ -74,6 +74,29 @@ TEST_F(BulkDataHandlersTest, GetRosbagMimetypeCasesSensitive) {
   EXPECT_EQ(BulkDataHandlers::get_rosbag_mimetype("Mcap"), "application/octet-stream");
 }
 
+// === Shared-recording identifier tests ===
+// Faults of one burst share a recording; each fault's descriptor carries
+// x-medkit.recording_id = the bag directory basename, so clients can group
+// the descriptors that serve the same bytes.
+
+TEST_F(BulkDataHandlersTest, RecordingIdIsTheBagDirectoryBasename) {
+  EXPECT_EQ(handlers::detail::rosbag_recording_id("/var/bags/fault_MOTOR_OVERHEAT_1738664999000"),
+            "fault_MOTOR_OVERHEAT_1738664999000");
+}
+
+TEST_F(BulkDataHandlersTest, RecordingIdIsTheSameForEveryFaultOfTheBurst) {
+  // Two faults of one burst store rows pointing at the same path: their
+  // descriptors must resolve to one identifier.
+  const std::string shared_path = "/tmp/fault_ROOT_CAUSE_1700000000000";
+  EXPECT_EQ(handlers::detail::rosbag_recording_id(shared_path), handlers::detail::rosbag_recording_id(shared_path));
+  EXPECT_EQ(handlers::detail::rosbag_recording_id(shared_path), "fault_ROOT_CAUSE_1700000000000");
+}
+
+TEST_F(BulkDataHandlersTest, RecordingIdToleratesTrailingSlashAndEmptyPath) {
+  EXPECT_EQ(handlers::detail::rosbag_recording_id("/var/bags/fault_X_123/"), "fault_X_123");
+  EXPECT_EQ(handlers::detail::rosbag_recording_id(""), "");
+}
+
 // === Shared timestamp utility tests ===
 
 // @verifies REQ_INTEROP_071
