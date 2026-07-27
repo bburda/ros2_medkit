@@ -988,9 +988,9 @@ Logs Endpoints
 --------------
 
 Query and configure the /rosout ring buffer for an entity. Supported entity types:
-**areas** (aggregated from hosted apps, namespace prefix fallback), **components** (aggregated from
-hosted apps, namespace prefix fallback for manifest-only deployments), **apps** (exact FQN match),
-and **functions** (aggregated from hosted apps).
+**areas** (aggregated from hosted apps, merged with a namespace prefix query), **components**
+(aggregated from hosted apps, merged with a namespace prefix query), **apps** (exact FQN match;
+external apps by bare entity id), and **functions** (aggregated from hosted apps).
 
 .. note::
 
