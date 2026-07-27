@@ -156,6 +156,36 @@ class TestFaultTriggersApi(GatewayTestCase):
                   'severity': 'ERROR'}, timeout=10)
         self.assertEqual(resp.status_code, 404, resp.text)
 
+    def test_07_disconnected_app_holds_rule_state(self):
+        """A rule on the down app never fires on its frozen last-known values.
+
+        test_route_plc_down_app reports connected=false while still serving
+        level=42.0. The trigger fetcher must treat that as unreadable
+        (nullopt), so the level-triggered engine holds state instead of firing
+        on a stale number for the whole outage - even though the same payload
+        does get freeze-framed (test_entity_freeze_frame.test.py).
+        """
+        resp = requests.post(
+            f'{self.BASE_URL}/apps/test_route_plc_down_app/fault-triggers',
+            json={'data_name': 'level', 'operator': '>=',
+                  'threshold': 10.0, 'fault_code': 'TEST_DOWN_LEVEL_HIGH',
+                  'severity': 'ERROR'}, timeout=10)
+        # Creation succeeds: data points are enumerable from last-known content.
+        self.assertEqual(resp.status_code, 201, resp.text)
+        rule = resp.json()
+
+        # 42.0 >= 10 would fire within a few 200 ms polls if the stale value
+        # were fetched; give it ample polls and require silence.
+        time.sleep(3.0)
+        self.assertIsNone(
+            self.poll_for_fault('TEST_DOWN_LEVEL_HIGH', timeout=1.0),
+            'rule fired on a disconnected app serving last-known values')
+
+        resp = requests.delete(
+            f'{self.BASE_URL}/apps/test_route_plc_down_app/fault-triggers'
+            f"/{rule['id']}", timeout=10)
+        self.assertEqual(resp.status_code, 204)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

@@ -252,6 +252,15 @@ json FaultHandlers::merge_entity_freeze_frames(json env_data,
       // absent marker = captured on the confirm edge.
       snap["capture_origin"] = "startup";
     }
+    // Value provenance, only when the plugin's payload reported it: a
+    // disconnected entity serves last-known values whose age captured_at_ns
+    // cannot convey.
+    if (frame.connected.has_value()) {
+      snap["connected"] = *frame.connected;
+    }
+    if (!frame.source_timestamp.is_null()) {
+      snap["source_timestamp"] = frame.source_timestamp;
+    }
     env_data["snapshots"].push_back(std::move(snap));
   }
   return env_data;
@@ -317,6 +326,13 @@ dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_jso
         }
         if (s.contains("capture_origin") && s["capture_origin"].is_string()) {
           snap["x-medkit"]["capture_origin"] = s["capture_origin"];
+        }
+        // Entity-frame provenance (merge_entity_freeze_frames), only when known.
+        if (s.contains("connected") && s["connected"].is_boolean()) {
+          snap["x-medkit"]["connected"] = s["connected"];
+        }
+        if (s.contains("source_timestamp")) {
+          snap["x-medkit"]["source_timestamp"] = s["source_timestamp"];
         }
       } else if (snapshot_type == "rosbag") {
         // Build absolute URI using entity path + fault_code as the bulk-data ID.
