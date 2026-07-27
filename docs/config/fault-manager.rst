@@ -215,7 +215,8 @@ Basic Snapshot Settings
      - Max concurrent capture threads under a fault storm (>= 1). The capture pool is
        shared and created when snapshots **or** rosbag is enabled, so these parameters
        bound both. ``capture_pool_size`` parallelizes freeze-frame snapshot capture
-       only; rosbag is single-writer and records one fault at a time regardless.
+       only; rosbag stays single-writer regardless - correlated faults confirming
+       inside one post-roll window share a single recording.
    * - ``snapshots.capture_queue_depth``
      - ``16``
      - Max pending captures before the full-queue policy applies (>= 1).
@@ -265,11 +266,17 @@ Capture continuous rosbag recordings around fault events.
      - Duration of pre-fault circular buffer.
    * - ``rosbag.duration_after_sec``
      - ``1.0``
-     - How long to record after fault.
+     - How long to record after fault. A fault confirming while this window is
+       still running attaches to the in-flight recording and shares its bag,
+       with one metadata entry per fault. At most 32 faults attach on top of
+       the first; any beyond that are recorded in the bag's data but get no
+       per-fault entry (logged as a warning).
    * - ``rosbag.topics``
      - ``entity``
      - Topic selection mode: ``entity`` (default; write only the faulting node's
-       topics + ``/tf``), ``config`` (per-fault), ``all``, or ``explicit``.
+       topics + ``/tf`` - a fault attaching to an in-flight recording adds its
+       own node's topics from that point on), ``config`` (per-fault), ``all``,
+       or ``explicit``.
    * - ``rosbag.exclude_sensor_topics``
      - ``true``
      - In broad modes (``all``/``entity``), auto-exclude high-bandwidth sensor
@@ -290,10 +297,13 @@ Capture continuous rosbag recordings around fault events.
      - Maximum size per rosbag file (MB).
    * - ``rosbag.max_total_storage_mb``
      - ``500``
-     - Maximum total storage for all rosbags (MB).
+     - Maximum total storage for all rosbags (MB). A recording shared by a
+       burst of faults counts once towards the total, and eviction removes a
+       whole burst's bag at a time (oldest first).
    * - ``rosbag.auto_cleanup``
      - ``true``
-     - Automatically delete oldest rosbags when storage limit reached.
+     - Delete a fault's bag when the fault is cleared. A recording shared by a
+       burst survives until the last fault referencing it clears.
 
 .. seealso::
 

@@ -103,8 +103,9 @@ Configure snapshot capture via fault manager parameters:
    * - ``snapshots.capture_pool_size``
      - ``2``
      - Max concurrent capture threads under a fault storm (>= 1). This parallelizes
-       freeze-frame snapshot capture only; rosbag capture is single-writer and
-       records one fault at a time regardless of this value.
+       freeze-frame snapshot capture only; rosbag capture stays single-writer
+       regardless of this value - correlated faults confirming inside one
+       post-roll window share a single recording.
    * - ``snapshots.capture_queue_depth``
      - ``16``
      - Max pending captures before the full-queue policy applies (>= 1).
@@ -406,6 +407,11 @@ Rosbag Configuration Options
      - ``1.0``
      - Post-fault recording duration. After a fault is confirmed, recording
        continues for this many seconds to capture immediate system response.
+       A fault confirming while this window is still running attaches to the
+       in-flight recording and shares its bag, with one metadata entry per
+       fault. At most 32 faults attach on top of the first; any beyond that
+       are recorded in the bag's data but get no per-fault entry (logged as
+       a warning).
    * - ``snapshots.rosbag.topics``
      - ``"entity"``
      - Topic selection mode:
@@ -413,7 +419,9 @@ Rosbag Configuration Options
        - ``"entity"`` - Default. Subscribe broadly for pre-roll, but on fault
          confirmation write only the faulting source node's topics (resolved from
          the fault's reporting source) plus ``/tf`` and ``/tf_static``. Falls back
-         to the full buffer if the source is not a live node.
+         to the full buffer if the source is not a live node. A fault attaching
+         to an in-flight recording adds its own node's topics from that point
+         on (or widens the recording to all topics if its scope is unresolved).
        - ``"config"`` - Use same topics as JSON snapshots (from config file)
        - ``"all"`` or ``"auto"`` - Auto-discover and record all available topics
        - ``"explicit"`` - Use only topics from ``include_topics`` list
@@ -456,11 +464,14 @@ Rosbag Configuration Options
    * - ``snapshots.rosbag.storage_path``
      - ``""``
      - Directory for bag files. Empty string uses system temp directory
-       (``/tmp``). Bags are named ``fault_{code}_{timestamp}/``.
+       (``/tmp``). Bags are named ``fault_{code}_{timestamp}/`` after the first
+       fault of the recording; faults that attached during its post-roll window
+       are served from that same directory.
    * - ``snapshots.rosbag.auto_cleanup``
      - ``true``
-     - Automatically delete bag files when faults are cleared. Set to ``false``
-       to retain bags for manual analysis.
+     - Automatically delete a fault's bag when it is cleared. A recording
+       shared by a burst of faults is deleted when the last fault referencing
+       it clears. Set to ``false`` to retain bags for manual analysis.
    * - ``snapshots.rosbag.lazy_start``
      - ``false``
      - Controls when the ring buffer starts recording. See diagram below.
@@ -471,7 +482,9 @@ Rosbag Configuration Options
    * - ``snapshots.rosbag.max_total_storage_mb``
      - ``500``
      - Total storage limit for all bag files. Oldest bags are automatically
-       deleted when this limit is exceeded.
+       deleted when this limit is exceeded. A recording shared by a burst of
+       faults counts once towards the total, and eviction removes a whole
+       burst's bag at a time.
 
 Understanding lazy_start Mode
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
