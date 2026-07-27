@@ -200,11 +200,13 @@ Configure how the gateway connects to the fault manager services and event topic
      - bool
      - ``true``
      - Zero-config freeze-frames for plugin-backed entities: when a fault from a
-       plugin-owned entity confirms, snapshot the entity's current data values
-       (via its plugin's DataProvider) and merge them into the fault detail's
+       plugin-owned entity confirms, snapshot the entity's data values as served
+       by its plugin's DataProvider and merge them into the fault detail's
        ``environment_data.snapshots``. Faults already confirmed at gateway start
        are caught up at startup; those frames read the values at start time (not
-       confirm time) and are marked ``x-medkit.capture_origin: startup``.
+       confirm time) and are marked ``x-medkit.capture_origin: startup``. For an
+       entity that reports its link down these are the plugin's last known
+       values, marked ``connected: false`` in the snapshot's ``x-medkit`` block.
        Explicit snapshot config in the fault manager always wins when present.
        Only active when plugins are loaded.
 

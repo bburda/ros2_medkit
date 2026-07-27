@@ -949,11 +949,16 @@ Query and manage faults.
 
    **Snapshot Types:**
 
-   - ``freeze_frame``: Topic data captured at fault confirmation. Entity
-     frames for faults that were already confirmed when the gateway started
-     are captured at gateway start instead and carry
-     ``"capture_origin": "startup"`` in their ``x-medkit`` block;
-     ``captured_at`` always stamps when the values were read.
+   - ``freeze_frame``: Data captured at fault confirmation. Entity frames for
+     faults that were already confirmed when the gateway started are captured
+     at gateway start instead and carry ``"capture_origin": "startup"`` in
+     their ``x-medkit`` block. For a plugin-backed entity that reports its
+     link down, the values are the plugin's last known ones and may predate
+     the confirmation by the length of the outage; such entries carry
+     ``connected`` (the payload's link flag, ``false`` for the loss-of-comms
+     case) and ``source_timestamp`` (the payload's own timestamp, verbatim)
+     in ``x-medkit``, both only when the plugin's payload reports them.
+     ``captured_at`` always dates the capture, not the values.
    - ``rosbag``: Recording file available via bulk-data endpoint
 
    **Response codes:**
