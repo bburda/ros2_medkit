@@ -176,12 +176,17 @@ row is written.
 **Plugin-backed entities** (``entity_freeze_frame.enabled``, gateway): PLC
 apps bridged by protocol plugins report faults under their bare SOVD entity
 id and their live values are not ROS topics, so the fault manager cannot
-capture them. Instead, the gateway snapshots the entity's current data
-values (from the owning plugin's ``DataProvider``, i.e. the latest polled
+capture them. Instead, the gateway snapshots the entity's data values as
+served by the owning plugin (its ``DataProvider``, i.e. the latest polled
 values) when the fault confirms, and merges them into the fault detail's
 ``environment_data.snapshots`` as a standard ``freeze_frame`` entry named
 after the entity - unless the fault manager already captured a freeze-frame
-for that fault (explicit config wins).
+for that fault (explicit config wins). When the entity reports its link down
+(the loss-of-comms case), the frozen values are the plugin's last known ones
+and may predate the confirmation by the length of the outage; the entry's
+``x-medkit`` block then carries ``connected: false`` and, when the plugin's
+payload includes one, ``source_timestamp`` (the payload's own timestamp)
+alongside ``captured_at``.
 
 Faults that are already confirmed when the gateway starts are caught up at
 startup: the gateway lists the confirmed faults and captures a frame for each
@@ -275,9 +280,11 @@ Snapshots are included inline in the fault response as ``environment_data``:
 
 **Snapshot Types:**
 
-- ``freeze_frame``: Topic data captured at fault confirmation (JSON format).
-  Entity frames caught up for faults that predate the gateway are captured at
-  gateway start instead, marked ``x-medkit.capture_origin: startup``.
+- ``freeze_frame``: Data captured at fault confirmation (JSON format). Entity
+  frames caught up for faults that predate the gateway are captured at
+  gateway start instead, marked ``x-medkit.capture_origin: startup``; a
+  plugin entity that reports its link down contributes its last known values,
+  marked ``connected: false`` in ``x-medkit``
 - ``rosbag``: Recording file available via bulk-data endpoint (binary format)
 
 **Get snapshots from fault response using jq:**
