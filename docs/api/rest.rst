@@ -1000,16 +1000,20 @@ and **functions** (aggregated from hosted apps).
    storage backend or take full ownership of the log pipeline (see plugin development docs).
 
 ``GET /api/v1/components/{id}/logs``
-   Query log entries aggregated from the component's hosted apps. Resolves child apps via
-   the entity cache and queries each by exact FQN. Falls back to namespace prefix match only
-   when the component has no hosted apps but declares a non-empty namespace (manifest-only
-   deployments where the component groups topics rather than nodes). The response always
-   carries ``x-medkit.aggregation_level=component`` and ``aggregated=true``; the
-   ``app_count`` and ``aggregation_sources`` fields are populated only when hosted-app
-   aggregation is active and are omitted under the namespace-prefix fallback.
+   Query log entries aggregated from the component's hosted apps. Child apps resolve via
+   the entity cache using the same rule as fault scoping: an external app (plugin-provided,
+   no ROS binding) is queried by its bare entity id, every other app by its exact FQN, and
+   an external component also returns entries stored under its own id. When the component
+   declares a non-empty namespace, a namespace prefix query runs in addition and the results
+   are merged and deduplicated, so ROS nodes under the namespace keep contributing even when
+   the component also hosts external apps. The response always carries
+   ``x-medkit.aggregation_level=component`` and ``aggregated=true``; the ``app_count`` and
+   ``aggregation_sources`` fields are populated only when at least one hosted source
+   resolves.
 
 ``GET /api/v1/apps/{id}/logs``
-   Query log entries for the specific app node (exact match).
+   Query log entries for the specific app. A ROS-bound app is queried by its exact FQN; an
+   external app by its bare entity id (the id ``add_log_entry`` and fault reporting use).
 
 **Query parameters:**
 

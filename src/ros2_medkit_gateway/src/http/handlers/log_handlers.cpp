@@ -14,8 +14,8 @@
 
 #include "ros2_medkit_gateway/core/http/handlers/log_handlers.hpp"
 
-#include <iterator>
 #include <optional>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -26,6 +26,7 @@
 
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
+#include "ros2_medkit_gateway/core/logs/log_scope.hpp"
 #include "ros2_medkit_gateway/core/managers/log_manager.hpp"
 #include "ros2_medkit_gateway/dto/json_reader.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
@@ -130,111 +131,52 @@ LogHandlers::get_logs(const http::TypedRequest & req) {
   dto::LogListXMedkit xm;
   bool xm_used = false;
 
-  // -----------------------------------------------------------------------
-  // FUNCTION - aggregate local hosted app logs + fan-out to peers
-  // -----------------------------------------------------------------------
-  if (entity.type == EntityType::FUNCTION) {
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
-    auto func = cache.get_function(entity_id);
+  // Local query: one shared scope resolution for every entity type. Exact
+  // sources follow the fault-scope rule (external app -> bare id, external
+  // component owns its own id, areas recurse subareas, functions follow
+  // component hosts); COMPONENT and AREA additionally merge the entity.fqn
+  // namespace-prefix query, so a component whose apps are all external keeps
+  // the ROS node entries under its namespace.
+  const auto & cache = ctx_.node()->get_thread_safe_cache();
+  std::set<std::string> resolved;
+  auto local_logs = logs::query_entity_logs(*log_mgr, cache, entity.sovd_type(), entity_id, entity.fqn, min_severity,
+                                            context_filter, &resolved);
+  if (!local_logs) {
+    return tl::unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, local_logs.error()));
+  }
+  response.items = parse_local_items(*local_logs);
 
+  if (entity.type == EntityType::FUNCTION) {
     xm.entity_id = entity_id;
     xm.aggregation_level = "function";
     xm.aggregated = true;
     xm_used = true;
-
-    if (func && !func->hosts.empty()) {
-      auto host_fqns = HandlerContext::resolve_app_host_fqns(cache, func->hosts);
-      if (!host_fqns.empty()) {
-        auto logs = log_mgr->get_logs(host_fqns, false, min_severity, context_filter, entity_id);
-        if (!logs) {
-          return tl::unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, logs.error()));
-        }
-        response.items = parse_local_items(*logs);
-        xm.host_count = static_cast<int64_t>(host_fqns.size());
-        xm.aggregation_sources = std::vector<std::string>(host_fqns.begin(), host_fqns.end());
-      }
+    if (!resolved.empty()) {
+      xm.host_count = static_cast<int64_t>(resolved.size());
+      xm.aggregation_sources = std::vector<std::string>(resolved.begin(), resolved.end());
     }
   } else if (entity.type == EntityType::AREA) {
-    // ---------------------------------------------------------------------
-    // AREA - aggregate local app logs from all components + fan-out
-    // ---------------------------------------------------------------------
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
-    auto comp_ids = cache.get_components_for_area(entity_id);
-
-    std::vector<std::string> host_fqns;
-    for (const auto & comp_id : comp_ids) {
-      auto comp_fqns = HandlerContext::resolve_app_host_fqns(cache, cache.get_apps_for_component(comp_id));
-      host_fqns.insert(host_fqns.end(), std::make_move_iterator(comp_fqns.begin()),
-                       std::make_move_iterator(comp_fqns.end()));
-    }
-
     xm.entity_id = entity_id;
     xm.aggregation_level = "area";
     xm.aggregated = true;
     xm_used = true;
-
-    if (!host_fqns.empty()) {
-      auto logs = log_mgr->get_logs(host_fqns, false, min_severity, context_filter, entity_id);
-      if (!logs) {
-        return tl::unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, logs.error()));
-      }
-      response.items = parse_local_items(*logs);
-      xm.component_count = static_cast<int64_t>(comp_ids.size());
-      xm.app_count = static_cast<int64_t>(host_fqns.size());
-      xm.aggregation_sources = std::vector<std::string>(host_fqns.begin(), host_fqns.end());
-    } else {
-      auto logs = log_mgr->get_logs({entity.fqn}, true, min_severity, context_filter, entity_id);
-      if (!logs) {
-        return tl::unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, logs.error()));
-      }
-      response.items = parse_local_items(*logs);
+    if (!resolved.empty()) {
+      xm.component_count = static_cast<int64_t>(cache.get_components_for_area(entity_id).size());
+      xm.app_count = static_cast<int64_t>(resolved.size());
+      xm.aggregation_sources = std::vector<std::string>(resolved.begin(), resolved.end());
     }
   } else if (entity.type == EntityType::COMPONENT) {
-    // ---------------------------------------------------------------------
-    // COMPONENT - aggregate from hosted apps' fqns (mirrors AREA / FUNCTION
-    // semantics) and fall through to the entity.fqn prefix path only when
-    // the component has no hosted apps. Synthetic / runtime-discovered
-    // components have an empty fqn, so the bare prefix-match query that
-    // worked for manifest components silently returned zero items even
-    // when the component grouped 20+ active nodes.
-    // ---------------------------------------------------------------------
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
-    auto host_fqns = HandlerContext::resolve_app_host_fqns(cache, cache.get_apps_for_component(entity_id));
-
     xm.entity_id = entity_id;
     xm.aggregation_level = "component";
     xm.aggregated = true;
     xm_used = true;
-
-    if (!host_fqns.empty()) {
-      auto logs = log_mgr->get_logs(host_fqns, false, min_severity, context_filter, entity_id);
-      if (!logs) {
-        return tl::unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, logs.error()));
-      }
-      response.items = parse_local_items(*logs);
-      xm.app_count = static_cast<int64_t>(host_fqns.size());
-      xm.aggregation_sources = std::vector<std::string>(host_fqns.begin(), host_fqns.end());
-    } else if (!entity.fqn.empty()) {
-      // Manifest component without hosted apps - keep the original namespace
-      // prefix path so manifest-only deployments still work.
-      auto logs = log_mgr->get_logs({entity.fqn}, true, min_severity, context_filter, entity_id);
-      if (!logs) {
-        return tl::unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, logs.error()));
-      }
-      response.items = parse_local_items(*logs);
+    if (!resolved.empty()) {
+      xm.app_count = static_cast<int64_t>(resolved.size());
+      xm.aggregation_sources = std::vector<std::string>(resolved.begin(), resolved.end());
     }
-  } else {
-    // ---------------------------------------------------------------------
-    // APP - local query + fan-out to peers. APP responses only carry an
-    // x-medkit block when fan-out actually produced observability output;
-    // tracked via xm_used (still false here) and the final apply step below.
-    // ---------------------------------------------------------------------
-    auto logs = log_mgr->get_logs({entity.fqn}, false, min_severity, context_filter, entity_id);
-    if (!logs) {
-      return tl::unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, logs.error()));
-    }
-    response.items = parse_local_items(*logs);
   }
+  // APP: x-medkit only appears when fan-out below produces observability
+  // output; tracked via xm_used (still false here).
 
   // Typed fan-out for collection endpoints. Replaces the legacy raw-JSON
   // `merge_peer_items` mutator: peer items come back as parsed `dto::LogEntry`

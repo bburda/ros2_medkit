@@ -317,9 +317,10 @@ class HandlerContext {
    * and may be empty. Duplicate sources from manifest / runtime double-binds
    * are collapsed so they do not produce repeated downstream queries.
    *
-   * Used by log_handlers and bulkdata_handlers to aggregate per-component /
-   * per-function resource queries from the entity's hosted apps. Static + public
-   * to enable direct unit testing without standing up a full GatewayNode fixture.
+   * Order-preserving wrapper over the shared per-app rule for callers that
+   * resolve an explicit app-id list; whole-entity resolution goes through
+   * `resolve_entity_source_fqns`. Static + public for direct unit testing
+   * without standing up a full GatewayNode fixture.
    *
    * @param cache Entity cache to look up apps in
    * @param app_ids App IDs to resolve
@@ -329,31 +330,18 @@ class HandlerContext {
                                                         const std::vector<std::string> & app_ids);
 
   /**
-   * @brief Resolve an entity to the set of source FQNs it owns.
+   * @brief Resolve an entity to the set of reporting sources it owns.
    *
-   * Returns the FQNs of every ROS 2 node within the entity's scope. Used by
-   * fault handlers to filter `reporting_sources` so that per-entity routes
-   * never expose faults reported from outside the addressed entity.
+   * Thin adapter over `faults::resolve_entity_source_fqns` (the per-type
+   * mapping - incl. the external bare-id rule, subarea recursion and
+   * component-hosted functions - is documented there). Used by fault, log and
+   * bulk-data handlers so per-entity routes never expose resources reported
+   * from outside the addressed entity.
    *
-   * Mapping per entity type:
-   * - App: the app's `effective_fqn()` (single entry, or empty set if unbound
-   *   or if `ros_binding.namespace_pattern` is a wildcard - by design
-   *   `effective_fqn()` returns "" for those, so the entity simply has no
-   *   addressable ROS node and the scope check excludes every fault).
-   * - Component: `effective_fqn()` of every hosted app via
-   *   `get_apps_for_component()`.
-   * - Area: `effective_fqn()` of every app under the area, walking
-   *   `get_subareas()` recursively so nested areas (e.g. ``powertrain ->
-   *   engine``) resolve to the union of their descendants' apps.
-   * - Function: `effective_fqn()` of every app the function hosts directly
-   *   plus, for hosts that are component IDs, the apps inside those
-   *   components.
-   * - Unknown: empty set.
+   * Apps that own no source are silently dropped from the set so the scope
+   * check cannot match arbitrary FQNs against an empty prefix.
    *
-   * Apps whose `effective_fqn()` is empty are silently dropped from the set
-   * so the scope check cannot match arbitrary FQNs against an empty prefix.
-   *
-   * An empty result means "no apps are in scope" and callers must NEVER
+   * An empty result means "no sources are in scope" and callers must NEVER
    * interpret that as "no filter" - any fault must be treated as out of
    * scope. The exact response (404 for per-fault routes, an empty `items`
    * array for collection lists, 204 for collection clears) is up to the
@@ -361,7 +349,7 @@ class HandlerContext {
    *
    * @param cache Entity cache for lookups
    * @param entity Resolved entity info (from `validate_entity_for_route`)
-   * @return Set of FQNs that uniquely scopes faults to this entity
+   * @return Set of sources that uniquely scopes faults to this entity
    */
   static std::set<std::string> resolve_entity_source_fqns(const ThreadSafeEntityCache & cache,
                                                           const EntityInfo & entity);

@@ -1312,10 +1312,10 @@ TEST_F(AreaAggregationTest, AreaLogsWithNoComponentsFallsThrough) {
 // =============================================================================
 // resolve_app_host_fqns tests (no GatewayNode required)
 //
-// Used by log_handlers and bulkdata_handlers to aggregate per-component /
-// per-function resource queries from the entity's hosted apps. These tests
-// pin the silent-skip semantics (missing apps, empty effective_fqn) that
-// downstream callers rely on for the "synthetic component" fallback.
+// Order-preserving wrapper over faults::resolve_app_source_fqn for explicit
+// app-id lists. These tests pin the per-app rule (external -> bare id, stray
+// binding, bound_fqn preference) and the silent-skip semantics (missing apps,
+// empty effective_fqn).
 // =============================================================================
 
 namespace {
