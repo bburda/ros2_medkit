@@ -36,6 +36,7 @@ report a fault under the bare id, then observe it on every rollup route.
 """
 
 import os
+import time
 import unittest
 
 from ament_index_python.packages import get_package_share_directory
@@ -49,12 +50,17 @@ from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
+from std_msgs.msg import Float32
+
 
 EXTERNAL_APP = 'plc-process'
 HOST_COMPONENT = 's7-plc'
 HOST_FUNCTION = 'level-control'
 HOST_AREA = 'plc-cell'
 FAULT_CODE = 'PLC_LEVEL_OVERFLOW'
+# Topic the test publishes so the fault_manager's rosbag ring buffer has data
+# to flush when the fault confirms (no demo nodes run in this launch).
+LEVEL_TOPIC = '/plc_cell/level'
 
 
 def generate_test_description():
@@ -67,7 +73,10 @@ def generate_test_description():
         fault_manager=True,
         # Negative threshold: the fault confirms after a couple of FAILED
         # events (see _report_fault, which reports several times).
-        fault_manager_params={'confirmation_threshold': -2},
+        fault_manager_params={
+            'confirmation_threshold': -2,
+            'snapshots.rosbag.include_topics': [LEVEL_TOPIC],
+        },
         gateway_params={
             'discovery.mode': 'hybrid',
             'discovery.manifest_path': manifest_path,
@@ -86,14 +95,18 @@ class TestExternalAppFaultRollup(GatewayTestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Wait for the gateway + discovery (the external app, area and function
-        # must exist before we exercise the rollup routes).
-        super().setUpClass()
+        # Create the publisher BEFORE the gateway wait: the fault_manager's
+        # explicit-topic rosbag capture retries type discovery for only ~10s
+        # after startup, so LEVEL_TOPIC must be on the graph early.
         rclpy.init()
         cls._reporter = Node('external_app_fault_reporter')
+        cls._level_pub = cls._reporter.create_publisher(Float32, LEVEL_TOPIC, 10)
         cls._report_client = cls._reporter.create_client(
             ReportFault, '/fault_manager/report_fault'
         )
+        # Wait for the gateway + discovery (the external app, area and function
+        # must exist before we exercise the rollup routes).
+        super().setUpClass()
         assert cls._report_client.wait_for_service(timeout_sec=15.0), \
             'report_fault service not available'
 
@@ -131,6 +144,69 @@ class TestExternalAppFaultRollup(GatewayTestCase):
             # intentionally drop the reply future (see docstring).
             self._report_client.call_async(req)
             rclpy.spin_once(self._reporter, timeout_sec=0.1)
+
+    def _publish_level(self, seconds, period=0.05):
+        """Keep LEVEL_TOPIC flowing so the capture ring buffer is not empty."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self._level_pub.publish(Float32(data=42.0))
+            time.sleep(period)
+
+    def test_external_app_bulk_data_uris_serve_the_captured_bag(self):
+        """The advertised bulk_data_uri serves the bag on app AND area routes.
+
+        The rosbag captured when the external app's fault confirms is keyed by
+        the fault's reporting source - the app's bare entity id. Every route
+        that lists the fault must also serve its bag. The area case is the
+        regression: ``GET /areas/plc-cell/faults/<code>`` advertises
+        ``/areas/plc-cell/bulk-data/rosbags/<code>``, which 404'd while the
+        area resolved its bulk-data scope through the namespace path instead
+        of its hosted apps' reporting sources.
+
+        Runs before the rollup test (method order is alphabetical) and reports
+        the same fault code; the report is idempotent for both tests.
+
+        @verifies REQ_INTEROP_072
+        """
+        # Fill the capture buffer around the confirmation edge: the bag is
+        # flushed once, on CONFIRMED, from whatever the buffer holds.
+        self._publish_level(seconds=0.5)
+        self._report_fault()
+        self._publish_level(seconds=1.0)
+
+        self.wait_for_fault(f'/apps/{EXTERNAL_APP}', FAULT_CODE)
+        bag_id = self.wait_for_fault_with_rosbag(f'/apps/{EXTERNAL_APP}')
+        self.assertEqual(bag_id, FAULT_CODE)
+
+        # App-level download: 200 + bytes.
+        app_uri = f'/apps/{EXTERNAL_APP}/bulk-data/rosbags/{FAULT_CODE}'
+        resp = self.get_raw(app_uri)
+        self.assertGreater(len(resp.content), 0, f'{app_uri} returned no bytes')
+
+        # Area rollup advertises an area-scoped URI for the same bag.
+        detail = self.wait_for_fault_detail(
+            f'/areas/{HOST_AREA}', snapshot_types={'rosbag'})
+        rosbag_snaps = [
+            s for s in detail['environment_data']['snapshots']
+            if s.get('type') == 'rosbag'
+        ]
+        self.assertTrue(
+            rosbag_snaps, 'area fault detail lost the rosbag snapshot')
+        area_uri = rosbag_snaps[0].get('bulk_data_uri')
+        self.assertEqual(
+            area_uri, f'/areas/{HOST_AREA}/bulk-data/rosbags/{FAULT_CODE}')
+
+        # The area listing shows the bag and the advertised URI downloads.
+        listing = self.get_json(f'/areas/{HOST_AREA}/bulk-data/rosbags')
+        listed_ids = [item.get('id') for item in listing.get('items', [])]
+        self.assertIn(FAULT_CODE, listed_ids)
+        resp = self.get_raw(area_uri)
+        self.assertGreater(len(resp.content), 0, f'{area_uri} returned no bytes')
+
+        # Function rollup resolves the same scope.
+        listing = self.get_json(f'/functions/{HOST_FUNCTION}/bulk-data/rosbags')
+        listed_ids = [item.get('id') for item in listing.get('items', [])]
+        self.assertIn(FAULT_CODE, listed_ids)
 
     def test_external_app_fault_appears_on_every_rollup(self):
         """The external app's fault surfaces on app, component, function, area.
