@@ -181,7 +181,17 @@ values (from the owning plugin's ``DataProvider``, i.e. the latest polled
 values) when the fault confirms, and merges them into the fault detail's
 ``environment_data.snapshots`` as a standard ``freeze_frame`` entry named
 after the entity - unless the fault manager already captured a freeze-frame
-for that fault (explicit config wins). Disable with:
+for that fault (explicit config wins).
+
+Faults that are already confirmed when the gateway starts are caught up at
+startup: the gateway lists the confirmed faults and captures a frame for each
+plugin-backed one, so a device standing in fault across a gateway restart
+still gets a frame. Catch-up frames carry ``"capture_origin": "startup"`` in
+their ``x-medkit`` block because their values were read at gateway start, not
+when the fault confirmed (which may be long before, since the fault manager
+persists faults); ``captured_at`` always stamps the moment the values were
+read. Frames without the marker were captured on the confirm edge. Disable
+with:
 
 .. code-block:: bash
 
@@ -265,7 +275,9 @@ Snapshots are included inline in the fault response as ``environment_data``:
 
 **Snapshot Types:**
 
-- ``freeze_frame``: Topic data captured at fault confirmation (JSON format)
+- ``freeze_frame``: Topic data captured at fault confirmation (JSON format).
+  Entity frames caught up for faults that predate the gateway are captured at
+  gateway start instead, marked ``x-medkit.capture_origin: startup``.
 - ``rosbag``: Recording file available via bulk-data endpoint (binary format)
 
 **Get snapshots from fault response using jq:**

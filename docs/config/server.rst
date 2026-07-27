@@ -202,8 +202,11 @@ Configure how the gateway connects to the fault manager services and event topic
      - Zero-config freeze-frames for plugin-backed entities: when a fault from a
        plugin-owned entity confirms, snapshot the entity's current data values
        (via its plugin's DataProvider) and merge them into the fault detail's
-       ``environment_data.snapshots``. Explicit snapshot config in the fault
-       manager always wins when present. Only active when plugins are loaded.
+       ``environment_data.snapshots``. Faults already confirmed at gateway start
+       are caught up at startup; those frames read the values at start time (not
+       confirm time) and are marked ``x-medkit.capture_origin: startup``.
+       Explicit snapshot config in the fault manager always wins when present.
+       Only active when plugins are loaded.
 
 When ``fault_manager.namespace`` is set, the gateway also subscribes to the matching
 fault event topic (for example ``/robot1/fault_manager/events`` instead of the default
