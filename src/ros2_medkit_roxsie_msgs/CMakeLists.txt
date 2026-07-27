@@ -22,7 +22,8 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/AlarmEvent.msg"
+  "msg/Alarm.msg"
+  "msg/AlarmList.msg"
   "msg/DiagnosticsStatus.msg"
   DEPENDENCIES builtin_interfaces
 )

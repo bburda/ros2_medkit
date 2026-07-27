@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# DiagnosticsStatus.msg - aggregate diagnostics state sent towards the PLC.
+# DiagnosticsStatus.msg - what the diagnostics side asks of the machine.
 #
-# Published by ros2_medkit_roxsie_bridge, consumed by the ROXSIE generated node,
-# which writes the values into a consumed data block the PLC program reads.
+# Written into a consumed data block by the PLC-side node. This is everything we
+# put inside the PLC. Faults stay on the ROS 2 side and whoever wants them reads
+# them over REST.
 #
-# This is everything we put inside the PLC. Faults stay on the ROS 2 side and
-# whoever wants them reads them over REST. The PLC only needs something it can
-# switch on: a lamp, and a bit it can interlock on. Four numbers, no strings,
-# no lists.
+# It says what we are asking for, not what to display. Machines already have a
+# state machine and, where PackML is used, a block that turns machine state into
+# signal column bits. We do not drive lamps; we hand the machine a condition its
+# own logic can act on. Two writers on one lamp is a fault of its own.
 
 # Liveness counter of the diagnostics layer, incremented about once per second.
 #
@@ -29,23 +30,22 @@
 # nothing.
 uint16 heartbeat
 
-# Highest severity among the active faults in scope, whatever reported them:
-# a PLC alarm, a robot node, or anything else on the ROS 2 side.
-# Values follow ros2_medkit_msgs/Fault SEVERITY_* semantics: 0 INFO, 1 WARN,
-# 2 ERROR, 3 CRITICAL. Typically drives the signal column.
-uint8 aggregate_severity
-
-# Number of active faults in scope. Optional indicator on the panel.
-uint16 active_fault_count
-
-# Coarse fault classes currently active, one bit per class.
+# What we are asking the machine to do about the faults in scope.
 #
-# Intended for machine logic, for example an interlock that must not depend on
-# reading a fault list. The mapping from fault codes to bits is deployment
-# configuration on the ROS 2 side, not a fixed catalogue in this message.
+# The wording follows the colour semantics the signalling standards already use,
+# so an integrator can wire it without a translation table.
+uint8 condition
+uint8 CONDITION_OK = 0
+uint8 CONDITION_ABNORMAL = 1
+uint8 CONDITION_ACTION_REQUIRED = 2
+uint8 CONDITION_STOP = 3
+
+# Optional, for machine logic only, one bit per coarse fault class. Meant for an
+# interlock that must not depend on reading a fault list. Which fault sets which
+# bit is deployment configuration on the ROS 2 side. Zero when unused.
 uint16 class_bitmask
 
-# Which part of the plant this status covers, expressed as an entity in the SOVD
-# tree, e.g. an area or a component id. Lets one diagnostics instance serve
-# several cells without them seeing each other's faults.
+# Which part of the plant this status covers, as an entity in the SOVD tree, e.g.
+# an area or a component id. Lets one diagnostics instance serve several cells
+# without them seeing each other's faults.
 string scope

@@ -11,42 +11,66 @@ config, exchanged over shared memory on the host. The generated node sits on the
 graph, so anything already listening to that graph can read the data.
 
 That covers process values. It does not cover alarms, because alarms live in the CPU
-message system and not in a data block: numbered alarms, coming and going states,
-acknowledgement, and the values the alarm system latched when the alarm fired.
+message system and not in a data block.
 
 So on a machine with a SIMATIC PLC and ROS 2 you still have two separate lists of what is
 wrong. To join them today you either read alarm bits over a protocol and rebuild their
 meaning from an engineering export, or someone copies the alarms by hand into a second
 list on the panel. Both drift.
 
-This package holds the two message definitions for that exchange. It has no runtime code,
-only ``.msg`` definitions that ``rosidl`` compiles into C++ and Python bindings.
+This package holds the messages for that exchange. It has no runtime code, only ``.msg``
+definitions that ``rosidl`` compiles into C++ and Python bindings.
 
-Design
-------
+A Picture, Not a Stream
+-----------------------
 
-The two directions are not the same size, on purpose. Every alarm goes out with its full
-context as ``AlarmEvent``: which alarm, coming or going, acked or not, the PLC timestamp,
-and the latched values. The bridge turns each event into a fault with a freeze-frame, and
-into an audit trail entry when the audit log is on. Back the other way we send four numbers
-as ``DiagnosticsStatus``, and the generated node writes them into a consumed data block.
+``AlarmList`` carries every alarm that is active or waiting for acknowledgement, published
+cyclically. Two reasons.
 
-Those four numbers cover every active fault in scope, not only the ones that came from the
-PLC. A navigation fault on the robot moves the same severity and the same bits, which is
-how a ROS 2 problem reaches the signal column.
+The transport is cyclic anyway. The PLC-side node reads a data block at a fixed rate, so a
+picture is what it naturally has. An event stream would be built on top of that and would
+need its own delivery guarantees.
 
-Alarm text has no fixed length and changes with the project. A PLC that handles strings
-loses determinism, and determinism is why it is there. Writing the fault list into the PLC
-would give us two lists, and two lists drift.
+A picture also survives a restart. Whoever restarts, the next cycle carries the full truth
+again. An event stream loses whatever happened while it was away, and the consumer cannot
+tell an empty stream from a healthy machine. The gap is not hypothetical: reading alarms
+over OPC UA has the same hole, because no table of pending alarms is served on reconnect.
 
-The PLC only needs something it can switch on: a lamp for the operator, a bit for an
-interlock. Whoever wants the detail reads it over REST.
+The bridge compares consecutive pictures. An entry that appears is reported as a fault, an
+entry that disappears heals it. Debounce, freeze-frame capture and the audit trail are the
+same ones every other fault source in medkit goes through.
 
-Alarm text does not travel at runtime. The generator writes an alarm number to text table
-next to the code, and the bridge looks the text up on the ROS 2 side.
+Two Ways to Fill the List
+-------------------------
 
-Acknowledgement is one shared value. The operator acks on the panel or a client acks over
-REST, and both sides see the same thing.
+**From bits.** The customer declares alarm bits in a data block and ROXSIE carries them
+like any other declared data. Nothing new is needed on the generator side, so this path
+works today. ``alarm_class``, ``priority``, ``producer``, ``plc_timestamp`` and
+``associated_values`` stay empty, and the freeze-frame comes from the process topics the
+same deployment already carries. Acknowledgement is a bit, so either side can set it.
+
+**From the CPU alarm system.** Generated code reads the alarm system with ``Get_Alarm`` and
+mirrors it into the data block. Still no OPC UA and no license. This fills everything the
+message can hold:
+
+* the event time from the CPU clock, rather than the moment ROS 2 noticed
+* the alarm class, which says whether the alarm needs acknowledgement
+* the priority the plant already engineers with, 0 to 16
+* the values the alarm system latched when the alarm fired, capped by the CPU at 512 bytes
+  across all of them
+
+It also picks up alarms nobody declared. The CPU message system carries system
+diagnostics, ProDiag, GRAPH, motion and security alarms, and ``producer`` says which one an
+entry came from. A module fault or a drive alarm arrives without any extra engineering,
+which is the strongest argument for this path.
+
+The trade is acknowledgement. The CPU owns the acknowledged state and has no per-alarm
+acknowledge instruction, so setting it for a single alarm needs the panel or OPC UA. We
+mirror it rather than write it.
+
+One cost worth naming: ``Get_Alarm`` reads from a queue, one entry at a time, while the
+data block has to hold a picture. The generated code has to keep that picture itself. That
+is real work, not a flag.
 
 Architecture
 ------------
@@ -60,9 +84,10 @@ Architecture
 
    package "SIMATIC PLC" {
        [CPU alarm system] as AS
-       [ROXSIE generated blocks] as GEN
+       [Alarm bits] as BITS
+       [Alarm list block] as GEN
        [Consumed status block] as DB
-       [Signal column\nMachine interlocks] as SIG
+       [Machine logic\nSignal column] as SIG
    }
 
    package "ROS 2" {
@@ -74,14 +99,14 @@ Architecture
 
    [Panel page, dashboards,\nmaintenance clients] as CONS
 
-   AS --> GEN : alarm events
+   AS --> GEN : Get_Alarm
+   BITS --> GEN : bit path
    GEN --> NODE : shared memory
-   NODE --> BR : AlarmEvent
+   NODE --> BR : AlarmList
    BR --> FM : ReportFault
    FM --> BR : fault events
    BR --> NODE : DiagnosticsStatus
-   NODE --> GEN : shared memory
-   GEN --> DB
+   NODE --> DB : shared memory
    DB --> SIG
    FM -- GW
    GW --> CONS : HTTPS
@@ -92,22 +117,24 @@ The generated node talks to the PLC over shared memory on the same host, but pub
 the ROS 2 graph over the network. So the diagnostics side does not have to run on the
 controller. It subscribes like any other ROS 2 participant.
 
-What the Generator Has to Provide
----------------------------------
+What Goes Back Into the PLC
+---------------------------
 
-The messages only describe the wire. The generated code is what gets the alarms out, so
-these belong to the contract:
+One value and a heartbeat. ``DiagnosticsStatus`` says what the diagnostics side is asking
+of the machine: nothing, something is abnormal, someone has to act, or stop.
 
-* **Read the CPU message system, not a data block mirror.** That is where alarm events
-  are.
-* **Put the latched values into the message.** If you read them again later, the
-  freeze-frame looks right and is wrong.
-* **Use the PLC clock for** ``plc_timestamp``, not the publish time.
-* **After a restart, send the alarms that are still active.** Otherwise an active alarm
-  disappears from our side until it goes away by itself.
-* **Emit the alarm number to text table** when you generate the code.
-* **Write the four values into the consumed data block**, so a watchdog in the program
-  can raise its own alarm when the heartbeat stops.
+It does not say what to light up. Machines already have a state machine, and where PackML
+is used, a block that turns machine state into signal column bits according to
+ISA TR88.00.02. Driving the lamp ourselves would put two writers on it. We hand over a
+condition and let the machine's own logic decide what that means for the lamp, for an
+interlock, or for a state transition.
+
+The condition covers every active fault in scope, not only the ones that came from the PLC.
+A navigation fault on the robot moves the same value, which is how a problem on the ROS 2
+side reaches an operator who never looks at a screen.
+
+``class_bitmask`` is there for machine logic that needs to interlock on a kind of fault
+without reading a list. Which fault sets which bit is deployment configuration.
 
 Message Definitions
 -------------------
@@ -118,32 +145,17 @@ Message Definitions
 
    * - Message
      - Purpose
-   * - ``AlarmEvent.msg``
-     - One alarm event from the CPU alarm system: identifier, source, class, coming or
-       going, acknowledgement state, PLC timestamp, latched values
+   * - ``Alarm.msg``
+     - One alarm: identity, source, class, priority, producer, active and acknowledged
+       flags, PLC timestamp, latched values
+   * - ``AlarmList.msg``
+     - The cyclic picture: every alarm active or not yet acknowledged
    * - ``DiagnosticsStatus.msg``
-     - Aggregate diagnostics state towards the PLC: heartbeat, worst severity, active
-       count, coarse class bits, scope
+     - What the diagnostics side asks of the machine: heartbeat, condition, class bits,
+       scope
 
-Lifecycle
----------
-
-A PLC alarm and a medkit fault model the same thing, so the mapping is direct.
-
-.. list-table::
-   :header-rows: 1
-   :widths: 40 60
-
-   * - Alarm event
-     - Fault behaviour
-   * - ``STATE_COMING``
-     - Reported as a FAILED event; debounce confirms it and a freeze-frame is captured
-       from the latched values
-   * - ``STATE_GOING``
-     - Reported as a PASSED event; the fault heals but is not deleted, so history stays
-       for the audit trail
-   * - ``ACK_ACKNOWLEDGED``
-     - The fault is cleared; the acknowledgement is the same state on both sides
+Alarm text does not travel at runtime. The text belongs to the project, changes with the
+project, and is resolved on the ROS 2 side from a table that ships with the deployment.
 
 Failure Behaviour
 -----------------
@@ -156,24 +168,52 @@ Failure Behaviour
      - Behaviour
    * - Diagnostics layer or link down
      - The heartbeat stops and a watchdog in the PLC program raises its own alarm, so the
-       plant sees that diagnostics are offline rather than a stale healthy state
+       plant sees that diagnostics are down rather than a green light that means nothing
    * - PLC or the generated node down
      - The bridge reports a communications fault on the ROS 2 side
-   * - Bridge restarts
-     - Currently pending alarms are re-published, so a restart does not silently lose
-       active alarms
+   * - Anything restarts
+     - The next picture carries the full set of active alarms, so nothing is silently lost
 
 The first row matters most. If our layer dies, the plant has to see it.
+
+What Comes After
+----------------
+
+This package covers alarms from the PLC and one condition back. Two extensions follow, both
+shaped by what a deployment needs rather than by what is interesting to build.
+
+**OpenTelemetry as another fault source.** A cell is more than a PLC and a robot. The switch
+that flaps, the controller that runs hot, the compute in another building that this machine
+depends on - none of them speak the PLC alarm system, and most of them already speak
+OpenTelemetry. Every one of those vendors ships its own API, and asking each of them for an
+integration does not scale; asking all of them for OpenTelemetry does. An OTLP receiver next
+to this bridge would leave three things to settle: which signal becomes a fault, where log
+records at error level are the obvious answer and metrics the more interesting one, since
+``ros2_medkit_fault_detection`` already evaluates thresholds and status words for PLC tags
+and can take a metric the same way; which entity a stream belongs to, since resource
+attributes have to map onto the tree or every host lands in one unattached pile; and what
+the operator sees, which needs no new wiring, because an IT fault in the same list already
+moves the condition that reaches the signal column.
+
+**OpenTelemetry as an export.** The same faults served over REST can be emitted as
+OpenTelemetry, and the per-scope condition as a metric. Two renderings of one state, not two
+sources of truth. Teams that already run an observability pipeline add a source rather than
+integrate an API.
+
+Neither exists today. There is a hook where an exporter plugs in and nothing behind it.
+Building it against a concrete consumer beats guessing at a generic one.
 
 Open Questions
 --------------
 
-#. Is ``alarm_id`` unique per CPU, or only per block? If only per block, the unique key
-   has to be ``(source, alarm_id)`` and the bridge cannot key on the number alone.
-#. Numeric or typed associated values? Numeric keeps the message fixed-size and cheap on
-   the PLC side; typed is richer but reintroduces strings.
-#. Can the generated code acknowledge an alarm in the CPU alarm system, or is
-   acknowledgement panel-only? It decides whether an acknowledgement made on the ROS 2
-   side can reach the native alarm list.
-#. Who owns the class catalogue behind ``class_bitmask``, and is 16 bits enough?
-#. Topic names and QoS for the two topics, and whether they are namespaced per cell.
+#. Is ``alarm_id`` unique per CPU, or only per block? If only per block, the key has to be
+   ``(source, alarm_id)``.
+#. Where does the alarm number to text table come from - the project export the generator
+   already reads, or a separate export?
+#. How many entries can the generated data block hold? The array is fixed size once
+   generated, and a plant can declare hundreds of alarms. If the ceiling is low, the fill
+   has to prioritise and say that it truncated.
+#. Is there any per-alarm acknowledge path in the CPU that we have missed? If not,
+   acknowledgement from the ROS 2 side stays a bit-path feature.
+#. Numeric associated values, or typed? Numeric keeps the entry fixed size. Typed carries
+   more and brings strings back.
