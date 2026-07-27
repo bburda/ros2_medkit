@@ -128,8 +128,18 @@ Ros2FaultServiceTransport::~Ros2FaultServiceTransport() {
 }
 
 bool Ros2FaultServiceTransport::wait_for_services(std::chrono::duration<double> timeout) {
-  return report_fault_client_->wait_for_service(timeout) && get_fault_client_->wait_for_service(timeout) &&
-         list_faults_client_->wait_for_service(timeout) && clear_fault_client_->wait_for_service(timeout);
+  // One deadline shared by all four waits: per-client timeouts would stack to
+  // 4x on an absent fault manager. Clamped to 0 (= non-blocking check) because
+  // a negative rclcpp timeout means wait forever.
+  const auto clamped = std::chrono::duration<double>(std::max(timeout.count(), 0.0));
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(clamped);
+  const auto remaining = [deadline] {
+    return std::max(std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()),
+                    std::chrono::duration<double>::zero());
+  };
+  return report_fault_client_->wait_for_service(remaining()) && get_fault_client_->wait_for_service(remaining()) &&
+         list_faults_client_->wait_for_service(remaining()) && clear_fault_client_->wait_for_service(remaining());
 }
 
 bool Ros2FaultServiceTransport::is_available() const {

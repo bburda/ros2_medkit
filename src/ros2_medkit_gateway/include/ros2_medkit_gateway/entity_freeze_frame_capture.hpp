@@ -65,6 +65,9 @@ class EntityFreezeFrameCapture {
     std::string entity_id;
     nlohmann::json values;  ///< compact {resource_id: value} dict
     int64_t captured_at_ns{0};
+    /// True when the frame comes from the startup catch-up: captured_at_ns is
+    /// then the gateway's start, possibly long after the fault confirmed.
+    bool startup_catchup{false};
   };
 
   /// Resolves an entity id to its owning plugin's DataProvider (nullptr when
@@ -88,8 +91,10 @@ class EntityFreezeFrameCapture {
   /// Lists the faults that are already confirmed when this object starts, so
   /// their missed confirm edge can still be framed. Called once, on the capture
   /// thread (it may block on a service becoming available), never after the
-  /// destructor has joined that thread - so it must not outlive its owner.
-  using StandingFaultLister = std::function<std::vector<StandingFault>()>;
+  /// destructor has joined that thread - so it must not outlive its owner. Any
+  /// blocking wait inside must poll should_abort and bail when it turns true:
+  /// that is what lets the destructor's join interrupt the wait.
+  using StandingFaultLister = std::function<std::vector<StandingFault>(const std::function<bool()> & should_abort)>;
 
   /**
    * @param node ROS 2 node used to resolve the fault-events topic name and logger
@@ -133,6 +138,13 @@ class EntityFreezeFrameCapture {
   /// Rejects the {} / all-null rows a cold poll cache or dead link yields.
   static bool values_have_data(const nlohmann::json & values);
 
+  /// Parse a fault-transport ListFaults reply body into standing faults.
+  /// Returns nullopt when the body is not shaped like a ListFaults answer (no
+  /// "faults" array). Total over untrusted content: items that are not objects
+  /// or lack a string "fault_code" / array "reporting_sources" are skipped,
+  /// non-string source entries are dropped, nothing throws.
+  static std::optional<std::vector<StandingFault>> standing_faults_from_list_reply(const nlohmann::json & data);
+
  private:
   /// Subscription-worker side: filter for EVENT_CONFIRMED and enqueue only.
   void on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::ConstSharedPtr & msg);
@@ -144,11 +156,22 @@ class EntityFreezeFrameCapture {
   /// plugins start reporting while the gateway is still wiring the capture, so
   /// a device that is in fault at boot confirms to nobody. Frames are
   /// process-local, so this restores what the missed edge would have produced
-  /// rather than duplicating anything. Runs on capture_thread_.
+  /// rather than duplicating anything. Runs on capture_thread_. Capped at
+  /// max_faults_ stored frames so the catch-up cannot FIFO-evict its own
+  /// earlier frames; fault codes with a confirm already queued are left to the
+  /// drain loop (one plugin read per confirm).
   void capture_standing_faults();
 
+  /// Bounded, abortable wait until the events subscription has a matched
+  /// publisher. Orders the standing-fault snapshot after matching: a confirm
+  /// published after the snapshot but before the reader matches would
+  /// otherwise be missed by both paths.
+  void wait_for_events_publisher(const std::function<bool()> & should_abort) const;
+
   /// Per-event capture (all plugin calls happen here, on capture_thread_).
-  void capture_for_event(const ros2_medkit_msgs::msg::FaultEvent & event);
+  /// Returns true when at least one frame was stored; startup_catchup marks
+  /// the stored frames as catch-up captures.
+  bool capture_for_event(const ros2_medkit_msgs::msg::FaultEvent & event, bool startup_catchup = false);
 
   /// Build a frame from list-data-shaped content, enforcing the shared
   /// no-row-of-nulls invariant on both capture paths.

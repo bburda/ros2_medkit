@@ -17,10 +17,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <rclcpp/rclcpp.hpp>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -212,6 +214,7 @@ TEST_F(EntityFreezeFrameCaptureTest, ConfirmedPluginFaultCapturesEntityValues) {
   EXPECT_DOUBLE_EQ(frames[0].values.value("temperature", 0.0), 42.5);
   EXPECT_DOUBLE_EQ(frames[0].values.value("pressure", 0.0), 3.2);
   EXPECT_GT(frames[0].captured_at_ns, 0);
+  EXPECT_FALSE(frames[0].startup_catchup);  // live confirm edge, not catch-up
 }
 
 /// @verifies REQ_INTEROP_088
@@ -259,12 +262,12 @@ TEST_F(EntityFreezeFrameCaptureTest, StandingFaultsAreFramedWithoutAnyEvent) {
         return json{{"connected", true}, {"items", json::array({{{"name", "level"}, {"value", 7.0}}})}};
       },
       256,
-      []() -> std::vector<EntityFreezeFrameCapture::StandingFault> {
+      [](const std::function<bool()> &) -> std::vector<EntityFreezeFrameCapture::StandingFault> {
         return {{"PLC_STANDING", {"route_plc_app"}}};
       });
 
   // No publish at all - the frame must appear from the catch-up alone.
-  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
   while (capture.frames_for("PLC_STANDING").empty() && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(20ms);
   }
@@ -272,14 +275,15 @@ TEST_F(EntityFreezeFrameCaptureTest, StandingFaultsAreFramedWithoutAnyEvent) {
   ASSERT_EQ(frames.size(), 1u);
   EXPECT_EQ(frames[0].entity_id, "route_plc_app");
   EXPECT_DOUBLE_EQ(frames[0].values.value("level", 0.0), 7.0);
+  EXPECT_TRUE(frames[0].startup_catchup);  // consumers can tell catch-up frames apart
 }
 
 /// @verifies REQ_INTEROP_088
-TEST_F(EntityFreezeFrameCaptureTest, LiveConfirmFrameWinsOverStandingCatchUp) {
-  // Both paths carry the same fault code. The catch-up runs first, on the
-  // capture thread, and the confirm that arrived meanwhile is drained by the
-  // same thread afterwards - so the live frame is the one that survives.
-  // Distinct entity ids make the winner unambiguous.
+TEST_F(EntityFreezeFrameCaptureTest, QueuedLiveConfirmDedupesStandingCatchUp) {
+  // Both paths carry the same fault code and the confirm is already queued
+  // when the catch-up snapshots the queue: the catch-up must skip that code
+  // entirely (one plugin read per confirm, no double capture) and the drain
+  // loop's live frame is the one that lands.
   std::atomic<bool> published{false};
   std::atomic<bool> standing_sampled{false};
   EntityFreezeFrameCapture capture(
@@ -300,14 +304,14 @@ TEST_F(EntityFreezeFrameCaptureTest, LiveConfirmFrameWinsOverStandingCatchUp) {
         return json{{"connected", true}, {"items", json::array({{{"name", "level"}, {"value", level}}})}};
       },
       256,
-      [&published]() -> std::vector<EntityFreezeFrameCapture::StandingFault> {
-        // Hold the catch-up until the live confirm is in flight so the two
-        // genuinely overlap instead of running far apart.
+      [&published](const std::function<bool()> &) -> std::vector<EntityFreezeFrameCapture::StandingFault> {
+        // Hold the catch-up until the live confirm has reached the queue so
+        // the standing entry and the queued event genuinely overlap.
         const auto deadline = std::chrono::steady_clock::now() + 5s;
         while (!published.load() && std::chrono::steady_clock::now() < deadline) {
           std::this_thread::sleep_for(10ms);
         }
-        std::this_thread::sleep_for(200ms);  // let the event reach the queue
+        std::this_thread::sleep_for(500ms);  // let the event reach the queue
         return {{"PLC_BOTH_PATHS", {"route_standing_app"}}};
       });
 
@@ -320,26 +324,142 @@ TEST_F(EntityFreezeFrameCaptureTest, LiveConfirmFrameWinsOverStandingCatchUp) {
   std::vector<EntityFreezeFrameCapture::Frame> frames;
   while (std::chrono::steady_clock::now() < deadline) {
     frames = capture.frames_for("PLC_BOTH_PATHS");
-    if (!frames.empty() && frames[0].entity_id == "route_live_app") {
+    if (!frames.empty()) {
       break;
     }
-    publisher_->publish(live);
     std::this_thread::sleep_for(20ms);
   }
 
-  // The catch-up precedes the drain loop, so it has necessarily sampled by the
-  // time the live frame lands.
-  EXPECT_TRUE(standing_sampled.load());
+  // The queued confirm dedupes the catch-up: the standing entity was never
+  // sampled and the only frame is the live one.
+  EXPECT_FALSE(standing_sampled.load());
   ASSERT_EQ(frames.size(), 1u);
   EXPECT_EQ(frames[0].entity_id, "route_live_app");
   EXPECT_DOUBLE_EQ(frames[0].values.value("level", 0.0), 99.0);
+  EXPECT_FALSE(frames[0].startup_catchup);
+}
 
-  // ...and nothing may overwrite it afterwards either.
+/// @verifies REQ_INTEROP_088
+TEST_F(EntityFreezeFrameCaptureTest, ThrowingListerDoesNotKillCaptureThread) {
+  // The lister runs on the capture thread's entry path: an escaping exception
+  // there is std::terminate. It must be swallowed, and the drain loop must
+  // still capture live confirms afterwards.
+  EntityFreezeFrameCapture capture(
+      node_.get(), *sub_exec_,
+      [this](const std::string & entity_id) -> DataProvider * {
+        return entity_id == "plc_app" ? provider_.get() : nullptr;
+      },
+      nullptr, 256,
+      [](const std::function<bool()> &) -> std::vector<EntityFreezeFrameCapture::StandingFault> {
+        throw std::runtime_error("fault services exploded");
+      });
+
+  ASSERT_TRUE(publish_and_wait(capture, make_confirmed_event("PLC_AFTER_THROW", {"plc_app"})));
+  EXPECT_FALSE(capture.frames_for("PLC_AFTER_THROW").empty());
+}
+
+/// @verifies REQ_INTEROP_088
+TEST_F(EntityFreezeFrameCaptureTest, DestructionAbortsBlockedLister) {
+  // A lister stuck waiting for the fault services must not hold the
+  // destructor's join for its full timeout: should_abort turns true on stop.
+  std::atomic<bool> entered{false};
+  std::atomic<bool> abort_seen{false};
+  auto capture = std::make_unique<EntityFreezeFrameCapture>(
+      node_.get(), *sub_exec_,
+      [](const std::string &) -> DataProvider * {
+        return nullptr;
+      },
+      nullptr, 256,
+      [&](const std::function<bool()> & should_abort) -> std::vector<EntityFreezeFrameCapture::StandingFault> {
+        entered.store(true);
+        while (!should_abort()) {  // stands in for the bounded service wait
+          std::this_thread::sleep_for(10ms);
+        }
+        abort_seen.store(true);
+        return {};
+      });
+
+  const auto entry_deadline = std::chrono::steady_clock::now() + 15s;
+  while (!entered.load() && std::chrono::steady_clock::now() < entry_deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(entered.load());
+
+  const auto start = std::chrono::steady_clock::now();
+  capture.reset();
+  EXPECT_TRUE(abort_seen.load());
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
+}
+
+/// @verifies REQ_INTEROP_088
+TEST_F(EntityFreezeFrameCaptureTest, ListerRunsOnlyAfterEventsPublisherMatched) {
+  // ~/events is reliable but volatile on both ends: a confirm published after
+  // the standing snapshot but before the reader matches would be missed by
+  // both paths. The catch-up must therefore wait for a matched publisher
+  // before calling the lister.
+  publisher_.reset();                  // no events publisher exists yet
+  std::this_thread::sleep_for(250ms);  // let the graph forget it
+  std::atomic<bool> publisher_created{false};
+  std::atomic<bool> lister_ran{false};
+  std::atomic<bool> saw_publisher{false};
+  EntityFreezeFrameCapture capture(
+      node_.get(), *sub_exec_,
+      [](const std::string &) -> DataProvider * {
+        return nullptr;
+      },
+      nullptr, 256,
+      [&](const std::function<bool()> &) -> std::vector<EntityFreezeFrameCapture::StandingFault> {
+        saw_publisher.store(publisher_created.load());
+        lister_ran.store(true);
+        return {};
+      });
+
+  // Ample time for an unordered catch-up to have run before any publisher.
   std::this_thread::sleep_for(500ms);
-  const auto settled = capture.frames_for("PLC_BOTH_PATHS");
-  ASSERT_EQ(settled.size(), 1u);
-  EXPECT_EQ(settled[0].entity_id, "route_live_app");
-  EXPECT_DOUBLE_EQ(settled[0].values.value("level", 0.0), 99.0);
+  publisher_created.store(true);
+  publisher_ = publisher_node_->create_publisher<FaultEvent>("/fault_manager/events", rclcpp::QoS(100).reliable());
+
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  while (!lister_ran.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(lister_ran.load());
+  EXPECT_TRUE(saw_publisher.load());
+}
+
+/// @verifies REQ_INTEROP_088
+TEST_F(EntityFreezeFrameCaptureTest, CatchUpCapsStoredFramesAtMaxFaults) {
+  // max_faults = 2. The no-data fault must not consume the cap (nothing was
+  // stored for it), and the fault past the cap must be skipped instead of
+  // FIFO-evicting the catch-up's own earliest frame.
+  EntityFreezeFrameCapture capture(
+      node_.get(), *sub_exec_,
+      [](const std::string &) -> DataProvider * {
+        return nullptr;
+      },
+      [](const std::string & entity_id) -> std::optional<json> {
+        if (entity_id == "route_no_data_app") {
+          return json{{"connected", false}};  // dead row: no frame stored
+        }
+        return json{{"connected", true}, {"items", json::array({{{"name", "level"}, {"value", 7.0}}})}};
+      },
+      /*max_faults=*/2,
+      [](const std::function<bool()> &) -> std::vector<EntityFreezeFrameCapture::StandingFault> {
+        return {{"PLC_CAP_NO_DATA", {"route_no_data_app"}},
+                {"PLC_CAP_A", {"route_a"}},
+                {"PLC_CAP_B", {"route_b"}},
+                {"PLC_CAP_C", {"route_c"}}};
+      });
+
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  while (capture.frames_for("PLC_CAP_B").empty() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(20ms);
+  }
+  std::this_thread::sleep_for(300ms);  // would be enough for an uncapped C capture
+  EXPECT_TRUE(capture.frames_for("PLC_CAP_NO_DATA").empty());
+  EXPECT_FALSE(capture.frames_for("PLC_CAP_A").empty());  // not evicted by C
+  EXPECT_FALSE(capture.frames_for("PLC_CAP_B").empty());
+  EXPECT_TRUE(capture.frames_for("PLC_CAP_C").empty());  // past the cap
 }
 
 /// @verifies REQ_INTEROP_088
@@ -545,6 +665,46 @@ TEST(ValuesFromListContent, NonStringIdOrNameNeverThrows) {
   EXPECT_EQ(values, json({{"b", 2}}));
 }
 
+TEST(StandingFaultsFromListReply, ParsesWellFormedReply) {
+  const json data = {{"faults", json::array({json{{"fault_code", "F1"}, {"reporting_sources", json::array({"a", "b"})}},
+                                             json{{"fault_code", "F2"}, {"reporting_sources", json::array()}}})},
+                     {"count", 2}};
+  const auto standing = EntityFreezeFrameCapture::standing_faults_from_list_reply(data);
+  ASSERT_TRUE(standing.has_value());
+  ASSERT_EQ(standing->size(), 2u);
+  EXPECT_EQ((*standing)[0].fault_code, "F1");
+  EXPECT_EQ((*standing)[0].reporting_sources, (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ((*standing)[1].fault_code, "F2");
+  EXPECT_TRUE((*standing)[1].reporting_sources.empty());
+}
+
+TEST(StandingFaultsFromListReply, RepliesNotShapedLikeListFaultsYieldNullopt) {
+  // nullopt (vs empty vector) is what lets the caller warn on a malformed or
+  // renamed reply instead of silently disabling the catch-up.
+  using Capture = EntityFreezeFrameCapture;
+  EXPECT_FALSE(Capture::standing_faults_from_list_reply(json::array()).has_value());
+  EXPECT_FALSE(Capture::standing_faults_from_list_reply(json(3)).has_value());
+  EXPECT_FALSE(Capture::standing_faults_from_list_reply(json(nullptr)).has_value());
+  EXPECT_FALSE(Capture::standing_faults_from_list_reply(json::object()).has_value());  // no "faults" key
+  EXPECT_FALSE(Capture::standing_faults_from_list_reply(json{{"faults", "nope"}}).has_value());
+}
+
+TEST(StandingFaultsFromListReply, MalformedItemsAreSkippedNeverThrownOn) {
+  const json data = {
+      {"faults",
+       json::array({"not_an_object", json{{"reporting_sources", json::array({"a"})}},     // missing fault_code
+                    json{{"fault_code", 42}, {"reporting_sources", json::array({"a"})}},  // non-string fault_code
+                    json{{"fault_code", "NO_SOURCES"}},                                   // missing sources
+                    json{{"fault_code", "BAD_SOURCES"}, {"reporting_sources", "x"}},      // non-array sources
+                    json{{"fault_code", "MIXED"}, {"reporting_sources", json::array({"ok", 7, true, "also_ok"})}}})}};
+  std::optional<std::vector<EntityFreezeFrameCapture::StandingFault>> standing;
+  ASSERT_NO_THROW(standing = EntityFreezeFrameCapture::standing_faults_from_list_reply(data));
+  ASSERT_TRUE(standing.has_value());
+  ASSERT_EQ(standing->size(), 1u);
+  EXPECT_EQ((*standing)[0].fault_code, "MIXED");
+  EXPECT_EQ((*standing)[0].reporting_sources, (std::vector<std::string>{"ok", "also_ok"}));
+}
+
 TEST(MergeEntityFreezeFrames, AppendsWhenNoConfiguredFreezeFrame) {
   json env_data = {{"snapshots", json::array()}};
   EntityFreezeFrameCapture::Frame frame;
@@ -559,6 +719,20 @@ TEST(MergeEntityFreezeFrames, AppendsWhenNoConfiguredFreezeFrame) {
   EXPECT_EQ(snap["name"], "plc_app");
   EXPECT_EQ(json::parse(snap["data"].get<std::string>())["temperature"], 42.5);
   EXPECT_EQ(snap["captured_at_ns"], 1234);
+  EXPECT_FALSE(snap.contains("capture_origin"));  // confirm-edge frames carry no marker
+}
+
+TEST(MergeEntityFreezeFrames, StartupCatchUpFrameCarriesCaptureOrigin) {
+  json env_data = {{"snapshots", json::array()}};
+  EntityFreezeFrameCapture::Frame frame;
+  frame.entity_id = "plc_app";
+  frame.values = {{"temperature", 42.5}};
+  frame.captured_at_ns = 1234;
+  frame.startup_catchup = true;
+
+  auto merged = FaultHandlers::merge_entity_freeze_frames(env_data, {frame});
+  ASSERT_EQ(merged["snapshots"].size(), 1u);
+  EXPECT_EQ(merged["snapshots"][0]["capture_origin"], "startup");
 }
 
 TEST(MergeEntityFreezeFrames, ExplicitConfigWins) {

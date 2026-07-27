@@ -115,6 +115,31 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseWithFreezeFrame) {
   EXPECT_DOUBLE_EQ(snap["data"].get<double>(), 85.5);  // Primary value extracted
   EXPECT_EQ(snap["x-medkit"]["topic"], "/motor/temperature");
   EXPECT_EQ(snap["x-medkit"]["message_type"], "sensor_msgs/msg/Temperature");
+  EXPECT_FALSE(snap["x-medkit"].contains("capture_origin"));  // confirm-edge capture
+}
+
+// @verifies REQ_INTEROP_088
+TEST_F(FaultHandlersTest, BuildSovdFaultResponsePropagatesCaptureOrigin) {
+  // Startup catch-up frames (entity freeze-frames taken for faults that were
+  // already confirmed at gateway start) carry capture_origin through to the
+  // wire x-medkit block, so consumers can tell them from confirm-time frames.
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "STANDING_FAULT";
+
+  json env_data = {{"snapshots", json::array({{{"type", "freeze_frame"},
+                                               {"snapshot_type", "freeze_frame"},
+                                               {"name", "plc_app"},
+                                               {"data", R"({"level": 7.0})"},
+                                               {"topic", ""},
+                                               {"message_type", ""},
+                                               {"captured_at_ns", 1234},
+                                               {"capture_origin", "startup"}}})}};
+
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_data, "/apps/plc_app"));
+
+  auto & snap = response["environment_data"]["snapshots"][0];
+  EXPECT_EQ(snap["type"], "freeze_frame");
+  EXPECT_EQ(snap["x-medkit"]["capture_origin"], "startup");
 }
 
 // Conversion layer must emit an explicit "snapshot_type" discriminator so

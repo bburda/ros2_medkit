@@ -81,6 +81,11 @@ class Ros2SubscriptionSlot final {
   [[nodiscard]] const std::string & type_name() const noexcept {
     return type_name_;
   }
+  /// Publishers currently matched to this subscription (rcl graph query,
+  /// callable from any thread while the slot is alive; may throw on rcl error).
+  [[nodiscard]] size_t publisher_count() const {
+    return sub_->get_publisher_count();
+  }
 
  private:
   Ros2SubscriptionSlot(Ros2SubscriptionExecutor & exec, std::string topic, std::string type_name,

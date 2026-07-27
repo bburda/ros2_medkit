@@ -247,6 +247,11 @@ json FaultHandlers::merge_entity_freeze_frames(json env_data,
     snap["topic"] = "";  // entity data values, not a ROS topic
     snap["message_type"] = "";
     snap["captured_at_ns"] = frame.captured_at_ns;
+    if (frame.startup_catchup) {
+      // Values were read at gateway start, not when the fault confirmed;
+      // absent marker = captured on the confirm edge.
+      snap["capture_origin"] = "startup";
+    }
     env_data["snapshots"].push_back(std::move(snap));
   }
   return env_data;
@@ -309,6 +314,9 @@ dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_jso
         } catch (const json::exception & e) {
           snap["data"] = raw_data;
           snap["x-medkit"] = {{"topic", topic}, {"message_type", message_type}, {"parse_error", e.what()}};
+        }
+        if (s.contains("capture_origin") && s["capture_origin"].is_string()) {
+          snap["x-medkit"]["capture_origin"] = s["capture_origin"];
         }
       } else if (snapshot_type == "rosbag") {
         // Build absolute URI using entity path + fault_code as the bulk-data ID.
