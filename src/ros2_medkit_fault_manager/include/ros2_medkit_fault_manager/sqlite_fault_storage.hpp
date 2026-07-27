@@ -17,6 +17,7 @@
 #include <sqlite3.h>
 
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
@@ -98,8 +99,9 @@ class SqliteFaultStorage : public FaultStorage {
   /// Whether any fault at all still references @p file_path. Caller holds mutex_.
   bool path_referenced(const std::string & file_path) const;
 
-  /// store_rosbag_file body without taking mutex_. Caller holds mutex_.
-  void store_rosbag_file_locked(const RosbagFileInfo & info);
+  /// store_rosbag_file body without taking mutex_. Caller holds mutex_ and
+  /// unlinks the returned replaced-bag path once the row change is durable.
+  std::optional<std::string> store_rosbag_file_locked(const RosbagFileInfo & info);
 
   /// Run a plain SQL statement or throw with the SQLite error. Caller holds mutex_.
   void exec_or_throw(const char * sql);
