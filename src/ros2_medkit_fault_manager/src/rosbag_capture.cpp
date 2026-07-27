@@ -257,7 +257,7 @@ bool RosbagCapture::attach_to_active_recording(const std::string & fault_code) {
   }
   if (attached_fault_codes_.insert(fault_code).second) {
     RCLCPP_INFO(node_->get_logger(), "Fault '%s' confirmed during post-fault recording, attaching it to bag for '%s'",
-                fault_code.c_str(), current_fault_code_.c_str());
+                fault_code.c_str(), current_fault_code_.empty() ? "<cleared primary>" : current_fault_code_.c_str());
     widen_capture_filter_for(fault_code);
   }
   return true;

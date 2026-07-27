@@ -903,7 +903,11 @@ void SqliteFaultStorage::exec_or_throw(const char * sql) {
 
 void SqliteFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
   std::lock_guard<std::mutex> lock(mutex_);
-  store_rosbag_file_locked(info);
+  const auto replaced = store_rosbag_file_locked(info);
+  if (replaced) {
+    std::error_code ec;
+    std::filesystem::remove_all(*replaced, ec);
+  }
 }
 
 void SqliteFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> & infos) {
@@ -913,30 +917,39 @@ void SqliteFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> & 
   std::lock_guard<std::mutex> lock(mutex_);
 
   // One transaction for the whole burst: a crash mid-store must not leave some
-  // faults of the shared recording without their lookup row.
+  // faults of the shared recording without their lookup row. Replaced bags are
+  // unlinked only after COMMIT - a ROLLBACK resurrects the old rows, which must
+  // keep pointing at bags that still exist.
+  std::vector<std::string> replaced;
   exec_or_throw("BEGIN IMMEDIATE");
   try {
     for (const auto & info : infos) {
-      store_rosbag_file_locked(info);
+      if (auto old_path = store_rosbag_file_locked(info)) {
+        replaced.push_back(*std::move(old_path));
+      }
     }
     exec_or_throw("COMMIT");
   } catch (...) {
     sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
     throw;
   }
+  for (const auto & path : replaced) {
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
 }
 
-void SqliteFaultStorage::store_rosbag_file_locked(const RosbagFileInfo & info) {
-  // Query existing record to delete old file (prevent orphaned files on re-confirm)
+std::optional<std::string> SqliteFaultStorage::store_rosbag_file_locked(const RosbagFileInfo & info) {
+  // A re-confirm replaces the row; report the orphaned old bag to the caller,
+  // which unlinks it once the row change is durable.
+  std::optional<std::string> replaced;
   {
     SqliteStatement query_stmt(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ?");
     query_stmt.bind_text(1, info.fault_code);
     if (query_stmt.step() == SQLITE_ROW) {
       std::string old_path = query_stmt.column_text(0);
       if (old_path != info.file_path && !path_shared_with_other_fault(old_path, info.fault_code)) {
-        std::error_code ec;
-        std::filesystem::remove_all(old_path, ec);
-        // Ignore errors - file may already be deleted
+        replaced = std::move(old_path);
       }
     }
   }
@@ -960,6 +973,7 @@ void SqliteFaultStorage::store_rosbag_file_locked(const RosbagFileInfo & info) {
   if (stmt.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to store rosbag file: ") + sqlite3_errmsg(db_));
   }
+  return replaced;
 }
 
 std::optional<RosbagFileInfo> SqliteFaultStorage::get_rosbag_file(const std::string & fault_code) const {
