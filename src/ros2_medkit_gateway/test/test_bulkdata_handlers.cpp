@@ -85,11 +85,12 @@ TEST_F(BulkDataHandlersTest, RecordingIdIsTheBagDirectoryBasename) {
 }
 
 TEST_F(BulkDataHandlersTest, RecordingIdIsTheSameForEveryFaultOfTheBurst) {
-  // Two faults of one burst store rows pointing at the same path: their
-  // descriptors must resolve to one identifier.
-  const std::string shared_path = "/tmp/fault_ROOT_CAUSE_1700000000000";
-  EXPECT_EQ(handlers::detail::rosbag_recording_id(shared_path), handlers::detail::rosbag_recording_id(shared_path));
-  EXPECT_EQ(handlers::detail::rosbag_recording_id(shared_path), "fault_ROOT_CAUSE_1700000000000");
+  // Rows of one burst carry different fault codes but the same path: their
+  // descriptors must group under one id, distinct from any other bag's.
+  const std::string burst_bag = "/tmp/fault_ROOT_CAUSE_1700000000000";
+  const std::string other_bag = "/tmp/fault_UNRELATED_1700000000042";
+  EXPECT_EQ(handlers::detail::rosbag_recording_id(burst_bag), "fault_ROOT_CAUSE_1700000000000");
+  EXPECT_NE(handlers::detail::rosbag_recording_id(burst_bag), handlers::detail::rosbag_recording_id(other_bag));
 }
 
 TEST_F(BulkDataHandlersTest, RecordingIdToleratesTrailingSlashAndEmptyPath) {
