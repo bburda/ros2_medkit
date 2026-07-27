@@ -16,8 +16,10 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,6 +30,8 @@
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
 #include "ros2_medkit_fault_manager/rosbag_capture.hpp"
 #include "ros2_medkit_fault_manager/snapshot_capture.hpp"
+#include "ros2_medkit_msgs/msg/fault.hpp"
+#include "ros2_medkit_msgs/srv/report_fault.hpp"
 
 using ros2_medkit_fault_manager::InMemoryFaultStorage;
 using ros2_medkit_fault_manager::RosbagCapture;
@@ -519,36 +523,46 @@ TEST_F(RosbagCaptureTest, EvictionFreesASharedBagOnceAndKeepsTheQuotaHonest) {
 }
 
 TEST_F(RosbagCaptureTest, EvictionKeepsGoingWhenTheSharedBagIsNotEnough) {
-  // Freeing the shared bag still leaves storage over budget here. The running
-  // total must stay truthful (no size_t underflow from per-row subtraction)
-  // and the eviction must move on to the next bag.
+  // The shared bag's rows disagree on size (a recording being finalised), and
+  // their per-row sum (900) far exceeds what deleting the bag really frees
+  // (MAX = 500). An eviction crediting bytes per row would believe itself under
+  // the 300-byte quota after the first bag and stop while the solo bag still
+  // blows it; grouping by path keeps the running total honest and forces the
+  // second eviction.
   const auto shared_path = (temp_dir_ / "shared_bag").string();
   const auto solo_path = (temp_dir_ / "solo_bag").string();
+  std::filesystem::create_directories(shared_path);
+  std::filesystem::create_directories(solo_path);
 
   ros2_medkit_fault_manager::RosbagFileInfo shared;
   shared.file_path = shared_path;
   shared.format = "mcap";
   shared.duration_sec = 5.0;
-  shared.size_bytes = 1000;
   shared.created_at_ns = 1000;
-  for (const char * code : {"ROOT_CAUSE", "CORRELATED_A"}) {
-    shared.fault_code = code;
-    storage_->store_rosbag_file(shared);
-  }
+  shared.fault_code = "ROOT_CAUSE";
+  shared.size_bytes = 500;
+  storage_->store_rosbag_file(shared);
+  shared.fault_code = "CORRELATED_A";
+  shared.size_bytes = 400;
+  storage_->store_rosbag_file(shared);
 
   ros2_medkit_fault_manager::RosbagFileInfo solo;
   solo.fault_code = "UNRELATED";
   solo.file_path = solo_path;
   solo.format = "mcap";
   solo.duration_sec = 5.0;
-  solo.size_bytes = 600;
+  solo.size_bytes = 400;
   solo.created_at_ns = 2000;
   storage_->store_rosbag_file(solo);
 
-  auto evicted = RosbagCapture::evict_bags_over_quota(storage_.get(), 500);
+  ASSERT_EQ(storage_->get_total_rosbag_storage_bytes(), 900u);
+
+  auto evicted = RosbagCapture::evict_bags_over_quota(storage_.get(), 300);
 
   EXPECT_EQ(evicted, (std::vector<std::string>{shared_path, solo_path}));
   EXPECT_EQ(storage_->get_total_rosbag_storage_bytes(), 0u);
+  EXPECT_FALSE(std::filesystem::exists(shared_path));
+  EXPECT_FALSE(std::filesystem::exists(solo_path));
 }
 
 // Integration tests (simplified without actual message publishing)
@@ -575,6 +589,29 @@ class RosbagCaptureIntegrationTest : public RosbagCaptureTest {
       pub->publish(msg);
       spin_for(std::chrono::milliseconds(50));
     }
+  }
+
+  /// Spin until the post-roll finalises and @p fault_code has its metadata row.
+  bool wait_for_row(const std::string & fault_code, std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (storage_->get_rosbag_file(fault_code).has_value()) {
+        return true;
+      }
+      spin_for(std::chrono::milliseconds(100));
+    }
+    return false;
+  }
+
+  /// Bag directories the capture left under the test storage path.
+  size_t count_bag_dirs() const {
+    size_t count = 0;
+    for (const auto & entry : std::filesystem::directory_iterator(temp_dir_)) {
+      if (entry.is_directory() && entry.path().filename().string().rfind("fault_", 0) == 0) {
+        ++count;
+      }
+    }
+    return count;
   }
 };
 
@@ -689,6 +726,200 @@ TEST_F(RosbagCaptureIntegrationTest, ClearingOneFaultOfABurstKeepsTheSharedBag) 
   // The last reference going away does delete it.
   capture.on_fault_cleared("ROOT_CAUSE");
   EXPECT_FALSE(std::filesystem::exists(bag_path));
+
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, FaultClearedDuringPostRollNeverGetsARow) {
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_sec = 10.0;
+  rosbag_config.duration_after_sec = 1.0;
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture capture(node_.get(), storage_.get(), rosbag_config, snapshot_config);
+
+  capture.start();
+  fill_buffer("/rosbag_cleared_mid_roll_probe");
+
+  capture.on_fault_confirmed("ROOT_CAUSE");
+  capture.on_fault_confirmed("CORRELATED");
+  // The attached fault clears before the post-roll timer fires. Its row has not
+  // been written yet - it must be forgotten, not resurrected at finalize, where
+  // a leftover row would pin the shared bag forever.
+  capture.on_fault_cleared("CORRELATED");
+
+  ASSERT_TRUE(wait_for_row("ROOT_CAUSE", std::chrono::milliseconds(8000)));
+  EXPECT_FALSE(storage_->get_rosbag_file("CORRELATED").has_value())
+      << "a fault cleared during the post-roll must not get a row at finalize";
+
+  // With no leftover row the bag belongs to the primary alone: clearing it
+  // must unlink the recording.
+  auto root = storage_->get_rosbag_file("ROOT_CAUSE");
+  ASSERT_TRUE(root.has_value());
+  capture.on_fault_cleared("ROOT_CAUSE");
+  EXPECT_FALSE(storage_->get_rosbag_file("ROOT_CAUSE").has_value());
+  EXPECT_FALSE(std::filesystem::exists(root->file_path));
+
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, PrimaryClearedDuringPostRollLeavesTheBagToItsAttachedFault) {
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_sec = 10.0;
+  rosbag_config.duration_after_sec = 1.0;
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture capture(node_.get(), storage_.get(), rosbag_config, snapshot_config);
+
+  capture.start();
+  fill_buffer("/rosbag_primary_cleared_probe");
+
+  capture.on_fault_confirmed("ROOT_CAUSE");
+  capture.on_fault_confirmed("CORRELATED");
+  // The fault that opened the recording clears mid post-roll; the attached
+  // sibling still needs the bag, so the recording finalises for it alone.
+  capture.on_fault_cleared("ROOT_CAUSE");
+
+  ASSERT_TRUE(wait_for_row("CORRELATED", std::chrono::milliseconds(8000)));
+  EXPECT_FALSE(storage_->get_rosbag_file("ROOT_CAUSE").has_value())
+      << "the cleared primary must not get a row at finalize";
+
+  auto correlated = storage_->get_rosbag_file("CORRELATED");
+  ASSERT_TRUE(correlated.has_value());
+  EXPECT_TRUE(std::filesystem::exists(correlated->file_path));
+
+  capture.on_fault_cleared("CORRELATED");
+  EXPECT_FALSE(std::filesystem::exists(correlated->file_path));
+
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, BurstFullyClearedDuringPostRollDiscardsTheBag) {
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_sec = 10.0;
+  rosbag_config.duration_after_sec = 0.5;
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture capture(node_.get(), storage_.get(), rosbag_config, snapshot_config);
+
+  capture.start();
+  fill_buffer("/rosbag_all_cleared_probe");
+
+  capture.on_fault_confirmed("ROOT_CAUSE");
+  capture.on_fault_confirmed("CORRELATED");
+  capture.on_fault_cleared("CORRELATED");
+  capture.on_fault_cleared("ROOT_CAUSE");
+
+  // Let the post-roll timer fire with nothing left to register.
+  spin_for(std::chrono::milliseconds(1500));
+
+  EXPECT_FALSE(storage_->get_rosbag_file("ROOT_CAUSE").has_value());
+  EXPECT_FALSE(storage_->get_rosbag_file("CORRELATED").has_value());
+  EXPECT_EQ(count_bag_dirs(), 0u) << "a bag nobody references must not be left on disk";
+
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, AttachmentCapDropsFaultsPastIt) {
+  // One recording covers the primary plus at most 32 attached faults. Fault 34
+  // of a burst is still in the bag's data but gets no row of its own and no
+  // separate bag - pinned here so the cap stays a documented contract.
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_sec = 10.0;
+  rosbag_config.duration_after_sec = 1.5;
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture capture(node_.get(), storage_.get(), rosbag_config, snapshot_config);
+
+  capture.start();
+  fill_buffer("/rosbag_cap_probe");
+
+  std::vector<std::string> codes;
+  for (int i = 0; i < 34; ++i) {
+    codes.push_back("BURST_" + std::string(i < 10 ? "0" : "") + std::to_string(i));
+  }
+  for (const auto & code : codes) {
+    capture.on_fault_confirmed(code);
+  }
+
+  ASSERT_TRUE(wait_for_row(codes[0], std::chrono::milliseconds(10000)));
+
+  auto primary = storage_->get_rosbag_file(codes[0]);
+  ASSERT_TRUE(primary.has_value());
+  for (size_t i = 1; i < 33; ++i) {
+    auto row = storage_->get_rosbag_file(codes[i]);
+    ASSERT_TRUE(row.has_value()) << codes[i] << " is within the cap and must resolve to the recording";
+    EXPECT_EQ(row->file_path, primary->file_path);
+  }
+  EXPECT_FALSE(storage_->get_rosbag_file(codes[33]).has_value())
+      << "fault 34 of the burst is past the cap and is dropped with a WARN";
+  EXPECT_EQ(count_bag_dirs(), 1u) << "the dropped fault must not open a second bag";
+
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, AttachedFaultTopicsJoinTheEntityScopedRecording) {
+  // In entity mode the post-roll writes only the first fault's topics. A fault
+  // attaching mid post-roll brings its own entity: its topics must join the
+  // capture filter, or its row would serve a bag with none of its data.
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.topics = "entity";
+  rosbag_config.duration_sec = 10.0;
+  rosbag_config.duration_after_sec = 3.0;
+  auto snapshot_config = create_snapshot_config();
+
+  // Two source nodes, each owning one topic; entity scope resolves from the
+  // faults' reporting_sources against the graph.
+  auto node_a = std::make_shared<rclcpp::Node>("scope_source_a");
+  auto node_b = std::make_shared<rclcpp::Node>("scope_source_b");
+  auto pub_a = node_a->create_publisher<std_msgs::msg::String>("/scope_topic_a", 10);
+  auto pub_b = node_b->create_publisher<std_msgs::msg::String>("/scope_topic_b", 10);
+
+  rclcpp::Clock clock;
+  storage_->report_fault_event("FAULT_A", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                               ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "fault a", "/scope_source_a", clock.now(),
+                               ros2_medkit_fault_manager::DebounceConfig{});
+  storage_->report_fault_event("FAULT_B", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                               ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "fault b", "/scope_source_b", clock.now(),
+                               ros2_medkit_fault_manager::DebounceConfig{});
+
+  RosbagCapture capture(node_.get(), storage_.get(), rosbag_config, snapshot_config);
+  capture.start();
+
+  // Publish both topics until the capture has them subscribed and buffered.
+  std_msgs::msg::String msg;
+  msg.data = "payload";
+  for (int i = 0; i < 40; ++i) {
+    pub_a->publish(msg);
+    pub_b->publish(msg);
+    spin_for(std::chrono::milliseconds(50));
+  }
+
+  capture.on_fault_confirmed("FAULT_A");
+  capture.on_fault_confirmed("FAULT_B");  // lands inside A's post-roll, attaches
+
+  // Keep both topics flowing during the post-roll so the widened filter has
+  // B's data to write.
+  for (int i = 0; i < 20; ++i) {
+    pub_a->publish(msg);
+    pub_b->publish(msg);
+    spin_for(std::chrono::milliseconds(50));
+  }
+
+  ASSERT_TRUE(wait_for_row("FAULT_B", std::chrono::milliseconds(12000)));
+
+  auto row_a = storage_->get_rosbag_file("FAULT_A");
+  auto row_b = storage_->get_rosbag_file("FAULT_B");
+  ASSERT_TRUE(row_a.has_value());
+  ASSERT_TRUE(row_b.has_value());
+  EXPECT_EQ(row_b->file_path, row_a->file_path);
+
+  // metadata.yaml lists every topic written to the bag; B's topic must be there.
+  const auto metadata_path = std::filesystem::path(row_b->file_path) / "metadata.yaml";
+  ASSERT_TRUE(std::filesystem::exists(metadata_path));
+  std::ifstream metadata_file(metadata_path);
+  std::stringstream buffer;
+  buffer << metadata_file.rdbuf();
+  const std::string metadata = buffer.str();
+  EXPECT_NE(metadata.find("/scope_topic_a"), std::string::npos);
+  EXPECT_NE(metadata.find("/scope_topic_b"), std::string::npos)
+      << "the attached fault's entity topics never reached the shared bag";
 
   capture.stop();
 }

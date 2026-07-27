@@ -221,6 +221,16 @@ class FaultStorage {
   /// @param info The rosbag file info to store (replaces any existing entry for fault_code)
   virtual void store_rosbag_file(const RosbagFileInfo & info) = 0;
 
+  /// Store one row per fault of a burst that shares a recording. Backends with
+  /// real transactions (SQLite) commit all rows atomically, so a crash mid-store
+  /// never leaves part of the burst without its lookup key. Default: plain loop.
+  /// @param infos The rows to store (typically all pointing at one file_path)
+  virtual void store_rosbag_files(const std::vector<RosbagFileInfo> & infos) {
+    for (const auto & info : infos) {
+      store_rosbag_file(info);
+    }
+  }
+
   /// Get rosbag file info for a fault
   /// @param fault_code The fault code to get rosbag for
   /// @return Rosbag file info if exists, nullopt otherwise
@@ -232,6 +242,22 @@ class FaultStorage {
   /// @param fault_code The fault code to delete rosbag for
   /// @return true if record was deleted, false if not found
   virtual bool delete_rosbag_file(const std::string & fault_code) = 0;
+
+  /// Delete the records of several faults (typically the whole burst behind one
+  /// recording). Backends with real transactions (SQLite) remove the rows
+  /// atomically and unlink the file only after the commit, so a crash mid-delete
+  /// never leaves a row pointing at a removed bag. Default: plain loop.
+  /// @param fault_codes The fault codes to delete rosbag records for
+  /// @return Number of records actually deleted
+  virtual size_t delete_rosbag_files(const std::vector<std::string> & fault_codes) {
+    size_t deleted = 0;
+    for (const auto & code : fault_codes) {
+      if (delete_rosbag_file(code)) {
+        ++deleted;
+      }
+    }
+    return deleted;
+  }
 
   /// Get total size of all stored rosbag files in bytes, counting a shared
   /// recording once regardless of how many faults reference it

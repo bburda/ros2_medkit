@@ -892,9 +892,41 @@ std::optional<FreezeFrameData> SqliteFaultStorage::get_freeze_frame(const std::s
   return frame;
 }
 
+void SqliteFaultStorage::exec_or_throw(const char * sql) {
+  char * err_msg = nullptr;
+  if (sqlite3_exec(db_, sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string msg = err_msg ? err_msg : "unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error(std::string("Failed to run '") + sql + "': " + msg);
+  }
+}
+
 void SqliteFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
   std::lock_guard<std::mutex> lock(mutex_);
+  store_rosbag_file_locked(info);
+}
 
+void SqliteFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> & infos) {
+  if (infos.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // One transaction for the whole burst: a crash mid-store must not leave some
+  // faults of the shared recording without their lookup row.
+  exec_or_throw("BEGIN IMMEDIATE");
+  try {
+    for (const auto & info : infos) {
+      store_rosbag_file_locked(info);
+    }
+    exec_or_throw("COMMIT");
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
+  }
+}
+
+void SqliteFaultStorage::store_rosbag_file_locked(const RosbagFileInfo & info) {
   // Query existing record to delete old file (prevent orphaned files on re-confirm)
   {
     SqliteStatement query_stmt(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ?");
@@ -984,11 +1016,63 @@ bool SqliteFaultStorage::delete_rosbag_file(const std::string & fault_code) {
   return sqlite3_changes(db_) > 0;
 }
 
+size_t SqliteFaultStorage::delete_rosbag_files(const std::vector<std::string> & fault_codes) {
+  if (fault_codes.empty()) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Rows go first, in one transaction, and the file only after the commit: a
+  // crash mid-delete leaves at worst an orphaned directory, never a row whose
+  // bag is already gone.
+  std::set<std::string> paths;
+  size_t deleted = 0;
+  exec_or_throw("BEGIN IMMEDIATE");
+  try {
+    for (const auto & code : fault_codes) {
+      {
+        SqliteStatement select_stmt(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ?");
+        select_stmt.bind_text(1, code);
+        if (select_stmt.step() == SQLITE_ROW) {
+          paths.insert(select_stmt.column_text(0));
+        }
+      }
+      SqliteStatement delete_stmt(db_, "DELETE FROM rosbag_files WHERE fault_code = ?");
+      delete_stmt.bind_text(1, code);
+      if (delete_stmt.step() != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to delete rosbag file record: ") + sqlite3_errmsg(db_));
+      }
+      if (sqlite3_changes(db_) > 0) {
+        ++deleted;
+      }
+    }
+    exec_or_throw("COMMIT");
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
+  }
+
+  for (const auto & path : paths) {
+    if (!path_referenced(path)) {
+      std::error_code ec;
+      std::filesystem::remove_all(path, ec);
+      // Ignore errors - file may already be deleted
+    }
+  }
+  return deleted;
+}
+
 bool SqliteFaultStorage::path_shared_with_other_fault(const std::string & file_path,
                                                       const std::string & fault_code) const {
   SqliteStatement stmt(db_, "SELECT COUNT(*) FROM rosbag_files WHERE file_path = ? AND fault_code != ?");
   stmt.bind_text(1, file_path);
   stmt.bind_text(2, fault_code);
+  return stmt.step() == SQLITE_ROW && stmt.column_int64(0) > 0;
+}
+
+bool SqliteFaultStorage::path_referenced(const std::string & file_path) const {
+  SqliteStatement stmt(db_, "SELECT COUNT(*) FROM rosbag_files WHERE file_path = ?");
+  stmt.bind_text(1, file_path);
   return stmt.step() == SQLITE_ROW && stmt.column_int64(0) > 0;
 }
 

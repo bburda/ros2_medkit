@@ -416,16 +416,17 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
 
         # Report multiple faults - buffer has messages from background publishers
         for fault_code in fault_codes:
+            # A fault confirming while the previous post-roll still runs attaches
+            # to that recording (shared bag), so wait until the previous fault's
+            # bag is finalized (its metadata row exists) instead of sleeping: a
+            # fixed sleep only exceeds duration_after_sec on an unloaded machine.
+            if bag_paths:
+                self.assertTrue(self._wait_for_buffered_data(),
+                                'ring buffer did not refill between faults')
             response = self._report_fault(fault_code, f'Multi-bag test: {fault_code}')
             self.assertTrue(response.accepted)
-            # Serialize per fault: the rosbag ring buffer is shared, so let each
-            # fault's recording flush before the next fault is reported.
-            time.sleep(1.0)
 
-        # Verify each fault has its own rosbag (poll for the async recording).
-        for fault_code in fault_codes:
             rosbag_response = self._wait_for_rosbag(fault_code)
-
             self.assertTrue(rosbag_response.success,
                             f'GetRosbag failed for {fault_code}: {rosbag_response.error_message}')
             self.assertTrue(os.path.exists(rosbag_response.file_path))
@@ -460,6 +461,34 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
 
         print(f'Rosbag duration: {rosbag_response.duration_sec:.2f}s '
               f'(expected: ~2.5s with tolerance)')
+
+    def test_07_burst_faults_share_one_recording(self):
+        """Faults confirmed back-to-back attach to one shared recording."""
+        fault_codes = ['BURST_SHARED_A', 'BURST_SHARED_B']
+
+        # A previous test's post-roll may have drained the ring buffer.
+        self.assertTrue(self._wait_for_buffered_data(),
+                        'ring buffer did not refill before reporting faults')
+
+        # No sleep between the reports: the second confirmation lands inside the
+        # first fault's post-roll window and must attach to its recording.
+        for fault_code in fault_codes:
+            response = self._report_fault(fault_code, f'Burst test: {fault_code}')
+            self.assertTrue(response.accepted)
+
+        responses = {}
+        for fault_code in fault_codes:
+            rosbag_response = self._wait_for_rosbag(fault_code)
+            self.assertTrue(rosbag_response.success,
+                            f'GetRosbag failed for {fault_code}: '
+                            f'{rosbag_response.error_message}')
+            self.assertTrue(os.path.exists(rosbag_response.file_path))
+            responses[fault_code] = rosbag_response
+
+        self.assertEqual(responses['BURST_SHARED_A'].file_path,
+                         responses['BURST_SHARED_B'].file_path,
+                         'faults of one burst must share a single recording')
+        print(f'Shared recording: {responses["BURST_SHARED_A"].file_path}')
 
 
 @launch_testing.post_shutdown_test()
