@@ -136,6 +136,14 @@ class TestBulkDataApi(GatewayTestCase):
         self.assertIn('x-medkit', descriptor)
         x_medkit = descriptor['x-medkit']
         self.assertIn('fault_code', x_medkit)
+        # recording_id (bag directory basename) groups the descriptors of
+        # faults that share one recording.
+        self.assertIn('recording_id', x_medkit)
+        self.assertTrue(
+            x_medkit['recording_id'].startswith('fault_'),
+            f'recording_id should be the bag directory name, '
+            f'got: {x_medkit["recording_id"]}',
+        )
 
     def test_bulk_data_list_descriptors_empty_result(self):
         """Bulk-data returns empty or non-empty array for component rosbags.

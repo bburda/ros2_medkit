@@ -101,6 +101,14 @@ std::vector<std::string> BulkDataHandlers::get_source_filters(const EntityInfo &
 
 namespace detail {
 
+std::string rosbag_recording_id(const std::string & file_path) {
+  std::filesystem::path p(file_path);
+  if (!p.has_filename()) {
+    p = p.parent_path();  // tolerate a trailing slash
+  }
+  return p.filename().string();
+}
+
 std::vector<std::string> compute_bulkdata_source_filters(const ThreadSafeEntityCache & cache,
                                                          const EntityInfo & entity) {
   if (entity.type == EntityType::FUNCTION) {
@@ -250,7 +258,15 @@ BulkDataHandlers::list_descriptors(const http::TypedRequest & req) {
       descriptor.mimetype = get_rosbag_mimetype(format);
       descriptor.size = size_bytes;
       descriptor.creation_date = format_timestamp_ns(created_at_ns);
-      descriptor.x_medkit = json{{"fault_code", fault_code}, {"duration_sec", duration_sec}, {"format", format}};
+      json x_medkit{{"fault_code", fault_code}, {"duration_sec", duration_sec}, {"format", format}};
+      // Faults of one burst share a recording and each descriptor reports the
+      // full bag size; recording_id lets clients group the descriptors that
+      // serve the same bytes.
+      std::string recording_id = detail::rosbag_recording_id(rosbag.value("file_path", ""));
+      if (!recording_id.empty()) {
+        x_medkit["recording_id"] = recording_id;
+      }
+      descriptor.x_medkit = std::move(x_medkit);
       response.items.push_back(std::move(descriptor));
     }
     return response;

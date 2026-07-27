@@ -1176,11 +1176,17 @@ List all bulk-data items in a category for the entity.
          "x-medkit": {
            "fault_code": "MOTOR_OVERHEAT",
            "duration_sec": 6.0,
-           "format": "mcap"
+           "format": "mcap",
+           "recording_id": "fault_MOTOR_OVERHEAT_1738664999000"
          }
        }
      ]
    }
+
+For ``rosbags``, faults confirmed in one burst share a single recording: each
+fault gets its own descriptor with the full bag size, and
+``x-medkit.recording_id`` (the bag directory name) is the same for every
+descriptor served from that recording, so clients can group them.
 
 Download Bulk Data
 ~~~~~~~~~~~~~~~~~~
