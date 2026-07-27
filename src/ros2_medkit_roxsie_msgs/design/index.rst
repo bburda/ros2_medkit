@@ -27,9 +27,13 @@ Design
 
 The two directions are not the same size, on purpose. Every alarm goes out with its full
 context as ``AlarmEvent``: which alarm, coming or going, acked or not, the PLC timestamp,
-and the latched values. The bridge turns each event into a fault with a freeze-frame and
-an audit trail. Back the other way we send four numbers as ``DiagnosticsStatus``, and the
-generated node writes them into a consumed data block.
+and the latched values. The bridge turns each event into a fault with a freeze-frame, and
+into an audit trail entry when the audit log is on. Back the other way we send four numbers
+as ``DiagnosticsStatus``, and the generated node writes them into a consumed data block.
+
+Those four numbers cover every active fault in scope, not only the ones that came from the
+PLC. A navigation fault on the robot moves the same severity and the same bits, which is
+how a ROS 2 problem reaches the signal column.
 
 Alarm text has no fixed length and changes with the project. A PLC that handles strings
 loses determinism, and determinism is why it is there. Writing the fault list into the PLC

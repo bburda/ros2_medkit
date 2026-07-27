@@ -19,6 +19,9 @@ project arrive in ROS 2 as faults, with the values the alarm system latched when
 fired. Back the other way, the PLC gets four numbers for the signal column and for machine
 logic.
 
+Those four numbers cover every active fault in scope, not only the ones that came from the
+PLC. A navigation fault on the robot moves the same severity and the same bits.
+
 The two directions are not the same size, on purpose. Every alarm goes out with its full
 context. Back the other way we send four numbers.
 

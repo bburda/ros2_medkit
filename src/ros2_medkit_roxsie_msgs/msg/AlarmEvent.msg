@@ -16,7 +16,8 @@
 # ROS 2 graph by the node that Siemens SIMATIC ROS Connector (ROXSIE) generates.
 #
 # Published by the ROXSIE generated node, consumed by ros2_medkit_roxsie_bridge,
-# which maps each event onto a SOVD fault with a freeze-frame and an audit trail.
+# which maps each event onto a SOVD fault with a freeze-frame. Fault manager also
+# writes an audit trail entry when the audit log is enabled.
 #
 # The payload is fixed-size and carries no strings the PLC would have to build.
 # Alarm text stays out of it: the generator writes an alarm_id -> text table next

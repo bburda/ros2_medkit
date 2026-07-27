@@ -29,7 +29,8 @@
 # nothing.
 uint16 heartbeat
 
-# Highest severity among the active faults in scope.
+# Highest severity among the active faults in scope, whatever reported them:
+# a PLC alarm, a robot node, or anything else on the ROS 2 side.
 # Values follow ros2_medkit_msgs/Fault SEVERITY_* semantics: 0 INFO, 1 WARN,
 # 2 ERROR, 3 CRITICAL. Typically drives the signal column.
 uint8 aggregate_severity
