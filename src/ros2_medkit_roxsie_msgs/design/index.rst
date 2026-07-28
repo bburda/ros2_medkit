@@ -217,3 +217,9 @@ Open Questions
    acknowledgement from the ROS 2 side stays a bit-path feature.
 #. Numeric associated values, or typed? Numeric keeps the entry fixed size. Typed carries
    more and brings strings back.
+#. The bridge needs a mapping: which bit or alarm number means which fault code, and which
+   fault classes set which bits going back. Kept by hand, that mapping and the PLC program
+   drift apart, which is the spreadsheet problem all over again. The generator reads the
+   config and the project export already, so it could emit the mapping file alongside the
+   generated code and there would be one source of truth. Does the project export carry the
+   alarm declarations and texts needed for that?
