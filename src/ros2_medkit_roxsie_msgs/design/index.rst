@@ -187,13 +187,15 @@ that flaps, the controller that runs hot, the compute in another building that t
 depends on - none of them speak the PLC alarm system, and most of them already speak
 OpenTelemetry. Every one of those vendors ships its own API, and asking each of them for an
 integration does not scale; asking all of them for OpenTelemetry does. An OTLP receiver next
-to this bridge would leave three things to settle: which signal becomes a fault, where log
-records at error level are the obvious answer and metrics the more interesting one, since
-``ros2_medkit_fault_detection`` already evaluates thresholds and status words for PLC tags
-and can take a metric the same way; which entity a stream belongs to, since resource
-attributes have to map onto the tree or every host lands in one unattached pile; and what
-the operator sees, which needs no new wiring, because an IT fault in the same list already
-moves the condition that reaches the signal column.
+to this bridge leaves three things to settle:
+
+* **Which signal becomes a fault.** Log records at error level are the obvious answer.
+  Metrics are the more interesting one, because ``ros2_medkit_fault_detection`` already
+  evaluates thresholds and status words for PLC tags and can take a metric the same way.
+* **Which entity a stream belongs to.** Resource attributes have to map onto the tree, or
+  every host lands in one unattached pile.
+* **What the operator sees.** Nothing new to wire: an IT fault in the same list already
+  moves the condition that reaches the signal column.
 
 **OpenTelemetry as an export.** The same faults served over REST can be emitted as
 OpenTelemetry, and the per-scope condition as a metric. Two renderings of one state, not two
