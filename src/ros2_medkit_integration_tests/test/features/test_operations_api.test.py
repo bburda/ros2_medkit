@@ -408,8 +408,11 @@ class TestOperationsApi(GatewayTestCase):
 
         @verifies REQ_INTEROP_036
         """
-        # Wait for the known action app to expose its async operation.
-        self.wait_for_operation('/apps/long_calibration', 'long_calibration')
+        # Wait for the operation to be usable, not merely listed: the name
+        # appears before the gateway has resolved the ROS interface type.
+        self.wait_for_operation_type_info(
+            '/apps/long_calibration', 'long_calibration',
+            ('goal', 'result', 'feedback'))
 
         # List executions - should return items array (may be empty)
         response = requests.get(
