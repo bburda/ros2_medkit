@@ -222,6 +222,10 @@ class SSEFaultHandler {
   /// holds queue_mutex_.
   std::deque<QueuedEvent>::iterator find_superseded_locked(bool updates_only);
 
+  /// True when the buffer holds an event newer than last_event_id. Caller
+  /// holds queue_mutex_.
+  bool has_pending_locked(uint64_t last_event_id) const;
+
   /// Record a successful write for this client. Caller holds queue_mutex_.
   void note_progress_locked(const std::shared_ptr<ClientCursor> & cursor, uint64_t delivered_id);
 

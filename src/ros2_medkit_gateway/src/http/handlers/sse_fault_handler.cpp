@@ -122,6 +122,10 @@ std::deque<SSEFaultHandler::QueuedEvent>::iterator SSEFaultHandler::find_superse
   return event_queue_.end();
 }
 
+bool SSEFaultHandler::has_pending_locked(uint64_t last_event_id) const {
+  return !event_queue_.empty() && event_queue_.back().id > last_event_id;
+}
+
 SSEFaultHandler::EvictionStats SSEFaultHandler::evict_to_capacity_locked() {
   EvictionStats stats;
   if (event_queue_.size() <= kMaxBufferedEvents) {
@@ -298,18 +302,20 @@ std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint6
       bool keepalive_due = false;
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        if (shutdown_flag_.load()) {
-          return false;  // Handler is shutting down
-        }
 
-        const auto status = queue_cv_.wait_for(lock, timeout);
+        // Predicate form: an event enqueued between the last flush and this
+        // wait already spent its notify_all while nobody was waiting; a plain
+        // wait_for would sleep the full keepalive interval on top of it.
+        const bool woke = queue_cv_.wait_for(lock, timeout, [this, &last_event_id] {
+          return shutdown_flag_.load() || has_pending_locked(last_event_id);
+        });
 
         if (shutdown_flag_.load()) {
           return false;  // Handler is shutting down
         }
 
         pending = collect_pending();
-        keepalive_due = pending.empty() && status == std::cv_status::timeout;
+        keepalive_due = !woke && pending.empty();
       }
 
       if (keepalive_due) {
