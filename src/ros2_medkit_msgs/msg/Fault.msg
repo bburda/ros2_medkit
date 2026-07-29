@@ -35,8 +35,12 @@ string description
 # Timestamp when this fault was first reported
 builtin_interfaces/Time first_occurred
 
-# Timestamp when this fault was last reported (FAILED or PASSED event)
+# Timestamp when this fault last occurred (FAILED events only; a PASSED
+# event is the fault ending, not occurring, and does not touch this field)
 builtin_interfaces/Time last_occurred
+
+# Timestamp of the last PASSED event reported for this fault (zero = never)
+builtin_interfaces/Time last_passed
 
 # Total number of FAILED events aggregated across all sources
 uint32 occurrence_count

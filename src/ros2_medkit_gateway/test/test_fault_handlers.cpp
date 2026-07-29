@@ -617,6 +617,7 @@ TEST(FaultListItemSchema, FaultToJsonConformsAndRoundTrips) {
   fault.occurrence_count = 3;
   fault.status = "active";
   fault.reporting_sources = {"brake_ecu", "abs_node"};
+  fault.last_passed.sec = 1200;  // absent-when-zero covered separately below
 
   const json wire = conversions::fault_to_json(fault);
 
@@ -625,6 +626,20 @@ TEST(FaultListItemSchema, FaultToJsonConformsAndRoundTrips) {
   ASSERT_TRUE(parsed.has_value()) << "fault_to_json output does not conform to FaultListItem";
   // ... and round-trip back to identical wire (no field added or dropped).
   EXPECT_EQ(dto::JsonWriter<dto::FaultListItem>::write(parsed.value()), wire);
+}
+
+TEST(FaultListItemSchema, LastPassedOmittedWhenNeverPassed) {
+  // last_passed carries the last PASSED instant; zero means the fault never
+  // reported PASSED, and the wire says that by omitting the key entirely.
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "NEVER_PASSED";
+  fault.status = "active";
+
+  EXPECT_FALSE(conversions::fault_to_json(fault).contains("last_passed"));
+
+  fault.last_passed.sec = 1200;
+  fault.last_passed.nanosec = 500000000;
+  EXPECT_DOUBLE_EQ(conversions::fault_to_json(fault)["last_passed"].get<double>(), 1200.5);
 }
 
 TEST(FaultListItemSchema, UnknownSeverityLabelIsAcceptedByEnum) {

@@ -42,7 +42,8 @@ namespace dto {
 //
 // Wire keys (exact, from fault_msg_conversions.cpp):
 //   fault_code, severity, description, first_occurred, last_occurred,
-//   occurrence_count, status, reporting_sources, severity_label
+//   last_passed (absent = never passed), occurrence_count, status,
+//   reporting_sources, severity_label
 // =============================================================================
 struct FaultListItem {
   std::string fault_code;
@@ -50,6 +51,7 @@ struct FaultListItem {
   std::optional<std::string> description;
   std::optional<double> first_occurred;
   std::optional<double> last_occurred;
+  std::optional<double> last_passed;
   std::optional<int64_t> occurrence_count;
   std::string status;
   std::optional<std::vector<std::string>> reporting_sources;
@@ -60,8 +62,9 @@ template <>
 inline constexpr auto dto_fields<FaultListItem> = std::make_tuple(
     field("fault_code", &FaultListItem::fault_code), field("severity", &FaultListItem::severity),
     field("description", &FaultListItem::description), field("first_occurred", &FaultListItem::first_occurred),
-    field("last_occurred", &FaultListItem::last_occurred), field("occurrence_count", &FaultListItem::occurrence_count),
-    field("status", &FaultListItem::status), field("reporting_sources", &FaultListItem::reporting_sources),
+    field("last_occurred", &FaultListItem::last_occurred), field("last_passed", &FaultListItem::last_passed),
+    field("occurrence_count", &FaultListItem::occurrence_count), field("status", &FaultListItem::status),
+    field("reporting_sources", &FaultListItem::reporting_sources),
     field_enum("severity_label", &FaultListItem::severity_label, kFaultSeverityLabelValues));
 
 template <>

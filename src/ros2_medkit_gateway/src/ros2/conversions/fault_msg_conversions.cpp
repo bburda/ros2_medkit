@@ -35,6 +35,10 @@ nlohmann::json fault_to_json(const ros2_medkit_msgs::msg::Fault & fault) {
   j["description"] = fault.description;
   j["first_occurred"] = to_seconds(fault.first_occurred);
   j["last_occurred"] = to_seconds(fault.last_occurred);
+  // Omitted while zero: the fault never reported a PASSED event.
+  if (fault.last_passed.sec != 0 || fault.last_passed.nanosec != 0u) {
+    j["last_passed"] = to_seconds(fault.last_passed);
+  }
   j["occurrence_count"] = fault.occurrence_count;
   j["status"] = fault.status;
   j["reporting_sources"] = fault.reporting_sources;

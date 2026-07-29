@@ -608,7 +608,7 @@ SqliteFaultStorage::list_faults(bool filter_by_severity, uint8_t severity,
   // Build query
   std::string sql =
       "SELECT fault_code, severity, description, first_occurred_ns, last_occurred_ns, "
-      "occurrence_count, status, reporting_sources FROM faults WHERE status IN (";
+      "occurrence_count, status, reporting_sources, last_passed_ns FROM faults WHERE status IN (";
   for (size_t i = 0; i < status_filter.size(); ++i) {
     if (i > 0) {
       sql += ", ";
@@ -646,6 +646,7 @@ SqliteFaultStorage::list_faults(bool filter_by_severity, uint8_t severity,
     fault.occurrence_count = static_cast<uint32_t>(stmt.column_int64(5));
     fault.status = stmt.column_text(6);
     fault.reporting_sources = parse_json_array(stmt.column_text(7));
+    fault.last_passed = rclcpp::Time(stmt.column_int64(8), RCL_SYSTEM_TIME);
 
     result.push_back(fault);
   }
@@ -658,7 +659,7 @@ std::optional<ros2_medkit_msgs::msg::Fault> SqliteFaultStorage::get_fault(const 
 
   SqliteStatement stmt(db_,
                        "SELECT fault_code, severity, description, first_occurred_ns, last_occurred_ns, "
-                       "occurrence_count, status, reporting_sources FROM faults WHERE fault_code = ?");
+                       "occurrence_count, status, reporting_sources, last_passed_ns FROM faults WHERE fault_code = ?");
   stmt.bind_text(1, fault_code);
 
   if (stmt.step() != SQLITE_ROW) {
@@ -678,6 +679,7 @@ std::optional<ros2_medkit_msgs::msg::Fault> SqliteFaultStorage::get_fault(const 
   fault.occurrence_count = static_cast<uint32_t>(stmt.column_int64(5));
   fault.status = stmt.column_text(6);
   fault.reporting_sources = parse_json_array(stmt.column_text(7));
+  fault.last_passed = rclcpp::Time(stmt.column_int64(8), RCL_SYSTEM_TIME);
 
   return fault;
 }
@@ -1178,7 +1180,7 @@ std::vector<ros2_medkit_msgs::msg::Fault> SqliteFaultStorage::get_all_faults() c
 
   SqliteStatement stmt(db_,
                        "SELECT fault_code, severity, description, first_occurred_ns, last_occurred_ns, "
-                       "occurrence_count, status, reporting_sources FROM faults");
+                       "occurrence_count, status, reporting_sources, last_passed_ns FROM faults");
 
   std::vector<ros2_medkit_msgs::msg::Fault> result;
   while (stmt.step() == SQLITE_ROW) {
@@ -1195,6 +1197,7 @@ std::vector<ros2_medkit_msgs::msg::Fault> SqliteFaultStorage::get_all_faults() c
     fault.occurrence_count = static_cast<uint32_t>(stmt.column_int64(5));
     fault.status = stmt.column_text(6);
     fault.reporting_sources = parse_json_array(stmt.column_text(7));
+    fault.last_passed = rclcpp::Time(stmt.column_int64(8), RCL_SYSTEM_TIME);
 
     result.push_back(fault);
   }
