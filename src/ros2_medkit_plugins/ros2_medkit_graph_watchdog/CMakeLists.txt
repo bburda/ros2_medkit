@@ -87,6 +87,14 @@ target_link_libraries(ros2_medkit_graph_watchdog nlohmann_json::nlohmann_json)
 install(TARGETS ros2_medkit_graph_watchdog LIBRARY DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
+  include(ROS2MedkitTestDomain)
+  # This package owns 75-89. The gtests below take one domain each through the shared macro,
+  # so the allocation table cannot drift from the literals and exhaustion is a configure
+  # error rather than a silent collision. The launch tests cannot use it: it writes
+  # ENVIRONMENT wholesale and they also need GATEWAY_TEST_PORT and the plugin path, so they
+  # keep an explicit assignment and share one domain under a RESOURCE_LOCK.
+  medkit_init_test_domains(START 75 END 89)
+
   find_package(ament_lint_auto REQUIRED)
   # uncrustify/cpplint conflict with project-wide clang-format (120 cols vs 100).
   # flake8/pep257 are excluded to match the rest of the workspace: no package here
@@ -145,7 +153,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_watchdog_clock test/test_watchdog_clock.cpp)
   target_include_directories(test_watchdog_clock PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
   medkit_target_dependencies(test_watchdog_clock rclcpp rosgraph_msgs)
-  set_tests_properties(test_watchdog_clock PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=75")
+  medkit_set_test_domain(test_watchdog_clock)
 
   ament_add_gtest(test_graph_watchdog_plugin
     test/test_graph_watchdog_plugin.cpp
@@ -159,7 +167,7 @@ if(BUILD_TESTING)
   medkit_target_dependencies(test_graph_watchdog_plugin
     ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs)
   target_link_libraries(test_graph_watchdog_plugin nlohmann_json::nlohmann_json)
-  set_tests_properties(test_graph_watchdog_plugin PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=76")
+  medkit_set_test_domain(test_graph_watchdog_plugin)
 
   ament_add_gtest(test_lifecycle_watcher
     test/test_lifecycle_watcher.cpp
@@ -167,7 +175,7 @@ if(BUILD_TESTING)
     ${LIFECYCLE_STATE_READER_SOURCES})
   target_include_directories(test_lifecycle_watcher PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
   medkit_target_dependencies(test_lifecycle_watcher ros2_medkit_gateway rclcpp lifecycle_msgs)
-  set_tests_properties(test_lifecycle_watcher PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=77")
+  medkit_set_test_domain(test_lifecycle_watcher)
 
   ament_add_gtest(test_reliability_gate
     test/test_reliability_gate.cpp
@@ -177,7 +185,7 @@ if(BUILD_TESTING)
   target_include_directories(test_reliability_gate PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
   medkit_target_dependencies(test_reliability_gate ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs)
   target_link_libraries(test_reliability_gate nlohmann_json::nlohmann_json)
-  set_tests_properties(test_reliability_gate PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=78")
+  medkit_set_test_domain(test_reliability_gate)
 
   # LifecycleShutdownSuppressor: needs a REAL ReliabilityGate (departed_lifecycle_state_of()
   # reads live from ctx.gate) - same real-Node/ROS_DOMAIN_ID rationale as test_reliability_gate
@@ -205,8 +213,8 @@ if(BUILD_TESTING)
   medkit_target_dependencies(test_qos_mismatch_integration
     ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs std_msgs)
   target_link_libraries(test_qos_mismatch_integration nlohmann_json::nlohmann_json)
-  set_tests_properties(test_qos_mismatch_integration PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=81"
-    TIMEOUT 120 RESOURCE_LOCK graph_watchdog_integration_domain)
+  medkit_set_test_domain(test_qos_mismatch_integration)
+  set_tests_properties(test_qos_mismatch_integration PROPERTIES TIMEOUT 120 RESOURCE_LOCK graph_watchdog_integration_domain)
 
   # === QoS-mismatch e2e (launch_testing) ===
   #

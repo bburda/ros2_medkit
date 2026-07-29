@@ -378,6 +378,19 @@ Functions
    forever. See :doc:`/tutorials/graph-provider` for the full prerequisites and a
    worked walkthrough, and :doc:`/config/graph-provider` for the threshold reference.
 
+``GET /api/v1/x-medkit-watchdog``
+   Get the graph watchdog's reliability status: which entities it has observed, which are
+   armed (past the bringup-quiesce warmup and therefore eligible to raise), and the cached
+   lifecycle state of any managed lifecycle nodes. Served by the
+   ``ros2_medkit_graph_watchdog`` plugin. Read-only; it raises nothing and changes nothing.
+
+   The payload carries ``schema_version``, the configured ``warmup_cycles``, a global state,
+   and a per-entity map. An entity that is present but not yet armed is normal during
+   bringup: the watchdog holds every raise until an entity has been continuously present for
+   ``warmup_cycles`` ticks, so a joining node does not read as a failure.
+
+   Use it to answer "why has the watchdog not reported anything yet" without reading logs.
+
    **Example Response:**
 
    .. code-block:: json

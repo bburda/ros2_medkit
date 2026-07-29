@@ -22,7 +22,7 @@
 #   ros2_medkit_sovd_service_interface: 1 -   9 (9 slots)
 #   ros2_medkit_fault_manager:         10 -  29 (20 slots)
 #   ros2_medkit_gateway:               30 -  74 (45 slots)
-#   ros2_medkit_graph_watchdog:        75 -  89 (15 slots)
+#   ros2_medkit_graph_watchdog:        75 -  89 (15 slots; launch tests share 89)
 #   ros2_medkit_diagnostic_bridge:     90 -  99 (10 slots)
 #   ros2_medkit_param_beacon:         100 - 104 (5 slots)
 #   ros2_medkit_topic_beacon:         105 - 109 (5 slots)
