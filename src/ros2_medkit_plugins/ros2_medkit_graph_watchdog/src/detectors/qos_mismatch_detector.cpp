@@ -122,6 +122,7 @@ class QosMismatchDetector : public Detector {
     log_warnings_once(ctx);
 
     std::map<std::string, std::string> affected;  // topic -> "<topic>: <reasons>"
+    std::vector<std::string> newly_affected;      // crossed the gate this tick -> named first
     bool any_starved = false;
     std::set<std::string> seen_topics;
     const auto topics = ctx.gateway_node->get_topic_names_and_types();
@@ -180,6 +181,13 @@ class QosMismatchDetector : public Detector {
       if (!starved_by_reason.empty()) {
         any_starved = true;
       }
+      // A topic crossing the gate on THIS tick is the new information. The description is
+      // capped, and affected topics are otherwise listed lexicographically, so without this
+      // a newly starved subscriber on a late-sorting topic would produce no operator-visible
+      // change at all: the code is already raised and the text is already full.
+      if (streak_[topic] == grace_ + 1) {
+        newly_affected.push_back(topic);
+      }
       affected[topic] = describe_topic(topic, starved_by_reason, partial_by_reason);
     }
     // Drop streaks for topics that left the graph, so the map cannot grow without bound on
@@ -192,7 +200,7 @@ class QosMismatchDetector : public Detector {
     // ERROR as soon as any subscriber anywhere receives nothing at all, WARN when every
     // finding is a degraded-but-alive topic.
     AggregatedFault aggregated{graph_fault_codes::kQosMismatch, any_starved ? kStarvedSeverity : kPartialSeverity};
-    aggregated.emit(ctx, affected);
+    aggregated.emit_ordered(ctx, affected, newly_affected);
   }
 
  private:
