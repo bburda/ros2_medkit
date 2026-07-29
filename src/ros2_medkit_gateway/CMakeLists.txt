@@ -345,7 +345,7 @@ if(BUILD_TESTING)
   )
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 30 END 89)
+  medkit_init_test_domains(START 30 END 74)
 
   # ─── Core purity check ────────────────────────────────────────────────────
   # Fails the build if any file under include/ros2_medkit_gateway/core/ or

@@ -1,0 +1,391 @@
+// Copyright 2026 bburda
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#include "ros2_medkit_graph_watchdog/graph_watchdog_plugin.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <exception>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_graph_watchdog/aggregated_fault.hpp"  // kGraphWatchdogEntityId
+#include "ros2_medkit_graph_watchdog/detector_config.hpp"
+#include "ros2_medkit_graph_watchdog/detector_registry.hpp"
+#include "ros2_medkit_graph_watchdog/reliability_gate.hpp"
+
+namespace ros2_medkit_graph_watchdog {
+
+namespace {
+// Mirrors NodeDeathDetector's own kDefaultMissGrace (node_death_detector.cpp, anonymous
+// namespace, not reachable from here) - kept in sync by convention since this is only a
+// fallback used when config carries no explicit "detectors.node_death.miss_grace".
+constexpr int kDefaultNodeDeathMissGrace = 2;
+}  // namespace
+
+ros2_medkit_gateway::IntrospectionResult
+GraphWatchdogPlugin::introspect(const ros2_medkit_gateway::IntrospectionInput & input) {
+  ros2_medkit_gateway::IntrospectionResult result;
+  ros2_medkit_gateway::App app;
+  app.id = kGraphWatchdogEntityId;
+  app.name = "Graph watchdog";
+  app.description = "Graph-level silent-fault detectors; every GRAPH_* fault is scoped here";
+  // This App stands for the graph itself, not for a ROS node, so it has no binding to
+  // derive an FQN from. Without `external` the fault scope resolves it to an empty FQN
+  // and drops it (fault_scope.cpp's resolve_app_source_fqn), which would leave every
+  // GRAPH_* fault exactly as unreachable as it was under the host Component.
+  app.external = true;
+  app.is_online = true;
+  app.source = "plugin";
+  // Attach to the host Component so the faults also roll up to /components/<host>/faults
+  // (a Component resolves its scope through its child apps). With no Component in the
+  // snapshot the App still stands alone and /apps/graph_watchdog/faults works.
+  if (!input.components.empty() && !input.components.front().id.empty()) {
+    app.component_id = input.components.front().id;
+  }
+  result.new_entities.apps.push_back(std::move(app));
+  return result;
+}
+
+GraphWatchdogPlugin::GraphWatchdogPlugin() = default;
+GraphWatchdogPlugin::~GraphWatchdogPlugin() {
+  shutdown();
+}
+
+void GraphWatchdogPlugin::configure(const nlohmann::json & config) {
+  std::lock_guard<std::mutex> lock(config_mutex_);
+  config_ = config;
+}
+
+void GraphWatchdogPlugin::load_parameters() {
+  std::lock_guard<std::mutex> lock(config_mutex_);
+  if (config_.contains("tick_interval_ms") && config_["tick_interval_ms"].is_number_integer()) {
+    const int candidate = config_["tick_interval_ms"].get<int>();
+    if (candidate > 0) {
+      tick_interval_ms_ = candidate;
+    } else {
+      log_warn("ignoring non-positive tick_interval_ms=" + std::to_string(candidate) + "; keeping " +
+               std::to_string(tick_interval_ms_));
+    }
+  }
+  if (config_.contains("warmup_cycles") && config_["warmup_cycles"].is_number_integer()) {
+    const int candidate = config_["warmup_cycles"].get<int>();
+    if (candidate >= 0) {
+      warmup_cycles_ = candidate;
+    } else {
+      log_warn("ignoring negative warmup_cycles=" + std::to_string(candidate));
+    }
+  }
+  if (config_.contains("prune_grace") && config_["prune_grace"].is_number_integer()) {
+    const int candidate = config_["prune_grace"].get<int>();
+    if (candidate >= 0) {
+      prune_grace_ = candidate;
+    } else {
+      log_warn("ignoring negative prune_grace=" + std::to_string(candidate));
+    }
+  }
+}
+
+int GraphWatchdogPlugin::compute_departed_retention_ticks(const nlohmann::json & config_snapshot) const {
+  // Read "detectors.node_death.miss_grace" directly off the full config tree (mirroring
+  // node_death_detector.cpp's own nested read of the same field) - node_death's own
+  // configure() has not run yet at the point set_context() needs this value, so its
+  // own kDefaultMissGrace/clamping cannot be reused directly here.
+  int node_death_miss_grace = kDefaultNodeDeathMissGrace;
+  int node_death_prune_grace = prune_grace_;
+  if (config_snapshot.contains("detectors") && config_snapshot["detectors"].is_object()) {
+    const auto & detectors = config_snapshot["detectors"];
+    if (detectors.contains("node_death") && detectors["node_death"].is_object()) {
+      const auto & node_death_cfg = detectors["node_death"];
+      if (node_death_cfg.contains("miss_grace") && node_death_cfg["miss_grace"].is_number_integer()) {
+        const int candidate = node_death_cfg["miss_grace"].get<int>();
+        if (candidate >= 0) {
+          node_death_miss_grace = candidate;
+        }
+      }
+      // Same reason we read miss_grace here: prune_grace is a per-detector key whose
+      // plugin-scope value is only a default, so the retention window must be computed from
+      // whatever node_death will ACTUALLY clamp its prune_ticks_ to. Reading prune_grace_
+      // unconditionally would under-run the retention whenever an operator raises
+      // detectors.node_death.prune_grace, and node_death would then re-raise a
+      // cleanly-shut-down node it should have silently reclaimed (see the formula below).
+      if (node_death_cfg.contains("prune_grace") && node_death_cfg["prune_grace"].is_number_integer()) {
+        const int candidate = node_death_cfg["prune_grace"].get<int>();
+        if (candidate >= 0) {
+          node_death_prune_grace = candidate;
+        }
+      }
+    }
+  }
+  // prune_ticks mirrors node_death's OWN prune_ticks_ clamp (node_death_detector.cpp's
+  // configure()): max(prune_grace, miss_grace + 1). The departed-lifecycle label must
+  // survive not just past the FIRST tick node_death evaluates suppression on
+  // (T_depart + miss_grace, see test_node_death_integration.cpp's
+  // CleanShutdownDepartureAtMissGraceBoundaryIsSuppressed), but all the way through
+  // node_death's own RECLAIM tick (T_depart + miss_grace + prune_ticks): only a durable
+  // suppressor (lifecycle_clean_shutdown IS one, see suppressor.hpp) may feed
+  // NodeLivenessTracker::prune(), and that reclaim can only happen while the suppressor
+  // still actively vetoes the id - i.e. while the label is still cached. If the label
+  // expired even one tick earlier (the old `max(prune_grace, miss_grace + 1)` retention
+  // - the SAME length as prune_ticks, but anchored miss_grace ticks later at
+  // T_depart instead of T_death), the suppressor would abstain right at the reclaim
+  // tick, node_death would RAISE instead of silently reclaiming, and - because the
+  // label is now gone for good - the id could never be suppressed again: a permanent
+  // false GRAPH_NODE_DISAPPEARED for a cleanly-shut-down node. The extra "+1" keeps one
+  // full tick of margin past the reclaim tick itself. See
+  // test_node_death_integration.cpp's CleanShutdownDepartureIsReclaimedNotReRaisedPastRetention
+  // for the regression this formula fixes.
+  const int prune_ticks = std::max(node_death_prune_grace, node_death_miss_grace + 1);
+  return prune_ticks + node_death_miss_grace + 1;
+}
+
+void GraphWatchdogPlugin::set_context(ros2_medkit_gateway::PluginContext & context) {
+  ctx_ = ros2_medkit_gateway::as_ros_plugin_context(context);
+  load_parameters();
+  if (!ctx_ || !ctx_->node()) {
+    log_error("no ROS node in context; graph_watchdog disabled");
+    return;
+  }
+  auto * node = ctx_->node();
+  clock_ = std::make_unique<WatchdogClock>(node);
+
+  nlohmann::json config_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    config_snapshot = config_;
+  }
+
+  // Computed BEFORE gate_ is constructed: node_death's own configure() (which normally
+  // owns its miss_grace default) has not run yet at this point.
+  const int departed_retention_ticks = compute_departed_retention_ticks(config_snapshot);
+  gate_ = std::make_unique<ReliabilityGate>(warmup_cycles_, node, &node_mutex_, departed_retention_ticks);
+  fault_client_ = node->create_client<ros2_medkit_msgs::srv::ReportFault>("/fault_manager/report_fault");
+
+  std::set<std::string> seen_ids;
+  for (auto & detector : DetectorRegistry::instance().create_all()) {
+    const std::string id = detector->id();
+    if (!seen_ids.insert(id).second) {
+      log_warn("duplicate detector id '" + id + "'; skipping the duplicate");
+      continue;
+    }
+    std::vector<std::string> mode_warnings;
+    const DetectorMode mode = parse_detector_mode(config_snapshot, id, &mode_warnings);
+    for (const auto & warning : mode_warnings) {
+      log_warn(warning);
+    }
+    if (mode == DetectorMode::Off) {
+      continue;
+    }
+    try {
+      // extract_detector_config() isolates each detector to config["detectors"][id], so a
+      // plugin-scope knob never reaches a detector on its own. Inject them under names every
+      // detector treats as plugin plumbing rather than operator keys (see
+      // plugin_injected_detector_keys()): node_death needs the tick period to turn its
+      // tick-counted grace into a wall-clock window, and every prune-aware detector reads
+      // prune_grace.
+      auto dcfg = extract_detector_config(config_snapshot, id);
+      dcfg["tick_interval_ms"] = tick_interval_ms_;
+      // prune_grace is a plugin-scope DEFAULT, not an override: every prune-aware detector
+      // documents it in its own key table and reads it off the config it is handed, so
+      // `detectors.tf_stale.prune_grace` must win over the plugin-scope value. Injecting it
+      // unconditionally silently discarded the per-detector setting.
+      if (!dcfg.contains("prune_grace")) {
+        dcfg["prune_grace"] = prune_grace_;
+      }
+      detector->configure(dcfg);
+    } catch (const std::exception & e) {
+      log_error("detector '" + id + "' configure() threw: " + std::string(e.what()) + "; skipping");
+      continue;
+    }
+    detectors_.emplace_back(std::move(detector), mode);
+  }
+
+  // A typo in the detector ID itself is the worst of the config typos: the whole block
+  // becomes a no-op, so `detectors.param_drfit.mode: off` leaves a detector the operator
+  // explicitly disabled still raising on the robot. Nothing downstream can catch it -
+  // extract_detector_config only ever looks up ids it already knows - so compare the
+  // configured ids against the registered set here, where both are in hand.
+  if (config_snapshot.contains("detectors") && config_snapshot["detectors"].is_object()) {
+    std::string registered;
+    for (const auto & id : seen_ids) {
+      if (!registered.empty()) {
+        registered += ", ";
+      }
+      registered += id;
+    }
+    for (const auto & item : config_snapshot["detectors"].items()) {
+      if (seen_ids.count(item.key()) == 0) {
+        log_warn("config block 'detectors." + item.key() + "' matches no registered detector and has no effect" +
+                 " (registered: " + registered + ")");
+      }
+    }
+  }
+
+  // Run the tick on a dedicated thread, NOT a gateway wall-timer: detectors do blocking
+  // parameter/service reads, and the gateway's small executor is only safe because
+  // blocking never runs on an executor thread (see the gateway's main.cpp). This keeps
+  // the blocking off the executor's callback group entirely.
+  tick_thread_ = std::thread([this] {
+    run_tick_loop();
+  });
+
+  // Quiesce the tick thread BEFORE rclcpp invalidates the context (this runs even on a SIGINT,
+  // ahead of context invalidation). It signals shutdown and waits, bounded, for run_tick_loop() to
+  // leave its loop so no detector is mid-rcl-read when the context dies. It does NOT join the
+  // thread (shutdown()/the destructor own that) - it only makes the thread quiescent.
+  context_ = node->get_node_base_interface()->get_context();
+  pre_shutdown_handle_ = context_->add_pre_shutdown_callback([this] {
+    {
+      std::lock_guard<std::mutex> lock(tick_cv_mutex_);
+      shutdown_requested_.store(true);
+    }
+    tick_cv_.notify_all();
+    std::unique_lock<std::mutex> lock(tick_cv_mutex_);
+    tick_cv_.wait_for(lock, std::chrono::seconds(2), [this] {
+      return tick_loop_exited_;
+    });
+  });
+
+  log_info("graph_watchdog up: " + std::to_string(detectors_.size()) + " detector(s)");
+}
+
+void GraphWatchdogPlugin::run_tick_loop() {
+  while (!shutdown_requested_.load()) {
+    tick();
+    std::unique_lock<std::mutex> lock(tick_cv_mutex_);
+    tick_cv_.wait_for(lock, std::chrono::milliseconds(tick_interval_ms_), [this] {
+      return shutdown_requested_.load();
+    });
+  }
+  // Announce that no more ticks (and so no more rcl reads) will run. The pre-shutdown callback
+  // waits on this so the context is not invalidated while a tick is mid-flight.
+  {
+    std::lock_guard<std::mutex> lock(tick_cv_mutex_);
+    tick_loop_exited_ = true;
+  }
+  tick_cv_.notify_all();
+}
+
+void GraphWatchdogPlugin::tick() {
+  if (shutdown_requested_.load()) {
+    return;
+  }
+  // No tick_mutex_ here: shutdown() joins this thread before tearing down any member, so
+  // tick() can never race teardown. Running lock-free is what keeps the blocking reads
+  // below from stalling the get_routes() status handler (which does take tick_mutex_).
+  tick_count_.fetch_add(1);
+  // The gate update runs first and can throw: get_entity_snapshot()'s contract is not
+  // enforced, and LifecycleWatcher::update() calls create_subscription() (invalid topic
+  // name, RCLError, bad_alloc). An escape would kill the tick thread and every detector,
+  // so guard it like each detector->tick() below.
+  ros2_medkit_gateway::IntrospectionInput snapshot;
+  try {
+    clock_->mark_tick();
+    if (ctx_) {
+      snapshot = ctx_->get_entity_snapshot();
+    }
+    if (gate_) {
+      gate_->update(snapshot, tick_count_.load());
+    }
+  } catch (const std::exception & e) {
+    log_error("graph_watchdog gate update threw: " + std::string(e.what()));
+  }
+  auto * node = ctx_ ? ctx_->node() : nullptr;
+  for (auto & [detector, mode] : detectors_) {
+    // Bail between detectors so shutdown() (which joins this thread) is not held for a full
+    // sweep of blocking reads once teardown has been requested.
+    if (shutdown_requested_.load()) {
+      return;
+    }
+    DetectorContext dctx;
+    dctx.gateway_node = node;
+    dctx.node_mutex = &node_mutex_;
+    dctx.clock = clock_.get();
+    dctx.gate = gate_.get();
+    dctx.mode = mode;
+    dctx.fault_client = fault_client_;
+    dctx.snapshot = &snapshot;
+    dctx.cancelled = &shutdown_requested_;
+    try {
+      detector->tick(dctx);
+    } catch (const std::exception & e) {
+      log_error("detector '" + detector->id() + "' threw: " + e.what());
+    }
+  }
+}
+
+void GraphWatchdogPlugin::shutdown() {
+  // Guard on teardown_done_, NOT shutdown_requested_: the pre-shutdown callback may already have set
+  // shutdown_requested_ to quiesce the tick loop, and guarding on that would make this early-return
+  // WITHOUT joining tick_thread_, leaving a joinable std::thread to std::terminate() at destruction.
+  if (teardown_done_.exchange(true)) {
+    return;
+  }
+  // Deregister the pre-shutdown callback (it captures `this`): a no-op if it already ran during a
+  // normal rclcpp shutdown, but it prevents a stale callback firing on a destroyed plugin when the
+  // plugin is torn down without an rclcpp shutdown.
+  if (context_) {
+    context_->remove_pre_shutdown_callback(pre_shutdown_handle_);
+  }
+  // Wake the tick loop out of its sleep and JOIN it before touching any member: after the
+  // join no tick runs, so the teardown below cannot race an in-flight tick. (A tick
+  // in progress finishes first; its blocking reads are bounded by the parameter
+  // transport's own service timeout, so the join cannot hang on an unresponsive node.)
+  // Set the stop flag under tick_cv_mutex_ before notifying so the signal cannot fall into the gap
+  // between the tick loop testing shutdown_requested_ and entering wait_for(): re-acquiring the mutex
+  // the waiter holds while it re-checks the predicate guarantees it observes the flag we just set,
+  // bounding shutdown latency to well under one tick interval. This is a latency optimization, not
+  // a correctness requirement - wait_for()'s timeout and predicate already backstop a missed wakeup.
+  {
+    std::lock_guard<std::mutex> lock(tick_cv_mutex_);
+    shutdown_requested_.store(true);
+  }
+  tick_cv_.notify_all();
+  if (tick_thread_.joinable()) {
+    tick_thread_.join();
+  }
+  // Fence the get_routes() status handler (the only other member reader) against teardown.
+  std::lock_guard<std::mutex> lock(tick_mutex_);
+  detectors_.clear();
+  fault_client_.reset();
+  clock_.reset();
+  if (gate_) {
+    gate_->reset();
+  }
+  gate_.reset();
+}
+
+std::vector<GraphWatchdogPlugin::PluginRoute> GraphWatchdogPlugin::get_routes() {
+  auto handler = [this](const ros2_medkit_gateway::PluginRequest &, ros2_medkit_gateway::PluginResponse & res) {
+    // tick_mutex_ guards gate_ against shutdown()'s teardown (which also holds it after
+    // joining the tick thread), so the pointer cannot be reset mid-read. The concurrent
+    // tick-thread gate_->update() is made safe against this status read by the gate's OWN
+    // internal gate_mutex_ (status_json() and update() both take it); status_json() does
+    // no blocking I/O, so this handler never stalls behind the detectors' blocking reads.
+    std::lock_guard<std::mutex> lock(tick_mutex_);
+    if (!gate_) {
+      res.send_error(503, ros2_medkit_gateway::ERR_SERVICE_UNAVAILABLE,
+                     "graph_watchdog reliability gate not initialized");
+      return;
+    }
+    res.send_json(gate_->status_json());
+  };
+  std::vector<PluginRoute> routes;
+  routes.push_back({"GET", R"(x-medkit-watchdog)", std::move(handler)});
+  return routes;
+}
+
+}  // namespace ros2_medkit_graph_watchdog
