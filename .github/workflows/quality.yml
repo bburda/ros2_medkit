@@ -316,9 +316,24 @@ jobs:
 
       - name: Extend test timeouts for ASan overhead
         run: |
-          find build/ -name "CTestTestfile.cmake" \
-            -exec sed -i 's/TIMEOUT "60"/TIMEOUT "180"/g' {} + \
-            -exec sed -i 's/TIMEOUT "120"/TIMEOUT "360"/g' {} +
+          # Multiply EVERY declared CTest timeout by three, whatever it is. The
+          # x3 factor is the one the two literal rewrites this replaced encoded
+          # (60 -> 180, 120 -> 360), so no test's effective budget changes here;
+          # what changes is that a test declared at any OTHER value is no longer
+          # silently left on its native budget under a sanitizer that makes it
+          # several times slower. A fixed pair of literals goes stale the moment
+          # a budget is raised for good reasons, and the failure it produces is
+          # the worst kind: ctest kills the process and the test's own output
+          # dies with it, so the run reports a timeout and no test name.
+          find build/ -name "CTestTestfile.cmake" -exec \
+            perl -pi -e 's/\bTIMEOUT "(\d+)"/sprintf(q{TIMEOUT "%d"}, $1 * 3)/ge' {} +
+          # Print what the tests will actually run with, so a sanitizer job that
+          # is killed on time can be read against its real budgets. `cat` first
+          # so grep sees one stream: its exit status then means "the rewrite had
+          # nothing to act on", which under pipefail correctly fails the step,
+          # rather than "one -exec batch happened to hold no timeouts".
+          find build/ -name "CTestTestfile.cmake" -exec cat {} + \
+            | grep -oE 'TIMEOUT "[0-9]+"' | sort -t'"' -k2 -n | uniq -c
 
       - name: Run unit + integration tests with ASan + UBSan
         timeout-minutes: 30
@@ -421,9 +436,12 @@ jobs:
 
       - name: Extend test timeouts for TSan overhead
         run: |
-          find build/ -name "CTestTestfile.cmake" \
-            -exec sed -i 's/TIMEOUT "60"/TIMEOUT "180"/g' {} + \
-            -exec sed -i 's/TIMEOUT "120"/TIMEOUT "360"/g' {} +
+          # Same generic x3 rewrite as the ASan job - see the comment there for
+          # why it is not a list of literal values.
+          find build/ -name "CTestTestfile.cmake" -exec \
+            perl -pi -e 's/\bTIMEOUT "(\d+)"/sprintf(q{TIMEOUT "%d"}, $1 * 3)/ge' {} +
+          find build/ -name "CTestTestfile.cmake" -exec cat {} + \
+            | grep -oE 'TIMEOUT "[0-9]+"' | sort -t'"' -k2 -n | uniq -c
 
       - name: Run unit + integration tests with TSan
         timeout-minutes: 30

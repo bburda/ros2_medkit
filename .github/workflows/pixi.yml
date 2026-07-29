@@ -16,7 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     # Experimental - don't block development while RoboStack support matures
     continue-on-error: true
-    timeout-minutes: 45
+    # The build step alone is ~32 min of this, and the job has been landing at 37-40 min for
+    # weeks with about 3 min of run-to-run variance, so 45 left no room for a package growing.
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash

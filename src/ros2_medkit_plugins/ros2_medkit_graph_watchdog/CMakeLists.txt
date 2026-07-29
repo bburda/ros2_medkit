@@ -29,6 +29,9 @@ find_package(ament_cmake REQUIRED)
 find_package(ros2_medkit_gateway REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+# The reused gateway parameter transport includes rcl_interfaces message headers directly;
+# it built only through rclcpp's transitive exports.
+find_package(rcl_interfaces REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(tf2_msgs REQUIRED)
@@ -83,7 +86,7 @@ add_library(ros2_medkit_graph_watchdog MODULE
   ${DETECTOR_SRCS})
 target_include_directories(ros2_medkit_graph_watchdog PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
 medkit_target_dependencies(ros2_medkit_graph_watchdog
-  ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs tf2_msgs geometry_msgs)
+  ros2_medkit_gateway rclcpp rcl_interfaces ros2_medkit_msgs lifecycle_msgs tf2_msgs geometry_msgs)
 target_link_libraries(ros2_medkit_graph_watchdog nlohmann_json::nlohmann_json)
 install(TARGETS ros2_medkit_graph_watchdog LIBRARY DESTINATION lib/${PROJECT_NAME})
 
@@ -122,6 +125,8 @@ if(BUILD_TESTING)
 
   find_package(ament_cmake_gtest REQUIRED)
   find_package(rosgraph_msgs REQUIRED)
+  # test_param_drift_integration.cpp includes rcutils/logging.h directly.
+  find_package(rcutils REQUIRED)
 
   ament_add_gtest(test_warmup_tracker test/test_warmup_tracker.cpp)
   target_include_directories(test_warmup_tracker PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
@@ -188,11 +193,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_reliability_gate nlohmann_json::nlohmann_json)
   medkit_set_test_domain(test_reliability_gate)
 
-  # LifecycleShutdownSuppressor: needs a REAL ReliabilityGate (departed_lifecycle_state_of()
-  # reads live from ctx.gate) - same real-Node/ROS_DOMAIN_ID rationale as test_reliability_gate
-  # above, unlike test_allowlist_suppressor (pure interface, no gate needed).
+  # Pure matching logic over hand-built inputs: no rclcpp::Node, so no domain is needed.
   ament_add_gtest(test_orphan_policy test/test_orphan_policy.cpp)
   target_include_directories(test_orphan_policy PRIVATE include)
+
+  ament_add_gtest(test_param_drift_policy test/test_param_drift_policy.cpp)
+  target_include_directories(test_param_drift_policy PRIVATE include)
+  target_link_libraries(test_param_drift_policy nlohmann_json::nlohmann_json)
 
   ament_add_gtest(test_qos_policy test/test_qos_policy.cpp)
   target_include_directories(test_qos_policy PRIVATE include)
@@ -203,9 +210,10 @@ if(BUILD_TESTING)
   medkit_target_dependencies(test_aggregated_fault ros2_medkit_gateway rclcpp ros2_medkit_msgs)
   target_link_libraries(test_aggregated_fault nlohmann_json::nlohmann_json)
 
-  # Pure suppressor-chain interface: no raise_fault/clear_fault calls (no ReliabilityGate
-  # sources needed), no live rclcpp::Node, so no ROS_DOMAIN_ID is required - same as
-  # test_qos_policy above.
+  # Real DDS endpoints read through the live graph API, so each of these takes a domain of its
+  # own via medkit_set_test_domain. The two that ALSO register a fake /fault_manager/report_fault
+  # service additionally share a RESOURCE_LOCK, because they spin real nodes for many seconds and
+  # running them concurrently on this box starves the discovery each one waits on.
   ament_add_gtest(test_qos_mismatch_integration
     test/test_qos_mismatch_integration.cpp
     src/detectors/qos_mismatch_detector.cpp
@@ -233,6 +241,27 @@ if(BUILD_TESTING)
   medkit_set_test_domain(test_orphan_integration)
   set_tests_properties(test_orphan_integration PROPERTIES TIMEOUT 120 RESOURCE_LOCK graph_watchdog_integration_domain)
 
+  ament_add_gtest(test_param_drift_integration
+    test/test_param_drift_integration.cpp
+    src/detectors/param_drift_detector.cpp
+    src/detector_registry.cpp
+    src/reliability_gate.cpp
+    src/lifecycle_watcher.cpp
+    ${LIFECYCLE_STATE_READER_SOURCES}
+    ${PARAMETER_TRANSPORT_SOURCES})
+  target_include_directories(test_param_drift_integration PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
+  medkit_target_dependencies(test_param_drift_integration
+    ros2_medkit_gateway rclcpp rcl_interfaces rcutils ros2_medkit_msgs lifecycle_msgs)
+  target_link_libraries(test_param_drift_integration nlohmann_json::nlohmann_json)
+  medkit_set_test_domain(test_param_drift_integration)
+  # 300 s, not 120: several cases here are paced off the detector's own attempt and tick horizons
+  # (sixty failed reads, sixty unarmed ticks, a read that answers past the per-read bound) and each
+  # of those costs real seconds that no budget knob can compress away. A timeout the suite can
+  # outgrow kills the process before gtest prints which case failed, which is the one thing a
+  # timeout must never do to a diagnostic suite.
+  set_tests_properties(test_param_drift_integration PROPERTIES
+    TIMEOUT 300 RESOURCE_LOCK graph_watchdog_integration_domain)
+
   # === QoS-mismatch e2e (launch_testing) ===
   #
   # Acceptance gate: proves GRAPH_QOS_MISMATCH raises and clears through the
@@ -256,6 +285,77 @@ if(BUILD_TESTING)
     LABELS "integration;e2e"
     # Shares the e2e domain and its lock rather than consuming another slot.
     ENVIRONMENT "GATEWAY_TEST_PORT=19130;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
+    RESOURCE_LOCK graph_watchdog_e2e_domain)
+
+  # param_drift e2e: the detector's DEFAULT mode. The config-plumbing scenarios below all set
+  # baseline: false and none of them asserts a clear, so without this the self-capturing behaviour
+  # operators actually get, and the whole healing story the README documents, had no e2e at all.
+  # 300 s, not 240: the file's own deadlines are now the arming gate (60), the silent-capture
+  # window (15), the raise poll (60), the still-raised check (30) and the heal poll (60), and 240
+  # no longer covers their sum. A budget shorter than the internal deadlines is killed by ctest
+  # before any of the messages those deadlines exist to print reaches the log, which turns every
+  # one of them into "timed out".
+  add_launch_test(test/e2e/test_param_drift_e2e.test.py TIMEOUT 300)
+  set_tests_properties(test_e2e_test_param_drift_e2e.test.py PROPERTIES
+    LABELS "integration;e2e"
+    ENVIRONMENT "GATEWAY_TEST_PORT=19170;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
+    RESOURCE_LOCK graph_watchdog_e2e_domain)
+
+  # Round-trip cost e2e: what ONE parameter read really costs the node that serves it, counted
+  # at a node that answers the parameter services by hand. param_drift's read budget is charged
+  # in round trips (2 / 3 / 2), every other test in this package proves the arithmetic GIVEN
+  # those numbers, and the stand-in transport they use counts CALLS - so nothing else here can
+  # notice a round trip being added to or removed from Ros2ParameterTransport. Deliberately runs
+  # with param_drift OFF: the reads are driven over the configurations endpoint so each count
+  # belongs to exactly one transport call.
+  # 300 s, not 180: this test's own retry deadlines (discovery, first contact against each of the
+  # two probes) plus the single-shot measurements between them can legitimately add up to more
+  # than 180 on a slow-discovery run - which is the run it exists to diagnose. A timeout shorter
+  # than the internal budgets kills the process before any of those diagnostics print, so the
+  # failure reads as "test timed out" and says nothing about round trips.
+  add_launch_test(test/e2e/test_param_roundtrip_e2e.test.py TIMEOUT 300)
+  set_tests_properties(test_e2e_test_param_roundtrip_e2e.test.py PROPERTIES
+    LABELS "integration;e2e"
+    ENVIRONMENT "GATEWAY_TEST_PORT=19180;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
+    RESOURCE_LOCK graph_watchdog_e2e_domain)
+
+  # === Config-plumbing e2e (launch_testing) ===
+  #
+  # Proves nested per-detector config reaches a live detector through the REAL gateway
+  # (extract_plugin_config -> detector_config.hpp -> ParamDriftConfig::from_json). No C++ test
+  # above can give that proof: they all call configure() directly with hand-built JSON and
+  # never touch the delivery path.
+  #
+  # One source file, three CTest targets. The plugin reads its config once, at set_context()
+  # time, so proving the nested `expect` reader and the nested `mode` reader needs separate
+  # gateway launches rather than separate test methods in one. WATCHDOG_E2E_SCENARIO selects
+  # which launch and which assertions run in each process.
+  add_launch_test(test/e2e/test_config_plumbing_e2e.test.py
+    TARGET test_config_plumbing_e2e_positive
+    TIMEOUT 180)
+  set_tests_properties(test_config_plumbing_e2e_positive PROPERTIES
+    LABELS "integration;e2e"
+    ENVIRONMENT "GATEWAY_TEST_PORT=19140;ROS_DOMAIN_ID=89;WATCHDOG_E2E_SCENARIO=positive;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
+    RESOURCE_LOCK graph_watchdog_e2e_domain)
+
+  add_launch_test(test/e2e/test_config_plumbing_e2e.test.py
+    TARGET test_config_plumbing_e2e_mode_off
+    TIMEOUT 180)
+  set_tests_properties(test_config_plumbing_e2e_mode_off PROPERTIES
+    LABELS "integration;e2e"
+    ENVIRONMENT "GATEWAY_TEST_PORT=19150;ROS_DOMAIN_ID=89;WATCHDOG_E2E_SCENARIO=mode_off;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
+    RESOURCE_LOCK graph_watchdog_e2e_domain)
+
+  # Third launch: `mode: off` written BARE, which the ROS parser types as a YAML 1.1 boolean
+  # rather than a string. That is the form operators write, and a string-only reader silently
+  # keeps the detector raising.
+  add_launch_test(test/e2e/test_config_plumbing_e2e.test.py
+    TARGET test_config_plumbing_e2e_mode_off_yaml_bool
+    TIMEOUT 180)
+  set_tests_properties(test_config_plumbing_e2e_mode_off_yaml_bool PROPERTIES
+    LABELS "integration;e2e"
+    ENVIRONMENT
+      "GATEWAY_TEST_PORT=19160;ROS_DOMAIN_ID=89;WATCHDOG_E2E_SCENARIO=mode_off_yaml_bool;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
     RESOURCE_LOCK graph_watchdog_e2e_domain)
 
   ros2_medkit_relax_vendor_warnings()

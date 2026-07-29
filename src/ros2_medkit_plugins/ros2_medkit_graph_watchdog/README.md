@@ -7,7 +7,8 @@ Detectors read the graph and raise faults through a `ReportFault` service client
 gateway node; the faults surface via FaultManager on the gateway `/faults` API.
 
 This package carries the plugin skeleton, the central reliability gate that holds raises
-until the graph has quiesced, and two detectors, `qos_mismatch` and `orphan`. The remaining
+until the graph has quiesced, and three detectors, `qos_mismatch`, `orphan` and
+`param_drift`. The remaining
 silent-fault classes land in follow-up changes, each against its own issue; their fault
 codes are already reserved in the frozen `GRAPH_*` namespace (see "Fault codes").
 
@@ -72,6 +73,17 @@ differs only in its numeric field and the rule above already spares it.
 `/robot/scan`, is six edits apart, so no budget that is still specific will reach it. Do not
 rely on this detector for that class.
 
+### `param_drift` keys
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `mode` | string \| bool | `raise` | As above. A bare `off` arrives as a YAML boolean; both forms disable the detector. |
+| `baseline` | bool | `true` | Self-capture the value of every parameter not listed in `expect`, then flag later changes to it. `false` checks only what `expect` pins, and skips reading the full parameter list. |
+| `expect.<param>` | any | - | Absolute expected value for `<param>`, checked on every node that has it. This is the only rule that catches a value that was wrong from the first tick, which self-capture cannot see. A node that does not declare `<param>` answers NOT_FOUND, which is not a drift - so a misspelt name checks nothing at all. Once the sweep has covered every armed app - each one read, or given up on after repeated failed reads - and at least one of them answered, a pin that no app declares is warned about once, naming it. |
+| `ignore` | string[] | `[]` | Parameter-name globs never flagged. Applies to the self-captured set only, so it cannot silence an `expect` pin. A pattern of nothing but `*` matches every name and suppresses self-capture wholesale, which is indistinguishable at runtime from finding nothing; that combination warns at startup. |
+| `max_reads_per_tick` | int | `8` | Parameter-service ROUND TRIPS this detector may spend per tick, round-robin over nodes. Round trips, not calls: one call is several requests at the watched node, and the node pays for each of them. A `baseline` visit is charged 2 (a list, then one batched get) whatever the node's parameter count; each `expect` pin is charged 3 (a list, a get and a descriptor read), or 2 on a node that does not declare it - see the table under "Coverage latency" for what each of those really costs the node. So a self-capture visit spends 2 of the budget and pinning N parameters spends up to 3N. It is an AMORTISED rate, not a per-tick cap: there is no pacing INSIDE a visit, so a node's whole read set is issued back to back and the reader waits out the debt afterwards. Four pins against a budget of 8 fire 12 round trips inside one tick period and then idle for the rest of the next one; what the knob bounds is the sustained rate, not the burst. Accepted range 1..100000; anything else keeps the default and warns. |
+| `prune_grace` | int | `60` | Consecutive sweeps an app may be missing before its finding is dropped: the finding survives `prune_grace` absences and goes on the next one. Injected for every detector at plugin scope and overridable per detector; a value outside 0..3600 is rejected with a warning and this detector falls back to 2, not to the plugin default. The captured BASELINE has a shorter horizon of its own, and that one is NOT configurable - it is the compile-time `kBaselineForgetGrace`: the baseline is dropped on the third consecutive missed sweep, the two the reliability gate absorbs plus one, so an ordinary dropped discovery poll cannot re-capture a node on its already-drifted value. Setting `prune_grace` below 2 pulls that forward onto the sweep the finding itself is dropped on, so the two then go together. |
+
 ### `qos_mismatch` keys
 
 | Key | Type | Default | Meaning |
@@ -80,6 +92,39 @@ rely on this detector for that class.
 | `grace` | int | `3` | Consecutive ticks a topic must stay affected before it is reported. Endpoint discovery is not atomic, so a subscriber can be visible before a publisher's QoS is, which reads as starvation for a tick or two. |
 | `allowlist` | string[] | `[]` | Subscriber FQNs never reported. Exact match only. |
 
+
+## Closing the loop: healing config is required
+
+Every detector here reports level-triggered: it re-raises FAILED while the condition holds
+and emits PASSED on every clean sweep. That is what lets the fault_manager's debounce
+counter walk from CONFIRMED back to HEALED. The fault_manager only counts PASSED events
+toward healing when `healing_enabled` is true for that fault, and it defaults to `false`.
+Without it, a `GRAPH_*` fault that has genuinely cleared stays CONFIRMED forever. Enable
+healing globally on the fault_manager node:
+
+```bash
+ros2 run ros2_medkit_fault_manager fault_manager_node --ros-args \
+  -p healing_enabled:=true \
+  -p healing_threshold:=1  # 2 consecutive clean sweeps to heal (confirmation_threshold defaults to -1)
+```
+
+or scope it to this plugin only, by longest-prefix match on `source_id`, which is always
+`graph_watchdog`:
+
+```yaml
+# entity_thresholds.yaml, loaded via the fault_manager's entity_thresholds.config_file param
+graph_watchdog:
+  healing_enabled: true
+  healing_threshold: 1  # 2 consecutive clean sweeps to heal (confirmation_threshold defaults to -1)
+```
+
+Healing time does not depend on how long the fault was active. The debounce counter is
+clamped to `[confirmation_threshold, healing_threshold]` on every event, so a FAILED event
+can push it down to `confirmation_threshold` and no further; a long-running fault does not
+dig a hole that later clean sweeps have to climb out of. After the fix, each clean sweep
+steps the counter up by one, so healing takes at most
+`healing_threshold - confirmation_threshold` consecutive clean sweeps - exactly that many once
+the counter has walked down to the floor, fewer if the fault was raised only briefly.
 
 ## Where GRAPH_* faults hang
 
@@ -339,6 +384,204 @@ local graph-cache queries, so every topic is checked every tick. `/rosout` and
    `configure()`; both C++ tiers hand `configure()` a JSON object directly.
 
 
+#### `param_drift` (GRAPH_PARAM_DRIFT)
+
+Watches ROS 2 node parameters and raises `GRAPH_PARAM_DRIFT` when a live value diverges
+from its reference. It needs no configuration to be useful: it captures each parameter's
+value once the node arms and flags later runtime changes. Pinning a parameter to an
+absolute value with `expect` additionally catches the case self-capture cannot see, a value
+that was already wrong when the node started.
+
+**A changed parameter is not the same as a broken robot.** The detector reports that a
+value moved and does not grade the consequence. Whether the new value matters is a question
+about the machine, not about the graph, so it raises at WARN and leaves the judgement to
+whoever reads the fault.
+
+**Aggregated fault, not per-node.** All drift in the graph is one graph-level
+`GRAPH_PARAM_DRIFT`, not a fault per owning node, for the same reason as the other
+detectors: the fault_manager identifies a fault by `fault_code` alone, so per-node faults
+would collide into a single record. The description enumerates every currently-drifted
+`(node, parameter)` pair, up to a cap of 480 characters - past that the text is truncated. Each
+app's own contribution is trimmed to 150 characters before that, so one node drifting on many
+parameters cannot fill the 480 by itself, and the entries are ordered `expect` violations first,
+then self-captured drift, with newly detected apps ahead of the ones already reported inside each
+group, so the cap cannot hide the two things worth reading. It clears
+(`EVENT_PASSED`) on every sweep where nothing drifts, so one node reverting is not enough while
+another still drifts, subject to the same `healing_enabled` requirement described in "Closing the
+loop" above. A clear is withheld while any app still has no usable read - one the sweep has not
+reached, one whose reads keep failing, or one the reliability gate has not armed - because health
+that was never measured is not reported as health. That withholding is bounded in both directions:
+an app whose reads keep failing stops holding the clear back once it has been given up on (see
+below), and a gate-denied app stops once the frozen hold has elapsed. An app whose reads keep
+failing is named in the log once ten consecutive attempts have failed; one the sweep has not yet
+attempted is not named, because nothing is known about it yet - instead, a clear that has been
+withheld for a whole minute of ticks is logged once, saying how many apps are behind it and naming
+one, so an operator watching a fault refuse to heal can tell a graph the sweep cannot cover from a
+detector that is simply working.
+
+```yaml
+plugins:
+  graph_watchdog:
+    detectors:
+      param_drift:
+        expect:
+          use_sim_time: false     # flag any node running on sim time in production
+        ignore: ["*_stamp"]       # only filters self-captured params, so keep baseline enabled
+```
+
+`baseline` and `expect` combine: an empty `expect` with `baseline: true` is pure
+self-capture; a sparse `expect` with `baseline: true` is pins plus self-capture;
+`baseline: false` checks only the pinned parameters and moves far less data, because it never
+reads the full parameter list. It is not cheaper against the budget, though: a self-capture visit
+is charged 2 round trips no matter how many parameters the node has, while a single pin the node
+declares is charged 3.
+
+**Coverage latency.** The sweep is budgeted by service ROUND TRIPS at the watched nodes - not by
+node count, and not by transport calls either. `max_reads_per_tick` bounds how many round trips
+happen per tick period, and the reader paces itself to that rate rather than reading back to back.
+A node's whole read set is read in one visit, and the visit is then charged in round trips rather
+than in calls. What it is charged is not always what the node paid:
+
+| Visit | Round trips charged | What the node actually pays |
+|-------|---------------------|-----------------------------|
+| `baseline: true` | 2 | 2 - one list, one batched get, whatever the parameter count. 4 on the very first contact; see below. |
+| one `expect` pin the node declares | 3 | 3 - a name-scoped list, a get, and a descriptor read the transport makes unconditionally on the success path |
+| one `expect` pin the node does not declare | 2 | 1 - the name-scoped list comes back empty and the transport stops there. The charge is the higher of the two NOT_FOUND paths: a name the list DOES find and the get then returns no value for costs 2, and the error code cannot tell them apart, so the bound overstates rather than understates. |
+| one `expect` pin the node declares but has not set | 3 | 3 - not a NOT_FOUND at all. rclcpp answers an unset parameter with a `PARAMETER_NOT_SET` value rather than an absent one, so the read succeeds, pays for the descriptor like any other resolved pin, and the pin fires: a node holding no value at all does not satisfy a pin that names one. It is reported as `got=<unset>`, not as `got=null`, because a NaN-valued parameter reads as `null` too and the two are different faults. |
+
+The right-hand column is measured rather than asserted: `test/e2e/test_param_roundtrip_e2e.test.py`
+drives the real transport against a node that answers the parameter services by hand and counts
+every request it is asked to serve.
+
+Visiting every node once therefore takes at least about
+
+- `ceil(2 * node_count / max_reads_per_tick)` tick periods with `baseline: true`, and
+- with `baseline: false`, `ceil(3 * pin_count * node_count / max_reads_per_tick)` where every node
+  declares every pin, down to `ceil(2 * pin_count * node_count / max_reads_per_tick)` where none of
+  them does,
+
+and a drift on a node not yet visited is invisible until then. At the defaults (budget 8, 1 s
+tick) a 20-node graph is about 5 ticks in self-capture mode; the same graph with four pins every
+node declares is about 30, and about 20 if no node declares any of them. Treat that as a floor
+rather than a bound: a read that overruns its slot is not compensated, so a few slow nodes stretch
+the rotation further.
+
+In `baseline: true` mode the very FIRST read of a given node costs two round trips more than the
+table charges, because `list_parameters` primes the transport's defaults cache before doing its own
+read. That excess is deliberately not charged: the cache has no expiry, so the pair is paid once
+per node for the life of the gateway, and charging it on every read would throttle the whole run to
+cover one rotation. The practical effect is that the first rotation after startup puts up to twice
+the budgeted load on the nodes in it, and every rotation after that stays within budget.
+`baseline: false` has no cold surcharge at all: `get_parameter` never primes that cache, so the
+first pinned read of a node costs the same three round trips as every later one.
+
+Coverage latency governs repairs as well as detections: a node that reverted but has not been read
+again yet keeps its stale entry, so the aggregated fault can stay raised for up to one rotation
+after the underlying fix. Raise `max_reads_per_tick`, or lower the tick interval, to shorten that
+window on a big graph.
+
+There is one stale entry those two knobs do NOT shorten. A node that is present but has left the
+reliability gate's `active` state is not read at all, so its finding is frozen rather than
+re-derived - which is right for a pause, and wrong for good. `kFrozenHoldTicks`, a compile-time 60
+consecutive gate-denied ticks (a minute at the default tick period), bounds it: past that the
+finding is released and the app also stops holding back a clear, and both come back from a fresh
+read if it ever arms again. Because that horizon is counted in TICKS and not in rotations, raising
+`max_reads_per_tick` does nothing to it and shortening `tick_interval_ms` shortens it only
+incidentally, by making a tick shorter.
+
+What is NOT derived from the rotation is anything the detector says about an app that will not
+answer. Both the log line and the point at which it stops holding back a clear rest primarily on
+completed, FAILED read attempts and not on elapsed ticks, so an app that is merely waiting its turn
+is never announced as silent: the log names an app once ten consecutive reads of it have failed,
+and the detector stops letting it hold back a clear only once more than sixty have. Each of those
+carries an additional FLOOR in ticks, of the same size, which the app must also have spent
+unread - an attempt is not a duration, and without the floor `max_reads_per_tick: 100000` spends
+sixty-one attempts in a couple of milliseconds and writes off a node that has merely not finished
+being discovered. The floor is a conjunction, so it can only ever delay the two, never bring them
+forward. An armed app the sweep has never ATTEMPTED blocks the clear for as long as that stays
+true, however long the rotation takes; a cached read is not a substitute, so an app whose reads
+start failing blocks the clear again from the first failure.
+
+The reads run on a thread the plugin owns, never on the gateway's ROS executor, so a node
+that stops answering stalls only this detector's sweep and not the gateway's request
+handling.
+
+**Getting back to clean after a deliberate change.** The detector cannot tell an
+intentional runtime change from a misconfiguration; it only knows the value moved away from
+what it last saw. Reverting the parameter always works: the aggregate clears on the first sweep
+where nothing drifts and every app has either been read, been given up on after repeated failed
+reads, or exhausted the frozen hold with the gate still shut.
+
+Restarting the node only works if the restart is slow enough to be SEEN. A captured baseline
+is dropped on the third consecutive sweep its app is absent from (sooner only if
+`prune_grace` is set below 2, see its row above), and only then does the node's return start from
+a fresh capture. That window is deliberate. DDS discovery drops a
+node from a single poll routinely, with no restart involved, so a one-sweep window would
+re-baseline that node on its already-drifted value and heal a true positive that could then
+never fire again, because the new baseline IS the wrong value. The cost runs the other way: a
+node that comes back inside the window keeps its pre-restart baseline and goes on being
+reported as drifted until someone reverts the change. `respawn` in a launch file defaults to
+no delay, so the usual edit-the-YAML-and-restart flow is frequently never observed as an
+absence at all: a respawn that completes inside one tick leaves the node present on every
+sweep, and no window, however short, catches that. To make a restart re-baseline, keep the
+node out of the graph long enough to miss three sweeps: a `respawn_delay`, or a stop, a pause,
+then a start. Accepting a new value as the baseline without a restart does not exist today.
+
+**Test tiers:**
+
+1. **Unit** (`test/test_param_drift_policy.cpp`): the pure comparison, rendering and
+   configuration rules against hand-built values - the glob matching, the exact
+   integer-versus-float comparison and the NaN carve-out, the `baseline` and `expect`
+   combinations, the config range checks, the ASCII-only elided rendering the capped description
+   depends on, and the `read_gap` spacing the pacing budget is built on.
+2. **Integration** (`test/test_param_drift_integration.cpp`): real `rclcpp` nodes with real
+   parameters, read over the real parameter service against a fake `ReportFault` service, plus a
+   scripted stand-in transport for the replies no live node can be made to produce on demand - a
+   read still in flight when its app is de-armed, a SUCCESS carrying no parameters at all, a read
+   that throws, a node that never answers. It covers the grace-based prune when a node vanishes,
+   the re-baseline after an absence long enough to be a restart together with the single dropped
+   poll that must NOT re-baseline, that the baseline forget is reachable at every accepted
+   `prune_grace`, that the baseline horizon is exactly three missed sweeps and not two or four,
+   the clear path, that a closing reliability gate does not heal a present drift, and every state
+   in which a clear must be withheld because nothing is known about an app: one the sweep has not
+   reached, one the gate has not armed, and one that answered once and then stopped. It also
+   covers that both unread warnings need FAILED attempts AND elapsed ticks rather than either
+   alone, that an app given up on stops blocking the clear, that a withheld clear says so in the
+   log once, that a read overrunning the per-read bound is abandoned, that an app re-bound to a
+   different node starts from a fresh baseline, the per-app share of the description and that
+   trimming it keeps both ends, and the ordering that decides what survives the capped
+   description: a newly drifted app ahead of the ones already reported, and an `expect` violation
+   ahead of self-captured drift - including the cross case, where a pinned violation already
+   reported still outranks brand-new self-captured drift. The pacing budget is covered in both
+   tiers - `read_gap`'s arithmetic in the unit tests above, and the rate the reader actually
+   achieves against a configured budget here.
+3. **E2e** (`test/e2e/test_param_drift_e2e.test.py`,
+   `test/e2e/test_param_roundtrip_e2e.test.py`,
+   `test/e2e/test_config_plumbing_e2e.test.py`): five real gateway launches.
+   The first is the acceptance gate: it drives the detector's DEFAULT self-capturing mode end to
+   end - a real node whose parameter the test changes over the real parameter service, a real
+   fault_manager, and both the raise and the heal read back from the operator-visible
+   `GET /api/v1/faults`.
+   The second is what makes the round-trip table above a measurement rather than an assertion. It
+   runs with `param_drift` switched OFF and drives the same two transport functions the detector
+   uses over `GET /{entity}/configurations`, against a node that answers the parameter services by
+   hand and counts every request it is asked to serve: a cold and a warm `baseline` visit, a
+   resolved pin, both NOT_FOUND paths (the unlisted name that costs 1 and the listed one with no
+   value that costs 2, which is what the charge of 2 is sized for), a declared-but-unset pin that
+   is a success costing 3, and a first pinned read of an untouched node. Nothing else in the
+   package can notice a round trip being added to or removed from the TRANSPORT - every other test
+   proves the arithmetic GIVEN those numbers, and the stand-in transport they use counts CALLS.
+   It does not read the detector's charge constants either, though: those are held to the
+   measurement by the timing cases in the integration suite, which pace the reader off them.
+   The last three are the only proof that a nested SUB-OBJECT under a detector key survives the
+   delivery path: `expect.<param>` arrives from the gateway as nested JSON and has to be flattened
+   back to the dotted parameter name. (Plain per-detector scalars and arrays are proven by the
+   orphan e2e.) Every C++ test above calls `configure()` directly with hand-built JSON and never
+   touches the delivery path. One launch proves the nested
+   `expect` reader, one proves `mode: "off"`, and one proves the bare `mode: off` that the
+   ROS parser types as a YAML 1.1 boolean rather than a string, which is the form operators
+   actually write.
+
 ## Reliability (bringup-quiesce)
 
 Silent-fault detectors are prone to bringup noise: a node joining the graph, a
@@ -413,7 +656,7 @@ itself. The two things a detector opts into explicitly are
 `/tf_static`, whose publishers latch so a late subscriber must match the
 durability to receive them).
 
-## Adding a detector 
+## Adding a detector
 
 1. Create `src/detectors/<id>.cpp`.
 2. Subclass `Detector`; implement `id()` and `tick(DetectorContext&)`. Read the
@@ -434,4 +677,3 @@ Frozen in `include/ros2_medkit_graph_watchdog/graph_fault_codes.hpp`:
 `GRAPH_QOS_MISMATCH`, `GRAPH_ORPHAN`, `GRAPH_NODE_DISAPPEARED`, `GRAPH_TF_STALE`,
 `GRAPH_PARAM_DRIFT`, `GRAPH_LATENCY_BUDGET`, plus one extension of the frozen
 namespace for a new capability beyond the original six: `GRAPH_NODE_INACTIVE`.
-

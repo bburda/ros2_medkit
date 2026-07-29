@@ -13,6 +13,10 @@
   <depend>ros2_medkit_gateway</depend>
   <depend>ros2_medkit_msgs</depend>
   <depend>rclcpp</depend>
+  <!-- The reused gateway parameter transport (PARAMETER_TRANSPORT_SOURCES) includes
+       rcl_interfaces message headers directly; it built only through rclcpp's transitive
+       exports. -->
+  <depend>rcl_interfaces</depend>
   <depend>nlohmann-json-dev</depend>
   <depend>lifecycle_msgs</depend>
   <depend>tf2_msgs</depend>
@@ -25,6 +29,9 @@
   <test_depend>rosgraph_msgs</test_depend>
   <test_depend>std_msgs</test_depend>
   <test_depend>sensor_msgs</test_depend>
+  <!-- test_param_drift_integration.cpp includes rcutils/logging.h directly (it installs an
+       rcutils log output handler to assert on what the detector logs). -->
+  <test_depend>rcutils</test_depend>
 
   <!-- Config-plumbing + QoS e2e (test/e2e/, launch_testing) -->
   <test_depend>launch_testing_ament_cmake</test_depend>

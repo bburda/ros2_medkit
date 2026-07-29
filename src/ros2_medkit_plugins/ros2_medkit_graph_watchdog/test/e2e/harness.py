@@ -31,9 +31,13 @@ package.xml test_depend (see CMakeLists.txt) so that package is importable
 on PYTHONPATH once the workspace's install/setup.bash is sourced.
 """
 
+import json
 import os
 import time
 
+from launch import LaunchDescription
+from launch.actions import TimerAction
+import launch_testing.actions
 import requests
 from ros2_medkit_test_utils.constants import get_test_port
 from ros2_medkit_test_utils.launch_helpers import (
@@ -42,16 +46,13 @@ from ros2_medkit_test_utils.launch_helpers import (
     create_gateway_node,
 )
 
-from launch import LaunchDescription
-from launch.actions import TimerAction
-import launch_testing.actions
-
 API_BASE_PATH = '/api/v1'
 
 
 def create_watchdog_test_launch(
     *,
     detector_params=None,
+    extra_gateway_params=None,
     demo_nodes=None,
     port=None,
     demo_delay=2.0,
@@ -66,6 +67,11 @@ def create_watchdog_test_launch(
         keys, e.g. ``'plugins.graph_watchdog.detectors.param_drift.mode'``),
         merged on top of the ``plugins``/``plugins.graph_watchdog.path``
         parameters this factory always sets.
+    extra_gateway_params : dict or None
+        Extra ROS parameters for the gateway node itself rather than for the
+        plugin (e.g. ``'parameter_service_negative_cache_sec'``). Kept separate
+        from `detector_params` so a gateway-scope knob is not filed under a
+        plugin-scope name; both end up in the same node config.
     demo_nodes : list of str or None
         Node keys from ``ros2_medkit_test_utils.launch_helpers.DEMO_NODE_REGISTRY``.
         ``None`` means no demo nodes.
@@ -95,6 +101,8 @@ def create_watchdog_test_launch(
     }
     if detector_params:
         params.update(detector_params)
+    if extra_gateway_params:
+        params.update(extra_gateway_params)
 
     gateway_node = create_gateway_node(port=port, extra_params=params)
 
@@ -155,7 +163,7 @@ def graph_watchdog_plugin_path():
     return path
 
 
-def wait_until_watchdog_armed(port, timeout=60.0, interval=0.5):
+def wait_until_watchdog_armed(port, timeout=60.0, interval=0.5, app_id=None):
     """Poll ``GET /api/v1/x-medkit-watchdog`` until the plugin is live and armed.
 
     Any assertion that a fault is ABSENT must gate on this first. Absence is the
@@ -173,6 +181,28 @@ def wait_until_watchdog_armed(port, timeout=60.0, interval=0.5):
     ``global_state == 'armed'`` additionally proves the bringup grace elapsed,
     i.e. the gate would have permitted a raise during the window that follows.
 
+    `app_id` narrows that from "some app is armed" to "THIS app is armed", which
+    is what a test that is about to perturb one specific node needs. The gate is
+    what decides whether a detector may target an app at all (param_drift builds
+    its read set from ``reliability_allows`` - see its tick()), so an armed
+    entry is the precondition for the very first read of that node: gating on it
+    means a perturbation can no longer land before the detector was even
+    permitted to look, and a stack that comes up late fails HERE, naming the
+    node, instead of surfacing later as an unexplained missing fault.
+
+    The check mirrors ``ReliabilityGate::allows_raise``: the payload's
+    per-entity ``state`` is ``armed`` only when the warmup has elapsed AND the
+    lifecycle watcher considers the node ok, which is exactly the conjunction
+    that permits a raise. The boolean ``armed`` field alone is only the warmup
+    half.
+
+    What this does NOT prove is that a detector has already READ the app - no
+    e2e surface exposes that. The plugin's only route reports gate state, and a
+    detector's level-triggered PASSED for a fault that does not exist yet is
+    dropped by the fault_manager (see ``report_fault_event``), so a clear is
+    invisible until something has been raised. Callers that need a captured
+    baseline must still allow the sweep a window after this returns.
+
     Parameters
     ----------
     port : int
@@ -181,26 +211,49 @@ def wait_until_watchdog_armed(port, timeout=60.0, interval=0.5):
         Maximum time to wait in seconds.
     interval : float
         Sleep between retries in seconds.
+    app_id : str or None
+        App id (as the gateway derives it from the ROS node name) that must be
+        present in ``entities`` with ``state == 'armed'``. ``None`` only
+        requires some entity plus a global ``armed`` state.
 
     Returns
     -------
     bool
-        ``True`` once the plugin reports at least one entity and a global
-        ``armed`` state, ``False`` on timeout.
+        ``True`` once the plugin reports a global ``armed`` state together with
+        at least one entity (or with `app_id` armed, when given), ``False`` on
+        timeout.
 
     """
     base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
     deadline = time.monotonic() + timeout
+    last_seen = 'GET /x-medkit-watchdog was never answered at all'
     while time.monotonic() < deadline:
         try:
             response = requests.get(f'{base}/x-medkit-watchdog', timeout=5)
-            if response.status_code == 200:
+            if response.status_code != 200:
+                # Worth naming rather than folding into the generic message: the route is
+                # registered by the plugin itself, so a 404 from a gateway that is otherwise
+                # answering says the .so never loaded.
+                last_seen = f'HTTP {response.status_code} from GET /x-medkit-watchdog'
+            else:
                 status = response.json().get('x-medkit-watchdog', {})
-                if status.get('entities') and status.get('global_state') == 'armed':
+                last_seen = json.dumps(status)
+                entities = status.get('entities') or []
+                if app_id is None:
+                    armed = bool(entities)
+                else:
+                    armed = any(
+                        e.get('id') == app_id and e.get('state') == 'armed' for e in entities)
+                if armed and status.get('global_state') == 'armed':
                     return True
-        except requests.exceptions.RequestException:
-            pass
+        except requests.exceptions.RequestException as exc:
+            last_seen = f'GET /x-medkit-watchdog failed: {exc}'
         time.sleep(interval)
+    # The caller turns this into an assertion failure, but only it knows what it
+    # was waiting for; the gate state itself is the evidence for WHY, and it is
+    # gone once the launch tears down. Print it while it still exists.
+    print(f'wait_until_watchdog_armed(app_id={app_id!r}) timed out after {timeout}s; '
+          f'last watchdog status: {last_seen}')
     return False
 
 

@@ -63,9 +63,10 @@ class AggregatedFault {
  public:
   /// Cap on the generated description. One aggregated fault names every affected entity, so
   /// on a large graph the raw text grows without bound - an oversized ReportFault description
-  /// then travels into every /faults payload and the fault_manager's store. param_drift's
-  /// hand-rolled aggregation applies the same cap; this keeps every detector that uses the
-  /// helper consistent with it.
+  /// then travels into every /faults payload and the fault_manager's store. Every detector
+  /// aggregates through this helper, so the cap is applied in one place rather than copied per
+  /// detector. A detector may additionally trim what a SINGLE entity contributes before handing
+  /// it over (param_drift does), so that one entity cannot spend the whole budget by itself.
   static constexpr std::size_t kMaxDescriptionChars = 480;
 
   AggregatedFault(const char * code, std::uint8_t severity) : code_(code), severity_(severity) {

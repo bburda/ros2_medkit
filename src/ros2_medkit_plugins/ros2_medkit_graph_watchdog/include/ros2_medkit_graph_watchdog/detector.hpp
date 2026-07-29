@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -28,7 +29,12 @@
 
 namespace ros2_medkit_gateway {
 struct IntrospectionInput;
-}
+// Only named in the test-only transport factory signature below, so a declaration is enough.
+// Including the gateway header here would pull it into every consumer of this one, and the test
+// targets that do not add GATEWAY_SRC_INCLUDE_DIR would then resolve it from install/ while the
+// plugin resolves it from the source tree - the split this package's own CMakeLists warns about.
+class ParameterTransport;
+}  // namespace ros2_medkit_gateway
 
 namespace ros2_medkit_graph_watchdog {
 
@@ -127,6 +133,21 @@ class Detector {
   /// detectors with no such tracker.
   virtual std::size_t tracked_count_for_test() const {
     return 0;
+  }
+
+  /// Test-only injection hook for detectors that read parameters over a transport. Returns false
+  /// when the detector does not use one, so a test can assert it reached the right detector rather
+  /// than silently doing nothing.
+  ///
+  /// It lives on the base because detectors are file-local and self-registering: a test only ever
+  /// holds a `Detector*` from the registry, so there is no derived type to cast to. The alternative
+  /// is leaving the behaviours that only a stand-in transport can produce - a read still in flight
+  /// when its app is de-armed, a SUCCESS response carrying no parameters, a transport that fails to
+  /// construct - untested, and none of them is reachable from a live ROS graph.
+  using ParameterTransportFactory =
+      std::function<std::unique_ptr<ros2_medkit_gateway::ParameterTransport>(rclcpp::Node *)>;
+  virtual bool set_parameter_transport_factory_for_test(const ParameterTransportFactory & /*factory*/) {
+    return false;
   }
 };
 
