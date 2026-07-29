@@ -793,8 +793,9 @@ Real-time fault event stream using Server-Sent Events (SSE). Clients receive ins
 - **Real-time notifications**: Events pushed instantly when fault state changes
 - **Automatic reconnection**: Supports `Last-Event-ID` header for seamless reconnection
 - **Keepalive**: Sends `:keepalive` comment every 30 seconds to prevent timeouts
-- **Event buffer**: Buffers up to 100 recent events for reconnecting clients. Under overflow the buffer drops entries every live client has already received, then entries superseded by a newer event for the same fault code, so a lagging client still converges on the current state of every fault
+- **Event buffer**: Buffers up to 100 recent events for reconnecting clients. Under overflow the buffer evicts entries every live client has already received, then `fault_updated` entries superseded by a newer event for the same fault code - a lagging client still converges on the current state of every fault and loses no status transition. Anything beyond that (a superseded transition, or an event with no newer sibling) is genuinely lost for lagging clients: those losses are counted and logged as drops, and an affected client should refetch `GET /api/v1/faults` to resynchronize
 - **Entity context (SOVD payload extension)**: When the gateway can resolve the fault's first reporting source back to an entity, the payload carries an `x-medkit` object with `entity_type` and `entity_id` fields so consumers can hit `/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}` directly without enumerating entities
+- **Correlation payload**: when a root-cause event auto-clears correlated symptom faults, the payload carries their codes in `auto_cleared_codes` (omitted when empty); those symptoms get no event of their own
 
 **Event Types:**
 - `fault_confirmed` - Fault transitioned to CONFIRMED status
@@ -833,7 +834,7 @@ data: {"event_type":"fault_cleared","fault":{"fault_code":"MOTOR_OVERHEAT",...},
 curl -N -H "Last-Event-ID: 5" http://localhost:8080/api/v1/faults/stream
 ```
 
-This replays any buffered events with ID > 5, then continues streaming new events.
+This replays any buffered events with ID > 5, then continues streaming new events. Replayed `id` sequences may contain holes (e.g. 41, 43, 44) where buffer eviction removed superseded events; ids are monotonically increasing but never guaranteed contiguous. A `Last-Event-ID` beyond the newest issued id is treated as "caught up": the client receives only events published after it connected.
 
 #### GET /api/v1/components/{component_id}/faults
 

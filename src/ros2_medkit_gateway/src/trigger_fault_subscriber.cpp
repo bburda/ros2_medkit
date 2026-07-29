@@ -64,7 +64,10 @@ void TriggerFaultSubscriber::on_fault_event(const ros2_medkit_msgs::msg::FaultEv
     }
   }
 
-  // Map event_type to ChangeType
+  // Map event_type to ChangeType. fault_cleared covers the manual clear AND
+  // the auto-heal; both remove the fault from the active set, so both are
+  // DELETED. Consumers needing the distinction read the payload's "status"
+  // (CLEARED vs HEALED) - change_type itself has no reader today.
   ChangeType change_type = ChangeType::UPDATED;
   if (msg->event_type == "fault_confirmed") {
     change_type = ChangeType::CREATED;

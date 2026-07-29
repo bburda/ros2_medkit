@@ -31,8 +31,12 @@ Core fault data model representing an aggregated fault condition.
    # Timestamp when this fault was first reported
    builtin_interfaces/Time first_occurred
 
-   # Timestamp when this fault was last reported
+   # Timestamp when this fault last occurred (FAILED events only; a PASSED
+   # event is the fault ending, not occurring, and does not touch this field)
    builtin_interfaces/Time last_occurred
+
+   # Timestamp of the last PASSED event reported for this fault (zero = never)
+   builtin_interfaces/Time last_passed
 
    # Total number of FAILED events aggregated across all sources
    uint32 occurrence_count
@@ -128,7 +132,9 @@ prefix (for example ``/robot1/fault_manager/events``).
    * - ``fault_confirmed``
      - Fault transitioned from PREFAILED to CONFIRMED
    * - ``fault_cleared``
-     - Fault cleared via ClearFault service
+     - Fault ended: cleared via the ClearFault service, or healed when PASSED
+       events crossed the healing threshold (``fault.status`` distinguishes
+       ``CLEARED`` from ``HEALED``)
    * - ``fault_updated``
      - Fault data changed without status transition (e.g., new occurrence)
 
