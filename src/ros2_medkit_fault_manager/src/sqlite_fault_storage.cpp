@@ -191,6 +191,19 @@ void SqliteFaultStorage::initialize_schema() {
     }
   }
 
+  // Migration: releases that advanced last_occurred_ns on PASSED events left
+  // inflated rows behind, and a latched CONFIRMED fault that only ever heals
+  // would keep the wrong timestamp forever. last_failed_ns holds the true
+  // last occurrence; last_occurred_ns can only exceed it via that old bug.
+  if (sqlite3_exec(db_,
+                   "UPDATE faults SET last_occurred_ns = last_failed_ns "
+                   "WHERE last_failed_ns > 0 AND last_occurred_ns > last_failed_ns",
+                   nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = err_msg ? err_msg : "Unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to repair last_occurred_ns rows: " + error);
+  }
+
   // Create snapshots table for storing topic data captured when faults are confirmed
   const char * create_snapshots_table_sql = R"(
     CREATE TABLE IF NOT EXISTS snapshots (
