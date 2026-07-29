@@ -20,10 +20,12 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -45,16 +47,21 @@ namespace handlers {
  *
  * Events streamed:
  * - fault_confirmed: When a fault transitions to CONFIRMED status
- * - fault_cleared: When a fault is manually cleared
+ * - fault_cleared: When a fault ends (acknowledged clear, or auto-heal)
  * - fault_updated: When fault data changes (occurrence_count, sources)
  *
  * Features:
  * - Multi-client support (multiple browsers can connect simultaneously)
  * - Keepalive every 30 seconds to prevent connection timeout
  * - Automatic reconnection support via Last-Event-ID header
- * - Replay buffer of up to 100 most recent events for reconnecting clients;
- *   when the buffer is full, older events are discarded (FIFO), so clients
- *   that are disconnected for long periods may miss some events
+ * - Replay buffer of up to 100 events. Eviction is state-convergent rather
+ *   than plain FIFO: entries every live client has already been sent go
+ *   first, then entries superseded by a newer event for the same fault code
+ *   (a lagging client still converges on the correct current state of every
+ *   fault). Only when neither applies is an event genuinely lost, and only
+ *   that case is counted and logged as a drop.
+ * - Clients that make no progress for 3 keepalive intervals are treated as
+ *   dead, reaped, and excluded from the backpressure accounting.
  */
 class SSEFaultHandler {
  public:
@@ -120,6 +127,26 @@ class SSEFaultHandler {
   size_t connected_clients() const;
 
   /**
+   * @brief Events genuinely lost: evicted while still owed to a live client and
+   * not superseded by a newer event for the same fault code.
+   *
+   * Rotation of the replay buffer with no client attached is NOT a drop.
+   */
+  std::size_t dropped_events() const;
+
+  /**
+   * @brief Events evicted because a newer event for the same fault code was
+   * already buffered. Lagging clients still converge on the correct state.
+   */
+  std::size_t coalesced_events() const;
+
+  /**
+   * @brief Clients declared dead (no delivery progress for 3 keepalive
+   * intervals) and reaped while making room in the replay buffer.
+   */
+  std::size_t reaped_clients() const;
+
+  /**
    * @brief Total number of fault events received and processed so far.
    *
    * Monotonically increasing (it never resets, even when the replay buffer
@@ -168,6 +195,43 @@ class SSEFaultHandler {
     std::optional<EntityContext> entity;
   };
 
+  /// Per-connection delivery cursor. Lets the buffer tell "nobody is owed this
+  /// event" from "a live client has not read it yet", so ring-buffer rotation
+  /// is no longer reported as client backpressure.
+  struct ClientCursor {
+    uint64_t last_delivered{0};
+    std::chrono::steady_clock::time_point last_progress{};
+    bool stalled{false};
+  };
+
+  /// Outcome of one eviction pass, reported outside the queue lock.
+  struct EvictionStats {
+    std::size_t dropped{0};
+    std::size_t coalesced{0};
+    std::size_t reaped{0};
+    std::size_t slow_clients{0};
+  };
+
+  /// Trim the buffer back to kMaxBufferedEvents. Caller holds queue_mutex_.
+  EvictionStats evict_to_capacity_locked();
+
+  /// Highest event id already delivered to every live client; kNothingOwed when
+  /// no live client is attached. Caller holds queue_mutex_.
+  uint64_t delivered_watermark_locked() const;
+
+  /// Oldest buffered entry whose fault code appears again later in the buffer,
+  /// i.e. one whose state a later entry already supersedes. Entries carrying
+  /// auto_cleared_codes are never chosen: that correlation payload exists
+  /// nowhere else. Caller holds queue_mutex_.
+  std::deque<QueuedEvent>::iterator find_superseded_locked();
+
+  /// Mark cursors with no delivery progress for kStallIntervals keepalives as
+  /// dead so their stream loop exits. Caller holds queue_mutex_.
+  std::size_t reap_stalled_clients_locked(std::chrono::steady_clock::time_point now);
+
+  /// Record a successful write for this client. Caller holds queue_mutex_.
+  void note_progress_locked(const std::shared_ptr<ClientCursor> & cursor, uint64_t delivered_id);
+
   /// Format a fault event as SSE message
   static std::string format_sse_event(const QueuedEvent & queued);
 
@@ -197,11 +261,21 @@ class SSEFaultHandler {
   /// Shutdown flag for clean termination
   std::atomic<bool> shutdown_flag_{false};
 
-  /// Total number of buffered fault events dropped because the buffer was at
-  /// kMaxBufferedEvents and a new event arrived. Surfaced via WARN logs at a
-  /// fixed cadence (kDropLogEveryN) so operators notice client lag without
-  /// flooding the logger.
+  /// Live delivery cursors, one per streaming connection. Guarded by queue_mutex_.
+  std::vector<std::shared_ptr<ClientCursor>> clients_;
+
+  /// Total events genuinely lost (owed to a live client, nothing newer for the
+  /// same fault code). Surfaced via WARN logs at a fixed cadence
+  /// (kDropLogEveryN) so operators notice client lag without flooding the
+  /// logger.
   std::atomic<std::size_t> dropped_events_{0};
+
+  /// Total events evicted because a newer event for the same fault code was
+  /// buffered. Not a loss: the client still converges on the right state.
+  std::atomic<std::size_t> coalesced_events_{0};
+
+  /// Total clients reaped as dead while making room in the buffer.
+  std::atomic<std::size_t> reaped_clients_{0};
 
   /// Keepalive interval used by the streaming loop
   std::chrono::milliseconds keepalive_interval_;
@@ -215,6 +289,13 @@ class SSEFaultHandler {
 
   /// Keepalive interval in seconds
   static constexpr int kKeepaliveIntervalSec = 30;
+
+  /// A client that has not completed a write (event or keepalive) for this many
+  /// keepalive intervals is dead, not slow.
+  static constexpr int kStallIntervals = 3;
+
+  /// Watermark meaning "no live client is owed anything in the buffer".
+  static constexpr uint64_t kNothingOwed = std::numeric_limits<uint64_t>::max();
 };
 
 }  // namespace handlers

@@ -21,8 +21,11 @@
 #include <functional>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/models/error_info.hpp"
@@ -89,6 +92,82 @@ void SSEFaultHandler::request_shutdown() {
   queue_cv_.notify_all();
 }
 
+uint64_t SSEFaultHandler::delivered_watermark_locked() const {
+  uint64_t watermark = kNothingOwed;
+  for (const auto & cursor : clients_) {
+    if (cursor->stalled) {
+      continue;  // dead client: its backlog is not backpressure
+    }
+    watermark = std::min(watermark, cursor->last_delivered);
+  }
+  return watermark;
+}
+
+std::deque<SSEFaultHandler::QueuedEvent>::iterator SSEFaultHandler::find_superseded_locked() {
+  std::unordered_map<std::string, std::size_t> newest_index;
+  for (std::size_t i = 0; i < event_queue_.size(); ++i) {
+    newest_index[event_queue_[i].event.fault.fault_code] = i;
+  }
+  for (std::size_t i = 0; i < event_queue_.size(); ++i) {
+    // An auto-clear cascade lists its symptoms only here; those codes get no
+    // event of their own, so this entry is never redundant.
+    if (!event_queue_[i].event.auto_cleared_codes.empty()) {
+      continue;
+    }
+    if (newest_index[event_queue_[i].event.fault.fault_code] != i) {
+      return event_queue_.begin() + static_cast<std::ptrdiff_t>(i);
+    }
+  }
+  return event_queue_.end();
+}
+
+std::size_t SSEFaultHandler::reap_stalled_clients_locked(std::chrono::steady_clock::time_point now) {
+  const auto stall_timeout = keepalive_interval_ * kStallIntervals;
+  std::size_t reaped = 0;
+  for (const auto & cursor : clients_) {
+    if (cursor->stalled || (now - cursor->last_progress) <= stall_timeout) {
+      continue;
+    }
+    cursor->stalled = true;  // the stream loop returns false on its next wakeup
+    ++reaped;
+  }
+  return reaped;
+}
+
+SSEFaultHandler::EvictionStats SSEFaultHandler::evict_to_capacity_locked() {
+  EvictionStats stats;
+  if (event_queue_.size() <= kMaxBufferedEvents) {
+    return stats;
+  }
+
+  stats.reaped = reap_stalled_clients_locked(std::chrono::steady_clock::now());
+  const uint64_t watermark = delivered_watermark_locked();
+
+  while (event_queue_.size() > kMaxBufferedEvents) {
+    if (event_queue_.front().id <= watermark) {
+      event_queue_.pop_front();  // every live client already has it
+      continue;
+    }
+    auto superseded = find_superseded_locked();
+    if (superseded != event_queue_.end()) {
+      event_queue_.erase(superseded);  // newer state for that fault code survives
+      ++stats.coalesced;
+      continue;
+    }
+    event_queue_.pop_front();  // distinct fault codes only: this one is lost
+    ++stats.dropped;
+  }
+
+  if (stats.dropped > 0) {
+    for (const auto & cursor : clients_) {
+      if (!cursor->stalled && cursor->last_delivered < event_queue_.back().id) {
+        ++stats.slow_clients;
+      }
+    }
+  }
+  return stats;
+}
+
 void SSEFaultHandler::on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::ConstSharedPtr & msg) {
   uint64_t event_id = next_event_id_.fetch_add(1);
 
@@ -97,30 +176,36 @@ void SSEFaultHandler::on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::Co
   // lock-free with respect to the cache.
   auto entity = resolve_entity_context(msg->fault);
 
-  std::size_t dropped_this_call = 0;
+  EvictionStats stats;
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
 
     // Add event to queue with resolved entity context
     event_queue_.push_back(QueuedEvent{event_id, *msg, std::move(entity)});
-
-    // Trim old events if buffer is full
-    while (event_queue_.size() > kMaxBufferedEvents) {
-      event_queue_.pop_front();
-      ++dropped_this_call;
-    }
+    stats = evict_to_capacity_locked();
   }
 
-  // Surface SSE backpressure without spamming the log: every kDropLogEveryN
-  // drops emit one WARN with the running total. dropped_events_ remains
-  // queryable for tests / future metrics endpoints.
-  if (dropped_this_call > 0) {
-    const auto total = dropped_events_.fetch_add(dropped_this_call) + dropped_this_call;
-    if ((total / kDropLogEveryN) > ((total - dropped_this_call) / kDropLogEveryN)) {
+  if (stats.reaped > 0) {
+    reaped_clients_.fetch_add(stats.reaped);
+    RCLCPP_WARN(HandlerContext::logger(),
+                "SSE fault stream: %zu client(s) made no progress for %" PRId64
+                "ms; treating them as disconnected and reaping",
+                stats.reaped, (keepalive_interval_ * kStallIntervals).count());
+  }
+  if (stats.coalesced > 0) {
+    coalesced_events_.fetch_add(stats.coalesced);
+  }
+
+  // Surface real SSE backpressure without spamming the log: every kDropLogEveryN
+  // losses emit one WARN with the running total. Buffer rotation with no client
+  // waiting on the evicted event is not counted at all.
+  if (stats.dropped > 0) {
+    const auto total = dropped_events_.fetch_add(stats.dropped) + stats.dropped;
+    if ((total / kDropLogEveryN) > ((total - stats.dropped) / kDropLogEveryN)) {
       RCLCPP_WARN(HandlerContext::logger(),
-                  "SSE fault event buffer overflow: %zu events dropped total "
-                  "(buffer cap=%zu, slow or disconnected clients)",
-                  total, kMaxBufferedEvents);
+                  "SSE fault event lost: %zu event(s) dropped total for %zu slow client(s) "
+                  "(buffer cap=%zu, %zu coalesced so far, %zu client(s) reaped as dead)",
+                  total, stats.slow_clients, kMaxBufferedEvents, coalesced_events_.load(), reaped_clients_.load());
     }
   }
 
@@ -148,69 +233,108 @@ uint64_t parse_last_event_id(std::string_view value) {
 
 }  // namespace
 
+void SSEFaultHandler::note_progress_locked(const std::shared_ptr<ClientCursor> & cursor, uint64_t delivered_id) {
+  cursor->last_delivered = std::max(cursor->last_delivered, delivered_id);
+  cursor->last_progress = std::chrono::steady_clock::now();
+}
+
 std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint64_t initial_last_event_id) {
-  return [this, last_event_id = initial_last_event_id](httplib::DataSink & sink) mutable -> bool {
-    // First, send any buffered events the client missed (for reconnection)
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
+  auto cursor = std::make_shared<ClientCursor>();
+  cursor->last_delivered = initial_last_event_id;
+  cursor->last_progress = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    clients_.push_back(cursor);
+  }
+
+  // Deregisters when the content provider (and with it this closure) is
+  // destroyed, which is the only point at which the connection is certainly
+  // gone for both the typed and the legacy entry.
+  auto unregister = std::shared_ptr<void>(nullptr, [this, cursor](void *) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    clients_.erase(std::remove(clients_.begin(), clients_.end(), cursor), clients_.end());
+  });
+
+  return [this, cursor, unregister, last_event_id = initial_last_event_id](httplib::DataSink & sink) mutable -> bool {
+    // Formatting happens under the lock, writing does not: the buffer now
+    // erases from the middle to coalesce, so holding an iterator across a
+    // write would be a use-after-free.
+    auto collect_pending = [this, &last_event_id]() {
+      std::vector<std::pair<uint64_t, std::string>> pending;
       for (const auto & queued : event_queue_) {
         if (queued.id > last_event_id) {
-          std::string sse_msg = format_sse_event(queued);
-          if (!sink.write(sse_msg.data(), sse_msg.size())) {
-            return false;  // Client disconnected
-          }
-          last_event_id = queued.id;
+          pending.emplace_back(queued.id, format_sse_event(queued));
         }
+      }
+      return pending;
+    };
+
+    auto flush = [this, &sink, &cursor, &last_event_id](const std::vector<std::pair<uint64_t, std::string>> & pending) {
+      for (const auto & [id, sse_msg] : pending) {
+        if (!sink.write(sse_msg.data(), sse_msg.size())) {
+          return false;  // Client disconnected
+        }
+        last_event_id = id;
+      }
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      note_progress_locked(cursor, last_event_id);
+      return true;
+    };
+
+    // First, send any buffered events the client missed (for reconnection)
+    {
+      std::vector<std::pair<uint64_t, std::string>> pending;
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        pending = collect_pending();
+      }
+      if (!pending.empty() && !flush(pending)) {
+        return false;
       }
     }
 
     // Wait for new events or keepalive timeout
-    auto timeout = keepalive_interval_;
-    std::unique_lock<std::mutex> lock(queue_mutex_);
+    const auto timeout = keepalive_interval_;
 
     while (true) {
-      // Check for shutdown
-      if (shutdown_flag_.load()) {
-        return false;  // Handler is shutting down
+      std::vector<std::pair<uint64_t, std::string>> pending;
+      bool keepalive_due = false;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        if (shutdown_flag_.load()) {
+          return false;  // Handler is shutting down
+        }
+
+        const auto status = queue_cv_.wait_for(lock, timeout);
+
+        if (shutdown_flag_.load()) {
+          return false;  // Handler is shutting down
+        }
+        if (cursor->stalled) {
+          return false;  // Reaped as dead while the buffer was under pressure
+        }
+
+        pending = collect_pending();
+        keepalive_due = pending.empty() && status == std::cv_status::timeout;
       }
 
-      // Wait for new event or timeout
-      auto status = queue_cv_.wait_for(lock, timeout);
-
-      // Check for shutdown after wakeup
-      if (shutdown_flag_.load()) {
-        return false;  // Handler is shutting down
-      }
-
-      if (status == std::cv_status::timeout) {
-        // Send keepalive comment
+      if (keepalive_due) {
         const char * keepalive = ":keepalive\n\n";
-        lock.unlock();
         if (!sink.write(keepalive, strlen(keepalive))) {
           return false;  // Client disconnected
         }
-        lock.lock();
+        // A completed keepalive write is proof the connection is alive even
+        // when there is nothing to deliver.
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        note_progress_locked(cursor, last_event_id);
         continue;
       }
 
-      // Check for new events
-      bool found_new = false;
-      for (const auto & queued : event_queue_) {
-        if (queued.id > last_event_id) {
-          std::string sse_msg = format_sse_event(queued);
-          lock.unlock();
-          if (!sink.write(sse_msg.data(), sse_msg.size())) {
-            return false;  // Client disconnected
-          }
-          lock.lock();
-          last_event_id = queued.id;
-          found_new = true;
-        }
+      if (pending.empty()) {
+        continue;  // Spurious wakeup
       }
-
-      if (!found_new) {
-        // Spurious wakeup, continue waiting
-        continue;
+      if (!flush(pending)) {
+        return false;
       }
     }
 
@@ -304,6 +428,18 @@ void SSEFaultHandler::handle_stream(const httplib::Request & req, httplib::Respo
 
 size_t SSEFaultHandler::connected_clients() const {
   return client_tracker_->connected_clients();
+}
+
+std::size_t SSEFaultHandler::dropped_events() const {
+  return dropped_events_.load();
+}
+
+std::size_t SSEFaultHandler::coalesced_events() const {
+  return coalesced_events_.load();
+}
+
+std::size_t SSEFaultHandler::reaped_clients() const {
+  return reaped_clients_.load();
 }
 
 uint64_t SSEFaultHandler::events_received() const {
