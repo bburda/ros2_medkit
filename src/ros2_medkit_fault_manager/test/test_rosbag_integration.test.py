@@ -452,6 +452,11 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
         fault_code = 'DURATION_TEST'
 
         # Report fault - buffer should have ~duration_sec worth of messages
+        # Same refill race as test_01/test_02: the previous test's post-fault window
+        # diverts messages away from the ring buffer, so reporting straight after it
+        # closes finds the buffer empty and no bag is created.
+        self.assertTrue(self._wait_for_buffered_data(),
+                        'ring buffer never refilled after the previous post-fault window')
         response = self._report_fault(fault_code, 'Duration test fault')
         self.assertTrue(response.accepted)
 
