@@ -509,6 +509,25 @@ TEST_F(FaultStorageTest, PassedEventIncrementsCounter) {
   EXPECT_EQ(fault->status, Fault::STATUS_PREPASSED);  // Counter > 0
 }
 
+TEST_F(FaultStorageTest, PassedEventDoesNotAdvanceLastOccurred) {
+  // Observed on a live box: a plugin sent one PASSED on reconnect, healing was
+  // disabled so the fault stayed CONFIRMED (by design), but last_occurred jumped
+  // to the PASSED instant - a fault that had not occurred for hours read as if it
+  // had just happened. last_occurred belongs to occurrences (FAILED) only.
+  const rclcpp::Time failed_at(1000, 0, RCL_SYSTEM_TIME);
+  const rclcpp::Time passed_at(9000, 0, RCL_SYSTEM_TIME);
+
+  storage_.report_fault_event("FAULT_1", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "Test", "/node1",
+                              failed_at, default_config());
+  storage_.report_fault_event("FAULT_1", ReportFault::Request::EVENT_PASSED, 0, "", "/node1", passed_at,
+                              default_config());
+
+  auto fault = storage_.get_fault("FAULT_1");
+  ASSERT_TRUE(fault.has_value());
+  EXPECT_EQ(fault->status, Fault::STATUS_CONFIRMED);  // healing disabled: latched, by design
+  EXPECT_EQ(rclcpp::Time(fault->last_occurred).nanoseconds(), failed_at.nanoseconds());
+}
+
 TEST_F(FaultStorageTest, HealingDisabledByDefault) {
   rclcpp::Clock clock;
 
@@ -1056,6 +1075,19 @@ class FaultEventPublishingTest : public ::testing::Test {
     return future.get()->accepted;
   }
 
+  bool call_report_passed(const std::string & fault_code, const std::string & source_id) {
+    auto request = std::make_shared<ReportFault::Request>();
+    request->fault_code = fault_code;
+    request->event_type = ReportFault::Request::EVENT_PASSED;
+    request->source_id = source_id;
+
+    auto future = report_fault_client_->async_send_request(request);
+    if (!spin_until_future_ready(future)) {
+      return false;
+    }
+    return future.get()->accepted;
+  }
+
   bool call_clear_fault(const std::string & fault_code) {
     auto request = std::make_shared<ClearFault::Request>();
     request->fault_code = fault_code;
@@ -1160,6 +1192,51 @@ TEST_F(FaultEventPublishingTest, ClearFaultPublishesClearedEvent) {
   EXPECT_EQ(received_events_[0].event_type, FaultEvent::EVENT_CLEARED);
   EXPECT_EQ(received_events_[0].fault.fault_code, "TEST_FAULT_3");
   EXPECT_EQ(received_events_[0].fault.status, Fault::STATUS_CLEARED);
+}
+
+/// Healing on, threshold 1: FAILED confirms (counter -1), the first PASSED lands on
+/// 0 (latched CONFIRMED), the second reaches 1 and heals.
+class HealingFaultEventPublishingTest : public FaultEventPublishingTest {
+ protected:
+  std::vector<rclcpp::Parameter> fault_manager_overrides() override {
+    return {
+        rclcpp::Parameter("storage_type", "memory"),
+        rclcpp::Parameter("confirmation_threshold", -1),
+        rclcpp::Parameter("healing_enabled", true),
+        rclcpp::Parameter("healing_threshold", 1),
+    };
+  }
+};
+
+TEST_F(HealingFaultEventPublishingTest, HealPublishesClearedEventSoStreamConsumersSeeTheEnd) {
+  ASSERT_TRUE(call_report_fault("HEAL_ME", Fault::SEVERITY_ERROR, "/test_node"));
+  ASSERT_TRUE(spin_until([this]() {
+    return received_events_.size() >= 1;
+  }));
+  received_events_.clear();
+
+  ASSERT_TRUE(call_report_passed("HEAL_ME", "/test_node"));
+  ASSERT_TRUE(call_report_passed("HEAL_ME", "/test_node"));
+
+  // The heal is the fault's end; without an event the SSE stream keeps every
+  // consumer showing a fault that is over.
+  auto find_end_event = [this]() -> const FaultEvent * {
+    for (const auto & event : received_events_) {
+      if (event.event_type == FaultEvent::EVENT_CLEARED) {
+        return &event;
+      }
+    }
+    return nullptr;
+  };
+
+  ASSERT_TRUE(spin_until([&]() {
+    return find_end_event() != nullptr;
+  })) << "no event published for the CONFIRMED -> HEALED transition";
+
+  const FaultEvent * event = find_end_event();
+  ASSERT_NE(event, nullptr);
+  EXPECT_EQ(event->fault.fault_code, "HEAL_ME");
+  EXPECT_EQ(event->fault.status, Fault::STATUS_HEALED);
 }
 
 TEST_F(FaultEventPublishingTest, ClearNonExistentFaultNoEvent) {

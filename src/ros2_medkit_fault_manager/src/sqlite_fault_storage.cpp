@@ -510,16 +510,15 @@ bool SqliteFaultStorage::report_fault_event(const std::string & fault_code, uint
 
       std::string new_status = compute_debounce_status(debounce_counter, current_status, config);
 
+      // last_occurred_ns is deliberately NOT touched: a PASSED event is the fault
+      // ENDING, not occurring. Bumping it made a long-stale CONFIRMED fault look
+      // freshly active. The PASSED instant is recorded in last_passed_ns.
       SqliteStatement update_stmt(
-          db_,
-          "UPDATE faults SET last_occurred_ns = ?, last_passed_ns = ?, status = ?, debounce_counter "
-          "= ? WHERE "
-          "fault_code = ?");
+          db_, "UPDATE faults SET last_passed_ns = ?, status = ?, debounce_counter = ? WHERE fault_code = ?");
       update_stmt.bind_int64(1, timestamp_ns);
-      update_stmt.bind_int64(2, timestamp_ns);
-      update_stmt.bind_text(3, new_status);
-      update_stmt.bind_int(4, debounce_counter);
-      update_stmt.bind_text(5, fault_code);
+      update_stmt.bind_text(2, new_status);
+      update_stmt.bind_int(3, debounce_counter);
+      update_stmt.bind_text(4, fault_code);
 
       if (update_stmt.step() != SQLITE_DONE) {
         throw std::runtime_error(std::string("Failed to update fault: ") + sqlite3_errmsg(db_));

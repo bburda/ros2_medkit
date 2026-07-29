@@ -193,6 +193,24 @@ TEST_F(SqliteFaultStorageTest, ClearNonExistentFault) {
   EXPECT_FALSE(cleared);
 }
 
+TEST_F(SqliteFaultStorageTest, PassedEventDoesNotAdvanceLastOccurred) {
+  // Same contract as the in-memory backend: a PASSED event ends a fault, it does
+  // not re-date it. Guards against a stale CONFIRMED fault reading as freshly
+  // active in /faults and in the SSE payload.
+  const rclcpp::Time failed_at(1000, 0, RCL_SYSTEM_TIME);
+  const rclcpp::Time passed_at(9000, 0, RCL_SYSTEM_TIME);
+
+  storage_->report_fault_event("FAULT_LO", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "Test", "/node1",
+                               failed_at, default_config());
+  storage_->report_fault_event("FAULT_LO", ReportFault::Request::EVENT_PASSED, 0, "", "/node1", passed_at,
+                               default_config());
+
+  auto fault = storage_->get_fault("FAULT_LO");
+  ASSERT_TRUE(fault.has_value());
+  EXPECT_EQ(fault->status, Fault::STATUS_CONFIRMED);  // healing disabled: latched, by design
+  EXPECT_EQ(rclcpp::Time(fault->last_occurred).nanoseconds(), failed_at.nanoseconds());
+}
+
 TEST_F(SqliteFaultStorageTest, GetClearedFaults) {
   rclcpp::Clock clock;
   auto timestamp = clock.now();
