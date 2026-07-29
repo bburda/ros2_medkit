@@ -68,9 +68,18 @@ class TestScenarioActionLifecycle(GatewayTestCase):
     ENTITY_ENDPOINT = '/apps/long_calibration'
 
     def _ensure_operation_ready(self):
-        """Wait for the long_calibration operation to be discovered."""
-        self.wait_for_operation(
-            self.ENTITY_ENDPOINT, self.OPERATION_ID, max_wait=15.0
+        """Wait for the long_calibration operation to be USABLE, not just listed.
+
+        An operation appears under /operations as soon as it is discovered by
+        name, but the gateway cannot send a goal until it has also resolved the
+        underlying ROS interface type. Waiting on the name alone races that
+        second step, and creating an execution in the gap returns 500
+        x-medkit-ros2-action-unavailable, because the empty type string fails
+        typesupport lookup. Wait for the resolved schema instead.
+        """
+        self.wait_for_operation_type_info(
+            self.ENTITY_ENDPOINT, self.OPERATION_ID,
+            ('goal', 'result', 'feedback'), max_wait=15.0
         )
 
     def _create_action_execution(self, order=5):
