@@ -30,7 +30,9 @@ builtin_interfaces/Time timestamp
 # Emitted when a fault transitions from PREFAILED to CONFIRMED status
 # (e.g., after debounce counter reaches confirmation threshold).
 string EVENT_CONFIRMED = "fault_confirmed"
-# Emitted when a fault transitions to CLEARED status via ClearFault service.
+# Emitted when a fault ends: CLEARED via the ClearFault service, or HEALED when
+# PASSED events drive it past the healing threshold. Check fault.status to tell
+# the two apart.
 string EVENT_CLEARED = "fault_cleared"
 # Emitted when fault data changes without status transition
 # (e.g., occurrence_count incremented, new source added to reporting_sources).

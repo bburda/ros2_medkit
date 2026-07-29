@@ -672,6 +672,14 @@ void FaultManagerNode::handle_report_fault(
     const bool just_healed = !is_new && status_before != ros2_medkit_msgs::msg::Fault::STATUS_HEALED &&
                              fault_after->status == ros2_medkit_msgs::msg::Fault::STATUS_HEALED;
 
+    // The end of a fault must reach the event stream too, or an SSE consumer keeps
+    // showing a fault that is over. EVENT_CLEARED (not a new event name) so existing
+    // consumers act on it; the payload's status = HEALED distinguishes auto-heal from
+    // an acknowledged clear.
+    if (just_healed) {
+      publish_fault_event(ros2_medkit_msgs::msg::FaultEvent::EVENT_CLEARED, *fault_after);
+    }
+
     // Append tamper-evident audit records for the transitions that just happened.
     // Recorded regardless of correlation muting: muting affects display, not the
     // fact that the state transition occurred.

@@ -175,9 +175,11 @@ bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, ui
     return true;  // Reactivation treated as new occurrence for event publishing
   }
 
-  state.last_occurred = timestamp;
-
   if (is_failed) {
+    // last_occurred tracks occurrences only. A PASSED event is the fault ENDING, not
+    // occurring; bumping it there makes a long-stale CONFIRMED fault look freshly
+    // active to operators. The PASSED instant is kept in last_passed_time.
+    state.last_occurred = timestamp;
     state.last_failed_time = timestamp;
 
     // occurrence_count is NOT bumped here: this is a still-active fault being
