@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <sqlite3.h>
+
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -208,6 +210,31 @@ TEST_F(SqliteFaultStorageTest, PassedEventDoesNotAdvanceLastOccurred) {
   auto fault = storage_->get_fault("FAULT_LO");
   ASSERT_TRUE(fault.has_value());
   EXPECT_EQ(fault->status, Fault::STATUS_CONFIRMED);  // healing disabled: latched, by design
+  EXPECT_EQ(rclcpp::Time(fault->last_occurred).nanoseconds(), failed_at.nanoseconds());
+}
+
+TEST_F(SqliteFaultStorageTest, ReopenRepairsLastOccurredInflatedByOldPassedBug) {
+  // Databases written by releases that advanced last_occurred_ns on PASSED
+  // events hold inflated rows, and a latched CONFIRMED fault that never fails
+  // again would keep the wrong timestamp forever. Opening the storage must
+  // repair them from last_failed_ns.
+  const rclcpp::Time failed_at(1000, 0, RCL_SYSTEM_TIME);
+  storage_->report_fault_event("FAULT_MIG", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "Test", "/node1",
+                               failed_at, default_config());
+  storage_.reset();
+
+  // Simulate the old bug: a PASSED event at t=9000s re-dated the row.
+  sqlite3 * db = nullptr;
+  ASSERT_EQ(sqlite3_open(temp_db_path_.c_str(), &db), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(db, "UPDATE faults SET last_occurred_ns = 9000000000000 WHERE fault_code = 'FAULT_MIG'",
+                         nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  sqlite3_close(db);
+
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  auto fault = storage_->get_fault("FAULT_MIG");
+  ASSERT_TRUE(fault.has_value());
   EXPECT_EQ(rclcpp::Time(fault->last_occurred).nanoseconds(), failed_at.nanoseconds());
 }
 
