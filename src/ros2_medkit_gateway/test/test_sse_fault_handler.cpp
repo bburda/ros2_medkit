@@ -415,8 +415,10 @@ TEST_F(SSEFaultHandlerTest, BufferRotationWithNoClientsIsNotADrop) {
 TEST_F(SSEFaultHandlerTest, LaggingClientKeepsRareFaultWhenFlapFillsBuffer) {
   // A PLC alarm flapping on a few-second cycle used to push every other fault
   // out of the 100-entry buffer, so a client behind by more than the buffer
-  // never learned the standing fault was active. Superseded flap events are
-  // evicted first now: the client converges on the current state of every code.
+  // never learned the standing fault was active. Superseded flap transitions
+  // are evicted before the unique standing fault - but a transition is
+  // history a lagging client can never recover, so every one of those
+  // evictions is honest, counted loss, never "coalesced".
   auto req = make_stream_request("127.0.0.1");
   httplib::Response res;
   handler_->handle_stream(req, res);  // registers a cursor; never drained below
@@ -427,8 +429,8 @@ TEST_F(SSEFaultHandlerTest, LaggingClientKeepsRareFaultWhenFlapFillsBuffer) {
     enqueue_event(make_fault_event(type, "TC3_ALARM_FLAP", 100 + i));
   }
 
-  EXPECT_EQ(handler_->dropped_events(), 0u);
-  EXPECT_GT(handler_->coalesced_events(), 0u);
+  EXPECT_EQ(handler_->dropped_events(), 51u);   // 151 events, 100 kept, all losses counted
+  EXPECT_EQ(handler_->coalesced_events(), 0u);  // transitions are never "no-loss" evictions
 
   auto output = read_stream_once(res, 1);
   EXPECT_EQ(parse_sse_payload(output)["fault"]["fault_code"], "PLC_COMMS_LOST");
@@ -436,22 +438,32 @@ TEST_F(SSEFaultHandlerTest, LaggingClientKeepsRareFaultWhenFlapFillsBuffer) {
   release_stream(res);
 }
 
-TEST_F(SSEFaultHandlerTest, CoalescedReplayEndsOnTheCurrentStateOfEachFault) {
-  // Convergence contract: whatever is dropped for capacity, the last event a
-  // client receives for a fault code must be that fault's latest state.
-  for (int i = 0; i < 150; ++i) {
-    const auto type = (i % 2 == 0) ? FaultEvent::EVENT_CONFIRMED : FaultEvent::EVENT_CLEARED;
-    enqueue_event(make_fault_event(type, "FLAPPER", 200 + i));
+TEST_F(SSEFaultHandlerTest, CoalescedReplayKeepsTransitionsAndEndsOnCurrentState) {
+  // Convergence contract for genuine coalescing: only fault_updated entries
+  // may be silently superseded. An update storm must not push out the fault's
+  // confirmation, and the last replayed frame must be the latest state.
+  auto req = make_stream_request("127.0.0.1");
+  httplib::Response res;
+  handler_->handle_stream(req, res);  // cursor open while the buffer is trimmed
+
+  enqueue_event(make_fault_event(FaultEvent::EVENT_CONFIRMED, "FLAPPER", 200));
+  for (int i = 1; i <= 149; ++i) {
+    enqueue_event(make_fault_event(FaultEvent::EVENT_UPDATED, "FLAPPER", 200 + i));
   }
   enqueue_event(make_fault_event(FaultEvent::EVENT_CLEARED, "FLAPPER", 999));
 
-  auto req = make_stream_request("127.0.0.1");
-  httplib::Response res;
-  handler_->handle_stream(req, res);
+  EXPECT_GT(handler_->coalesced_events(), 0u);
+  EXPECT_EQ(handler_->dropped_events(), 0u);
 
   // The buffer holds exactly its cap after the overflow; disconnect on the last
   // replayed frame so the loop never reaches the keepalive wait.
   auto output = read_stream_once(res, 100);
+
+  const auto first_frame = output.find("event: ");
+  ASSERT_NE(first_frame, std::string::npos);
+  auto first = parse_sse_payload(output.substr(first_frame));
+  EXPECT_EQ(first["event_type"], "fault_confirmed");  // the transition survived the storm
+
   const auto last_frame = output.rfind("event: ");
   ASSERT_NE(last_frame, std::string::npos);
   auto payload = parse_sse_payload(output.substr(last_frame));
@@ -462,34 +474,61 @@ TEST_F(SSEFaultHandlerTest, CoalescedReplayEndsOnTheCurrentStateOfEachFault) {
   release_stream(res);
 }
 
-TEST_F(SSEFaultHandlerTest, StalledClientIsReapedInsteadOfCountedAsBackpressure) {
-  // A client that stops making progress is dead, not slow. It must be reaped
-  // and dropped from the backpressure accounting, and said so in the log.
-  auto fast_tracker = std::make_shared<SSEClientTracker>(1);
-  SSEFaultHandler fast_handler(*ctx_, fast_tracker, 10ms);  // stall budget = 30ms
-
+TEST_F(SSEFaultHandlerTest, OwedDistinctEventsLostUnderPressureAreCountedAndLogged) {
+  // The counter this PR is about: a live client is owed events, the buffer
+  // overflows with distinct fault codes (nothing to coalesce), so events are
+  // genuinely lost - counted, attributed to the one slow client, and WARNed
+  // starting from the very first loss.
   auto req = make_stream_request("127.0.0.1");
   httplib::Response res;
-  fast_handler.handle_stream(req, res);  // cursor registered, provider never driven
-  std::this_thread::sleep_for(100ms);
+  handler_->handle_stream(req, res);  // cursor registered; never drained
 
   testing::internal::CaptureStderr();
-  // Fill past capacity with distinct codes so nothing can be coalesced: only
-  // the reaping decision keeps these evictions from counting as loss.
   for (int i = 1; i <= 150; ++i) {
-    auto event = make_fault_event(FaultEvent::EVENT_CONFIRMED, "STALL_" + std::to_string(i), i);
-    publisher_->publish(event);
-    const uint64_t before = fast_handler.events_received();
-    for (int spin = 0; spin < 500 && fast_handler.events_received() == before; ++spin) {
-      executor_->spin_some();
-      std::this_thread::sleep_for(1ms);
-    }
+    enqueue_event(make_fault_event(FaultEvent::EVENT_CONFIRMED, "DISTINCT_" + std::to_string(i), i));
   }
   auto logs = testing::internal::GetCapturedStderr();
 
-  EXPECT_EQ(fast_handler.reaped_clients(), 1u);
-  EXPECT_EQ(fast_handler.dropped_events(), 0u);
-  EXPECT_NE(logs.find("made no progress"), std::string::npos) << logs;
+  EXPECT_EQ(handler_->dropped_events(), 50u);
+  EXPECT_EQ(handler_->coalesced_events(), 0u);
+  EXPECT_NE(logs.find("SSE fault event lost: 1 event(s) dropped total for 1 slow client(s)"), std::string::npos)
+      << logs;
+
+  release_stream(res);
+}
+
+TEST_F(SSEFaultHandlerTest, HugeLastEventIdIsClampedToNewestIssuedId) {
+  // Last-Event-ID above the newest issued id (here: UINT64_MAX) used to make
+  // the stream permanently blind and alias the delivery watermark. It must be
+  // treated as "caught up": new events still flow.
+  enqueue_event(make_fault_event(FaultEvent::EVENT_CONFIRMED, "FAULT_OLD", 100));
+
+  auto req = make_stream_request("127.0.0.1", "18446744073709551615");
+  httplib::Response res;
+  handler_->handle_stream(req, res);
+
+  enqueue_event(make_fault_event(FaultEvent::EVENT_CONFIRMED, "FAULT_NEW", 101));
+
+  auto output = read_stream_once(res, 1);
+  EXPECT_NE(output.find("id: 2\n"), std::string::npos);
+  EXPECT_EQ(parse_sse_payload(output)["fault"]["fault_code"], "FAULT_NEW");
+
+  release_stream(res);
+}
+
+TEST_F(SSEFaultHandlerTest, NegativeLastEventIdFallsBackToFullReplay) {
+  // std::stoull accepts "-1" and wraps it to UINT64_MAX; the parser must
+  // reject it as malformed so the client gets the full replay instead of a
+  // blind stream.
+  enqueue_event(make_fault_event(FaultEvent::EVENT_CONFIRMED, "FAULT_NEG", 300));
+
+  auto req = make_stream_request("127.0.0.1", "-1");
+  httplib::Response res;
+  handler_->handle_stream(req, res);
+
+  auto output = read_stream_once(res, 1);
+  EXPECT_NE(output.find("id: 1\n"), std::string::npos);
+  EXPECT_EQ(parse_sse_payload(output)["fault"]["fault_code"], "FAULT_NEG");
 
   release_stream(res);
 }
