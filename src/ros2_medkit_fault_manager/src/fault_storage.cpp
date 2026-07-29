@@ -76,6 +76,7 @@ ros2_medkit_msgs::msg::Fault FaultState::to_msg() const {
   msg.description = description;
   msg.first_occurred = first_occurred;
   msg.last_occurred = last_occurred;
+  msg.last_passed = last_passed_time;
   msg.occurrence_count = occurrence_count;
   msg.status = status;
 

@@ -526,6 +526,8 @@ TEST_F(FaultStorageTest, PassedEventDoesNotAdvanceLastOccurred) {
   ASSERT_TRUE(fault.has_value());
   EXPECT_EQ(fault->status, Fault::STATUS_CONFIRMED);  // healing disabled: latched, by design
   EXPECT_EQ(rclcpp::Time(fault->last_occurred).nanoseconds(), failed_at.nanoseconds());
+  // The PASSED instant is not lost: it rides on the wire as last_passed.
+  EXPECT_EQ(rclcpp::Time(fault->last_passed).nanoseconds(), passed_at.nanoseconds());
 }
 
 TEST_F(FaultStorageTest, HealingDisabledByDefault) {
