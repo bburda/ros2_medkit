@@ -89,8 +89,9 @@ Reliability core
 
 Detectors
 ---------
-``qos_mismatch`` and ``orphan`` are the detectors this package ships so far. The
-remaining silent-fault classes land in follow-up changes, each against its own issue.
+``qos_mismatch``, ``orphan`` and ``param_drift`` are the detectors this package ships so
+far. The remaining silent-fault classes land in follow-up changes, each against its own
+issue.
 
 ``qos_mismatch`` raises ``GRAPH_QOS_MISMATCH``. It
 watches every topic's publisher/subscriber QoS pairs rather than parameter values: each
@@ -129,11 +130,10 @@ are not checked. The checks match only concrete incompatible enum pairs, so
 ``SYSTEM_DEFAULT``/``UNKNOWN`` (never
 reported by a live endpoint, which always carries the resolved profile) never raise.
 
-**Aggregation via the shared helper.** ``qos_mismatch`` is the first detector to use
-the new ``AggregatedFault`` helper (``aggregated_fault.hpp``), factored out of
-a shared helper so later detectors do not each reimplement the same
-level-triggered raise/clear pattern. The rationale is
-(see "Aggregation rationale" above): the fault_manager identifies a fault by
+**Aggregation via the shared helper.** ``qos_mismatch`` was the first detector to use the
+``AggregatedFault`` helper (``aggregated_fault.hpp``); ``orphan`` and ``param_drift`` go
+through the same one, so no detector reimplements the level-triggered raise/clear
+pattern. The rationale: the fault_manager identifies a fault by
 ``fault_code`` alone, so one ``GRAPH_QOS_MISMATCH`` per mismatched topic would collide
 into a single record under the shared code. The detector keeps one ``AggregatedFault``
 instance for the whole graph and, each tick, hands it every currently-mismatched
@@ -141,12 +141,17 @@ topic's description (keyed by topic name so a repeat mismatch on the same topic
 overwrites rather than duplicates); an empty map on a clean tick clears
 (``EVENT_PASSED``), level-triggered semantics (see
 "Closing the loop" in the README for the ``healing_enabled`` requirement to actually
-reach HEALED). ``graph_source_id()``, also in ``aggregated_fault.hpp``, is the same
-host-Component-id-or-literal-fallback logic - the detectors'
-aggregated faults land under the same ``source_id``.
+reach HEALED). ``graph_source_id()``, also in ``aggregated_fault.hpp``, returns the
+constant ``kGraphWatchdogEntityId`` (``"graph_watchdog"``) and nothing else, so every
+detector's aggregated faults land under the same ``source_id``. It deliberately does NOT
+fall back to the host Component id: a runtime host Component built by ``HostInfoProvider``
+never sets ``external``, ``collect_component_app_fqns`` only puts a Component's bare id in
+the fault scope set when it does, and a fault raised under it is therefore listed by no
+entity endpoint at all. The ``ctx`` argument is unused and kept only because every call
+site already has it in hand.
 
-**Coverage is exhaustive, not budgeted.** Unlike a call-budgeted
-round-robin sweep (bounded by a parameter-service transport call budget),
+**Coverage is exhaustive, not budgeted.** Unlike a budgeted
+round-robin sweep (bounded by a parameter-service round-trip budget),
 ``qos_mismatch`` reads no external service - ``get_topic_names_and_types()`` and the
 two ``get_*_info_by_topic()`` calls are local graph-cache queries, so every topic is
 checked every tick with no coverage-latency trade-off to configure or budget knob to
@@ -221,9 +226,99 @@ so it also proves a string array and an integer survive the parameter path into
 ``configure()``, which no C++ tier can show.
 
 
+``param_drift`` raises ``GRAPH_PARAM_DRIFT``. It reads node parameters over the
+parameter service and reports a value that no longer matches its reference. The
+reference is either self-captured, the value the parameter had when the node armed, or
+pinned in config through ``expect``. A node absent for longer than the window the
+reliability gate absorbs loses its captured baseline, so a restart - the documented way to apply
+a new configuration - re-captures instead of reporting the change as drift. A shorter gap keeps
+the baseline on purpose: DDS discovery drops a node from a single poll routinely, and re-capturing
+on that would take the node's current, possibly already drifted, value as the new reference and
+heal a real fault that could then never fire again. Only the pinned form can catch a value that was
+already wrong at startup; self-capture by construction treats whatever it first sees as
+correct.
+
+**A budgeted sweep, unlike every other detector here.** ``qos_mismatch`` and ``orphan``
+read the local graph cache and are therefore exhaustive every tick. This one makes real
+service calls to other nodes, so it is bounded by ``max_reads_per_tick`` and sweeps the
+graph round-robin. The budget is spent in service ROUND TRIPS at the watched node rather
+than in transport calls, because one call is several requests there: a self-capture read
+is a list plus a batched get, and an ``expect`` pin the node declares is a list, a get and a
+descriptor read. A pin the node does NOT declare stops at the list, and is charged two rather
+than the one it costs, because a second and rarer NOT_FOUND path does cost two and the error
+code cannot tell them apart - a load bound may overstate, never understate. That buys a bound
+on the load the sweep puts on watched nodes and pays with
+coverage latency: a drift is invisible until its node's turn comes, and so is a repair.
+The reads run on a thread the plugin owns rather than the gateway executor, so a node
+that stops answering stalls this sweep only.
+
+**Three horizons for a stale entry.** A node missing from one sweep is not forgotten
+immediately. Its captured BASELINE is dropped on the third consecutive sweep without it - the
+two the warmup tracker's forget grace absorbs, plus one - so that a one-tick discovery gap does
+not silently reset the baseline and hide a real drift behind a fresh capture. Its FINDING
+survives ``prune_grace`` consecutive absences and is dropped on the next one, so that the same
+gap does not clear the aggregated fault either. Only the finding horizon is configurable:
+``prune_grace`` is a per-detector config key, while the baseline horizon is the compile-time
+``kBaselineForgetGrace``. A ``prune_grace`` below 2 makes the finding the shorter of the two and
+the baseline then goes on the same sweep, because the absence counter it rides on is dropped
+with the finding.
+
+The third horizon is not about absence at all. A node that stays PRESENT but leaves the
+reliability gate's ``active`` state is never re-evaluated (it is not armed) and never pruned (it
+is still there), so its finding would otherwise be re-raised for ever - an operator who fixes
+the parameter and leaves the node deactivated would watch ``GRAPH_PARAM_DRIFT`` stay CONFIRMED
+naming a value that is no longer true. ``kFrozenHoldTicks`` (60 consecutive gate-denied ticks,
+one minute at the default tick period) bounds that: past it the finding is released and the app
+also stops holding back a clear, and both re-derive from a fresh read if it ever arms again.
+Because it is a compile-time constant and counted in ticks rather than in rotations, neither
+``max_reads_per_tick`` nor ``tick_interval_ms`` shortens it.
+
+**Severity is WARN, deliberately.** The detector knows a value moved; it does not know
+whether that breaks the robot. Grading the consequence needs knowledge of the machine
+that the graph does not carry.
+
+**Nothing is cleared that was not measured.** A clear asserts that nothing is drifting anywhere,
+which is only true if every app was actually looked at, so the aggregate emits nothing at all while
+any app still has no usable read. That covers three states which are all "nothing is known about
+this app": the round-robin has not reached it, its reads keep failing, or the reliability gate has
+not armed it - and the last of those is the ordinary state of every app for the first
+``warmup_cycles`` ticks of a run, so without it a restart clears before issuing a single round trip.
+A cached read counts as evidence only until a read of that app FAILS, after which the app is
+unmeasured again. Each hold is bounded from the other side: an app is given up on after both sixty
+failed attempts and sixty ticks unread, and a gate-denied one after the frozen hold. The bound on
+attempts alone would not do, because an attempt is not a duration - the reader paces itself off
+``max_reads_per_tick``, so at the accepted ceiling sixty-one attempts are spent in milliseconds and
+a node still being discovered would be written off. Finally, a clear withheld for a minute of ticks
+is logged once with the count of apps behind it, because from outside the process a correctly
+withheld clear and a detector that has nothing to report look exactly the same.
+
+**Test tiers.** ``test_param_drift_policy.cpp`` pins the pure comparison, rendering and
+config rules. ``test_param_drift_integration.cpp`` drives real nodes with real parameters over
+the real parameter service against a fake ``ReportFault`` service, including a node that
+never answers, which must not hang the tick, and a node that answers past the per-read bound,
+which must not be read at all.
+``test/e2e/test_param_drift_e2e.test.py`` is the acceptance gate: one gateway launch carrying
+the whole raise-and-clear story for the detector's default self-capturing mode, with a real
+fault_manager and both ends read back from ``GET /api/v1/faults``.
+``test/e2e/test_param_roundtrip_e2e.test.py`` measures what one parameter read really costs the
+node that serves it, against a node that answers the parameter services by hand and counts every
+request - so a round trip added to or removed from the TRANSPORT is caught, instead of quietly
+invalidating the round-trip figures the budget is built on. Nothing else in the package can
+notice that: every other test proves the arithmetic GIVEN those figures, and the stand-in
+transport they use counts calls. It does not, however, read the detector's own charge constants
+at all - it runs with ``param_drift`` switched off - so what holds those to the measurement is
+the timing suite in ``test_param_drift_integration.cpp``, which times the reader against a
+configured budget and therefore moves when a charge does. Cost and charge are pinned separately
+and on purpose.
+``test/e2e/test_config_plumbing_e2e.test.py`` drives three further gateway launches covering the
+nested ``expect`` sub-object reader, ``mode: "off"``, and the bare ``mode: off`` that the
+ROS parser types as a YAML 1.1 boolean; those three prove configuration delivery and
+suppression only, and assert no clear.
+
+
 Status
 ---------------
 The plugin loads, ticks the graph, and shuts down cleanly. The reliability core is real
-and already ticking. Two silent-fault detector classes raise through it today,
-``qos_mismatch`` and ``orphan``. The remaining classes land in follow-up changes, each
-against its own issue.
+and already ticking. Three silent-fault detector classes raise through it today,
+``qos_mismatch``, ``orphan`` and ``param_drift``. The remaining classes land in follow-up
+changes, each against its own issue.
