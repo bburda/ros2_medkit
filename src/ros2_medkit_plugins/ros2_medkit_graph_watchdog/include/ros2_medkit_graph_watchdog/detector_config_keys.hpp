@@ -27,7 +27,7 @@ namespace ros2_medkit_graph_watchdog {
 /// (GraphWatchdogPlugin::set_context). They are plumbing, not a detector's own keys, so a
 /// detector that ignores one must never report it as an operator typo.
 inline const std::set<std::string> & plugin_injected_detector_keys() {
-  static const std::set<std::string> keys{"tick_interval_ms"};
+  static const std::set<std::string> keys{"prune_grace", "tick_interval_ms"};
   return keys;
 }
 

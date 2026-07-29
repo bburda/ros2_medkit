@@ -298,8 +298,12 @@ ActionSendGoalResult OperationManager::send_component_action_goal(const std::str
 }
 
 namespace {
-/// Wall-clock budget for one CancelGoal round-trip. See the call site for why it is not tighter.
-constexpr std::chrono::duration<double> kCancelGoalTimeout{15.0};
+/// Floor for the CancelGoal budget. Cancel is a service call to the action server plus that
+/// server's own handling, so it is bounded by the SERVER, not by us; a very small configured
+/// service timeout would otherwise report a live cancel as a failure. The configured
+/// service_call_timeout_sec still wins whenever it is larger, so lowering it keeps bounding
+/// cancel like every other call in this file.
+constexpr double kCancelGoalFloorSec = 15.0;
 }  // namespace
 
 ActionCancelResult OperationManager::cancel_action_goal(const std::string & action_path, const std::string & goal_id) {
@@ -327,7 +331,9 @@ ActionCancelResult OperationManager::cancel_action_goal(const std::string & acti
   // handling, so it is bounded by the SERVER, not by us. 5s was enough on an idle machine and
   // not on a loaded one: under a busy CI container the request timed out and the cancel was
   // reported as a vendor error while the goal had in fact been accepted for cancellation.
-  result = action_transport_->cancel_goal(action_path, goal_id, kCancelGoalTimeout);
+  const auto cancel_timeout =
+      std::chrono::duration<double>(std::max(static_cast<double>(service_call_timeout_sec_), kCancelGoalFloorSec));
+  result = action_transport_->cancel_goal(action_path, goal_id, cancel_timeout);
 
   if (result.success && result.return_code == 0) {
     update_goal_status(goal_id, ActionGoalStatus::CANCELING);
