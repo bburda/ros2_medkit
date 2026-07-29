@@ -320,6 +320,28 @@ TEST_F(SSEFaultHandlerTest, StreamReplaysBufferedEventsUsingSseFormat) {
   EXPECT_EQ(payload["fault"]["fault_code"], "TEMP_HIGH");
   EXPECT_EQ(payload["fault"]["severity_label"], "ERROR");
   EXPECT_DOUBLE_EQ(payload["timestamp"].get<double>(), 123.456);
+  EXPECT_FALSE(payload.contains("auto_cleared_codes"));  // omitted when empty
+
+  release_stream(res);
+}
+
+TEST_F(SSEFaultHandlerTest, StreamCarriesAutoClearedCodes) {
+  // A correlation cascade lists its auto-cleared symptoms only on the root
+  // cause's event; the stream payload must carry them or SSE consumers never
+  // learn about the cascade.
+  auto event = make_fault_event(FaultEvent::EVENT_CLEARED, "ROOT_CAUSE", 80);
+  event.auto_cleared_codes = {"SYMPTOM_A", "SYMPTOM_B"};
+  enqueue_event(event);
+
+  auto req = make_stream_request("127.0.0.1");
+  httplib::Response res;
+  handler_->handle_stream(req, res);
+
+  auto output = read_stream_once(res, 1);
+  auto payload = parse_sse_payload(output);
+
+  ASSERT_TRUE(payload.contains("auto_cleared_codes")) << payload.dump();
+  EXPECT_EQ(payload["auto_cleared_codes"], (json::array({"SYMPTOM_A", "SYMPTOM_B"})));
 
   release_stream(res);
 }

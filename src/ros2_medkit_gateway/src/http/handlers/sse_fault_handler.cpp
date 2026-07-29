@@ -466,6 +466,13 @@ std::string SSEFaultHandler::format_sse_event(const QueuedEvent & queued) {
       static_cast<double>(queued.event.timestamp.sec) + static_cast<double>(queued.event.timestamp.nanosec) * 1e-9;
   json_event["timestamp"] = timestamp_sec;
 
+  // Correlation payload: symptom codes auto-cleared with this event's root
+  // cause. These codes get no event of their own, so this is the only place
+  // a stream consumer learns about the cascade. Omitted when empty.
+  if (!queued.event.auto_cleared_codes.empty()) {
+    json_event["auto_cleared_codes"] = queued.event.auto_cleared_codes;
+  }
+
   // SOVD payload extension: nest ``entity_type`` / ``entity_id`` under the
   // ``x-medkit`` response-extension object so global-stream consumers can
   // hit ``/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}``
