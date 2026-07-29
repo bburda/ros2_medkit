@@ -92,46 +92,34 @@ void SSEFaultHandler::request_shutdown() {
   queue_cv_.notify_all();
 }
 
-uint64_t SSEFaultHandler::delivered_watermark_locked() const {
-  uint64_t watermark = kNothingOwed;
+std::optional<uint64_t> SSEFaultHandler::delivered_watermark_locked() const {
+  std::optional<uint64_t> watermark;
   for (const auto & cursor : clients_) {
-    if (cursor->stalled) {
-      continue;  // dead client: its backlog is not backpressure
-    }
-    watermark = std::min(watermark, cursor->last_delivered);
+    watermark = watermark ? std::min(*watermark, cursor->last_delivered) : cursor->last_delivered;
   }
   return watermark;
 }
 
-std::deque<SSEFaultHandler::QueuedEvent>::iterator SSEFaultHandler::find_superseded_locked() {
+std::deque<SSEFaultHandler::QueuedEvent>::iterator SSEFaultHandler::find_superseded_locked(bool updates_only) {
   std::unordered_map<std::string, std::size_t> newest_index;
   for (std::size_t i = 0; i < event_queue_.size(); ++i) {
     newest_index[event_queue_[i].event.fault.fault_code] = i;
   }
   for (std::size_t i = 0; i < event_queue_.size(); ++i) {
+    const auto & entry = event_queue_[i].event;
     // An auto-clear cascade lists its symptoms only here; those codes get no
     // event of their own, so this entry is never redundant.
-    if (!event_queue_[i].event.auto_cleared_codes.empty()) {
+    if (!entry.auto_cleared_codes.empty()) {
       continue;
     }
-    if (newest_index[event_queue_[i].event.fault.fault_code] != i) {
+    if (updates_only && entry.event_type != ros2_medkit_msgs::msg::FaultEvent::EVENT_UPDATED) {
+      continue;
+    }
+    if (newest_index[entry.fault.fault_code] != i) {
       return event_queue_.begin() + static_cast<std::ptrdiff_t>(i);
     }
   }
   return event_queue_.end();
-}
-
-std::size_t SSEFaultHandler::reap_stalled_clients_locked(std::chrono::steady_clock::time_point now) {
-  const auto stall_timeout = keepalive_interval_ * kStallIntervals;
-  std::size_t reaped = 0;
-  for (const auto & cursor : clients_) {
-    if (cursor->stalled || (now - cursor->last_progress) <= stall_timeout) {
-      continue;
-    }
-    cursor->stalled = true;  // the stream loop returns false on its next wakeup
-    ++reaped;
-  }
-  return reaped;
 }
 
 SSEFaultHandler::EvictionStats SSEFaultHandler::evict_to_capacity_locked() {
@@ -140,28 +128,37 @@ SSEFaultHandler::EvictionStats SSEFaultHandler::evict_to_capacity_locked() {
     return stats;
   }
 
-  stats.reaped = reap_stalled_clients_locked(std::chrono::steady_clock::now());
-  const uint64_t watermark = delivered_watermark_locked();
+  const auto watermark = delivered_watermark_locked();
+  uint64_t newest_lost = 0;
 
   while (event_queue_.size() > kMaxBufferedEvents) {
-    if (event_queue_.front().id <= watermark) {
-      event_queue_.pop_front();  // every live client already has it
+    if (!watermark || event_queue_.front().id <= *watermark) {
+      event_queue_.pop_front();  // nobody attached, or every live client already has it
       continue;
     }
-    auto superseded = find_superseded_locked();
+    auto superseded = find_superseded_locked(/*updates_only=*/true);
     if (superseded != event_queue_.end()) {
-      event_queue_.erase(superseded);  // newer state for that fault code survives
+      event_queue_.erase(superseded);  // newer state survives, no transition erased
       ++stats.coalesced;
       continue;
     }
-    event_queue_.pop_front();  // distinct fault codes only: this one is lost
+    // Something a live client is owed has to go. Prefer an entry a newer
+    // same-code event supersedes: the current state still reaches the client
+    // even though the transition history does not. Either way it is a real,
+    // counted loss.
+    auto victim = find_superseded_locked(/*updates_only=*/false);
+    if (victim == event_queue_.end()) {
+      victim = event_queue_.begin();
+    }
+    newest_lost = std::max(newest_lost, victim->id);
+    event_queue_.erase(victim);
     ++stats.dropped;
   }
 
   if (stats.dropped > 0) {
     for (const auto & cursor : clients_) {
-      if (!cursor->stalled && cursor->last_delivered < event_queue_.back().id) {
-        ++stats.slow_clients;
+      if (cursor->last_delivered < newest_lost) {
+        ++stats.slow_clients;  // this client was owed at least one lost event
       }
     }
   }
@@ -185,13 +182,6 @@ void SSEFaultHandler::on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::Co
     stats = evict_to_capacity_locked();
   }
 
-  if (stats.reaped > 0) {
-    reaped_clients_.fetch_add(stats.reaped);
-    RCLCPP_WARN(HandlerContext::logger(),
-                "SSE fault stream: %zu client(s) made no progress for %" PRId64
-                "ms; treating them as disconnected and reaping",
-                stats.reaped, (keepalive_interval_ * kStallIntervals).count());
-  }
   if (stats.coalesced > 0) {
     coalesced_events_.fetch_add(stats.coalesced);
   }
@@ -205,8 +195,8 @@ void SSEFaultHandler::on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::Co
     if (previous == 0 || (total / kDropLogEveryN) > (previous / kDropLogEveryN)) {
       RCLCPP_WARN(HandlerContext::logger(),
                   "SSE fault event lost: %zu event(s) dropped total for %zu slow client(s) "
-                  "(buffer cap=%zu, %zu coalesced so far, %zu client(s) reaped as dead)",
-                  total, stats.slow_clients, kMaxBufferedEvents, coalesced_events_.load(), reaped_clients_.load());
+                  "(buffer cap=%zu, %zu coalesced so far)",
+                  total, stats.slow_clients, kMaxBufferedEvents, coalesced_events_.load());
     }
   }
 
@@ -220,15 +210,16 @@ void SSEFaultHandler::on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::Co
 namespace {
 
 /// Parse the Last-Event-ID header; absent / malformed values map to 0 so the
-/// client receives every buffered event on connect.
+/// client receives every buffered event on connect. Digits only: std::stoull
+/// alone would accept "-1" and wrap it to UINT64_MAX.
 uint64_t parse_last_event_id(std::string_view value) {
-  if (value.empty()) {
+  if (value.empty() || value.find_first_not_of("0123456789") != std::string_view::npos) {
     return 0;
   }
   try {
     return std::stoull(std::string(value));
   } catch (...) {
-    return 0;
+    return 0;  // out of range
   }
 }
 
@@ -236,13 +227,18 @@ uint64_t parse_last_event_id(std::string_view value) {
 
 void SSEFaultHandler::note_progress_locked(const std::shared_ptr<ClientCursor> & cursor, uint64_t delivered_id) {
   cursor->last_delivered = std::max(cursor->last_delivered, delivered_id);
-  cursor->last_progress = std::chrono::steady_clock::now();
 }
 
 std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint64_t initial_last_event_id) {
+  // Clamp to the newest id issued so far: a Last-Event-ID above it (any bogus
+  // value, e.g. "18446744073709551615") would otherwise leave collect_pending
+  // permanently empty (blind stream, no keepalives under steady traffic) and
+  // seed the delivery watermark with an id nobody was ever sent, evicting the
+  // whole buffer as "already delivered".
+  initial_last_event_id = std::min(initial_last_event_id, next_event_id_.load() - 1);
+
   auto cursor = std::make_shared<ClientCursor>();
   cursor->last_delivered = initial_last_event_id;
-  cursor->last_progress = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     clients_.push_back(cursor);
@@ -310,9 +306,6 @@ std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint6
 
         if (shutdown_flag_.load()) {
           return false;  // Handler is shutting down
-        }
-        if (cursor->stalled) {
-          return false;  // Reaped as dead while the buffer was under pressure
         }
 
         pending = collect_pending();
@@ -437,10 +430,6 @@ std::size_t SSEFaultHandler::dropped_events() const {
 
 std::size_t SSEFaultHandler::coalesced_events() const {
   return coalesced_events_.load();
-}
-
-std::size_t SSEFaultHandler::reaped_clients() const {
-  return reaped_clients_.load();
 }
 
 uint64_t SSEFaultHandler::events_received() const {
