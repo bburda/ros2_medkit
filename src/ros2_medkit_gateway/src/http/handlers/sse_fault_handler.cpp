@@ -196,12 +196,13 @@ void SSEFaultHandler::on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::Co
     coalesced_events_.fetch_add(stats.coalesced);
   }
 
-  // Surface real SSE backpressure without spamming the log: every kDropLogEveryN
-  // losses emit one WARN with the running total. Buffer rotation with no client
-  // waiting on the evicted event is not counted at all.
+  // Surface real SSE backpressure without spamming the log: the first loss, then
+  // one WARN per kDropLogEveryN. Buffer rotation with no client waiting on the
+  // evicted event is not counted at all.
   if (stats.dropped > 0) {
-    const auto total = dropped_events_.fetch_add(stats.dropped) + stats.dropped;
-    if ((total / kDropLogEveryN) > ((total - stats.dropped) / kDropLogEveryN)) {
+    const auto previous = dropped_events_.fetch_add(stats.dropped);
+    const auto total = previous + stats.dropped;
+    if (previous == 0 || (total / kDropLogEveryN) > (previous / kDropLogEveryN)) {
       RCLCPP_WARN(HandlerContext::logger(),
                   "SSE fault event lost: %zu event(s) dropped total for %zu slow client(s) "
                   "(buffer cap=%zu, %zu coalesced so far, %zu client(s) reaped as dead)",
