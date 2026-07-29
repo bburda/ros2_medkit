@@ -190,6 +190,9 @@ if(BUILD_TESTING)
   # LifecycleShutdownSuppressor: needs a REAL ReliabilityGate (departed_lifecycle_state_of()
   # reads live from ctx.gate) - same real-Node/ROS_DOMAIN_ID rationale as test_reliability_gate
   # above, unlike test_allowlist_suppressor (pure interface, no gate needed).
+  ament_add_gtest(test_orphan_policy test/test_orphan_policy.cpp)
+  target_include_directories(test_orphan_policy PRIVATE include)
+
   ament_add_gtest(test_qos_policy test/test_qos_policy.cpp)
   target_include_directories(test_qos_policy PRIVATE include)
   medkit_target_dependencies(test_qos_policy rmw)   # rmw is transitively found via rclcpp; no find_package needed
@@ -214,7 +217,20 @@ if(BUILD_TESTING)
     ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs std_msgs)
   target_link_libraries(test_qos_mismatch_integration nlohmann_json::nlohmann_json)
   medkit_set_test_domain(test_qos_mismatch_integration)
-  set_tests_properties(test_qos_mismatch_integration PROPERTIES TIMEOUT 120 RESOURCE_LOCK graph_watchdog_integration_domain)
+
+  ament_add_gtest(test_orphan_integration
+    test/test_orphan_integration.cpp
+    src/detectors/orphan_detector.cpp
+    src/detector_registry.cpp
+    src/reliability_gate.cpp
+    src/lifecycle_watcher.cpp
+    ${LIFECYCLE_STATE_READER_SOURCES})
+  target_include_directories(test_orphan_integration PRIVATE include)
+  medkit_target_dependencies(test_orphan_integration
+    ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs std_msgs sensor_msgs)
+  target_link_libraries(test_orphan_integration nlohmann_json::nlohmann_json)
+  medkit_set_test_domain(test_orphan_integration)
+  set_tests_properties(test_orphan_integration PROPERTIES TIMEOUT 120 RESOURCE_LOCK graph_watchdog_integration_domain)
 
   # === QoS-mismatch e2e (launch_testing) ===
   #
@@ -232,6 +248,13 @@ if(BUILD_TESTING)
     LABELS "integration;e2e"
     # Shares the e2e domain and its lock rather than consuming another slot.
     ENVIRONMENT "GATEWAY_TEST_PORT=19120;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
+    RESOURCE_LOCK graph_watchdog_e2e_domain)
+
+  add_launch_test(test/e2e/test_orphan_e2e.test.py TIMEOUT 180)
+  set_tests_properties(test_e2e_test_orphan_e2e.test.py PROPERTIES
+    LABELS "integration;e2e"
+    # Shares the e2e domain and its lock rather than consuming another slot.
+    ENVIRONMENT "GATEWAY_TEST_PORT=19130;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
     RESOURCE_LOCK graph_watchdog_e2e_domain)
 
   ros2_medkit_relax_vendor_warnings()

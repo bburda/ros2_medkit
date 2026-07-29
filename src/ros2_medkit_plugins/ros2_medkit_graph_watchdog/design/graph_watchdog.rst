@@ -89,10 +89,10 @@ Reliability core
 
 Detectors
 ---------
-``qos_mismatch`` is the detector this package ships first. The remaining silent-fault
-classes land in follow-up changes, each against its own issue.
+``qos_mismatch`` and ``orphan`` are the detectors this package ships so far. The
+remaining silent-fault classes land in follow-up changes, each against its own issue.
 
-``qos_mismatch`` is the second detector and raises ``GRAPH_QOS_MISMATCH``. It
+``qos_mismatch`` raises ``GRAPH_QOS_MISMATCH``. It
 watches every topic's publisher/subscriber QoS pairs rather than parameter values: each
 tick it enumerates every topic via ``get_topic_names_and_types()`` and, for each one,
 every currently-connected publisher and subscriber (``get_publishers_info_by_topic`` /
@@ -177,9 +177,53 @@ overlapping:
    ``tick()`` called directly.
 
 
+
+``orphan`` raises ``GRAPH_ORPHAN``. It looks for the mistake no ROS 2 tool
+reports: a topic that exists but has no counterpart, because one side was spelled
+slightly differently. Each tick it counts publishers and subscribers per topic, keeps
+the one-sided ones, and pairs a publisher-only topic with a subscriber-only topic when
+their names are within ``max_edit_distance`` Levenshtein edits of each other. Only a
+pair is reported, never a lone one-sided topic: a publisher with no subscriber is
+normal on almost every robot, so it carries no signal on its own.
+
+**Three guards keep this from crying wolf.**
+
+- Names must sit in the same parent namespace. ``/a/scan`` and ``/b/scan`` differ by one
+  character but belong to two different robots, and pairing them would be nonsense. The
+  leaf and the namespace carry separate edit budgets and the namespace one defaults to
+  zero, so this is an exact match unless an operator raises
+  ``namespace_edit_distance``. Raising it is what makes a misspelled namespace
+  (``/robott/scan`` against ``/robot/scan``) visible at all, at the price of reporting
+  every robot of a fleet whose namespaces are themselves near-misses, which is why it is
+  opt-in rather than tuned.
+- A pair that matches once every run of digits collapses to one placeholder is an
+  enumeration, not a typo. ``/lidar_1`` next to ``/lidar_2``, each one-sided, is the
+  ordinary state of a multi-sensor machine, and reporting it would fire on every such
+  machine. Collapsing runs rather than comparing character positions also covers
+  ``/lidar_9`` next to ``/lidar_10``, where the index changes length. The price is a real
+  typo in a digit going unreported, which is a deliberate trade.
+- ``grace`` consecutive sweeps must agree before anything is raised. During bringup one
+  side of a healthy pair is routinely missing for a moment, which looks exactly like a
+  typo until the other side appears.
+
+An operator who still gets a false alarm puts the topic in ``allowlist``. What this
+detector cannot see at all is a namespace added or dropped by accident: ``/scan``
+against ``/robot/scan`` is far past any sensible edit distance.
+
+**Test tiers.** ``test_orphan_policy.cpp`` pins the pure matching rules, including each
+guard and the cases it deliberately lets through. ``test_orphan_integration.cpp`` drives
+the detector over a real ``rclcpp`` graph and a fake ``ReportFault`` service, covering
+the grace counter, the clear on repair, and the allowlist. ``test/e2e/test_orphan_e2e.test.py``
+is the acceptance gate: a real gateway with the plugin loaded, a real fault_manager, and
+the fault read back from ``GET /api/v1/faults``. It carries three pairs at once - one
+reported, one allowlisted, one visible only under a raised ``namespace_edit_distance`` -
+so it also proves a string array and an integer survive the parameter path into
+``configure()``, which no C++ tier can show.
+
+
 Status
 ---------------
-The plugin loads, ticks the graph, and shuts down cleanly. The reliability core is
-real and already ticking, and all six silent-fault detector classes are live and
-raising through it. The remaining silent-fault classes land in follow-up changes,
-each against its own issue.
+The plugin loads, ticks the graph, and shuts down cleanly. The reliability core is real
+and already ticking. Two silent-fault detector classes raise through it today,
+``qos_mismatch`` and ``orphan``. The remaining classes land in follow-up changes, each
+against its own issue.
