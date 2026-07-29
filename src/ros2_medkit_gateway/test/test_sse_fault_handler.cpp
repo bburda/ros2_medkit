@@ -399,6 +399,101 @@ TEST_F(SSEFaultHandlerTest, BufferEvictsOldestEventWhenFull) {
   release_stream(res);
 }
 
+TEST_F(SSEFaultHandlerTest, BufferRotationWithNoClientsIsNotADrop) {
+  // Observed on a live diagnostic box: 19,000+ "events dropped ... slow or
+  // disconnected clients" with zero SSE clients ever connected. Rotating a
+  // replay buffer nobody is reading loses nothing and must not be reported as
+  // backpressure.
+  for (int i = 1; i <= 150; ++i) {
+    enqueue_event(make_fault_event(FaultEvent::EVENT_CONFIRMED, "FAULT_" + std::to_string(i), i));
+  }
+
+  EXPECT_EQ(handler_->connected_clients(), 0u);
+  EXPECT_EQ(handler_->dropped_events(), 0u);
+}
+
+TEST_F(SSEFaultHandlerTest, LaggingClientKeepsRareFaultWhenFlapFillsBuffer) {
+  // A PLC alarm flapping on a few-second cycle used to push every other fault
+  // out of the 100-entry buffer, so a client behind by more than the buffer
+  // never learned the standing fault was active. Superseded flap events are
+  // evicted first now: the client converges on the current state of every code.
+  auto req = make_stream_request("127.0.0.1");
+  httplib::Response res;
+  handler_->handle_stream(req, res);  // registers a cursor; never drained below
+
+  enqueue_event(make_fault_event(FaultEvent::EVENT_CONFIRMED, "PLC_COMMS_LOST", 1));
+  for (int i = 0; i < 150; ++i) {
+    const auto type = (i % 2 == 0) ? FaultEvent::EVENT_CLEARED : FaultEvent::EVENT_CONFIRMED;
+    enqueue_event(make_fault_event(type, "TC3_ALARM_FLAP", 100 + i));
+  }
+
+  EXPECT_EQ(handler_->dropped_events(), 0u);
+  EXPECT_GT(handler_->coalesced_events(), 0u);
+
+  auto output = read_stream_once(res, 1);
+  EXPECT_EQ(parse_sse_payload(output)["fault"]["fault_code"], "PLC_COMMS_LOST");
+
+  release_stream(res);
+}
+
+TEST_F(SSEFaultHandlerTest, CoalescedReplayEndsOnTheCurrentStateOfEachFault) {
+  // Convergence contract: whatever is dropped for capacity, the last event a
+  // client receives for a fault code must be that fault's latest state.
+  for (int i = 0; i < 150; ++i) {
+    const auto type = (i % 2 == 0) ? FaultEvent::EVENT_CONFIRMED : FaultEvent::EVENT_CLEARED;
+    enqueue_event(make_fault_event(type, "FLAPPER", 200 + i));
+  }
+  enqueue_event(make_fault_event(FaultEvent::EVENT_CLEARED, "FLAPPER", 999));
+
+  auto req = make_stream_request("127.0.0.1");
+  httplib::Response res;
+  handler_->handle_stream(req, res);
+
+  // The buffer holds exactly its cap after the overflow; disconnect on the last
+  // replayed frame so the loop never reaches the keepalive wait.
+  auto output = read_stream_once(res, 100);
+  const auto last_frame = output.rfind("event: ");
+  ASSERT_NE(last_frame, std::string::npos);
+  auto payload = parse_sse_payload(output.substr(last_frame));
+  EXPECT_EQ(payload["fault"]["fault_code"], "FLAPPER");
+  EXPECT_EQ(payload["event_type"], "fault_cleared");
+  EXPECT_DOUBLE_EQ(payload["timestamp"].get<double>(), 999.0);
+
+  release_stream(res);
+}
+
+TEST_F(SSEFaultHandlerTest, StalledClientIsReapedInsteadOfCountedAsBackpressure) {
+  // A client that stops making progress is dead, not slow. It must be reaped
+  // and dropped from the backpressure accounting, and said so in the log.
+  auto fast_tracker = std::make_shared<SSEClientTracker>(1);
+  SSEFaultHandler fast_handler(*ctx_, fast_tracker, 10ms);  // stall budget = 30ms
+
+  auto req = make_stream_request("127.0.0.1");
+  httplib::Response res;
+  fast_handler.handle_stream(req, res);  // cursor registered, provider never driven
+  std::this_thread::sleep_for(100ms);
+
+  testing::internal::CaptureStderr();
+  // Fill past capacity with distinct codes so nothing can be coalesced: only
+  // the reaping decision keeps these evictions from counting as loss.
+  for (int i = 1; i <= 150; ++i) {
+    auto event = make_fault_event(FaultEvent::EVENT_CONFIRMED, "STALL_" + std::to_string(i), i);
+    publisher_->publish(event);
+    const uint64_t before = fast_handler.events_received();
+    for (int spin = 0; spin < 500 && fast_handler.events_received() == before; ++spin) {
+      executor_->spin_some();
+      std::this_thread::sleep_for(1ms);
+    }
+  }
+  auto logs = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(fast_handler.reaped_clients(), 1u);
+  EXPECT_EQ(fast_handler.dropped_events(), 0u);
+  EXPECT_NE(logs.find("made no progress"), std::string::npos) << logs;
+
+  release_stream(res);
+}
+
 TEST_F(SSEFaultHandlerTest, StreamSanitizesNewlinesInEventType) {
   enqueue_event(make_fault_event("fault_confirmed\nretry: 0\r\nevent: injected", "FAULT_SANITIZED", 300));
 
