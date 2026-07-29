@@ -316,6 +316,11 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
         fault_code = 'ROSBAG_TEST_001'
 
         # Report fault - buffer should already have messages from background publishers
+        # The previous test's post-fault recording window diverts incoming messages away
+        # from the ring buffer, so right after it closes the buffer can be empty and
+        # flush_to_bag creates no bag. Wait for it to refill before reporting.
+        self.assertTrue(self._wait_for_buffered_data(),
+                        'ring buffer never refilled after the previous post-fault window')
         response = self._report_fault(fault_code, 'Rosbag integration test fault')
         self.assertTrue(response.accepted)
         print(f'Fault {fault_code} reported and confirmed')
@@ -344,6 +349,11 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
         fault_code = 'ROSBAG_CLEANUP_TEST'
 
         # Report fault - buffer has messages from background publishers
+        # The previous test's post-fault recording window diverts incoming messages away
+        # from the ring buffer, so right after it closes the buffer can be empty and
+        # flush_to_bag creates no bag. Wait for it to refill before reporting.
+        self.assertTrue(self._wait_for_buffered_data(),
+                        'ring buffer never refilled after the previous post-fault window')
         response = self._report_fault(fault_code, 'Cleanup test fault')
         self.assertTrue(response.accepted)
 
