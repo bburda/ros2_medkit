@@ -22,7 +22,8 @@ Core fault data model representing an aggregated fault condition with AUTOSAR DE
 | `severity` | uint8 | Severity level (use SEVERITY_* constants) |
 | `description` | string | Human-readable description |
 | `first_occurred` | builtin_interfaces/Time | When fault was first reported |
-| `last_occurred` | builtin_interfaces/Time | When fault was last reported (FAILED or PASSED) |
+| `last_occurred` | builtin_interfaces/Time | When fault last occurred (FAILED events only) |
+| `last_passed` | builtin_interfaces/Time | When fault last reported PASSED (zero = never) |
 | `occurrence_count` | uint32 | Total FAILED events aggregated across all sources |
 | `status` | string | Current status (see STATUS_* constants) |
 | `reporting_sources` | string[] | List of source identifiers that reported this fault |
@@ -63,12 +64,13 @@ Real-time fault event notification for SSE streaming (published on `/fault_manag
 | `event_type` | string | Event type (see constants below) |
 | `fault` | Fault | The fault data (state after event) |
 | `timestamp` | builtin_interfaces/Time | When the event occurred |
+| `auto_cleared_codes` | string[] | Symptom codes auto-cleared with the root cause (correlation) |
 
 **Event Types:**
 | Constant | Trigger |
 |----------|---------|
 | `EVENT_CONFIRMED` | Fault transitions PREFAILED → CONFIRMED |
-| `EVENT_CLEARED` | Fault transitions to CLEARED |
+| `EVENT_CLEARED` | Fault ends: CLEARED via ClearFault, or HEALED by PASSED events (`fault.status` tells which) |
 | `EVENT_UPDATED` | Fault data changes without status transition |
 
 ## Services
