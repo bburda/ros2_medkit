@@ -15,8 +15,8 @@
 #include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <iomanip>
 #include <random>
 #include <regex>
