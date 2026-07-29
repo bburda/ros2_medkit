@@ -793,13 +793,13 @@ Real-time fault event stream using Server-Sent Events (SSE). Clients receive ins
 - **Real-time notifications**: Events pushed instantly when fault state changes
 - **Automatic reconnection**: Supports `Last-Event-ID` header for seamless reconnection
 - **Keepalive**: Sends `:keepalive` comment every 30 seconds to prevent timeouts
-- **Event buffer**: Buffers up to 100 recent events for reconnecting clients
+- **Event buffer**: Buffers up to 100 recent events for reconnecting clients. Under overflow the buffer drops entries every live client has already received, then entries superseded by a newer event for the same fault code, so a lagging client still converges on the current state of every fault
 - **Entity context (SOVD payload extension)**: When the gateway can resolve the fault's first reporting source back to an entity, the payload carries an `x-medkit` object with `entity_type` and `entity_id` fields so consumers can hit `/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}` directly without enumerating entities
 
 **Event Types:**
 - `fault_confirmed` - Fault transitioned to CONFIRMED status
 - `fault_updated` - Fault data changed (occurrence_count, sources, etc.)
-- `fault_cleared` - Fault was cleared via ClearFault service
+- `fault_cleared` - Fault ended: cleared via ClearFault service, or auto-healed by PASSED events (check `fault.status` for `CLEARED` vs `HEALED`)
 
 **Example:**
 ```bash
