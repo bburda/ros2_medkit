@@ -82,6 +82,15 @@ SSEFaultHandler::~SSEFaultHandler() {
   // Signal shutdown and wake up any waiting clients
   request_shutdown();
   subscription_.reset();
+
+  // The per-stream unregister deleter dereferences this handler (it locks
+  // queue_mutex_ and erases from clients_) and runs whenever the framework
+  // destroys the content provider. Hold destruction until every closure is
+  // gone so that deleter can never run on a dead handler.
+  std::unique_lock<std::mutex> lock(queue_mutex_);
+  queue_cv_.wait(lock, [this] {
+    return clients_.empty();
+  });
 }
 
 void SSEFaultHandler::request_shutdown() {
@@ -254,6 +263,7 @@ std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint6
   auto unregister = std::shared_ptr<void>(nullptr, [this, cursor](void *) {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     clients_.erase(std::remove(clients_.begin(), clients_.end(), cursor), clients_.end());
+    queue_cv_.notify_all();  // ~SSEFaultHandler may be waiting for the last closure
   });
 
   return [this, cursor, unregister, last_event_id = initial_last_event_id](httplib::DataSink & sink) mutable -> bool {

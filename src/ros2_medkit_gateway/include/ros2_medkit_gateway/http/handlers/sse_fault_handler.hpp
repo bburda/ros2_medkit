@@ -82,7 +82,11 @@ class SSEFaultHandler {
   SSEFaultHandler(HandlerContext & ctx, std::shared_ptr<SSEClientTracker> client_tracker,
                   std::chrono::milliseconds keepalive_interval);
 
-  /// Destructor - cleanup subscription
+  /// Destructor. Signals shutdown, then blocks until every stream closure has
+  /// been destroyed: the per-stream unregister deleter locks queue_mutex_ and
+  /// touches clients_, so no closure may outlive the handler. The HTTP server
+  /// must already be stopping (request_shutdown() makes every loop return
+  /// false on its next wakeup) or destruction will wait for it.
   ~SSEFaultHandler();
 
   // Disable copy/move
