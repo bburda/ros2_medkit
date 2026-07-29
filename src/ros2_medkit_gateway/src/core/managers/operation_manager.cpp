@@ -15,6 +15,7 @@
 #include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <iomanip>
 #include <random>
@@ -296,6 +297,11 @@ ActionSendGoalResult OperationManager::send_component_action_goal(const std::str
   return send_action_goal(action_path, resolved_type, goal, entity_id);
 }
 
+namespace {
+/// Wall-clock budget for one CancelGoal round-trip. See the call site for why it is not tighter.
+constexpr std::chrono::duration<double> kCancelGoalTimeout{15.0};
+}  // namespace
+
 ActionCancelResult OperationManager::cancel_action_goal(const std::string & action_path, const std::string & goal_id) {
   ActionCancelResult result;
   result.success = false;
@@ -317,7 +323,11 @@ ActionCancelResult OperationManager::cancel_action_goal(const std::string & acti
     return result;
   }
 
-  result = action_transport_->cancel_goal(action_path, goal_id, std::chrono::duration<double>(5.0));
+  // A CancelGoal round-trip is a service call to the action server plus that server's own
+  // handling, so it is bounded by the SERVER, not by us. 5s was enough on an idle machine and
+  // not on a loaded one: under a busy CI container the request timed out and the cancel was
+  // reported as a vendor error while the goal had in fact been accepted for cancellation.
+  result = action_transport_->cancel_goal(action_path, goal_id, kCancelGoalTimeout);
 
   if (result.success && result.return_code == 0) {
     update_goal_status(goal_id, ActionGoalStatus::CANCELING);

@@ -84,7 +84,10 @@ jobs:
           ccache -s
 
       - name: Run unit and integration tests
-        timeout-minutes: 15
+        # The suite grew past the old 15-minute budget: on lyrical it was already taking
+        # 14m13s on main, so any new package tipped it over. This is real work finishing, not
+        # a hang.
+        timeout-minutes: 25
         env:
           # FastRTPS 2.6 on Humble has a known use-after-free in the
           # discovery-teardown path (EDP::unpairWriterProxy) that segfaults
