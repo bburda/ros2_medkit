@@ -41,6 +41,7 @@ from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
 
 FAULT_CODE = 'SSE_E2E_HEAL_ME'
+PRIME_CODE = 'SSE_E2E_PRIME'
 SOURCE_ID = '/powertrain/engine/temp_sensor'
 
 
@@ -82,9 +83,9 @@ class TestSseFaultStreamE2E(GatewayTestCase):
         cls._reporter.destroy_node()
         rclpy.shutdown()
 
-    def _report(self, event_type):
+    def _report(self, event_type, fault_code=FAULT_CODE):
         req = ReportFault.Request()
-        req.fault_code = FAULT_CODE
+        req.fault_code = fault_code
         req.event_type = event_type
         req.severity = Fault.SEVERITY_ERROR
         req.description = 'SSE E2E test fault'
@@ -118,6 +119,35 @@ class TestSseFaultStreamE2E(GatewayTestCase):
         except Exception:  # noqa: BLE001 - closed socket on test teardown
             pass
 
+    def _prime_stream(self, frames):
+        """Block until the fault event pipeline demonstrably reaches the stream.
+
+        /fault_manager/events is reliable but volatile: an event published
+        before the gateway's subscription has matched the fault manager's
+        publisher is lost outright, and under sanitizer load that matching can
+        finish after the first report (ASan CI lost the one-shot confirm to
+        exactly this race). Every accepted report publishes an event, so
+        repeating a sacrificial fault until one of its frames arrives proves
+        service -> fault manager -> events topic -> SSE end to end.
+        """
+        deadline = time.monotonic() + FAULT_TIMEOUT
+        while time.monotonic() < deadline:
+            self._report(ReportFault.Request.EVENT_FAILED, fault_code=PRIME_CODE)
+            settle = min(time.monotonic() + 1.0, deadline)
+            while time.monotonic() < settle:
+                for frame in list(frames):
+                    data = frame.get('data')
+                    if data is None:
+                        continue
+                    payload = json.loads(data)
+                    if payload.get('fault', {}).get('fault_code') == PRIME_CODE:
+                        return
+                time.sleep(0.1)
+        raise AssertionError(
+            f'no event for priming fault {PRIME_CODE} on /faults/stream '
+            f'within {FAULT_TIMEOUT}s; events pipeline never went live'
+        )
+
     def _wait_for_event(self, frames, event_type, deadline):
         while time.monotonic() < deadline:
             for frame in list(frames):
@@ -145,6 +175,7 @@ class TestSseFaultStreamE2E(GatewayTestCase):
         )
         pump.start()
         try:
+            self._prime_stream(frames)
             self._report(ReportFault.Request.EVENT_FAILED)
             confirmed = self._wait_for_event(
                 frames, 'fault_confirmed', time.monotonic() + FAULT_TIMEOUT
