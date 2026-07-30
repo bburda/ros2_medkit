@@ -826,6 +826,12 @@ int main(int argc, char ** argv) {
 
   UA_StatusCode rc = UA_Server_run(server, reinterpret_cast<volatile UA_Boolean *>(&g_running));
   g_running = false;
+  // The exit code is 1 for every bad status, so print the status itself:
+  // otherwise a server that ends on its own leaves the driving test with a
+  // closed stdin pipe and no reason anywhere.
+  if (rc != UA_STATUSCODE_GOOD) {
+    std::cout << "EXIT UA_Server_run rc=" << UA_StatusCode_name(rc) << std::endl;
+  }
   if (cli.joinable()) {
     cli.join();
   }

@@ -247,6 +247,41 @@ def start_gateway(params_file, log_path, env):
     return proc
 
 
+def send_cmd(server, server_log, cmd):
+    """
+    Write one alarm-CLI command, reporting a dead server instead of EPIPE.
+
+    A bare write to an exited server raises BrokenPipeError from whichever
+    command comes next, naming neither the server nor a reason. Check first and
+    dump the server log, which carries the UA_Server_run status.
+
+    Returns True on success, False if the server is gone (caller should fail).
+    """
+    def report():
+        rc = server.returncode
+        print(f'FAIL: alarm server gone (rc={rc}) before {cmd!r}', file=sys.stderr)
+        print('server log:\n' + Path(server_log).read_text(errors='replace'),
+              file=sys.stderr)
+        return False
+
+    if server.poll() is not None:
+        return report()
+    try:
+        server.stdin.write(cmd + '\n')
+        server.stdin.flush()
+    except (BrokenPipeError, ValueError):
+        # The poll() above is a point-in-time check: the server can still exit
+        # between it and the flush. Report the same way instead of letting the
+        # exception escape, which is the failure mode this helper exists to
+        # remove. ValueError covers a stdin already closed on teardown.
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return report()
+    return True
+
+
 def terminate(proc):
     """Best-effort SIGTERM then SIGKILL of a child process."""
     if proc is None:
@@ -387,8 +422,8 @@ def main():
         print(f'  OK secured read: tank_level = {value}')
 
         # Secured A&C: fire an alarm over the server stdin -> CONFIRMED fault.
-        server.stdin.write('fire Overpressure 750\n')
-        server.stdin.flush()
+        if not send_cmd(server, server_log, 'fire Overpressure 750'):
+            return 1
         # Generous deadline for slow CI runners: the alarm has already fired on
         # the server, but report -> fault_manager -> REST propagation can take
         # a while under load. A longer deadline only slows the failure path.
@@ -415,8 +450,8 @@ def main():
         # while a real condition on the catch-all still faults. Reset the still-
         # active Overpressure condition first so its ConditionRefresh replay does
         # not pre-map PLC_ALARM before the sysevent is even fired.
-        server.stdin.write('clear Overpressure\n')
-        server.stdin.flush()
+        if not send_cmd(server, server_log, 'clear Overpressure'):
+            return 1
 
         catch_node_map = workdir / 'catchall_nodes.yaml'
         write_catchall_node_map(catch_node_map)
@@ -438,8 +473,8 @@ def main():
             return 1
 
         # Fire the non-condition system event; the guard must drop it.
-        server.stdin.write('sysevent\n')
-        server.stdin.flush()
+        if not send_cmd(server, server_log, 'sysevent'):
+            return 1
         leaked = wait_json(
             f'{catch_base}/faults',
             lambda j: any(i.get('fault_code') == NONCOND_CODE for i in j.get('items', [])),
@@ -455,8 +490,8 @@ def main():
 
         # A real condition on the catch-all source still faults (proves the
         # pipeline can produce PLC_ALARM, so the absence above is meaningful).
-        server.stdin.write('fire Overpressure 750\n')
-        server.stdin.flush()
+        if not send_cmd(server, server_log, 'fire Overpressure 750'):
+            return 1
         catch_faults = wait_json(
             f'{catch_base}/faults',
             lambda j: any(i.get('fault_code') == NONCOND_CODE and i.get('status') == 'CONFIRMED'
