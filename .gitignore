@@ -93,6 +93,8 @@ cover/
 *.gcno
 *.gcov
 coverage.info
+coverage.raw.info
+coverage.extracted.info
 coverage_html/
 
 # Translations

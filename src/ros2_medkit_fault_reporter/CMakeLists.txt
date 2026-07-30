@@ -22,16 +22,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
 include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
-
-# Code coverage option
-option(ENABLE_COVERAGE "Enable code coverage reporting" OFF)
-if(ENABLE_COVERAGE)
-  message(STATUS "Code coverage enabled")
-  add_compile_options(--coverage -O0 -g)
-  add_link_options(--coverage)
-endif()
 
 find_package(ament_cmake REQUIRED)
 
@@ -57,11 +50,6 @@ medkit_target_dependencies(fault_reporter_lib
   rclcpp_lifecycle
   ros2_medkit_msgs
 )
-
-if(ENABLE_COVERAGE)
-  target_compile_options(fault_reporter_lib PRIVATE --coverage -O0 -g)
-  target_link_options(fault_reporter_lib PRIVATE --coverage)
-endif()
 
 # Install library
 install(TARGETS fault_reporter_lib
@@ -100,20 +88,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_local_filter fault_reporter_lib)
   medkit_target_dependencies(test_local_filter rclcpp rclcpp_lifecycle ros2_medkit_msgs)
 
-  if(ENABLE_COVERAGE)
-    target_compile_options(test_local_filter PRIVATE --coverage -O0 -g)
-    target_link_options(test_local_filter PRIVATE --coverage)
-  endif()
-
   ament_add_gtest(test_fault_reporter_construction test/test_fault_reporter_construction.cpp)
   target_link_libraries(test_fault_reporter_construction fault_reporter_lib)
   medkit_target_dependencies(test_fault_reporter_construction rclcpp rclcpp_lifecycle ros2_medkit_msgs)
   medkit_set_test_domain(test_fault_reporter_construction)
-
-  if(ENABLE_COVERAGE)
-    target_compile_options(test_fault_reporter_construction PRIVATE --coverage -O0 -g)
-    target_link_options(test_fault_reporter_construction PRIVATE --coverage)
-  endif()
 
   # Integration tests
   install(DIRECTORY test

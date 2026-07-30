@@ -24,16 +24,9 @@ find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
 include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
-
-# Code coverage option
-option(ENABLE_COVERAGE "Enable code coverage reporting" OFF)
-if(ENABLE_COVERAGE)
-  message(STATUS "Code coverage enabled")
-  add_compile_options(--coverage -O0 -g)
-  add_link_options(--coverage)
-endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -89,20 +82,9 @@ target_link_libraries(fault_manager_lib PUBLIC
 
 medkit_apply_compat_defs(fault_manager_lib)
 
-if(ENABLE_COVERAGE)
-  target_compile_options(fault_manager_lib PRIVATE --coverage -O0 -g)
-  target_link_options(fault_manager_lib PRIVATE --coverage)
-endif()
-
 # Executable target
 add_executable(fault_manager_node src/main.cpp)
 target_link_libraries(fault_manager_node fault_manager_lib)
-
-# Apply coverage flags to executable
-if(ENABLE_COVERAGE)
-  target_compile_options(fault_manager_node PRIVATE --coverage -O0 -g)
-  target_link_options(fault_manager_node PRIVATE --coverage)
-endif()
 
 # Install targets
 install(TARGETS fault_manager_node
@@ -181,26 +163,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_entity_thresholds fault_manager_lib)
   medkit_target_dependencies(test_entity_thresholds rclcpp ros2_medkit_msgs)
   medkit_set_test_domain(test_entity_thresholds)
-
-  # Apply coverage flags to test targets
-  if(ENABLE_COVERAGE)
-    target_compile_options(test_fault_manager PRIVATE --coverage -O0 -g)
-    target_link_options(test_fault_manager PRIVATE --coverage)
-    target_compile_options(test_sqlite_storage PRIVATE --coverage -O0 -g)
-    target_link_options(test_sqlite_storage PRIVATE --coverage)
-    target_compile_options(test_snapshot_capture PRIVATE --coverage -O0 -g)
-    target_link_options(test_snapshot_capture PRIVATE --coverage)
-    target_compile_options(test_rosbag_capture PRIVATE --coverage -O0 -g)
-    target_link_options(test_rosbag_capture PRIVATE --coverage)
-    target_compile_options(test_correlation_config_parser PRIVATE --coverage -O0 -g)
-    target_link_options(test_correlation_config_parser PRIVATE --coverage)
-    target_compile_options(test_pattern_matcher PRIVATE --coverage -O0 -g)
-    target_link_options(test_pattern_matcher PRIVATE --coverage)
-    target_compile_options(test_correlation_engine PRIVATE --coverage -O0 -g)
-    target_link_options(test_correlation_engine PRIVATE --coverage)
-    target_compile_options(test_entity_thresholds PRIVATE --coverage -O0 -g)
-    target_link_options(test_entity_thresholds PRIVATE --coverage)
-  endif()
 
   # Integration tests
   install(DIRECTORY test

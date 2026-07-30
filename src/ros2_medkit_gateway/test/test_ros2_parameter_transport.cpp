@@ -530,12 +530,19 @@ class TestRos2ParameterTransportListRespondsGetSetStuck : public ::testing::Test
   }
 
   void TearDown() override {
+    // Both halves of this order are load-bearing.
+    // Join before cancel(): cancel() while the spin thread is inside
+    // spin_some() races the executor's notify-waitable
+    // (ExecutorNotifyWaitable::is_ready() against trigger_entity_recollect()).
+    // Keep cancel(): it releases the executor's node references. Without it the
+    // previous test's service outlives its fixture and answers the next test's
+    // request, turning an expected timeout into a success.
     release_all_ = true;  // unstick any blocked callback first
-    executor_->cancel();
     spin_thread_running_ = false;
     if (spin_thread_.joinable()) {
       spin_thread_.join();
     }
+    executor_->cancel();
     executor_->remove_node(node_);
     executor_.reset();
     list_parameters_service_.reset();

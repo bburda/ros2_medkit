@@ -334,9 +334,12 @@ jobs:
             exit 1
           fi
 
+          # $PWD, not pwd -P: gcov records the path the compiler was given, which
+          # is the logical one. Resolving symlinks here would stop matching.
+          WS="${PWD}"
           lcov --extract coverage.raw.info \
-            '*/ros2_medkit/src/*/src/*' \
-            '*/ros2_medkit/src/*/include/*' \
+            "${WS}/src/*/src/*" \
+            "${WS}/src/*/include/*" \
             --output-file coverage.extracted.info \
             --ignore-errors unused,empty
 
@@ -352,6 +355,15 @@ jobs:
 
           lcov --list coverage.info
           genhtml coverage.info --output-directory coverage_html --ignore-errors source
+
+      # A package that never gets --coverage emits no .gcda and drops out of the
+      # report entirely - out of the numerator and the denominator both, so the
+      # percentage silently stops describing the workspace. Assert the report
+      # still covers every package the source tree says holds production C++.
+      - name: Verify every C++ package reached the coverage report
+        run: |
+          ./scripts/check_coverage_packages.sh coverage.info \
+            --skip ros2_medkit_opcua
 
       - name: Upload coverage HTML report as artifact
         uses: actions/upload-artifact@v4

@@ -23,6 +23,7 @@ install(
   FILES
     cmake/ROS2MedkitCompat.cmake
     cmake/ROS2MedkitCcache.cmake
+    cmake/ROS2MedkitCoverage.cmake
     cmake/ROS2MedkitLinting.cmake
     cmake/ROS2MedkitSanitizers.cmake
     cmake/ROS2MedkitTestDomain.cmake

@@ -152,9 +152,30 @@ Generating Coverage
 
 .. code-block:: bash
 
-   colcon build --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
-   colcon test
-   # Coverage report in build/ros2_medkit_gateway/coverage/
+   cd ~/workspace
+   WS="${PWD}"
+
+   colcon build --packages-skip ros2_medkit_opcua \
+     --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
+   colcon test --packages-skip ros2_medkit_opcua --ctest-args -LE linter
+
+   lcov --capture --directory build --output-file coverage.raw.info \
+     --ignore-errors mismatch,negative,empty,gcov
+   lcov --extract coverage.raw.info "${WS}/src/*/src/*" \
+     "${WS}/src/*/include/*" \
+     --output-file coverage.extracted.info --ignore-errors unused,empty
+   lcov --remove coverage.extracted.info '*/vendored/*' \
+     --output-file coverage.info --ignore-errors unused,empty
+   genhtml coverage.info --output-directory coverage_html --ignore-errors source
+
+   # Assert no package silently dropped out of the report
+   ./scripts/check_coverage_packages.sh coverage.info --skip ros2_medkit_opcua
+
+Open ``coverage_html/index.html`` in a browser. This mirrors the measurement
+pipeline of the CI coverage job, so the number is comparable to the published
+one; ``.github/workflows/ci.yml`` is the authoritative version. See
+``CONTRIBUTING.md`` for why the last step exists and why ``ros2_medkit_opcua``
+is skipped.
 
 Customization
 -------------
