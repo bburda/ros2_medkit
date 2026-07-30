@@ -10,16 +10,9 @@ find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
 include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
-
-# Code coverage option
-option(ENABLE_COVERAGE "Enable code coverage reporting" OFF)
-if(ENABLE_COVERAGE)
-  message(STATUS "Code coverage enabled")
-  add_compile_options(--coverage -O0 -g)
-  add_link_options(--coverage)
-endif()
 
 # Swagger UI embedding option
 option(ENABLE_SWAGGER_UI "Embed Swagger UI assets in gateway binary" OFF)
@@ -257,14 +250,6 @@ if(ENABLE_SWAGGER_UI)
   target_compile_definitions(gateway_node PRIVATE ENABLE_SWAGGER_UI)
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SwaggerUI.cmake)
   target_compile_definitions(gateway_ros2 PRIVATE SWAGGER_UI_VERSION="${SWAGGER_UI_VERSION}")
-endif()
-
-# Apply coverage flags to main targets
-if(ENABLE_COVERAGE)
-  foreach(_target gateway_ros2 gateway_node)
-    target_compile_options(${_target} PRIVATE --coverage -O0 -g)
-    target_link_options(${_target} PRIVATE --coverage)
-  endforeach()
 endif()
 
 # Install
@@ -1102,106 +1087,7 @@ if(BUILD_TESTING)
   # No medkit_set_test_domain - this is ROS-free (gateway_core only).
   ament_add_gtest(test_entity_cache_alloc test/test_entity_cache_alloc.cpp)
   target_link_libraries(test_entity_cache_alloc gateway_core)
-  # NOTE: test_entity_cache_alloc is intentionally excluded from _test_targets below.
-  # Its global operator new/delete override corrupts lcov allocation counters in other TUs.
 
-  # Apply coverage flags to test targets
-  if(ENABLE_COVERAGE)
-    set(_test_targets
-      test_gateway_node
-      test_auth_manager
-      test_generic_client_compat
-      test_operation_manager
-      test_configuration_manager
-      test_ros2_parameter_transport
-      test_ros2_parameter_transport_shutdown
-      test_discovery_manager
-      test_runtime_discovery
-      test_tls_config
-      test_fault_manager
-      test_error_info
-      test_parameter_error_precedence
-      test_lifecycle_status_helpers
-      test_ros2_lifecycle_state_reader
-      test_ros2_subscription_executor
-      test_ros2_subscription_slot
-      test_topic_data_provider_interface
-      test_ros2_topic_data_provider
-      test_trigger_topic_subscriber
-      test_ros2_log_source
-      test_discovery_models
-      test_host_info_provider
-      test_discovery_handlers
-      test_manifest_parser
-      test_manifest_validator
-      test_manifest_manager
-      test_capability_builder
-      test_handler_context
-      test_rate_limiter
-      test_auth_config
-      test_data_access_manager
-      test_entity_resource_model
-      test_function_resource_collections
-      test_entity_path_utils
-      test_fault_handlers
-      test_bulk_data_store
-      test_bulkdata_handlers
-      test_subscription_manager
-      test_resource_sampler_registry
-      test_transport_registry
-      test_cyclic_subscription_handlers
-      test_sse_transport_provider
-      test_sse_fault_handler
-      test_entity_freeze_frame_capture
-      test_update_manager
-      test_script_manager
-      test_default_script_provider
-      test_script_handlers
-      test_data_handlers
-      test_auth_handlers
-      test_health_handlers
-      test_operation_handlers
-      test_plugin_loader
-      test_plugin_manager
-      test_plugin_http_types
-      test_plugin_abi_conformance
-      test_log_manager
-      test_log_handlers
-      test_log_scope
-      test_merge_pipeline
-      test_runtime_linker
-      test_route_descriptions
-      test_schema_builder
-      test_path_builder
-      test_openapi_spec_builder
-      test_path_resolver
-      test_capability_generator
-      test_route_registry
-      test_typed_route_registry
-      test_docs_handlers
-      test_lock_manager
-      test_lock_handlers
-      test_condition_evaluator
-      test_resource_change_notifier
-      test_trigger_store
-      test_trigger_manager
-      test_trigger_handlers
-      test_fault_trigger_engine
-      test_peer_client
-      test_entity_merger
-      test_fan_out_helpers
-      test_aggregation_manager
-      test_aggregation_classification
-      test_stream_proxy
-      test_mdns_discovery
-      test_network_utils
-      test_plugin_context_aggregation
-    )
-    foreach(_target ${_test_targets})
-      target_compile_options(${_target} PRIVATE --coverage -O0 -g)
-      target_link_options(${_target} PRIVATE --coverage)
-    endforeach()
-  endif()
   ros2_medkit_relax_vendor_warnings()
 endif()
 

@@ -11,6 +11,17 @@ find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitWarnings)
 
+# The shared coverage module is deliberately NOT included here: everything this
+# package compiles is test scaffolding - the demo_nodes/ fixtures driven by the
+# launch_testing suites - not production code, so it stays out of the coverage
+# report by design rather than by oversight.
+#
+# What keeps it out is the EXCLUDED_PACKAGES array in
+# scripts/check_coverage_packages.sh, NOT the absence of the include. That gate
+# derives the packages it expects from the source tree precisely so that a
+# missing include cannot excuse itself. Delete the array entry and this package
+# starts failing the gate.
+
 find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)

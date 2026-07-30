@@ -15,8 +15,8 @@
 # Automatically sourced by ament after find_package(ros2_medkit_cmake).
 # Adds the installed cmake module directory to CMAKE_MODULE_PATH so that
 # include(ROS2MedkitCompat), include(ROS2MedkitCcache),
-# include(ROS2MedkitLinting), include(ROS2MedkitSanitizers),
-# include(ROS2MedkitTestDomain), and include(ROS2MedkitWarnings)
-# work transparently.
+# include(ROS2MedkitCoverage), include(ROS2MedkitLinting),
+# include(ROS2MedkitSanitizers), include(ROS2MedkitTestDomain),
+# and include(ROS2MedkitWarnings) work transparently.
 
 list(APPEND CMAKE_MODULE_PATH "${ros2_medkit_cmake_DIR}")

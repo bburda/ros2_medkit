@@ -32,6 +32,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Source-tree half of the coverage-scope gate. Reads only CMakeLists.txt,
+      # needs neither ROS nor a build, so it sits directly after checkout: a
+      # package that compiles C++ without opting into coverage instrumentation
+      # fails here in under a second instead of at the end of the coverage job.
+      - name: Every C++ package opts into coverage instrumentation
+        run: ./scripts/check_coverage_packages.sh --static-only
+
       - name: Pre-install ROS 2 apt source
         uses: ./.github/actions/ros-apt-source
 
@@ -347,9 +354,9 @@ jobs:
       # fit the container overlay on small GitHub runners, so build on /mnt.
       volumes:
         - "/mnt:/mnt"
-    # A full TSan run is ~40 min, leaving only ~5 min of headroom at 45; bump to
-    # 60 so a slow runner does not cancel the job mid-run (see sanitizer-asan).
-    timeout-minutes: 60
+    # Successful runs reach 59 min, and a timeout here reads as "TSan found
+    # something" rather than "the job ran out of clock". Keep the headroom.
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash

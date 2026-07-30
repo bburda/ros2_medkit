@@ -22,15 +22,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
 include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
-
-option(ENABLE_COVERAGE "Enable code coverage reporting" OFF)
-if(ENABLE_COVERAGE)
-  message(STATUS "Code coverage enabled")
-  add_compile_options(--coverage -O0 -g)
-  add_link_options(--coverage)
-endif()
 
 find_package(ament_cmake REQUIRED)
 
@@ -103,11 +97,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_log_bridge log_bridge_lib)
   medkit_target_dependencies(test_log_bridge rclcpp rcl_interfaces ros2_medkit_msgs)
   medkit_set_test_domain(test_log_bridge)
-
-  if(ENABLE_COVERAGE)
-    target_compile_options(test_log_bridge PRIVATE --coverage -O0 -g)
-    target_link_options(test_log_bridge PRIVATE --coverage)
-  endif()
 
   # Integration test (launch_testing): fault_manager + bridge + synthetic /rosout
   install(DIRECTORY test

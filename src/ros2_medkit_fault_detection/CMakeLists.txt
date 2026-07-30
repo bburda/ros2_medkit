@@ -19,6 +19,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ros2_medkit_cmake REQUIRED)
+include(ROS2MedkitCoverage)
 include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)

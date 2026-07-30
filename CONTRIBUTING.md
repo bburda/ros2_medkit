@@ -95,15 +95,60 @@ On push: incremental clang-tidy on changed `.cpp` files.
 
 #### Code Coverage
 
+Run from the workspace root. This mirrors the measurement pipeline of the CI
+coverage job (same lcov capture, filters and flags), so the local percentage is
+comparable to the published one. The job additionally builds with
+`--symlink-install`, installs `ros-jazzy-test-msgs` via rosdep, and prints
+`lcov --list`; see `.github/workflows/ci.yml` for the authoritative version.
+
 ```bash
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
-./scripts/test.sh              # run tests
-lcov --capture --directory build --output-file coverage.raw.info --ignore-errors mismatch,negative
-lcov --extract coverage.raw.info '*/ros2_medkit/src/*/src/*' '*/ros2_medkit/src/*/include/*' --output-file coverage.info
-genhtml coverage.info --output-directory coverage_html
+WS="${PWD}"   # gcov records the path the compiler was given, not the resolved one
+
+colcon build --packages-skip ros2_medkit_opcua \
+  --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
+colcon test --packages-skip ros2_medkit_opcua --ctest-args -LE linter
+
+lcov --capture --directory build --output-file coverage.raw.info \
+  --ignore-errors mismatch,negative,empty,gcov
+lcov --extract coverage.raw.info "${WS}/src/*/src/*" "${WS}/src/*/include/*" \
+  --output-file coverage.extracted.info --ignore-errors unused,empty
+lcov --remove coverage.extracted.info '*/vendored/*' \
+  --output-file coverage.info --ignore-errors unused,empty
+genhtml coverage.info --output-directory coverage_html --ignore-errors source
+
+./scripts/check_coverage_packages.sh coverage.info --skip ros2_medkit_opcua
 ```
 
 Open `coverage_html/index.html` in your browser.
+
+`ros2_medkit_opcua` is skipped because it pulls `open62541pp` over the network
+via `FetchContent`, which costs every matrix run time for a plugin unrelated to
+it; CI skips it in the same jobs and builds it separately in
+`.github/workflows/opcua-plugin.yml`. Dropping the `--remove` step leaves
+vendored third-party code in the report and your number will not match CI's.
+
+#### Coverage scope
+
+`ENABLE_COVERAGE` is handled by the shared `ROS2MedkitCoverage` module, not by
+per-package CMake code. **Every package that compiles production C++ must
+`include(ROS2MedkitCoverage)` before it declares its first target** - the flags
+apply at directory scope, so a target created before the include is not
+instrumented. Packages that compile only test scaffolding are exempt and are
+listed in `EXCLUDED_PACKAGES` in the gate script, each with a reason;
+`ros2_medkit_integration_tests` is the current entry.
+
+A package that misses this does not fail the build. It emits no `.gcda`, lcov
+never sees it, and it drops out of both the numerator and the denominator - the
+reported percentage then silently describes a subset of the workspace.
+
+`scripts/check_coverage_packages.sh` guards against that. It derives the set of
+packages that *must* appear from the source tree (anything holding hand-written
+C++ under `src/` or `include/`), never from the presence of the include - a set
+derived from the include could not detect a package that never added it, or one
+where the line was deleted. It runs twice in CI: `--static-only` in the Quality
+workflow, so a missing include fails in seconds, and against the real report in
+the coverage job. Pass `--skip <package>` for a package the current job does not
+build.
 
 #### CI/CD
 
