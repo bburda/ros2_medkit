@@ -147,6 +147,12 @@ constexpr const char * ERR_INSUFFICIENT_ACCESS_RIGHTS = "insufficient-access-rig
 /// SOVD standard: a required precondition was not fulfilled (409)
 constexpr const char * ERR_PRECONDITION_NOT_FULFILLED = "precondition-not-fulfilled";
 
+/// SOVD standard: entity queried but did not respond (504). SOVD reserves
+/// 504 Gateway Timeout for "no response from the underlying entity in time"
+/// - used when a ROS 2 round-trip times out and the outcome is therefore
+/// UNKNOWN, as opposed to a definitive failure reported by the entity.
+constexpr const char * ERR_NOT_RESPONDING = "not-responding";
+
 // Script error codes (vendor-specific only; generic cases use ERR_RESOURCE_NOT_FOUND / ERR_INVALID_PARAMETER)
 constexpr const char * ERR_SCRIPT_ALREADY_EXISTS = "x-medkit-script-already-exists";
 constexpr const char * ERR_SCRIPT_MANAGED = "x-medkit-managed-script";

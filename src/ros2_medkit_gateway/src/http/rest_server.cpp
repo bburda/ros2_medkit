@@ -695,6 +695,13 @@ void RESTServer::setup_routes() {
         .summary(std::string("Update execution for ") + et.singular)
         .description("Sends a control command to a running execution.")
         .response(202, "Accepted (asynchronous control)", SB::ref("OperationExecution"))
+        // 400/404/500 come from the registry's automatic response-level
+        // GenericError $ref; the remaining cancel-outcome statuses
+        // (issue #576) need manual declarations.
+        .response(503, "Action server unavailable (x-medkit-ros2-action-unavailable)",
+                  nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
+        .response(504, "No cancel response in time - outcome unknown (not-responding)",
+                  nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
         .operation_id(std::string("update") + capitalize(et.singular) + "Execution");
 
     reg.del<http::NoContent>(entity_path + "/operations/{operation_id}/executions/{execution_id}",
@@ -704,6 +711,12 @@ void RESTServer::setup_routes() {
         .tag("Operations")
         .summary(std::string("Cancel execution for ") + et.singular)
         .description("Cancels a running execution.")
+        // Same cancel-outcome statuses as PUT-stop (issue #576);
+        // 400/404/500 are auto-declared by the registry.
+        .response(503, "Action server unavailable (x-medkit-ros2-action-unavailable)",
+                  nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
+        .response(504, "No cancel response in time - outcome unknown (not-responding)",
+                  nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
         .operation_id(std::string("cancel") + capitalize(et.singular) + "Execution");
 
     // --- Configurations ---

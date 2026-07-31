@@ -97,6 +97,7 @@ class MockActionTransport : public ActionTransport {
     ActionCancelResult r;
     r.success = cancel_success_;
     r.return_code = cancel_return_code_;
+    r.outcome = cancel_success_ && cancel_return_code_ == 0 ? CancelOutcome::kOk : CancelOutcome::kErrorResponse;
     r.error_message = cancel_error_;
     return r;
   }
@@ -278,6 +279,9 @@ TEST(OperationManagerRoutingTest, CancelActionGoalRoutesToActionTransport) {
   EXPECT_EQ(act->cancel_calls_, 1);
   EXPECT_EQ(act->last_cancel_path_, "/p/a");
   EXPECT_EQ(act->last_cancel_goal_id_, sent.goal_id);
+  // The cancel budget must follow the configured service timeout exactly,
+  // like every other action RPC - no hidden floor (issue #576).
+  EXPECT_DOUBLE_EQ(act->last_cancel_timeout_, 2.0);
 
   auto tracked = mgr.get_tracked_goal(sent.goal_id);
   ASSERT_TRUE(tracked.has_value());

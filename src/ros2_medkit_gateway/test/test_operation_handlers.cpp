@@ -588,9 +588,14 @@ TEST_F(OperationHandlersFixtureTest, UpdateExecutionStopReturnsAcceptedAndLocati
     EXPECT_EQ(exec.status, "running");
     EXPECT_EQ(goal_info.status, ActionGoalStatus::CANCELING);
   } else {
-    EXPECT_EQ(result.error().http_status, 400);
-    EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_VENDOR_ERROR);
-    EXPECT_TRUE(goal_info.status == ActionGoalStatus::CANCELING || goal_info.status == ActionGoalStatus::CANCELED);
+    // The fixture's action server always ACCEPTS cancels, so the only
+    // realistic failure here is a lost/late CancelGoal response whose
+    // timeout could not be reconciled against the status stream: 504 +
+    // standard `not-responding` (issue #576). The old expectation asserted
+    // ERR_VENDOR_ERROR, which the handler never produced - that constant
+    // only ever existed on the wire after the renderer's remap.
+    EXPECT_EQ(result.error().http_status, 504);
+    EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_NOT_RESPONDING);
   }
 }
 

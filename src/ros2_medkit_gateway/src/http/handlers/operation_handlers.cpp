@@ -203,6 +203,73 @@ ErrorInfo make_provider_error(const OperationProviderErrorInfo & info, const std
   return make_plugin_error(info.http_status, info.message, std::move(params));
 }
 
+/// Failure shape produced by `map_cancel_result`. `std::nullopt` from the
+/// mapper means "the cancellation is in progress" and the entry point should
+/// render its success shape (204 for DELETE, 202 for PUT-stop).
+struct CancelFailure {
+  int http_status;
+  const char * error_code;
+  std::string message;
+};
+
+/// Shared outcome mapping for the two cancel entry points (DELETE execution
+/// and PUT-stop) - issue #576:
+/// - kOk: success.
+/// - kTimeout: the CancelGoal response did not arrive, so the outcome is
+///   UNKNOWN, not a rejection. Reconcile against the tracked goal fed by the
+///   /_action/status stream: if the stream already shows CANCELING/CANCELED
+///   the cancellation is in fact happening -> success. Otherwise 504 +
+///   standard `not-responding` (SOVD: "no response from the underlying
+///   entity in time"). The tracked status is NOT written on this path - the
+///   status stream stays the authority.
+/// - kServiceUnavailable: 503 - the action server is gone; retry may help.
+/// - kTransportError: 500 - the request could not be delivered/parsed.
+/// - kErrorResponse: 400 + `x-medkit-ros2-action-rejected` - the server
+///   answered and definitively refused (return_code 1/2/3).
+///
+/// @param verb "Cancel" or "Stop" - keeps each entry point's message wording.
+std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result, OperationManager & operation_mgr,
+                                               const std::string & execution_id, const char * verb) {
+  switch (result.outcome) {
+    case CancelOutcome::kOk:
+      return std::nullopt;
+    case CancelOutcome::kTimeout: {
+      auto tracked = operation_mgr.get_tracked_goal(execution_id);
+      if (tracked.has_value() &&
+          (tracked->status == ActionGoalStatus::CANCELING || tracked->status == ActionGoalStatus::CANCELED)) {
+        return std::nullopt;
+      }
+      return CancelFailure{504, ERR_NOT_RESPONDING,
+                           std::string(verb) +
+                               " outcome unknown: the action server did not answer the cancel request in time. "
+                               "Poll the execution status resource to observe the goal's progress."};
+    }
+    case CancelOutcome::kServiceUnavailable:
+      return CancelFailure{503, ERR_X_MEDKIT_ROS2_ACTION_UNAVAILABLE,
+                           result.error_message.empty() ? "Cancel service not available" : result.error_message};
+    case CancelOutcome::kTransportError:
+      return CancelFailure{500, ERR_X_MEDKIT_ROS2_ACTION_UNAVAILABLE,
+                           result.error_message.empty() ? std::string(verb) + " failed" : result.error_message};
+    case CancelOutcome::kErrorResponse:
+      break;
+  }
+  std::string message;
+  switch (result.return_code) {
+    case 1:
+      message = std::string(verb) + " request rejected";
+      break;
+    case 2:
+      message = "Unknown execution ID";
+      break;
+    case 3:
+      message = "Execution already terminated";
+      break;
+    default:
+      message = result.error_message.empty() ? std::string(verb) + " failed" : result.error_message;
+  }
+  return CancelFailure{400, ERR_X_MEDKIT_ROS2_ACTION_REJECTED, std::move(message)};
+}
+
 }  // namespace
 
 // =============================================================================
@@ -758,24 +825,11 @@ http::Result<http::NoContent> OperationHandlers::cancel_execution(const http::Ty
   }
 
   auto result = operation_mgr->cancel_action_goal(goal_info->action_path, execution_id);
-  if (result.success && result.return_code == 0) {
+  auto failure = map_cancel_result(result, *operation_mgr, execution_id, "Cancel");
+  if (!failure.has_value()) {
     return http::NoContent{};
   }
-  std::string error_msg;
-  switch (result.return_code) {
-    case 1:
-      error_msg = "Cancel request rejected";
-      break;
-    case 2:
-      error_msg = "Unknown execution ID";
-      break;
-    case 3:
-      error_msg = "Execution already terminated";
-      break;
-    default:
-      error_msg = result.error_message.empty() ? "Cancel failed" : result.error_message;
-  }
-  return tl::make_unexpected(make_error(400, ERR_X_MEDKIT_ROS2_ACTION_REJECTED, error_msg,
+  return tl::make_unexpected(make_error(failure->http_status, failure->error_code, failure->message,
                                         json{{"entity_id", entity_id},
                                              {"operation_id", operation_id},
                                              {"execution_id", execution_id},
@@ -833,7 +887,8 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
   // supported_capabilities hint.
   if (capability == "stop") {
     auto result = operation_mgr->cancel_action_goal(goal_info->action_path, execution_id);
-    if (result.success && result.return_code == 0) {
+    auto failure = map_cancel_result(result, *operation_mgr, execution_id, "Stop");
+    if (!failure.has_value()) {
       const std::string base_path =
           req.path().find("/apps/") != std::string::npos ? "/api/v1/apps/" : "/api/v1/components/";
       const std::string location =
@@ -847,25 +902,12 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
       att.with_status(202).with_header("Location", location);
       return SuccessPair{std::move(exec_dto), std::move(att)};
     }
-    std::string error_msg;
-    switch (result.return_code) {
-      case 1:
-        error_msg = "Stop request rejected";
-        break;
-      case 2:
-        error_msg = "Unknown execution ID";
-        break;
-      case 3:
-        error_msg = "Execution already terminated";
-        break;
-      default:
-        error_msg = result.error_message.empty() ? "Stop failed" : result.error_message;
-    }
-    return tl::make_unexpected(make_error(400, ERR_X_MEDKIT_ROS2_ACTION_REJECTED, error_msg,
+    return tl::make_unexpected(make_error(failure->http_status, failure->error_code, failure->message,
                                           json{{"entity_id", entity_id},
                                                {"operation_id", operation_id},
                                                {"execution_id", execution_id},
-                                               {"capability", capability}}));
+                                               {"capability", capability},
+                                               {"return_code", result.return_code}}));
   }
   if (capability == "execute") {
     return tl::make_unexpected(
