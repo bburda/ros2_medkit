@@ -103,8 +103,12 @@ ActionGoalStatus from_status_byte(int8_t status) {
 
 }  // namespace
 
-Ros2ActionTransport::Ros2ActionTransport(rclcpp::Node * node)
-  : node_(node), serializer_(std::make_shared<ros2_medkit_serialization::JsonSerializer>()) {
+Ros2ActionTransport::Ros2ActionTransport(rclcpp::Node * node, rclcpp::CallbackGroup::SharedPtr rpc_group,
+                                         rclcpp::CallbackGroup::SharedPtr status_group)
+  : node_(node)
+  , rpc_group_(std::move(rpc_group))
+  , status_group_(std::move(status_group))
+  , serializer_(std::make_shared<ros2_medkit_serialization::JsonSerializer>()) {
   RCLCPP_INFO(node_->get_logger(), "Ros2ActionTransport initialised (native serialization)");
 }
 
@@ -143,15 +147,17 @@ Ros2ActionTransport::ActionClientSet & Ros2ActionTransport::get_or_create_client
 
   std::string send_goal_service = action_path + "/_action/send_goal";
   std::string send_goal_type = ServiceActionTypes::get_action_send_goal_service_type(action_type);
-  clients.send_goal_client = compat::create_generic_service_client(node_, send_goal_service, send_goal_type);
+  clients.send_goal_client =
+      compat::create_generic_service_client(node_, send_goal_service, send_goal_type, rpc_group_);
 
   std::string get_result_service = action_path + "/_action/get_result";
   std::string get_result_type = ServiceActionTypes::get_action_get_result_service_type(action_type);
-  clients.get_result_client = compat::create_generic_service_client(node_, get_result_service, get_result_type);
+  clients.get_result_client =
+      compat::create_generic_service_client(node_, get_result_service, get_result_type, rpc_group_);
 
   std::string cancel_service = action_path + "/_action/cancel_goal";
   clients.cancel_goal_client =
-      compat::create_generic_service_client(node_, cancel_service, "action_msgs/srv/CancelGoal");
+      compat::create_generic_service_client(node_, cancel_service, "action_msgs/srv/CancelGoal", rpc_group_);
 
   RCLCPP_DEBUG(node_->get_logger(), "Created action clients for %s (type: %s)", action_path.c_str(),
                action_type.c_str());
@@ -440,8 +446,13 @@ void Ros2ActionTransport::subscribe_status(const std::string & action_path, Stat
     on_status_msg(action_path, msg);
   };
 
-  auto subscription =
-      node_->create_subscription<action_msgs::msg::GoalStatusArray>(status_topic, rclcpp::QoS(10).best_effort(), cb);
+  // Dispatch on the shared MutuallyExclusive status group (issue #575):
+  // in-order delivery per subscription is preserved, but status tracking is
+  // no longer serialized behind the node's default group.
+  rclcpp::SubscriptionOptions sub_options;
+  sub_options.callback_group = status_group_;
+  auto subscription = node_->create_subscription<action_msgs::msg::GoalStatusArray>(
+      status_topic, rclcpp::QoS(10).best_effort(), cb, sub_options);
 
   status_subscriptions_[action_path] = subscription;
   RCLCPP_INFO(node_->get_logger(), "Subscribed to action status: %s", status_topic.c_str());

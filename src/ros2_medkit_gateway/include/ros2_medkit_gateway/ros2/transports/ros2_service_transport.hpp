@@ -38,8 +38,14 @@ class Ros2ServiceTransport : public ServiceTransport {
  public:
   /**
    * @param node Non-owning ROS node used for client creation.
+   * @param rpc_group Callback group the clients' response callbacks are
+   *        dispatched on - the shared Reentrant RPC group from
+   *        ros2_common::create_gateway_callback_groups() (issue #575), so a
+   *        response can be delivered while default-group callbacks run. The
+   *        transport keeps the shared_ptr alive for its own lifetime (the
+   *        node only holds a weak reference to the group).
    */
-  explicit Ros2ServiceTransport(rclcpp::Node * node);
+  Ros2ServiceTransport(rclcpp::Node * node, rclcpp::CallbackGroup::SharedPtr rpc_group);
 
   ~Ros2ServiceTransport() override;
 
@@ -58,6 +64,9 @@ class Ros2ServiceTransport : public ServiceTransport {
                                                                const std::string & service_type);
 
   rclcpp::Node * node_;
+  /// Shared Reentrant group for response dispatch; owned here because the
+  /// node keeps only a weak reference to its callback groups.
+  rclcpp::CallbackGroup::SharedPtr rpc_group_;
   std::shared_ptr<ros2_medkit_serialization::JsonSerializer> serializer_;
 
   mutable std::shared_mutex clients_mutex_;
