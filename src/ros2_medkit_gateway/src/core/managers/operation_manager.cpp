@@ -297,15 +297,6 @@ ActionSendGoalResult OperationManager::send_component_action_goal(const std::str
   return send_action_goal(action_path, resolved_type, goal, entity_id);
 }
 
-namespace {
-/// Floor for the CancelGoal budget. Cancel is a service call to the action server plus that
-/// server's own handling, so it is bounded by the SERVER, not by us; a very small configured
-/// service timeout would otherwise report a live cancel as a failure. The configured
-/// service_call_timeout_sec still wins whenever it is larger, so lowering it keeps bounding
-/// cancel like every other call in this file.
-constexpr double kCancelGoalFloorSec = 15.0;
-}  // namespace
-
 ActionCancelResult OperationManager::cancel_action_goal(const std::string & action_path, const std::string & goal_id) {
   ActionCancelResult result;
   result.success = false;
@@ -327,15 +318,15 @@ ActionCancelResult OperationManager::cancel_action_goal(const std::string & acti
     return result;
   }
 
-  // A CancelGoal round-trip is a service call to the action server plus that server's own
-  // handling, so it is bounded by the SERVER, not by us. 5s was enough on an idle machine and
-  // not on a loaded one: under a busy CI container the request timed out and the cancel was
-  // reported as a vendor error while the goal had in fact been accepted for cancellation.
-  const auto cancel_timeout =
-      std::chrono::duration<double>(std::max(static_cast<double>(service_call_timeout_sec_), kCancelGoalFloorSec));
-  result = action_transport_->cancel_goal(action_path, goal_id, cancel_timeout);
+  // Cancel gets the same budget as every other action RPC. A timed-out
+  // cancel is no longer conflated with a rejection (issue #576): the
+  // transport reports it as CancelOutcome::kTimeout and the HTTP layer
+  // reconciles it against the /_action/status stream, so there is no need
+  // for the old 15s floor that papered over slow dispatch.
+  result =
+      action_transport_->cancel_goal(action_path, goal_id, std::chrono::duration<double>(service_call_timeout_sec_));
 
-  if (result.success && result.return_code == 0) {
+  if (result.outcome == CancelOutcome::kOk) {
     update_goal_status(goal_id, ActionGoalStatus::CANCELING);
   }
   return result;

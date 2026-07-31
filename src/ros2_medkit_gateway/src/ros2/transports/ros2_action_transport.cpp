@@ -255,6 +255,7 @@ ActionCancelResult Ros2ActionTransport::cancel_goal(const std::string & action_p
   ActionCancelResult result;
   result.success = false;
   result.return_code = 0;
+  result.outcome = CancelOutcome::kTransportError;
 
   try {
     // Cancel does not need an action_type to be valid; reuse cached clients
@@ -283,6 +284,7 @@ ActionCancelResult Ros2ActionTransport::cancel_goal(const std::string & action_p
         std::chrono::milliseconds{static_cast<std::int64_t>(std::max(timeout.count(), 0.0) * 1000.0)};
 
     if (!clients.cancel_goal_client->wait_for_service(std::chrono::seconds(2))) {
+      result.outcome = CancelOutcome::kServiceUnavailable;
       result.error_message = "Cancel service not available";
       return result;
     }
@@ -300,6 +302,10 @@ ActionCancelResult Ros2ActionTransport::cancel_goal(const std::string & action_p
     if (future_status != std::future_status::ready) {
       clients.cancel_goal_client->remove_pending_request(future_and_id.request_id);
       ros2_medkit_serialization::destroy_ros_message(&ros_request);
+      // The response did not arrive in time: the cancel may well have been
+      // accepted server-side, so the outcome is UNKNOWN - callers must not
+      // treat this as a rejection (issue #576).
+      result.outcome = CancelOutcome::kTimeout;
       result.error_message = "Cancel request timed out";
       return result;
     }
@@ -321,6 +327,7 @@ ActionCancelResult Ros2ActionTransport::cancel_goal(const std::string & action_p
 
     result.success = true;
     result.return_code = static_cast<int8_t>(response.value("return_code", 0));
+    result.outcome = result.return_code == 0 ? CancelOutcome::kOk : CancelOutcome::kErrorResponse;
 
     if (result.return_code == 0) {
       RCLCPP_INFO(node_->get_logger(), "Cancel request accepted for goal: %s", goal_id.c_str());

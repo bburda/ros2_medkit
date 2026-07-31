@@ -146,8 +146,9 @@ class TestScenarioActionLifecycle(GatewayTestCase):
 
         # Cancel the execution. The client budget must exceed the gateway's: cancelling is
         # a service round-trip to the action server (up to 2s to find the service plus the
-        # cancel budget itself), so a 10s client timeout would surface a slow-but-successful
-        # cancel as an opaque ReadTimeout instead of the server's own diagnosable error.
+        # configured service_call_timeout_sec, default 10s), so a 10s client timeout would
+        # surface a slow-but-successful cancel as an opaque ReadTimeout instead of the
+        # server's own diagnosable error.
         response = self.delete_request(
             self._exec_endpoint(execution_id),
             timeout=25,

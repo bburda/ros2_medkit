@@ -843,6 +843,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_operation_handlers gateway_ros2)
   medkit_target_dependencies(test_operation_handlers rclcpp rclcpp_action std_srvs example_interfaces)
 
+  # Cancel-outcome falsifiers (issue #576). The fixture's CancelGoal service
+  # deliberately parks requests past the configured budget, so the suite
+  # spends multiple seconds inside blocking waits by design - give it
+  # headroom over the default gtest timeout.
+  ament_add_gtest(test_cancel_outcomes test/test_cancel_outcomes.cpp TIMEOUT 180)
+  target_link_libraries(test_cancel_outcomes gateway_ros2)
+  medkit_target_dependencies(test_cancel_outcomes rclcpp action_msgs)
+  medkit_set_test_domain(test_cancel_outcomes)
+
   # Callback-group wiring contract (issue #575)
   ament_add_gtest(test_callback_groups test/test_callback_groups.cpp)
   target_link_libraries(test_callback_groups gateway_ros2)
