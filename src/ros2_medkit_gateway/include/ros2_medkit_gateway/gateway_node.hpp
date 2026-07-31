@@ -62,6 +62,7 @@
 #include "ros2_medkit_gateway/ros2/transports/ros2_topic_subscription_transport.hpp"
 #include "ros2_medkit_gateway/ros2/transports/ros2_topic_transport.hpp"
 #include "ros2_medkit_gateway/ros2/trigger_topic_subscriber.hpp"
+#include "ros2_medkit_gateway/ros2_common/callback_groups.hpp"
 #include "ros2_medkit_gateway/trigger_fault_subscriber.hpp"
 
 namespace ros2_medkit_gateway {
@@ -357,6 +358,13 @@ class GatewayNode : public rclcpp::Node {
   // provider attach/detach hooks can forward into the adapter alongside the
   // manager and discovery side updates.
   std::shared_ptr<ros2::Ros2TopicTransport> topic_transport_;
+
+  // Shared callback groups for blocking-RPC response dispatch (Reentrant)
+  // and per-action status subscriptions (MutuallyExclusive) - issue #575.
+  // Declared BEFORE the transports so the groups destruct after every
+  // entity registered into them; the node itself only holds weak
+  // references to its callback groups.
+  ros2_common::GatewayCallbackGroups callback_groups_;
 
   // Service / action transport adapters shared with OperationManager. Held
   // here so their lifetime matches the gateway's executor (transports own

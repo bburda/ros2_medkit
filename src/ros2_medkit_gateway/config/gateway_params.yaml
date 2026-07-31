@@ -50,11 +50,14 @@ ros2_medkit_gateway:
       keep_alive_timeout_sec: 2
 
       # Number of threads in the main rclcpp MultiThreadedExecutor. This
-      # executor only dispatches the gateway node's own callbacks (timers,
-      # graph events, log/fault subscriptions); HTTP handlers that issue ROS
-      # service calls use their own private executors, so a small pool here is
-      # safe. Bounded to a small fixed size instead of std::thread::
-      # hardware_concurrency(). Clamped to [1, 256].
+      # executor dispatches the gateway node's own callbacks (timers, graph
+      # events, log/fault subscriptions) plus the response callbacks that
+      # complete operation/action RPC futures. The RPC response callbacks run
+      # in a shared reentrant callback group, so with 2+ threads a service or
+      # action response is delivered even while another gateway callback
+      # (e.g. a discovery refresh pass) is running. Bounded to a small fixed
+      # size instead of std::thread::hardware_concurrency().
+      # Clamped to [1, 256].
       # Default: 2
       executor_threads: 2
 

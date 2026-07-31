@@ -55,14 +55,20 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // instead of scaling with the host core count, so the footprint stays the
   // same on a 4-core SBC and a 64-core server.
   //
-  // executor_threads: the main executor only delivers the node's own callbacks
+  // executor_threads: the main executor delivers the node's own callbacks
   // (timers, graph events, subscriptions) and the service-response callbacks
-  // that complete operation/action RPC futures. All of these run on the node's
-  // default callback group, which is mutually-exclusive, so they serialize
-  // through a single thread regardless of this count - raising it buys no
-  // RPC-response parallelism. The reason a small executor is safe is solely that
-  // the blocking wait for an RPC runs on the cpp-httplib pool thread (off the
-  // executor), never on an executor thread, so it cannot deadlock the executor.
+  // that complete operation/action RPC futures. The RPC response callbacks
+  // live in a shared Reentrant callback group (issue #575; see
+  // ros2_common/callback_groups.hpp), so a second executor thread can
+  // dispatch a response while a default-group callback (e.g. a discovery
+  // refresh pass) is running - the default of 2 buys real RPC-response
+  // parallelism. Timers and the SSE-fault / trigger-fault / rosout
+  // subscriptions stay in the default MutuallyExclusive group on purpose:
+  // refresh passes must stay serialized and those subscriptions rely on
+  // in-order delivery. A single thread remains safe (a Reentrant group does
+  // not require a second thread), and the blocking wait for an RPC runs on
+  // the cpp-httplib pool thread (off the executor), never on an executor
+  // thread, so it cannot deadlock the executor.
   //
   // http_thread_pool_size: each active SSE stream pins one worker for its
   // lifetime and each cold-/data wait parks one for up to
@@ -590,8 +596,14 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   const auto topic_sample_timeout_sec = get_parameter("topic_sample_timeout_sec").as_double();
   topic_transport_ = std::make_shared<ros2::Ros2TopicTransport>(this, topic_sample_timeout_sec);
   data_access_mgr_ = std::make_unique<DataAccessManager>(topic_transport_, topic_sample_timeout_sec);
-  service_transport_ = std::make_shared<ros2::Ros2ServiceTransport>(this);
-  action_transport_ = std::make_shared<ros2::Ros2ActionTransport>(this);
+  // Shared callback groups for blocking-RPC response dispatch and action
+  // status tracking (issue #575). Created once, here on the startup thread,
+  // before any executor spins this node and before RESTServer threads exist
+  // (see ros2_common/callback_groups.hpp for the thread-safety contract).
+  callback_groups_ = ros2_common::create_gateway_callback_groups(*this);
+  service_transport_ = std::make_shared<ros2::Ros2ServiceTransport>(this, callback_groups_.rpc_reentrant);
+  action_transport_ =
+      std::make_shared<ros2::Ros2ActionTransport>(this, callback_groups_.rpc_reentrant, callback_groups_.action_status);
   const auto service_call_timeout_sec =
       static_cast<int>(declare_parameter<int64_t>("service_call_timeout_sec", static_cast<int64_t>(10)));
   operation_mgr_ = std::make_unique<OperationManager>(service_transport_, action_transport_, discovery_mgr_.get(),

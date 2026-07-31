@@ -44,8 +44,20 @@ class Ros2ActionTransport : public ActionTransport {
  public:
   /**
    * @param node Non-owning ROS node used for client + subscription creation.
+   * @param rpc_group Callback group for the send_goal / get_result /
+   *        cancel_goal clients' response callbacks - the shared Reentrant
+   *        RPC group from ros2_common::create_gateway_callback_groups()
+   *        (issue #575), so responses can be delivered while default-group
+   *        callbacks run.
+   * @param status_group Callback group for the `/_action/status`
+   *        subscriptions - the shared MutuallyExclusive group, preserving
+   *        per-subscription in-order delivery while decoupling status
+   *        tracking from the default group.
+   *        Both group shared_ptrs are kept alive by this transport (the
+   *        node only holds weak references to its callback groups).
    */
-  explicit Ros2ActionTransport(rclcpp::Node * node);
+  Ros2ActionTransport(rclcpp::Node * node, rclcpp::CallbackGroup::SharedPtr rpc_group,
+                      rclcpp::CallbackGroup::SharedPtr status_group);
 
   ~Ros2ActionTransport() override;
 
@@ -81,6 +93,11 @@ class Ros2ActionTransport : public ActionTransport {
   void on_status_msg(const std::string & action_path, const action_msgs::msg::GoalStatusArray::ConstSharedPtr & msg);
 
   rclcpp::Node * node_;
+  /// Shared Reentrant group for RPC response dispatch and shared
+  /// MutuallyExclusive group for status subscriptions; owned here because
+  /// the node keeps only weak references to its callback groups.
+  rclcpp::CallbackGroup::SharedPtr rpc_group_;
+  rclcpp::CallbackGroup::SharedPtr status_group_;
   std::shared_ptr<ros2_medkit_serialization::JsonSerializer> serializer_;
 
   /// Set on the first shutdown signal so callbacks short-circuit while the

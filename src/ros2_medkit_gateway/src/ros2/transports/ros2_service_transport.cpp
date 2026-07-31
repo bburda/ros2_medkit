@@ -24,8 +24,10 @@
 
 namespace ros2_medkit_gateway::ros2 {
 
-Ros2ServiceTransport::Ros2ServiceTransport(rclcpp::Node * node)
-  : node_(node), serializer_(std::make_shared<ros2_medkit_serialization::JsonSerializer>()) {
+Ros2ServiceTransport::Ros2ServiceTransport(rclcpp::Node * node, rclcpp::CallbackGroup::SharedPtr rpc_group)
+  : node_(node)
+  , rpc_group_(std::move(rpc_group))
+  , serializer_(std::make_shared<ros2_medkit_serialization::JsonSerializer>()) {
   RCLCPP_INFO(node_->get_logger(), "Ros2ServiceTransport initialised (native serialization)");
 }
 
@@ -61,7 +63,7 @@ compat::GenericServiceClient::SharedPtr Ros2ServiceTransport::get_or_create_clie
     return it->second;
   }
 
-  auto client = compat::create_generic_service_client(node_, service_path, service_type);
+  auto client = compat::create_generic_service_client(node_, service_path, service_type, rpc_group_);
   clients_[key] = client;
 
   RCLCPP_DEBUG(node_->get_logger(), "Created generic client for %s (%s)", service_path.c_str(), service_type.c_str());

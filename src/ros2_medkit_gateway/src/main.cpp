@@ -76,19 +76,23 @@ int main(int argc, char ** argv) {
     // rclcpp's default (host cores, minimum 2), so the footprint does not grow
     // with the host core count.
     //
-    // Note this count does NOT buy RPC-response parallelism: the futures behind
-    // operation/action RPCs are completed by service-response callbacks, and
-    // every client here registers on the node's default callback group, which is
-    // mutually-exclusive - so those responses, timers, and graph events all
-    // serialize through a single executor thread no matter how high this is set.
-    // The reason a small executor is safe is solely that the blocking wait for an
-    // RPC runs on the cpp-httplib pool thread (a separate server_thread_), never
-    // on an executor thread, so it cannot deadlock the executor; the fault
-    // transport additionally uses its own private executor. Raise this only if
-    // the node's own callback load (e.g. very frequent graph churn) grows. The
-    // Ros2SubscriptionExecutor built below owns its own internal single-threaded
-    // executor (spun from its worker thread); the subscription node is
-    // intentionally not added here.
+    // What the count buys (issue #575): the response callbacks of the blocking
+    // RPC clients (generic service clients + the per-action client trio) live
+    // in a shared Reentrant callback group (ros2_common/callback_groups.hpp),
+    // so with 2+ threads a service/action response is dispatched even while a
+    // default-group callback (e.g. a discovery refresh pass) is running. The
+    // node's timers, graph events and the SSE-fault / trigger-fault / rosout
+    // subscriptions stay in the default MutuallyExclusive group by design -
+    // refresh passes must stay serialized and those subscriptions rely on
+    // in-order delivery; per-action status subscriptions sit in their own
+    // MutuallyExclusive group, ordered but decoupled from the default group.
+    // A single thread is still safe: a Reentrant group does not require a
+    // second thread, and the blocking wait for an RPC runs on the cpp-httplib
+    // pool thread (a separate server_thread_), never on an executor thread,
+    // so it cannot deadlock the executor; the fault transport additionally
+    // uses its own private executor. The Ros2SubscriptionExecutor built below
+    // owns its own internal single-threaded executor (spun from its worker
+    // thread); the subscription node is intentionally not added here.
     const auto executor_threads =
         ros2_medkit_gateway::clamp_thread_count(node->get_parameter("server.executor_threads").as_int(), 1, 256);
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), executor_threads);

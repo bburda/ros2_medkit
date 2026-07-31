@@ -21,6 +21,7 @@
 #include "ros2_medkit_gateway/discovery/discovery_manager.hpp"
 #include "ros2_medkit_gateway/ros2/transports/ros2_action_transport.hpp"
 #include "ros2_medkit_gateway/ros2/transports/ros2_service_transport.hpp"
+#include "ros2_medkit_gateway/ros2_common/callback_groups.hpp"
 
 using namespace ros2_medkit_gateway;
 
@@ -38,8 +39,10 @@ class TestOperationManager : public ::testing::Test {
     // Use short timeout for tests to avoid long waits on nonexistent services.
     node_ = std::make_shared<rclcpp::Node>("test_operation_manager_node");
     discovery_manager_ = std::make_unique<DiscoveryManager>(node_.get());
-    service_transport_ = std::make_shared<ros2::Ros2ServiceTransport>(node_.get());
-    action_transport_ = std::make_shared<ros2::Ros2ActionTransport>(node_.get());
+    auto groups = ros2_common::create_gateway_callback_groups(*node_);
+    service_transport_ = std::make_shared<ros2::Ros2ServiceTransport>(node_.get(), groups.rpc_reentrant);
+    action_transport_ =
+        std::make_shared<ros2::Ros2ActionTransport>(node_.get(), groups.rpc_reentrant, groups.action_status);
     operation_manager_ = std::make_unique<OperationManager>(service_transport_, action_transport_,
                                                             discovery_manager_.get(), /*timeout=*/1);
   }
