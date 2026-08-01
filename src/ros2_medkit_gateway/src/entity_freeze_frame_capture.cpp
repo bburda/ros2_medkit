@@ -61,7 +61,7 @@ EntityFreezeFrameCapture::EntityFreezeFrameCapture(rclcpp::Node * node, ros2_com
   // pre-match window instead.
   auto slot = ros2_common::Ros2SubscriptionSlot::create_typed<ros2_medkit_msgs::msg::FaultEvent>(
       exec, fault_events_topic, rclcpp::QoS(100).reliable(),
-      [this](std::shared_ptr<const ros2_medkit_msgs::msg::FaultEvent> msg) {
+      [this](const std::shared_ptr<const ros2_medkit_msgs::msg::FaultEvent> & msg) {
         on_fault_event(msg);
       });
   if (!slot) {
