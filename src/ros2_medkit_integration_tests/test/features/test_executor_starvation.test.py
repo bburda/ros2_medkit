@@ -49,7 +49,7 @@ import unittest
 import launch_testing
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
+from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_time_scale
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
@@ -67,7 +67,14 @@ REFRESH_INTERVAL_MS = 200
 # The pre-fix behaviour was to burn the whole budget and fail with 500;
 # the fixed gateway answers in well under a second even mid-stall. 8s keeps
 # CI headroom while staying decisively below the failure mode.
-FAST_COMPLETION_BUDGET_SEC = 8.0
+#
+# Scaled by MEDKIT_TEST_TIME_SCALE so the sanitizer jobs - which multiply
+# every ctest timeout but cannot reach an assertion inside a test - do not
+# read their own instrumentation overhead as a starved response. The
+# unscaled value stays 8.0 so the falsifier keeps its edge where it was
+# proven red (main burns the full 10s budget and answers 500, which no
+# scaling can turn into a pass).
+FAST_COMPLETION_BUDGET_SEC = 8.0 * get_time_scale()
 
 
 def generate_test_description():

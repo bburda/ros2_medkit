@@ -21,6 +21,27 @@ DEFAULT_PORT = int(os.environ.get('GATEWAY_TEST_PORT', '8080'))
 DEFAULT_BASE_URL = f'http://localhost:{DEFAULT_PORT}{API_BASE_PATH}'
 
 
+def get_time_scale():
+    """Return the multiplier for in-test wall-clock budgets.
+
+    CTest timeouts are stretched by the sanitizer CI jobs (a generic x3
+    rewrite of every declared ``TIMEOUT``), but budgets asserted *inside* a
+    test are invisible to that rewrite: an ASan/TSan-instrumented gateway can
+    blow a hard-coded "must answer within N seconds" assertion long before
+    ctest's own clock runs out, and the failure then reads as a regression
+    rather than as sanitizer overhead. Those jobs set
+    ``MEDKIT_TEST_TIME_SCALE`` to the same factor they apply to ctest.
+
+    Unset / unparseable / below 1.0 means "no scaling", so the normal jobs
+    keep the tight budgets that give the assertions their falsifying power.
+    """
+    try:
+        scale = float(os.environ.get('MEDKIT_TEST_TIME_SCALE', '1'))
+    except ValueError:
+        return 1.0
+    return scale if scale >= 1.0 else 1.0
+
+
 def get_test_port(offset=0):
     """Return the assigned test port plus an optional offset.
 
