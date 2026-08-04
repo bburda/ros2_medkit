@@ -332,20 +332,15 @@ ActionCancelResult Ros2ActionTransport::cancel_goal(const std::string & action_p
     if (result.return_code == 0) {
       RCLCPP_INFO(node_->get_logger(), "Cancel request accepted for goal: %s", goal_id.c_str());
     } else {
-      switch (result.return_code) {
-        case 1:
-          result.error_message = "Cancel request rejected";
-          break;
-        case 2:
-          result.error_message = "Unknown goal ID";
-          break;
-        case 3:
-          result.error_message = "Goal already terminated";
-          break;
-        default:
-          result.error_message = "Unknown cancel error";
-          break;
-      }
+      // Deliberately NOT a per-return_code message table: the client-facing
+      // wording for CancelGoal's documented codes 1-3 lives in exactly one
+      // place, `handlers::detail::map_cancel_result`, which alone knows
+      // whether the client asked to cancel or to stop. A second copy here
+      // would let a deleted mapper case silently change the wire message
+      // with every test still green. What remains is the fallback for a
+      // code the protocol does not define.
+      result.error_message =
+          "Cancel rejected by action server (return_code " + std::to_string(result.return_code) + ")";
     }
 
   } catch (const std::exception & e) {

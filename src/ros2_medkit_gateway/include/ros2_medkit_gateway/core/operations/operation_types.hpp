@@ -63,6 +63,14 @@ enum class CancelOutcome : uint8_t {
   kServiceUnavailable,  ///< cancel_goal service not discoverable (server gone).
   kTransportError,      ///< Null response / unknown type / exception / precondition failure.
   kErrorResponse,       ///< Server answered with return_code 1/2/3 (definitive).
+  /// The execution is not (or no longer) tracked - the cancel never left the
+  /// gateway. Reachable over HTTP when the cleanup timer evicts the goal
+  /// between the handler's lookup and the manager's own re-check; the
+  /// truthful answer is "no such execution", not "action server unavailable".
+  kNotTracked,
+  /// The execution id is malformed - a client error, again with no request
+  /// ever reaching the action server.
+  kInvalidRequest,
 };
 
 /// Result of canceling an action goal.
