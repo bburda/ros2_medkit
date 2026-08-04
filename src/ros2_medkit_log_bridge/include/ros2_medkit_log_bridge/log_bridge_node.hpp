@@ -89,7 +89,7 @@ class LogBridgeNode : public rclcpp::Node {
   /// (first occurrence passes; same code+severity within report_cooldown_sec is
   /// suppressed; 0.0 disables). Keyed by severity so a WARN never suppresses a
   /// same-message ERROR escalation. Exposed for unit testing.
-  bool cooldown_allows(const std::string & fault_code, uint8_t severity, rclcpp::Time now);
+  bool cooldown_allows(const std::string & fault_code, uint8_t severity, const rclcpp::Time & now);
 
   /// Fetch (or lazily create) the per-source FaultReporter for an originating
   /// node, so the fault's source_id is the node that logged, not the bridge.

@@ -180,7 +180,7 @@ bool LogBridgeNode::node_is_eligible(const std::string & source_id) const {
   return true;
 }
 
-bool LogBridgeNode::cooldown_allows(const std::string & fault_code, uint8_t severity, rclcpp::Time now) {
+bool LogBridgeNode::cooldown_allows(const std::string & fault_code, uint8_t severity, const rclcpp::Time & now) {
   if (report_cooldown_sec_ <= 0.0) {
     return true;
   }
