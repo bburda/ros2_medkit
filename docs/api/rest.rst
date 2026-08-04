@@ -739,6 +739,17 @@ Execute Operations
      the status stream does not show the goal cancelling: the outcome is
      unknown - poll the execution status resource (``not-responding``)
 
+.. note::
+
+   **Cancel budget.** Both routes above are bounded by
+   ``service_call_timeout_sec`` (default 10 s, clamped to 1-3600; see
+   :doc:`../config/server`) plus up to 2 s spent discovering the action's
+   cancel service, so the worst case a client should allow is
+   ``service_call_timeout_sec + 2 s``. Configuring a budget shorter than that
+   discovery wait does not shorten the discovery wait - a cancel issued before
+   the cancel service has been discovered still spends up to 2 s there before
+   the response wait starts.
+
 Lifecycle Endpoints
 -------------------
 
@@ -2539,8 +2550,10 @@ Vendor-specific ``x-medkit-*`` codes are enveloped: the response carries
      - 404
      - The requested resource (topic, service, parameter) does not exist
    * - ``invalid-request``
-     - 400
-     - Invalid request body or missing required parameters
+     - 400, 409
+     - Invalid request body or missing required parameters (400), or a request
+       that conflicts with the resource's current state - e.g. ``execute`` on
+       an execution that is still running (409)
    * - ``invalid-parameter``
      - 400
      - Invalid parameter value (including malformed entity IDs)

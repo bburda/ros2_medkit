@@ -166,6 +166,21 @@ Data Access Settings
      - After a node's parameter service fails to respond, subsequent requests
        return immediately with SERVICE_UNAVAILABLE for this duration.
        Set to 0 to disable. Range: 0-3600.
+   * - ``service_call_timeout_sec``
+     - int
+     - ``10``
+     - Response budget for every operation RPC: ROS 2 service calls
+       (``POST .../executions`` on a service-backed operation) and all three
+       action RPCs - send goal, get result, and **cancel**. Values outside
+       the range are clamped with a warning at startup. Range: 1-3600.
+
+       This is the *cancel budget* referenced by ``DELETE .../executions/{id}``
+       and ``PUT .../executions/{id}`` (see :doc:`../api/rest`): a cancel that
+       gets no answer within it is reported as ``504 not-responding`` unless
+       the action's status stream already shows the goal cancelling. Discovery
+       of the cancel service adds up to a further 2 s on top, so with the
+       minimum of 1 s a cancel issued before the service is discovered can
+       take up to 3 s before the response wait even starts.
 
 .. note::
 
