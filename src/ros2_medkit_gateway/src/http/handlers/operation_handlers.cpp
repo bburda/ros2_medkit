@@ -911,7 +911,7 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
       // requested path: the route is registered for apps, components, areas
       // and functions alike, and a hand-built apps/components pair sends an
       // areas client into the wrong collection.
-      const std::string location(req.path());
+      const std::string & location = req.path();
 
       dto::OperationExecution exec_dto;
       exec_dto.id = execution_id;
