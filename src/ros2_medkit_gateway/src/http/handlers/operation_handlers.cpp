@@ -228,7 +228,6 @@ namespace detail {
 /// - kNotTracked: 404 - the execution no longer exists (evicted between the
 ///   handler's lookup and the manager's re-check); no request ever reached
 ///   the action server, so an availability code would misdirect the operator.
-/// - kInvalidRequest: 400 + `invalid-parameter` - malformed execution id.
 ///
 /// @param verb "Cancel" or "Stop" - keeps each entry point's message wording.
 std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result, OperationManager & operation_mgr,
@@ -265,9 +264,6 @@ std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result
                            result.error_message.empty() ? std::string(verb) + " failed" : result.error_message};
     case CancelOutcome::kNotTracked:
       return CancelFailure{404, ERR_RESOURCE_NOT_FOUND, "Execution not found"};
-    case CancelOutcome::kInvalidRequest:
-      return CancelFailure{400, ERR_INVALID_PARAMETER,
-                           result.error_message.empty() ? "Invalid execution id" : result.error_message};
     case CancelOutcome::kErrorResponse:
       break;
   }

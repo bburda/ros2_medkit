@@ -156,6 +156,22 @@ class TestScenarioActionLifecycle(GatewayTestCase):
         )
         self.assertEqual(len(response.content), 0)
 
+        # The /_action/status stream is the authority for the goal's state,
+        # and the accepted-cancel reply raced it: whichever of the two the
+        # gateway processed second used to win. When the stream's terminal
+        # frame lost that race the execution was pinned at "canceling"
+        # forever - no further frame is ever published - so this is the only
+        # place the defect is visible end to end. Any terminal state is fine
+        # (the goal may also have completed before the cancel landed); what
+        # must not happen is the execution never leaving a running state.
+        terminal = {'canceled', 'succeeded', 'aborted'}
+        self.poll_endpoint_until(
+            self._exec_endpoint(execution_id),
+            lambda d: d if (d.get('x-medkit') or {}).get('ros2_status') in terminal else None,
+            timeout=20.0,
+            interval=0.3,
+        )
+
     def test_03_service_execution_returns_immediately(self):
         """Create a Trigger service execution, get immediate result.
 

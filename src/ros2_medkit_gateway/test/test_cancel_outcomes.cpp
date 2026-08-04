@@ -687,15 +687,3 @@ TEST_F(CancelOutcomesFixtureTest, ExecutionEvictedBetweenChecksMapsTo404NotFound
   EXPECT_EQ(failure->http_status, 404) << failure->error_code << ": " << failure->message;
   EXPECT_STREQ(failure->error_code, "resource-not-found");
 }
-
-TEST_F(CancelOutcomesFixtureTest, MalformedExecutionIdMapsTo400InvalidParameter) {
-  auto * operation_mgr = gateway_node_->get_operation_manager();
-
-  auto result = operation_mgr->cancel_action_goal(kActionPath, "not-a-uuid");
-  auto failure =
-      ros2_medkit_gateway::handlers::detail::map_cancel_result(result, *operation_mgr, "not-a-uuid", "Cancel");
-
-  ASSERT_TRUE(failure.has_value());
-  EXPECT_EQ(failure->http_status, 400) << failure->error_code << ": " << failure->message;
-  EXPECT_STREQ(failure->error_code, "invalid-parameter");
-}

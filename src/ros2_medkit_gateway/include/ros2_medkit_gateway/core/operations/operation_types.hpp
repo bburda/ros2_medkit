@@ -68,9 +68,6 @@ enum class CancelOutcome : uint8_t {
   /// between the handler's lookup and the manager's own re-check; the
   /// truthful answer is "no such execution", not "action server unavailable".
   kNotTracked,
-  /// The execution id is malformed - a client error, again with no request
-  /// ever reaching the action server.
-  kInvalidRequest,
 };
 
 /// Result of canceling an action goal.
