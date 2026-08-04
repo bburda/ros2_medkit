@@ -34,13 +34,19 @@ All checks read the gateways' own process output, so they are deterministic and
 do not depend on request timing.
 """
 
+import time
 import unittest
 
 from launch import LaunchDescription
 import launch_testing
 import launch_testing.actions
+import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port
+from ros2_medkit_test_utils.constants import (
+    ALLOWED_EXIT_CODES,
+    API_BASE_PATH,
+    get_test_port,
+)
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_gateway_node
 
@@ -143,6 +149,31 @@ class TestThreadPoolStarvationGuard(GatewayTestCase):
         """The documented range ceiling (256) is accepted and applied as-is."""
         proc_output.assertWaitFor(
             'Main executor bounded to 256 threads', process=gw_ceiling, timeout=15,
+        )
+
+    def test_executor_threads_ceiling_gateway_serves_requests(self):
+        """The 256-thread gateway actually serves, not just logs its bound.
+
+        Every other assertion in the clamp sweep reads a log line, so a
+        regression that logged the clamped count and then failed to bring the
+        executor up would stay green. One real request over HTTP pins that
+        the clamped value was applied to a working gateway.
+        """
+        url = f'http://localhost:{get_test_port(2)}{API_BASE_PATH}/health'
+        deadline = time.monotonic() + 30.0
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    self.assertEqual(response.json().get('status'), 'healthy')
+                    return
+                last_error = f'HTTP {response.status_code}: {response.text}'
+            except requests.RequestException as exc:
+                last_error = repr(exc)
+            time.sleep(0.5)
+        self.fail(
+            f'the executor_threads=256 gateway never served /health: {last_error}'
         )
 
     def test_executor_threads_invalid_clamps_to_floor(self, proc_output, gw_invalid):

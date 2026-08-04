@@ -368,6 +368,9 @@ jobs:
           # new_delete_type_mismatch=0: ROS 2 DDS scalar/array new/delete mismatch
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=0:new_delete_type_mismatch=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          # Same factor as the ctest TIMEOUT rewrite above, for the wall-clock
+          # budgets tests assert internally - ctest's clock cannot reach those.
+          MEDKIT_TEST_TIME_SCALE: 3
         run: |
           source /opt/ros/jazzy/setup.bash
           source install/setup.bash
@@ -476,6 +479,10 @@ jobs:
 
       - name: Run unit + integration tests with TSan
         timeout-minutes: 30
+        env:
+          # Same factor as the ctest TIMEOUT rewrite above, for the wall-clock
+          # budgets tests assert internally - ctest's clock cannot reach those.
+          MEDKIT_TEST_TIME_SCALE: 3
         run: |
           export TSAN_OPTIONS="halt_on_error=0:history_size=4:suppressions=$(pwd)/tsan_suppressions.txt"
           source /opt/ros/jazzy/setup.bash
