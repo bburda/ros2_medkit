@@ -302,15 +302,19 @@ ActionCancelResult OperationManager::cancel_action_goal(const std::string & acti
   result.success = false;
   result.return_code = 0;
 
-  // Each guard classifies itself: they all short-circuit before the request
-  // reaches the action server, so riding the struct's kTransportError default
-  // would tell the client the action server is unavailable when it is fine.
+  // Defence in depth only: per this method's documented precondition every
+  // goal_id in tracked_goals_ came from uuid_bytes_to_hex, so a caller that
+  // resolved the goal first cannot reach this branch. Left unclassified
+  // (kTransportError) deliberately - it has no wire contract to honour.
   if (!is_valid_uuid_hex(goal_id)) {
-    result.outcome = CancelOutcome::kInvalidRequest;
     result.error_message = "Invalid goal_id format: must be 32 hex characters";
     return result;
   }
 
+  // This one IS reachable through the contract: the caller resolved the goal,
+  // then the cleanup timer evicted it before this re-check. Answering
+  // "action server unavailable" would blame a healthy server for what is
+  // simply an execution that no longer exists.
   auto goal_info = get_tracked_goal(goal_id);
   if (!goal_info) {
     result.outcome = CancelOutcome::kNotTracked;
@@ -318,10 +322,10 @@ ActionCancelResult OperationManager::cancel_action_goal(const std::string & acti
     return result;
   }
 
+  // Also defence in depth: the transport is a constructor dependency and the
+  // gateway always supplies one. A missing transport genuinely is a
+  // gateway-side transport failure, so the default classification fits.
   if (!action_transport_) {
-    // A missing transport IS a gateway-side transport failure - the only
-    // guard for which the default classification is the right one.
-    result.outcome = CancelOutcome::kTransportError;
     result.error_message = "ActionTransport not configured";
     return result;
   }

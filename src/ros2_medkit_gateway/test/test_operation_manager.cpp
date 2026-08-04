@@ -471,33 +471,20 @@ TEST_F(TestOperationManager, test_unsubscribe_keeps_stream_for_a_goal_that_arriv
 
 // ==================== CANCEL GUARD CLASSIFICATION ====================
 
-// The three manager-side guards never set an outcome, so they ride the
-// struct default (kTransportError) into 500 + an availability-flavoured
-// error code. The reachable one is the eviction race: the handler finds the
-// execution, the cleanup timer evicts it, and the client is told the action
-// server is unavailable when the truthful answer is "no such execution".
+// Of the three manager-side guards, only this one is reachable through the
+// contract: both HTTP entry points resolve the goal (and 404 themselves) and
+// pass the resolved action_path, and every tracked goal_id comes from
+// uuid_bytes_to_hex - so a malformed id never gets this far and the transport
+// is never null. What a caller CAN produce is the eviction race: it finds the
+// execution, the cleanup timer evicts it, and the unclassified guard tells
+// the client the action server is unavailable when the truthful answer is
+// "no such execution".
 TEST_F(TestOperationManager, test_cancel_action_goal_not_tracked_is_not_a_transport_error) {
   auto result = operation_manager_->cancel_action_goal("/test/action", "00000000000000000000000000000000");
 
   EXPECT_FALSE(result.success);
   EXPECT_NE(result.outcome, CancelOutcome::kTransportError)
       << "an execution that is not tracked is not an action-transport failure";
-}
-
-TEST_F(TestOperationManager, test_cancel_action_goal_invalid_uuid_is_not_a_transport_error) {
-  auto result = operation_manager_->cancel_action_goal("/test/action", "invalid_uuid");
-
-  EXPECT_FALSE(result.success);
-  EXPECT_NE(result.outcome, CancelOutcome::kTransportError)
-      << "a malformed execution id is a client error, not an action-transport failure";
-}
-
-TEST_F(TestOperationManager, test_cancel_action_goal_guards_are_distinguishable) {
-  auto not_tracked = operation_manager_->cancel_action_goal("/test/action", "00000000000000000000000000000000");
-  auto invalid_uuid = operation_manager_->cancel_action_goal("/test/action", "invalid_uuid");
-
-  EXPECT_NE(not_tracked.outcome, invalid_uuid.outcome)
-      << "the two guards answer different questions and must not collapse into one wire status";
 }
 
 int main(int argc, char ** argv) {

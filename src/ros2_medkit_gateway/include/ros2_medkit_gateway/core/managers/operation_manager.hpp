@@ -124,6 +124,16 @@ class OperationManager {
                                                   const std::string & entity_id = "");
 
   /// Cancel a running action goal.
+  ///
+  /// PRECONDITION: the caller has already resolved `goal_id` through
+  /// get_tracked_goal() and taken `action_path` from the resulting
+  /// ActionGoalInfo. Both HTTP entry points do exactly that and answer 404
+  /// themselves when the lookup fails, so the only guard below that a
+  /// contract-respecting caller can trip is the tracked-goal re-check - and
+  /// only by racing the cleanup timer, which is why that one alone carries a
+  /// wire classification (CancelOutcome::kNotTracked -> 404). A malformed
+  /// goal_id cannot reach here at all: every key in the tracking map comes
+  /// from uuid_bytes_to_hex().
   ActionCancelResult cancel_action_goal(const std::string & action_path, const std::string & goal_id);
 
   /// Get the result of a completed action.
