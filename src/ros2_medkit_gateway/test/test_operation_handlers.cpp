@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -38,6 +39,7 @@
 #include <variant>
 #include <vector>
 
+#include "ros2_medkit_gateway/core/discovery/models/area.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/handlers/operation_handlers.hpp"
 #include "ros2_medkit_gateway/dto/json_writer.hpp"
@@ -48,6 +50,7 @@ using json = nlohmann::json;
 using ros2_medkit_gateway::ActionGoalInfo;
 using ros2_medkit_gateway::ActionGoalStatus;
 using ros2_medkit_gateway::ActionInfo;
+using ros2_medkit_gateway::Area;
 using ros2_medkit_gateway::AuthConfig;
 using ros2_medkit_gateway::Component;
 using ros2_medkit_gateway::CorsConfig;
@@ -382,8 +385,18 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     component.actions = {ActionInfo{"long_calibration", "/powertrain/engine/long_calibration",
                                     "example_interfaces/action/Fibonacci", std::nullopt}};
 
+    // The area the component sits in. The operation routes are registered for
+    // all four entity types and create_execution rejects a collection /
+    // entity-type mismatch, so exercising a non-component collection needs a
+    // real entity of that type; an area aggregates its components' operations.
+    Area area;
+    area.id = "powertrain";
+    area.name = "Powertrain";
+    area.namespace_path = "/powertrain";
+    area.source = "manifest";
+
     auto & cache = const_cast<ThreadSafeEntityCache &>(gateway_node_->get_thread_safe_cache());
-    cache.update_all({}, {component}, {}, {});
+    cache.update_all({area}, {component}, {}, {});
   }
 
   /// Drive `create_execution` and assert the typed response carries the async
@@ -554,6 +567,37 @@ TEST_F(OperationHandlersFixtureTest, CancelExecutionUnknownIdReturns404) {
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().http_status, 404);
   EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_RESOURCE_NOT_FOUND);
+}
+
+// The POST executions route is registered for apps, components, areas and
+// functions alike (rest_server.cpp entity-type loop), so a Location built
+// from a hardcoded apps/components pair sends an areas or functions client
+// into the components collection - and bypasses api_path() while doing it.
+// Driven through the areas collection: create_execution validates that the
+// route's entity type matches the resolved entity, so the request has to
+// target a genuine non-component entity that owns the action.
+// The created execution is a sub-resource of whatever collection the client
+// POSTed to, so the Location must extend the request path.
+TEST_F(OperationHandlersFixtureTest, CreateExecutionLocationExtendsTheRequestedCollectionPath) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/long_calibration/executions",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+  const std::string & requested_path = typed.path();
+  dto::ExecutionCreateRequest body;
+  body.parameters = json{{"order", 6}};
+
+  auto result = handlers_->create_execution(typed, body);
+
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  const auto * async_ptr = std::get_if<dto::ExecutionCreateAsync>(&result.value().first);
+  ASSERT_NE(async_ptr, nullptr);
+
+  const auto & headers = result.value().second.headers;
+  auto location = std::find_if(headers.begin(), headers.end(), [](const auto & kv) {
+    return kv.first == "Location";
+  });
+  ASSERT_NE(location, headers.end()) << "202 must carry a Location header";
+  EXPECT_EQ(location->second, requested_path + "/" + async_ptr->id);
 }
 
 TEST_F(OperationHandlersFixtureTest, UpdateExecutionStopReturnsAcceptedAndLocation) {

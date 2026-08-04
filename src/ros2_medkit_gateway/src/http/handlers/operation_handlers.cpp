@@ -623,9 +623,12 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
       async_dto.id = action_result.goal_id;
       async_dto.status = "running";
 
-      const std::string base_path = (lookup->entity_type == "app") ? "/api/v1/apps/" : "/api/v1/components/";
-      const std::string location =
-          base_path + entity_id + "/operations/" + operation_id + "/executions/" + action_result.goal_id;
+      // The created execution is a sub-resource of the collection this POST
+      // targeted, so append the new id to the request path. Hand-building the
+      // prefix from an apps/components pair points areas and functions
+      // clients - the route is registered for all four entity types - into
+      // the components collection, and bypasses api_path() besides.
+      const std::string location = req.path() + "/" + action_result.goal_id;
 
       http::ResponseAttachments att;
       att.with_header("Location", location);
