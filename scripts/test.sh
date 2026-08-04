@@ -60,9 +60,13 @@ case "$PRESET" in
       "$@"
     ;;
   tidy)
-    echo "==> Running clang-tidy (this will take a while)"
+    echo "==> Running clang-tidy"
+    # One package at a time: each clang_tidy test already analyses its own
+    # translation units in parallel (ROS2_MEDKIT_CLANG_TIDY_JOBS, default one
+    # process per core). Running the package tests concurrently on top of that
+    # would multiply peak memory by the number of packages.
     colcon test "${COMMON_ARGS[@]}" \
-      --ctest-args -j "$(nproc)" -R "clang_tidy" \
+      --ctest-args -j 1 -R "clang_tidy" \
       "$@"
     ;;
   all)
