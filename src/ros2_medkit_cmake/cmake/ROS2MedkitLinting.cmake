@@ -20,9 +20,29 @@ include_guard(GLOBAL)
 #
 # Provides:
 #   option ENABLE_CLANG_TIDY (default OFF)
-#   function ros2_medkit_clang_tidy([HEADER_FILTER <regex>] [TIMEOUT <seconds>])
+#   cache var ROS2_MEDKIT_CLANG_TIDY_JOBS (default: host core count)
+#   function ros2_medkit_clang_tidy([HEADER_FILTER <regex>] [TIMEOUT <seconds>] [JOBS <n>])
 
 option(ENABLE_CLANG_TIDY "Register clang-tidy as a CTest target" OFF)
+
+# ament_clang_tidy defaults to --jobs 1, so one CTest test analyses a whole
+# package one translation unit at a time while the rest of the machine idles.
+# CTest-level parallelism does not help: each package registers a single
+# clang_tidy test, and the largest package dominates the wall clock.
+#
+# Analysing in parallel WITHIN the test is the lever. Because several package
+# tests can still run concurrently, keep the CTest job count for clang-tidy low
+# (scripts/test.sh runs the tidy preset serially) or peak memory becomes
+# packages x jobs x ~0.5 GB per clang-tidy process.
+include(ProcessorCount)
+# Invoked lower-case: CMake command names are case-insensitive, and the
+# repository's cmake-lint gate rejects mixed case.
+processorcount(_ros2_medkit_host_cores)
+if(_ros2_medkit_host_cores EQUAL 0)
+  set(_ros2_medkit_host_cores 1)
+endif()
+set(ROS2_MEDKIT_CLANG_TIDY_JOBS "${_ros2_medkit_host_cores}"
+    CACHE STRING "Number of clang-tidy processes per package (default: host core count)")
 
 # Capture at include-time: inside a function CMAKE_CURRENT_LIST_DIR resolves to the caller.
 set(_ROS2_MEDKIT_CLANG_TIDY_CONFIG "${CMAKE_CURRENT_LIST_DIR}/.clang-tidy")
@@ -32,7 +52,7 @@ function(ros2_medkit_clang_tidy)
     return()
   endif()
 
-  cmake_parse_arguments(ARG "" "HEADER_FILTER;TIMEOUT" "" ${ARGN})
+  cmake_parse_arguments(ARG "" "HEADER_FILTER;TIMEOUT;JOBS" "" ${ARGN})
 
   find_package(ament_cmake_clang_tidy REQUIRED)
 
@@ -44,6 +64,12 @@ function(ros2_medkit_clang_tidy)
 
   if(ARG_TIMEOUT)
     list(APPEND _args TIMEOUT "${ARG_TIMEOUT}")
+  endif()
+
+  if(ARG_JOBS)
+    list(APPEND _args JOBS "${ARG_JOBS}")
+  elseif(ROS2_MEDKIT_CLANG_TIDY_JOBS)
+    list(APPEND _args JOBS "${ROS2_MEDKIT_CLANG_TIDY_JOBS}")
   endif()
 
   ament_clang_tidy(${_args})

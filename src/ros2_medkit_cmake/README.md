@@ -24,6 +24,24 @@ Resolves dependency differences across ROS 2 distributions:
 - `medkit_target_dependencies()` - Drop-in replacement for `ament_target_dependencies` (removed on Lyrical)
 - `medkit_detect_compat_defs()` / `medkit_apply_compat_defs()` - Compile definitions for version-specific APIs
 
+### ROS2MedkitLinting
+
+Registers the package's `clang_tidy` CTest test behind `-DENABLE_CLANG_TIDY=ON`
+(off by default locally, on in CI).
+
+Each package registers exactly one such test, so CTest-level parallelism only
+overlaps packages - the largest package still decides the wall clock. The
+analysis is therefore parallelised **inside** the test:
+
+- `-DROS2_MEDKIT_CLANG_TIDY_JOBS=<n>` at configure time sets how many
+  `clang-tidy` processes one package runs. It defaults to the host core count.
+- `ros2_medkit_clang_tidy(JOBS <n>)` overrides it for a single package.
+
+Because the parallelism lives inside each test, run the package tests one at a
+time - `./scripts/test.sh tidy` already passes `-j 1` to CTest. Running both
+levels at once multiplies peak memory by the number of packages, and a
+`clang-tidy` process on this codebase holds roughly half a gigabyte.
+
 ### ROS2MedkitCoverage
 
 Adds `--coverage -O0 -g` when built with `-DENABLE_COVERAGE=ON`, and is a no-op
