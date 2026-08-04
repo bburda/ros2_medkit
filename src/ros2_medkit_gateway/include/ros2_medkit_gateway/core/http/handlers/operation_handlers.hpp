@@ -14,9 +14,13 @@
 
 #pragma once
 
+#include <optional>
+#include <string>
 #include <utility>
 #include <variant>
 
+#include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
+#include "ros2_medkit_gateway/core/operations/operation_types.hpp"
 #include "ros2_medkit_gateway/dto/operations.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
 #include "ros2_medkit_gateway/http/response_types.hpp"
@@ -24,6 +28,30 @@
 
 namespace ros2_medkit_gateway {
 namespace handlers {
+
+namespace detail {
+
+/// Failure shape produced by `map_cancel_result`. `std::nullopt` from the
+/// mapper means "the cancellation is in progress" and the entry point should
+/// render its success shape (204 for DELETE, 202 for PUT-stop).
+struct CancelFailure {
+  int http_status;
+  const char * error_code;
+  std::string message;
+};
+
+/// Shared outcome mapping for the two cancel entry points (DELETE execution
+/// and PUT-stop) - issue #576. Declared here rather than kept file-local so
+/// the wire contract of every `CancelOutcome` is directly testable: the
+/// manager-side guards (invalid uuid / goal evicted between the handler's
+/// lookup and the manager's re-check) are only reachable over HTTP through a
+/// race, so their mapping has to be pinned at this seam.
+///
+/// @param verb "Cancel" or "Stop" - keeps each entry point's message wording.
+std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result, OperationManager & operation_mgr,
+                                               const std::string & execution_id, const char * verb);
+
+}  // namespace detail
 
 /**
  * @brief Handlers for operation-related REST API endpoints (services and actions).

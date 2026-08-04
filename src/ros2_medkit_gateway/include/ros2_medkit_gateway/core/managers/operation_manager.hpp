@@ -157,8 +157,18 @@ class OperationManager {
   /// the tracking map on the transport's executor thread.
   void subscribe_to_action_status(const std::string & action_path);
 
-  /// Unsubscribe from action status updates. Idempotent.
+  /// Unsubscribe from action status updates. Idempotent, and a no-op while
+  /// any goal for the path is still tracked - a tracked goal without its
+  /// status stream can never be reconciled by the cancel-timeout path.
   void unsubscribe_from_action_status(const std::string & action_path);
+
+  /// Resolved service / action call budget in seconds. Every service call and
+  /// every action RPC (send_goal, cancel_goal, get_result) is bounded by it,
+  /// so the value the gateway actually applies is observable rather than
+  /// merely configured.
+  int service_call_timeout_sec() const {
+    return service_call_timeout_sec_;
+  }
 
   /// Test-only helper: inject a fully-formed ActionGoalInfo directly into the
   /// tracking map. Used by unit tests to exercise paths (e.g. stuck-goal
@@ -182,6 +192,11 @@ class OperationManager {
   /// Track a new goal in the local map.
   void track_goal(const std::string & goal_id, const std::string & action_path, const std::string & action_type,
                   const std::string & entity_id);
+
+  /// True while at least one goal for `action_path` is tracked. Cheaper than
+  /// get_goals_for_action (no copy, no sort) and safe to call while holding
+  /// subscriptions_mutex_ - nothing takes goals_mutex_ before that one.
+  bool has_goals_for_action(const std::string & action_path) const;
 
   /// Propagate a goal status change observed via the action transport into
   /// the tracking map, firing the resource-change notifier on transitions.

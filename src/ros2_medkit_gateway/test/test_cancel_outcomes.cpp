@@ -40,6 +40,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -112,16 +113,18 @@ httplib::Request make_request_with_match(const std::string & path, const std::st
 }
 
 /// Raw CancelGoal service + status publisher standing in for an action
-/// server whose cancel path misbehaves. Two modes:
+/// server whose cancel path misbehaves. Three modes:
 /// - kBlockUntilReleased: the service callback parks on a condition variable
 ///   (bounded, releasable) so the caller's response future must time out -
 ///   the deterministic "cancel response lost" case a real action server
 ///   cannot produce.
-/// - kRejectImmediately: replies ERROR_REJECTED (return_code=1) at once -
-///   the definitive-rejection case.
+/// - kRejectImmediately: replies with `reject_return_code_` (1/2/3) at once -
+///   the definitive-rejection cases.
+/// - kAcceptImmediately: replies ERROR_NONE at once - the accepted cancel,
+///   used to race a stream-delivered terminal status against the kOk write.
 class PhantomCancelFixtureNode : public rclcpp::Node {
  public:
-  enum class CancelMode { kBlockUntilReleased, kRejectImmediately };
+  enum class CancelMode { kBlockUntilReleased, kRejectImmediately, kAcceptImmediately };
 
   PhantomCancelFixtureNode() : rclcpp::Node("phantom_cancel_fixture", "/powertrain/engine") {
     cancel_service_ = create_service<action_msgs::srv::CancelGoal>(
@@ -129,7 +132,11 @@ class PhantomCancelFixtureNode : public rclcpp::Node {
         [this](const std::shared_ptr<action_msgs::srv::CancelGoal::Request> & /*request*/,
                const std::shared_ptr<action_msgs::srv::CancelGoal::Response> & response) {
           if (mode_.load() == CancelMode::kRejectImmediately) {
-            response->return_code = action_msgs::srv::CancelGoal::Response::ERROR_REJECTED;
+            response->return_code = reject_return_code_.load();
+            return;
+          }
+          if (mode_.load() == CancelMode::kAcceptImmediately) {
+            response->return_code = action_msgs::srv::CancelGoal::Response::ERROR_NONE;
             return;
           }
           // Swallow the request past any realistic budget so the caller's
@@ -162,6 +169,13 @@ class PhantomCancelFixtureNode : public rclcpp::Node {
     mode_.store(mode);
   }
 
+  /// Return code replied in kRejectImmediately mode. Defaults to
+  /// ERROR_REJECTED (1); set to 2 / 3 to drive the other documented
+  /// rejection codes.
+  void set_reject_return_code(int8_t code) {
+    reject_return_code_.store(code);
+  }
+
   void release_blocked_cancels() {
     {
       std::lock_guard<std::mutex> lock(release_mutex_);
@@ -183,6 +197,7 @@ class PhantomCancelFixtureNode : public rclcpp::Node {
   rclcpp::Service<action_msgs::srv::CancelGoal>::SharedPtr cancel_service_;
   rclcpp::Publisher<action_msgs::msg::GoalStatusArray>::SharedPtr status_pub_;
   std::atomic<CancelMode> mode_{CancelMode::kBlockUntilReleased};
+  std::atomic<int8_t> reject_return_code_{action_msgs::srv::CancelGoal::Response::ERROR_REJECTED};
   std::mutex release_mutex_;
   std::condition_variable release_cv_;
   bool released_{false};
@@ -343,9 +358,17 @@ class CancelOutcomesFixtureTest : public ::testing::Test {
   }
 
   http::TypedRequest make_execution_request() {
-    raw_req_ = make_request_with_match(
-        std::string("/api/v1/components/engine/operations/phantom_calibration/executions/") + kGoalIdHex,
-        R"(/api/v1/components/([^/]+)/operations/([^/]+)/executions/([^/]+))");
+    return make_execution_request_for("components");
+  }
+
+  /// The DELETE/PUT execution routes are registered for every entity
+  /// collection (apps, components, areas, functions), so the fixture has to
+  /// be able to drive any of them - a response that hardcodes one collection
+  /// is only observable from another.
+  http::TypedRequest make_execution_request_for(const std::string & collection) {
+    raw_req_ = make_request_with_match("/api/v1/" + collection + "/engine/operations/phantom_calibration/executions/" +
+                                           kGoalIdHex,
+                                       "/api/v1/" + collection + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+))");
     return http::TypedRequest(raw_req_);
   }
 
@@ -472,4 +495,207 @@ TEST_F(CancelOutcomesFixtureTest, PutStopRejectedByServerReturns400Rejected) {
   EXPECT_EQ(result.error().http_status, 400);
   EXPECT_EQ(result.error().code, "x-medkit-ros2-action-rejected");
   EXPECT_EQ(result.error().message, "Stop request rejected");
+}
+
+// ---------------------------------------------------------------------------
+// The accepted-cancel write must not move a terminal tracked status backwards
+// ---------------------------------------------------------------------------
+
+TEST_F(CancelOutcomesFixtureTest, AcceptedCancelKeepsStreamDeliveredTerminalStatus) {
+  // The status stream and the CancelGoal response race: an action server that
+  // cancels immediately publishes STATUS_CANCELED before its rc=0 answer is
+  // processed. The branch's own contract is that the stream stays the
+  // authority - hand-writing CANCELING on top of a terminal CANCELED is a
+  // backwards transition that nothing ever corrects (no further status frame
+  // is published), leaving GET reporting "running" forever and the goal only
+  // force-evicted through the stuck-goal path with a false "server crashed"
+  // warning.
+  fixture_node_->set_mode(PhantomCancelFixtureNode::CancelMode::kAcceptImmediately);
+  inject_goal();
+  ASSERT_TRUE(deliver_status_until_tracked(ActionGoalStatus::CANCELED, action_msgs::msg::GoalStatus::STATUS_CANCELED))
+      << "status stream never reached the tracked goal";
+
+  auto typed = make_execution_request();
+  auto result = handlers_->cancel_execution(typed);
+
+  ASSERT_TRUE(result.has_value()) << "an accepted cancel is still a success: " << result.error().code << ": "
+                                  << result.error().message;
+  EXPECT_EQ(tracked_status_or_fail(), ActionGoalStatus::CANCELED)
+      << "the accepted-cancel write downgraded a terminal status delivered by the stream";
+}
+
+// ---------------------------------------------------------------------------
+// The reconciled 202 body must agree with the resource it points at
+// ---------------------------------------------------------------------------
+
+TEST_F(CancelOutcomesFixtureTest, PutStopReconciledBodyStatusAgreesWithGetExecution) {
+  // Reconcile set includes CANCELED, which GET renders as "failed"; a 202
+  // body hardcoding "running" contradicts the very resource its Location
+  // header points at.
+  inject_goal();
+  ASSERT_TRUE(deliver_status_until_tracked(ActionGoalStatus::CANCELED, action_msgs::msg::GoalStatus::STATUS_CANCELED))
+      << "status stream never reached the tracked goal";
+
+  auto typed = make_execution_request();
+  dto::ExecutionUpdateRequest body;
+  body.capability = "stop";
+
+  auto result = handlers_->update_execution(typed, body);
+
+  ASSERT_TRUE(result.has_value()) << "stop must reconcile against the status stream: " << result.error().code << ": "
+                                  << result.error().message;
+  ASSERT_TRUE(result.value().second.status_override.has_value());
+  EXPECT_EQ(*result.value().second.status_override, 202);
+
+  auto get_typed = make_execution_request();
+  auto exec = handlers_->get_execution(get_typed);
+  ASSERT_TRUE(exec.has_value());
+  EXPECT_EQ(result.value().first.status, exec->status)
+      << "the 202 body contradicts an immediate GET of the same execution";
+}
+
+TEST_F(CancelOutcomesFixtureTest, PutStopReconciledLocationPointsAtTheRequestedCollection) {
+  // The same route is registered for apps, components, areas and functions.
+  // A Location built from a hardcoded apps/components pair sends an areas
+  // client into the components collection.
+  inject_goal();
+  ASSERT_TRUE(deliver_status_until_tracked(ActionGoalStatus::CANCELING, action_msgs::msg::GoalStatus::STATUS_CANCELING))
+      << "status stream never reached the tracked goal";
+
+  auto typed = make_execution_request_for("areas");
+  const std::string requested_path = std::string(typed.path());
+  dto::ExecutionUpdateRequest body;
+  body.capability = "stop";
+
+  auto result = handlers_->update_execution(typed, body);
+
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  const auto & headers = result.value().second.headers;
+  auto location = std::find_if(headers.begin(), headers.end(), [](const auto & kv) {
+    return kv.first == "Location";
+  });
+  ASSERT_NE(location, headers.end()) << "202 must carry a Location header";
+  EXPECT_EQ(location->second, requested_path);
+}
+
+// ---------------------------------------------------------------------------
+// Terminal tracked status on the timeout path
+// ---------------------------------------------------------------------------
+
+TEST_F(CancelOutcomesFixtureTest, CancelTimeoutWithTerminalStatusReturns504WithoutPromisingProgress) {
+  // The cancel RPC really did go unanswered (504 stands, ruling R5), but the
+  // gateway's own tracked state proves the goal is terminal: telling the
+  // client to poll for "the goal's progress" describes something that cannot
+  // happen.
+  inject_goal(ActionGoalStatus::SUCCEEDED);
+  auto typed = make_execution_request();
+
+  auto result = handlers_->cancel_execution(typed);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 504) << result.error().code << ": " << result.error().message;
+  EXPECT_EQ(result.error().code, "not-responding");
+  EXPECT_EQ(result.error().message.find("progress"), std::string::npos)
+      << "a terminal goal has no progress to observe: " << result.error().message;
+  EXPECT_NE(result.error().message.find("succeeded"), std::string::npos)
+      << "the message must state the terminal status the gateway already knows: " << result.error().message;
+  EXPECT_EQ(tracked_status_or_fail(), ActionGoalStatus::SUCCEEDED);
+}
+
+TEST_F(CancelOutcomesFixtureTest, TimeoutErrorParametersCarryNoReturnCode) {
+  // `return_code: 0` on a path where no server return code exists is exactly
+  // the ambiguity issue #576 is about.
+  inject_goal();
+  auto typed = make_execution_request();
+
+  auto result = handlers_->cancel_execution(typed);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 504);
+  EXPECT_FALSE(result.error().params.contains("return_code"))
+      << "no server return code exists on the timeout path: " << result.error().params.dump();
+}
+
+// ---------------------------------------------------------------------------
+// Rejection codes 2 and 3 at both entry points
+// ---------------------------------------------------------------------------
+
+// The docs promise 400 for return_code 1-3 at both entry points, but only
+// rc=1 was ever driven - a mapper case for rc=2 or rc=3 could be deleted and
+// the suite would stay green while the wire message silently changed to the
+// transport's differently-worded copy.
+TEST_F(CancelOutcomesFixtureTest, CancelRejectionCodesEachMapTo400WithTheirOwnMessage) {
+  fixture_node_->set_mode(PhantomCancelFixtureNode::CancelMode::kRejectImmediately);
+  inject_goal();
+
+  const std::pair<int8_t, const char *> cases[] = {
+      {1, "Cancel request rejected"}, {2, "Unknown execution ID"}, {3, "Execution already terminated"}};
+  for (const auto & [code, expected_message] : cases) {
+    SCOPED_TRACE("return_code=" + std::to_string(static_cast<int>(code)));
+    fixture_node_->set_reject_return_code(code);
+    auto typed = make_execution_request();
+
+    auto result = handlers_->cancel_execution(typed);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().http_status, 400);
+    EXPECT_EQ(result.error().code, "x-medkit-ros2-action-rejected");
+    EXPECT_EQ(result.error().message, expected_message);
+    EXPECT_EQ(result.error().params["return_code"], code);
+  }
+}
+
+TEST_F(CancelOutcomesFixtureTest, PutStopRejectionCodesEachMapTo400WithTheirOwnMessage) {
+  fixture_node_->set_mode(PhantomCancelFixtureNode::CancelMode::kRejectImmediately);
+  inject_goal();
+
+  const std::pair<int8_t, const char *> cases[] = {
+      {1, "Stop request rejected"}, {2, "Unknown execution ID"}, {3, "Execution already terminated"}};
+  for (const auto & [code, expected_message] : cases) {
+    SCOPED_TRACE("return_code=" + std::to_string(static_cast<int>(code)));
+    fixture_node_->set_reject_return_code(code);
+    auto typed = make_execution_request();
+    dto::ExecutionUpdateRequest body;
+    body.capability = "stop";
+
+    auto result = handlers_->update_execution(typed, body);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().http_status, 400);
+    EXPECT_EQ(result.error().code, "x-medkit-ros2-action-rejected");
+    EXPECT_EQ(result.error().message, expected_message);
+    EXPECT_EQ(result.error().params["return_code"], code);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Manager guard exits reaching the wire
+// ---------------------------------------------------------------------------
+
+TEST_F(CancelOutcomesFixtureTest, ExecutionEvictedBetweenChecksMapsTo404NotFound) {
+  // The handler validates the execution exists, then the cleanup timer can
+  // evict it before the manager's own re-check. The truthful answer is
+  // "execution no longer exists" (404) - the same answer the request gets a
+  // millisecond later - not "action server unavailable" (500).
+  auto * operation_mgr = gateway_node_->get_operation_manager();
+  ASSERT_FALSE(operation_mgr->get_tracked_goal(kGoalIdHex).has_value());
+
+  auto result = operation_mgr->cancel_action_goal(kActionPath, kGoalIdHex);
+  auto failure = ros2_medkit_gateway::handlers::detail::map_cancel_result(result, *operation_mgr, kGoalIdHex, "Cancel");
+
+  ASSERT_TRUE(failure.has_value());
+  EXPECT_EQ(failure->http_status, 404) << failure->error_code << ": " << failure->message;
+  EXPECT_STREQ(failure->error_code, "resource-not-found");
+}
+
+TEST_F(CancelOutcomesFixtureTest, MalformedExecutionIdMapsTo400InvalidParameter) {
+  auto * operation_mgr = gateway_node_->get_operation_manager();
+
+  auto result = operation_mgr->cancel_action_goal(kActionPath, "not-a-uuid");
+  auto failure =
+      ros2_medkit_gateway::handlers::detail::map_cancel_result(result, *operation_mgr, "not-a-uuid", "Cancel");
+
+  ASSERT_TRUE(failure.has_value());
+  EXPECT_EQ(failure->http_status, 400) << failure->error_code << ": " << failure->message;
+  EXPECT_STREQ(failure->error_code, "invalid-parameter");
 }
