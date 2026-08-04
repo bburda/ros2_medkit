@@ -118,10 +118,22 @@ jobs:
             log/
             build/*/test_results/
 
-  jazzy-build:
+  # Builds AND tests Jazzy. These were two jobs (jazzy-build -> jazzy-test)
+  # passing a tarred build/ + install/ tree between them. That split dates from
+  # when lint ran off the same artifact in parallel; lint has since moved to
+  # quality.yml, where format-lint and clang-tidy each do their own build, so
+  # the artifact was left with exactly one consumer and the split bought no
+  # parallelism at all. It cost 4.24 min of duplicated container bring-up and
+  # ROS setup in the second job plus 0.50 min of tar/upload in the first.
+  #
+  # The job id stays jazzy-test because notify-demos gates on it by name.
+  jazzy-test:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
+    # The more generous of the two timeouts this job replaces (build had 60,
+    # test had 45). One job now covers both phases, and a cold ccache makes the
+    # build phase the variable one, so keep the headroom rather than the sum.
     timeout-minutes: 60
     defaults:
       run:
@@ -158,7 +170,9 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update
-          apt-get install -y ros-jazzy-test-msgs
+          apt-get install -y \
+            ros-jazzy-test-msgs \
+            ros-jazzy-rmw-cyclonedds-cpp
           source /opt/ros/jazzy/setup.bash
           rosdep update
           rosdep install --from-paths src --ignore-src -y
@@ -175,61 +189,6 @@ jobs:
             --cmake-args -DCMAKE_BUILD_TYPE=Release \
             --event-handlers console_direct+
           ccache -s
-
-      - name: Package build artifacts
-        run: tar cf /tmp/jazzy-build.tar build/ install/
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: jazzy-build
-          path: /tmp/jazzy-build.tar
-          retention-days: 1
-
-  jazzy-test:
-    needs: jazzy-build
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:noble
-    timeout-minutes: 45
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - name: Install Git
-        run: |
-          apt-get update
-          apt-get install -y git
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Pre-install ROS 2 apt source
-        uses: ./.github/actions/ros-apt-source
-
-      - name: Set up ROS 2 Jazzy
-        uses: ros-tooling/setup-ros@v0.7
-        with:
-          required-ros-distributions: jazzy
-
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            ros-jazzy-test-msgs \
-            ros-jazzy-rmw-cyclonedds-cpp
-          source /opt/ros/jazzy/setup.bash
-          rosdep update
-          rosdep install --from-paths src --ignore-src -y
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: jazzy-build
-
-      - name: Extract build artifacts
-        run: tar xf jazzy-build.tar && rm jazzy-build.tar
 
       - name: Run unit and integration tests
         env:
@@ -258,6 +217,15 @@ jobs:
             build/*/test_results/
 
   coverage:
+    # Push to main only. This job owned CI's critical path in 79% of PR runs at
+    # ~40 min, and what a PR loses by not running it is narrow: its Codecov
+    # upload was already gated to push (see the last step), and the source-tree
+    # half of the coverage-scope gate - the half that catches a new package
+    # compiling C++ without opting into instrumentation - runs on every PR in
+    # quality.yml's format-lint job via check_coverage_packages.sh --static-only.
+    # What moves to main-only is the runtime half, which needs .gcda files and
+    # therefore needs this job's build and test run.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
@@ -319,14 +287,26 @@ jobs:
       - name: Run unit and integration tests for coverage
         run: |
           source /opt/ros/jazzy/setup.bash
-          colcon test \
+          # --return-code-on-test-failure, as in the two other colcon test
+          # invocations in this file. Without it colcon exits 0 whatever the
+          # tests did, so this job ran the full Jazzy suite under a coverage
+          # build and could not fail CI on a failure - it read as a gate
+          # without being one.
+          colcon test --return-code-on-test-failure \
             --packages-skip ros2_medkit_opcua \
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
       - name: Generate coverage report
         run: |
+          # --parallel: this single lcov --capture was measured at >99% of the
+          # whole step (13.43 min of 13.50, 17.87 of 17.95) and is otherwise
+          # single-threaded, while --extract, --remove, --list and genhtml
+          # together finish in under six seconds. It forks per .gcda directory,
+          # so the output is the same records from the same gcov runs, only
+          # gathered concurrently.
           lcov --capture --directory build --output-file coverage.raw.info \
+            --parallel "$(nproc)" \
             --ignore-errors mismatch,negative,empty,gcov
 
           if [ ! -s coverage.raw.info ] || ! grep -q 'SF:' coverage.raw.info; then

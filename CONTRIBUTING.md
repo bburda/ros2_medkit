@@ -152,7 +152,7 @@ build.
 
 #### CI/CD
 
-All PRs are tested on Ubuntu 24.04 (Jazzy) with parallel lint + test jobs, plus Humble and Lyrical. Coverage is uploaded to Codecov on push to main. All CI jobs use ccache.
+All PRs are tested on Ubuntu 24.04 (Jazzy), where build and tests run in a single job, plus Humble and Lyrical. Linters and clang-tidy run in the Quality workflow. Coverage is uploaded to Codecov on push to main. All CI jobs use ccache.
 
 ### Pull Request Checklist
 

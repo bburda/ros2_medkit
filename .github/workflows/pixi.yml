@@ -1,10 +1,19 @@
 name: Pixi (experimental)
 
+# Push-to-main plus a nightly safety net, not per-PR. This workflow is
+# continue-on-error (see the job below), so it never gated a PR in the first
+# place, and it cost 35.3 min p50 per PR - 30.8 of that a build that could not
+# warm its own cache, because cache-write is push-to-main only. Moving it off
+# PRs loses no gate; a RoboStack packaging break is now caught on merge, or by
+# the nightly at the latest. Same shape opcua-plugin.yml uses for its filtered
+# suite: a narrowed trigger with a cron as the backstop.
 on:
-  pull_request:
-    branches: [main]
   push:
     branches: [main]
+  schedule:
+    # Daily at 05:00 UTC. One hour after the OPC-UA nightly so the two do not
+    # contend for runners.
+    - cron: '0 5 * * *'
 
 jobs:
   pixi-build:

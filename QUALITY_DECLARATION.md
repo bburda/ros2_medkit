@@ -87,7 +87,7 @@ GitHub Copilot code review is used in addition to human review.
 All pull requests must pass CI before merging:
 
 - **Build & Test job:** Full build + unit/integration tests on Ubuntu Noble / ROS 2 Jazzy, Ubuntu Jammy / ROS 2 Humble, and Ubuntu Resolute / ROS 2 Lyrical. Linter tests on Jazzy only
-- **Coverage job:** Debug build with coverage. Reports are generated for all PRs as artifacts and uploaded to [Codecov](https://codecov.io/gh/selfpatch/ros2_medkit) on pushes to `main`
+- **Coverage job:** Debug build with coverage, run on pushes to `main`. Reports are archived as artifacts and uploaded to [Codecov](https://codecov.io/gh/selfpatch/ros2_medkit). Every pull request is gated on the static coverage-scope check in the Quality workflow, which fails if a package compiles production C++ without opting into coverage instrumentation
 - Linting enforced: `clang-format`, `clang-tidy` via `ament_lint_auto`
 
 CI configuration: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
