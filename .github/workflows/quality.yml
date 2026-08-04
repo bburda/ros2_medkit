@@ -298,7 +298,15 @@ jobs:
       - name: Build with ASan + UBSan
         env:
           CCACHE_DIR: /root/.cache/ccache
-          CCACHE_MAXSIZE: 500M
+          # 2G, not the 500M the other jobs use. At 500M this job's ccache was
+          # measured at 101-104% of its ceiling with 551-1019 cleanups DURING a
+          # single build - ccache evicting the objects that same build was still
+          # producing - and it never exceeded 18% hits. The instrumented object
+          # set does not fit in 500M and cannot be made to; the -g1 change in
+          # ROS2MedkitSanitizers.cmake shrinks it, this gives it somewhere to
+          # land. Sized against the repo's 10 GB Actions cache quota, which the
+          # docker-publish mode=min change frees room in.
+          CCACHE_MAXSIZE: 2G
           CCACHE_SLOPPINESS: pch_defines,time_macros
           TMPDIR: /mnt/asan/tmp
         run: |
@@ -423,7 +431,10 @@ jobs:
       - name: Build with TSan
         env:
           CCACHE_DIR: /root/.cache/ccache
-          CCACHE_MAXSIZE: 500M
+          # 1.5G - same reasoning as the ASan job, one sanitizer instead of two.
+          # Measured at 99.5-99.9% of the old 500M ceiling with 697-1017
+          # cleanups inside one build.
+          CCACHE_MAXSIZE: 1.5G
           CCACHE_SLOPPINESS: pch_defines,time_macros
           TMPDIR: /mnt/tsan/tmp
         run: |

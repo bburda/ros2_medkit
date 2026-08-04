@@ -42,5 +42,13 @@ jobs:
                   build-args: ROS_DISTRO=${{ matrix.ros_distro }}
                   tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ros2_medkit-${{ matrix.ros_distro }}:latest
                   cache-from: type=gha,scope=${{ matrix.ros_distro }}
-                  cache-to: type=gha,mode=max,scope=${{ matrix.ros_distro }}
+                  # mode=min, not max: max exports every intermediate build
+                  # stage, which for three distros held ~3.1 GB of the repo's
+                  # 10 GB Actions cache quota - about 30% of the budget, for a
+                  # job that only runs on push to main. The quota was measured
+                  # over the limit (10.54 GB active), so GitHub was evicting
+                  # LRU, and the ccache entries the build jobs depend on were
+                  # what it evicted. mode=min keeps the final-stage layers,
+                  # which is what cache-from actually reuses here.
+                  cache-to: type=gha,mode=min,scope=${{ matrix.ros_distro }}
                   platforms: linux/amd64
