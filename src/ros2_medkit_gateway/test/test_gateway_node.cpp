@@ -32,6 +32,7 @@
 
 #include "ros2_medkit_gateway/core/discovery/models/function.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
 #include "ros2_medkit_gateway/fault_manager_paths.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 
@@ -276,6 +277,40 @@ TEST_F(TestGatewayNode, test_fault_manager_namespace_configures_event_subscriber
   auto res = client.Get((std::string(API_BASE_PATH) + "/health").c_str());
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
+}
+
+// `service_call_timeout_sec` is the whole cancel budget since the 15s floor
+// was removed (issue #576), yet it was declared with no bounds at all: 0 and
+// negatives were accepted silently (a cancel wait of 0 ms) and an absurd
+// value would pin an HTTP worker for as long as it says. Sweep the documented
+// range's endpoints and both degenerate directions, and observe the budget
+// the gateway actually applies rather than the value that was configured.
+TEST_F(TestGatewayNode, test_service_call_timeout_sec_is_clamped_to_the_documented_range) {
+  const std::pair<int64_t, int> cases[] = {
+      {0, 1},        // degenerate: no budget at all -> floor
+      {-5, 1},       // negative -> floor
+      {1, 1},        // range floor, accepted as-is
+      {10, 10},      // default, accepted as-is
+      {3600, 3600},  // range ceiling, accepted as-is
+      {100000, 3600}
+      // above the ceiling -> ceiling
+  };
+
+  for (const auto & [configured, expected] : cases) {
+    SCOPED_TRACE("service_call_timeout_sec=" + std::to_string(configured));
+    node_.reset();
+
+    int free_port = reserve_free_port();
+    ASSERT_NE(free_port, 0) << "Failed to reserve a free port for test";
+    create_node_with_overrides({
+        rclcpp::Parameter("server.port", free_port),
+        rclcpp::Parameter("service_call_timeout_sec", configured),
+    });
+
+    auto * operation_mgr = node_->get_operation_manager();
+    ASSERT_NE(operation_mgr, nullptr);
+    EXPECT_EQ(operation_mgr->service_call_timeout_sec(), expected);
+  }
 }
 
 TEST_F(TestGatewayNode, test_version_info_endpoint) {

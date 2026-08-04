@@ -604,8 +604,24 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   service_transport_ = std::make_shared<ros2::Ros2ServiceTransport>(this, callback_groups_.rpc_reentrant);
   action_transport_ =
       std::make_shared<ros2::Ros2ActionTransport>(this, callback_groups_.rpc_reentrant, callback_groups_.action_status);
-  const auto service_call_timeout_sec =
-      static_cast<int>(declare_parameter<int64_t>("service_call_timeout_sec", static_cast<int64_t>(10)));
+  // Budget for every service call and every action RPC, including the action
+  // cancel (issue #576 removed the special 15s cancel floor, making this the
+  // sole cancel budget). Degenerate values are not cosmetic here: 0 or a
+  // negative makes the response wait expire immediately, so every cancel
+  // answers 504 unless the status stream wins the race, and an unbounded
+  // value pins an HTTP worker for as long as it says. Clamp to the documented
+  // range with a warning, like the sibling timeouts.
+  static constexpr int64_t kMinServiceCallTimeoutSec = 1;
+  static constexpr int64_t kMaxServiceCallTimeoutSec = 3600;
+  const auto raw_service_call_timeout =
+      declare_parameter<int64_t>("service_call_timeout_sec", static_cast<int64_t>(10));
+  const auto clamped_service_call_timeout =
+      std::clamp(raw_service_call_timeout, kMinServiceCallTimeoutSec, kMaxServiceCallTimeoutSec);
+  if (clamped_service_call_timeout != raw_service_call_timeout) {
+    RCLCPP_WARN(get_logger(), "service_call_timeout_sec %" PRId64 " clamped to %" PRId64, raw_service_call_timeout,
+                clamped_service_call_timeout);
+  }
+  const auto service_call_timeout_sec = static_cast<int>(clamped_service_call_timeout);
   operation_mgr_ = std::make_unique<OperationManager>(service_transport_, action_transport_, discovery_mgr_.get(),
                                                       service_call_timeout_sec);
 
