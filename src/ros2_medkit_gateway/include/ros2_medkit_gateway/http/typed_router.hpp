@@ -138,9 +138,13 @@ class TypedRequest {
   ///
   /// That is what makes it the right basis for a `Location` header - either
   /// verbatim (PUT, where the target IS the resource) or with the new id
-  /// appended (`Location: <request-path>/<new-id>` on POST). Do NOT wrap it in
-  /// `api_path()`: that would double the prefix. Routes that need to inspect
-  /// path segments should use `path_param` instead.
+  /// appended (`Location: <request-path>/<new-id>` on POST). It is the path
+  /// the client sent, though, and `to_regex_path` anchors with `/?$`, so a
+  /// trailing slash routes and arrives here: build the header through
+  /// `canonical_request_path` / `child_resource_path` rather than by
+  /// concatenation, or it carries a double slash that answers 404. Do NOT
+  /// wrap it in `api_path()`: that would double the prefix. Routes that need
+  /// to inspect path segments should use `path_param` instead.
   const std::string & path() const {
     return req_.path;
   }

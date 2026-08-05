@@ -206,6 +206,63 @@ class TestScriptsCRUD(GatewayTestCase):
         self.assertIn('items', data)
         self.assertIsInstance(data['items'], list)
 
+    # @verifies REQ_INTEROP_041
+    def test_01b_urls_name_the_collection_the_caller_addressed(self):
+        """`href`, `_links` and `Location` all use the caller's own collection.
+
+        These used to come from "components if the path says so, else apps".
+        The segment is now read out of the request path instead of chosen, so
+        this pins both reachable collections - a component caller must not
+        start getting `/apps/...` back from the rewritten derivation.
+
+        Areas and functions cannot be checked here: the scripts routes are
+        registered for apps and components only (`rest_server.cpp`), so those
+        paths never route and no URL is built for them. That is why the old
+        guess never actually mislabelled a live response.
+        """
+        r, script_id = self._upload_script(filename='collection_pin.py')
+        self.assertEqual(
+            r.headers['Location'],
+            f'{API_BASE_PATH}/apps/temp_sensor/scripts/{script_id}')
+
+        listed = self.get_json('/apps/temp_sensor/scripts')
+        self.assertEqual(listed['_links']['self'], f'{API_BASE_PATH}/apps/temp_sensor/scripts')
+        self.assertEqual(listed['_links']['parent'], f'{API_BASE_PATH}/apps/temp_sensor')
+        hrefs = [i['href'] for i in listed['items'] if i['id'] == script_id]
+        self.assertEqual(hrefs, [f'{API_BASE_PATH}/apps/temp_sensor/scripts/{script_id}'])
+
+        comp_id = self.get_json('/components')['items'][0]['id']
+        comp_listed = self.get_json(f'/components/{comp_id}/scripts')
+        self.assertEqual(
+            comp_listed['_links']['self'],
+            f'{API_BASE_PATH}/components/{comp_id}/scripts')
+        self.assertEqual(
+            comp_listed['_links']['parent'], f'{API_BASE_PATH}/components/{comp_id}')
+
+    # @verifies REQ_INTEROP_040
+    def test_01c_trailing_slash_location_still_resolves(self):
+        """A stray trailing slash must not produce a `Location` that 404s.
+
+        Route regexes are anchored with `/?$`, so `POST .../scripts/` routes
+        just as `POST .../scripts` does, and nothing normalises the path
+        afterwards. Appending the new id to the raw request path then yields
+        `.../scripts//new_id`, which no route matches - `([^/]+)` cannot match
+        an empty segment - so the header hands the client a dead URI.
+        """
+        files = {'file': ('slash.py', PYTHON_SCRIPT, 'application/octet-stream')}
+        r = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/scripts/', files=files, timeout=5)
+        self.assertEqual(r.status_code, 201, r.text)
+
+        location = r.headers['Location']
+        self.assertNotIn('//', location.split('://')[-1])
+        self.assertEqual(
+            location, f'{API_BASE_PATH}/apps/temp_sensor/scripts/{r.json()["id"]}')
+
+        follow = requests.get(
+            self.BASE_URL + location[len(API_BASE_PATH):], timeout=5)
+        self.assertEqual(follow.status_code, 200, follow.text)
+
     # @verifies REQ_INTEROP_040
     def test_02_upload_and_list(self):
         """Upload a script, verify it appears in the list."""

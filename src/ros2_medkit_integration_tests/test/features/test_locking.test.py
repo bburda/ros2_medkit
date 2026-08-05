@@ -29,7 +29,7 @@ import unittest
 import launch_testing
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
+from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, API_BASE_PATH
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
@@ -114,6 +114,44 @@ class TestLocking(GatewayTestCase):
         # ISO 8601 datetime format
         self.assertIn('T', data['lock_expiration'])
         self.assertIn('Z', data['lock_expiration'])
+
+        # The 201 must name the lock it created, and that URI has to resolve.
+        self.assertEqual(
+            resp.headers.get('Location'),
+            f'{API_BASE_PATH}/apps/temp_sensor/locks/{data["id"]}')
+        follow = requests.get(
+            f'{self.BASE_URL}/apps/temp_sensor/locks/{data["id"]}',
+            headers={'X-Client-Id': 'client_a'}, timeout=10)
+        self.assertEqual(follow.status_code, 200, follow.text)
+
+    # @verifies REQ_INTEROP_100
+    def test_acquire_lock_location_survives_a_trailing_slash(self):
+        """The 201 `Location` must resolve even when the caller adds a slash.
+
+        Route regexes end `/?$`, so `POST .../locks/` routes and the path is
+        not normalised. Appending the lock id to it produced
+        `.../locks//lock_1`, which the item route cannot match - `([^/]+)`
+        refuses an empty segment - so the header handed back a dead URI. This
+        is on the shipped default: `locking.enabled` is true out of the box.
+        """
+        resp = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/locks/',
+            json={'lock_expiration': 300},
+            headers={'X-Client-Id': 'client_slash'},
+            timeout=10,
+        )
+        self.assertEqual(resp.status_code, 201, resp.text)
+        lock_id = resp.json()['id']
+        self.addCleanup(
+            self._delete_lock, 'apps', 'temp_sensor', lock_id, 'client_slash')
+
+        location = resp.headers.get('Location')
+        self.assertEqual(location, f'{API_BASE_PATH}/apps/temp_sensor/locks/{lock_id}')
+
+        follow = requests.get(
+            self.BASE_URL + location[len(API_BASE_PATH):],
+            headers={'X-Client-Id': 'client_slash'}, timeout=10)
+        self.assertEqual(follow.status_code, 200, follow.text)
 
     # @verifies REQ_INTEROP_100
     def test_acquire_lock_with_scopes(self):

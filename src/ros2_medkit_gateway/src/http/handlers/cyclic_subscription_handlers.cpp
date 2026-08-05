@@ -207,7 +207,7 @@ CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
   http::ResponseAttachments att;
   // The subscription is a child of the POST target, and `req.path()` already
   // carries the API prefix, so this is the same absolute form every `href` uses.
-  att.with_location(req.path() + "/" + sub_dto.id);
+  att.with_location(child_resource_path(req.path(), sub_dto.id));
   return std::make_pair(http::Created<dto::CyclicSubscription>{std::move(sub_dto)}, std::move(att));
 }
 

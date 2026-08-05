@@ -338,7 +338,7 @@ TriggerHandlers::post_trigger(const http::TypedRequest & req, dto::TriggerCreate
   http::ResponseAttachments att;
   // The trigger is a child of the POST target, and `req.path()` already carries
   // the API prefix, so this is the same absolute form every `href` uses.
-  att.with_location(req.path() + "/" + trigger_dto.id);
+  att.with_location(child_resource_path(req.path(), trigger_dto.id));
   return std::make_pair(http::Created<dto::Trigger>{std::move(trigger_dto)}, std::move(att));
 }
 

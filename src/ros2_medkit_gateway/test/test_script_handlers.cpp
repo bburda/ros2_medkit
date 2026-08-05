@@ -200,6 +200,22 @@ httplib::Request make_script_request(const std::string & entity_type, const std:
   return req;
 }
 
+/// Request for `POST /{entity}/scripts/{script_id}/executions`.
+///
+/// Distinct from `make_script_request` because the route really does end in
+/// `/executions`, and the handler builds the 202 `Location` by appending the
+/// new execution id to the request path. A fixture that stops at the script
+/// resource describes a route the gateway does not serve.
+httplib::Request make_start_execution_request(const std::string & entity_type, const std::string & entity_id,
+                                              const std::string & script_id) {
+  httplib::Request req;
+  req.path = "/api/v1/" + entity_type + "/" + entity_id + "/scripts/" + script_id + "/executions";
+  std::string pattern = "/api/v1/" + entity_type + "/([^/]+)/scripts/([^/]+)/executions";
+  std::regex re(pattern);
+  std::regex_match(req.path, req.matches, re);
+  return req;
+}
+
 httplib::Request make_execution_request(const std::string & entity_type, const std::string & entity_id,
                                         const std::string & script_id, const std::string & execution_id) {
   httplib::Request req;
@@ -414,7 +430,7 @@ class ScriptHandlersErrorMappingTest : public ::testing::Test {
     mock_provider_->error_code = err;
     mock_provider_->error_message = "test error";
 
-    req_storage = make_script_request("components", "ecu", "test_script");
+    req_storage = make_start_execution_request("components", "ecu", "test_script");
     req_storage.body = R"({"execution_type": "now"})";
     http::TypedRequest typed(req_storage);
     return handlers_->start_execution(typed);
@@ -526,7 +542,9 @@ TEST_F(ScriptHandlersErrorMappingTest, UploadReturns201WithLocation) {
   for (const auto & [name, value] : att.headers) {
     if (name == "Location") {
       found_location = true;
-      EXPECT_NE(value.find("/scripts/uploaded_001"), std::string::npos);
+      // Exact, not a substring: the header is the request path plus the new
+      // id, so the collection segment is part of what is being asserted.
+      EXPECT_EQ(value, "/api/v1/components/ecu/scripts/uploaded_001");
     }
   }
   EXPECT_TRUE(found_location);
@@ -561,7 +579,7 @@ TEST_F(ScriptHandlersErrorMappingTest, UploadRejectsWrongContentType) {
 TEST_F(ScriptHandlersErrorMappingTest, StartExecutionReturns202WithLocation) {
   mock_provider_->succeed = true;
 
-  auto req = make_script_request("components", "ecu", "test_script");
+  auto req = make_start_execution_request("components", "ecu", "test_script");
   req.body = R"({"execution_type": "now"})";
 
   http::TypedRequest typed(req);
@@ -578,7 +596,7 @@ TEST_F(ScriptHandlersErrorMappingTest, StartExecutionReturns202WithLocation) {
   for (const auto & [name, value] : att.headers) {
     if (name == "Location") {
       found_location = true;
-      EXPECT_NE(value.find("/executions/exec_001"), std::string::npos);
+      EXPECT_EQ(value, "/api/v1/components/ecu/scripts/test_script/executions/exec_001");
     }
   }
   EXPECT_TRUE(found_location);

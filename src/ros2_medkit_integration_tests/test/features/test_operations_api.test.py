@@ -425,6 +425,56 @@ class TestOperationsApi(GatewayTestCase):
         self.assertIn('items', data)
         self.assertIsInstance(data['items'], list)
 
+    def test_rejected_goal_names_the_entity_field_the_caller_used(self):
+        """The error params key the caller's own entity type.
+
+        `id_field` was chosen the same "app or else component" way the Location
+        was, so a function whose goal was rejected got back
+        `{"component_id": "powertrain"}` - a field it never sent, on an entity
+        type that is not a component. The demo action rejects order > 50, which
+        is the cheapest way to reach the params.
+
+        @verifies REQ_INTEROP_035
+        """
+        self.wait_for_operation('/functions/powertrain', 'long_calibration')
+
+        resp = requests.post(
+            f'{self.BASE_URL}/functions/powertrain/operations'
+            '/long_calibration/executions',
+            json={'parameters': {'order': 99}}, timeout=15)
+        self.assertEqual(resp.status_code, 400, resp.text)
+
+        params = resp.json()['parameters']
+        self.assertEqual(params.get('function_id'), 'powertrain')
+        self.assertNotIn('component_id', params)
+
+    def test_execution_location_survives_a_trailing_slash(self):
+        """The same dead-URI trap as the scripts one, on the executions route.
+
+        `POST .../executions/` routes (every route regex ends `/?$`) and the
+        path is not normalised, so appending the goal id to it produced
+        `.../executions//<id>` - a `Location` no route can match.
+
+        @verifies REQ_INTEROP_035
+        """
+        self.wait_for_operation('/functions/powertrain', 'long_calibration')
+
+        resp = requests.post(
+            f'{self.BASE_URL}/functions/powertrain/operations'
+            '/long_calibration/executions/',
+            json={}, timeout=15)
+        self.assertEqual(resp.status_code, 202, resp.text)
+
+        location = resp.headers['Location']
+        self.assertEqual(
+            location,
+            f'{API_BASE_PATH}/functions/powertrain/operations/long_calibration'
+            f'/executions/{resp.json()["id"]}')
+
+        follow_url = self.BASE_URL + location[len(API_BASE_PATH):]
+        self.addCleanup(requests.delete, follow_url, timeout=10)
+        self.assertEqual(requests.get(follow_url, timeout=10).status_code, 200)
+
     def test_async_execution_location_resolves(self):
         """The 202 `Location` names the execution under the addressed collection.
 
