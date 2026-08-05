@@ -696,8 +696,11 @@ void RESTServer::setup_routes() {
         .description("Sends a control command to a running execution.")
         .response(202, "Accepted (asynchronous control)", SB::ref("OperationExecution"))
         // 400/404/500 come from the registry's automatic response-level
-        // GenericError $ref; the remaining cancel-outcome statuses
-        // (issue #576) need manual declarations.
+        // GenericError $ref; the remaining statuses this route can return
+        // need manual declarations, or the generated SDK has no branch for
+        // them (issue #576).
+        .response(409, "Execution is still running (precondition-not-fulfilled)",
+                  nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
         .response(503, "Action server unavailable (x-medkit-ros2-action-unavailable)",
                   nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
         .response(504, "No cancel response in time - outcome unknown (not-responding)",

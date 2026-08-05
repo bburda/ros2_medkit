@@ -130,11 +130,17 @@ class TypedRequest {
     return req_.has_header("X-Medkit-No-Fan-Out");
   }
 
-  /// Returns the request path (post-routing, post-prefix-strip). Handlers
-  /// occasionally need this to build a `Location` header for resources they
-  /// just created via POST (e.g. `Location: <request-path>/<new-id>`). This
-  /// is the only path-shaped read most handlers need; routes that need to
-  /// inspect path segments should use `path_param` instead.
+  /// Returns the request path exactly as the client sent it, **including the
+  /// `/api/v1` prefix**: routes are registered with the prefix already
+  /// concatenated (`RouteRegistry::register_all`) and nothing rewrites
+  /// `req.path` on the way in, so this is the absolute path of the resource
+  /// being addressed.
+  ///
+  /// That is what makes it the right basis for a `Location` header - either
+  /// verbatim (PUT, where the target IS the resource) or with the new id
+  /// appended (`Location: <request-path>/<new-id>` on POST). Do NOT wrap it in
+  /// `api_path()`: that would double the prefix. Routes that need to inspect
+  /// path segments should use `path_param` instead.
   const std::string & path() const {
     return req_.path;
   }

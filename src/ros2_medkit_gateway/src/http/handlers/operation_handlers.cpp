@@ -246,13 +246,19 @@ std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result
       // CANCELED already reconciled above, so a terminal status here means
       // the goal finished on its own. Telling the client to watch for
       // progress would describe something that cannot happen - say what the
-      // gateway already knows instead.
+      // gateway already knows instead, in the vocabulary the resource being
+      // named actually answers in (`sovd_status_from_ros2`, not the raw ROS
+      // word: the execution resource never emits "succeeded"/"aborted").
       if (tracked.has_value() &&
           (tracked->status == ActionGoalStatus::SUCCEEDED || tracked->status == ActionGoalStatus::ABORTED)) {
         message += "The execution status resource already reports the goal as " +
-                   action_status_to_string(tracked->status) + ", so there is nothing left to cancel.";
+                   sovd_status_from_ros2(tracked->status) + ", so there is nothing left to cancel.";
       } else {
-        message += "Poll the execution status resource to observe the goal's progress.";
+        // `status` alone cannot express the answer the client is asking for -
+        // it renders CANCELED and ABORTED identically as "failed" - so name
+        // the field that can.
+        message +=
+            "Poll the execution status resource and read x-medkit.ros2_status to learn the goal's outcome.";
       }
       return CancelFailure{504, ERR_NOT_RESPONDING, std::move(message)};
     }
@@ -916,13 +922,25 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
       // areas client into the wrong collection.
       const std::string & location = req.path();
 
-      dto::OperationExecution exec_dto;
-      exec_dto.id = execution_id;
       // Render the tracked status rather than assuming "running": the
       // reconcile set includes CANCELED, which GET reports as "failed", and
       // a 202 body must not contradict the resource Location points at.
+      //
+      // If the goal is gone by now - the cleanup timer can evict it between
+      // the mapper's read and this one - then there is no status to render
+      // and the Location we would hand out answers 404. Say that instead of
+      // inventing "running", which would reproduce exactly the contradiction
+      // this branch removed.
       auto tracked = operation_mgr->get_tracked_goal(execution_id);
-      exec_dto.status = tracked.has_value() ? sovd_status_from_ros2(tracked->status) : "running";
+      if (!tracked.has_value()) {
+        return tl::make_unexpected(make_error(
+            404, ERR_RESOURCE_NOT_FOUND, "Execution not found",
+            json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"execution_id", execution_id}}));
+      }
+
+      dto::OperationExecution exec_dto;
+      exec_dto.id = execution_id;
+      exec_dto.status = sovd_status_from_ros2(tracked->status);
 
       http::ResponseAttachments att;
       att.with_status(202).with_header("Location", location);
@@ -939,8 +957,11 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
         make_error(failure->http_status, failure->error_code, failure->message, std::move(params)));
   }
   if (capability == "execute") {
+    // `precondition-not-fulfilled` is the SOVD standard code for "prerequisites
+    // not met" and is what the gateway already answers its lifecycle 409 with;
+    // `invalid-request` is not in the standard code list at all.
     return tl::make_unexpected(
-        make_error(409, ERR_INVALID_REQUEST,
+        make_error(409, ERR_PRECONDITION_NOT_FULFILLED,
                    "Cannot re-execute while operation is running. Cancel first, then start new execution.",
                    json{{"entity_id", entity_id},
                         {"operation_id", operation_id},

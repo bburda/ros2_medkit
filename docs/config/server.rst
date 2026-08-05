@@ -169,18 +169,44 @@ Data Access Settings
    * - ``service_call_timeout_sec``
      - int
      - ``10``
-     - Response budget for every operation RPC: ROS 2 service calls
-       (``POST .../executions`` on a service-backed operation) and all three
-       action RPCs - send goal, get result, and **cancel**. Values outside
-       the range are clamped with a warning at startup. Range: 1-3600.
+     - How long the gateway waits for a **response** to an operation RPC: a
+       ROS 2 service call (``POST .../executions`` on a service-backed
+       operation) and each of the three action RPCs - send goal, get result
+       and cancel. Values outside the range are clamped with a warning at
+       startup. Range: 1-3600.
 
-       This is the *cancel budget* referenced by ``DELETE .../executions/{id}``
-       and ``PUT .../executions/{id}`` (see :doc:`../api/rest`): a cancel that
-       gets no answer within it is reported as ``504 not-responding`` unless
-       the action's status stream already shows the goal cancelling. Discovery
-       of the cancel service adds up to a further 2 s on top, so with the
-       minimum of 1 s a cancel issued before the service is discovered can
-       take up to 3 s before the response wait even starts.
+       It is not the whole wall-clock cost, because each RPC first waits for
+       its service to be discovered and the three do that differently:
+
+       .. list-table::
+          :header-rows: 1
+          :widths: 30 35 35
+
+          * - RPC
+            - Discovery wait
+            - Worst case in total
+          * - Service call
+            - none (bounded by the response wait)
+            - ``service_call_timeout_sec``
+          * - Action send goal
+            - up to ``service_call_timeout_sec``
+            - ``2 x service_call_timeout_sec``
+          * - Action get result
+            - up to 2 s, fixed
+            - ``service_call_timeout_sec + 2 s``
+          * - Action cancel
+            - up to 2 s, fixed
+            - ``service_call_timeout_sec + 2 s``
+
+       The last row is the *cancel budget* referenced by
+       ``DELETE .../executions/{id}`` and ``PUT .../executions/{id}`` (see
+       :doc:`../api/rest`): a cancel that gets no answer within the response
+       wait is reported as ``504 not-responding`` unless the action's status
+       stream already shows the goal cancelling. The 2 s discovery waits are
+       fixed and do not shrink with this parameter, so lowering it to the
+       minimum of 1 s does not make an undiscovered cancel or get-result
+       answer in under 2 s - size client timeouts off the "worst case in
+       total" column, not off the parameter alone.
 
 .. note::
 
