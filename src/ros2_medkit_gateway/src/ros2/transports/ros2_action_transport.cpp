@@ -453,8 +453,29 @@ void Ros2ActionTransport::subscribe_status(const std::string & action_path, Stat
   // no longer serialized behind the node's default group.
   rclcpp::SubscriptionOptions sub_options;
   sub_options.callback_group = status_group_;
+  // Match the action protocol's own status profile: rcl_action declares
+  // KEEP_LAST(1) + RELIABLE + TRANSIENT_LOCAL
+  // (rcl_action/default_qos.h, rcl_action_qos_profile_status_default) for the
+  // server's publisher AND the client's subscription alike.
+  //
+  // Durability is the load-bearing part. The gateway subscribes only after
+  // the goal has been sent, so on the first goal for a path the action can
+  // reach a terminal state while this subscription is still matching. A
+  // VOLATILE reader is delivered nothing on match and the terminal frame is
+  // lost for good - no other code path re-reads a goal's status - which since
+  // #576 also means a timed-out cancel can never reconcile to 204. A
+  // TRANSIENT_LOCAL reader receives the writer's last sample on match, which
+  // is precisely the frame it missed.
+  //
+  // Cost of the reliable reader: with KEEP_LAST(1) the publisher overwrites
+  // rather than blocking, so a slow gateway cannot stall an action server
+  // indefinitely - the exposure is bounded by the writer's max_blocking_time
+  // plus retransmission traffic. Depth 1 can coalesce intermediate
+  // transitions (EXECUTING -> CANCELING -> CANCELED may arrive as CANCELED
+  // only); harmless here, because the tracking map stores the goal's current
+  // status and the cancel reconciliation accepts CANCELING or CANCELED.
   auto subscription = node_->create_subscription<action_msgs::msg::GoalStatusArray>(
-      status_topic, rclcpp::QoS(10).best_effort(), cb, sub_options);
+      status_topic, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(), cb, sub_options);
 
   status_subscriptions_[action_path] = subscription;
   RCLCPP_INFO(node_->get_logger(), "Subscribed to action status: %s", status_topic.c_str());
