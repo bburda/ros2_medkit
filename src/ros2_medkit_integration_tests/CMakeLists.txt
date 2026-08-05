@@ -136,6 +136,23 @@ install(TARGETS topics_test_plugin LIBRARY DESTINATION lib/${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
 
+  # Lint the Python that makes up this package. Without this the whole package
+  # sits outside `colcon test -L linter`, so the documented lint command passes
+  # while none of these files are checked, and the pre-commit hooks are the
+  # first thing to see a problem. The rule set matches those hooks (see .flake8
+  # and .pre-commit-config.yaml) so the two never disagree.
+  #
+  # Only flake8 for now. ament_pep257 also belongs here, and every other package
+  # that ships Python runs it, but this package drifted while it was unchecked:
+  # 563 multi-line docstrings put the summary on the opening line, which the
+  # convention the rest of the tree follows does not. Adding the checker and
+  # correcting those docstrings is its own change.
+  #
+  # ament_lint_common is deliberately not used either: it would also apply the
+  # C++ style checks to the demo nodes, which is a separate decision.
+  find_package(ament_cmake_flake8 REQUIRED)
+  ament_flake8()
+
   # Each integration test gets a unique HTTP port via GATEWAY_TEST_PORT env var,
   # allowing parallel CTest execution without port conflicts.
   # Stride of 10 per test so multi-gateway tests can use get_test_port(offset).

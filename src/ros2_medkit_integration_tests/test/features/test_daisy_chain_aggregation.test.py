@@ -80,7 +80,7 @@ def _manifest(name, ecu_id):
     only exercise discovery endpoints and request forwarding - not
     live runtime sampling.
     """
-    return textwrap.dedent(f'''
+    return textwrap.dedent(f"""
         manifest_version: "1.0"
         metadata:
           name: {name}
@@ -106,7 +106,7 @@ def _manifest(name, ecu_id):
             ros_binding:
               node_name: {ecu_id}_app
               namespace: /{ecu_id}
-    ''').strip()
+    """).strip()
 
 
 def _write_manifest(name, ecu_id):

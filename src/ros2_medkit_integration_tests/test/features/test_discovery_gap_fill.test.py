@@ -94,7 +94,7 @@ class TestGapFillConfig(GatewayTestCase):
                 'powertrain', 'chassis', 'body', 'perception',
                 # HATEOAS edge-case fixture, manifest-only.
                 'hateoas-edge-area',
-            ], f"Unexpected area found in top-level listing: {area_id}")
+            ], f'Unexpected area found in top-level listing: {area_id}')
 
     def test_only_manifest_components_present(self):
         """Components come from manifest only - runtime never creates components."""
@@ -117,7 +117,7 @@ class TestGapFillConfig(GatewayTestCase):
         for comp_id in component_ids:
             self.assertIn(
                 comp_id, manifest_components,
-                f"Unexpected heuristic component found: {comp_id}",
+                f'Unexpected heuristic component found: {comp_id}',
             )
 
     def test_manifest_apps_present_and_linked(self):
@@ -138,7 +138,7 @@ class TestGapFillConfig(GatewayTestCase):
         for app_id in expected_linked:
             self.assertIn(
                 app_id, app_ids,
-                f"Expected manifest app {app_id} not found in apps list",
+                f'Expected manifest app {app_id} not found in apps list',
             )
 
     def test_health_shows_discovery_info(self):

@@ -114,7 +114,7 @@ class TestLayerPolicyOverrides(GatewayTestCase):
         # Manifest defines engine-temp-sensor, engine-rpm-sensor, etc.
         self.assertTrue(
             any('engine' in aid for aid in app_ids),
-            f"No engine apps found: {app_ids}",
+            f'No engine apps found: {app_ids}',
         )
 
     def test_merge_pipeline_has_layers(self):
@@ -151,7 +151,7 @@ class TestLayerPolicyOverrides(GatewayTestCase):
         # be no conflict (authoritative simply wins)
         self.assertEqual(
             pipeline.get('conflict_count', -1), 0,
-            f"Expected no merge conflicts with authoritative policy, got: {pipeline}",
+            f'Expected no merge conflicts with authoritative policy, got: {pipeline}',
         )
 
 

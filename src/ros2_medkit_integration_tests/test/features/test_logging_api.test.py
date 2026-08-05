@@ -102,7 +102,7 @@ class TestLoggingApi(GatewayTestCase):
         ts = entry['timestamp']
         self.assertTrue(
             ts.endswith('Z') and 'T' in ts,
-            f"timestamp should be ISO 8601 with Z suffix, got: {ts}"
+            f'timestamp should be ISO 8601 with Z suffix, got: {ts}'
         )
         # severity is one of the valid values
         self.assertIn(
@@ -269,7 +269,7 @@ class TestLoggingApi(GatewayTestCase):
         sources = ext.get('aggregation_sources', [])
         self.assertTrue(
             any('temp_sensor' in src for src in sources),
-            f"Expected aggregation_sources to contain a temp_sensor fqn, got: {sources}",
+            f'Expected aggregation_sources to contain a temp_sensor fqn, got: {sources}',
         )
 
     def test_component_get_logs_configuration_returns_200(self):
@@ -434,7 +434,7 @@ class TestLoggingApi(GatewayTestCase):
         for entry in data.get('items', []):
             self.assertEqual(
                 entry['severity'], 'fatal',
-                f'Expected only fatal entries after setting filter, got: {entry["severity"]}'
+                f"Expected only fatal entries after setting filter, got: {entry['severity']}"
             )
 
 

@@ -32,40 +32,40 @@ import pytest
 import requests
 
 BASE_URL = os.environ.get(
-    "SYSTEMD_TEST_BASE_URL", "http://localhost:9200/api/v1"
+    'SYSTEMD_TEST_BASE_URL', 'http://localhost:9200/api/v1'
 )
 STARTUP_TIMEOUT = 60
 POLL_INTERVAL = 1
 POLL_RETRIES = 20
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope='module', autouse=True)
 def wait_for_gateway():
     """Wait for gateway health and app discovery inside Docker container."""
     deadline = time.monotonic() + STARTUP_TIMEOUT
     while time.monotonic() < deadline:
         try:
-            r = requests.get(f"{BASE_URL}/health", timeout=2)
+            r = requests.get(f'{BASE_URL}/health', timeout=2)
             if r.status_code == 200:
                 # Also wait for at least 2 apps (temp_sensor + rpm_sensor)
-                r2 = requests.get(f"{BASE_URL}/apps", timeout=2)
+                r2 = requests.get(f'{BASE_URL}/apps', timeout=2)
                 if r2.status_code == 200:
-                    apps = r2.json().get("items", [])
+                    apps = r2.json().get('items', [])
                     if len(apps) >= 2:
                         return
         except requests.RequestException:
             pass
         time.sleep(1)
-    pytest.fail(f"Gateway not ready after {STARTUP_TIMEOUT}s")
+    pytest.fail(f'Gateway not ready after {STARTUP_TIMEOUT}s')
 
 
 def _get_app_ids():
     """Get all discovered app IDs."""
-    r = requests.get(f"{BASE_URL}/apps", timeout=5)
+    r = requests.get(f'{BASE_URL}/apps', timeout=5)
     r.raise_for_status()
-    items = r.json().get("items", [])
-    assert len(items) > 0, "No apps discovered"
-    return [item["id"] for item in items]
+    items = r.json().get('items', [])
+    assert len(items) > 0, 'No apps discovered'
+    return [item['id'] for item in items]
 
 
 def _get_first_app_id():
@@ -75,11 +75,11 @@ def _get_first_app_id():
 
 def _get_first_component_id():
     """Get first discovered component ID."""
-    r = requests.get(f"{BASE_URL}/components", timeout=5)
+    r = requests.get(f'{BASE_URL}/components', timeout=5)
     r.raise_for_status()
-    items = r.json().get("items", [])
-    assert len(items) > 0, "No components discovered"
-    return items[0]["id"]
+    items = r.json().get('items', [])
+    assert len(items) > 0, 'No components discovered'
+    return items[0]['id']
 
 
 def _poll_endpoint(url, retries=POLL_RETRIES, interval=POLL_INTERVAL):
@@ -102,16 +102,16 @@ class TestSystemdAppEndpoint:
         """
         app_id = _get_first_app_id()
         status, data = _poll_endpoint(
-            f"{BASE_URL}/apps/{app_id}/x-medkit-systemd"
+            f'{BASE_URL}/apps/{app_id}/x-medkit-systemd'
         )
         assert status == 200, (
-            f"systemd endpoint not available for {app_id}"
+            f'systemd endpoint not available for {app_id}'
         )
-        assert "unit" in data
-        assert data["unit"].endswith(".service")
-        assert data["active_state"] == "active"
-        assert "sub_state" in data
-        assert data["sub_state"] == "running"
+        assert 'unit' in data
+        assert data['unit'].endswith('.service')
+        assert data['active_state'] == 'active'
+        assert 'sub_state' in data
+        assert data['sub_state'] == 'running'
 
     def test_returns_unit_type(self):
         """Systemd endpoint includes unit_type field.
@@ -120,10 +120,10 @@ class TestSystemdAppEndpoint:
         """
         app_id = _get_first_app_id()
         status, data = _poll_endpoint(
-            f"{BASE_URL}/apps/{app_id}/x-medkit-systemd"
+            f'{BASE_URL}/apps/{app_id}/x-medkit-systemd'
         )
         assert status == 200
-        assert data["unit_type"] == "service"
+        assert data['unit_type'] == 'service'
 
     def test_returns_restart_count(self):
         """Systemd endpoint includes restart_count (NRestarts property).
@@ -132,12 +132,12 @@ class TestSystemdAppEndpoint:
         """
         app_id = _get_first_app_id()
         status, data = _poll_endpoint(
-            f"{BASE_URL}/apps/{app_id}/x-medkit-systemd"
+            f'{BASE_URL}/apps/{app_id}/x-medkit-systemd'
         )
         assert status == 200
-        assert "restart_count" in data
-        assert isinstance(data["restart_count"], int)
-        assert data["restart_count"] >= 0
+        assert 'restart_count' in data
+        assert isinstance(data['restart_count'], int)
+        assert data['restart_count'] >= 0
 
     def test_returns_watchdog_usec(self):
         """Systemd endpoint includes watchdog_usec field.
@@ -146,11 +146,11 @@ class TestSystemdAppEndpoint:
         """
         app_id = _get_first_app_id()
         status, data = _poll_endpoint(
-            f"{BASE_URL}/apps/{app_id}/x-medkit-systemd"
+            f'{BASE_URL}/apps/{app_id}/x-medkit-systemd'
         )
         assert status == 200
-        assert "watchdog_usec" in data
-        assert isinstance(data["watchdog_usec"], int)
+        assert 'watchdog_usec' in data
+        assert isinstance(data['watchdog_usec'], int)
 
 
 class TestSystemdComponentEndpoint:
@@ -163,13 +163,13 @@ class TestSystemdComponentEndpoint:
         """
         comp_id = _get_first_component_id()
         status, data = _poll_endpoint(
-            f"{BASE_URL}/components/{comp_id}/x-medkit-systemd"
+            f'{BASE_URL}/components/{comp_id}/x-medkit-systemd'
         )
         assert status == 200, (
-            f"systemd component endpoint not available for {comp_id}"
+            f'systemd component endpoint not available for {comp_id}'
         )
-        assert "units" in data
-        assert isinstance(data["units"], list)
+        assert 'units' in data
+        assert isinstance(data['units'], list)
 
     def test_units_include_node_ids(self):
         """Each unit in the aggregation includes node_ids listing the apps.
@@ -178,14 +178,14 @@ class TestSystemdComponentEndpoint:
         """
         comp_id = _get_first_component_id()
         status, data = _poll_endpoint(
-            f"{BASE_URL}/components/{comp_id}/x-medkit-systemd"
+            f'{BASE_URL}/components/{comp_id}/x-medkit-systemd'
         )
         assert status == 200
-        if len(data["units"]) > 0:
-            unit = data["units"][0]
-            assert "node_ids" in unit
-            assert isinstance(unit["node_ids"], list)
-            assert len(unit["node_ids"]) > 0
+        if len(data['units']) > 0:
+            unit = data['units'][0]
+            assert 'node_ids' in unit
+            assert isinstance(unit['node_ids'], list)
+            assert len(unit['node_ids']) > 0
 
     def test_units_have_active_state(self):
         """Each unit in the aggregation includes active_state.
@@ -194,12 +194,12 @@ class TestSystemdComponentEndpoint:
         """
         comp_id = _get_first_component_id()
         status, data = _poll_endpoint(
-            f"{BASE_URL}/components/{comp_id}/x-medkit-systemd"
+            f'{BASE_URL}/components/{comp_id}/x-medkit-systemd'
         )
         assert status == 200
-        for unit in data["units"]:
-            assert "active_state" in unit
-            assert "unit" in unit
+        for unit in data['units']:
+            assert 'active_state' in unit
+            assert 'unit' in unit
 
 
 class TestSystemdErrorHandling:
@@ -211,7 +211,7 @@ class TestSystemdErrorHandling:
         @verifies REQ_INTEROP_003
         """
         r = requests.get(
-            f"{BASE_URL}/apps/nonexistent_app_xyz/x-medkit-systemd",
+            f'{BASE_URL}/apps/nonexistent_app_xyz/x-medkit-systemd',
             timeout=5,
         )
         assert r.status_code == 404
@@ -222,7 +222,7 @@ class TestSystemdErrorHandling:
         @verifies REQ_INTEROP_003
         """
         r = requests.get(
-            f"{BASE_URL}/components/nonexistent_comp_xyz/x-medkit-systemd",
+            f'{BASE_URL}/components/nonexistent_comp_xyz/x-medkit-systemd',
             timeout=5,
         )
         assert r.status_code == 404
