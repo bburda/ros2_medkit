@@ -45,6 +45,8 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <memory>
@@ -73,6 +75,32 @@ namespace http = ros2_medkit_gateway::http;
 namespace {
 
 using namespace std::chrono_literals;
+
+/// Multiplier for the wall-clock budgets this fixture waits on. The sanitizer
+/// CI jobs run the unit suite too, and an ASan/TSan-instrumented GatewayNode
+/// takes materially longer to bring a service up - a budget that is generous
+/// unsanitized can be tight under instrumentation, and the failure then reads
+/// as a #576 regression rather than as overhead. The jobs export
+/// MEDKIT_TEST_TIME_SCALE with the same factor they apply to every ctest
+/// TIMEOUT; unset / unparseable / below 1 means no scaling, so the normal
+/// jobs keep the tight budgets.
+double test_time_scale() {
+  const char * raw = std::getenv("MEDKIT_TEST_TIME_SCALE");
+  if (raw == nullptr) {
+    return 1.0;
+  }
+  try {
+    const double scale = std::stod(raw);
+    return scale >= 1.0 ? scale : 1.0;
+  } catch (const std::exception &) {
+    return 1.0;
+  }
+}
+
+/// Scale a wall-clock budget by `test_time_scale()`.
+std::chrono::seconds scaled(std::chrono::seconds base) {
+  return std::chrono::seconds{static_cast<std::int64_t>(static_cast<double>(base.count()) * test_time_scale())};
+}
 
 int reserve_local_port() {
   int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -143,13 +171,19 @@ class PhantomCancelFixtureNode : public rclcpp::Node {
           // future times out. Bounded and releasable so teardown never hangs
           // an executor thread.
           std::unique_lock<std::mutex> lock(release_mutex_);
-          release_cv_.wait_for(lock, std::chrono::seconds(30), [this] {
+          release_cv_.wait_for(lock, scaled(std::chrono::seconds(30)), [this] {
             return released_;
           });
           response->return_code = action_msgs::srv::CancelGoal::Response::ERROR_NONE;
         });
-    status_pub_ =
-        create_publisher<action_msgs::msg::GoalStatusArray>("phantom_calibration/_action/status", rclcpp::QoS(10));
+    // Publish with the profile a real action server offers -
+    // rcl_action_qos_profile_status_default: KEEP_LAST(1), RELIABLE,
+    // TRANSIENT_LOCAL. This stands in for an action server's status
+    // publisher, so it has to make the same offer: a VOLATILE writer is
+    // durability-incompatible with the gateway's TRANSIENT_LOCAL reader and
+    // would never match it, which no real deployment can reproduce.
+    status_pub_ = create_publisher<action_msgs::msg::GoalStatusArray>(
+        "phantom_calibration/_action/status", rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
   }
 
   // Subscription-destructor pattern: the service callback captures `this`,
@@ -303,7 +337,7 @@ class CancelOutcomesFixtureTest : public ::testing::Test {
     ASSERT_FALSE(sent.success) << "no send_goal server exists - the priming send must fail";
   }
 
-  bool wait_for_cancel_service(std::chrono::seconds timeout = std::chrono::seconds(15)) {
+  bool wait_for_cancel_service(std::chrono::seconds timeout = scaled(std::chrono::seconds(15))) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
       const auto services = gateway_node_->get_service_names_and_types();
@@ -345,7 +379,7 @@ class CancelOutcomesFixtureTest : public ::testing::Test {
     auto * operation_mgr = gateway_node_->get_operation_manager();
     operation_mgr->subscribe_to_action_status(kActionPath);
     const auto uuid = goal_id_bytes();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto deadline = std::chrono::steady_clock::now() + scaled(std::chrono::seconds(10));
     while (std::chrono::steady_clock::now() < deadline) {
       fixture_node_->publish_status(uuid, status_byte);
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -403,6 +437,12 @@ TEST_F(CancelOutcomesFixtureTest, CancelTimeoutReturns504NotRespondingAndLeavesT
   ASSERT_FALSE(result.has_value()) << "a swallowed cancel must not be reported as success";
   EXPECT_EQ(result.error().http_status, 504) << result.error().code << ": " << result.error().message;
   EXPECT_EQ(result.error().code, "not-responding");
+  // The advice must name a field that can actually express the answer: the
+  // SOVD `status` renders CANCELED and ABORTED identically as "failed", so
+  // polling it alone can never tell a client whether its cancel took effect.
+  EXPECT_NE(result.error().message.find("x-medkit.ros2_status"), std::string::npos)
+      << "the message points at a resource but not at the field that carries the outcome: "
+      << result.error().message;
   // The outcome is unknown - the handler must not fabricate a tracked status;
   // the /_action/status stream stays the authority.
   EXPECT_EQ(tracked_status_or_fail(), ActionGoalStatus::EXECUTING);
@@ -597,8 +637,17 @@ TEST_F(CancelOutcomesFixtureTest, CancelTimeoutWithTerminalStatusReturns504Witho
   EXPECT_EQ(result.error().code, "not-responding");
   EXPECT_EQ(result.error().message.find("progress"), std::string::npos)
       << "a terminal goal has no progress to observe: " << result.error().message;
-  EXPECT_NE(result.error().message.find("succeeded"), std::string::npos)
-      << "the message must state the terminal status the gateway already knows: " << result.error().message;
+
+  // Pin the AGREEMENT, not the string the handler happens to print: the
+  // message names the execution status resource, so the word it quotes has to
+  // be the word that resource answers with. Asserting a literal here would
+  // stay green if the message drifted away from the endpoint it cites.
+  auto get_typed = make_execution_request();
+  auto exec = handlers_->get_execution(get_typed);
+  ASSERT_TRUE(exec.has_value());
+  EXPECT_NE(result.error().message.find(exec->status), std::string::npos)
+      << "the 504 message must quote the execution resource's own vocabulary (" << exec->status
+      << "): " << result.error().message;
   EXPECT_EQ(tracked_status_or_fail(), ActionGoalStatus::SUCCEEDED);
 }
 
@@ -614,6 +663,24 @@ TEST_F(CancelOutcomesFixtureTest, TimeoutErrorParametersCarryNoReturnCode) {
   EXPECT_EQ(result.error().http_status, 504);
   EXPECT_FALSE(result.error().params.contains("return_code"))
       << "no server return code exists on the timeout path: " << result.error().params.dump();
+}
+
+// The 409 on PUT-execute must carry a code from the SOVD standard list.
+// `invalid-request` is not in it (knowledge/technology/sovd/general_aspects.rst,
+// "SOVD Error Codes"); `precondition-not-fulfilled` ("Prerequisites not met")
+// is, and the gateway already answers its other 409 with it
+// (lifecycle_handlers.cpp). One status, one code, across the whole server.
+TEST_F(CancelOutcomesFixtureTest, ReExecuteOnARunningExecutionCarriesTheStandard409Code) {
+  inject_goal();
+  auto typed = make_execution_request();
+  dto::ExecutionUpdateRequest body;
+  body.capability = "execute";
+
+  auto result = handlers_->update_execution(typed, body);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 409);
+  EXPECT_EQ(result.error().code, "precondition-not-fulfilled") << result.error().message;
 }
 
 // ---------------------------------------------------------------------------
