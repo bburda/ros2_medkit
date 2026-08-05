@@ -109,9 +109,13 @@ class TestActionStatusFirstGoal(GatewayTestCase):
         self.assertEqual(followed.status_code, 200, followed.text)
         self.assertEqual(followed.json().get('capability'), 'execute')
 
+        def terminal_or_none(d):
+            status = (d.get('x-medkit') or {}).get('ros2_status')
+            return d if status in TERMINAL_ROS2_STATUSES else None
+
         final = self.poll_endpoint_until(
             endpoint,
-            lambda d: d if (d.get('x-medkit') or {}).get('ros2_status') in TERMINAL_ROS2_STATUSES else None,
+            terminal_or_none,
             timeout=TERMINAL_STATUS_BUDGET_SEC,
             interval=0.3,
         )
