@@ -144,21 +144,73 @@ RouteEntry & RouteEntry::response(int status_code, const std::string & desc, con
   return *this;
 }
 
+namespace {
+
+/// Whether a JSON Schema can describe a body served under this media type.
+bool media_type_carries_a_json_document(const std::string & media_type) {
+  // An SSE frame's `data:` field is a JSON document, so a schema describes it
+  // exactly - it just describes the frame rather than the whole response body.
+  // `application/octet-stream` and `multipart/byteranges` carry bytes, where a
+  // JSON Schema would describe nothing.
+  return media_type == "text/event-stream";
+}
+
+}  // namespace
+
 RouteEntry & RouteEntry::response(int status_code, const std::string & desc, const nlohmann::json & schema,
                                   const std::vector<std::string> & content_types) {
-  if (!schema.empty()) {
+  const bool schema_is_publishable =
+      !content_types.empty() && std::all_of(content_types.begin(), content_types.end(), [](const std::string & mt) {
+        return media_type_carries_a_json_document(mt);
+      });
+  if (!schema.empty() && !schema_is_publishable) {
     // Reported, not published, and not asserted - this is a Release build. A
-    // JSON Schema attached to `application/octet-stream` or
-    // `text/event-stream` would describe a body shape nothing validates.
+    // JSON Schema attached to `application/octet-stream` would describe a body
+    // shape nothing validates.
     schema_on_non_json_statuses_.push_back(status_code);
   }
-  responses_[status_code] = {desc, {}, {}, content_types};
+  responses_[status_code] = {desc, schema_is_publishable ? schema : nlohmann::json{}, {}, content_types};
   return *this;
 }
 
 RouteEntry & RouteEntry::request_body(const std::string & desc, const nlohmann::json & schema,
                                       const std::string & content_type) {
   request_body_ = RequestBodyInfo{desc, schema, content_type};
+  return *this;
+}
+
+RouteEntry & RouteEntry::multipart_body(const std::string & desc, const std::vector<MultipartPart> & parts) {
+  nlohmann::json properties = nlohmann::json::object();
+  nlohmann::json required = nlohmann::json::array();
+  nlohmann::json encoding = nlohmann::json::object();
+  for (const auto & part : parts) {
+    // A binary part is a schema-less property plus an encoding entry; anything
+    // else carries the schema the call site gave it.
+    properties[part.name] = part.schema.empty() ? nlohmann::json::object() : part.schema;
+    if (!part.description.empty()) {
+      properties[part.name]["description"] = part.description;
+    }
+    if (part.required) {
+      required.push_back(part.name);
+    }
+    if (!part.content_type.empty()) {
+      encoding[part.name]["contentType"] = part.content_type;
+    }
+  }
+  nlohmann::json schema{{"type", "object"}, {"properties", properties}};
+  if (!required.empty()) {
+    schema["required"] = required;
+  }
+  request_body_ = RequestBodyInfo{desc, schema, "multipart/form-data"};
+  multipart_encoding_ = std::move(encoding);
+  return *this;
+}
+
+RouteEntry & RouteEntry::accepts(const std::string & content_type, const nlohmann::json & schema) {
+  // No description: it is the primary body's, since this is the same payload in
+  // another encoding. Read from request_body_ at emission time rather than
+  // restated here, so the two cannot disagree.
+  extra_bodies_.push_back(RequestBodyInfo{std::string{}, schema, content_type});
   return *this;
 }
 
@@ -234,6 +286,41 @@ RouteEntry & RouteEntry::success_description(const std::string & desc) {
       info.desc = desc;
     }
   }
+  return *this;
+}
+
+RouteEntry & RouteEntry::success_schema(const nlohmann::json & schema) {
+  ResponseInfo * target = nullptr;
+  for (auto & [code, info] : responses_) {
+    if (code >= 200 && code < 300) {
+      if (target != nullptr) {
+        // Two success responses and no way to know which one this describes.
+        // No assert - Release build - so record it and let the startup check
+        // report it rather than picking one at random.
+        success_schema_without_single_2xx_ = true;
+        return *this;
+      }
+      target = &info;
+    }
+  }
+  if (target == nullptr) {
+    success_schema_without_single_2xx_ = true;
+    return *this;
+  }
+  // A schema can only describe a body a JSON Schema can describe. The JSON
+  // default (no declared media types) always qualifies; a declared set does
+  // only when every entry carries a JSON document, which is true of an SSE
+  // frame and false of a binary download.
+  const bool describable =
+      target->content_types.empty() ||
+      std::all_of(target->content_types.begin(), target->content_types.end(), [](const std::string & mt) {
+        return media_type_carries_a_json_document(mt);
+      });
+  if (!describable) {
+    success_schema_without_single_2xx_ = true;
+    return *this;
+  }
+  target->schema = schema;
   return *this;
 }
 
@@ -498,9 +585,14 @@ RouteEntry & RouteRegistry::sse(const std::string & openapi_path,
   entry.gate_ = gate;
   // Declared with the media type cpp-httplib is handed two lines above, so the
   // document and the wire come from one fact rather than from a summary string
-  // containing the word "stream". No frame schema: the three SSE families
-  // (trigger events, subscription data, fault notifications) put different
-  // shapes in `data:`, so a single schema here would be wrong for two of them.
+  // containing the word "stream".
+  //
+  // No frame schema here, because the three SSE families (trigger events,
+  // subscription data, fault notifications) put different shapes in `data:` and
+  // one schema would be wrong for two of them. Each family attaches its own on
+  // the returned RouteEntry with `.success_schema<T>()`, which replaces this
+  // response's schema and leaves the status, description and the two headers
+  // below untouched; this helper cannot know which family it is registering.
   entry.response(200, "Server-Sent Events stream", nlohmann::json{}, {"text/event-stream"});
   // Declared here, next to the `set_header` calls above, because that is what
   // stops the two from drifting: the framework owns these headers, so no SSE
@@ -893,6 +985,17 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       if (!route.request_body_->schema.empty()) {
         operation["requestBody"]["content"][ct]["schema"] = route.request_body_->schema;
       }
+      if (!route.multipart_encoding_.empty()) {
+        operation["requestBody"]["content"][ct]["encoding"] = route.multipart_encoding_;
+      }
+      // Further encodings of the same payload (the auth endpoints' RFC 6749
+      // form encoding). Merged into the same content object, because they are
+      // alternative representations of one body rather than separate bodies.
+      for (const auto & extra : route.extra_bodies_) {
+        if (!extra.schema.empty()) {
+          operation["requestBody"]["content"][extra.content_type]["schema"] = extra.schema;
+        }
+      }
       operation["requestBody"]["required"] = true;
     }
 
@@ -909,11 +1012,19 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
             operation["responses"][code_str]["content"]["application/json"]["schema"] = info.schema;
           }
         } else {
-          // Non-JSON body: one `content` entry per media type, each an empty
-          // Media Type Object. The absent schema is the point, not an omission
-          // - see RouteEntry::response(status, desc, schema, content_types).
+          // Non-JSON body: one `content` entry per media type. Normally an
+          // empty Media Type Object - the absent schema is the point, not an
+          // omission, see RouteEntry::response(status, desc, schema,
+          // content_types). The exception is a media type whose body IS a JSON
+          // document: an SSE frame's `data:` field has a shape worth
+          // publishing, and `response()` only kept a schema here after
+          // checking that.
           for (const auto & media_type : info.content_types) {
-            operation["responses"][code_str]["content"][media_type] = nlohmann::json::object();
+            auto & media = operation["responses"][code_str]["content"][media_type];
+            media = nlohmann::json::object();
+            if (!info.schema.empty()) {
+              media["schema"] = info.schema;
+            }
           }
         }
         for (const auto & header : info.headers) {
@@ -935,8 +1046,15 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
         operation["responses"][code] = {{"$ref", "#/components/responses/" + component}};
       }
     };
-    auto add_error_ref = [&add_response_ref](const std::string & code) {
-      add_response_ref(code, "GenericError");
+    // Which error body this route puts on the wire is already a per-route fact:
+    // `error_renderer_` is what `write_typed_error` dispatches on. Reading it
+    // here is what stops the document claiming a SOVD GenericError on the three
+    // routes that answer RFC 6749 instead. Everything the middleware owns
+    // (401/403/429) keeps its own component below - those never reach a handler,
+    // so the route's renderer has no say in them.
+    const bool oauth2 = route.error_renderer_ && *route.error_renderer_ == ErrorRenderer::kOAuth2Error;
+    auto add_error_ref = [&add_response_ref, oauth2](const std::string & code) {
+      add_response_ref(code, oauth2 ? "OAuth2Error" : "GenericError");
     };
 
     for (int code : route.declared_errors_) {
@@ -1005,7 +1123,15 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
     // unlike the statuses derived from recorded runs, this declaration is a
     // framework-level constant, pinned by
     // RouteRegistryTest.EveryDocumentedRouteDeclaresTheFrameworkAnsweredRangeRejection.
-    add_error_ref("416");
+    //
+    // add_response_ref, not add_error_ref: this body does not come from the
+    // route's own renderer. cpp-httplib writes 416 with no body, and
+    // `RESTServer::setup_global_error_handlers` fills every body-less error
+    // response with a GenericError - including on the `/auth/*` routes, whose
+    // handler-returned errors are RFC 6749. Routing it through the renderer
+    // would document the one status those routes answer in the SOVD shape as
+    // an OAuth2Error.
+    add_response_ref("416", "GenericError");
 
     // Peer aggregation. When an entity turns out to belong to a peer, the
     // request is proxied inside `validate_entity_for_route`, and the statuses
@@ -1168,6 +1294,16 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
       issues.push_back({ValidationIssue::Severity::kError, route_id,
                         "response_header() targeted undeclared status " + std::to_string(code) +
                             "; declare the status first (success statuses come from the return type)"});
+    }
+
+    // success_schema() replaces the body shape of the one declared 2xx. With no
+    // 2xx, or with several, there is nothing unambiguous to replace, so the call
+    // was dropped and the route still publishes the schema derived from its
+    // return type - the opposite of what the call site asked for.
+    if (route.success_schema_without_single_2xx_) {
+      issues.push_back({ValidationIssue::Severity::kError, route_id,
+                        "success_schema() was dropped: the route declares no single 2xx to attach to, or "
+                        "that 2xx carries a media type no JSON Schema can describe"});
     }
 
     // Check response schemas for non-DELETE methods

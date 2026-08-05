@@ -87,18 +87,10 @@ inline constexpr auto dto_fields<ScriptMetadata> =
 template <>
 inline constexpr std::string_view dto_name<ScriptMetadata> = "ScriptMetadata";
 
-// =============================================================================
-// Collection<ScriptMetadata> - named "ScriptMetadataList".
-//
-// Wire shape: {"items": [<ScriptMetadata>, ...]}
-//
-// Retained in the registry because the generic Collection<T> visitor stamps it
-// onto the OpenAPI schema. The wire-facing list endpoint actually emits the
-// `ScriptList` wrapper below so the `_links` envelope is typed instead of
-// free-form JSON.
-// =============================================================================
-template <>
-inline constexpr std::string_view dto_name<Collection<ScriptMetadata>> = "ScriptMetadataList";
+// `Collection<ScriptMetadata>` deliberately has no dto_name and no AllDtos
+// entry. It used to publish a `ScriptMetadataList` schema no operation could
+// return: the list endpoint emits the `ScriptList` wrapper below, whose
+// `_links` envelope is typed rather than free-form.
 
 // =============================================================================
 // ScriptList - GET /{entity}/scripts response with typed HATEOAS envelope.
@@ -212,6 +204,47 @@ inline constexpr auto dto_fields<ScriptControlRequest> =
 
 template <>
 inline constexpr std::string_view dto_name<ScriptControlRequest> = "ScriptControlRequest";
+
+// =============================================================================
+// ScriptExecutionRequest - POST request body for
+// /{entity}/scripts/{script_id}/executions.
+//
+// Wire keys (from ScriptHandlers::start_execution, which parses the body by
+// hand through the framework escape hatch so it can keep its own 400 messages):
+//   execution_type     - required, non-empty string
+//   parameters         - optional, forwarded to the provider untouched
+//   proximity_response - optional string, read only when it is a string
+//
+// Uses plain field() (NOT field_enum) on execution_type. Nothing here rejects
+// anything: this route is the body-less typed `post` and start_execution parses
+// by hand, so no JsonReader ever walks this descriptor and the read-time
+// enforcement field_enum performs elsewhere cannot fire. The descriptor is
+// documentation, and that is exactly the reason - a closed enum would *publish*
+// a vocabulary as complete when it is not. The value goes to the ScriptProvider
+// verbatim and each backend decides its own; DefaultScriptProvider checks it
+// against `ScriptConfig::supported_execution_types` (shipped default: {"now"})
+// and a plugin answers for its own set. Same reasoning as the fault-trigger
+// DTOs, whose raw() routes are documentation-only for the same reason.
+// =============================================================================
+struct ScriptExecutionRequest {
+  std::string execution_type;
+  std::optional<nlohmann::json> parameters;
+  std::optional<std::string> proximity_response;
+};
+
+template <>
+inline constexpr auto dto_fields<ScriptExecutionRequest> = std::make_tuple(
+    field("execution_type", &ScriptExecutionRequest::execution_type,
+          "When to run. The shipped backend accepts only `now`; a ScriptProvider plugin defines its own "
+          "vocabulary and answers 400 for a value it does not support."),
+    field("parameters", &ScriptExecutionRequest::parameters,
+          "Input parameters, forwarded to the provider untouched. The accepted shape is the script's own - "
+          "read `parameters_schema` on `GET /{entity_type}/{entity_id}/scripts/{script_id}`."),
+    field("proximity_response", &ScriptExecutionRequest::proximity_response,
+          "Operator's answer to a proximity prompt, for scripts that require physical presence."));
+
+template <>
+inline constexpr std::string_view dto_name<ScriptExecutionRequest> = "ScriptExecutionRequest";
 
 }  // namespace dto
 }  // namespace ros2_medkit_gateway

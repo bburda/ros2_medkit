@@ -134,5 +134,42 @@ inline constexpr auto dto_fields<AuthRevokeResponse> = std::make_tuple(field("st
 template <>
 inline constexpr std::string_view dto_name<AuthRevokeResponse> = "AuthRevokeResponse";
 
+// =============================================================================
+// OAuth2Error - RFC 6749 section 5.2 error body. Deliberately NOT the SOVD
+// GenericError shape.
+//
+// Two emitters put these exact two keys on the wire, and both used to be
+// documented as a GenericError:
+//   * the /auth/* routes, via `write_oauth2_error`
+//     (core/http/detail/primitives.cpp), selected by
+//     `.error_renderer(kOAuth2Error)` on the registration; and
+//   * AuthMiddleware, whose 401 (`invalid_token`) and 403
+//     (`insufficient_scope`) both serialise `AuthErrorResponse::to_json()`
+//     = {error, error_description} ahead of any handler, on every route.
+//
+// So this shape is not confined to the auth endpoints: with authentication on,
+// it is what any route answers when the token is missing or under-scoped.
+// =============================================================================
+// `error_description` is required, not optional. RFC 6749 leaves it optional,
+// but both emitters set it unconditionally - `write_oauth2_error` from
+// `ErrorInfo::message`, `AuthErrorResponse::to_json()` from its own member - so
+// declaring it optional would tell a client to handle an absence this gateway
+// cannot produce.
+struct OAuth2Error {
+  std::string error;
+  std::string error_description;
+};
+
+template <>
+inline constexpr auto dto_fields<OAuth2Error> =
+    std::make_tuple(field("error", &OAuth2Error::error,
+                          "RFC 6749 error code, e.g. `invalid_grant`, `invalid_request`, `unsupported_grant_type`, "
+                          "`invalid_token`, `insufficient_scope`, `server_error`."),
+                    field("error_description", &OAuth2Error::error_description,
+                          "Human-readable cause. Always present, though RFC 6749 permits its absence."));
+
+template <>
+inline constexpr std::string_view dto_name<OAuth2Error> = "OAuth2Error";
+
 }  // namespace dto
 }  // namespace ros2_medkit_gateway

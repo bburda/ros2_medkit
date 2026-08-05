@@ -108,6 +108,11 @@ constexpr const char * ERR_X_MEDKIT_SUBSCRIBE_FAILED = "x-medkit-subscribe-faile
 /// Concurrent cold-wait pool saturation; retry with backoff
 constexpr const char * ERR_X_MEDKIT_COLD_WAIT_CAP_EXCEEDED = "x-medkit-cold-wait-cap-exceeded";
 
+/// A cyclic subscription's resource sampler could not produce a value this
+/// tick. Delivered inside an SSE frame's `error` object, never as an HTTP
+/// status: the stream stays open and the next tick is retried.
+constexpr const char * ERR_X_MEDKIT_RESOURCE_SAMPLE_FAILED = "x-medkit-resource-sample-failed";
+
 /// Software update package not found
 constexpr const char * ERR_X_MEDKIT_UPDATE_NOT_FOUND = "x-medkit-update-not-found";
 

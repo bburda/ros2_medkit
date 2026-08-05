@@ -401,6 +401,27 @@ any error branch via the route's configured ``ErrorRenderer``
 (``kSovdGenericError`` by default; the ``/auth/*`` routes opt into
 ``kOAuth2Error`` to emit the RFC 6749 wire shape).
 
+The document reads the same field. ``to_openapi_paths()`` selects between the
+``GenericError`` and ``OAuth2Error`` component responses from
+``route.error_renderer_``, so the declared error body and the rendered one come
+from one fact rather than from a hand-written list that can go stale. Three
+statuses deliberately bypass that selection, because they are not produced by
+the route's renderer at all:
+
+- **416** is written by cpp-httplib before routing, with no body, and
+  ``RESTServer::setup_global_error_handlers`` fills it with a ``GenericError``.
+  That happens on the ``/auth/*`` routes too, so 416 is declared as a
+  ``GenericError`` everywhere.
+- **401 / 403** come from ``AuthMiddleware``, also ahead of any handler. Both
+  serialise ``AuthErrorResponse::to_json()`` = ``{error, error_description}``,
+  which is the RFC 6749 shape - so the shared ``Unauthorized`` and ``Forbidden``
+  component responses carry the ``OAuth2Error`` schema on every route, not just
+  the auth ones. They keep their own components because only there can their
+  ``WWW-Authenticate`` header live: no handler return type produces it.
+
+``RateLimited`` (429) stays a ``GenericError``: the limiter emits the SOVD
+shape, unlike the two auth statuses beside it.
+
 Type-System Guarantees
 ~~~~~~~~~~~~~~~~~~~~~~
 
@@ -435,6 +456,19 @@ To author the prose a generated client shows for a success response, use
 already-derived 2xx and touches neither the status nor the schema. Without it
 the framework publishes a status-appropriate default ("Created", "Accepted",
 "No content", "Successful response").
+
+Its sibling ``.success_schema<T>()`` rewrites the *schema* of the already-derived
+2xx, again leaving the status and the description alone. It exists for the few
+routes whose C++ return type is a pass-through envelope
+(``FaultListResult`` and friends) purely so a backend's JSON survives
+byte-for-byte, while the wire shape on that particular route is nonetheless
+fixed. ``GET /faults`` is the shipped example: it returns ``FaultListResult`` so
+the FaultManager's items and the peers' merged items are never re-parsed, and it
+publishes ``FaultList`` because - unlike the per-entity list - it has no
+plugin-delegation branch and can only ever answer with that shape. Using it on a
+route that *does* delegate to a plugin would promise fields no plugin sends.
+A call that finds no single declared 2xx is dropped and reported by
+``validate_completeness()``.
 
 Routes whose handler genuinely returns a ``std::variant`` - the
 ``post_alternates`` / ``del_alternates`` helpers - legitimately declare more
@@ -832,8 +866,45 @@ remain compile-time-checked at their boundary.
   Used by the fault SSE stream and by cyclic-subscription event streams. The
   helper declares ``text/event-stream`` on the 200 from the same string it
   hands cpp-httplib, and declares **no** frame schema: the three SSE families
-  put different shapes in ``data:``, so one schema would be wrong for two of
-  them.
+  put different shapes in ``data:``, so one schema *here* would be wrong for
+  two of them. Each registration names its own with
+  ``.success_schema<dto::XxxEventFrame>()``, which replaces the schema of the
+  already-declared 200 and leaves its ``Cache-Control`` /
+  ``X-Accel-Buffering`` headers standing - a second ``response(200, ...)``
+  would replace the whole response object and drop them.
+
+  The three families and the code each schema has to agree with:
+
+  .. list-table::
+     :header-rows: 1
+     :widths: 30 30 40
+
+     * - DTO
+       - Built by
+       - Shape
+     * - ``TriggerEventFrame``
+       - ``TriggerManager``
+       - ``{timestamp, payload}``; no error branch, because a frame exists only
+         when the condition fired
+     * - ``SubscriptionEventFrame``
+       - ``SubscriptionTransportProvider::make_sse_stream``
+       - ``{timestamp, payload | error}``; a failed sample reports and the
+         stream stays open
+     * - ``FaultStreamEvent``
+       - ``SSEFaultHandler::format_sse_event``
+       - ``{event_type, fault, timestamp, x-medkit?}``; no ``payload`` key at
+         all, and ``timestamp`` is epoch seconds where the other two send an
+         ISO 8601 string
+
+  A schema against ``text/event-stream`` is legitimate because a ``data:``
+  field *is* a JSON document. ``response()`` decides that per media type
+  (``media_type_carries_a_json_document``) rather than allowing it wholesale,
+  so a binary download still cannot acquire one - see ``binary_download``
+  below. Neither schema covers the non-JSON lines a stream also emits:
+  ``:keepalive`` comments, and the ``id:`` / ``event:`` fields the fault stream
+  sets. The fault stream declares the matching ``Last-Event-ID`` request
+  header, without which its frame ids are a number clients can see and cannot
+  use.
 - ``reg.binary_download(path, handler, media_types)`` - registers a range-aware
   binary download. The handler returns a ``Result<http::BinaryResponse>``
   carrying ``provider``, ``content_type``, ``filename``, ``supports_ranges``,
@@ -854,6 +925,18 @@ remain compile-time-checked at their boundary.
   ``Result<std::pair<TResponse, http::ResponseAttachments>>``. Uploads declare
   201 through ``TResponse`` (``http::Created<dto::BulkDataDescriptor>``) and use
   the attachments only for the ``Location`` header. Used by bulk-data POST/PUT.
+
+  The *request* half has to be declared at the call site with
+  ``.multipart_body(desc, parts)``: the helper cannot see which parts a handler
+  looks up in ``MultipartBody.parts``, so without it the body is the
+  ``{"type": "object", "additionalProperties": true}`` placeholder the helper
+  installs - a body no generated client can build. Each ``MultipartPart`` names
+  the part, says whether the handler rejects the request without it, and carries
+  either a schema (a textual part such as ``metadata``) or an empty schema plus
+  a ``content_type`` (a binary part such as ``file``). The empty schema is
+  deliberate: OpenAPI 3.1 describes a binary part through
+  ``encoding.<part>.contentType``, having dropped ``format: binary`` with the
+  rest of the pre-JSON-Schema-2020-12 vocabulary.
 - ``reg.static_asset(path, handler)`` - serves bytes already in memory
   (Swagger UI bundles, embedded HTML/JS/CSS) as
   ``Result<http::StaticAsset>`` carrying ``bytes``, ``content_type``, and
@@ -942,11 +1025,38 @@ The typed envelopes - ``FaultListResult``, ``FaultDetailResult``,
 ``FaultClearResult``, the corresponding ``Data*Result`` and ``Operation*Result``
 shapes, and ``UpdateProvider::get_update``'s typed return - wrap an opaque
 ``content`` payload so the wire bytes are byte-identical to the pre-typed
-ABI: ``JsonWriter`` emits the ``content`` object verbatim, ``SchemaWriter``
-publishes ``x-medkit-opaque: true``, and JsonReader accepts any JSON object
-on round-trip. This keeps backend-specific shapes (UDS DTC records, OPC-UA
-alarm metadata, vendor extensions) flowing through unchanged while pinning
-the envelope itself to a single typed contract.
+ABI: ``JsonWriter`` emits the ``content`` object verbatim and JsonReader
+accepts any JSON object on round-trip. This keeps backend-specific shapes
+(UDS DTC records, OPC-UA alarm metadata, vendor extensions) flowing through
+unchanged while pinning the envelope itself to a single typed contract.
+
+What their ``SchemaWriter`` publishes is *not* uniformly
+``{type: object, x-medkit-opaque: true}``. An envelope on a route that also
+serves ROS 2-backed entities has a known shape for exactly those entities, and
+publishing the bare object schema told a client nothing about either branch. So
+those envelopes publish an ``anyOf``: the in-tree DTO first, the opaque
+plugin branch last, with a schema-level ``description`` naming
+``x-medkit.source`` as the way a client tells the two apart before calling.
+``FaultListResult`` (``FaultList`` | ``FaultListAggregated`` | plugin),
+``FaultDetailResult`` (``FaultDetail`` | plugin) and ``DataListResult``
+(``DataList`` | plugin) are the three. Envelopes with no in-tree named shape -
+``FaultClearResult``, ``DataValue``, ``OperationExecutionResult`` - stay a plain
+opaque object and carry a ``description`` saying who decides the shape and where
+a client discovers it. Every named schema needs *some* prose for that reason;
+``test_openapi_contract`` fails a content-free schema that carries none.
+
+``UpdateDetail`` and ``UpdateRegisterRequest`` show the third variant: their
+``SchemaWriter`` publishes real ``properties`` while ``JsonWriter`` and
+``JsonReader`` stay pass-through. Nothing round-trips through the descriptor,
+so the vendor extensions a backend stores (Uptane TUF metadata, component
+lists) survive untouched, and ``additionalProperties: true`` keeps them legal.
+The two are typed from different sources, because the standard treats them
+differently: ``UpdateDetail`` gets SOVD's attribute table (ISO 17978-3
+section 7.18), since SOVD fixes the response shape; ``UpdateRegisterRequest``
+declares only ``id`` - the sole field ``post_update`` validates - because SOVD
+leaves the register *request* manufacturer-specific. Transplanting the response
+table onto the request would document a validation the gateway does not
+perform.
 
 Commercial plugins (UDS, OPC-UA, Uptane OTA, ...) implement the typed
 interface directly. Out-of-tree plugins that previously returned raw
@@ -1033,7 +1143,12 @@ The published ``openapi.json`` is assembled mechanically from two sources:
 
 - ``components/schemas`` is exactly ``collect_component_schemas<AllDtos>()`` -
   one entry per DTO listed in ``dto/registry.hpp``, with no hand-written
-  survivors merged in.
+  survivors merged in. Membership of ``AllDtos`` is therefore a publishing
+  decision, not a bookkeeping one: a DTO that exists only to type a plugin ABI
+  (``DataWriteResult``, the return type of ``DataProvider::write_data``, which
+  no route answers with) or that a route stopped returning
+  (``Collection<ScriptMetadata>``, superseded by ``ScriptList``) must be left
+  out, or every generated client materialises a type it can never receive.
 - ``paths`` is ``RouteRegistry::to_openapi_paths()``: every typed route
   contributes a path item with ``$ref`` entries auto-derived from its
   ``TResponse`` / ``TBody`` template parameters plus any tags, summary,
@@ -1050,6 +1165,21 @@ The published ``openapi.json`` is assembled mechanically from two sources:
 hand-written ``paths`` items in the published spec, and no hand-written schema
 blocks in ``components/schemas``. Adding a route or a DTO field updates the
 spec on the next process start with no schema-side edit.
+
+Because the two blocks are compiled independently, they can drift apart: a DTO
+can sit in ``AllDtos`` while no route's ``$ref`` chain reaches it.
+``openapi::unreachable_schemas(document)``
+(``core/openapi/document_checks.hpp``) closes that gap. It walks every ``$ref``
+an operation makes, follows the chain through ``components/responses`` and
+through each reached schema, and returns the names nothing arrives at.
+``CapabilityGenerator::generate_root()`` runs it over the assembled document and
+logs a warning naming the orphans;
+``test_openapi_contract::test_no_unreachable_schemas`` is what turns a suite red.
+It is deliberately a free function over the finished document rather than a rule
+in ``RouteRegistry::validate_completeness()``: the registry sees routes and has
+no visibility of either component block, so only the assembled document can
+answer the question. Its unit tests are ``test_schema_reachability``, which
+links ``gateway_core`` - the function touches no ROS type.
 
 Optional fields are now emitted as ``anyOf: [<inner>, {type: "null"}]``
 (OpenAPI 3.1 idiom) so generated clients see ``T | null`` rather than

@@ -283,10 +283,27 @@ template <>
 inline constexpr std::string_view dto_name<FaultDetail> = "FaultDetail";
 
 // =============================================================================
-// Collection<FaultListItem> - named "FaultList"
+// Collection<FaultListItem, FaultListXMedkit> - named "FaultList"
+//
+// The x-medkit member is FaultListXMedkit, not the generic XMedkitCollection:
+// every fault-list emitter writes a FaultListXMedkit (count / muted_count /
+// cluster_count / ...) and none of them writes XMedkitCollection's
+// total_count + contributors. Naming the generic one here published a
+// vendor-extension object the gateway has never sent.
 // =============================================================================
 template <>
-inline constexpr std::string_view dto_name<Collection<FaultListItem>> = "FaultList";
+inline constexpr std::string_view dto_name<Collection<FaultListItem, FaultListXMedkit>> = "FaultList";
+
+// =============================================================================
+// Collection<FaultListItem, FaultListAggXMedkit> - named "FaultListAggregated"
+//
+// The per-entity list emits this instead of FaultList when the entity spans
+// several reporting sources (Function / Component / Area branches of
+// handle_list_faults): same items, a different vendor extension carrying the
+// aggregation level and the source FQNs.
+// =============================================================================
+template <>
+inline constexpr std::string_view dto_name<Collection<FaultListItem, FaultListAggXMedkit>> = "FaultListAggregated";
 
 // =============================================================================
 // FaultListResult - typed envelope around the plugin-defined fault list
@@ -337,7 +354,25 @@ struct JsonReader<FaultListResult> {
 template <>
 struct SchemaWriter<FaultListResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"description",
+         "Fault list whose shape depends on who owns the entity. An entity backed by the ROS 2 graph "
+         "answers with `FaultList`, or with `FaultListAggregated` when the entity spans several reporting "
+         "sources. A plugin-owned entity answers with whatever its FaultProvider returns and the gateway "
+         "emits that verbatim. Which branch applies is discoverable ahead of the call: `x-medkit.source` on "
+         "the entity's own document (`GET /{entity_type}/{entity_id}`) reads `plugin` for a plugin-owned "
+         "entity."},
+        {"anyOf",
+         nlohmann::json::array({nlohmann::json{{"$ref", "#/components/schemas/FaultList"}},
+                                nlohmann::json{{"$ref", "#/components/schemas/FaultListAggregated"}},
+                                nlohmann::json{{"title", "PluginFaultList"},
+                                               {"type", "object"},
+                                               {"additionalProperties", true},
+                                               {"x-medkit-opaque", true},
+                                               {"description",
+                                                "Plugin-defined list. A UDS backend adds DTC status bytes and "
+                                                "snapshot record references; an OPC-UA backend adds node references "
+                                                "and severity metadata. Read the plugin's own documentation."}}})}};
   }
 };
 
@@ -397,7 +432,23 @@ struct JsonReader<FaultDetailResult> {
 template <>
 struct SchemaWriter<FaultDetailResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"description",
+         "One fault whose shape depends on who owns the entity. An entity backed by the ROS 2 graph answers "
+         "with `FaultDetail` (SOVD `item` + `environment_data` + `x-medkit`). A plugin-owned entity answers "
+         "with whatever its FaultProvider returns and the gateway emits that verbatim. Which branch applies "
+         "is discoverable ahead of the call: `x-medkit.source` on the entity's own document "
+         "(`GET /{entity_type}/{entity_id}`) reads `plugin` for a plugin-owned entity."},
+        {"anyOf",
+         nlohmann::json::array({nlohmann::json{{"$ref", "#/components/schemas/FaultDetail"}},
+                                nlohmann::json{{"title", "PluginFaultDetail"},
+                                               {"type", "object"},
+                                               {"additionalProperties", true},
+                                               {"x-medkit-opaque", true},
+                                               {"description",
+                                                "Plugin-defined fault. Backends carry DTC environment records, "
+                                                "snapshot blobs or vendor extended status here. Read the plugin's "
+                                                "own documentation."}}})}};
   }
 };
 
@@ -457,7 +508,16 @@ struct JsonReader<FaultClearResult> {
 template <>
 struct SchemaWriter<FaultClearResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"type", "object"},
+        {"additionalProperties", true},
+        {"x-medkit-opaque", true},
+        {"description",
+         "Acknowledgement of a clear, shaped by whoever owns the entity. The ROS 2 path answers "
+         "`{\"code\": <fault_code>, \"cleared\": true}`; a plugin answers with its backend's own "
+         "acknowledgement - UDS clear response codes, vendor warnings, residual fault state - and the "
+         "gateway emits it verbatim. Treat the 2xx status, not a body field, as the signal that the clear "
+         "succeeded."}};
   }
 };
 
