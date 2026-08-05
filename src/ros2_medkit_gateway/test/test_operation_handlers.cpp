@@ -334,6 +334,12 @@ class OperationHandlersFixtureTest : public ::testing::Test {
 
     action_server_node_ = std::make_shared<TestLongCalibrationActionServer>();
 
+    // Before the executor spins. `PluginManager::add_plugin` writes `plugins_`
+    // without taking the lock its readers hold, because it is documented as
+    // init-only - and once a thread is spinning, the log-observer read of that
+    // same vector races the write.
+    seed_plugin_entity();
+
     executor_ = std::make_unique<rclcpp::executors::MultiThreadedExecutor>();
     executor_->add_node(gateway_node_);
     executor_->add_node(service_node_);
@@ -360,7 +366,6 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     ASSERT_TRUE(wait_for_discovery_settled(base_generation))
         << "action/service discovery did not settle before seeding";
     seed_component_cache();
-    seed_plugin_entity();
   }
 
   void TearDown() override {
@@ -452,6 +457,26 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     area.namespace_path = "/powertrain";
     area.source = "manifest";
 
+    // A second aggregate that does NOT contain `engine`, and that has an
+    // operation of its own so `resolve_entity_operations` succeeds for it. An
+    // empty area would 404 for want of operations and would prove nothing
+    // about who may address whose execution.
+    Component brakes;
+    brakes.id = "brakes";
+    brakes.name = "Brakes";
+    brakes.namespace_path = "/chassis/brakes";
+    brakes.fqn = "/chassis/brakes";
+    brakes.area = "chassis";
+    brakes.source = "manifest";
+    brakes.actions = {ActionInfo{"long_calibration", "/chassis/brakes/long_calibration",
+                                 "example_interfaces/action/Fibonacci", std::nullopt}};
+
+    Area chassis;
+    chassis.id = "chassis";
+    chassis.name = "Chassis";
+    chassis.namespace_path = "/chassis";
+    chassis.source = "manifest";
+
     Component plugin_ecu;
     plugin_ecu.id = MockOperationPlugin::kEntityId;
     plugin_ecu.name = "Plugin ECU";
@@ -460,7 +485,7 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     plugin_ecu.source = "plugin";
 
     auto & cache = const_cast<ThreadSafeEntityCache &>(gateway_node_->get_thread_safe_cache());
-    cache.update_all({area}, {component, gearbox, plugin_ecu}, {}, {});
+    cache.update_all({area, chassis}, {component, gearbox, brakes, plugin_ecu}, {}, {});
   }
 
   /// Give the plugin ECU an owner, so the handlers route it to the provider.
@@ -620,6 +645,73 @@ TEST_F(OperationHandlersFixtureTest, ListExecutionsResolvesAQualifiedIdToItsMemb
   ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
   ASSERT_EQ(result->items.size(), 1u);
   EXPECT_EQ(result->items[0].id, execution_id);
+}
+
+// A collection that hands out an id its own item routes reject is worse than
+// one that hides the execution: the client did everything right and still gets
+// "not found". Reading the collection and following what it returned is the
+// only way to catch that, so this asserts on the id the previous case listed
+// rather than on one the test built itself.
+// Parsing a member half proves only that the ADDRESSED entity aggregates. It
+// does not prove the member named is one of ITS members, and an execution is
+// not a global handle: reachable through the entity that started it, and
+// through an aggregate that actually contains that entity, and nowhere else.
+// Without the membership gate any aggregate could name someone else's owner
+// and read, stop or cancel their execution from an unrelated URI.
+TEST_F(OperationHandlersFixtureTest, AnUnrelatedAggregateCannotReachAnExecutionByNamingItsOwner) {
+  const auto execution_id = create_action_execution();
+  ASSERT_FALSE(execution_id.empty());
+
+  // `chassis` aggregates `brakes`, never `engine`, but it does aggregate - so
+  // the member half parses and only membership can refuse this.
+  const std::string intruder = "/api/v1/areas/chassis/operations/engine:long_calibration/executions/" + execution_id;
+  const char * pattern = R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions/([^/]+))";
+
+  auto get_req = make_request_with_match(intruder, pattern);
+  http::TypedRequest get_typed(get_req);
+  auto fetched = handlers_->get_execution(get_typed);
+  ASSERT_FALSE(fetched.has_value()) << "an unrelated aggregate read someone else's execution";
+  EXPECT_EQ(fetched.error().http_status, 404);
+
+  auto del_req = make_request_with_match(intruder, pattern);
+  http::TypedRequest del_typed(del_req);
+  auto cancelled = handlers_->cancel_execution(del_typed);
+  ASSERT_FALSE(cancelled.has_value()) << "an unrelated aggregate cancelled someone else's execution";
+  EXPECT_EQ(cancelled.error().http_status, 404);
+
+  // And the execution is untouched: the refusal must not be a side effect of
+  // having already killed it.
+  auto owner_req =
+      make_request_with_match("/api/v1/components/engine/operations/long_calibration/executions/" + execution_id,
+                              R"(/api/v1/components/([^/]+)/operations/([^/]+)/executions/([^/]+))");
+  http::TypedRequest owner_typed(owner_req);
+  EXPECT_TRUE(handlers_->get_execution(owner_typed).has_value()) << "the owner lost its own execution";
+}
+
+TEST_F(OperationHandlersFixtureTest, AQualifiedIdListedByTheCollectionAlsoResolvesOnTheItemRoutes) {
+  const auto execution_id = create_action_execution();
+  ASSERT_FALSE(execution_id.empty());
+
+  auto list_req = make_request_with_match("/api/v1/areas/powertrain/operations/engine:long_calibration/executions",
+                                          R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest list_typed(list_req);
+  auto listed = handlers_->list_executions(list_typed);
+  ASSERT_TRUE(listed.has_value()) << listed.error().code << ": " << listed.error().message;
+  ASSERT_EQ(listed->items.size(), 1u);
+  const std::string advertised_id = listed->items[0].id;
+
+  auto item_req =
+      make_request_with_match("/api/v1/areas/powertrain/operations/engine:long_calibration/executions/" + advertised_id,
+                              R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions/([^/]+))");
+  http::TypedRequest item_typed(item_req);
+
+  auto fetched = handlers_->get_execution(item_typed);
+  ASSERT_TRUE(fetched.has_value()) << "the collection advertised " << advertised_id << " but GET answered "
+                                   << fetched.error().code << ": " << fetched.error().message;
+  // `id` is only populated by the PUT response; the identity a GET carries is
+  // the tracked goal, so that is what has to be the execution we followed.
+  ASSERT_TRUE(fetched->x_medkit.has_value());
+  EXPECT_EQ(fetched->x_medkit->goal_id, advertised_id);
 }
 
 // A service answers inside its own call, so it never leaves an execution

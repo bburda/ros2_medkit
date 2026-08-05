@@ -408,6 +408,49 @@ dto::XMedkitOperationItem build_action_xmedkit(const ActionInfo & act, const std
   return x_medkit;
 }
 
+/// Look up a tracked action goal, and refuse it through any entity other than
+/// the one it was started on.
+///
+/// `ActionGoalInfo` carries the owning entity, so the check costs nothing -
+/// and without it a goal id is a global handle: an execution started on one
+/// app can be read, stopped and cancelled through a completely unrelated
+/// entity's URI, and `GET /apps/a/operations/x/executions/{id}` happily
+/// answers 200 for an execution belonging to a function. A caller that
+/// addresses the wrong entity gets the same "not found" it would get for a
+/// wrong id, which is the answer that keeps entity boundaries meaningful.
+tl::expected<ActionGoalInfo, ErrorInfo> owned_goal(const HandlerContext & ctx, OperationManager * operation_mgr,
+                                                   const std::string & entity_id, const std::string & operation_id,
+                                                   const std::string & execution_id) {
+  auto goal_info = operation_mgr->get_tracked_goal(execution_id);
+  if (goal_info.has_value()) {
+    if (goal_info->entity_id == entity_id) {
+      return *goal_info;
+    }
+    // The executions collection lists a goal under the member a qualified id
+    // names, so the item routes have to accept that same id: a client that
+    // reads the collection and follows an id it was handed must not be told
+    // the execution does not exist.
+    //
+    // `names_a_member` is the half that makes this safe, and the collection
+    // applies it too. Parsing a member half only proves the ADDRESSED entity
+    // aggregates - not that the member named is one of its members. Without
+    // this gate any aggregate could name the owner of someone else's goal and
+    // read, stop or cancel it from an unrelated URI.
+    const auto entity_info = ctx.get_entity_info(entity_id);
+    const auto & cache = ctx.node()->get_thread_safe_cache();
+    if (auto lookup = resolve_entity_operations(cache, entity_info.sovd_type(), entity_id)) {
+      const auto parsed = http::parse_member_qualified_id(operation_id, lookup->ops.is_aggregated);
+      if (parsed.has_member && names_a_member(lookup->ops, parsed.member_id) &&
+          goal_info->entity_id == parsed.member_id) {
+        return *goal_info;
+      }
+    }
+  }
+  return tl::make_unexpected(
+      make_error(404, ERR_RESOURCE_NOT_FOUND, "Execution not found",
+                 json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"execution_id", execution_id}}));
+}
+
 /// Map an `OperationProviderErrorInfo` (from the typed plugin ABI) into the
 /// SOVD `x-medkit-plugin-error` wire shape via `make_plugin_error`.
 ErrorInfo make_provider_error(const OperationProviderErrorInfo & info, const std::string & entity_id,
@@ -1195,6 +1238,12 @@ http::Result<dto::Collection<dto::ExecutionId>> OperationHandlers::list_executio
     }
   }
 
+  // The route is mounted on all four entity types, so the lookup has to cover
+  // all four. It used to reach for the component cache and then the app cache
+  // and 404 otherwise, which made an area or a function report that the entity
+  // did not exist - immediately after the same entity listed the operation.
+  // `resolve_entity_operations` is the same lookup `list_operations` uses, so
+  // the two endpoints now agree on what an entity's operations are.
   const auto & cache = ctx_.node()->get_thread_safe_cache();
   auto lookup = resolve_entity_operations(cache, entity_info.sovd_type(), entity_id);
   if (!lookup) {
@@ -1250,6 +1299,19 @@ http::Result<dto::Collection<dto::ExecutionId>> OperationHandlers::list_executio
   if (resolved.action.has_value()) {
     auto * operation_mgr = ctx_.node()->get_operation_manager();
     for (const auto & goal : operation_mgr->get_goals_for_action(resolved.action->full_path)) {
+      // An action reachable through several entities is one action with one
+      // set of goals, so the collection has to say whose executions it lists.
+      // `create_execution` records the goal under the entity the POST
+      // addressed, which is the aggregate when the caller started it through
+      // one; the same execution is also reachable under the member a
+      // qualified id names, because that member is how the caller selects it.
+      // Both readings are legitimate, so either match keeps the execution -
+      // testing only one of them empties the collection for the other.
+      const bool started_here = goal.entity_id == entity_id;
+      const bool started_on_the_named_member = parsed.has_member && goal.entity_id == parsed.member_id;
+      if (!started_here && !started_on_the_named_member) {
+        continue;
+      }
       dto::ExecutionId item;
       item.id = goal.goal_id;
       collection.items.push_back(std::move(item));
@@ -1297,11 +1359,9 @@ http::Result<dto::OperationExecution> OperationHandlers::get_execution(const htt
   }
 
   auto * operation_mgr = ctx_.node()->get_operation_manager();
-  auto goal_info = operation_mgr->get_tracked_goal(execution_id);
-  if (!goal_info.has_value()) {
-    return tl::make_unexpected(
-        make_error(404, ERR_RESOURCE_NOT_FOUND, "Execution not found",
-                   json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"execution_id", execution_id}}));
+  auto goal_info = owned_goal(ctx_, operation_mgr, entity_id, operation_id, execution_id);
+  if (!goal_info) {
+    return tl::make_unexpected(goal_info.error());
   }
 
   dto::OperationExecution exec_dto;
@@ -1371,11 +1431,9 @@ http::Result<http::NoContent> OperationHandlers::cancel_execution(const http::Ty
   }
 
   auto * operation_mgr = ctx_.node()->get_operation_manager();
-  auto goal_info = operation_mgr->get_tracked_goal(execution_id);
-  if (!goal_info.has_value()) {
-    return tl::make_unexpected(
-        make_error(404, ERR_RESOURCE_NOT_FOUND, "Execution not found",
-                   json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"execution_id", execution_id}}));
+  auto goal_info = owned_goal(ctx_, operation_mgr, entity_id, operation_id, execution_id);
+  if (!goal_info) {
+    return tl::make_unexpected(goal_info.error());
   }
 
   auto result = operation_mgr->cancel_action_goal(goal_info->action_path, execution_id);
@@ -1443,11 +1501,9 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
   const std::string capability = body.capability;
 
   auto * operation_mgr = ctx_.node()->get_operation_manager();
-  auto goal_info = operation_mgr->get_tracked_goal(execution_id);
-  if (!goal_info.has_value()) {
-    return tl::make_unexpected(
-        make_error(404, ERR_RESOURCE_NOT_FOUND, "Execution not found",
-                   json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"execution_id", execution_id}}));
+  auto goal_info = owned_goal(ctx_, operation_mgr, entity_id, operation_id, execution_id);
+  if (!goal_info) {
+    return tl::make_unexpected(goal_info.error());
   }
 
   // SOVD capabilities: execute, freeze, reset, stop. ROS 2 actions only
