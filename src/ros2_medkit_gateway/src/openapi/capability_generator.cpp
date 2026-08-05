@@ -14,18 +14,17 @@
 
 #include "capability_generator.hpp"
 
+#include <algorithm>
 #include <mutex>
+#include <optional>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "openapi_spec_builder.hpp"
 #include "path_builder.hpp"
 
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
-#include "ros2_medkit_gateway/core/http/member_qualified_id.hpp"
-#include "ros2_medkit_gateway/core/http/operation_item_id.hpp"
-#include "ros2_medkit_gateway/core/models/entity_capabilities.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
 #include "ros2_medkit_gateway/core/openapi/document_checks.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
@@ -36,14 +35,64 @@
 namespace ros2_medkit_gateway {
 namespace openapi {
 
+namespace {
+
+/// The one bearer-token scheme any document that mentions security refers to.
+/// The description is part of the definition because the name alone overstates
+/// what a given gateway does: `auth.enabled` decides whether the token is
+/// *checked*, and a document served by a gateway with it off would otherwise
+/// read as if it were.
+nlohmann::json bearer_scheme() {
+  return nlohmann::json{{"type", "http"},
+                        {"scheme", "bearer"},
+                        {"bearerFormat", "JWT"},
+                        {"description",
+                         "JWT bearer token. Where an operation carries a `security` requirement, the scope on that "
+                         "requirement is the role the gateway's permission table grants for its path, and an empty "
+                         "requirement (`security: []`) marks an operation reachable with no token at all. Whether "
+                         "any of it is enforced is a deployment setting: with `auth.enabled` off the gateway serves "
+                         "every operation unauthenticated, which is why this document carries no top-level "
+                         "`security` requirement in that configuration. With it on, `auth.require_auth_for` decides "
+                         "how much is checked - under `write` a GET is served without a token even though its "
+                         "operation names the role the table would grant."}};
+}
+
+/// Remove every per-operation `security` requirement from an assembled
+/// document, leaving the scheme definitions and the document-level
+/// requirement alone. Walks whatever `paths` contains, so it does not care
+/// which producer wrote an operation.
+void strip_per_operation_security(nlohmann::json & document) {
+  auto paths = document.find("paths");
+  if (paths == document.end() || !paths->is_object()) {
+    return;
+  }
+  for (auto & path_item : *paths) {
+    if (!path_item.is_object()) {
+      continue;
+    }
+    for (auto & operation : path_item) {
+      if (operation.is_object()) {
+        operation.erase("security");
+      }
+    }
+  }
+}
+
+}  // namespace
+
 CapabilityGenerator::CapabilityGenerator(handlers::HandlerContext & ctx, GatewayNode & node, PluginManager * plugin_mgr,
-                                         const RouteRegistry * route_registry)
-  : ctx_(ctx), node_(node), plugin_mgr_(plugin_mgr), route_registry_(route_registry), schema_builder_() {
+                                         const RouteRegistry * route_registry, DocsCacheBounds bounds)
+  : ctx_(ctx)
+  , node_(node)
+  , plugin_mgr_(plugin_mgr)
+  , route_registry_(route_registry)
+  , schema_builder_()
+  , bounds_(bounds) {
 }
 
 // TODO(#272): Fix TOCTOU race - use compare-and-swap when storing cached specs
 // TODO(#273): Use cache.snapshot() for consistent reads across multiple queries
-std::optional<nlohmann::json> CapabilityGenerator::generate(const std::string & base_path) const {
+std::optional<std::string> CapabilityGenerator::generate_serialized(const std::string & base_path) const {
   auto cache_key = get_cache_key(base_path);
   auto cached = lookup_cache(cache_key);
   if (cached.has_value()) {
@@ -51,13 +100,60 @@ std::optional<nlohmann::json> CapabilityGenerator::generate(const std::string & 
   }
 
   auto result = generate_impl(base_path);
-  if (result.has_value()) {
-    store_cache(cache_key, *result);
+  if (!result.has_value()) {
+    return std::nullopt;
   }
-  return result;
+
+  // `dump(2)` is exactly what `http::detail::write_json_body` applies to a
+  // document, so serializing here rather than at the writer leaves the bytes
+  // on the wire unchanged - and lets the cache hold them instead of a DOM.
+  auto document = result->dump(2);
+  store_cache(cache_key, document);
+  return document;
+}
+
+std::optional<nlohmann::json> CapabilityGenerator::generate(const std::string & base_path) const {
+  auto document = generate_serialized(base_path);
+  if (!document.has_value()) {
+    return std::nullopt;
+  }
+
+  // Non-throwing parse: handlers in this gateway report failure by value
+  // rather than by exception. The input is text this class just produced with
+  // `dump(2)`, so a parse failure would mean nlohmann cannot read back its own
+  // output; nullopt is then the only honest answer available here.
+  auto parsed = nlohmann::json::parse(*document, /*cb=*/nullptr, /*allow_exceptions=*/false);
+  if (parsed.is_discarded()) {
+    return std::nullopt;
+  }
+  return parsed;
 }
 
 std::optional<nlohmann::json> CapabilityGenerator::generate_impl(const std::string & base_path) const {
+  auto document = build_document(base_path);
+
+  // Applied once, here, over the finished document rather than inside any one
+  // producer - and that placement is the point.
+  //
+  // The rule is a property of the *gateway*, not of where an operation came
+  // from: this document is served from `/docs` by a running gateway and
+  // describes it, and `AuthManager::requires_authentication` returns false
+  // outright when `!config_.enabled` (`auth_manager.cpp:316-319`), so with
+  // authentication off every caller is admitted and no operation may publish a
+  // role. Two producers emit one - `RouteEntry::requires_role` through
+  // `RouteRegistry::to_openapi_paths()`, and a plugin's
+  // `OperationDesc::requires_role` through the fold - and both reach every
+  // `<entity-path>/docs` sub-document as well, because those are a projection
+  // of the same two. Putting the rule in either producer would have meant a
+  // second copy in the other. Here it sits after all of them, so a new one
+  // inherits it.
+  if (document.has_value() && !ctx_.auth_config().enabled) {
+    strip_per_operation_security(*document);
+  }
+  return document;
+}
+
+std::optional<nlohmann::json> CapabilityGenerator::build_document(const std::string & base_path) const {
   auto resolved = PathResolver::resolve(base_path);
 
   switch (resolved.category) {
@@ -103,6 +199,62 @@ std::optional<nlohmann::json> CapabilityGenerator::generate_impl(const std::stri
 // -----------------------------------------------------------------------------
 
 nlohmann::json CapabilityGenerator::generate_root() const {
+  std::vector<TagInfo> tags{
+      {"Server", "Gateway health, metadata, and version info"},
+      {"Discovery", "Entity discovery and hierarchy navigation"},
+      {"Data", "Read and write ROS 2 topic data"},
+      {"Operations", "Execute ROS 2 service and action operations"},
+      {"Configuration", "Read and write ROS 2 node parameters"},
+      {"Faults", "Fault management and diagnostics"},
+      {"Logs", "Application log access and configuration"},
+      {"Bulk Data", "Large file downloads (rosbags, snapshots)"},
+      {"Subscriptions", "Cyclic data subscriptions and event streaming"},
+      {"Triggers", "Event-driven condition monitoring and notifications"},
+      {"FaultTriggers", "Threshold rules on discovered data points that raise and auto-clear faults"},
+      {"Locking", "Entity lock management for exclusive access"},
+      {"Scripts", "Diagnostic script upload, execution, and management"},
+      {"Updates", "Software update management"},
+      {"Lifecycle", "Entity status and lifecycle control (start, restart, shutdown)"},
+      {"Authentication", "JWT-based authentication"},
+  };
+
+  const auto registry_paths = route_registry_ ? route_registry_->to_openapi_paths() : nlohmann::json::object();
+  const auto extension_paths = plugin_paths();
+
+  // A plugin picks its own tag, so the tag list cannot be a literal and stay
+  // complete - `test_health` and `test_openapi_contract` both fail on a tag an
+  // operation uses without the document declaring it. Collected from the
+  // operations themselves so the invariant holds for whatever a plugin
+  // chooses, rather than for the one tag the in-tree plugin happens to use.
+  for (const auto & [path, item] : extension_paths.items()) {
+    for (const auto & [method, operation] : item.items()) {
+      if (!operation.is_object()) {
+        continue;
+      }
+      // Walked rather than looked up with `find()`: GCC inlines the iterator
+      // dereference into a -Wnull-dereference false positive, the same one
+      // `route_registry.cpp` documents around its parameter scan, and the
+      // build treats it as an error.
+      for (const auto & [op_key, op_value] : operation.items()) {
+        if (op_key != "tags" || !op_value.is_array()) {
+          continue;
+        }
+        for (const auto & tag : op_value) {
+          if (!tag.is_string()) {
+            continue;
+          }
+          const auto & name = tag.get_ref<const std::string &>();
+          const bool already_declared = std::any_of(tags.begin(), tags.end(), [&name](const TagInfo & declared) {
+            return declared.name == name;
+          });
+          if (!already_declared) {
+            tags.push_back({name, "Vendor extension resources served by a gateway plugin"});
+          }
+        }
+      }
+    }
+  }
+
   OpenApiSpecBuilder builder;
   builder.info("ROS 2 Medkit Gateway", kGatewayVersion)
       .description(
@@ -111,34 +263,36 @@ nlohmann::json CapabilityGenerator::generate_root() const {
       .contact("selfpatch.ai", "https://selfpatch.ai")
       .sovd_version(kSovdVersion)
       .server(build_server_url(), "Gateway server")
-      .tags({
-          {"Server", "Gateway health, metadata, and version info"},
-          {"Discovery", "Entity discovery and hierarchy navigation"},
-          {"Data", "Read and write ROS 2 topic data"},
-          {"Operations", "Execute ROS 2 service and action operations"},
-          {"Configuration", "Read and write ROS 2 node parameters"},
-          {"Faults", "Fault management and diagnostics"},
-          {"Logs", "Application log access and configuration"},
-          {"Bulk Data", "Large file downloads (rosbags, snapshots)"},
-          {"Subscriptions", "Cyclic data subscriptions and event streaming"},
-          {"Triggers", "Event-driven condition monitoring and notifications"},
-          {"FaultTriggers", "Threshold rules on discovered data points that raise and auto-clear faults"},
-          {"Locking", "Entity lock management for exclusive access"},
-          {"Scripts", "Diagnostic script upload, execution, and management"},
-          {"Updates", "Software update management"},
-          {"Lifecycle", "Entity status and lifecycle control (start, restart, shutdown)"},
-          {"Authentication", "JWT-based authentication"},
-      });
+      .tags(tags)
+      .add_paths(registry_paths);
 
-  // Use route registry as single source of truth for paths when available
-  if (route_registry_) {
-    builder.add_paths(route_registry_->to_openapi_paths());
+  // Plugin-served routes are mounted on the same HTTP server as the
+  // registry's, so a client that cannot see them here has no other way to
+  // learn they exist. Merged after the registry's paths and never over them:
+  // a plugin pattern that shadows a gateway route is a routing defect, and
+  // silently replacing the gateway's description of that path would hide it.
+  for (const auto & [path, item] : extension_paths.items()) {
+    if (registry_paths.contains(path)) {
+      RCLCPP_WARN(handlers::HandlerContext::logger(),
+                  "Plugin describes path '%s', which the gateway already documents; keeping the gateway's "
+                  "description. The plugin's route is still mounted - check it is not shadowing a gateway route.",
+                  path.c_str());
+      continue;
+    }
+    builder.add_paths(nlohmann::json{{path, item}});
   }
 
-  const auto & auth_config = ctx_.auth_config();
-  if (auth_config.enabled) {
-    builder.security_scheme("bearerAuth", {{"type", "http"}, {"scheme", "bearer"}, {"bearerFormat", "JWT"}});
-  }
+  // Registered whether or not authentication is on. With it on, this is the
+  // scheme the per-operation requirements name - an operation cannot reference
+  // a scheme the document does not define. With it off there are no such
+  // requirements at all (`generate_impl` strips them from the assembled
+  // document), and the definition is kept anyway because a definition nothing
+  // references asserts nothing about this gateway - it only tells a reader
+  // what `bearerAuth` would mean.
+  //
+  // The *document-level* requirement - "every request needs a token" - is the
+  // part that would be untrue with `auth.enabled` off, so that stays gated.
+  builder.security_scheme("bearerAuth", bearer_scheme(), ctx_.auth_config().enabled);
 
   // Register named schemas in components/schemas for $ref usage.
   // Generated clients use these as named types (e.g., FaultDetail, Lock, Trigger).
@@ -176,40 +330,160 @@ nlohmann::json CapabilityGenerator::generate_root() const {
 }
 
 // -----------------------------------------------------------------------------
+// Sub-documents - a projection of the document the gateway serves
+//
+// Every `<entity-path>/docs` document below is a slice of `served_paths()`,
+// with the ids the caller named substituted into the path templates. Nothing
+// here describes a route a second time: what a sub-document says about an
+// operation is what the root document says about it, minus the templating the
+// caller has already resolved.
+//
+// The exception is a data item and an operation item, whose payload schema
+// comes from the ROS type in the entity cache - a fact no registration holds.
+// `add_cache_derived_items` is the whole of that exception.
+// -----------------------------------------------------------------------------
+
+nlohmann::json CapabilityGenerator::served_paths() const {
+  // Bound to named locals. Both calls return by value, and iterating `.items()`
+  // on the temporary walks a destroyed object.
+  const nlohmann::json registry_paths =
+      route_registry_ ? route_registry_->to_openapi_paths() : nlohmann::json::object();
+  const nlohmann::json extension_paths = plugin_paths();
+
+  nlohmann::json served = registry_paths;
+  for (const auto & [path, item] : extension_paths.items()) {
+    if (served.contains(path)) {
+      continue;  // `generate_root` warns about the shadowing; once is enough.
+    }
+    served[path] = item;
+  }
+  return served;
+}
+
+nlohmann::json CapabilityGenerator::project(const nlohmann::json & served, const std::string & template_prefix,
+                                            const std::vector<PathBinding> & bindings) {
+  const nlohmann::json subtree = paths_under(served, template_prefix);
+
+  nlohmann::json bound = nlohmann::json::object();
+  for (const auto & [key, item] : subtree.items()) {
+    std::string path = key;
+    nlohmann::json path_item = item;
+    for (const auto & [parameter, value] : bindings) {
+      const std::string placeholder = "{" + parameter + "}";
+      const auto pos = path.find(placeholder);
+      if (pos == std::string::npos) {
+        continue;
+      }
+      path.replace(pos, placeholder.size(), value);
+      strip_entity_path_parameter(path_item, parameter);
+    }
+    bound[path] = std::move(path_item);
+  }
+  return bound;
+}
+
+nlohmann::json CapabilityGenerator::build_subtree_document(const std::string & title,
+                                                           const nlohmann::json & paths) const {
+  OpenApiSpecBuilder builder;
+  builder.info("ROS 2 Medkit Gateway - " + title, kGatewayVersion)
+      .sovd_version(kSovdVersion)
+      .server(build_server_url(), "Gateway server")
+      // The projected operations carry whatever `security` their registration
+      // declared, so the scheme they name has to be defined here as well - an
+      // operation cannot reference a scheme its document does not have. With
+      // `auth.enabled` off `generate_impl` removes those requirements from the
+      // finished document, and the definition stays for the same reason it does
+      // in the root document: it asserts nothing about this gateway.
+      .security_scheme("bearerAuth", bearer_scheme(), ctx_.auth_config().enabled)
+      .add_paths(paths);
+
+  // Only the schemas this slice reaches. The root document carries all of
+  // `dto::AllDtos`; an entity page that did the same would ship every DTO the
+  // gateway knows on every request, and one that carried none - which is what
+  // these documents used to do - publishes `$ref`s no client can resolve.
+  nlohmann::json named_schemas = nlohmann::json::object();
+  for (const auto & [name, schema] : referenced_schemas(paths, SchemaBuilder::component_schemas())) {
+    named_schemas[name] = schema;
+  }
+  builder.add_schemas(named_schemas);
+
+  return builder.build();
+}
+
+std::pair<std::string, std::vector<CapabilityGenerator::PathBinding>>
+CapabilityGenerator::entity_template(const ResolvedPath & resolved, bool include_self) {
+  std::string prefix;
+  std::vector<PathBinding> bindings;
+
+  auto append = [&prefix, &bindings](const std::string & entity_type, const std::string & entity_id) {
+    // "areas" -> "area_id", "subcomponents" -> "subcomponent_id": the same
+    // singular-plus-`_id` shape every entity route in `rest_server.cpp` is
+    // registered under.
+    std::string parameter = entity_type;
+    if (!parameter.empty() && parameter.back() == 's') {
+      parameter.pop_back();
+    }
+    parameter += "_id";
+    prefix += "/" + entity_type + "/{" + parameter + "}";
+    bindings.push_back({parameter, entity_id});
+  };
+
+  for (const auto & parent : resolved.parent_chain) {
+    append(parent.entity_type, parent.entity_id);
+  }
+  if (include_self) {
+    append(resolved.entity_type, resolved.entity_id);
+  } else {
+    prefix += "/" + resolved.entity_type;
+  }
+  return {prefix, bindings};
+}
+
+std::string CapabilityGenerator::concrete_path(const std::string & template_prefix,
+                                               const std::vector<PathBinding> & bindings) {
+  std::string path = template_prefix;
+  for (const auto & [parameter, value] : bindings) {
+    const std::string placeholder = "{" + parameter + "}";
+    const auto pos = path.find(placeholder);
+    if (pos != std::string::npos) {
+      path.replace(pos, placeholder.size(), value);
+    }
+  }
+  return path;
+}
+
+std::optional<std::string> CapabilityGenerator::single_parameter_segment_under(const nlohmann::json & served,
+                                                                               const std::string & prefix) {
+  if (!served.is_object()) {
+    return std::nullopt;
+  }
+  std::optional<std::string> found;
+  for (auto entry = served.begin(); entry != served.end(); ++entry) {
+    const std::string & key = entry.key();
+    if (key.size() <= prefix.size() + 1 || key.compare(0, prefix.size(), prefix) != 0 || key[prefix.size()] != '/') {
+      continue;
+    }
+    const std::string segment = key.substr(prefix.size() + 1);
+    if (segment.find('/') != std::string::npos || segment.front() != '{' || segment.back() != '}') {
+      continue;
+    }
+    const std::string parameter = segment.substr(1, segment.size() - 2);
+    if (found.has_value() && *found != parameter) {
+      return std::nullopt;  // ambiguous - see the header comment
+    }
+    found = parameter;
+  }
+  return found;
+}
+
+// -----------------------------------------------------------------------------
 // Entity collection spec (e.g., /areas, /components)
 // -----------------------------------------------------------------------------
 
 nlohmann::json CapabilityGenerator::generate_entity_collection(const ResolvedPath & resolved) const {
-  PathBuilder path_builder(schema_builder_, ctx_.auth_config().enabled);
-  nlohmann::json paths;
-
-  // Build parent path prefix from parent chain using concrete entity IDs
-  // (this spec is scoped to a specific entity, not a generic template)
-  std::string prefix;
-  for (const auto & parent : resolved.parent_chain) {
-    prefix += "/" + parent.entity_type + "/" + parent.entity_id;
-  }
-
-  // Collection listing path
-  std::string collection_path = prefix + "/" + resolved.entity_type;
-  paths[collection_path] = path_builder.build_entity_collection(resolved.entity_type);
-
-  // Detail path for individual entity
-  // Derive singular for path parameter
-  std::string singular = resolved.entity_type;
-  if (!singular.empty() && singular.back() == 's') {
-    singular.pop_back();
-  }
-  std::string detail_path = collection_path + "/{" + singular + "_id}";
-  paths[detail_path] = path_builder.build_entity_detail(resolved.entity_type);
-
-  OpenApiSpecBuilder builder;
-  builder.info("ROS 2 Medkit Gateway - " + resolved.entity_type, kGatewayVersion)
-      .sovd_version(kSovdVersion)
-      .server(build_server_url(), "Gateway server")
-      .add_paths(paths);
-
-  return builder.build();
+  const auto [prefix, bindings] = entity_template(resolved, false);
+  const nlohmann::json served = served_paths();
+  return build_subtree_document(resolved.entity_type, project(served, prefix, bindings));
 }
 
 // -----------------------------------------------------------------------------
@@ -217,30 +491,9 @@ nlohmann::json CapabilityGenerator::generate_entity_collection(const ResolvedPat
 // -----------------------------------------------------------------------------
 
 nlohmann::json CapabilityGenerator::generate_specific_entity(const ResolvedPath & resolved) const {
-  PathBuilder path_builder(schema_builder_, ctx_.auth_config().enabled);
-  nlohmann::json paths;
-
-  // Build entity path prefix
-  std::string entity_path;
-  for (const auto & parent : resolved.parent_chain) {
-    entity_path += "/" + parent.entity_type + "/" + parent.entity_id;
-  }
-  entity_path += "/" + resolved.entity_type + "/" + resolved.entity_id;
-
-  // Entity detail endpoint
-  paths[entity_path] = path_builder.build_entity_detail(resolved.entity_type, false);
-
-  // Add resource collection paths based on entity capabilities
-  auto sovd_type = entity_type_from_keyword(resolved.entity_type);
-  add_resource_collection_paths(paths, entity_path, resolved.entity_id, sovd_type);
-
-  OpenApiSpecBuilder builder;
-  builder.info("ROS 2 Medkit Gateway - " + resolved.entity_id, kGatewayVersion)
-      .sovd_version(kSovdVersion)
-      .server(build_server_url(), "Gateway server")
-      .add_paths(paths);
-
-  return builder.build();
+  const auto [prefix, bindings] = entity_template(resolved, true);
+  const nlohmann::json served = served_paths();
+  return build_subtree_document(resolved.entity_id, project(served, prefix, bindings));
 }
 
 // -----------------------------------------------------------------------------
@@ -248,118 +501,15 @@ nlohmann::json CapabilityGenerator::generate_specific_entity(const ResolvedPath 
 // -----------------------------------------------------------------------------
 
 nlohmann::json CapabilityGenerator::generate_resource_collection(const ResolvedPath & resolved) const {
-  auto sovd_type_check = entity_type_from_keyword(resolved.entity_type);
-  if (sovd_type_check == SovdEntityType::UNKNOWN) {
-    return build_base_spec();
-  }
+  auto [prefix, bindings] = entity_template(resolved, true);
+  const std::string entity_path = concrete_path(prefix, bindings);
+  prefix += "/" + resolved.resource_collection;
 
-  PathBuilder path_builder(schema_builder_, ctx_.auth_config().enabled);
-  nlohmann::json paths;
+  const nlohmann::json served = served_paths();
+  auto paths = project(served, prefix, bindings);
+  add_cache_derived_items(paths, resolved, entity_path);
 
-  // Build entity path
-  std::string entity_path;
-  for (const auto & parent : resolved.parent_chain) {
-    entity_path += "/" + parent.entity_type + "/" + parent.entity_id;
-  }
-  entity_path += "/" + resolved.entity_type + "/" + resolved.entity_id;
-
-  std::string collection_path = entity_path + "/" + resolved.resource_collection;
-  const auto & cache = node_.get_thread_safe_cache();
-
-  // The documented id of an item has to be the id the collection emits, or the
-  // spec describes a request the gateway then refuses. Both use the same rule:
-  // an id that more than one item carries is qualified with its owning member,
-  // an id that names one thing is left bare. What the generator cannot see is
-  // a peer contributing a second item under the same id - it reads the local
-  // cache only, and there is no peer view here to consult.
-  const auto qualified_item_id = [](const std::string & item_id, size_t provider_count,
-                                    const std::string & owner) -> std::string {
-    if (provider_count < 2 || owner.empty()) {
-      return item_id;
-    }
-    return http::make_member_qualified_id(owner, item_id);
-  };
-
-  if (resolved.resource_collection == "data") {
-    auto data = cache.get_entity_data(resolved.entity_id);
-    paths[collection_path] = path_builder.build_data_collection(entity_path, data.topics);
-    // Add individual data item paths
-    for (const auto & topic : data.topics) {
-      std::string item_path = collection_path + "/" + topic.name;
-      paths[item_path] = path_builder.build_data_item(entity_path, topic);
-    }
-  } else if (resolved.resource_collection == "operations") {
-    auto ops = cache.get_app_operations(resolved.entity_id);
-    // Try component/area/function-level aggregation if app-level is empty
-    auto sovd_type = entity_type_from_keyword(resolved.entity_type);
-    if (ops.empty() && sovd_type == SovdEntityType::COMPONENT) {
-      ops = cache.get_component_operations(resolved.entity_id);
-    } else if (ops.empty() && sovd_type == SovdEntityType::AREA) {
-      ops = cache.get_area_operations(resolved.entity_id);
-    } else if (ops.empty() && sovd_type == SovdEntityType::FUNCTION) {
-      ops = cache.get_function_operations(resolved.entity_id);
-    }
-    paths[collection_path] = path_builder.build_operations_collection(entity_path, ops);
-
-    // A path key that two operations produce documents one of them and drops
-    // the other, so the id here has to be the id the collection emits - both
-    // halves of it. `short_name_counts` decides the member half; a short name
-    // one provider carries twice takes the ROS path as its item half, because
-    // the member half is that same provider for both copies.
-    std::unordered_map<std::string, size_t> short_name_counts;
-    for (const auto & svc : ops.services) {
-      ++short_name_counts[svc.name];
-    }
-    for (const auto & action : ops.actions) {
-      ++short_name_counts[action.name];
-    }
-    const auto owner_of = [&ops](const std::string & full_path) -> std::string {
-      auto owner = ops.owner_by_path.find(full_path);
-      return owner != ops.owner_by_path.end() ? owner->second : std::string{};
-    };
-    const auto addressed_by_path = http::operation_paths_addressed_by_path(ops);
-    const auto operation_id_of = [&](const std::string & name, const std::string & full_path) {
-      return qualified_item_id(http::operation_item_half(name, full_path, addressed_by_path), short_name_counts[name],
-                               owner_of(full_path));
-    };
-
-    for (const auto & svc : ops.services) {
-      std::string item_path = collection_path + "/" + operation_id_of(svc.name, svc.full_path);
-      paths[item_path] = path_builder.build_operation_item(entity_path, svc);
-    }
-    for (const auto & action : ops.actions) {
-      std::string item_path = collection_path + "/" + operation_id_of(action.name, action.full_path);
-      paths[item_path] = path_builder.build_operation_item(entity_path, action);
-    }
-  } else if (resolved.resource_collection == "configurations") {
-    paths[collection_path] = path_builder.build_configurations_collection(entity_path);
-  } else if (resolved.resource_collection == "faults") {
-    paths[collection_path] = path_builder.build_faults_collection(entity_path);
-  } else if (resolved.resource_collection == "logs") {
-    paths[collection_path] = path_builder.build_logs_collection(entity_path);
-    // Also add log configuration sub-endpoint
-    add_log_configuration_path(paths, collection_path, entity_path);
-  } else if (resolved.resource_collection == "bulk-data") {
-    paths[collection_path] = path_builder.build_bulk_data_collection(entity_path);
-  } else if (resolved.resource_collection == "cyclic-subscriptions") {
-    paths[collection_path] = path_builder.build_cyclic_subscriptions_collection(entity_path);
-  } else {
-    // Unsupported resource collection - just note it exists with a generic path
-    nlohmann::json generic_path;
-    nlohmann::json get_op;
-    get_op["summary"] = "List " + resolved.resource_collection + " for " + resolved.entity_id;
-    get_op["responses"]["200"]["description"] = "Successful response";
-    generic_path["get"] = std::move(get_op);
-    paths[collection_path] = std::move(generic_path);
-  }
-
-  OpenApiSpecBuilder builder;
-  builder.info("ROS 2 Medkit Gateway - " + resolved.entity_id + "/" + resolved.resource_collection, kGatewayVersion)
-      .sovd_version(kSovdVersion)
-      .server(build_server_url(), "Gateway server")
-      .add_paths(paths);
-
-  return builder.build();
+  return build_subtree_document(resolved.entity_id + "/" + resolved.resource_collection, paths);
 }
 
 // -----------------------------------------------------------------------------
@@ -367,131 +517,146 @@ nlohmann::json CapabilityGenerator::generate_resource_collection(const ResolvedP
 // -----------------------------------------------------------------------------
 
 nlohmann::json CapabilityGenerator::generate_specific_resource(const ResolvedPath & resolved) const {
-  auto sovd_type_check = entity_type_from_keyword(resolved.entity_type);
-  if (sovd_type_check == SovdEntityType::UNKNOWN) {
-    return build_base_spec();
-  }
+  auto [prefix, bindings] = entity_template(resolved, true);
+  const std::string entity_path = concrete_path(prefix, bindings);
+  const std::string collection_prefix = prefix + "/" + resolved.resource_collection;
 
-  PathBuilder path_builder(schema_builder_, ctx_.auth_config().enabled);
-  nlohmann::json paths;
+  const nlohmann::json served = served_paths();
 
-  // Build full path
-  std::string entity_path;
-  for (const auto & parent : resolved.parent_chain) {
-    entity_path += "/" + parent.entity_type + "/" + parent.entity_id;
-  }
-  entity_path += "/" + resolved.entity_type + "/" + resolved.entity_id;
-
-  std::string resource_path = entity_path + "/" + resolved.resource_collection + "/" + resolved.resource_id;
-  const auto & cache = node_.get_thread_safe_cache();
-
-  if (resolved.resource_collection == "data") {
-    // Look up specific topic data
-    auto data = cache.get_entity_data(resolved.entity_id);
-    bool found = false;
-    for (const auto & topic : data.topics) {
-      if (topic.name == resolved.resource_id) {
-        paths[resource_path] = path_builder.build_data_item(entity_path, topic);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      // Topic not found in cache, generate a generic data path
-      TopicData generic_topic;
-      generic_topic.name = resolved.resource_id;
-      generic_topic.type = "";
-      generic_topic.direction = "publish";
-      paths[resource_path] = path_builder.build_data_item(entity_path, generic_topic);
-    }
-  } else if (resolved.resource_collection == "operations") {
-    // Look up specific operation
-    auto ops = cache.get_app_operations(resolved.entity_id);
-    auto sovd_type = entity_type_from_keyword(resolved.entity_type);
-    if (ops.empty() && sovd_type == SovdEntityType::COMPONENT) {
-      ops = cache.get_component_operations(resolved.entity_id);
-    } else if (ops.empty() && sovd_type == SovdEntityType::AREA) {
-      ops = cache.get_area_operations(resolved.entity_id);
-    } else if (ops.empty() && sovd_type == SovdEntityType::FUNCTION) {
-      ops = cache.get_function_operations(resolved.entity_id);
-    }
-
-    // The requested id may name its owning member, which is how the collection
-    // addresses an operation short name that more than one member exposes.
-    // Matching the bare half alone would document one member's operation under
-    // the other member's id.
-    auto requested = http::parse_member_qualified_id(resolved.resource_id, ops.is_aggregated);
-    const auto owned_by_requested = [&ops, &requested](const std::string & full_path) {
-      if (!requested.has_member) {
-        return true;
-      }
-      auto owner = ops.owner_by_path.find(full_path);
-      return owner != ops.owner_by_path.end() && owner->second == requested.member_id;
-    };
-
-    bool found = false;
-    for (const auto & svc : ops.services) {
-      if (svc.name == requested.item_id && owned_by_requested(svc.full_path)) {
-        paths[resource_path] = path_builder.build_operation_item(entity_path, svc);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      for (const auto & action : ops.actions) {
-        if (action.name == requested.item_id && owned_by_requested(action.full_path)) {
-          paths[resource_path] = path_builder.build_operation_item(entity_path, action);
-          found = true;
-          break;
-        }
-      }
-    }
-    if (!found) {
-      // Operation not found - generate generic
-      ServiceInfo generic_svc;
-      generic_svc.name = resolved.resource_id;
-      generic_svc.type = "";
-      paths[resource_path] = path_builder.build_operation_item(entity_path, generic_svc);
-    }
-  } else if (resolved.resource_collection == "faults") {
-    paths[resource_path] = path_builder.build_faults_collection(entity_path);
+  // Which template the item sits under is read from the registry, not
+  // tabulated: the item route is the one key that extends the collection by
+  // exactly one segment and whose segment is a whole `{param}`. A collection
+  // whose item segment is a literal - `/logs/configuration` - has none, and
+  // the literal is the prefix.
+  const auto item_parameter = single_parameter_segment_under(served, collection_prefix);
+  if (item_parameter.has_value()) {
+    prefix = collection_prefix + "/{" + *item_parameter + "}";
+    bindings.push_back({*item_parameter, resolved.resource_id});
   } else {
-    // Generic resource path
-    nlohmann::json generic_path;
-    nlohmann::json get_op;
-    get_op["summary"] = "Get " + resolved.resource_id;
-    get_op["responses"]["200"]["description"] = "Successful response";
-    generic_path["get"] = std::move(get_op);
-    paths[resource_path] = std::move(generic_path);
+    prefix = collection_prefix + "/" + resolved.resource_id;
   }
 
-  OpenApiSpecBuilder builder;
-  builder.info("ROS 2 Medkit Gateway - " + resolved.resource_id, kGatewayVersion)
-      .sovd_version(kSovdVersion)
-      .server(build_server_url(), "Gateway server")
-      .add_paths(paths);
+  auto paths = project(served, prefix, bindings);
+  add_cache_derived_items(paths, resolved, entity_path);
 
-  return builder.build();
+  return build_subtree_document(resolved.resource_id, paths);
+}
+
+void CapabilityGenerator::add_cache_derived_items(nlohmann::json & paths, const ResolvedPath & resolved,
+                                                  const std::string & entity_path) const {
+  const std::string collection_path = entity_path + "/" + resolved.resource_collection;
+  const auto & cache = node_.get_thread_safe_cache();
+  const PathBuilder path_builder(schema_builder_, ctx_.auth_config().enabled);
+  const bool one_item = !resolved.resource_id.empty();
+
+  // A data point or operation the cache does not know needs nothing here: the
+  // projection already published the item route's own description at that key,
+  // which is a truthful account of what the gateway will do with the request.
+  // Only a resource the cache *does* know gains anything, and what it gains is
+  // the ROS type.
+  if (resolved.resource_collection == "data") {
+    auto data = cache.get_entity_data(resolved.entity_id);
+    for (const auto & topic : data.topics) {
+      if (one_item && topic.name != resolved.resource_id) {
+        continue;
+      }
+      paths[collection_path + "/" + topic.name] = path_builder.build_data_item(entity_path, topic);
+    }
+    return;
+  }
+
+  if (resolved.resource_collection != "operations") {
+    return;
+  }
+
+  // Operations aggregate upward: an app owns its services directly, while a
+  // component, area or function collects the ones its apps expose.
+  auto ops = cache.get_app_operations(resolved.entity_id);
+  if (ops.empty()) {
+    switch (entity_type_from_keyword(resolved.entity_type)) {
+      case SovdEntityType::COMPONENT:
+        ops = cache.get_component_operations(resolved.entity_id);
+        break;
+      case SovdEntityType::AREA:
+        ops = cache.get_area_operations(resolved.entity_id);
+        break;
+      case SovdEntityType::FUNCTION:
+        ops = cache.get_function_operations(resolved.entity_id);
+        break;
+      case SovdEntityType::APP:
+      case SovdEntityType::SERVER:
+      case SovdEntityType::UNKNOWN:
+      default:
+        break;
+    }
+  }
+
+  for (const auto & svc : ops.services) {
+    if (one_item && svc.name != resolved.resource_id) {
+      continue;
+    }
+    paths[collection_path + "/" + svc.name] = path_builder.build_operation_item(entity_path, svc);
+  }
+  for (const auto & action : ops.actions) {
+    if (one_item && action.name != resolved.resource_id) {
+      continue;
+    }
+    paths[collection_path + "/" + action.name] = path_builder.build_operation_item(entity_path, action);
+  }
 }
 
 // -----------------------------------------------------------------------------
 // Plugin route docs
 // -----------------------------------------------------------------------------
 
-nlohmann::json CapabilityGenerator::generate_plugin_docs(const std::string & path) const {
+nlohmann::json CapabilityGenerator::plugin_paths() const {
   if (!plugin_mgr_) {
-    return {};
+    return nlohmann::json::object();
   }
 
-  auto descriptions = plugin_mgr_->collect_route_descriptions();
+  // A plugin's declared role is carried through unchanged here. Whether the
+  // gateway is in a configuration that honours it is not a question about the
+  // fold, so it is not answered in the fold - `generate_impl` strips every
+  // per-operation requirement once, over the finished document, for whatever
+  // producer wrote it.
+  nlohmann::json paths = nlohmann::json::object();
+  for (const auto & desc : plugin_mgr_->collect_route_descriptions()) {
+    auto paths_json = desc.to_json();  // CapabilityGenerator is friend
+    for (auto & [key, item] : paths_json.items()) {
+      for (auto & [method, operation] : item.items()) {
+        if (!operation.is_object()) {
+          continue;
+        }
+        // What separates a plugin operation from a gateway one, and the
+        // reason it has to be visible in the document rather than inferred
+        // from the path: a plugin route is mounted straight onto the HTTP
+        // server by `PluginManager::register_routes`, not through the
+        // `RouteRegistry`. Everything the registry attaches at mount time -
+        // most of all the emitted-status recorder that
+        // `test_openapi_error_coverage` reads - therefore never sees it.
+        operation["x-medkit-plugin-served"] = true;
+
+        // 416 is answered by cpp-httplib before routing, so it reaches a
+        // plugin route for exactly the same reason it reaches a registry
+        // one (see the `add_response_ref("416", ...)` comment in
+        // `route_registry.cpp`). Stamped here rather than left to the
+        // plugin: it is a fact about the HTTP server the plugin is mounted
+        // on, not about the plugin.
+        operation["responses"]["416"] = nlohmann::json{{"$ref", "#/components/responses/GenericError"}};
+      }
+      paths[key] = item;
+    }
+  }
+  return paths;
+}
+
+nlohmann::json CapabilityGenerator::generate_plugin_docs(const std::string & path) const {
   nlohmann::json matching_paths = nlohmann::json::object();
 
-  for (const auto & desc : descriptions) {
-    auto paths_json = desc.to_json();  // CapabilityGenerator is friend
-    for (auto & [key, value] : paths_json.items()) {
-      if (key == path || key.find(path + "/") == 0) {
-        matching_paths[key] = value;
-      }
+  auto all_paths = plugin_paths();
+  for (auto & [key, value] : all_paths.items()) {
+    if (key == path || key.find(path + "/") == 0) {
+      matching_paths[key] = value;
     }
   }
 
@@ -503,6 +668,9 @@ nlohmann::json CapabilityGenerator::generate_plugin_docs(const std::string & pat
   builder.info("ROS 2 Medkit Gateway - Plugin", kGatewayVersion)
       .sovd_version(kSovdVersion)
       .server(build_server_url(), "Gateway server")
+      // Without the definition, the per-operation `security` a plugin
+      // declares would name a scheme this sub-document does not have.
+      .security_scheme("bearerAuth", bearer_scheme(), ctx_.auth_config().enabled)
       .add_paths(matching_paths);
   return builder.build();
 }
@@ -649,20 +817,6 @@ bool CapabilityGenerator::validate_entity_hierarchy(const ResolvedPath & resolve
 // Helper methods
 // -----------------------------------------------------------------------------
 
-nlohmann::json CapabilityGenerator::build_base_spec() const {
-  OpenApiSpecBuilder builder;
-  builder.info("ROS 2 Medkit Gateway", kGatewayVersion)
-      .sovd_version(kSovdVersion)
-      .server(build_server_url(), "Gateway server");
-
-  const auto & auth_config = ctx_.auth_config();
-  if (auth_config.enabled) {
-    builder.security_scheme("bearerAuth", {{"type", "http"}, {"scheme", "bearer"}, {"bearerFormat", "JWT"}});
-  }
-
-  return builder.build();
-}
-
 std::string CapabilityGenerator::build_server_url() const {
   // Read host/port independently so a missing host doesn't clobber a valid port
   std::string host = "localhost";
@@ -706,139 +860,24 @@ SovdEntityType CapabilityGenerator::entity_type_from_keyword(const std::string &
   return SovdEntityType::UNKNOWN;
 }
 
-void CapabilityGenerator::add_log_configuration_path(nlohmann::json & paths, const std::string & logs_path,
-                                                     const std::string & entity_path) {
-  nlohmann::json config_path_item;
-
-  nlohmann::json config_get;
-  config_get["tags"] = nlohmann::json::array({"Logs"});
-  config_get["summary"] = "Get log configuration for " + entity_path;
-  config_get["description"] = "Returns the current log level configuration.";
-  config_get["responses"]["200"]["description"] = "Current log configuration";
-  config_get["responses"]["200"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("LogConfiguration");
-  config_path_item["get"] = std::move(config_get);
-
-  nlohmann::json config_put;
-  config_put["tags"] = nlohmann::json::array({"Logs"});
-  config_put["summary"] = "Update log configuration for " + entity_path;
-  config_put["description"] = "Update the log level configuration.";
-  config_put["requestBody"]["required"] = true;
-  config_put["requestBody"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("LogConfiguration");
-  config_put["responses"]["204"]["description"] = "Log configuration updated";
-  config_path_item["put"] = std::move(config_put);
-
-  paths[logs_path + "/configuration"] = std::move(config_path_item);
-}
-
-void CapabilityGenerator::add_resource_collection_paths(nlohmann::json & paths, const std::string & entity_path,
-                                                        const std::string & entity_id,
-                                                        ros2_medkit_gateway::SovdEntityType entity_type) const {
-  if (entity_type == SovdEntityType::UNKNOWN) {
-    return;
-  }
-  PathBuilder path_builder(schema_builder_, ctx_.auth_config().enabled);
-  auto caps = EntityCapabilities::for_type(entity_type);
-  const auto & cache = node_.get_thread_safe_cache();
-
-  for (const auto & col : caps.collections()) {
-    std::string col_path = entity_path + "/" + to_path_segment(col);
-
-    switch (col) {
-      case ResourceCollection::DATA: {
-        auto data = cache.get_entity_data(entity_id);
-        paths[col_path] = path_builder.build_data_collection(entity_path, data.topics);
-        break;
-      }
-      case ResourceCollection::OPERATIONS: {
-        AggregatedOperations ops;
-        switch (entity_type) {
-          case SovdEntityType::APP:
-            ops = cache.get_app_operations(entity_id);
-            break;
-          case SovdEntityType::COMPONENT:
-            ops = cache.get_component_operations(entity_id);
-            break;
-          case SovdEntityType::AREA:
-            ops = cache.get_area_operations(entity_id);
-            break;
-          case SovdEntityType::FUNCTION:
-            ops = cache.get_function_operations(entity_id);
-            break;
-          case SovdEntityType::SERVER:
-          case SovdEntityType::UNKNOWN:
-          default:
-            break;
-        }
-        paths[col_path] = path_builder.build_operations_collection(entity_path, ops);
-        break;
-      }
-      case ResourceCollection::CONFIGURATIONS:
-        paths[col_path] = path_builder.build_configurations_collection(entity_path);
-        break;
-      case ResourceCollection::FAULTS:
-        paths[col_path] = path_builder.build_faults_collection(entity_path);
-        break;
-      case ResourceCollection::BULK_DATA:
-        paths[col_path] = path_builder.build_bulk_data_collection(entity_path);
-        break;
-      case ResourceCollection::CYCLIC_SUBSCRIPTIONS:
-        paths[col_path] = path_builder.build_cyclic_subscriptions_collection(entity_path);
-        break;
-      case ResourceCollection::LOGS:
-        paths[col_path] = path_builder.build_logs_collection(entity_path);
-        add_log_configuration_path(paths, col_path, entity_path);
-        break;
-      // Registered for every entity type and unconditionally 501: the routes
-      // carry `.only_status(501, ...)`, so a 200 here would be a success a
-      // client can never observe.
-      case ResourceCollection::DATA_CATEGORIES:
-      case ResourceCollection::DATA_GROUPS: {
-        nlohmann::json not_implemented;
-        nlohmann::json get_op;
-        get_op["tags"] = nlohmann::json::array({"Data"});
-        get_op["summary"] = "List " + to_string(col) + " for " + entity_id;
-        get_op["description"] = "Not implemented for ROS 2 - this route always answers 501.";
-        get_op["responses"]["501"] = nlohmann::json{{"$ref", "#/components/responses/GenericError"}};
-        not_implemented["get"] = std::move(get_op);
-        paths[col_path] = std::move(not_implemented);
-        break;
-      }
-
-      // Served, but with no dedicated builder in this file yet, so the listing
-      // is generic. `to_openapi_paths()` already holds each of these routes
-      // with its real statuses and schema; projecting the sub-document out of
-      // the registry is what removes the last of this hand-written half.
-      case ResourceCollection::LOCKS:
-      case ResourceCollection::TRIGGERS:
-      case ResourceCollection::SCRIPTS:
-      case ResourceCollection::FAULT_TRIGGERS: {
-        nlohmann::json generic_path;
-        nlohmann::json get_op;
-        get_op["summary"] = "List " + to_string(col) + " for " + entity_id;
-        get_op["responses"]["200"]["description"] = "Successful response";
-        generic_path["get"] = std::move(get_op);
-        paths[col_path] = std::move(generic_path);
-        break;
-      }
-
-      // No entity-scoped route, so no entity type lists one of these and the
-      // loop cannot reach these labels. (`UPDATES` is in the SERVER list, and
-      // SERVER never reaches this function - it is called for the four entity
-      // types only.) They are spelled out rather than folded into a `default:`
-      // so that adding an enumerator fails the build here
-      // (-Werror=switch-enum) instead of silently acquiring a fabricated 200.
-      case ResourceCollection::DATA_LISTS:
-      case ResourceCollection::MODES:
-      case ResourceCollection::COMMUNICATION_LOGS:
-      case ResourceCollection::UPDATES:
-        break;
-    }
-  }
-}
-
 // -----------------------------------------------------------------------------
 // Cache helpers
 // -----------------------------------------------------------------------------
+
+void CapabilityGenerator::clear_cache_locked() const {
+  spec_cache_.clear();
+  cache_bytes_ = 0;
+}
+
+size_t CapabilityGenerator::cache_entry_count() const {
+  std::shared_lock lock(cache_mutex_);
+  return spec_cache_.size();
+}
+
+size_t CapabilityGenerator::cache_byte_size() const {
+  std::shared_lock lock(cache_mutex_);
+  return cache_bytes_;
+}
 
 std::string CapabilityGenerator::get_cache_key(const std::string & path) const {
   auto & cache = node_.get_thread_safe_cache();
@@ -846,14 +885,14 @@ std::string CapabilityGenerator::get_cache_key(const std::string & path) const {
   {
     std::unique_lock lock(cache_mutex_);
     if (generation != cached_generation_) {
-      spec_cache_.clear();
+      clear_cache_locked();
       cached_generation_ = generation;
     }
   }
   return std::to_string(generation) + ":" + path;
 }
 
-std::optional<nlohmann::json> CapabilityGenerator::lookup_cache(const std::string & key) const {
+std::optional<std::string> CapabilityGenerator::lookup_cache(const std::string & key) const {
   std::shared_lock lock(cache_mutex_);
   auto it = spec_cache_.find(key);
   if (it != spec_cache_.end()) {
@@ -862,12 +901,33 @@ std::optional<nlohmann::json> CapabilityGenerator::lookup_cache(const std::strin
   return std::nullopt;
 }
 
-void CapabilityGenerator::store_cache(const std::string & key, const nlohmann::json & spec) const {
-  std::unique_lock lock(cache_mutex_);
-  if (spec_cache_.size() >= kMaxCacheSize) {
-    spec_cache_.clear();  // Simple eviction: clear all when full
+void CapabilityGenerator::store_cache(const std::string & key, const std::string & document) const {
+  const size_t entry_bytes = key.size() + document.size();
+  // A document that cannot fit the budget by itself is served but not cached;
+  // storing it would put the cache over its bound for as long as it is held.
+  if (entry_bytes > bounds_.max_bytes) {
+    return;
   }
-  spec_cache_[key] = spec;
+
+  std::unique_lock lock(cache_mutex_);
+
+  // Replacing an existing key: swap the accounting rather than adding to it.
+  // Two threads can miss on the same key concurrently (TODO(#272)), so this
+  // path is reachable and double-counting here would leak budget until the
+  // next generation change.
+  auto it = spec_cache_.find(key);
+  if (it != spec_cache_.end()) {
+    cache_bytes_ -= it->first.size() + it->second.size();
+    it->second = document;
+    cache_bytes_ += entry_bytes;
+    return;
+  }
+
+  if (spec_cache_.size() >= bounds_.max_entries || cache_bytes_ + entry_bytes > bounds_.max_bytes) {
+    clear_cache_locked();  // Simple eviction: clear all when full
+  }
+  spec_cache_.emplace(key, document);
+  cache_bytes_ += entry_bytes;
 }
 
 }  // namespace openapi

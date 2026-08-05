@@ -34,8 +34,11 @@ What the recorder can see, and what it cannot, is documented on
 ``include/ros2_medkit_gateway/http/detail/status_recorder.hpp``. The short
 version: it observes the wire status of everything the route registry mounts,
 and is blind to what answers ahead of routing (the rate limiter's 429, the
-auth middleware's 401/403, the CORS reject) and to anything cpp-httplib
-answers by itself. Those are declared by hand.
+auth middleware's 401/403, the CORS reject), to anything cpp-httplib answers
+by itself, and to routes a plugin mounts outside the registry. Those are
+declared by hand; the plugin ones are marked ``x-medkit-plugin-served`` in the
+document so the reachability assertion below can tell them apart from a
+registry route the sweep genuinely failed to reach.
 """
 
 import json
@@ -344,14 +347,40 @@ class TestOpenApiErrorCoverage(GatewayTestCase):
         going unreached means the substitution, the spec fetch or the recorder
         itself has quietly stopped working, and the superset rule above would
         then pass with an empty left-hand side.
+
+        Operations marked ``x-medkit-plugin-served`` are excluded, and that
+        exclusion is derived rather than listed: a plugin route is mounted by
+        ``PluginManager::register_routes`` instead of by the ``RouteRegistry``,
+        and the recorder attaches at the registry's mounting point, so no run
+        can ever observe one. The sweep still *calls* them - what it cannot do
+        is see the answer. The marker is stamped by the gateway when it folds
+        the plugin's description into the document, so this cannot drift into
+        excusing a registry route.
         """
-        documented = {(method, path) for path, method, _ in self.operations()}
+        plugin_served = {(method, path) for path, method, op in self.operations()
+                         if op.get('x-medkit-plugin-served')}
+        documented = {(method, path) for path, method, _ in self.operations()} - plugin_served
         observed = {(e['method'].lower(), e['path'])
                     for e in self.coverage()['emitted']}
         reached = observed & documented
         print(f'coverage: {len(reached)}/{len(documented)} documented operations '
               f'reached, {self._swept} requests issued; '
+              f'plugin-served (recorder-invisible): {sorted(plugin_served)}; '
               f'unreached: {sorted(documented - observed)}')
+        # This fixture loads the graph provider, which is the only in-tree
+        # plugin that describes a route. An empty exclusion set would mean the
+        # fold stopped happening, and this test would then be passing on a
+        # document that lost an operation rather than on one that never had it.
+        self.assertTrue(
+            plugin_served,
+            'no plugin-served operation in the document; the fixture loads the '
+            'graph provider, so the plugin route fold has broken')
+        # The recorder's blind spot is structural, not per-route: nothing a
+        # plugin serves may appear in `observed` at all. If one ever did, the
+        # exclusion above would be silently hiding a real gap.
+        self.assertEqual(
+            sorted(plugin_served & observed), [],
+            'the recorder observed a plugin-served route, so excluding them is wrong')
         # Cross-check first: every pinned entry must be one the sweep genuinely
         # cannot call. Without this the literal could be padded with a route
         # that is reachable, turning the pin into an exemption list.

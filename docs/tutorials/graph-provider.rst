@@ -213,8 +213,10 @@ The Discovery Path
 
       curl http://localhost:8080/api/v1/functions | jq
 
-2. **Read the Function's detail** and follow its capability href. Every
-   Function detail response carries an ``"x-medkit-graph"`` link:
+2. **Read the Function's detail** and follow its capability href. A Function
+   detail response carries an ``"x-medkit-graph"`` link exactly while this
+   plugin is loaded - the key is absent on a gateway running without it,
+   because nothing would answer at that URI:
 
    .. code-block:: bash
 

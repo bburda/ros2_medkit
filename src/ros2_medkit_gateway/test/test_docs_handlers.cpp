@@ -112,14 +112,11 @@ TEST_F(DocsHandlersTest, DocsDisabledReturns501) {
   handlers::DocsHandlers docs_handlers(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get());
 
   httplib::Request req;
-  httplib::Response res;
+  auto result = docs_handlers.handle_docs_root(http::TypedRequest(req));
 
-  docs_handlers.handle_docs_root(req, res);
-
-  EXPECT_EQ(res.status, 501);
-
-  auto body = nlohmann::json::parse(res.body);
-  EXPECT_TRUE(body.contains("error_code"));
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 501);
+  EXPECT_FALSE(result.error().code.empty());
 }
 
 // =============================================================================
@@ -131,14 +128,10 @@ TEST_F(DocsHandlersTest, DocsRootReturnsValidJson) {
   handlers::DocsHandlers docs_handlers(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get());
 
   httplib::Request req;
-  httplib::Response res;
+  auto result = docs_handlers.handle_docs_root(http::TypedRequest(req));
 
-  docs_handlers.handle_docs_root(req, res);
-
-  // send_json does not set res.status (httplib server framework does that),
-  // so verify the response body contains a valid OpenAPI spec
-  ASSERT_FALSE(res.body.empty());
-  auto body = nlohmann::json::parse(res.body);
+  ASSERT_TRUE(result.has_value()) << result.error().message;
+  auto body = nlohmann::json::parse(result.value());
   EXPECT_EQ(body["openapi"], "3.1.0");
   EXPECT_TRUE(body.contains("info"));
   EXPECT_TRUE(body.contains("paths"));
@@ -148,6 +141,43 @@ TEST_F(DocsHandlersTest, DocsRootReturnsValidJson) {
   EXPECT_FALSE(body["paths"].empty()) << "Root spec should contain paths from RouteRegistry";
   EXPECT_TRUE(body["paths"].contains("/health"));
   EXPECT_TRUE(body["paths"].contains("/apps"));
+}
+
+// The handler answers with text now, and `docs_endpoint` writes that text
+// straight out instead of dumping a DOM. That is only wire-compatible while
+// the text is exactly what `write_json_body` would have produced, which is
+// `dump(2)`. Re-dumping the parse and comparing is the mechanical check:
+// indent width, key order and separators all have to agree.
+TEST_F(DocsHandlersTest, DocsRootBodyIsTheSameBytesADomWouldHaveWritten) {
+  handlers::DocsHandlers docs_handlers(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get());
+
+  httplib::Request req;
+  auto result = docs_handlers.handle_docs_root(http::TypedRequest(req));
+
+  ASSERT_TRUE(result.has_value()) << result.error().message;
+  EXPECT_EQ(result.value(), nlohmann::json::parse(result.value()).dump(2));
+}
+
+// Same contract on the scoped route, which reaches the response through
+// `write_json_text` rather than through the typed router.
+TEST_F(DocsHandlersTest, DocsAnyPathBodyIsTheSameBytesADomWouldHaveWritten) {
+  handlers::DocsHandlers docs_handlers(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get());
+
+  httplib::Request req;
+  httplib::Response res;
+  req.path = "/api/v1/apps/docs";
+  std::regex pattern(R"(/api/v1/(.*)/docs)");
+  std::smatch match;
+  std::regex_match(req.path, match, pattern);
+  req.matches = match;
+
+  docs_handlers.handle_docs_any_path(req, res);
+
+  ASSERT_EQ(res.status, 200);
+  EXPECT_EQ(res.body, nlohmann::json::parse(res.body).dump(2));
+  // The header a JSON client selects on. Serving pre-serialized text must not
+  // have moved it.
+  EXPECT_EQ(res.get_header_value("Content-Type"), "application/json");
 }
 
 // =============================================================================

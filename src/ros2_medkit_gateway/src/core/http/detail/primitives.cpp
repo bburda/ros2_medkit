@@ -47,6 +47,14 @@ void write_json_body(FrameworkOrPluginAccess /*token*/, httplib::Response & res,
   res.set_content(body.dump(2), kContentTypeJson);
 }
 
+void write_json_text(FrameworkOrPluginAccess /*token*/, httplib::Response & res, const std::string & body, int status) {
+  // Same sentinel contract as write_json_body above.
+  if (status != 0) {
+    res.status = status;
+  }
+  res.set_content(body, kContentTypeJson);
+}
+
 void write_generic_error(FrameworkOrPluginAccess /*token*/, httplib::Response & res, const ErrorInfo & err) {
   res.status = clamp_error_status(err.http_status);
 

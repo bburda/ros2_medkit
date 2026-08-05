@@ -1593,7 +1593,6 @@ http::Result<dto::FunctionDetail> DiscoveryHandlers::get_function(const http::Ty
     detail.faults = base_uri + "/faults";
     detail.logs = base_uri + "/logs";
     detail.bulk_data = base_uri + "/bulk-data";
-    detail.x_medkit_graph = base_uri + "/x-medkit-graph";
     detail.cyclic_subscriptions = base_uri + "/cyclic-subscriptions";
     detail.triggers = base_uri + "/triggers";
 
@@ -1605,6 +1604,16 @@ http::Result<dto::FunctionDetail> DiscoveryHandlers::get_function(const http::Ty
     auto func_caps = CapabilityBuilder::build_capabilities("functions", func.id, caps);
     append_plugin_capabilities(func_caps, "functions", func.id, SovdEntityType::FUNCTION, ctx_.node());
     detail.capabilities = func_caps;
+
+    // Read off the capability list rather than set unconditionally: nothing in
+    // the gateway serves `x-medkit-graph`. The route exists only while a
+    // plugin registers the capability (the graph provider does so for every
+    // Function in `set_context`), and `append_plugin_capabilities` above is
+    // where that registration becomes visible here. Set unconditionally, this
+    // URI answered 404 on every gateway running without the plugin.
+    if (has_capability(func_caps, "x-medkit-graph")) {
+      detail.x_medkit_graph = base_uri + "/x-medkit-graph";
+    }
 
     LinksBuilder links;
     links.self("/api/v1/functions/" + func.id).collection("/api/v1/functions");

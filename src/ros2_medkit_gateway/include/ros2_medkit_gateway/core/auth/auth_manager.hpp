@@ -100,6 +100,26 @@ class AuthManager {
   AuthorizationResult check_authorization(UserRole role, const std::string & method, const std::string & path) const;
 
   /**
+   * @brief Merge permission entries into the table check_authorization reads.
+   *
+   * The table starts empty and the check fails closed, so a manager nobody
+   * feeds authorizes nothing. That is deliberate: the entries belong to the
+   * route set actually mounted, and only the caller that mounts the routes
+   * knows what that is. `RESTServer::setup_routes()` merges two sources - the
+   * registry's derivation for the gateway's own routes and
+   * `AuthConfig::residual_route_permissions()` for the ones mounted outside it
+   * - before the HTTP server starts listening.
+   *
+   * Merging, not replacing, so those two calls compose. Not thread-safe, and
+   * not made so: every call happens on the constructing thread before
+   * `RESTServer::start()`, which is what publishes the table to the request
+   * threads that read it.
+   *
+   * @param permissions Entries to add, keyed by role
+   */
+  void add_route_permissions(const RoutePermissions & permissions);
+
+  /**
    * @brief Check if authentication is required for a request
    * @param method HTTP method
    * @param path Request path
@@ -193,6 +213,11 @@ class AuthManager {
   std::optional<RefreshTokenRecord> get_refresh_token(const std::string & token_id) const;
 
   AuthConfig config_;
+
+  // RBAC entries check_authorization matches against, populated via
+  // add_route_permissions() before the server starts listening. Empty until
+  // then, and an empty set authorizes nothing - see add_route_permissions().
+  RoutePermissions permissions_;
 
   // Auth requirement policy (created from config)
   std::unique_ptr<IAuthRequirementPolicy> auth_policy_;

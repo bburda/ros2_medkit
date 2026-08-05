@@ -29,6 +29,7 @@
 #include <variant>
 #include <vector>
 
+#include "ros2_medkit_gateway/core/auth/auth_config.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/dto/contract.hpp"
 #include "ros2_medkit_gateway/dto/json_reader.hpp"
@@ -388,6 +389,35 @@ class RouteEntry {
   /// closure captures the shared_ptr by value).
   RouteEntry & error_renderer(ErrorRenderer renderer);
 
+  /// Declare the weakest role that may call this route.
+  ///
+  /// One declaration, two consumers, and that is the point of putting it on
+  /// the registration rather than in a table somewhere else:
+  ///   * `RouteRegistry::route_permissions()` turns it into the entries
+  ///     `AuthManager::check_authorization` matches against, expanded to this
+  ///     role *and every stronger one* - `AuthConfig` has no inheritance, so
+  ///     the expansion is what makes "operator or above" true;
+  ///   * `to_openapi_paths()` publishes it as `security: [{bearerAuth:
+  ///     [<role>]}]`, the same shape a plugin's `OperationDesc::requires_role`
+  ///     emits.
+  ///
+  /// Mandatory. Enforcement fails closed - a path no entry matches is 403 -
+  /// so a registration that declares neither this nor `public_route()` ships a
+  /// route nobody below ADMIN can call. `validate_completeness()` reports that
+  /// as an error, including for `hidden()` routes: hidden means absent from the
+  /// document, not absent from the router.
+  RouteEntry & requires_role(UserRole role);
+
+  /// Declare that this route is reachable with no token at all.
+  ///
+  /// Only legitimate where the *middleware* exempts the path before it ever
+  /// reaches the permission table - today that is `/auth/*` alone, which
+  /// `AllAuthRequirementPolicy` and `WriteOnlyAuthRequirementPolicy` both let
+  /// through by prefix. Marking any other route public would emit `security:
+  /// []` while `require_auth_for: all` still demanded a token, and the route
+  /// would answer 403 for every role the table does not otherwise cover.
+  RouteEntry & public_route();
+
  private:
   friend class RouteRegistry;
   std::string method_;
@@ -417,6 +447,12 @@ class RouteEntry {
   /// declaration there is a genuine gap the check must keep reporting.
   bool takes_no_request_body_{false};
   std::string operation_id_;
+
+  /// Set by requires_role() / public_route(). The optional distinguishes
+  /// "public" (declared, no role) from "not declared yet", which is what lets
+  /// validate_completeness() tell a deliberate exemption from an omission.
+  std::optional<UserRole> required_role_;
+  bool role_declared_{false};
 
   /// Heap-allocated so the typed wrapper closure can hold a stable handle to
   /// the renderer choice and observe later `.error_renderer(...)` updates.
@@ -690,14 +726,33 @@ class RouteRegistry {
 
   /// Register the OpenAPI JSON endpoint at the given path. The spec body is
   /// supplied by the caller (typically a closure over the gateway's
-  /// `OpenApiSpecBuilder`).
+  /// `OpenApiSpecBuilder`) already serialized, and written out as-is.
+  ///
+  /// Serialized rather than a `nlohmann::json` the wrapper would dump: the
+  /// capability generator caches documents as text, and taking a DOM here
+  /// would mean parsing one back out of the cache only for this wrapper to
+  /// dump it again. The caller owes the same bytes `write_json_body` would
+  /// have produced - see `http::detail::write_json_text`.
+  ///
+  /// The route is documented like any other. A capability description a
+  /// client cannot discover from the document it is reading is one it has to
+  /// be told about out of band, which defeats the point of serving it.
   RouteEntry & docs_endpoint(const std::string & openapi_path,
-                             std::function<http::Result<nlohmann::json>(http::TypedRequest)> handler);
+                             std::function<http::Result<std::string>(http::TypedRequest)> handler);
 
-  /// Register a catch-all docs route via cpp-httplib regex (used for Swagger
-  /// UI subtree where the path arguments are not fixed). The route is hidden
-  /// from the OpenAPI spec.
-  RouteEntry & docs_subtree(const std::string & regex_pattern, HandlerFn handler);
+  /// Register a route whose URI is a cpp-httplib regex the OpenAPI path
+  /// grammar cannot express, used for the `<entity-path>/docs` sub-document
+  /// whose prefix is any entity or resource path.
+  ///
+  /// `openapi_path` is what the document publishes and `regex_pattern` is
+  /// what cpp-httplib matches; they are separate arguments because the regex
+  /// is not a path template and emitting it as a path key would put a
+  /// literal `(.+)` in the document. The caller owns both, so they can
+  /// disagree - keep the template the shape a client would fill in.
+  ///
+  /// Declares its own 200 carrying the OpenAPI document, so a call site never
+  /// hand-attaches a success status.
+  RouteEntry & docs_subtree(const std::string & openapi_path, const std::string & regex_pattern, HandlerFn handler);
 
   // ---------------------------------------------------------------------------
   // Registry-level operations.
@@ -719,6 +774,42 @@ class RouteRegistry {
   /// Returns issues found. Errors indicate missing required metadata,
   /// warnings indicate missing optional metadata.
   std::vector<ValidationIssue> validate_completeness() const;
+
+  /// Derive the RBAC permission entries for every registered route.
+  ///
+  /// Keyed by role, each value a set of `"<METHOD>:<path pattern>"` strings in
+  /// the grammar `AuthManager::matches_path` reads - the same table
+  /// `check_authorization` has always consulted, now produced from the
+  /// registrations instead of restated beside them.
+  ///
+  /// Two translations happen here and neither is cosmetic:
+  ///
+  /// * The pattern comes from each route's **cpp-httplib regex**, not from its
+  ///   OpenAPI path. That regex is what actually decides whether a request
+  ///   reaches the handler, so deriving the permission from it is what keeps
+  ///   the two from disagreeing. `([^/]+)` becomes `*` (one segment) and
+  ///   `(.+)` becomes `**` (any number), which matters for the routes whose
+  ///   last parameter is allowed to contain slashes - a ROS topic name under
+  ///   `/data/{data_id}` or a dotted parameter under
+  ///   `/configurations/{config_id}` - and for the `<entity-path>/docs`
+  ///   catch-all, whose prefix is a whole path. Deriving from `{param}` alone
+  ///   would have made all three single-segment and 403'd the very requests
+  ///   they exist to serve.
+  ///
+  /// * Roles are expanded upward. `AuthConfig` has no inheritance
+  ///   (`check_authorization` looks up exactly one role's set), so a route
+  ///   declaring OPERATOR lands in OPERATOR, CONFIGURATOR and ADMIN.
+  ///
+  /// `public_route()` routes contribute nothing: the middleware answers them
+  /// before the table is consulted, so an entry would be dead weight.
+  ///
+  /// Routes that declare no role contribute nothing either, which is exactly
+  /// the fail-closed 403 `validate_completeness()` reports as an error.
+  ///
+  /// Covers only what the registry holds. Routes mounted straight onto the
+  /// HTTP server - plugin routes, Swagger UI, the test-build status recorder -
+  /// are not here; see `AuthConfig::residual_route_permissions()`.
+  RoutePermissions route_permissions(const std::string & api_prefix) const;
 
   /// Number of registered routes.
   size_t size() const {
@@ -870,6 +961,42 @@ class RouteRegistry {
   static HandlerFn wrap_del_alternates(std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest)> handler,
                                        std::shared_ptr<ErrorRenderer> renderer, GateHandle gate);
 };
+
+// =============================================================================
+// Projections over an emitted `paths` object
+//
+// These take what `to_openapi_paths()` produced rather than the registry
+// itself, so they apply equally to the plugin-fold's paths - and so the
+// `<entity-path>/docs` sub-documents are a slice of the document the gateway
+// actually serves instead of a second, hand-written description of it.
+// =============================================================================
+
+/// Every path item in `paths` whose key is `prefix` or lies beneath it.
+///
+/// The comparison is by path segment, not by string prefix, and that is the
+/// whole point: `/apps/{app_id}/data` *is* a string prefix of
+/// `/apps/{app_id}/data-groups`, so a `starts_with` filter would hand the data
+/// collection's sub-document three routes belonging to a different collection.
+/// A key qualifies when it equals `prefix` exactly, or continues it with `/`.
+///
+/// Returns an empty object when `paths` is not an object, so a caller can pass
+/// a document that has no paths at all.
+nlohmann::json paths_under(const nlohmann::json & paths, const std::string & prefix);
+
+/// Remove the `in: path` parameter named `param_name` from every operation in
+/// `path_item`.
+///
+/// The other half of substituting a literal id into a path key, and not
+/// optional: OpenAPI ties a path parameter to a `{template}` in the key, so
+/// once the key names a concrete entity a parameter declared for it describes
+/// a placeholder the path no longer has. Leaving it behind publishes a
+/// sub-document a strict validator rejects and a generated client would build
+/// a call signature from.
+///
+/// Only `in: path` parameters of that name are touched - a header or query
+/// parameter that happens to share the name stays, because substituting the
+/// path answered neither.
+void strip_entity_path_parameter(nlohmann::json & path_item, const std::string & param_name);
 
 // =============================================================================
 // Template implementations

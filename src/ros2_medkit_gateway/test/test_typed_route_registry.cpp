@@ -453,22 +453,54 @@ TEST(TypedRouteRegistry, TypedPutRoundTrip) {
 }
 
 // =============================================================================
-// docs_subtree - catch-all regex
+// docs_subtree - catch-all regex, documented under a path template
 // =============================================================================
 
 TEST(TypedRouteRegistry, DocsSubtreeRegexRoutes) {
   RouteRegistry reg;
-  reg.docs_subtree("/docs/(.*)", [](const httplib::Request & req, httplib::Response & res) {
-    res.status = 200;
-    res.set_content("docs:" + req.matches[1].str(), "text/plain");
-  });
+  reg.docs_subtree("/{doc_path}/docs", "/(.*)/docs$",
+                   [](const httplib::Request & req, httplib::Response & res) {
+                     res.status = 200;
+                     res.set_content("docs:" + req.matches[1].str(), "text/plain");
+                   })
+      .tag("Server")
+      .summary("Scoped docs");
 
   auto s = start_server(reg);
   httplib::Client cli("127.0.0.1", s.port);
-  auto r = cli.Get("/api/v1/docs/foo/bar.html");
+  auto r = cli.Get("/api/v1/foo/bar/docs");
   ASSERT_TRUE(r);
   EXPECT_EQ(r->status, 200);
-  EXPECT_EQ(r->body, "docs:foo/bar.html");
+  EXPECT_EQ(r->body, "docs:foo/bar");
+}
+
+// The regex is what cpp-httplib matches; the path template is what the
+// document publishes. They are separate arguments precisely so the `(.*)`
+// never reaches the document as a path key - a client reading `/(.*)/docs$`
+// has no way to fill it in.
+TEST(TypedRouteRegistry, DocsSubtreePublishesTheTemplateNotTheRegex) {
+  RouteRegistry reg;
+  reg.docs_subtree("/{doc_path}/docs", "/(.*)/docs$",
+                   [](const httplib::Request &, httplib::Response & res) {
+                     res.status = 200;
+                   })
+      .tag("Server")
+      .summary("Scoped docs");
+
+  const auto paths = reg.to_openapi_paths();
+  EXPECT_TRUE(paths.contains("/{doc_path}/docs"));
+  EXPECT_FALSE(paths.contains("/(.*)/docs$"));
+  // The helper declares the success status, so the call site above did not -
+  // and could not without hand-attaching a 2xx.
+  const auto & ok = paths["/{doc_path}/docs"]["get"]["responses"]["200"];
+  EXPECT_FALSE(ok["description"].get<std::string>().empty());
+  EXPECT_EQ(ok["content"]["application/json"]["schema"]["type"], "object");
+  // The template's parameter is published, so a generated client knows there
+  // is something to substitute.
+  const auto & params = paths["/{doc_path}/docs"]["get"]["parameters"];
+  ASSERT_EQ(params.size(), 1U);
+  EXPECT_EQ(params[0]["name"], "doc_path");
+  EXPECT_EQ(params[0]["in"], "path");
 }
 
 // =============================================================================

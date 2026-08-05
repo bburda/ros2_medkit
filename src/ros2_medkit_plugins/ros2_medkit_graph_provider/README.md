@@ -9,7 +9,11 @@ into a standalone plugin package in v0.4.0.
 
 - Serves `GET /api/v1/functions/{function_id}/x-medkit-graph`, plus a cyclic-subscription
   sampler under the same resource name and a capability href on every Function's
-  detail response.
+  detail response. That href, and the Function detail's top-level `x-medkit-graph`
+  link, exist only while this plugin is loaded - a gateway without it omits both
+  rather than publishing a URI nothing answers.
+- Exports `describe_plugin_routes`, so the endpoint and the shape of the graph document
+  are part of `GET /api/v1/docs` instead of being reachable but undocumented.
 - Subscribes to `/diagnostics` and resolves the publishing node for each metrics sample
   (never a fabricated or hardcoded name).
 - Builds a per-Function graph of Apps (nodes) and topic connections (edges) with

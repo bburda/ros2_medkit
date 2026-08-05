@@ -39,16 +39,23 @@ The gateway supports three authentication modes via the ``require_auth_for`` par
 Roles and Permissions
 ---------------------
 
+Roles are cumulative: each one may do everything the row above it may do, plus
+its own column. There is no inheritance in the stored table - the gateway
+expands each route's declared role upward when it builds the table - but the
+effect for a caller is the ladder below.
+
 .. list-table::
-   :widths: 20 15 15 20 15 15
+   :widths: 18 14 14 14 20 20
    :header-rows: 1
 
    * - Role
      - Read (GET)
      - Data (PUT)
-     - Operations (POST)
-     - Config (PUT/DEL)
-     - Faults (DEL)
+     - Operations, faults, locks, subscriptions, triggers, bulk-data,
+       script runs, start/restart
+     - Configurations, log configuration, script upload/delete, updates,
+       shutdown
+     - Plugin-served routes
    * - ``viewer``
      - ✅
      - ❌
@@ -73,6 +80,38 @@ Roles and Permissions
      - ✅
      - ✅
      - ✅
+
+Clearing faults is ``operator``, not ``admin`` - it is a runtime action, not a
+change to how the system is configured. Tearing an entity down
+(``PUT /{entity}/status/shutdown`` and ``force-shutdown``) is ``configurator``,
+while bringing one up or restarting it is ``operator``.
+
+Where the table comes from
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each route declares its own weakest caller at the point it is registered, and
+that single declaration produces both halves of the contract:
+
+* the permission entries ``AuthManager::check_authorization`` matches against,
+  and
+* the ``security`` requirement the served OpenAPI document publishes for that
+  operation - ``GET /api/v1/docs`` names the role each endpoint needs.
+
+Enforcement fails closed: a path no entry matches is refused, so an endpoint's
+published role is the role the gateway actually demands rather than a separate
+claim about it.
+
+Two consequences worth knowing:
+
+* **Plugin-served routes are ``admin``-only.** A plugin mounts its routes
+  directly on the HTTP server, outside the route registry, so no per-route
+  declaration describes them. They are covered only by the admin wildcards, and
+  the document publishes ``admin`` for them.
+* **The document reflects this deployment, not the product.** With
+  ``auth.enabled`` false the gateway serves every endpoint unauthenticated and
+  the document publishes no roles at all. With it true, ``require_auth_for``
+  still decides how much is checked - under ``write`` a GET is served without a
+  token even though its operation names the role the table would grant.
 
 Basic Setup
 -----------

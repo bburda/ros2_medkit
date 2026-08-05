@@ -16,7 +16,6 @@
 
 #include <nlohmann/json.hpp>
 #include <string>
-#include <vector>
 
 #include "ros2_medkit_gateway/core/discovery/models/common.hpp"
 #include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
@@ -26,41 +25,35 @@ namespace openapi {
 
 class SchemaBuilder;
 
-/// Builds OpenAPI 3.1.0 PathItem JSON objects for each resource type.
-/// Uses SchemaBuilder for response/request schemas and adds SOVD extensions.
+/// Builds the OpenAPI PathItem for one *discovered* resource - a single ROS 2
+/// topic, service or action.
+///
+/// What is left here after the `<entity-path>/docs` sub-documents became a
+/// projection of `RouteRegistry::to_openapi_paths()`: the route registry holds
+/// `/apps/{app_id}/data/{data_id}` with a payload schema that has to cover
+/// every topic at once, and it has no way to learn that *this* entity's
+/// `temperature` carries a `std_msgs/msg/Float32` or that a publish-only topic
+/// cannot be written. That comes from the entity cache, so these three
+/// builders do, and nothing else in this class does.
+///
+/// A path item built here is not a projection of anything and so does not
+/// carry what a projected operation carries - the framework-level error set,
+/// the declared role. Everything the registry *can* answer is answered by the
+/// projection; adding a fourth builder here is how the hand-written half grows
+/// back.
 class PathBuilder {
  public:
   explicit PathBuilder(const SchemaBuilder & schema_builder, bool auth_enabled = false);
 
-  // Entity collection paths (GET /areas, GET /components, etc.)
-  nlohmann::json build_entity_collection(const std::string & entity_type) const;
-
-  // Entity detail path (GET /areas/{id}, GET /apps/{id})
-  /// @param use_template If true, emit path parameter for {entity_id}. If false, assume concrete path.
-  nlohmann::json build_entity_detail(const std::string & entity_type, bool use_template = true) const;
-
-  // Resource collection paths
-  nlohmann::json build_data_collection(const std::string & entity_path, const std::vector<TopicData> & topics) const;
   nlohmann::json build_data_item(const std::string & entity_path, const TopicData & topic) const;
-  nlohmann::json build_operations_collection(const std::string & entity_path, const AggregatedOperations & ops) const;
   nlohmann::json build_operation_item(const std::string & entity_path, const ServiceInfo & service) const;
   nlohmann::json build_operation_item(const std::string & entity_path, const ActionInfo & action) const;
-  nlohmann::json build_configurations_collection(const std::string & entity_path) const;
-  nlohmann::json build_faults_collection(const std::string & entity_path) const;
-  nlohmann::json build_logs_collection(const std::string & entity_path) const;
-  nlohmann::json build_bulk_data_collection(const std::string & entity_path) const;
-  nlohmann::json build_cyclic_subscriptions_collection(const std::string & entity_path) const;
 
-  // SSE endpoints
-  nlohmann::json build_sse_endpoint(const std::string & path, const std::string & description) const;
-
-  // Common helpers
+  /// The 400/404/500 set every item path carries, plus 401/403 when
+  /// authentication is on.
   nlohmann::json error_responses() const;
 
  private:
-  nlohmann::json build_path_param(const std::string & name, const std::string & description) const;
-  nlohmann::json build_query_params_for_collection() const;
-
   const SchemaBuilder & schema_builder_;
   bool auth_enabled_;
 };

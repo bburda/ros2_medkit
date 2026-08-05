@@ -20,151 +20,52 @@
 using namespace ros2_medkit_gateway;
 
 // =============================================================================
-// AuthConfig role permissions tests
+// Residual route permissions
 // =============================================================================
+//
+// What is left in AuthConfig after the per-role table moved to the
+// registrations. These tests are about the residual list itself - what it
+// covers and, more usefully, what it deliberately does not. The gateway's real
+// per-route grants are derived by `RouteRegistry::route_permissions()` and
+// checked end to end against enforcement in `test_rbac_contract.test.py`;
+// asserting them here would only restate the derivation's input.
 
-TEST(AuthConfigRolePermissionsTest, ViewerPermissionsExist) {
-  const auto & permissions = AuthConfig::get_role_permissions();
-
-  auto it = permissions.find(UserRole::VIEWER);
-  ASSERT_NE(it, permissions.end());
-
-  const auto & viewer_perms = it->second;
-
-  // Viewer should have read access
-  EXPECT_TRUE(viewer_perms.count("GET:/api/v1/health") > 0);
-  EXPECT_TRUE(viewer_perms.count("GET:/api/v1/areas") > 0);
-  EXPECT_TRUE(viewer_perms.count("GET:/api/v1/components") > 0);
-
-  // Viewer should NOT have write access
-  EXPECT_TRUE(viewer_perms.count("POST:/api/v1/components/*/operations/*") == 0);
-  EXPECT_TRUE(viewer_perms.count("PUT:/api/v1/components/*/configurations/*") == 0);
-  EXPECT_TRUE(viewer_perms.count("DELETE:/api/v1/components/*/faults/*") == 0);
-}
-
-TEST(AuthConfigRolePermissionsTest, OperatorPermissionsIncludeOperations) {
-  const auto & permissions = AuthConfig::get_role_permissions();
-
-  auto it = permissions.find(UserRole::OPERATOR);
-  ASSERT_NE(it, permissions.end());
-
-  const auto & operator_perms = it->second;
-
-  // Operator should have operation permissions
-  EXPECT_TRUE(operator_perms.count("POST:/api/v1/components/*/operations/*/executions") > 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/components/*/operations/*/executions/*") > 0);
-  EXPECT_TRUE(operator_perms.count("DELETE:/api/v1/components/*/operations/*/executions/*") > 0);
-  EXPECT_TRUE(operator_perms.count("DELETE:/api/v1/components/*/faults/*") > 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/components/*/data/*") > 0);
-
-  // Operator should NOT have config modification
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/components/*/configurations/*") == 0);
-}
-
-TEST(AuthConfigRolePermissionsTest, ConfiguratorPermissionsIncludeConfigurations) {
-  const auto & permissions = AuthConfig::get_role_permissions();
-
-  auto it = permissions.find(UserRole::CONFIGURATOR);
-  ASSERT_NE(it, permissions.end());
-
-  const auto & config_perms = it->second;
-
-  // Configurator should have config permissions
-  EXPECT_TRUE(config_perms.count("PUT:/api/v1/components/*/configurations/*") > 0);
-  EXPECT_TRUE(config_perms.count("DELETE:/api/v1/components/*/configurations/*") > 0);
-
-  // Plus all operator permissions
-  EXPECT_TRUE(config_perms.count("POST:/api/v1/components/*/operations/*/executions") > 0);
-  EXPECT_TRUE(config_perms.count("PUT:/api/v1/components/*/operations/*/executions/*") > 0);
-}
-
-TEST(AuthConfigRolePermissionsTest, AdminHasWildcardAccess) {
-  const auto & permissions = AuthConfig::get_role_permissions();
+TEST(AuthConfigResidualPermissionsTest, AdminWildcardsCoverEveryMethod) {
+  // @verifies REQ_INTEROP_086
+  const auto & permissions = AuthConfig::residual_route_permissions();
 
   auto it = permissions.find(UserRole::ADMIN);
   ASSERT_NE(it, permissions.end());
 
   const auto & admin_perms = it->second;
-
-  // Admin should have wildcard access
   EXPECT_TRUE(admin_perms.count("GET:/api/v1/**") > 0);
   EXPECT_TRUE(admin_perms.count("POST:/api/v1/**") > 0);
   EXPECT_TRUE(admin_perms.count("PUT:/api/v1/**") > 0);
   EXPECT_TRUE(admin_perms.count("DELETE:/api/v1/**") > 0);
 }
 
-// =============================================================================
-// Status and lifecycle RBAC tests
-// =============================================================================
+TEST(AuthConfigResidualPermissionsTest, NoRoleBelowAdminHasResidualEntries) {
+  // The residual list exists for routes mounted outside the RouteRegistry -
+  // plugin routes above all. Granting one of those to a weaker role would hand
+  // that role every route whichever plugins the deployment happens to load,
+  // sight unseen, so the list stops at ADMIN. This is also why a plugin
+  // operation's published role reads `admin`.
+  const auto & permissions = AuthConfig::residual_route_permissions();
 
-TEST(AuthConfigRolePermissionsTest, ViewerCanReadStatus) {
-  const auto & permissions = AuthConfig::get_role_permissions();
-
-  const auto & viewer_perms = permissions.at(UserRole::VIEWER);
-  EXPECT_TRUE(viewer_perms.count("GET:/api/v1/apps/*/status") > 0);
-  EXPECT_TRUE(viewer_perms.count("GET:/api/v1/components/*/status") > 0);
+  EXPECT_EQ(permissions.count(UserRole::VIEWER), 0u);
+  EXPECT_EQ(permissions.count(UserRole::OPERATOR), 0u);
+  EXPECT_EQ(permissions.count(UserRole::CONFIGURATOR), 0u);
 }
 
-TEST(AuthConfigRolePermissionsTest, OperatorCanReadStatusAndControlNonDestructiveLifecycle) {
-  const auto & permissions = AuthConfig::get_role_permissions();
+TEST(AuthConfigResidualPermissionsTest, CarriesNoPerRouteEntries) {
+  // The old literal table lived here and listed every gateway route by hand.
+  // It is gone, and this pins that it stays gone: a per-route entry added back
+  // here would be a second source for a grant the registration already
+  // declares, and the two would drift.
+  const auto & permissions = AuthConfig::residual_route_permissions();
 
-  const auto & operator_perms = permissions.at(UserRole::OPERATOR);
-  EXPECT_TRUE(operator_perms.count("GET:/api/v1/apps/*/status") > 0);
-  EXPECT_TRUE(operator_perms.count("GET:/api/v1/components/*/status") > 0);
-  // Non-destructive transitions are allowed for OPERATOR.
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/apps/*/status/start") > 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/apps/*/status/restart") > 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/apps/*/status/force-restart") > 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/components/*/status/start") > 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/components/*/status/restart") > 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/components/*/status/force-restart") > 0);
-}
-
-TEST(AuthConfigRolePermissionsTest, OperatorCannotPerformDestructiveTransitions) {
-  const auto & permissions = AuthConfig::get_role_permissions();
-
-  const auto & operator_perms = permissions.at(UserRole::OPERATOR);
-  // shutdown / force-shutdown tear an entity down and are gated behind CONFIGURATOR.
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/apps/*/status/shutdown") == 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/apps/*/status/force-shutdown") == 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/components/*/status/shutdown") == 0);
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/components/*/status/force-shutdown") == 0);
-  // The old broad wildcard must not be present.
-  EXPECT_TRUE(operator_perms.count("PUT:/api/v1/apps/*/status/*") == 0);
-}
-
-TEST(AuthConfigRolePermissionsTest, ConfiguratorCanControlDestructiveLifecycle) {
-  const auto & permissions = AuthConfig::get_role_permissions();
-
-  const auto & config_perms = permissions.at(UserRole::CONFIGURATOR);
-  EXPECT_TRUE(config_perms.count("GET:/api/v1/apps/*/status") > 0);
-  EXPECT_TRUE(config_perms.count("GET:/api/v1/components/*/status") > 0);
-  // CONFIGURATOR has the non-destructive transitions plus the teardown ones.
-  EXPECT_TRUE(config_perms.count("PUT:/api/v1/apps/*/status/restart") > 0);
-  EXPECT_TRUE(config_perms.count("PUT:/api/v1/apps/*/status/shutdown") > 0);
-  EXPECT_TRUE(config_perms.count("PUT:/api/v1/apps/*/status/force-shutdown") > 0);
-  EXPECT_TRUE(config_perms.count("PUT:/api/v1/components/*/status/shutdown") > 0);
-  EXPECT_TRUE(config_perms.count("PUT:/api/v1/components/*/status/force-shutdown") > 0);
-}
-
-TEST(AuthConfigRolePermissionsTest, ViewerCannotControlLifecycle) {
-  const auto & permissions = AuthConfig::get_role_permissions();
-
-  const auto & viewer_perms = permissions.at(UserRole::VIEWER);
-  EXPECT_TRUE(viewer_perms.count("PUT:/api/v1/apps/*/status/start") == 0);
-  EXPECT_TRUE(viewer_perms.count("PUT:/api/v1/apps/*/status/restart") == 0);
-  EXPECT_TRUE(viewer_perms.count("PUT:/api/v1/apps/*/status/shutdown") == 0);
-  EXPECT_TRUE(viewer_perms.count("PUT:/api/v1/components/*/status/restart") == 0);
-}
-
-TEST(AuthConfigRolePermissionsTest, AdminStatusCoveredByWildcard) {
-  const auto & permissions = AuthConfig::get_role_permissions();
-
-  const auto & admin_perms = permissions.at(UserRole::ADMIN);
-  // Admin is covered by PUT:/api/v1/** - no specific status entries needed
-  EXPECT_TRUE(admin_perms.count("PUT:/api/v1/**") > 0);
-  EXPECT_TRUE(admin_perms.count("PUT:/api/v1/apps/*/status/shutdown") == 0);
-  EXPECT_TRUE(admin_perms.count("PUT:/api/v1/components/*/status/force-shutdown") == 0);
+  ASSERT_EQ(permissions.size(), 1u);
+  EXPECT_EQ(permissions.at(UserRole::ADMIN).size(), 4u);
 }
 
 // =============================================================================

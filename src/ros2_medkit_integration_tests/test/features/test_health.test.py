@@ -21,6 +21,7 @@ is launched so the test starts quickly.
 
 """
 
+import re
 import unittest
 
 import launch_testing
@@ -127,6 +128,32 @@ class TestHealth(GatewayTestCase):
         self.assertIn('GET /api/v1/apps/{app_id}/data', endpoints)
         self.assertIn('GET /api/v1/apps/{app_id}/operations', endpoints)
         self.assertIn('GET /api/v1/apps/{app_id}/configurations', endpoints)
+
+    def test_endpoint_list_names_each_route_once(self):
+        """The endpoints list names each mounted route exactly once.
+
+        It is the route registry's list plus a short hand-written tail for the
+        routes mounted outside the registry. Moving a route into the registry
+        without deleting its hand-written entry lists it twice.
+
+        Compared with parameter *names* erased, not as literal strings. The
+        entry this was written for was spelled ``{entity-path}`` by hand and
+        ``{entity_path}`` by the registry, so a literal comparison would have
+        read the two copies as two different endpoints and passed. Erasing the
+        names is safe here because no two routes in this API differ only by a
+        parameter name - every pair differs in a literal segment - so a
+        collision after erasure is a duplicate and not a false positive.
+
+        @verifies REQ_INTEROP_010
+        """
+        endpoints = self.get_json('/')['endpoints']
+        erased = [re.sub(r'\{[^}]*\}', '{}', e) for e in endpoints]
+        duplicates = sorted({e for e in erased if erased.count(e) > 1})
+        self.assertEqual(
+            duplicates, [],
+            f'endpoints listed more than once (parameter names erased): {duplicates}')
+        self.assertIn('GET /api/v1/docs', endpoints)
+        self.assertIn('GET /api/v1/{entity_path}/docs', endpoints)
 
     def test_docs_endpoint(self):
         """GET /docs returns OpenAPI 3.1.0 spec.

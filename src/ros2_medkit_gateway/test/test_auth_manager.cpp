@@ -21,6 +21,49 @@
 
 using namespace ros2_medkit_gateway;
 
+namespace {
+
+/// A stand-in for the shipped permission table, and honestly a stand-in.
+///
+/// The real table is derived from the route registrations and installed by
+/// `RESTServer::setup_routes()`; an `AuthManager` built on its own has none and
+/// fails closed. What the authorization tests below exercise is the *matcher* -
+/// exact hit, single-segment `*`, multi-segment `**`, and the no-match refusal
+/// - so they need a table shaped like the derived one rather than the derived
+/// one itself: roles expanded upward, because `AuthConfig` has no inheritance.
+///
+/// It says nothing about whether the shipped table grants the right thing on
+/// the right path. No hand-written table can answer that, since it would be the
+/// same author restating the same belief twice. The gateway's real table is
+/// checked against the gateway's real enforcement in
+/// `test_rbac_contract.test.py`.
+RoutePermissions matcher_fixture_permissions() {
+  const std::unordered_set<std::string> viewer = {
+      "GET:/api/v1/components",
+      "GET:/api/v1/components/*/data",
+      "GET:/api/v1/areas",
+  };
+  const std::unordered_set<std::string> operator_only = {
+      "POST:/api/v1/components/*/operations/*/executions",
+      "DELETE:/api/v1/components/*/faults/*",
+      "PUT:/api/v1/components/*/data/*",
+  };
+  const std::unordered_set<std::string> configurator_only = {
+      "PUT:/api/v1/components/*/configurations/*",
+      "DELETE:/api/v1/components/*/configurations/*",
+  };
+
+  RoutePermissions permissions;
+  permissions[UserRole::VIEWER] = viewer;
+  permissions[UserRole::OPERATOR] = viewer;
+  permissions[UserRole::OPERATOR].insert(operator_only.begin(), operator_only.end());
+  permissions[UserRole::CONFIGURATOR] = permissions[UserRole::OPERATOR];
+  permissions[UserRole::CONFIGURATOR].insert(configurator_only.begin(), configurator_only.end());
+  return permissions;
+}
+
+}  // namespace
+
 // Test fixture for AuthManager tests
 // @verifies REQ_INTEROP_086, REQ_INTEROP_087
 class AuthManagerTest : public ::testing::Test {
@@ -42,6 +85,11 @@ class AuthManagerTest : public ::testing::Test {
                   .build();
 
     auth_manager_ = std::make_unique<AuthManager>(config_);
+    // ADMIN's entries come from the residual list, which is where they live on
+    // a running gateway too - `**` per method, covering the routes the registry
+    // never sees.
+    auth_manager_->add_route_permissions(matcher_fixture_permissions());
+    auth_manager_->add_route_permissions(AuthConfig::residual_route_permissions());
   }
 
   AuthConfig config_;
@@ -404,6 +452,49 @@ TEST_F(AuthManagerTest, AuthorizeAdminHasFullAccess) {
 
   result = auth_manager_->check_authorization(UserRole::ADMIN, "DELETE", "/api/v1/anything/goes");
   EXPECT_TRUE(result.authorized);
+}
+
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerPermissionTableTest, AManagerWithNoTableAuthorizesNothing) {
+  // The fail-closed property the whole derivation rests on. `RESTServer` feeds
+  // the table before the server listens; a manager that never got one must
+  // refuse rather than fall back to some built-in default, because a default
+  // would be a second source for every grant.
+  AuthConfig config = AuthConfigBuilder()
+                          .with_enabled(true)
+                          .with_jwt_secret("test_secret_key_min_32_chars_empty")
+                          .with_token_expiry(3600)
+                          .with_refresh_token_expiry(86400)
+                          .build();
+  AuthManager manager(config);
+
+  for (UserRole role : {UserRole::VIEWER, UserRole::OPERATOR, UserRole::CONFIGURATOR, UserRole::ADMIN}) {
+    auto result = manager.check_authorization(role, "GET", "/api/v1/health");
+    EXPECT_FALSE(result.authorized) << "role " << static_cast<int>(role);
+  }
+}
+
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerPermissionTableTest, AddedPermissionsMergeRatherThanReplace) {
+  // `RESTServer` calls this twice - once with the registry's derivation, once
+  // with the residual list - so the second call must not erase the first.
+  AuthConfig config = AuthConfigBuilder()
+                          .with_enabled(true)
+                          .with_jwt_secret("test_secret_key_min_32_chars_merge")
+                          .with_token_expiry(3600)
+                          .with_refresh_token_expiry(86400)
+                          .build();
+  AuthManager manager(config);
+
+  RoutePermissions first;
+  first[UserRole::VIEWER] = {"GET:/api/v1/health"};
+  RoutePermissions second;
+  second[UserRole::VIEWER] = {"GET:/api/v1/version-info"};
+  manager.add_route_permissions(first);
+  manager.add_route_permissions(second);
+
+  EXPECT_TRUE(manager.check_authorization(UserRole::VIEWER, "GET", "/api/v1/health").authorized);
+  EXPECT_TRUE(manager.check_authorization(UserRole::VIEWER, "GET", "/api/v1/version-info").authorized);
 }
 
 // Test auth requirement checking
@@ -857,6 +948,12 @@ class AuthMiddlewareTest : public ::testing::Test {
                   .build();
 
     auth_manager_ = std::make_unique<AuthManager>(config_);
+    // The middleware delegates the RBAC decision to the manager, and a manager
+    // with no table refuses everything - see matcher_fixture_permissions().
+    // ADMIN's grant comes from the residual list, which is where the token
+    // these tests use gets its reach on a running gateway too.
+    auth_manager_->add_route_permissions(matcher_fixture_permissions());
+    auth_manager_->add_route_permissions(AuthConfig::residual_route_permissions());
     middleware_ = std::make_unique<AuthMiddleware>(config_, auth_manager_.get());
   }
 

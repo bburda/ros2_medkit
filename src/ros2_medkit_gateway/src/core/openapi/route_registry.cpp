@@ -446,6 +446,18 @@ RouteEntry & RouteEntry::error_renderer(ErrorRenderer renderer) {
   return *this;
 }
 
+RouteEntry & RouteEntry::requires_role(UserRole role) {
+  required_role_ = role;
+  role_declared_ = true;
+  return *this;
+}
+
+RouteEntry & RouteEntry::public_route() {
+  required_role_.reset();
+  role_declared_ = true;
+  return *this;
+}
+
 // -----------------------------------------------------------------------------
 // RouteRegistry route registration
 // -----------------------------------------------------------------------------
@@ -730,7 +742,7 @@ RouteEntry & RouteRegistry::static_asset(const std::string & openapi_path,
 }
 
 RouteEntry & RouteRegistry::docs_endpoint(const std::string & openapi_path,
-                                          std::function<http::Result<nlohmann::json>(http::TypedRequest)> handler) {
+                                          std::function<http::Result<std::string>(http::TypedRequest)> handler) {
   auto renderer = std::make_shared<ErrorRenderer>(ErrorRenderer::kSovdGenericError);
   auto gate = std::make_shared<std::optional<RouteGate>>();
   HandlerFn fn = [handler = std::move(handler), renderer, gate](const httplib::Request & req, httplib::Response & res) {
@@ -745,20 +757,26 @@ RouteEntry & RouteRegistry::docs_endpoint(const std::string & openapi_path,
       write_typed_error(res, outcome.error(), renderer);
       return;
     }
-    http::detail::write_json_body(http::detail::FrameworkOrPluginAccess{}, res, outcome.value(), 200);
+    http::detail::write_json_text(http::detail::FrameworkOrPluginAccess{}, res, outcome.value(), 200);
   };
   auto & entry = add_route("get", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
   entry.gate_ = gate;
   entry.response(200, "OpenAPI specification document",
                  nlohmann::json{{"type", "object"}, {"additionalProperties", true}});
-  entry.hidden();  // The docs spec endpoint describes itself externally.
   return entry;
 }
 
-RouteEntry & RouteRegistry::docs_subtree(const std::string & regex_pattern, HandlerFn handler) {
-  auto & entry = add_raw_route("get", regex_pattern, regex_pattern, std::move(handler));
-  entry.hidden();
+RouteEntry & RouteRegistry::docs_subtree(const std::string & openapi_path, const std::string & regex_pattern,
+                                         HandlerFn handler) {
+  auto & entry = add_raw_route("get", openapi_path, regex_pattern, std::move(handler));
+  // Attached here, not at the call site, for the same reason `docs_endpoint`
+  // does it: a success status is a property of the registration, and a call
+  // site that hand-attaches its own 2xx is the drift this design forbids
+  // (design/dto_contract.rst). The body is the OpenAPI document itself, which
+  // is why this helper exists rather than a typed `get<T>`.
+  entry.response(200, "OpenAPI specification document scoped to the requested path",
+                 nlohmann::json{{"type", "object"}, {"additionalProperties", true}});
   return entry;
 }
 
@@ -1280,6 +1298,29 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       operation["operationId"] = op_id;
     }
 
+    // The role declared at the registration, in the shape a plugin's
+    // `OperationDesc::requires_role` already emits - one scheme, the role as
+    // its scope. `public_route()` emits the empty requirement list, which is
+    // how OpenAPI says "this operation overrides the document-level
+    // requirement and needs no token"; without it the `/auth/*` endpoints
+    // would inherit a token requirement that is precisely what a caller uses
+    // them to obtain.
+    //
+    // Emitted unconditionally here, and removed again by
+    // `CapabilityGenerator::generate_impl` when `auth.enabled` is off. That
+    // split is deliberate: whether the running gateway honours a role is a
+    // property of the deployment, not of the registration, and answering it
+    // once over the finished document is what keeps every producer - registry,
+    // plugin fold, sub-documents - on one rule.
+    if (route.role_declared_) {
+      if (route.required_role_.has_value()) {
+        operation["security"] =
+            nlohmann::json::array({{{"bearerAuth", nlohmann::json::array({role_to_string(*route.required_role_)})}}});
+      } else {
+        operation["security"] = nlohmann::json::array();
+      }
+    }
+
     paths[route.path_][route.method_] = std::move(operation);
   }
 
@@ -1287,8 +1328,201 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
 }
 
 // -----------------------------------------------------------------------------
+// Projections over an emitted `paths` object
+// -----------------------------------------------------------------------------
+
+nlohmann::json paths_under(const nlohmann::json & paths, const std::string & prefix) {
+  nlohmann::json subtree = nlohmann::json::object();
+  if (!paths.is_object()) {
+    return subtree;
+  }
+  for (const auto & [key, item] : paths.items()) {
+    const bool same = key == prefix;
+    // The segment boundary: the next character after the prefix must be the
+    // separator, or `/data` swallows `/data-groups`.
+    const bool beneath =
+        key.size() > prefix.size() && key.compare(0, prefix.size(), prefix) == 0 && key[prefix.size()] == '/';
+    if (same || beneath) {
+      subtree[key] = item;
+    }
+  }
+  return subtree;
+}
+
+void strip_entity_path_parameter(nlohmann::json & path_item, const std::string & param_name) {
+  if (!path_item.is_object()) {
+    return;
+  }
+  for (auto & operation : path_item) {
+    // A path item can carry non-operation members (a path-level `summary`, a
+    // vendor extension). Only an object can hold `parameters`.
+    if (!operation.is_object() || !operation.contains("parameters") || !operation["parameters"].is_array()) {
+      continue;
+    }
+    // Rebuilt rather than erased in place: nlohmann's array `erase` takes an
+    // iterator and invalidates the ones past it, so removing while iterating
+    // needs an index dance this does not.
+    //
+    // Members are read through `contains()` + `operator[]` to match the
+    // convention the parameter scan in `to_openapi_paths()` set, and for the
+    // reason recorded there - GCC inlines nlohmann's iterator dereference into
+    // a -Wnull-dereference this build treats as an error. Whether it would fire
+    // on this particular loop was not tested; following the convention costs
+    // nothing.
+    nlohmann::json kept = nlohmann::json::array();
+    for (const auto & param : operation["parameters"]) {
+      const bool answered_by_the_substitution = param.is_object() && param.contains("in") && param["in"] == "path" &&
+                                                param.contains("name") && param["name"] == param_name;
+      if (!answered_by_the_substitution) {
+        kept.push_back(param);
+      }
+    }
+    if (kept.empty()) {
+      // An empty `parameters` array is legal but says nothing; dropping it
+      // keeps a concrete entity's operation looking like what it is.
+      operation.erase("parameters");
+    } else {
+      operation["parameters"] = std::move(kept);
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
 // tags - collect unique tags
 // -----------------------------------------------------------------------------
+
+namespace {
+
+/// Rewrite a route's cpp-httplib regex as an `AuthManager::matches_path`
+/// pattern.
+///
+/// The regexes `to_regex_path()` builds contain exactly two constructs beyond
+/// literal text - `([^/]+)` for a segment and `(.+)` for a slash-spanning tail
+/// - plus the `/?$` anchor it appends. `add_raw_route()` supplies its own
+/// regex, and the one caller (`docs_subtree`) uses the same two constructs with
+/// a bare `$`. Both anchors are handled; anything else left over is reported by
+/// the caller rather than guessed at, because a pattern that silently drops a
+/// metacharacter would grant a path nobody wrote down.
+///
+/// The optional trailing slash the `/?` anchor accepts is deliberately NOT
+/// mirrored into a second pattern, and the reason is behaviour rather than
+/// cost: `GET /api/v1/health/` was 403 for a viewer before this derivation and
+/// still is, so mirroring the slash would be a widening nobody asked for.
+///
+/// It would also double a set that this change already grew. The old table
+/// held seven entries for ADMIN - the four `**` wildcards plus three
+/// `POST:/api/v1/auth/*` literals that `POST:/api/v1/**` already covered, and
+/// that the middleware exempts by prefix before the table is consulted at all -
+/// and a literal list for everyone else; the derived one carries an entry per
+/// route per granted role, and `check_authorization` scans a role's whole set,
+/// compiling a `std::regex` per pattern, on any request the exact-match lookup
+/// misses. Doubling it again would be paid on every such request. Neither
+/// reason on its own would settle it; together they do.
+///
+/// The one exception is the root route, whose regex IS the anchor: it gets both
+/// forms, because `/api/v1` without the slash is otherwise unreachable - it was
+/// refused for every role, ADMIN included, before this derivation.
+std::optional<std::string> regex_to_permission_pattern(const std::string & regex_path) {
+  std::string body = regex_path;
+  if (body.size() >= 3 && body.compare(body.size() - 3, 3, "/?$") == 0) {
+    body.erase(body.size() - 3);
+  } else if (!body.empty() && body.back() == '$') {
+    body.pop_back();
+  }
+
+  std::string pattern;
+  pattern.reserve(body.size());
+  for (size_t i = 0; i < body.size();) {
+    if (body.compare(i, 7, "([^/]+)") == 0) {
+      pattern += '*';
+      i += 7;
+      continue;
+    }
+    if (body.compare(i, 4, "(.+)") == 0) {
+      pattern += "**";
+      i += 4;
+      continue;
+    }
+    // Any regex metacharacter that is not one of the two known captures means
+    // the route's URI was written in a form this translation does not model.
+    if (std::string("()[]{}.+*?^$|\\").find(body[i]) != std::string::npos) {
+      return std::nullopt;
+    }
+    pattern += body[i];
+    ++i;
+  }
+  return pattern;
+}
+
+/// Every role at or above `role`. `UserRole` is declared weakest-first, so the
+/// tail of the enumerator list is exactly "this role and stronger" - the
+/// expansion `AuthConfig`'s lack of inheritance forces.
+std::vector<UserRole> roles_at_or_above(UserRole role) {
+  static const std::array<UserRole, 4> kAscending = {UserRole::VIEWER, UserRole::OPERATOR, UserRole::CONFIGURATOR,
+                                                     UserRole::ADMIN};
+  std::vector<UserRole> out;
+  bool reached = false;
+  for (UserRole candidate : kAscending) {
+    reached = reached || candidate == role;
+    if (reached) {
+      out.push_back(candidate);
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+RoutePermissions RouteRegistry::route_permissions(const std::string & api_prefix) const {
+  RoutePermissions permissions;
+  // Every route, `hidden()` included. Hidden keeps a route out of the document,
+  // not out of the router: the request still arrives and still meets this
+  // table. The two hidden 405 stubs (bulk-data writes on areas and functions)
+  // are the case in point - without an entry the caller is told "forbidden"
+  // where the truth is "this entity type cannot host uploads".
+  for (const auto & route : routes_) {
+    // Skipped: a `public_route()` (the middleware answers it before the table
+    // is consulted, so an entry would be dead weight on a set that is scanned
+    // per request) and a route that declared nothing at all (which
+    // validate_completeness() reports as an error).
+    if (!route.role_declared_ || !route.required_role_.has_value()) {
+      continue;
+    }
+    auto pattern = regex_to_permission_pattern(route.regex_path_);
+    if (!pattern.has_value()) {
+      continue;  // Reported by validate_completeness().
+    }
+    std::string method_upper = route.method_;
+    std::transform(method_upper.begin(), method_upper.end(), method_upper.begin(), [](unsigned char c) {
+      return std::toupper(c);
+    });
+
+    // Built once per route rather than once per granted role: the entry is the
+    // same string in every role's set, and a route declaring VIEWER lands in
+    // four of them.
+    std::string entry;
+    entry.reserve(method_upper.size() + api_prefix.size() + pattern->size() + 2);
+    entry += method_upper;
+    entry += ':';
+    entry += api_prefix;
+    entry += *pattern;
+
+    std::vector<std::string> entries;
+    entries.reserve(2);
+    if (pattern->empty()) {
+      // The root route: its regex is the anchor alone, so the entry above ends
+      // at the bare prefix. Both spellings are reachable URIs.
+      std::string with_slash = entry;
+      with_slash += '/';
+      entries.push_back(std::move(with_slash));
+    }
+    entries.push_back(std::move(entry));
+    for (UserRole granted : roles_at_or_above(*route.required_role_)) {
+      permissions[granted].insert(entries.begin(), entries.end());
+    }
+  }
+  return permissions;
+}
 
 std::vector<std::string> RouteRegistry::to_endpoint_list(const std::string & api_prefix) const {
   std::vector<std::string> endpoints;
@@ -1326,16 +1560,33 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
   std::vector<ValidationIssue> issues;
 
   for (const auto & route : routes_) {
-    // Hidden routes are excluded from OpenAPI - skip validation
-    if (route.hidden_) {
-      continue;
-    }
-
     std::string method_upper = route.method_;
     std::transform(method_upper.begin(), method_upper.end(), method_upper.begin(), [](unsigned char c) {
       return std::toupper(c);
     });
     std::string route_id = method_upper + " " + route.path_;
+
+    // Checked ahead of the hidden-route skip, and that ordering is the whole
+    // value of the check. `hidden()` removes a route from the document, not
+    // from the router: the request still arrives, the middleware still consults
+    // the permission table, and a route with no declaration has no entry there.
+    // Fail-closed enforcement turns that into a 403 nobody wrote down - which
+    // no test of the document could ever see, because the route is not in it.
+    if (!route.role_declared_) {
+      issues.push_back({ValidationIssue::Severity::kError, route_id,
+                        "No requires_role() or public_route() on the registration; with fail-closed "
+                        "authorization the route answers 403 for every role below ADMIN"});
+    } else if (route.required_role_.has_value() && !regex_to_permission_pattern(route.regex_path_).has_value()) {
+      issues.push_back({ValidationIssue::Severity::kError, route_id,
+                        "The route's URI pattern '" + route.regex_path_ +
+                            "' cannot be expressed as a permission pattern, so the declared role grants "
+                            "nothing and the route answers 403 for every role below ADMIN"});
+    }
+
+    // Hidden routes are excluded from OpenAPI - skip the document checks
+    if (route.hidden_) {
+      continue;
+    }
 
     // Every route must have a tag
     if (route.tag_.empty()) {

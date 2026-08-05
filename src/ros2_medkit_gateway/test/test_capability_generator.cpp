@@ -54,8 +54,19 @@ void seed_get_no_summary(RouteRegistry & reg, const std::string & path, const st
   reg.get<dto::Health>(path, std::move(h)).tag(tag);
 }
 
+/// A route whose only outcome is 501, the shape `/data-categories` and
+/// `/data-groups` are registered with in `rest_server.cpp`.
+void seed_get_501(RouteRegistry & reg, const std::string & path, const std::string & tag) {
+  std::function<http::Result<dto::Health>(http::TypedRequest)> h = &noop_cap_handler;
+  reg.get<dto::Health>(path, std::move(h)).tag(tag).only_status(501, "Not implemented for ROS 2");
+}
+
 // Populate a RouteRegistry with representative routes matching what the real
-// gateway registers, so that generate_root() produces the paths the tests expect.
+// gateway registers. The sub-documents are a projection of this registry, so
+// what it holds is what the tests below can observe - a collection missing
+// here is missing from every sub-document, which is the property the
+// `EntityDocumentOffersNoCollectionWithoutARoute` case turns into an
+// assertion.
 void populate_test_routes(RouteRegistry & reg) {
   seed_get(reg, "/health", "Server", "Health check");
   seed_get(reg, "/", "Server", "API overview");
@@ -74,16 +85,29 @@ void populate_test_routes(RouteRegistry & reg) {
     seed_get(reg, entity_path, "Discovery", std::string("Get ") + singular);
     seed_get_no_summary(reg, entity_path + "/data", "Data");
     seed_get_no_summary(reg, entity_path + "/data/{data_id}", "Data");
+    seed_get_501(reg, entity_path + "/data-categories", "Data");
+    seed_get_501(reg, entity_path + "/data-groups", "Data");
     seed_get_no_summary(reg, entity_path + "/operations", "Operations");
+    seed_get_no_summary(reg, entity_path + "/operations/{operation_id}", "Operations");
     seed_get_no_summary(reg, entity_path + "/configurations", "Configuration");
     seed_get_no_summary(reg, entity_path + "/faults", "Faults");
+    seed_get_no_summary(reg, entity_path + "/faults/{fault_code}", "Faults");
     seed_get_no_summary(reg, entity_path + "/logs", "Logs");
+    seed_get_no_summary(reg, entity_path + "/logs/configuration", "Logs");
     seed_get_no_summary(reg, entity_path + "/bulk-data", "Bulk Data");
+    seed_get_no_summary(reg, entity_path + "/triggers", "Triggers");
     seed_get_no_summary(reg, entity_path + "/cyclic-subscriptions", "Subscriptions");
   }
 
   seed_get(reg, "/faults", "Faults", "List all faults globally");
   seed_get(reg, "/faults/stream", "Faults", "Stream fault events (SSE)");
+}
+
+/// The id of some component the running node discovered, or an empty string.
+std::string first_component_id(const GatewayNode & node) {
+  const auto & cache = node.get_thread_safe_cache();
+  auto components = cache.get_components();
+  return components.empty() ? std::string{} : components.front().id;
 }
 
 }  // namespace
@@ -330,21 +354,16 @@ TEST_F(CapabilityGeneratorTest, GenerateNonexistentComponentReturnsNullopt) {
 
 // The entity sub-document is the second surface that advertises an entity's
 // collections - the `capabilities` array on the detail response is the first.
-// It is driven by `EntityCapabilities::for_type`, and `/data-lists`, `/modes`
-// and `/updates` used to reach it and be published with a fabricated 200: no
-// entity type registers them.
 //
-// What this pins is the generator's own half of the guarantee. The switch in
-// `add_resource_collection_paths` is exhaustive and gives the four unrouted
-// collections an empty arm, so even a capability list that named one again
-// would produce no path here - `EntityCapabilities.NoEntityAdvertises...`
-// covers the list itself, and the two together are what keep both surfaces
-// clean.
+// Since the sub-document became a projection of the routes the gateway
+// registers, the guarantee is structural rather than a matter of keeping two
+// lists agreeing: a collection appears here exactly when a route answers it.
+// `/data-lists`, `/modes`, `/updates` and `/communication-logs` used to be
+// published with a fabricated 200 while no route served any of them.
 TEST_F(CapabilityGeneratorTest, EntityDocumentOffersNoCollectionWithoutARoute) {
-  const auto & cache = node_->get_thread_safe_cache();
-  auto components = cache.get_components();
-  ASSERT_FALSE(components.empty()) << "no component discovered - the assertions below would prove nothing";
-  const std::string entity_path = "/components/" + components.front().id;
+  const std::string component_id = first_component_id(*node_);
+  ASSERT_FALSE(component_id.empty()) << "no component discovered - the assertions below would prove nothing";
+  const std::string entity_path = "/components/" + component_id;
 
   auto result = generator_->generate(entity_path);
   ASSERT_TRUE(result.has_value());
@@ -352,7 +371,7 @@ TEST_F(CapabilityGeneratorTest, EntityDocumentOffersNoCollectionWithoutARoute) {
   for (const auto * phantom : {"/data-lists", "/modes", "/updates", "/communication-logs"}) {
     EXPECT_FALSE(result->at("paths").contains(entity_path + phantom)) << phantom;
   }
-  // ... while the collections the loop does register are still offered.
+  // ... while every collection the registry does hold is offered.
   for (const auto * served : {"/data", "/data-categories", "/data-groups", "/operations", "/configurations", "/faults",
                               "/logs", "/bulk-data", "/triggers", "/cyclic-subscriptions"}) {
     EXPECT_TRUE(result->at("paths").contains(entity_path + served)) << served;
@@ -360,22 +379,131 @@ TEST_F(CapabilityGeneratorTest, EntityDocumentOffersNoCollectionWithoutARoute) {
 }
 
 // data-categories and data-groups are registered with `.only_status(501, ...)`,
-// so the sub-document has to say 501 and nothing else. The generic listing it
-// used to fall through to declared a 200 no client can ever observe.
-TEST_F(CapabilityGeneratorTest, NotImplementedCollectionsDeclareOnly501) {
-  const auto & cache = node_->get_thread_safe_cache();
-  auto components = cache.get_components();
-  ASSERT_FALSE(components.empty()) << "no component discovered - the assertions below would prove nothing";
-  const std::string entity_path = "/components/" + components.front().id;
+// so the sub-document must not offer a success a client can never observe. It
+// used to fall through to a generic listing that declared a 200.
+//
+// The response set is not asserted to be *only* 501: the framework declares
+// 416 on every operation, `only_status` or not, because cpp-httplib answers an
+// unparseable `Range` before any handler runs. What must be absent is a 2xx.
+TEST_F(CapabilityGeneratorTest, NotImplementedCollectionsDeclareNoSuccess) {
+  const std::string component_id = first_component_id(*node_);
+  ASSERT_FALSE(component_id.empty()) << "no component discovered - the assertions below would prove nothing";
+  const std::string entity_path = "/components/" + component_id;
 
   auto result = generator_->generate(entity_path);
   ASSERT_TRUE(result.has_value());
 
   for (const auto * col : {"/data-categories", "/data-groups"}) {
-    const auto & op = result->at("paths").at(entity_path + col).at("get");
-    EXPECT_EQ(op.at("responses").size(), 1u) << col;
-    EXPECT_TRUE(op.at("responses").contains("501")) << col;
-    EXPECT_EQ(op.at("responses").at("501").at("$ref"), "#/components/responses/GenericError") << col;
+    const auto & responses = result->at("paths").at(entity_path + col).at("get").at("responses");
+    EXPECT_TRUE(responses.contains("501")) << col;
+    for (auto it = responses.begin(); it != responses.end(); ++it) {
+      EXPECT_FALSE(!it.key().empty() && it.key().front() == '2') << col << " declares success " << it.key();
+    }
+  }
+}
+
+// Substituting the id into the path key without removing the parameter that
+// described it publishes a parameter the path no longer has - a document a
+// strict validator rejects and a generated client builds a call signature
+// from.
+TEST_F(CapabilityGeneratorTest, EntityDocumentDropsTheParameterItSubstituted) {
+  const std::string component_id = first_component_id(*node_);
+  ASSERT_FALSE(component_id.empty()) << "no component discovered - the assertions below would prove nothing";
+  const std::string entity_path = "/components/" + component_id;
+
+  auto result = generator_->generate(entity_path);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->at("paths").contains(entity_path));
+
+  for (const auto & [path, item] : result->at("paths").items()) {
+    EXPECT_EQ(path.find("{component_id}"), std::string::npos) << path;
+    for (const auto & [method, operation] : item.items()) {
+      if (!operation.is_object() || !operation.contains("parameters")) {
+        continue;
+      }
+      for (const auto & param : operation.at("parameters")) {
+        EXPECT_FALSE(param.at("in") == "path" && param.at("name") == "component_id") << path << " " << method;
+      }
+    }
+  }
+  // The parameters a substitution did not answer stay: the data item route
+  // still templates `{data_id}` and still declares it.
+  const auto & item = result->at("paths").at(entity_path + "/data/{data_id}").at("get");
+  ASSERT_TRUE(item.contains("parameters"));
+  bool declares_data_id = false;
+  for (const auto & param : item.at("parameters")) {
+    declares_data_id = declares_data_id || (param.at("in") == "path" && param.at("name") == "data_id");
+  }
+  EXPECT_TRUE(declares_data_id);
+}
+
+// A prefix match on the string would let `/data-groups` and `/data-categories`
+// answer under `/data`, so the data collection's sub-document would describe
+// two collections it is not about.
+TEST_F(CapabilityGeneratorTest, ResourceCollectionDocumentStopsAtTheSegmentBoundary) {
+  const std::string component_id = first_component_id(*node_);
+  ASSERT_FALSE(component_id.empty()) << "no component discovered - the assertions below would prove nothing";
+  const std::string entity_path = "/components/" + component_id;
+
+  auto result = generator_->generate(entity_path + "/data");
+  ASSERT_TRUE(result.has_value());
+
+  const auto & paths = result->at("paths");
+  EXPECT_TRUE(paths.contains(entity_path + "/data"));
+  EXPECT_TRUE(paths.contains(entity_path + "/data/{data_id}"));
+  EXPECT_FALSE(paths.contains(entity_path + "/data-groups"));
+  EXPECT_FALSE(paths.contains(entity_path + "/data-categories"));
+}
+
+// A sub-document that names a schema it does not carry publishes a `$ref` no
+// client can resolve. Every one of these documents used to do exactly that.
+//
+// Rooted at the whole document, not at `paths`. `referenced_schemas()` walks
+// only `paths`, so a chain that leaves through `components/responses` is
+// precisely the case a paths-rooted check could not see - the one this is named
+// for. It happens to be safe today (the five response components
+// `OpenApiSpecBuilder` always emits name only `GenericError` and `OAuth2Error`,
+// which it always backfills), but "happens to be safe" is what the walk is here
+// to stop depending on.
+TEST_F(CapabilityGeneratorTest, SubDocumentCarriesTheSchemasItReferences) {
+  const std::string component_id = first_component_id(*node_);
+  ASSERT_FALSE(component_id.empty()) << "no component discovered - the assertions below would prove nothing";
+  const std::string entity_path = "/components/" + component_id;
+
+  for (const auto & sub_path : {std::string("/components"), entity_path, entity_path + "/faults", entity_path + "/logs",
+                                entity_path + "/data"}) {
+    auto result = generator_->generate(sub_path);
+    ASSERT_TRUE(result.has_value()) << sub_path;
+
+    size_t refs_seen = 0;
+    std::function<void(const nlohmann::json &)> check = [&](const nlohmann::json & node) {
+      if (node.is_array()) {
+        for (const auto & element : node) {
+          check(element);
+        }
+        return;
+      }
+      if (!node.is_object()) {
+        return;
+      }
+      for (const auto & [key, value] : node.items()) {
+        static const std::string kPrefix = "#/components/";
+        if (key == "$ref" && value.is_string() && value.get_ref<const std::string &>().rfind(kPrefix, 0) == 0) {
+          const std::string & ref = value.get_ref<const std::string &>();
+          const auto slash = ref.rfind('/');
+          const std::string section = ref.substr(kPrefix.size(), slash - kPrefix.size());
+          ++refs_seen;
+          EXPECT_TRUE(result->at("components").contains(section) &&
+                      result->at("components").at(section).contains(ref.substr(slash + 1)))
+              << sub_path << " -> " << ref;
+          continue;
+        }
+        check(value);
+      }
+    };
+    check(*result);
+    // A document whose walk found nothing would pass vacuously.
+    EXPECT_GT(refs_seen, 0u) << sub_path;
   }
 }
 
@@ -592,6 +720,92 @@ TEST_F(CapabilityGeneratorTest, RepeatedCacheHitsDoNotGrow) {
     auto result = generator_->generate(path);
     ASSERT_TRUE(result.has_value()) << "Failed to generate spec for: " << path;
   }
+  // Four distinct paths were requested, so four entries is the whole cache.
+  EXPECT_EQ(generator_->cache_entry_count(), 4u);
+}
+
+// What the cache holds is the serialized document, and the byte total it
+// bounds itself with has to agree with that. Asserting the total equals the
+// summed key+text lengths is what makes `cache_byte_size` a measurement
+// rather than a counter that happens to go up.
+TEST_F(CapabilityGeneratorTest, CacheAccountsForTheBytesItHolds) {
+  const std::vector<std::string> paths = {"/", "/areas", "/apps"};
+  size_t serialized = 0;
+  for (const auto & path : paths) {
+    auto document = generator_->generate_serialized(path);
+    ASSERT_TRUE(document.has_value()) << "Failed to generate document for: " << path;
+    serialized += document->size();
+  }
+  ASSERT_EQ(generator_->cache_entry_count(), paths.size());
+
+  // Each key is "<generation>:<path>", so the accounted total is the documents
+  // plus those keys - never less than the documents alone.
+  EXPECT_GT(generator_->cache_byte_size(), serialized);
+  size_t keys = 0;
+  for (const auto & path : paths) {
+    keys += std::to_string(node_->get_thread_safe_cache().generation()).size() + 1 + path.size();
+  }
+  EXPECT_EQ(generator_->cache_byte_size(), serialized + keys);
+}
+
+// The bound the entry count could not give: with documents this size, 256
+// entries is tens of megabytes. Driven through the overridable budget rather
+// than by generating 16 MiB of documents.
+TEST_F(CapabilityGeneratorTest, ByteBudgetEvictsBeforeTheEntryCountWould) {
+  auto first = generator_->generate_serialized("/areas");
+  ASSERT_TRUE(first.has_value());
+
+  // A budget that fits one document of this size but not two.
+  openapi::DocsCacheBounds bounds;
+  bounds.max_bytes = first->size() + 64;
+  CapabilityGenerator bounded(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get(), bounds);
+
+  ASSERT_TRUE(bounded.generate_serialized("/areas").has_value());
+  ASSERT_EQ(bounded.cache_entry_count(), 1u);
+
+  ASSERT_TRUE(bounded.generate_serialized("/apps").has_value());
+  // Well under kDocsCacheMaxEntries, so only the byte budget can have evicted.
+  EXPECT_EQ(bounded.cache_entry_count(), 1u);
+  EXPECT_LE(bounded.cache_byte_size(), bounds.max_bytes);
+}
+
+// A single document larger than the whole budget is served but not stored -
+// caching it would hold the cache over its bound indefinitely.
+TEST_F(CapabilityGeneratorTest, DocumentLargerThanTheBudgetIsServedUncached) {
+  openapi::DocsCacheBounds bounds;
+  bounds.max_bytes = 16;
+  CapabilityGenerator bounded(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get(), bounds);
+
+  auto document = bounded.generate_serialized("/areas");
+  ASSERT_TRUE(document.has_value());
+  EXPECT_GT(document->size(), bounds.max_bytes);
+  EXPECT_EQ(bounded.cache_entry_count(), 0u);
+  EXPECT_EQ(bounded.cache_byte_size(), 0u);
+}
+
+// The entry count is the other half of the bound, and it still has to bite.
+TEST_F(CapabilityGeneratorTest, EntryCountEvictsWhenTheByteBudgetIsSlack) {
+  openapi::DocsCacheBounds bounds;
+  bounds.max_entries = 2;
+  CapabilityGenerator bounded(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get(), bounds);
+
+  ASSERT_TRUE(bounded.generate_serialized("/areas").has_value());
+  ASSERT_TRUE(bounded.generate_serialized("/apps").has_value());
+  ASSERT_EQ(bounded.cache_entry_count(), 2u);
+
+  // Third distinct path trips the clear-all, leaving just the new entry.
+  ASSERT_TRUE(bounded.generate_serialized("/components").has_value());
+  EXPECT_EQ(bounded.cache_entry_count(), 1u);
+  EXPECT_LT(bounded.cache_byte_size(), bounds.max_bytes);
+}
+
+// The parsed accessor must describe the same document the routes serve.
+TEST_F(CapabilityGeneratorTest, SerializedAndParsedFormsAgree) {
+  auto document = generator_->generate_serialized("/apps");
+  auto parsed = generator_->generate("/apps");
+  ASSERT_TRUE(document.has_value());
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(*document, parsed->dump(2));
 }
 
 // =============================================================================

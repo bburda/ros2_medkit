@@ -110,6 +110,17 @@ class TestGraphProviderPlugin(GatewayTestCase):
             graph_cap['href'],
         )
 
+        # The top-level `x-medkit-graph` link is a second, independent
+        # surface: it is emitted off the capability list above, and only
+        # while a plugin serves the collection. Its absence without the
+        # plugin is pinned by
+        # `test_discovery_handlers.cpp::GetFunctionOmitsGraphLinkWithoutAPlugin`;
+        # this is the other half - with the plugin loaded, it is there and it
+        # matches the capability href.
+        self.assertEqual(
+            data.get('x-medkit-graph'), graph_cap['href'],
+            'the detail link and the capability href must name the same URI')
+
     def test_02_graph_endpoint_returns_valid_response(self):
         """GET /functions/{id}/x-medkit-graph returns a valid graph document.
 

@@ -411,6 +411,29 @@ def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True,
 # Gateway parameter presets
 # ---------------------------------------------------------------------------
 
+def graph_provider_params():
+    """Gateway parameters that load the graph provider plugin.
+
+    The only in-tree plugin that exports ``describe_plugin_routes``, so it is
+    what any test about plugin-served routes appearing in the OpenAPI document
+    has to load. Its ``.so`` path is resolved here, in one place, rather than
+    at each fixture.
+
+    Returns
+    -------
+    dict
+        Parameter overrides for ``create_gateway_node(extra_params=...)``.
+
+    """
+    graph_plugin = os.path.join(
+        get_package_prefix('ros2_medkit_graph_provider'), 'lib',
+        'ros2_medkit_graph_provider', 'libros2_medkit_graph_provider_plugin.so')
+    return {
+        'plugins': ['graph_provider'],
+        'plugins.graph_provider.path': graph_plugin,
+    }
+
+
 def full_feature_gateway_params(scripts_dir):
     """Gateway parameters that turn on every optional feature gate.
 
@@ -418,6 +441,12 @@ def full_feature_gateway_params(scripts_dir):
     scripts, updates, triggers, locking and the graph provider plugin must all
     be live. Without this the gated routes are absent and assertions about them
     pass vacuously.
+
+    Authentication is deliberately NOT enabled here. The document a gateway
+    serves describes that gateway, so the per-operation ``security`` a plugin
+    declares is stripped while ``auth.enabled`` is false - which makes this
+    fixture the auth-off half of that pair. The auth-on half is
+    ``test_auth.test.py``.
 
     Parameters
     ----------
@@ -431,16 +460,12 @@ def full_feature_gateway_params(scripts_dir):
         Parameter overrides for ``create_test_launch(gateway_params=...)``.
 
     """
-    graph_plugin = os.path.join(
-        get_package_prefix('ros2_medkit_graph_provider'), 'lib',
-        'ros2_medkit_graph_provider', 'libros2_medkit_graph_provider_plugin.so')
     return {
         'updates.enabled': True,
         'scripts.scripts_dir': scripts_dir,
         'triggers.enabled': True,
         'locking.enabled': True,
-        'plugins': ['graph_provider'],
-        'plugins.graph_provider.path': graph_plugin,
+        **graph_provider_params(),
     }
 
 

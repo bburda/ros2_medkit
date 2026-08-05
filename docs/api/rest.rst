@@ -2898,9 +2898,55 @@ RFC 6749 clients default to. ``/auth/revoke`` accepts JSON only, and per
 RFC 7009 section 2.2 answers ``200`` whether or not the submitted token was
 valid - so it never returns ``401``.
 
+These three endpoints are the only ones the middleware lets through
+unauthenticated whatever ``require_auth_for`` says - a caller has to be able to
+obtain a token before it has one. They are also the only operations the served
+OpenAPI document publishes with an empty ``security: []`` requirement; every
+other operation names the role the gateway's permission table grants for its
+path, so ``GET /api/v1/docs`` is where a client reads which role an endpoint
+needs. See :ref:`rest-role-required` below.
+
 .. seealso::
 
    :doc:`/tutorials/authentication` for configuration details.
+
+.. _rest-role-required:
+
+Which role an endpoint needs
+----------------------------
+
+Every route declares its weakest permitted caller where it is registered, and
+that one declaration produces both the entries the middleware matches against
+and the ``security`` requirement published for the operation. The served
+document is therefore the reference: read
+``paths.<path>.<method>.security[0].bearerAuth[0]`` from
+``GET /api/v1/docs``.
+
+The shape of the assignment:
+
+* ``viewer`` - every ``GET`` the gateway itself serves, including the SSE
+  streams, the bulk-data downloads and the capability descriptions. Routes a
+  plugin mounts are the exception and are ``admin`` whatever their method (see
+  below).
+* ``operator`` - runtime writes: operation executions, clearing faults,
+  publishing data, locks, cyclic subscriptions, triggers, fault-trigger rules,
+  bulk-data upload and delete, starting and controlling script executions, and
+  the ``start`` / ``restart`` / ``force-restart`` lifecycle transitions.
+* ``configurator`` - changes to how the system is configured: configuration
+  writes and resets, log configuration, script upload and delete, the
+  ``/updates`` write verbs (register, prepare, execute, automated, delete -
+  reading an update or its status is ``viewer``), and the ``shutdown`` /
+  ``force-shutdown`` transitions.
+* ``admin`` - everything above, plus every route mounted outside the route
+  registry. That is what covers plugin-served routes, which no per-route
+  declaration describes; they publish ``admin`` and nothing weaker reaches
+  them.
+
+Enforcement fails closed - a path no entry matches is refused - so the
+published role is what the gateway demands rather than a separate claim about
+it. What is enforced at all is a deployment setting: with ``auth.enabled``
+false no role is published or checked, and with ``require_auth_for: write`` a
+``GET`` is served without a token even though its operation names a role.
 
 ``POST /api/v1/auth/authorize``
    Authenticate with client credentials.
@@ -3618,27 +3664,33 @@ use cases benefit.
 The SOVD spec defines resource collections only for apps and components. ros2_medkit
 extends this to areas and functions where aggregation makes practical sense.
 
-The matrix below transcribes ``EntityCapabilities::for_type``. That drives the
-paths in an entity's ``/docs`` sub-document, and the collection check in
-``validate_collection_access_typed``. It is **not** where the ``capabilities``
-array of ``GET /{entity-type}/{id}`` comes from: that array is built from a
-second, independent list, the ``CapabilityBuilder::Capability`` vector each
-handler in ``discovery_handlers.cpp`` assembles. The two surfaces overlap but
-are not the same set - the component array also carries ``status``,
+The matrix below transcribes ``EntityCapabilities::for_type``, which drives the
+collection check in ``validate_collection_access_typed``. It is **not** where
+the ``capabilities`` array of ``GET /{entity-type}/{id}`` comes from: that array
+is built from a second, independent list, the ``CapabilityBuilder::Capability``
+vector each handler in ``discovery_handlers.cpp`` assembles. The two surfaces
+overlap but are not the same set - the component array also carries ``status``,
 ``subcomponents``, ``hosts`` and ``depends-on``, and the area array
 ``subareas``, ``contains`` and ``components``, none of which are resource
 collections and so none of which appear in the table.
+
+Nor is it what an entity's ``/docs`` sub-document lists. That document is a
+projection of the routes the gateway registers (see `Capability Description
+(OpenAPI Docs)`_ below), so a collection appears there when a route answers it
+and not otherwise - the table cannot make it appear or disappear.
 
 The transcription is by hand. What is checked mechanically is the property the
 table exists to describe:
 ``test_openapi_contract::test_every_advertised_collection_is_served`` takes the
 first discovered entity of each type, follows every non-templated ``href`` in
-its ``capabilities`` array **and** every path in its ``/docs`` sub-document
-against a live gateway, and fails on a 404 - so it covers both surfaces,
-including where they disagree. Its fixture discovers no areas, so the Areas
-column below is covered by the ``EntityCapabilities`` unit tests instead, which
-assert the per-type lists directly. ``501`` is a served answer, not a missing
-one: see ``data-categories`` and ``data-groups`` below.
+its ``capabilities`` array **and** every path in its ``/docs`` sub-document that
+declares a ``GET`` against a live gateway, and fails on a 404 - so it covers
+both surfaces, including where they disagree. Paths with no ``GET`` are skipped
+because a 404 there says nothing: ``PUT /{type}/{id}/status/restart`` has no GET
+to answer. Its fixture discovers no areas, so the Areas column below is covered
+by the ``EntityCapabilities`` unit tests instead, which assert the per-type
+lists directly. ``501`` is a served answer, not a missing one: see
+``data-categories`` and ``data-groups`` below.
 
 Collections named by the SOVD standard that the gateway does **not** serve
 per entity - ``data-lists``, ``modes`` and ``communication-logs`` - are absent
@@ -3740,8 +3792,8 @@ differently, which is worth stating rather than leaving to be discovered:
 - ``locks``: the routes are always registered for components and apps and answer
   ``501`` when there is no lock manager (``locking.enabled`` off). The
   ``capabilities`` entry and the ``locks`` URI field follow the lock manager; the
-  ``/docs`` sub-document lists ``/locks`` unconditionally, because
-  ``for_type(COMPONENT)`` does.
+  ``/docs`` sub-document lists ``/locks`` unconditionally, because registration
+  is unconditional and the sub-document reports registrations.
 - ``scripts``: the same shape. ``ScriptManager`` is constructed unconditionally,
   so all eight script routes are always registered for components and apps, and
   they answer ``501`` until a backend exists - either a plugin
@@ -3923,26 +3975,60 @@ The gateway provides self-describing OpenAPI 3.1.0 capability descriptions at an
 of the API hierarchy. Append ``/docs`` to any valid path to receive a context-scoped
 OpenAPI spec describing the available operations at that level.
 
+How much of that description is derived from the handlers rather than asserted
+beside them - and, for each mechanism, what keeps the two from drifting apart -
+is set out in :doc:`/design/ros2_medkit_gateway/openapi_derivation`.
+
+Every scoped spec is a **projection of the root document**: the paths at or
+below the requested path, with the ids the request named substituted into the
+templates and the ``in: path`` parameters those substitutions answered removed.
+For a projected path, what a scoped spec says about an operation is what the
+root spec says about it - status codes, schemas, roles and all - and a
+collection appears in it exactly when a route answers that collection.
+
+The exception is the concrete data and operation item paths described below,
+which are built from the entity cache rather than projected. They carry the ROS
+2 payload schema, which is why they exist; because they are built rather than
+projected, nothing reaches them *from* the registration, so what they say about
+an operation is narrower than what the root spec says about the templated route
+they sit beside. Measured on a component's ``/data`` spec: the projected
+``GET /data/{data_id}`` declares ``200, 400, 404, 416, 500, 503`` and the
+``PUT`` declares ``200, 400, 404, 409, 416, 500``, while a concrete
+``/data/<topic>`` declares ``200, 400, 404, 500`` on both - no 416, no 409 on
+the lock-guarded write, and with ``auth.enabled`` on no ``security``
+requirement either. Read the templated sibling beside them for the full outcome
+set.
+
 ``GET /api/v1/docs``
    Returns the full OpenAPI spec for the gateway root, including all server-level
    endpoints, entity collections, and global resources.
 
 ``GET /api/v1/{entity-collection}/docs``
-   Returns a spec scoped to the entity collection (e.g., ``/apps/docs``,
-   ``/components/docs``). Includes collection listing and detail endpoints.
+   The subtree under the collection (e.g. ``/apps/docs``, ``/components/docs``):
+   the listing, the entity detail template, and everything below it.
 
 ``GET /api/v1/{entity-type}/{entity-id}/docs``
-   Returns a spec for a specific entity, including all resource collection
-   endpoints supported by that entity (data, operations, configurations, faults,
-   logs, bulk-data, cyclic-subscriptions, triggers).
+   The subtree under one entity, with its id substituted - the detail endpoint
+   and every resource route registered for that entity type. Templates deeper
+   than the entity (``{data_id}``, ``{fault_code}``) stay templated and keep
+   their parameters.
 
 ``GET /api/v1/{entity-type}/{entity-id}/{resource}/docs``
-   Returns a spec for a specific resource collection, with detailed schemas
-   for each resource item.
+   The subtree under one resource collection. For ``data`` and ``operations``
+   this also carries one concrete path per discovered topic / service / action,
+   whose payload schema is generated from the ROS 2 type - the one thing a route
+   registration cannot know, and the only part of any scoped spec that is not a
+   projection.
+
+Each scoped spec carries the ``components/schemas`` entries its own ``$ref``
+chains reach, not the full DTO set the root spec ships.
 
 **Features:**
 
-- Specs include SOVD extensions (``x-sovd-version``, ``x-sovd-data-category``)
+- Specs include SOVD extensions: ``x-sovd-version`` on every spec, and
+  ``x-sovd-data-category`` / ``x-sovd-name`` /
+  ``x-sovd-cyclic-subscription-supported`` on the concrete data and operation
+  item paths described above
 - Each operation declares exactly one success status, derived from the handler's
   C++ return type. The few operations whose handler can genuinely answer with one
   of several success shapes (``POST .../operations/{operation_id}/executions``,
@@ -3950,10 +4036,31 @@ OpenAPI spec describing the available operations at that level.
   ``DELETE .../configurations``) carry ``x-medkit-alternates: true`` and list every
   alternative under its own status code. A generated client can therefore branch on
   status only where that marker is present.
-- Entity-level specs reflect actual capabilities from the runtime entity cache
-- Specs are cached per entity cache generation for performance
-- Plugin-registered vendor routes appear in path-scoped specs when the requested
-  path matches a plugin route prefix (not in the root spec)
+- The concrete data and operation item paths in an entity-level or
+  resource-level spec come from the runtime entity cache, so they change as the
+  ROS 2 graph does
+- Specs are cached per entity cache generation for performance. The cache holds
+  each document serialized, not parsed, so what it costs in memory is close to
+  what the document costs on the wire; it is bounded both by entry count and by
+  total bytes, and is emptied whenever either bound is reached or the entity
+  cache generation changes. A document larger than the whole byte budget is
+  served but not cached. None of this is observable from a response: the two
+  ``/docs`` routes answer ``application/json`` with the same 2-space-indented
+  body whether it came from the cache or was just generated
+- The two ``/docs`` routes are themselves in the root spec, as
+  ``getCapabilityDescription`` (``/docs``) and ``getScopedCapabilityDescription``
+  (``/{entity_path}/docs``). The second one's ``entity_path`` parameter spans
+  several path segments - it is the whole prefix, e.g. ``apps/temp_sensor/data`` -
+  so a generated client must send its slashes unescaped.
+- Routes mounted by a loaded plugin are in the root spec too, provided the plugin
+  exports ``describe_plugin_routes`` (see :doc:`/tutorials/plugin-system`). They
+  carry ``x-medkit-plugin-served: true``, and the tag each one declares is added
+  to the document's global tag list. A plugin route whose path lies under a
+  scoped path appears in that scoped spec as well, for the same reason a
+  registry route does - both are projected from the same merged set. Where a
+  plugin describes a path the registry already holds, the registry's description
+  is the one published. A plugin that does not export the symbol serves routes
+  that appear nowhere in any spec.
 
 **Configuration:**
 

@@ -260,6 +260,50 @@ class TestDocsEndpoint(GatewayTestCase):
             self.assertIn('severity_filter', put_props)
             self.assertNotIn('level', put_props)
 
+    def test_nested_entity_docs_describes_nothing_rather_than_fabricating(self):
+        """A nested entity path the gateway does not route publishes no paths.
+
+        `/components/{id}/apps/{id}` resolves - the component really does host
+        the app - but no route is registered under it, and the nested entity
+        itself answers 404. Since the sub-document became a projection of the
+        route registry, its spec is a valid OpenAPI document with an empty
+        `paths` object. The hand-written producer described 15 paths there that
+        no route answers: the detail endpoint, one per entry of
+        `EntityCapabilities::for_type(APP).collections()` - 13 of them, none
+        skipped - and `/logs/configuration`.
+
+        Pinned so that emptiness is the intended answer rather than an
+        accident of the filter.
+
+        @verifies REQ_INTEROP_002
+        """
+        comp_id = self.poll_endpoint_until(
+            '/components',
+            lambda d: d if d.get('items') else None,
+        )['items'][0]['id']
+        app_id = self.poll_endpoint_until(
+            '/apps',
+            lambda d: d if d.get('items') else None,
+        )['items'][0]['id']
+        nested = f'/components/{comp_id}/apps/{app_id}'
+
+        # The nested entity is not itself a route the gateway serves ...
+        self.assertEqual(
+            requests.get(f'{self.BASE_URL}{nested}', timeout=10).status_code, 404,
+            f'{nested} is routed after all - this case no longer proves anything'
+        )
+
+        # ... so its spec describes nothing, and invents nothing.
+        data = self.poll_endpoint_until(
+            f'{nested}/docs',
+            lambda d: d if 'paths' in d else None,
+        )
+        self._assert_valid_openapi_spec(data)
+        self.assertEqual(
+            data['paths'], {},
+            f'expected no paths, got {list(data["paths"])}'
+        )
+
     def test_nonexistent_entity_docs_returns_404(self):
         """GET /apps/nonexistent_entity_xyz/docs returns 404.
 

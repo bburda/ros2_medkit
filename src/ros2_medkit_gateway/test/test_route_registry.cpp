@@ -55,6 +55,8 @@ inline constexpr std::string_view dto_name<RouteRegistryTestSeedDto> = "RouteReg
 
 using namespace ros2_medkit_gateway::openapi;
 using ros2_medkit_gateway::ErrorInfo;
+using ros2_medkit_gateway::RoutePermissions;
+using ros2_medkit_gateway::UserRole;
 using ros2_medkit_gateway::dto::FaultEntityListQuery;
 using ros2_medkit_gateway::dto::FaultListQuery;
 using ros2_medkit_gateway::dto::RouteRegistryTestSeedDto;
@@ -699,6 +701,7 @@ TEST_F(RouteRegistryTest, DeprecatedFlagAppearsInOutput) {
 TEST_F(RouteRegistryTest, ValidateCompletenessPassesForCompleteRoute) {
   seed_get(registry_, "/health")
       .tag("Server")
+      .requires_role(UserRole::VIEWER)
       .summary("Health check")
       .response(200, "Healthy", json{{"type", "object"}});
 
@@ -727,7 +730,7 @@ TEST_F(RouteRegistryTest, ValidateCompletenessErrorOnMissingTag) {
 }
 
 TEST_F(RouteRegistryTest, ValidateCompletenessPassesForDeleteWith204) {
-  seed_del(registry_, "/items/{id}").tag("Items").summary("Delete item");
+  seed_del(registry_, "/items/{id}").tag("Items").requires_role(UserRole::OPERATOR).summary("Delete item");
 
   auto issues = registry_.validate_completeness();
   int error_count = 0;
@@ -740,7 +743,7 @@ TEST_F(RouteRegistryTest, ValidateCompletenessPassesForDeleteWith204) {
 }
 
 TEST_F(RouteRegistryTest, ValidateCompletenessPassesForSSEEndpoint) {
-  seed_get(registry_, "/events/stream").tag("Events").summary("SSE events stream");
+  seed_get(registry_, "/events/stream").tag("Events").requires_role(UserRole::VIEWER).summary("SSE events stream");
 
   auto issues = registry_.validate_completeness();
   int error_count = 0;
@@ -766,7 +769,7 @@ TEST_F(RouteRegistryTest, ValidateCompletenessWarnsOnMissingSummary) {
 }
 
 TEST_F(RouteRegistryTest, ValidateCompletenessPassesForCompletePostRoute) {
-  seed_post(registry_, "/items").tag("Items").summary("Create item");
+  seed_post(registry_, "/items").tag("Items").requires_role(UserRole::OPERATOR).summary("Create item");
 
   auto issues = registry_.validate_completeness();
   int error_count = 0;
@@ -822,12 +825,95 @@ TEST_F(RouteRegistryTest, HiddenRouteStillCountedInSize) {
   EXPECT_EQ(registry_.size(), 2u);
 }
 
-TEST_F(RouteRegistryTest, HiddenRouteSkippedByValidateCompleteness) {
-  // Hidden route without required metadata should NOT trigger validation errors
+TEST_F(RouteRegistryTest, HiddenRouteSkipsTheDocumentChecksButNotTheRoleCheck) {
+  // A hidden route publishes nothing, so the document checks have nothing to
+  // say about it - no tag, no summary and no success schema are defects only in
+  // a route somebody can read. The role is the exception, and the reason that
+  // check runs ahead of the hidden skip: hidden removes a route from the
+  // document, not from the router, so the request still arrives and still meets
+  // a permission table that would have no entry for it.
+  seed_post(registry_, "/hidden").requires_role(UserRole::OPERATOR).hidden();
+
+  EXPECT_TRUE(registry_.validate_completeness().empty());
+}
+
+// =============================================================================
+// RBAC derivation - one declaration, two consumers
+// =============================================================================
+
+TEST_F(RouteRegistryTest, DeclaredRoleIsPublishedAsASecurityRequirement) {
+  seed_get(registry_, "/health").tag("Server").requires_role(UserRole::VIEWER).summary("Health");
+
+  auto paths = registry_.to_openapi_paths();
+  EXPECT_EQ(paths["/health"]["get"]["security"], json::array({{{"bearerAuth", json::array({"viewer"})}}}));
+}
+
+TEST_F(RouteRegistryTest, PublicRoutePublishesTheEmptyRequirement) {
+  // Not "no requirement": `security: []` is how an operation overrides the
+  // document-level one. Omitting the key entirely would leave `/auth/token`
+  // inheriting a demand for the very token it exists to hand out.
+  seed_post(registry_, "/auth/token").tag("Authentication").public_route().summary("Token");
+
+  auto paths = registry_.to_openapi_paths();
+  EXPECT_EQ(paths["/auth/token"]["post"]["security"], json::array());
+}
+
+TEST_F(RouteRegistryTest, PermissionEntryIsGrantedToTheRoleAndEveryStrongerOne) {
+  seed_post(registry_, "/apps/{app_id}/locks").tag("Locking").requires_role(UserRole::OPERATOR).summary("Lock");
+
+  auto permissions = registry_.route_permissions("/api/v1");
+  const std::string entry = "POST:/api/v1/apps/*/locks";
+  EXPECT_EQ(permissions[UserRole::OPERATOR].count(entry), 1u);
+  EXPECT_EQ(permissions[UserRole::CONFIGURATOR].count(entry), 1u);
+  EXPECT_EQ(permissions[UserRole::ADMIN].count(entry), 1u);
+  // AuthConfig has no inheritance, so "operator and above" has to mean the
+  // weaker role is genuinely absent rather than implied.
+  EXPECT_EQ(permissions[UserRole::VIEWER].count(entry), 0u);
+}
+
+TEST_F(RouteRegistryTest, ASlashSpanningParameterBecomesTheMultiSegmentWildcard) {
+  // `{data_id}` is a ROS topic name, `{config_id}` a dotted parameter path and
+  // `{operation_id}` a ROS path where one provider exposes a short name at more
+  // than one path; all three compile to `(.+)` in the router, so a
+  // single-segment `*` here would 403 exactly the requests these routes exist
+  // to serve.
+  seed_get(registry_, "/apps/{app_id}/data/{data_id}").tag("Data").requires_role(UserRole::VIEWER).summary("Item");
+  seed_get(registry_, "/apps/{app_id}/operations/{operation_id}")
+      .tag("Operations")
+      .requires_role(UserRole::VIEWER)
+      .summary("Op");
+
+  auto permissions = registry_.route_permissions("/api/v1");
+  EXPECT_EQ(permissions[UserRole::VIEWER].count("GET:/api/v1/apps/*/data/**"), 1u);
+  EXPECT_EQ(permissions[UserRole::VIEWER].count("GET:/api/v1/apps/*/operations/**"), 1u);
+}
+
+TEST_F(RouteRegistryTest, APublicRouteContributesNoPermissionEntry) {
+  // The middleware answers `/auth/*` before the table is consulted, so an
+  // entry would be dead weight on a set that is scanned per request.
+  seed_post(registry_, "/auth/token").tag("Authentication").public_route().summary("Token");
+
+  auto permissions = registry_.route_permissions("/api/v1");
+  for (UserRole role : {UserRole::VIEWER, UserRole::OPERATOR, UserRole::CONFIGURATOR, UserRole::ADMIN}) {
+    EXPECT_EQ(permissions[role].size(), 0u) << "role " << static_cast<int>(role);
+  }
+}
+
+TEST_F(RouteRegistryTest, TheRootRouteIsGrantedWithAndWithoutItsTrailingSlash) {
+  seed_get(registry_, "/").tag("Server").requires_role(UserRole::VIEWER).summary("Overview");
+
+  auto permissions = registry_.route_permissions("/api/v1");
+  EXPECT_EQ(permissions[UserRole::VIEWER].count("GET:/api/v1"), 1u);
+  EXPECT_EQ(permissions[UserRole::VIEWER].count("GET:/api/v1/"), 1u);
+}
+
+TEST_F(RouteRegistryTest, HiddenRouteWithNoRoleIsStillReported) {
   seed_post(registry_, "/hidden").hidden();
 
   auto issues = registry_.validate_completeness();
-  EXPECT_TRUE(issues.empty());
+  ASSERT_EQ(issues.size(), 1u);
+  EXPECT_EQ(issues[0].severity, ValidationIssue::Severity::kError);
+  EXPECT_NE(issues[0].message.find("requires_role"), std::string::npos);
 }
 
 // =============================================================================
@@ -877,7 +963,11 @@ TEST_F(RouteRegistryTest, OnlyStatusPublishesErrorBodySchema) {
 TEST_F(RouteRegistryTest, OnlyStatusKeepsAnErrorStubComplete) {
   // The stub declares no 2xx at all; validate_completeness must not ask it for
   // a success schema it can never have.
-  seed_get(registry_, "/stub").tag("Test").summary("Stub").only_status(501, "Not implemented");
+  seed_get(registry_, "/stub")
+      .tag("Test")
+      .requires_role(UserRole::VIEWER)
+      .summary("Stub")
+      .only_status(501, "Not implemented");
 
   for (const auto & issue : registry_.validate_completeness()) {
     EXPECT_NE(issue.severity, ValidationIssue::Severity::kError) << issue.route << ": " << issue.message;

@@ -221,7 +221,14 @@ http::Result<dto::RootOverview> HealthHandlers::get_root(const http::TypedReques
       }
     }
 
-    // Read docs.enabled parameter (defaults to true)
+#ifdef ENABLE_SWAGGER_UI
+    // The two `/docs` routes are in the registry, so `to_endpoint_list` above
+    // already lists them; a hand-written entry here would list each twice, and
+    // under a second spelling of the path parameter at that. Swagger UI is
+    // still mounted straight onto the server, so it is still added by hand -
+    // and it is the only endpoint `docs.enabled` now hides from this list. The
+    // `/docs` routes stay listed when the capability is off, because they stay
+    // mounted and answer 501: this list says what is mounted, not what is on.
     bool docs_enabled = true;
     if (ctx_.node()) {
       try {
@@ -230,15 +237,10 @@ http::Result<dto::RootOverview> HealthHandlers::get_root(const http::TypedReques
         // Parameter may not be declared - default to true
       }
     }
-
-    // Add docs endpoints (not in registry - registered directly with server)
     if (docs_enabled) {
-      endpoints.push_back("GET " + std::string(API_BASE_PATH) + "/docs");
-      endpoints.push_back("GET " + std::string(API_BASE_PATH) + "/{entity-path}/docs");
-#ifdef ENABLE_SWAGGER_UI
       endpoints.push_back("GET " + std::string(API_BASE_PATH) + "/swagger-ui");
-#endif
     }
+#endif
 
     const auto & auth_config = ctx_.auth_config();
     const auto & tls_config = ctx_.tls_config();

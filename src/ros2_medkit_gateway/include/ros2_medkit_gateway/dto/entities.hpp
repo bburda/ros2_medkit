@@ -362,7 +362,7 @@ inline constexpr std::string_view dto_name<FunctionListItem> = "FunctionListItem
 // Wire keys:
 //   id, name, description?, translation_id?, tags?,
 //   hosts, data, data-categories, data-groups, operations, configurations,
-//   faults, logs, bulk-data, x-medkit-graph, cyclic-subscriptions, triggers,
+//   faults, logs, bulk-data, x-medkit-graph?, cyclic-subscriptions, triggers,
 //   capabilities (array of EntityCapability),
 //   _links (open relation map - see kLinksDescription),
 //   x-medkit
@@ -383,9 +383,14 @@ struct FunctionDetail {
   std::string configurations;
   std::string faults;
   std::string logs;
-  std::string bulk_data;             // wire key: "bulk-data"
-  std::string x_medkit_graph;        // wire key: "x-medkit-graph"
-  std::string cyclic_subscriptions;  // wire key: "cyclic-subscriptions"
+  std::string bulk_data;  // wire key: "bulk-data"
+  // Optional, unlike the collections above it: `x-medkit-graph` is served by
+  // the graph-provider plugin, not by the gateway, so on a gateway without
+  // that plugin loaded there is no route behind the URI. Emitted only when
+  // the entity's capability list says a plugin serves it - a link to a 404 is
+  // worse than no link.
+  std::optional<std::string> x_medkit_graph;  // wire key: "x-medkit-graph"
+  std::string cyclic_subscriptions;           // wire key: "cyclic-subscriptions"
   std::string triggers;
   // Free-form fields
   std::optional<std::vector<EntityCapability>> capabilities;
