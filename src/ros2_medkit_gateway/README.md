@@ -509,13 +509,36 @@ Cancel a running action execution.
 curl -X DELETE http://localhost:8080/api/v1/components/long_calibration/operations/long_calibration/executions/abc123def456
 ```
 
-**Response (200 OK):**
-```json
-{
-  "status": "canceling",
-  "goal_id": "abc123def456...",
-  "message": "Cancel request sent"
-}
+**Response:** `204 No Content` (empty body) - the cancellation is underway. Also
+returned when the cancel response was lost but the action's status stream
+already shows the goal cancelling.
+
+**Other outcomes:**
+
+| Status | Meaning |
+|--------|---------|
+| `400` | The action server answered and refused (`x-medkit-ros2-action-rejected`, `return_code` 1-3) |
+| `404` | No such execution (`resource-not-found`) - including one evicted while the request was in flight |
+| `500` | The cancel could not be delivered or parsed (`x-medkit-ros2-action-unavailable`) |
+| `503` | The cancel service is gone - the action server died (`x-medkit-ros2-action-unavailable`) |
+| `504` | No answer within the cancel budget and the status stream does not show the goal cancelling, so the outcome is unknown (`not-responding`) |
+
+The cancel budget is `service_call_timeout_sec` (default 10 s) plus up to 2 s of
+cancel-service discovery. On `504`, poll the execution resource above and read
+`x-medkit.ros2_status` - the SOVD `status` field renders both `CANCELED` and
+`ABORTED` as `failed`, so it cannot tell you whether the cancellation took
+effect.
+
+#### PUT /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}
+
+Send a control command to a running execution. ROS 2 actions implement the SOVD
+`stop` capability, which maps to action cancel and shares the outcome table
+above (with `202 Accepted` in place of `204`, plus `409` when `execute` is
+requested on an execution that is still running).
+
+```bash
+curl -X PUT -H 'Content-Type: application/json' -d '{"capability": "stop"}' \
+  http://localhost:8080/api/v1/components/long_calibration/operations/long_calibration/executions/abc123def456
 ```
 
 ### Authentication Endpoints

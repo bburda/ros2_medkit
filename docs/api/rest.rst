@@ -688,14 +688,33 @@ Execute Operations
    .. code-block:: json
 
       {
-        "execution_id": "abc123-def456",
-        "status": "succeeded",
-        "result": {"sequence": [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]},
-        "feedback": [
-          {"partial_sequence": [0, 1]},
-          {"partial_sequence": [0, 1, 1, 2, 3]}
-        ]
+        "status": "completed",
+        "capability": "execute",
+        "parameters": {"sequence": [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]},
+        "x-medkit": {
+          "goal_id": "abc123def456789a0b1c2d3e4f506172",
+          "ros2_status": "succeeded",
+          "ros2": {
+            "action": "/powertrain/engine/long_calibration",
+            "type": "example_interfaces/action/Fibonacci"
+          }
+        }
       }
+
+   ``status`` carries the SOVD execution status and is one of ``pending``,
+   ``running``, ``completed``, ``failed``. ``parameters`` carries the action's
+   most recent feedback.
+
+   .. note::
+
+      **Reading the outcome of a cancel.** ``status`` cannot express it on its
+      own: a cancelled goal and a goal that failed by itself both render as
+      ``failed``, and a goal that is still cancelling renders as ``running``.
+      ``x-medkit.ros2_status`` carries the underlying ROS 2 goal state
+      verbatim - ``accepted``, ``executing``, ``canceling``, ``succeeded``,
+      ``canceled``, ``aborted`` - and is the field to read when a
+      ``DELETE``/``PUT``-stop answered ``504`` and the outcome has to be
+      established by polling.
 
 ``PUT /api/v1/components/{id}/operations/{operation_id}/executions/{execution_id}``
    Send a control command to a running execution. ROS 2 actions implement the
@@ -714,7 +733,8 @@ Execute Operations
      capability is unsupported (``freeze`` / ``reset`` / unknown -
      ``invalid-parameter``)
    - **404:** Execution not found
-   - **409:** ``execute`` on an already-running execution (``invalid-request``)
+   - **409:** ``execute`` on an already-running execution
+     (``precondition-not-fulfilled``)
    - **500:** Transport failure while sending the cancel
      (``x-medkit-ros2-action-unavailable``)
    - **503:** Cancel service not available - the action server is gone
@@ -729,8 +749,12 @@ Execute Operations
    - **204:** Execution cancelled. Also returned when the cancel response was
      lost but the action's status stream already shows the goal cancelling.
    - **400:** The action server answered and rejected the cancel
-     (``x-medkit-ros2-action-rejected``, ``return_code`` 1-3)
-   - **404:** Execution not found
+     (``x-medkit-ros2-action-rejected``, ``return_code`` 1-3). Note
+     ``return_code`` 2 means the *action server* no longer knows the goal
+     while the gateway still tracks it - the request will not start
+     succeeding on retry.
+   - **404:** Execution not found - the *gateway* no longer tracks it
+     (``resource-not-found``)
    - **500:** Transport failure while sending the cancel
      (``x-medkit-ros2-action-unavailable``)
    - **503:** Cancel service not available - the action server is gone
@@ -2550,10 +2574,12 @@ Vendor-specific ``x-medkit-*`` codes are enveloped: the response carries
      - 404
      - The requested resource (topic, service, parameter) does not exist
    * - ``invalid-request``
-     - 400, 409
-     - Invalid request body or missing required parameters (400), or a request
-       that conflicts with the resource's current state - e.g. ``execute`` on
-       an execution that is still running (409)
+     - 400
+     - Invalid request body or missing required parameters
+   * - ``precondition-not-fulfilled``
+     - 409
+     - The resource's current state does not allow the request - e.g.
+       ``execute`` on an execution that is still running
    * - ``invalid-parameter``
      - 400
      - Invalid parameter value (including malformed entity IDs)
