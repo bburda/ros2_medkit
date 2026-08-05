@@ -128,6 +128,22 @@ class AuthManager {
   bool requires_authentication(const std::string & method, const std::string & path) const;
 
   /**
+   * @brief The policy half of `requires_authentication`
+   *
+   * Borrowed, never null, owned by this manager. Exposed so a reader that has
+   * to answer the same question about a route it is not currently serving -
+   * `RouteRegistry`, deciding whether an operation may publish a token
+   * requirement - asks the same object rather than a second copy of the rule.
+   * Callers must apply `AuthConfig::enabled` themselves; this accessor
+   * deliberately does not, because it hands out the policy, not the verdict.
+   *
+   * @return The configured requirement policy
+   */
+  const IAuthRequirementPolicy * auth_policy() const {
+    return auth_policy_.get();
+  }
+
+  /**
    * @brief Revoke a refresh token
    * @param refresh_token The refresh token to revoke
    * @return true if revoked, false if not found

@@ -60,6 +60,12 @@ ParameterErrorClassification classify_error_code(ParameterErrorCode error_code) 
       break;
     case ParameterErrorCode::SHUT_DOWN:
     case ParameterErrorCode::INTERNAL_ERROR:
+    // COUNT is the enumerator count, never a value a transport reports. It is
+    // named because `-Werror=switch-enum` requires every enumerator to be, and
+    // it classifies as 500 so that a caller which somehow produced it is not
+    // told its request was bad. It is deliberately absent from
+    // `kAllParameterErrorCodes`, so this arm contributes no declared status.
+    case ParameterErrorCode::COUNT:
     default:
       result.status_code = 500;
       result.error_code = ERR_INTERNAL_ERROR;
@@ -79,11 +85,23 @@ constexpr std::array<ParameterErrorCode, 10> kAllParameterErrorCodes{
     ParameterErrorCode::INVALID_VALUE, ParameterErrorCode::NO_DEFAULTS_CACHED,
     ParameterErrorCode::SHUT_DOWN,     ParameterErrorCode::INTERNAL_ERROR};
 
-/// Compile-time guard on the array above. The switch has a case per enumerator
-/// and deliberately no `default`, so `-Werror=switch-enum` turns "somebody
-/// added a ParameterErrorCode" into a build failure here - three lines from the
-/// array that then has to list it - rather than into a status the routes
-/// quietly stop declaring.
+/// The array above must list every enumerator, and this is what enforces it.
+///
+/// `-Werror=switch-enum` on its own does not: it demands a `case` per
+/// enumerator in every switch, and adding those cases leaves a build that
+/// compiles cleanly with the array still one entry short - at which point
+/// `parameter_error_statuses()` never classifies the new code and the four
+/// registrations that read it silently stop declaring a status it can produce.
+/// Comparing against `ParameterErrorCode::COUNT` closes that gap: the array's
+/// length is now checked, not merely intended.
+static_assert(kAllParameterErrorCodes.size() == static_cast<std::size_t>(ParameterErrorCode::COUNT),
+              "kAllParameterErrorCodes must list every ParameterErrorCode; add the new enumerator to the array "
+              "(and a case to every switch over it)");
+
+/// Compile-time guard that every entry of the array is a real enumerator the
+/// classifier handles. The switch has a case per enumerator and deliberately no
+/// `default`, so `-Werror=switch-enum` turns "somebody added a
+/// ParameterErrorCode" into a build failure here too.
 constexpr bool is_known_parameter_error_code(ParameterErrorCode code) {
   switch (code) {
     case ParameterErrorCode::NONE:
@@ -97,6 +115,11 @@ constexpr bool is_known_parameter_error_code(ParameterErrorCode code) {
     case ParameterErrorCode::SHUT_DOWN:
     case ParameterErrorCode::INTERNAL_ERROR:
       return true;
+    // Not an error code, and must never reach the array: the static_assert
+    // above counts up to it, so listing it there would make the count agree
+    // while the classifier ran over a non-code.
+    case ParameterErrorCode::COUNT:
+      return false;
   }
   return false;
 }

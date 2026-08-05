@@ -1254,6 +1254,253 @@ class TestOpenApiContract(GatewayTestCase):
                 covered.get(entity_type, 0), 8,
                 f'{entity_type}: only {covered.get(entity_type, 0)} hrefs followed')
 
+    def test_the_root_list_and_the_document_agree(self):
+        """`GET /api/v1` and `GET /api/v1/docs` describe the same gateway.
+
+        The two lists answer different questions and are allowed to differ -
+        the root says what is *mounted*, the document says what is
+        *documented* - but the difference has a rule, and until this test
+        nothing compared them. They had drifted in both directions: four
+        `hidden()` bulk-data routes were advertised and undocumented, and the
+        plugin-served route was documented and unadvertised.
+
+        The rule, checked here rather than asserted from a hand-maintained
+        list of exceptions:
+
+        * every documented operation is advertised - there is no such thing as
+          a documented route that is not mounted;
+        * every advertised endpoint that is *not* documented answers 405 -
+          which is what `hidden()` is for and the only reason a mounted route
+          has nothing to document.
+
+        The second half is driven on the wire, so a route that stops answering
+        405 - or a route hidden for some other reason - fails here instead of
+        being absorbed by an exception list.
+        """
+        root = self.get_json('')
+        advertised = set(root['endpoints'])
+        documented = {
+            f'{method.upper()} /api/v1{path}'
+            for path, method, _ in self.operations()
+        }
+
+        # Anti-vacuous: both sides must be the real surface.
+        self.assertGreater(len(advertised), 200, 'root advertised almost nothing')
+        self.assertGreater(len(documented), 200, 'document described almost nothing')
+
+        undocumented = sorted(advertised - documented)
+        unadvertised = sorted(documented - advertised)
+
+        self.assertEqual(
+            unadvertised, [],
+            f'documented but not advertised by the root: {unadvertised}')
+
+        # Swagger UI is mounted outside the registry and has no operation, so
+        # it is advertised and undocumented by construction.
+        undocumented = [e for e in undocumented if not e.endswith('/swagger-ui')]
+
+        not_405 = []
+        for endpoint in undocumented:
+            method, path = endpoint.split(' ', 1)
+            probe = re.sub(r'\{[^}]+\}', 'rootlistprobe', path)
+            response = requests.request(
+                method, f'{self.BASE_URL}{probe[len("/api/v1"):]}',
+                json={}, timeout=10)
+            if response.status_code != 405:
+                not_405.append(f'{endpoint} -> {response.status_code}')
+        self.assertEqual(
+            not_405, [],
+            f'advertised, undocumented, and not a 405 route: {not_405}')
+        # And the hidden set is not empty, or the loop above proved nothing.
+        self.assertTrue(
+            undocumented,
+            'no advertised-but-undocumented endpoint; the 405 check is vacuous')
+
+    def test_a_scoped_item_says_what_its_templated_sibling_says(self):
+        """A built item never contradicts the route it names, at either scope.
+
+        The cache-derived data and operation items are the only paths in a
+        scoped spec that are built rather than projected. They carry the
+        concrete path and the ``x-sovd-*`` extensions; everything a client acts
+        on - the role, the responses, the request body, the lock contract - is
+        inherited from the projected route they describe, because they *are*
+        that route.
+
+        Both scopes are compared, not merely visited. ``project()`` substitutes
+        the ids it was given into the path **keys**, so at collection scope the
+        sibling is still templated (``/data/{data_id}``) while at
+        specific-resource scope it has already become concrete
+        (``/data/temperature``). An earlier version used the collection
+        document only as a source of siblings, which meant every
+        collection-scope item could be published completely un-inherited and
+        this test stayed green.
+
+        Read from the document alone: the sibling states the contract and the
+        built item must match it, so no second source is needed and none is
+        trusted.
+        """
+        compared = 0
+        built_items = {'data': 0, 'operations': 0}
+        offenders = []
+        for entity_type in ('apps', 'components'):
+            items = self.get_json(f'/{entity_type}').get('items', [])
+            if not items:
+                continue
+            entity_id = items[0]['id']
+            for collection in ('data', 'operations'):
+                base = f'/{entity_type}/{entity_id}/{collection}'
+                collection_doc = self.get_json(f'{base}/docs')
+                collection_paths = collection_doc.get('paths', {})
+                # The item parameter is read from the served document, the way
+                # `CapabilityGenerator` reads it from the registry. Spelling
+                # `data_id`/`operation_id` here was a second copy of the fact
+                # that fix removed from production: renaming the registry
+                # parameter left production working and this guard green having
+                # compared nothing.
+                template = self._item_template(collection_paths, base)
+                self.assertIsNotNone(
+                    template,
+                    f'{base}/docs publishes no templated item route; the '
+                    f'comparisons below would have no sibling')
+
+                # Collection scope: every built item in the collection document
+                # against that one template.
+                for key, path_item in collection_paths.items():
+                    if 'x-sovd-name' not in path_item:
+                        continue
+                    built_items[collection] += 1
+                    for method, operation in path_item.items():
+                        if method not in HTTP_METHODS:
+                            continue
+                        problems, did_compare = self._framework_mismatch(
+                            collection_paths, template, key, method, operation)
+                        compared += did_compare
+                        offenders.extend(problems)
+
+                # Specific-resource scope: the item is republished at the key
+                # the projection occupied, so it is fetched per resource.
+                listing = requests.get(f'{self.BASE_URL}{base}', timeout=10)
+                if listing.status_code != 200:
+                    continue
+                for entry in listing.json().get('items', []):
+                    resource_id = entry['id']
+                    scoped = requests.get(
+                        f'{self.BASE_URL}{base}/{resource_id}/docs', timeout=10)
+                    if scoped.status_code != 200:
+                        continue
+                    key = f'{base}/{resource_id.lstrip("/")}'
+                    path_item = scoped.json().get('paths', {}).get(key, {})
+                    # `x-sovd-name` is written only by `PathBuilder`, so it is
+                    # what tells a *built* item from the projection that sits
+                    # at the same key at this scope. Counting the key alone
+                    # made this test unfalsifiable.
+                    if 'x-sovd-name' not in path_item:
+                        continue
+                    built_items[collection] += 1
+                    for method, operation in path_item.items():
+                        if method not in HTTP_METHODS:
+                            continue
+                        problems, did_compare = self._framework_mismatch(
+                            collection_paths, template, key, method, operation)
+                        compared += did_compare
+                        offenders.extend(problems)
+
+        self.assertEqual(
+            offenders, [],
+            f'built items contradicting their route: {offenders[:12]}')
+        # A cache-derived item must *exist*, and a comparison must actually have
+        # happened. `compared` counts comparisons performed, not operations
+        # visited: a sibling that is missing is a miss, not a pass, so a guard
+        # that found no sibling can no longer satisfy this by counting the
+        # operations it skipped.
+        # Per collection, not in total. Both are built by the same code down
+        # different branches, so one can vanish entirely while the other keeps
+        # the count above zero - which is what happened when a built verb the
+        # sibling lacked made every *data* item get discarded and this stayed
+        # green on operations alone.
+        for collection, count in sorted(built_items.items()):
+            self.assertGreater(
+                count, 0,
+                f'no {collection} sub-document published a cache-derived item '
+                f'(none carried x-sovd-name); every comparison over '
+                f'{collection} was vacuous')
+        self.assertGreater(
+            compared, 0,
+            'no built operation was compared against a sibling; the guard ran '
+            'over nothing')
+
+    @staticmethod
+    def _item_template(collection_paths, base):
+        """Return the templated item route under `base`, or None.
+
+        The item route is the one key that extends the collection by exactly
+        one segment and whose segment is a whole ``{param}`` - the same rule
+        `CapabilityGenerator::single_parameter_segment_under` applies.
+        """
+        for key in collection_paths:
+            if not key.startswith(base + '/'):
+                continue
+            tail = key[len(base) + 1:]
+            if '/' not in tail and tail.startswith('{') and tail.endswith('}'):
+                return key
+        return None
+
+    def _framework_mismatch(self, collection_paths, template, key, method,
+                            operation):
+        """Compare one built operation against its templated sibling.
+
+        Returns ``(problems, compared)``. A missing sibling is reported rather
+        than skipped: it used to return no problems, so a lookup that found
+        nothing counted as a pass everywhere it was called.
+        """
+        sibling = collection_paths.get(template, {}).get(method)
+        if sibling is None:
+            return ([f'{method.upper()} {key}: no sibling {method.upper()} at '
+                     f'{template} to inherit from'], 0)
+        problems = []
+        if operation.get('security') != sibling.get('security'):
+            problems.append(
+                f'{method.upper()} {key}: security '
+                f'{operation.get("security")} != {sibling.get("security")}')
+        # Every status, 2xx included. An earlier version carved 2xx out as
+        # "the payload, meant to differ", which is true of a request body and
+        # false of a response: the gateway envelopes every read - `DataValue`,
+        # `OperationDetail` - so a built 200 was a second, contradictory answer
+        # for one route rather than a more specific one.
+        built_statuses = set(operation.get('responses', {}))
+        sibling_statuses = set(sibling.get('responses', {}))
+        if built_statuses != sibling_statuses:
+            problems.append(
+                f'{method.upper()} {key}: statuses {sorted(built_statuses)} != '
+                f'{sorted(sibling_statuses)}')
+        for status in built_statuses & sibling_statuses:
+            if (operation['responses'][status].get('content')
+                    != sibling['responses'][status].get('content')):
+                problems.append(
+                    f'{method.upper()} {key}: {status} body differs from the '
+                    f'route it names')
+        # The request body, which had no test at any level. Deleting the line
+        # that inherits it left every suite green while a built `PUT` lost its
+        # body entirely and a client following the document got back
+        # `400 "type: missing required field; data: missing required field"` -
+        # the very defect the inheritance was added to remove.
+        if operation.get('requestBody') != sibling.get('requestBody'):
+            problems.append(
+                f'{method.upper()} {key}: requestBody differs from the route '
+                f'it names')
+        if (operation.get('x-medkit-lock-guarded')
+                != sibling.get('x-medkit-lock-guarded')):
+            problems.append(f'{method.upper()} {key}: lock marker differs')
+        built_headers = {p['name'] for p in operation.get('parameters', [])
+                         if p.get('in') != 'path'}
+        sibling_headers = {p['name'] for p in sibling.get('parameters', [])
+                           if p.get('in') != 'path'}
+        if built_headers != sibling_headers:
+            problems.append(
+                f'{method.upper()} {key}: non-path parameters '
+                f'{sorted(built_headers)} != {sorted(sibling_headers)}')
+        return (problems, 1)
+
 
 @launch_testing.post_shutdown_test()
 class TestShutdown(unittest.TestCase):

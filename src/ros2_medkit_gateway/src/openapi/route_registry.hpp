@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "ros2_medkit_gateway/core/auth/auth_config.hpp"
+#include "ros2_medkit_gateway/core/auth/auth_requirement_policy.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/dto/contract.hpp"
 #include "ros2_medkit_gateway/dto/json_reader.hpp"
@@ -347,6 +348,23 @@ class RouteEntry {
   /// handlers.
   RouteEntry & lock_guarded();
 
+  /// Declare that this route reads `X-Client-Id` to consult the lock manager,
+  /// without the rest of the `lock_guarded()` contract.
+  ///
+  /// For the one route that reads the header and can still never answer 409:
+  /// `DELETE /faults` skips faults on entities locked by another client and
+  /// answers 204 regardless. It must not carry the marker - that would publish
+  /// a status it cannot return - but the header is a locking declaration all
+  /// the same, and comes out with `locking.enabled` for the same reason the
+  /// marker does. Without this, that route is the one place a document on a
+  /// lock-less gateway still describes lock behaviour.
+  ///
+  /// The lock CRUD's own `X-Client-Id` is declared with plain `header_param()`
+  /// and stays: those routes are served either way and answer 501, and their
+  /// header is the lock API's own input rather than a claim about how locks
+  /// affect some other route.
+  RouteEntry & lock_client_header(const std::string & desc);
+
   /// Declare the `X-Medkit-No-Fan-Out` request header this route reads.
   ///
   /// Presence-only: `TypedRequest::fan_out_disabled()` and the
@@ -435,6 +453,11 @@ class RouteEntry {
   bool partial_content_{false};
   /// Set by lock_guarded(); emitted as `x-medkit-lock-guarded: true`.
   bool lock_guarded_{false};
+  /// Set by lock_guarded() and by lock_client_header(): this route declares an
+  /// `X-Client-Id` that describes locking, so it comes out when locking is off.
+  /// Distinct from lock_guarded_ because one route declares the header without
+  /// the marker, and the lock CRUD declares the header as neither.
+  bool lock_client_header_{false};
   /// Set by only_status(); suppresses the blanket 400/404/500 injection.
   bool only_status_{false};
   /// Set by the *attachments* body-less typed `put<TResponse>` overload - the
@@ -816,9 +839,38 @@ class RouteRegistry {
     return routes_.size();
   }
 
-  /// Set whether authentication is enabled (controls 401/403 in OpenAPI output).
+  /// Set whether authentication is configured at all.
+  ///
+  /// Necessary but not sufficient for 401/403: `auth.enabled` off means the
+  /// middleware admits every caller, but on it means only that a policy is
+  /// consulted. Pair with `set_auth_policy()` for the rest of the answer.
   void set_auth_enabled(bool enabled) {
     auth_enabled_ = enabled;
+  }
+
+  /// Set the policy that decides *which* routes the middleware checks
+  /// (controls 401/403 in OpenAPI output alongside `set_auth_enabled`).
+  ///
+  /// `auth.enabled` alone is the wrong key and was the wrong key here. What
+  /// the middleware runs is `config_.enabled && auth_policy_->
+  /// requires_authentication(method, path)` (`AuthManager::
+  /// requires_authentication`), and the second half is not a constant:
+  /// `require_auth_for: write` leaves every GET open, `none` leaves everything
+  /// open, and both configurations previously published `security` and both
+  /// refusal statuses on all of them.
+  ///
+  /// @param policy The live policy the middleware consults. Not owned; must
+  ///   outlive this registry. Passing nullptr (the default) leaves the
+  ///   registry on `auth_enabled_` alone, which is `require_auth_for: all` -
+  ///   the strictest reading, so a caller that forgets to wire the policy
+  ///   over-declares rather than under-declares.
+  /// @param api_prefix The prefix the routes are mounted under (`/api/v1`).
+  ///   Registered paths are stored without it, and the policy matches on the
+  ///   path the client sends - `AllAuthRequirementPolicy` exempts
+  ///   `/api/v1/auth/` by prefix - so it has to be put back before asking.
+  void set_auth_policy(const IAuthRequirementPolicy * policy, std::string api_prefix) {
+    auth_policy_ = policy;
+    auth_api_prefix_ = std::move(api_prefix);
   }
 
   /// Set whether rate limiting is enabled (controls 429 in OpenAPI output).
@@ -837,6 +889,24 @@ class RouteRegistry {
   /// see `entity_scoped()` for which routes those are.
   void set_aggregation_enabled(bool enabled) {
     aggregation_enabled_ = enabled;
+  }
+
+  /// Set whether entity locking is enabled (controls the whole `lock_guarded()`
+  /// contract in OpenAPI output: the `x-medkit-lock-guarded` marker, the
+  /// `X-Client-Id` parameter and the 409).
+  ///
+  /// `locking.enabled` defaults true and `GatewayNode` only builds the
+  /// `LockManager` when it is set. With it off `HandlerContext::
+  /// validate_lock_access` returns success without reading the header, so no
+  /// write can be refused for a lock and none of the three declarations
+  /// describes anything - while the same gateway's root reports
+  /// `capabilities.locking: false`.
+  ///
+  /// Defaults true, matching the ROS parameter: a caller that forgets to wire
+  /// this over-declares a contract rather than dropping a 409 a client would
+  /// then meet undocumented.
+  void set_locking_enabled(bool enabled) {
+    locking_enabled_ = enabled;
   }
 
   /// Escape hatch for JSON routes without typed DTOs (e.g. the fault-trigger
@@ -861,10 +931,21 @@ class RouteRegistry {
   RouteEntry & add_raw_route(const std::string & method, const std::string & openapi_path,
                              const std::string & regex_path, HandlerFn handler);
 
+  /// Whether the auth middleware answers this route ahead of its handler.
+  ///
+  /// The one place the registry decides that, so `to_openapi_paths()` and any
+  /// later reader ask the same question of the same object the middleware
+  /// asks. Mirrors `AuthManager::requires_authentication` deliberately - see
+  /// `set_auth_policy()`.
+  bool auth_enforced_on(const RouteEntry & route) const;
+
   std::deque<RouteEntry> routes_;
   bool auth_enabled_{false};
+  const IAuthRequirementPolicy * auth_policy_{nullptr};
+  std::string auth_api_prefix_;
   bool rate_limit_enabled_{false};
   bool aggregation_enabled_{false};
+  bool locking_enabled_{true};
 
   /// True when `openapi_path` carries one of the four entity-id path
   /// parameters, which is exactly the condition under which a handler can call

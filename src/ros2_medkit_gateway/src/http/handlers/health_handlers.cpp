@@ -221,6 +221,35 @@ http::Result<dto::RootOverview> HealthHandlers::get_root(const http::TypedReques
       }
     }
 
+    // Plugin routes are mounted straight onto the HTTP server by
+    // `PluginManager::register_routes`, never through the registry, so the loop
+    // above cannot see them. Without this they were the one thing `/docs`
+    // documented that the root did not advertise - the opposite direction to
+    // the `hidden()` routes, which the root advertises and `/docs` omits.
+    //
+    // Both directions are correct once the two lists are read for what they
+    // are: this one says what is *mounted* (see the Swagger UI note below), and
+    // the document says what is *documented*. A `hidden()` route is mounted and
+    // answers 405; a plugin route is mounted and is documented. Pinned by
+    // `test_openapi_contract.test.py::test_the_root_list_and_the_document_agree`.
+    if (ctx_.node() && ctx_.node()->get_plugin_manager()) {
+      const std::string api_base_path{API_BASE_PATH};
+      for (const auto & desc : ctx_.node()->get_plugin_manager()->collect_route_descriptions()) {
+        for (const auto & [method, path] : desc.endpoints()) {
+          // Built in place rather than by `+` chaining, matching
+          // `RouteRegistry::to_endpoint_list` above: the chain allocates a
+          // throwaway temporary per operator.
+          std::string endpoint;
+          endpoint.reserve(method.size() + api_base_path.size() + path.size() + 1);
+          endpoint += method;
+          endpoint += ' ';
+          endpoint += api_base_path;
+          endpoint += path;
+          endpoints.push_back(std::move(endpoint));
+        }
+      }
+    }
+
 #ifdef ENABLE_SWAGGER_UI
     // The two `/docs` routes are in the registry, so `to_endpoint_list` above
     // already lists them; a hand-written entry here would list each twice, and

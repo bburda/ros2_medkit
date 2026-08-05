@@ -186,6 +186,19 @@ nlohmann::json OpenApiSpecBuilder::build() const {
   // document-level requirement still lands in `components/securitySchemes` -
   // that is what lets a single operation name it - but adds no `security`
   // entry, so the document does not claim every request needs a token.
+  //
+  // The callers key `document_level_requirement` on `auth.enabled` alone, and
+  // that is deliberate rather than the same over-broad key the per-operation
+  // requirement was corrected away from. This entry is the *default* for an
+  // operation that states nothing, and with auth on that default is right
+  // under every `require_auth_for`: a route registered without
+  // `requires_role()` or `public_route()` is one `AuthManager::
+  // check_authorization` fails closed on. It is also never the operative
+  // statement about a real operation, because
+  // `CapabilityGenerator::project_security_onto_enforcement` gives every
+  // operation an explicit requirement - a role or the empty list - before the
+  // document is served. Dropping it under `none` would gain nothing and would
+  // make a forgotten registration read as public.
   for (const auto & ss : security_schemes_) {
     spec["components"]["securitySchemes"][ss.name] = ss.scheme;
     if (!ss.document_level_requirement) {

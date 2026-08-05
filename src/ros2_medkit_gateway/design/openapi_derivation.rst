@@ -502,10 +502,21 @@ to re-derive which half is which.
 Their counterpart *is* declared, which is what makes the boundary a decision
 rather than an omission: the statuses with a finite first-party range are
 derived. ``handlers::parameter_error_statuses()`` runs the classifier over every
-``ParameterErrorCode``, so a new enumerator widens the declaration with no edit
-at any registration, and a switch with no ``default`` beside it makes
-``-Werror=switch-enum`` fail the build if an enumerator is added without being
-listed. The lock verbs have no enum, so their range is pinned behaviourally by
+``ParameterErrorCode`` in ``kAllParameterErrorCodes``, so a new enumerator
+widens the declaration with no edit at any registration - **once it is added to
+that array**, which is hand-written and is the one step still on the author.
+
+Two compiler checks sit on that step, and it took both. ``-Werror=switch-enum``
+with a ``default``-less switch beside the array fails the build when an
+enumerator is added, but only until a ``case`` is written for it; adding the
+cases and leaving the array short compiled cleanly, and the four registrations
+then quietly stopped declaring a status the new code produces. The enum
+therefore ends in a ``COUNT`` sentinel and the array's length is
+``static_assert``-ed against it, so the omission is a build failure rather than
+a convention. Adding an enumerator now fails with ``the comparison reduces to
+(10 == 11)`` until the array lists it.
+
+The lock verbs have no enum, so their range is pinned behaviourally by
 ``LockManagerTest.extend_and_release_answer_only_400_403_404``.
 
 **Statuses no handler produces.** The rate limiter's 429 and the auth

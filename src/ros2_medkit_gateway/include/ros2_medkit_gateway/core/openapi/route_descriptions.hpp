@@ -322,6 +322,18 @@ class PathDescBuilder {
     return *this;
   }
 
+  /// The method keys this path item carries, lower-case as OpenAPI spells
+  /// them. Read by `RouteDescriptions::endpoints()`; see the comment there.
+  std::vector<std::string> methods() const {
+    std::vector<std::string> out;
+    out.reserve(operations_.size());
+    for (const auto & [method, op] : operations_) {
+      (void)op;
+      out.push_back(method);
+    }
+    return out;
+  }
+
   // Convert to JSON
   nlohmann::json to_json() const {
     nlohmann::json j;
@@ -359,6 +371,28 @@ class RouteDescriptions {
   RouteDescriptions(RouteDescriptions &&) = default;
   RouteDescriptions & operator=(const RouteDescriptions &) = default;
   RouteDescriptions & operator=(RouteDescriptions &&) = default;
+
+  /// The (UPPERCASE method, path) pair of every operation described here.
+  ///
+  /// Public where `to_json()` is not, and deliberately so: the root endpoint
+  /// list needs to say that these routes are mounted, and nothing more. A
+  /// plugin route is mounted straight onto the HTTP server, so without this it
+  /// was the one served route the root did not advertise while `/docs`
+  /// documented it. Handing out the whole document instead would give the
+  /// endpoint list a second, richer view of the same routes that could then
+  /// drift from the one `CapabilityGenerator` folds.
+  std::vector<std::pair<std::string, std::string>> endpoints() const {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto & [path, builder] : paths_) {
+      for (std::string method : builder.methods()) {
+        for (char & c : method) {
+          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        out.emplace_back(std::move(method), path);
+      }
+    }
+    return out;
+  }
 
  private:
   RouteDescriptions() = default;

@@ -40,7 +40,10 @@ TEST_F(PathBuilderTest, DataItemGetAlwaysPresent) {
   TopicData topic{"temperature", "std_msgs/msg/Float32", "publish"};
   auto result = path_builder_.build_data_item("apps/sensor", topic);
   ASSERT_TRUE(result.contains("get"));
-  EXPECT_TRUE(result["get"]["responses"].contains("200"));
+  // No 200: the gateway answers the `DataValue` envelope, not the bare
+  // message, so the read body is the projected sibling's to state.
+  // `adopt_projected_framework` copies it in.
+  EXPECT_FALSE(result["get"]["responses"].contains("200"));
 }
 
 TEST_F(PathBuilderTest, DataItemPutForSubscribeTopic) {
@@ -74,32 +77,52 @@ TEST_F(PathBuilderTest, DataItemHasSovdExtensions) {
   EXPECT_EQ(result["x-sovd-name"], "temperature");
 }
 
-TEST_F(PathBuilderTest, DataItemSchemaFromRosType) {
-  TopicData topic{"temperature", "std_msgs/msg/Float32", "publish"};
-  auto result = path_builder_.build_data_item("apps/sensor", topic);
-  auto schema = result["get"]["responses"]["200"]["content"]["application/json"]["schema"];
-  // std_msgs/msg/Float32 has a "data" field
-  EXPECT_EQ(schema["type"], "object");
-  EXPECT_TRUE(schema.contains("properties"));
+TEST_F(PathBuilderTest, DataItemWriteBodyOmittedWhenTheTypeIsUnknown) {
+  // `TopicData::type` is empty on every gateway today - every construction site
+  // in `thread_safe_entity_cache.cpp` pushes `{topic, "", direction}` - so this
+  // is the branch production actually takes, and it had no coverage at all.
+  // With nothing to say beyond `DataWriteRequest`, the builder says nothing and
+  // the projected sibling's named `$ref` is inherited instead.
+  TopicData topic{"command", "", "subscribe"};
+  auto result = path_builder_.build_data_item("apps/actuator", topic);
+  ASSERT_TRUE(result.contains("put"));
+  EXPECT_FALSE(result["put"].contains("requestBody"));
+  // And the description does not render an empty type as "(type: )".
+  EXPECT_EQ(result["get"]["description"], "Read current value of topic command.");
 }
 
 // =============================================================================
 // Operation item (service) tests
 // =============================================================================
 
-TEST_F(PathBuilderTest, ServiceOperationHasGetAndPost) {
+TEST_F(PathBuilderTest, ServiceOperationHasGetOnly) {
   // @verifies REQ_INTEROP_002
   ServiceInfo service{"calibrate", "/engine/calibrate", "std_srvs/srv/Trigger", std::nullopt};
   auto result = path_builder_.build_operation_item("apps/engine", service);
   ASSERT_TRUE(result.contains("get"));
-  ASSERT_TRUE(result.contains("post"));
+  // The gateway registers no POST at `/{entity}/operations/{operation_id}` -
+  // execution is `POST .../{operation_id}/executions` - so publishing one here
+  // named an operation that answers 404.
+  EXPECT_FALSE(result.contains("post"));
+  // And no 200: `GET .../operations/{operation_id}` answers `OperationDetail`
+  // (`{"item": {...}}` on the wire), never the ROS service response. Building
+  // one from `from_ros_srv_response` put two contradictory bodies on one route.
+  EXPECT_FALSE(result["get"]["responses"].contains("200"));
 }
 
-TEST_F(PathBuilderTest, ServiceOperationPostHasRequestBody) {
-  ServiceInfo service{"calibrate", "/engine/calibrate", "std_srvs/srv/Trigger", std::nullopt};
-  auto result = path_builder_.build_operation_item("apps/engine", service);
-  ASSERT_TRUE(result["post"].contains("requestBody"));
-  EXPECT_TRUE(result["post"]["requestBody"]["required"].get<bool>());
+TEST_F(PathBuilderTest, DataItemPutBodyIsTheWriteEnvelopeNotTheBareMessage) {
+  // The handler reads `DataWriteRequest{type, data}`. Publishing the bare
+  // message schema was answered `400 "type: missing required field"` on the
+  // wire, so the shape - not merely the status set - has to match.
+  TopicData topic{"command", "std_msgs/msg/String", "subscribe"};
+  auto result = path_builder_.build_data_item("apps/actuator", topic);
+  auto schema = result["put"]["requestBody"]["content"]["application/json"]["schema"];
+  EXPECT_EQ(schema["type"], "object");
+  EXPECT_EQ(schema["required"], nlohmann::json::array({"type", "data"}));
+  EXPECT_EQ(schema["properties"]["type"]["const"], "std_msgs/msg/String");
+  // `data` carries what the bare schema used to sit at the top level.
+  EXPECT_EQ(schema["properties"]["data"]["type"], "object");
+  EXPECT_TRUE(schema["properties"]["data"].contains("properties"));
 }
 
 TEST_F(PathBuilderTest, ServiceOperationHasSovdName) {
@@ -118,12 +141,12 @@ TEST_F(PathBuilderTest, ServiceOperationNotAsynchronous) {
 // Operation item (action) tests
 // =============================================================================
 
-TEST_F(PathBuilderTest, ActionOperationHasGetAndPost) {
+TEST_F(PathBuilderTest, ActionOperationHasGetOnly) {
   // @verifies REQ_INTEROP_002
   ActionInfo action{"navigate", "/nav/navigate", "nav2_msgs/action/NavigateToPose", std::nullopt};
   auto result = path_builder_.build_operation_item("apps/navigation", action);
   ASSERT_TRUE(result.contains("get"));
-  ASSERT_TRUE(result.contains("post"));
+  EXPECT_FALSE(result.contains("post"));
 }
 
 TEST_F(PathBuilderTest, ActionOperationIsAsynchronous) {
@@ -133,10 +156,11 @@ TEST_F(PathBuilderTest, ActionOperationIsAsynchronous) {
   EXPECT_TRUE(result["x-sovd-asynchronous-execution"].get<bool>());
 }
 
-TEST_F(PathBuilderTest, ActionOperationPostReturns202) {
+TEST_F(PathBuilderTest, ActionOperationDeclaresNoResponseBodyOfItsOwn) {
   ActionInfo action{"navigate", "/nav/navigate", "nav2_msgs/action/NavigateToPose", std::nullopt};
   auto result = path_builder_.build_operation_item("apps/navigation", action);
-  EXPECT_TRUE(result["post"]["responses"].contains("202"));
+  EXPECT_FALSE(result["get"]["responses"].contains("200"));
+  EXPECT_FALSE(result["get"]["responses"].contains("202"));
 }
 
 TEST_F(PathBuilderTest, ActionOperationHasSovdName) {
@@ -159,14 +183,16 @@ TEST_F(PathBuilderTest, ErrorResponsesWithoutAuth) {
   EXPECT_FALSE(errors.contains("403"));
 }
 
-TEST_F(PathBuilderTest, ErrorResponsesWithAuth) {
-  PathBuilder auth_builder(schema_builder_, true);
-  auto errors = auth_builder.error_responses();
-  EXPECT_TRUE(errors.contains("400"));
-  EXPECT_TRUE(errors.contains("404"));
-  EXPECT_TRUE(errors.contains("500"));
-  EXPECT_TRUE(errors.contains("401"));
-  EXPECT_TRUE(errors.contains("403"));
+TEST_F(PathBuilderTest, ErrorResponsesNeverCarryTheMiddlewareStatuses) {
+  // 401/403 are the auth middleware's, answered in the RFC 6749 shape and only
+  // where the policy enforces. This builder cannot know either, so it declares
+  // neither; `CapabilityGenerator::adopt_projected_framework` copies them in
+  // from the templated sibling, which does know.
+  auto errors = path_builder_.error_responses();
+  EXPECT_FALSE(errors.contains("401"));
+  EXPECT_FALSE(errors.contains("403"));
+  EXPECT_FALSE(errors.contains("409"));
+  EXPECT_FALSE(errors.contains("416"));
 }
 
 TEST_F(PathBuilderTest, ErrorResponsesUseGenericErrorSchema) {

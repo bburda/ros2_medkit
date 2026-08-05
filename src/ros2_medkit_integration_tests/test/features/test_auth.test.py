@@ -102,8 +102,8 @@ class TestAuthenticationIntegration(GatewayTestCase):
         self.assertTrue(data['auth']['enabled'])
         self.assertEqual(data['auth']['algorithm'], 'HS256')
 
-    def test_02b_plugin_operation_publishes_its_role_when_auth_is_on(self):
-        """With auth enabled the document publishes the role an operation needs.
+    def test_02b_plugin_operation_states_what_this_gateway_enforces(self):
+        """A plugin's declared role reaches the document, and is then filtered.
 
         The other half of this pair is
         ``test_openapi_contract::test_no_operation_publishes_a_role_when_auth_is_off``:
@@ -112,9 +112,19 @@ class TestAuthenticationIntegration(GatewayTestCase):
         gateway has one value of ``auth.enabled``, and the whole point of the
         rule is that the document follows it.
 
-        The role is ``admin`` because ``AuthConfig``'s ``*`` matches a single
-        path segment, so no ``viewer`` entry under ``/functions/*`` reaches
-        this collection and only ADMIN's ``GET:/api/v1/**`` does.
+        What this fixture pins is the *second* filter. The graph provider
+        declares ``admin`` on this route, and under ``require_auth_for: all``
+        that is what the document publishes and what the middleware demands.
+        This gateway runs ``write``, under which the middleware admits every
+        GET - measured, not assumed: the ``/docs`` fetch on the line below
+        carries no token and succeeds. So the honest published requirement here
+        is the empty one, and publishing ``admin`` would have promised a check
+        an anonymous caller does not meet.
+
+        The role-publishing direction has not been dropped; it moved to
+        ``test_auth_policy_contract.test.py``, which runs one gateway per
+        ``require_auth_for`` value and can therefore drive both answers for
+        this same operation.
         """
         spec = requests.get(f'{self.BASE_URL}/docs', timeout=10).json()
         op = spec['paths'].get(
@@ -122,11 +132,30 @@ class TestAuthenticationIntegration(GatewayTestCase):
         self.assertIsNotNone(
             op, 'the graph provider route is not documented; the fixture must '
                 'load the plugin for this test to mean anything')
-        self.assertEqual(op.get('security'), [{'bearerAuth': ['admin']}])
-        # A requirement may only name a scheme the document defines.
+        self.assertEqual(
+            op.get('security'), [],
+            'under require_auth_for=write the middleware admits every GET, so '
+            'the plugin route must publish the empty requirement')
+        # The scheme is defined either way - that is what lets a single
+        # operation name it - and its presence is the auth-on marker that
+        # survives a permissive policy.
         self.assertIn(
             'bearerAuth',
             spec.get('components', {}).get('securitySchemes', {}))
+        # Anti-vacuous: `security: []` above must mean "this policy admits
+        # GETs", not "this gateway publishes no roles at all". The writes are
+        # checked under `write`, and they say so.
+        roles = {
+            tuple(req['bearerAuth'])
+            for item in spec['paths'].values()
+            for method, operation in item.items()
+            if method in ('post', 'put', 'patch', 'delete')
+            for req in operation.get('security', [])
+            if 'bearerAuth' in req
+        }
+        self.assertTrue(
+            roles, 'no write operation publishes a role; the document has '
+                   'stopped naming roles altogether')
 
     def test_03_authenticate_valid_credentials(self):
         """@verifies REQ_INTEROP_086 - Authentication with valid credentials."""
