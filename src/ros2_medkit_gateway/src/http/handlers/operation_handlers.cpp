@@ -257,8 +257,7 @@ std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result
         // `status` alone cannot express the answer the client is asking for -
         // it renders CANCELED and ABORTED identically as "failed" - so name
         // the field that can.
-        message +=
-            "Poll the execution status resource and read x-medkit.ros2_status to learn the goal's outcome.";
+        message += "Poll the execution status resource and read x-medkit.ros2_status to learn the goal's outcome.";
       }
       return CancelFailure{504, ERR_NOT_RESPONDING, std::move(message)};
     }
@@ -933,9 +932,9 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
       // this branch removed.
       auto tracked = operation_mgr->get_tracked_goal(execution_id);
       if (!tracked.has_value()) {
-        return tl::make_unexpected(make_error(
-            404, ERR_RESOURCE_NOT_FOUND, "Execution not found",
-            json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"execution_id", execution_id}}));
+        return tl::make_unexpected(
+            make_error(404, ERR_RESOURCE_NOT_FOUND, "Execution not found",
+                       json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"execution_id", execution_id}}));
       }
 
       dto::OperationExecution exec_dto;

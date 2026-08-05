@@ -100,6 +100,28 @@ pre-commit install --hook-type pre-push
 On commit: clang-format, cmake-lint, shellcheck, flake8, ament-copyright, trailing whitespace.
 On push: incremental clang-tidy on changed `.cpp` files.
 
+#### Reproducing a sanitizer failure locally
+
+The ASan/TSan jobs multiply every declared CTest `TIMEOUT` by three, but a
+budget a test asserts on *itself* is invisible to that rewrite - an
+instrumented gateway can blow a "must answer within N seconds" assertion long
+before ctest's clock runs out, and the failure then reads as a product
+regression rather than as instrumentation overhead. Those budgets read
+`MEDKIT_TEST_TIME_SCALE`, which the sanitizer jobs export with the same factor.
+
+Set it when reproducing a sanitizer failure locally, or the run you get is not
+the run CI got:
+
+```bash
+MEDKIT_TEST_TIME_SCALE=3 colcon test --ctest-args -LE linter
+```
+
+It is honoured by both suites - Python integration tests via
+`ros2_medkit_test_utils.constants.get_time_scale()`, and C++ fixtures that wait
+on wall-clock budgets via their own local `test_time_scale()` helper. Unset,
+unparseable or below `1` means no scaling, so ordinary runs keep the tight
+budgets that give the assertions their falsifying power.
+
 #### Code Coverage
 
 Run from the workspace root. This mirrors the measurement pipeline of the CI

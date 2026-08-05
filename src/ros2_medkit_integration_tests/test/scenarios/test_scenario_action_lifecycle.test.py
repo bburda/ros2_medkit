@@ -26,7 +26,7 @@ import launch_testing
 import launch_testing.actions
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
+from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_time_scale
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
@@ -168,7 +168,7 @@ class TestScenarioActionLifecycle(GatewayTestCase):
         self.poll_endpoint_until(
             self._exec_endpoint(execution_id),
             lambda d: d if (d.get('x-medkit') or {}).get('ros2_status') in terminal else None,
-            timeout=20.0,
+            timeout=20.0 * get_time_scale(),
             interval=0.3,
         )
 
