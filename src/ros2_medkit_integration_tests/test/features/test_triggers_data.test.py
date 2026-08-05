@@ -19,6 +19,11 @@ Validates trigger CRUD on data collections and SSE event delivery when
 topic data changes. Uses the temp_sensor demo node which publishes
 Float64 temperature data.
 
+A second gateway runs with ``triggers.enabled: false`` so the feature gate on
+the six trigger routes is exercised: with the trigger manager absent the
+handlers are never constructed, and the gate is the only thing standing
+between a request and a null dereference.
+
 """
 
 import json
@@ -30,16 +35,36 @@ import launch_testing
 import launch_testing.actions
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, API_BASE_PATH
+from ros2_medkit_test_utils.constants import (
+    ALLOWED_EXIT_CODES,
+    API_BASE_PATH,
+    get_test_port,
+)
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
-from ros2_medkit_test_utils.launch_helpers import create_test_launch
+from ros2_medkit_test_utils.launch_helpers import create_gateway_node, create_test_launch
+
+HTTP_METHODS = {'get', 'post', 'put', 'delete', 'patch', 'head', 'options'}
+
+PORT_TRIGGERS_OFF = get_test_port(1)
 
 
 def generate_test_description():
-    return create_test_launch(
+    launch_description, context = create_test_launch(
         demo_nodes=['temp_sensor', 'rpm_sensor', 'lidar_sensor'],
         fault_manager=False,
     )
+    gateway_triggers_off = create_gateway_node(
+        name='gateway_triggers_off',
+        port=PORT_TRIGGERS_OFF,
+        extra_params={
+            'server.host': '127.0.0.1',
+            'triggers.enabled': False,
+        },
+    )
+    # Prepend so it comes up alongside the primary gateway, before ReadyToTest.
+    launch_description.entities.insert(0, gateway_triggers_off)
+    context['gateway_triggers_off'] = gateway_triggers_off
+    return launch_description, context
 
 
 class TestTriggersData(GatewayTestCase):
@@ -602,6 +627,123 @@ class TestTriggersData(GatewayTestCase):
         self.assertEqual(r.status_code, 200)
         ids = [item['id'] for item in r.json().get('items', [])]
         self.assertIn(trig_id, ids)
+
+
+class TestTriggersDisabled(GatewayTestCase):
+    """Trigger routes on a gateway launched with ``triggers.enabled: false``.
+
+    With the trigger manager absent the handlers are never constructed, so the
+    registration gate is the only thing between a request and a null
+    dereference. Every assertion here therefore does double duty: it checks the
+    501 wire shape and it proves the gate actually fires.
+    """
+
+    BASE_URL = f'http://127.0.0.1:{PORT_TRIGGERS_OFF}{API_BASE_PATH}'
+    MIN_EXPECTED_APPS = 0
+
+    APP = 'temp_sensor'
+
+    def assert_not_available(self, resp):
+        """Every gated trigger route answers the same SOVD GenericError."""
+        self.assertEqual(resp.status_code, 501, resp.text)
+        body = resp.json()
+        self.assertEqual(body['error_code'], 'not-implemented')
+        self.assertEqual(body['message'], 'Triggers not available')
+
+    def test_01_list_triggers_returns_501(self):
+        """GET /apps/{id}/triggers is gated off."""
+        self.assert_not_available(
+            requests.get(f'{self.BASE_URL}/apps/{self.APP}/triggers', timeout=5)
+        )
+
+    def test_02_create_trigger_returns_501(self):
+        """POST /apps/{id}/triggers is gated off."""
+        self.assert_not_available(
+            requests.post(
+                f'{self.BASE_URL}/apps/{self.APP}/triggers',
+                json={
+                    'resource': f'{API_BASE_PATH}/apps/{self.APP}/faults',
+                    'trigger_condition': {'condition_type': 'OnChange'},
+                    'multishot': True,
+                },
+                timeout=5,
+            )
+        )
+
+    def test_03_get_trigger_returns_501(self):
+        """GET /apps/{id}/triggers/{trigger_id} is gated off."""
+        self.assert_not_available(
+            requests.get(
+                f'{self.BASE_URL}/apps/{self.APP}/triggers/ghost', timeout=5
+            )
+        )
+
+    def test_04_update_trigger_returns_501(self):
+        """PUT /apps/{id}/triggers/{trigger_id} is gated off.
+
+        The body has to be valid, because the gate runs after body parsing -
+        an invalid one would be answered with 400 before the gate is reached.
+        """
+        self.assert_not_available(
+            requests.put(
+                f'{self.BASE_URL}/apps/{self.APP}/triggers/ghost',
+                json={'lifetime': 60},
+                timeout=5,
+            )
+        )
+
+    def test_05_delete_trigger_returns_501(self):
+        """DELETE /apps/{id}/triggers/{trigger_id} is gated off."""
+        self.assert_not_available(
+            requests.delete(
+                f'{self.BASE_URL}/apps/{self.APP}/triggers/ghost', timeout=5
+            )
+        )
+
+    def test_06_trigger_events_stream_returns_501(self):
+        """GET /apps/{id}/triggers/{trigger_id}/events (SSE) is gated off.
+
+        The SSE escape hatch has its own wrapper, so the gate has to be wired
+        there separately from the typed CRUD wrappers.
+        """
+        self.assert_not_available(
+            requests.get(
+                f'{self.BASE_URL}/apps/{self.APP}/triggers/ghost/events',
+                timeout=5,
+            )
+        )
+
+    def test_07_malformed_json_returns_400_not_501(self):
+        """A malformed body outranks the feature gate.
+
+        The gate runs inside the typed wrapper, after body parsing. Trigger
+        POST goes through a different wrapper than the update routes
+        (``wrap_with_body`` rather than ``wrap_with_body_attachments``), so
+        the ordering is worth proving on both.
+        """
+        resp = requests.post(
+            f'{self.BASE_URL}/apps/{self.APP}/triggers',
+            data='not{valid json',
+            headers={'Content-Type': 'application/json'},
+            timeout=5,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertEqual(resp.json()['error_code'], 'invalid-request')
+
+    # @verifies REQ_INTEROP_002
+    def test_08_spec_declares_the_gated_status(self):
+        """Every documented trigger operation declares the 501 the gate returns."""
+        spec = self.get_json('/docs')
+        checked = 0
+        for path, item in spec['paths'].items():
+            if '/triggers' not in path:
+                continue
+            for method, op in item.items():
+                if method not in HTTP_METHODS:
+                    continue
+                checked += 1
+                self.assertIn('501', op['responses'], f'{method.upper()} {path}')
+        self.assertGreater(checked, 0, 'No trigger operations in the document')
 
 
 @launch_testing.post_shutdown_test()

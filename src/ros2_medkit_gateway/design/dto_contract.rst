@@ -431,6 +431,33 @@ Two further ``RouteEntry`` knobs shape the published response set:
   other response and suppresses the blanket 400/404/500 injection. The
   auth 401/403 refs stay when authentication is enabled: they come from the
   middleware ahead of the handler and are reachable on every route.
+  A ``code >= 400`` is published with the ``GenericError`` schema attached,
+  because that is what the handler puts on the wire; publishing it bare would
+  describe a bodyless response a generated client then receives JSON into.
+  ``only_status`` is not sticky with respect to ``errors()``: a call placed
+  *after* it re-declares those statuses, so state the single outcome last. It
+  *is* safe with respect to ``gated_on()`` in either order - a live gate is a
+  second reachable outcome, so ``only_status`` re-declares the gate's status
+  rather than dropping it.
+- ``gated_on(available, unavailable)`` - the route's backing feature can be
+  absent. ``available`` is re-evaluated per request (a manager can appear after
+  registration), and when it is false the framework answers with
+  ``unavailable`` rendered through this route's ``ErrorRenderer``. The call
+  also declares ``unavailable.http_status`` via ``errors()``, which is the
+  point: a gate written as an inline ``if (!handlers_) return
+  tl::unexpected(...)`` inside the handler lambda is invisible to the document
+  generator, so the published operation omitted the 501 it answers with in
+  practice.
+
+  The guard runs *inside* the typed wrapper, at the same place the inline
+  ``if`` used to sit - after the request body has been parsed. A malformed
+  payload sent to a gated-off route therefore still answers 400, not the gate's
+  status.
+
+  Feature gates the registration cannot see - a handler that answers 501
+  because its own backend is unconfigured, e.g. ``LockHandlers`` without a lock
+  manager - are declared with plain ``errors({501})`` until a handler-level
+  seam exists.
 
 Escape Hatches
 --------------

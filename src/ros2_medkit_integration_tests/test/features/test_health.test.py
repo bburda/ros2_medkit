@@ -200,6 +200,14 @@ class TestHealth(GatewayTestCase):
                 summary = op.get('summary', '')
                 if 'SSE' in summary or 'stream' in summary.lower():
                     has_schema = True
+                # An operation that declares no 2xx at all cannot return a
+                # success body to describe - the data-categories / data-groups
+                # stubs declare only their 501. Deliberately narrow: an
+                # operation that DOES declare a 2xx still owes a schema, which
+                # is the coverage this rule exists for.
+                declared = op.get('responses', {})
+                if declared and not any(code.startswith('2') for code in declared):
+                    has_schema = True
                 if not has_schema:
                     issues.append(f'{op_id}: no response schema')
         self.assertEqual(issues, [], f'Operations missing response schema: {issues}')

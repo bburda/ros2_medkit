@@ -33,6 +33,8 @@ from ros2_medkit_test_utils.launch_helpers import create_gateway_node
 PORT_NO_PLUGIN = get_test_port(0)
 PORT_WITH_PLUGIN = get_test_port(1)
 
+HTTP_METHODS = {'get', 'post', 'put', 'delete', 'patch', 'head', 'options'}
+
 
 def _get_test_plugin_path():
     """Get path to test_update_backend.so demo plugin."""
@@ -201,6 +203,41 @@ class TestUpdatesNoPlugin(GatewayTestCase):
         r = requests.delete(f'{self.BASE_URL}/updates/some-pkg', timeout=5)
         self.assertEqual(r.status_code, 501)
         self.assertEqual(r.json()['error_code'], 'not-implemented')
+
+    # @verifies REQ_INTEROP_083
+    def test_09_malformed_json_returns_400_not_501(self):
+        """A malformed body outranks the feature gate.
+
+        The gate runs inside the typed wrapper, after body parsing, so a broken
+        payload is still reported as the client's own error. Moving the guard
+        ahead of the parse would answer 501 here and hide the real problem.
+        """
+        r = requests.post(
+            f'{self.BASE_URL}/updates',
+            data='not{valid json',
+            headers={'Content-Type': 'application/json'},
+            timeout=5,
+        )
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(r.json()['error_code'], 'invalid-request')
+
+    # @verifies REQ_INTEROP_002
+    def test_disabled_feature_returns_501_and_declares_it(self):
+        """Every /updates operation documents the 501 the gate returns.
+
+        The eight tests above prove the gateway answers 501 with the feature
+        off. This one proves the generated document says so, which is what a
+        generated client needs to handle the response instead of treating it
+        as an undeclared surprise.
+        """
+        spec = self.get_json('/docs')
+        for path, item in spec['paths'].items():
+            if not path.startswith('/updates'):
+                continue
+            for method, op in item.items():
+                if method not in HTTP_METHODS:
+                    continue
+                self.assertIn('501', op['responses'], f'{method.upper()} {path}')
 
 
 class TestUpdatesCRUD(_UpdatesTestMixin, GatewayTestCase):

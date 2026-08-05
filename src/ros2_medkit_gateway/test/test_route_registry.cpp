@@ -54,6 +54,7 @@ inline constexpr std::string_view dto_name<RouteRegistryTestSeedDto> = "RouteReg
 }  // namespace ros2_medkit_gateway
 
 using namespace ros2_medkit_gateway::openapi;
+using ros2_medkit_gateway::ErrorInfo;
 using ros2_medkit_gateway::dto::FaultEntityListQuery;
 using ros2_medkit_gateway::dto::FaultListQuery;
 using ros2_medkit_gateway::dto::RouteRegistryTestSeedDto;
@@ -762,4 +763,119 @@ TEST_F(RouteRegistryTest, ErrorResponsesUseGenericErrorRef) {
   EXPECT_EQ(resp_400["$ref"].get<std::string>(), "#/components/responses/GenericError");
   // No inline description when using $ref
   EXPECT_FALSE(resp_400.contains("description"));
+}
+
+// -----------------------------------------------------------------------------
+// only_status / gated_on interaction
+// -----------------------------------------------------------------------------
+
+TEST_F(RouteRegistryTest, OnlyStatusPublishesErrorBodySchema) {
+  // A 501 stub answers with a GenericError body. Publishing the status without
+  // `content` would describe a bodyless response, which a generated client
+  // models as void and then receives JSON into.
+  seed_get(registry_, "/stub").tag("Test").summary("Stub").only_status(501, "Not implemented for ROS 2");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & responses = paths["/stub"]["get"]["responses"];
+
+  ASSERT_TRUE(responses.contains("501"));
+  EXPECT_EQ(responses["501"]["description"].get<std::string>(), "Not implemented for ROS 2");
+  ASSERT_TRUE(responses["501"].contains("content"));
+  EXPECT_EQ(responses["501"]["content"]["application/json"]["schema"]["$ref"].get<std::string>(),
+            "#/components/schemas/GenericError");
+
+  // The single-outcome claim still drops the blanket set and the derived 200.
+  EXPECT_FALSE(responses.contains("200"));
+  EXPECT_FALSE(responses.contains("400"));
+  EXPECT_FALSE(responses.contains("404"));
+  EXPECT_FALSE(responses.contains("500"));
+}
+
+TEST_F(RouteRegistryTest, OnlyStatusKeepsAnErrorStubComplete) {
+  // The stub declares no 2xx at all; validate_completeness must not ask it for
+  // a success schema it can never have.
+  seed_get(registry_, "/stub").tag("Test").summary("Stub").only_status(501, "Not implemented");
+
+  for (const auto & issue : registry_.validate_completeness()) {
+    EXPECT_NE(issue.severity, ValidationIssue::Severity::kError) << issue.route << ": " << issue.message;
+  }
+}
+
+TEST_F(RouteRegistryTest, GatedRouteDeclaresTheGateStatus) {
+  ErrorInfo unavailable;
+  unavailable.code = "not-implemented";
+  unavailable.message = "Feature not available";
+  unavailable.http_status = 501;
+
+  seed_get(registry_, "/gated")
+      .tag("Test")
+      .summary("Gated")
+      .gated_on(
+          [] {
+            return false;
+          },
+          unavailable);
+
+  auto paths = registry_.to_openapi_paths();
+  auto & resp_501 = paths["/gated"]["get"]["responses"]["501"];
+  ASSERT_TRUE(resp_501.contains("$ref"));
+  EXPECT_EQ(resp_501["$ref"].get<std::string>(), "#/components/responses/GenericError");
+}
+
+TEST_F(RouteRegistryTest, GatedStatusSurvivesEitherBuilderOrder) {
+  // A live gate is a second reachable outcome, so only_status() must not drop
+  // it - regardless of which call comes last. Without this the very status the
+  // gate exists to return disappears from the document on one ordering.
+  ErrorInfo unavailable;
+  unavailable.code = "not-implemented";
+  unavailable.message = "Feature not available";
+  unavailable.http_status = 501;
+  auto never_available = [] {
+    return false;
+  };
+
+  seed_get(registry_, "/gate-then-only")
+      .tag("Test")
+      .summary("Gate then only")
+      .gated_on(never_available, unavailable)
+      .only_status(405, "Method not allowed");
+
+  seed_get(registry_, "/only-then-gate")
+      .tag("Test")
+      .summary("Only then gate")
+      .only_status(405, "Method not allowed")
+      .gated_on(never_available, unavailable);
+
+  auto paths = registry_.to_openapi_paths();
+  for (const char * path : {"/gate-then-only", "/only-then-gate"}) {
+    auto & responses = paths[path]["get"]["responses"];
+    EXPECT_TRUE(responses.contains("501")) << path << " dropped the gate status";
+    EXPECT_TRUE(responses.contains("405")) << path << " dropped the only_status code";
+  }
+}
+
+TEST_F(RouteRegistryTest, GateWithSubErrorStatusIsReportedNotPublished) {
+  // gated_on() declares through errors(), so a sub-400 status is rejected and
+  // surfaced instead of being published as a phantom success.
+  ErrorInfo misconfigured;
+  misconfigured.code = "nonsense";
+  misconfigured.http_status = 302;
+
+  seed_get(registry_, "/bad-gate")
+      .tag("Test")
+      .summary("Bad gate")
+      .gated_on(
+          [] {
+            return true;
+          },
+          misconfigured);
+
+  bool reported = false;
+  for (const auto & issue : registry_.validate_completeness()) {
+    if (issue.message.find("302") != std::string::npos) {
+      reported = true;
+    }
+  }
+  EXPECT_TRUE(reported) << "sub-400 gate status was silently dropped";
+  EXPECT_FALSE(registry_.to_openapi_paths()["/bad-gate"]["get"]["responses"].contains("302"));
 }

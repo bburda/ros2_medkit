@@ -15,8 +15,10 @@
 #include "route_registry.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -167,8 +169,41 @@ RouteEntry & RouteEntry::only_status(int code, const std::string & desc) {
   responses_.clear();
   declared_errors_.clear();
   only_status_ = true;
-  responses_[code] = {desc, {}};
+  // An error status carries a GenericError body on the wire, so publishing it
+  // with no `content` would describe a bodyless response a client then receives
+  // JSON into. Attaching the schema here (rather than routing `code` through
+  // declared_errors_, which would empty responses_ and make
+  // validate_completeness inject a phantom 200) keeps `desc` AND keeps the
+  // "only error responses" branch of both completeness gates satisfied.
+  nlohmann::json schema;
+  if (code >= 400) {
+    schema = nlohmann::json{{"$ref", "#/components/schemas/GenericError"}};
+  }
+  responses_[code] = {desc, schema};
+  // A live gate is a second outcome this route can produce, so "exactly one
+  // status" is not true of a gated route. Re-declare the gate's status instead
+  // of letting builder order decide whether the document mentions it: without
+  // this, `.gated_on(...).only_status(...)` silently drops the very status the
+  // gate exists to return.
+  if (gate_ && gate_->has_value()) {
+    errors({(*gate_)->unavailable.http_status});
+  }
   return *this;
+}
+
+RouteEntry & RouteEntry::gated_on(std::function<bool()> available, ErrorInfo unavailable) {
+  // Read the status before the move: declaring it is the half of this call the
+  // document depends on, and a moved-from ErrorInfo has none.
+  const int status = unavailable.http_status;
+  // The shared handle is captured by the typed wrapper closure, so assigning
+  // through it is what makes a `.gated_on(...)` applied AFTER `reg.get<...>()`
+  // reach the already-built handler (same mechanism as `.error_renderer(...)`).
+  *gate_ = RouteGate{std::move(available), std::move(unavailable)};
+  // A gate is the only thing that can produce this status on this route, so the
+  // route declares it here rather than leaving the document silent about it.
+  // Routing it through errors() also means a sub-400 status is rejected and
+  // reported by validate_completeness() instead of being published.
+  return errors({status});
 }
 
 RouteEntry & RouteEntry::error_renderer(ErrorRenderer renderer) {
@@ -254,6 +289,23 @@ void RouteRegistry::write_typed_error(httplib::Response & res, const ErrorInfo &
   }
 }
 
+bool RouteRegistry::gate_blocked(httplib::Response & res, const GateHandle & gate,
+                                 const std::shared_ptr<ErrorRenderer> & renderer) {
+  if (!gate || !gate->has_value()) {
+    return false;
+  }
+  const RouteGate & g = **gate;
+  // Fail closed. A gate whose predicate is empty is a half-built gate, and the
+  // handlers behind a gate dereference their manager unconditionally - the gate
+  // is the only thing keeping that safe. Answering the documented status beats
+  // running the handler and segfaulting.
+  if (g.available && g.available()) {
+    return false;
+  }
+  write_typed_error(res, g.unavailable, renderer);
+  return true;
+}
+
 // -----------------------------------------------------------------------------
 // Escape-hatch routes (SSE / binary / static asset / docs)
 // -----------------------------------------------------------------------------
@@ -261,8 +313,9 @@ void RouteRegistry::write_typed_error(httplib::Response & res, const ErrorInfo &
 RouteEntry & RouteRegistry::sse(const std::string & openapi_path,
                                 std::function<http::Result<http::SseStream>(http::TypedRequest)> stream_factory) {
   auto renderer = std::make_shared<ErrorRenderer>(ErrorRenderer::kSovdGenericError);
-  HandlerFn fn = [factory = std::move(stream_factory), renderer](const httplib::Request & req,
-                                                                 httplib::Response & res) {
+  auto gate = std::make_shared<std::optional<RouteGate>>();
+  HandlerFn fn = [factory = std::move(stream_factory), renderer, gate](const httplib::Request & req,
+                                                                       httplib::Response & res) {
     // Install the forwarding scope so SSE factories that call
     // validate_entity_for_route can stream a proxied wire response for entities
     // owned by a remote peer. Without it the validator's Forwarded branch has
@@ -270,6 +323,9 @@ RouteEntry & RouteRegistry::sse(const std::string & openapi_path,
     // provider starts streaming - peer-forwarding is a synchronous decision
     // made up-front, never mid-stream.
     http::detail::ForwardResponseScope forward_scope(&res);
+    if (gate_blocked(res, gate, renderer)) {
+      return;
+    }
     http::TypedRequest typed_req(req);
     auto outcome = factory(typed_req);
     if (!outcome.has_value()) {
@@ -299,6 +355,7 @@ RouteEntry & RouteRegistry::sse(const std::string & openapi_path,
   };
   auto & entry = add_route("get", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
+  entry.gate_ = gate;
   // SSE has no JSON schema; mark it explicitly so validate_completeness skips
   // the success-schema check via its SSE-name heuristic.
   entry.response(200, "Server-Sent Events stream");
@@ -309,10 +366,14 @@ RouteEntry &
 RouteRegistry::binary_download(const std::string & openapi_path,
                                std::function<http::Result<http::BinaryResponse>(http::TypedRequest)> handler) {
   auto renderer = std::make_shared<ErrorRenderer>(ErrorRenderer::kSovdGenericError);
-  HandlerFn fn = [handler = std::move(handler), renderer](const httplib::Request & req, httplib::Response & res) {
+  auto gate = std::make_shared<std::optional<RouteGate>>();
+  HandlerFn fn = [handler = std::move(handler), renderer, gate](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope: entity-scoped binary downloads (bulk-data, scripts) on a
     // remote peer must proxy through validate_entity_for_route (see sse / wrap_body_less).
     http::detail::ForwardResponseScope forward_scope(&res);
+    if (gate_blocked(res, gate, renderer)) {
+      return;
+    }
     http::TypedRequest typed_req(req);
     auto outcome = handler(typed_req);
     if (!outcome.has_value()) {
@@ -340,6 +401,7 @@ RouteRegistry::binary_download(const std::string & openapi_path,
   };
   auto & entry = add_route("get", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
+  entry.gate_ = gate;
   entry.response(200, "Binary download", nlohmann::json{{"type", "string"}, {"format", "binary"}});
   return entry;
 }
@@ -347,10 +409,14 @@ RouteRegistry::binary_download(const std::string & openapi_path,
 RouteEntry & RouteRegistry::static_asset(const std::string & openapi_path,
                                          std::function<http::Result<http::StaticAsset>(http::TypedRequest)> handler) {
   auto renderer = std::make_shared<ErrorRenderer>(ErrorRenderer::kSovdGenericError);
-  HandlerFn fn = [handler = std::move(handler), renderer](const httplib::Request & req, httplib::Response & res) {
+  auto gate = std::make_shared<std::optional<RouteGate>>();
+  HandlerFn fn = [handler = std::move(handler), renderer, gate](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope kept uniform across wrappers (static assets are not
     // entity-scoped, so this never forwards; see the comment at the top of this file).
     http::detail::ForwardResponseScope forward_scope(&res);
+    if (gate_blocked(res, gate, renderer)) {
+      return;
+    }
     http::TypedRequest typed_req(req);
     auto outcome = handler(typed_req);
     if (!outcome.has_value()) {
@@ -367,6 +433,7 @@ RouteEntry & RouteRegistry::static_asset(const std::string & openapi_path,
   };
   auto & entry = add_route("get", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
+  entry.gate_ = gate;
   entry.hidden();  // Static assets are not part of the documented JSON API.
   return entry;
 }
@@ -374,9 +441,13 @@ RouteEntry & RouteRegistry::static_asset(const std::string & openapi_path,
 RouteEntry & RouteRegistry::docs_endpoint(const std::string & openapi_path,
                                           std::function<http::Result<nlohmann::json>(http::TypedRequest)> handler) {
   auto renderer = std::make_shared<ErrorRenderer>(ErrorRenderer::kSovdGenericError);
-  HandlerFn fn = [handler = std::move(handler), renderer](const httplib::Request & req, httplib::Response & res) {
+  auto gate = std::make_shared<std::optional<RouteGate>>();
+  HandlerFn fn = [handler = std::move(handler), renderer, gate](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope kept uniform across wrappers (see the comment at the top of this file).
     http::detail::ForwardResponseScope forward_scope(&res);
+    if (gate_blocked(res, gate, renderer)) {
+      return;
+    }
     http::TypedRequest typed_req(req);
     auto outcome = handler(typed_req);
     if (!outcome.has_value()) {
@@ -387,6 +458,7 @@ RouteEntry & RouteRegistry::docs_endpoint(const std::string & openapi_path,
   };
   auto & entry = add_route("get", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
+  entry.gate_ = gate;
   entry.response(200, "OpenAPI specification document",
                  nlohmann::json{{"type", "object"}, {"additionalProperties", true}});
   entry.hidden();  // The docs spec endpoint describes itself externally.
