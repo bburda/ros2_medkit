@@ -45,9 +45,9 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
-#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -441,8 +441,7 @@ TEST_F(CancelOutcomesFixtureTest, CancelTimeoutReturns504NotRespondingAndLeavesT
   // SOVD `status` renders CANCELED and ABORTED identically as "failed", so
   // polling it alone can never tell a client whether its cancel took effect.
   EXPECT_NE(result.error().message.find("x-medkit.ros2_status"), std::string::npos)
-      << "the message points at a resource but not at the field that carries the outcome: "
-      << result.error().message;
+      << "the message points at a resource but not at the field that carries the outcome: " << result.error().message;
   // The outcome is unknown - the handler must not fabricate a tracked status;
   // the /_action/status stream stays the authority.
   EXPECT_EQ(tracked_status_or_fail(), ActionGoalStatus::EXECUTING);

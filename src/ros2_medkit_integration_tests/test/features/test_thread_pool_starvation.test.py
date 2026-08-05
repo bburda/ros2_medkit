@@ -46,6 +46,7 @@ from ros2_medkit_test_utils.constants import (
     ALLOWED_EXIT_CODES,
     API_BASE_PATH,
     get_test_port,
+    get_time_scale,
 )
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_gateway_node
@@ -160,11 +161,11 @@ class TestThreadPoolStarvationGuard(GatewayTestCase):
         the clamped value was applied to a working gateway.
         """
         url = f'http://localhost:{get_test_port(2)}{API_BASE_PATH}/health'
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + 30.0 * get_time_scale()
         last_error = None
         while time.monotonic() < deadline:
             try:
-                response = requests.get(url, timeout=5)
+                response = requests.get(url, timeout=5 * get_time_scale())
                 if response.status_code == 200:
                     self.assertEqual(response.json().get('status'), 'healthy')
                     return
