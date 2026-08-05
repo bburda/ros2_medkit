@@ -19,82 +19,103 @@ namespace ros2_medkit_gateway {
 EntityCapabilities EntityCapabilities::for_type(SovdEntityType type) {
   EntityCapabilities caps;
 
+  // Every entry below names a route that exists for that entity type. The lists
+  // are read back out as `href`s in an entity's `capabilities` array and as
+  // paths in its `/docs` sub-document, so an entry with no route is a link a
+  // client follows into a 404. `rest_server.cpp::setup_routes()` is the source
+  // of truth: the four-entity-type loop registers data / data-categories /
+  // data-groups / operations / configurations / faults / logs / bulk-data /
+  // triggers for every type, and gates cyclic-subscriptions (not areas), locks
+  // and scripts (components and apps) and fault-triggers (apps) behind an
+  // entity-type check.
   switch (type) {
     case SovdEntityType::SERVER:
-      // SERVER supports all collections
+      // Server-scoped collections are the two mounted at the API root:
+      // `/faults` (+ `/faults/stream`) and `/updates`. Everything else in this
+      // enum is entity-scoped only - `/logs`, `/data`, `/operations`,
+      // `/configurations`, `/bulk-data`, `/locks`, `/triggers`, `/scripts` and
+      // `/cyclic-subscriptions` all answer 404 at the root.
       caps.collections_ = {
-          ResourceCollection::CONFIGURATIONS, ResourceCollection::DATA,      ResourceCollection::FAULTS,
-          ResourceCollection::OPERATIONS,     ResourceCollection::BULK_DATA, ResourceCollection::DATA_LISTS,
-          ResourceCollection::LOCKS,          ResourceCollection::MODES,     ResourceCollection::CYCLIC_SUBSCRIPTIONS,
-          ResourceCollection::LOGS,           ResourceCollection::TRIGGERS,  ResourceCollection::SCRIPTS,
+          ResourceCollection::FAULTS,
           ResourceCollection::UPDATES,
       };
       // SERVER resources. SOVD (ISO 17978-3 §7.6) does not define
       // /belongs-to for server, only for apps - advertising it here would
       // make supports_resource("belongs-to") return true and clients would
-      // get 404 when following it.
-      caps.resources_ = {"docs", "version-info", "logs", "depends-on", "data-categories", "data-groups"};
+      // get 404 when following it. The same argument removed /logs,
+      // /depends-on, /data-categories and /data-groups: all four are
+      // entity-scoped routes with nothing mounted at the root.
+      caps.resources_ = {"docs", "version-info"};
       break;
 
     case SovdEntityType::AREA:
       // ros2_medkit extension: areas support resource collections via aggregation
       // (SOVD spec defines collections only for apps/components)
       caps.collections_ = {
-          ResourceCollection::DATA,   ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS,
-          ResourceCollection::FAULTS, ResourceCollection::LOGS,       ResourceCollection::BULK_DATA,
+          ResourceCollection::DATA,       ResourceCollection::DATA_CATEGORIES, ResourceCollection::DATA_GROUPS,
+          ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS,  ResourceCollection::FAULTS,
+          ResourceCollection::LOGS,       ResourceCollection::BULK_DATA,       ResourceCollection::TRIGGERS,
       };
       caps.aggregated_collections_ = {
           ResourceCollection::DATA,   ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS,
           ResourceCollection::FAULTS, ResourceCollection::LOGS,
       };
-      caps.resources_ = {"docs", "contains", "subareas", "related-components"};
+      // The route is `/areas/{area_id}/components`; "related-components" was a
+      // name no registration ever used.
+      caps.resources_ = {"docs", "contains", "subareas", "components"};
       break;
 
     case SovdEntityType::COMPONENT:
-      // COMPONENT supports most collections
       caps.collections_ = {
-          ResourceCollection::CONFIGURATIONS, ResourceCollection::DATA,      ResourceCollection::FAULTS,
-          ResourceCollection::OPERATIONS,     ResourceCollection::BULK_DATA, ResourceCollection::DATA_LISTS,
-          ResourceCollection::LOCKS,          ResourceCollection::MODES,     ResourceCollection::CYCLIC_SUBSCRIPTIONS,
-          ResourceCollection::LOGS,           ResourceCollection::TRIGGERS,  ResourceCollection::SCRIPTS,
-          ResourceCollection::UPDATES,
+          ResourceCollection::CONFIGURATIONS, ResourceCollection::DATA,     ResourceCollection::DATA_CATEGORIES,
+          ResourceCollection::DATA_GROUPS,    ResourceCollection::FAULTS,   ResourceCollection::OPERATIONS,
+          ResourceCollection::BULK_DATA,      ResourceCollection::LOCKS,    ResourceCollection::CYCLIC_SUBSCRIPTIONS,
+          ResourceCollection::LOGS,           ResourceCollection::TRIGGERS, ResourceCollection::SCRIPTS,
       };
       // SOVD (ISO 17978-3 §7.6) defines /belongs-to only for apps; component
       // exposes parent area via /is-located-on (which is itself app-only in
       // the spec, but ros2_medkit treats it as the canonical area pointer).
       // Listing belongs-to here would be a 404 promise.
-      caps.resources_ = {"docs", "logs", "hosts", "depends-on", "subcomponents", "data-categories", "data-groups"};
+      caps.resources_ = {"docs", "logs", "hosts", "depends-on", "subcomponents"};
       break;
 
     case SovdEntityType::APP:
-      // APP supports most collections
+      // Apps carry everything a component does plus the fault-trigger rule
+      // collection, whose routes are registered for `/apps` alone.
       caps.collections_ = {
-          ResourceCollection::CONFIGURATIONS, ResourceCollection::DATA,      ResourceCollection::FAULTS,
-          ResourceCollection::OPERATIONS,     ResourceCollection::BULK_DATA, ResourceCollection::DATA_LISTS,
-          ResourceCollection::LOCKS,          ResourceCollection::MODES,     ResourceCollection::CYCLIC_SUBSCRIPTIONS,
-          ResourceCollection::LOGS,           ResourceCollection::TRIGGERS,  ResourceCollection::SCRIPTS,
-          ResourceCollection::UPDATES,
+          ResourceCollection::CONFIGURATIONS,
+          ResourceCollection::DATA,
+          ResourceCollection::DATA_CATEGORIES,
+          ResourceCollection::DATA_GROUPS,
+          ResourceCollection::FAULTS,
+          ResourceCollection::FAULT_TRIGGERS,
+          ResourceCollection::OPERATIONS,
+          ResourceCollection::BULK_DATA,
+          ResourceCollection::LOCKS,
+          ResourceCollection::CYCLIC_SUBSCRIPTIONS,
+          ResourceCollection::LOGS,
+          ResourceCollection::TRIGGERS,
+          ResourceCollection::SCRIPTS,
       };
-      caps.resources_ = {"docs", "logs", "is-located-on", "belongs-to", "depends-on", "data-categories", "data-groups"};
+      caps.resources_ = {"docs", "logs", "is-located-on", "belongs-to", "depends-on"};
       break;
 
     case SovdEntityType::FUNCTION:
       // ros2_medkit extension: functions support additional collections via aggregation
       // (SOVD spec only defines data/operations for functions)
       caps.collections_ = {
-          ResourceCollection::DATA,
-          ResourceCollection::OPERATIONS,
-          ResourceCollection::CONFIGURATIONS,
-          ResourceCollection::FAULTS,
-          ResourceCollection::LOGS,
-          ResourceCollection::BULK_DATA,
-          ResourceCollection::CYCLIC_SUBSCRIPTIONS,
+          ResourceCollection::DATA,       ResourceCollection::DATA_CATEGORIES, ResourceCollection::DATA_GROUPS,
+          ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS,  ResourceCollection::FAULTS,
+          ResourceCollection::LOGS,       ResourceCollection::BULK_DATA,       ResourceCollection::CYCLIC_SUBSCRIPTIONS,
+          ResourceCollection::TRIGGERS,
       };
       caps.aggregated_collections_ = {
           ResourceCollection::DATA,   ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS,
           ResourceCollection::FAULTS, ResourceCollection::LOGS,
       };
-      caps.resources_ = {"docs", "hosts", "depends-on"};
+      // /depends-on is registered for components and apps only - a function
+      // that listed it handed clients a 404.
+      caps.resources_ = {"docs", "hosts"};
       break;
 
     case SovdEntityType::UNKNOWN:

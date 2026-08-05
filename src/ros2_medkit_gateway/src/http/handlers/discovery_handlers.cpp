@@ -62,17 +62,14 @@ void set_x_medkit_available(dto::XMedkitComponent & x_medkit, bool available) {
 }
 
 /// Check if a capability name is already present in the capabilities array
-bool has_capability(const json & capabilities, const std::string & name) {
-  for (const auto & cap : capabilities) {
-    if (cap.contains("name") && cap["name"] == name) {
-      return true;
-    }
-  }
-  return false;
+bool has_capability(const std::vector<dto::EntityCapability> & capabilities, const std::string & name) {
+  return std::any_of(capabilities.begin(), capabilities.end(), [&name](const dto::EntityCapability & cap) {
+    return cap.name == name;
+  });
 }
 
-/// Append plugin-registered capabilities to a capabilities JSON array
-void append_plugin_capabilities(json & capabilities, const std::string & entity_type_path,
+/// Append plugin-registered capabilities to an entity's capabilities array
+void append_plugin_capabilities(std::vector<dto::EntityCapability> & capabilities, const std::string & entity_type_path,
                                 const std::string & entity_id, SovdEntityType entity_type, const GatewayNode * node) {
   auto * pmgr = node->get_plugin_manager();
   if (!pmgr) {
@@ -83,15 +80,22 @@ void append_plugin_capabilities(json & capabilities, const std::string & entity_
   href_prefix.reserve(64);
   href_prefix.append("/api/v1/").append(entity_type_path).append("/").append(entity_id).append("/");
 
+  auto add = [&capabilities, &href_prefix](const std::string & name) {
+    if (has_capability(capabilities, name)) {
+      return;
+    }
+    capabilities.push_back(dto::EntityCapability{name, href_prefix + name});
+  };
+
   // Auto-add standard capabilities based on registered providers
-  if (pmgr->get_data_provider_for_entity(entity_id) && !has_capability(capabilities, "data")) {
-    capabilities.push_back({{"name", "data"}, {"href", href_prefix + "data"}});
+  if (pmgr->get_data_provider_for_entity(entity_id)) {
+    add("data");
   }
-  if (pmgr->get_operation_provider_for_entity(entity_id) && !has_capability(capabilities, "operations")) {
-    capabilities.push_back({{"name", "operations"}, {"href", href_prefix + "operations"}});
+  if (pmgr->get_operation_provider_for_entity(entity_id)) {
+    add("operations");
   }
-  if (pmgr->get_fault_provider_for_entity(entity_id) && !has_capability(capabilities, "faults")) {
-    capabilities.push_back({{"name", "faults"}, {"href", href_prefix + "faults"}});
+  if (pmgr->get_fault_provider_for_entity(entity_id)) {
+    add("faults");
   }
 
   // Plugin-registered custom capabilities (via PluginContext)
@@ -102,16 +106,12 @@ void append_plugin_capabilities(json & capabilities, const std::string & entity_
 
   // Type-level capabilities (registered for all entities of this type)
   for (const auto & cap_name : ctx->get_type_capabilities(entity_type)) {
-    if (!has_capability(capabilities, cap_name)) {
-      capabilities.push_back({{"name", cap_name}, {"href", href_prefix + cap_name}});
-    }
+    add(cap_name);
   }
 
   // Entity-specific capabilities
   for (const auto & cap_name : ctx->get_entity_capabilities(entity_id)) {
-    if (!has_capability(capabilities, cap_name)) {
-      capabilities.push_back({{"name", cap_name}, {"href", href_prefix + cap_name}});
-    }
+    add(cap_name);
   }
 }
 
@@ -304,6 +304,8 @@ http::Result<dto::AreaDetail> DiscoveryHandlers::get_area(const http::TypedReque
     detail.components = base_uri + "/components";
     detail.contains = base_uri + "/contains";
     detail.data = base_uri + "/data";
+    detail.data_categories = base_uri + "/data-categories";
+    detail.data_groups = base_uri + "/data-groups";
     detail.operations = base_uri + "/operations";
     detail.configurations = base_uri + "/configurations";
     detail.faults = base_uri + "/faults";
@@ -312,8 +314,12 @@ http::Result<dto::AreaDetail> DiscoveryHandlers::get_area(const http::TypedReque
     detail.triggers = base_uri + "/triggers";
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::SUBAREAS, Cap::CONTAINS, Cap::DATA,      Cap::OPERATIONS, Cap::CONFIGURATIONS,
-                             Cap::FAULTS,   Cap::LOGS,     Cap::BULK_DATA, Cap::TRIGGERS};
+    // Cap::COMPONENTS matches `detail.components` above: `/areas/{area_id}/components`
+    // is registered for areas, so the capability array advertises it like the
+    // other three types advertise their relationship endpoints.
+    std::vector<Cap> caps = {Cap::SUBAREAS,        Cap::CONTAINS,    Cap::COMPONENTS, Cap::DATA,
+                             Cap::DATA_CATEGORIES, Cap::DATA_GROUPS, Cap::OPERATIONS, Cap::CONFIGURATIONS,
+                             Cap::FAULTS,          Cap::LOGS,        Cap::BULK_DATA,  Cap::TRIGGERS};
     prune_plugin_unserved_capabilities(caps, area.id, ctx_.node());
     auto area_caps = CapabilityBuilder::build_capabilities("areas", area.id, caps);
     append_plugin_capabilities(area_caps, "areas", area.id, SovdEntityType::AREA, ctx_.node());
@@ -678,6 +684,8 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     std::string base = "/api/v1/components/" + comp.id;
     detail.status = base + "/status";
     detail.data = base + "/data";
+    detail.data_categories = base + "/data-categories";
+    detail.data_groups = base + "/data-groups";
     detail.operations = base + "/operations";
     detail.configurations = base + "/configurations";
     detail.faults = base + "/faults";
@@ -690,6 +698,13 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
 
     if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
       detail.scripts = base + "/scripts";
+    }
+
+    // Same gate as Cap::LOCKS below. The routes are registered either way; with
+    // `locking.enabled` off there is no LockManager and they answer 501, so the
+    // URI is emitted only when it leads to a collection that exists.
+    if (ctx_.node() && ctx_.node()->get_lock_manager()) {
+      detail.locks = base + "/locks";
     }
 
     if (!comp.depends_on.empty()) {
@@ -754,9 +769,10 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     set_x_medkit_external(x_medkit_comp, comp.external);
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {
-        Cap::STATUS,        Cap::DATA,  Cap::OPERATIONS, Cap::CONFIGURATIONS,       Cap::FAULTS,  Cap::LOGS,
-        Cap::SUBCOMPONENTS, Cap::HOSTS, Cap::BULK_DATA,  Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    std::vector<Cap> caps = {Cap::STATUS,        Cap::DATA,           Cap::DATA_CATEGORIES, Cap::DATA_GROUPS,
+                             Cap::OPERATIONS,    Cap::CONFIGURATIONS, Cap::FAULTS,          Cap::LOGS,
+                             Cap::SUBCOMPONENTS, Cap::HOSTS,          Cap::BULK_DATA,       Cap::CYCLIC_SUBSCRIPTIONS,
+                             Cap::TRIGGERS};
     if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
       caps.push_back(Cap::SCRIPTS);
     }
@@ -1112,8 +1128,14 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     std::string base_uri = "/api/v1/apps/" + app.id;
     detail.status = base_uri + "/status";
     detail.data = base_uri + "/data";
+    detail.data_categories = base_uri + "/data-categories";
+    detail.data_groups = base_uri + "/data-groups";
     detail.operations = base_uri + "/operations";
     detail.configurations = base_uri + "/configurations";
+    // Registered for `/apps` alone, and unconditionally: with no engine running
+    // the route answers 501, which is why it is advertised whether or not the
+    // feature is on.
+    detail.fault_triggers = base_uri + "/fault-triggers";
     detail.faults = base_uri + "/faults";
     detail.logs = base_uri + "/logs";
     detail.bulk_data = base_uri + "/bulk-data";
@@ -1122,6 +1144,12 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
 
     if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
       detail.scripts = base_uri + "/scripts";
+    }
+
+    // Same gate as Cap::LOCKS below, and the same reasoning as the component
+    // handler: registered either way, 501 without a LockManager.
+    if (ctx_.node() && ctx_.node()->get_lock_manager()) {
+      detail.locks = base_uri + "/locks";
     }
 
     if (!app.component_id.empty()) {
@@ -1134,8 +1162,18 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     }
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::STATUS, Cap::DATA,      Cap::OPERATIONS,           Cap::CONFIGURATIONS, Cap::FAULTS,
-                             Cap::LOGS,   Cap::BULK_DATA, Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    std::vector<Cap> caps = {Cap::STATUS,
+                             Cap::DATA,
+                             Cap::DATA_CATEGORIES,
+                             Cap::DATA_GROUPS,
+                             Cap::OPERATIONS,
+                             Cap::CONFIGURATIONS,
+                             Cap::FAULTS,
+                             Cap::FAULT_TRIGGERS,
+                             Cap::LOGS,
+                             Cap::BULK_DATA,
+                             Cap::CYCLIC_SUBSCRIPTIONS,
+                             Cap::TRIGGERS};
     // Relationship endpoints are gated the same way as the top-level URI keys
     // above so the three advertising surfaces (top-level URIs, `_links`,
     // `capabilities` array) describe the same set of available collections.
@@ -1548,6 +1586,8 @@ http::Result<dto::FunctionDetail> DiscoveryHandlers::get_function(const http::Ty
     std::string base_uri = "/api/v1/functions/" + func.id;
     detail.hosts = base_uri + "/hosts";
     detail.data = base_uri + "/data";
+    detail.data_categories = base_uri + "/data-categories";
+    detail.data_groups = base_uri + "/data-groups";
     detail.operations = base_uri + "/operations";
     detail.configurations = base_uri + "/configurations";
     detail.faults = base_uri + "/faults";
@@ -1558,8 +1598,9 @@ http::Result<dto::FunctionDetail> DiscoveryHandlers::get_function(const http::Ty
     detail.triggers = base_uri + "/triggers";
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::HOSTS, Cap::DATA,      Cap::OPERATIONS,           Cap::CONFIGURATIONS, Cap::FAULTS,
-                             Cap::LOGS,  Cap::BULK_DATA, Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    std::vector<Cap> caps = {
+        Cap::HOSTS,  Cap::DATA, Cap::DATA_CATEGORIES, Cap::DATA_GROUPS,          Cap::OPERATIONS, Cap::CONFIGURATIONS,
+        Cap::FAULTS, Cap::LOGS, Cap::BULK_DATA,       Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
     prune_plugin_unserved_capabilities(caps, func.id, ctx_.node());
     auto func_caps = CapabilityBuilder::build_capabilities("functions", func.id, caps);
     append_plugin_capabilities(func_caps, "functions", func.id, SovdEntityType::FUNCTION, ctx_.node());

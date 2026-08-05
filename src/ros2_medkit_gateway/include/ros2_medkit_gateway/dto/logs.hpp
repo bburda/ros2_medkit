@@ -158,7 +158,17 @@ inline constexpr std::string_view dto_name<Collection<LogEntry, LogListXMedkit>>
 //
 // Wire shape (from log_configuration_schema() in schema_builder.cpp):
 //   severity_filter - log level filter string (optional)
-//   max_entries     - maximum number of buffered log entries (optional, 1..10000)
+//   max_entries     - maximum number of entries ONE GET /logs answers with
+//                     (optional, 1..10000)
+//
+// Both settings filter the answer, not the buffer: LogManager::on_log_entry
+// consults neither, so nothing is dropped on account of them, and the ring
+// buffer's own size is the separate max_buffer_size_ constructor argument.
+// (Ingestion does drop entries for its own reasons - ring-buffer overflow, the
+// distinct-node cap, a LogProvider observer claiming the entry - none of which
+// these two settings influence.) See the note on LogConfig in
+// core/log_types.hpp: SOVD reads max_entries as a storage limit, and this
+// implementation deliberately does not.
 //
 // severity_filter uses plain field() (not field_enum) because handle_put_logs_configuration
 // performs its own bespoke validation of severity via log_mgr->update_config(), which
@@ -172,7 +182,20 @@ struct LogConfiguration {
 
 template <>
 inline constexpr auto dto_fields<LogConfiguration> = std::make_tuple(
-    field("severity_filter", &LogConfiguration::severity_filter), field("max_entries", &LogConfiguration::max_entries));
+    field("severity_filter", &LogConfiguration::severity_filter,
+          "Lowest severity a `GET /{entity}/logs` answers with: `debug`, `info`, `warning`, `error` or `fatal`. "
+          "Like `max_entries` this filters the answer, not the buffer - nothing is discarded on account of it, "
+          "so raising it hides quieter entries from subsequent reads and lowering it brings them back. The "
+          "effective floor is the stricter of this and the request's own `severity` parameter, so a lenient "
+          "query cannot see past a strict configuration. A registered LogProvider plugin serves the query "
+          "itself and this setting does not apply to it."),
+    field("max_entries", &LogConfiguration::max_entries,
+          "Ceiling on how many entries one `GET /{entity}/logs` answers with. A match longer than this is cut "
+          "down to the most recent `max_entries` and the older ones are dropped from the answer - silently, with "
+          "nothing on the response saying so and no way to page past it. Accepted range is 1 to 10000. It caps "
+          "the answer, not the gateway's log buffer, whose size is a separate start-up setting. A registered "
+          "LogProvider plugin serves the query itself and this setting does not apply to it.",
+          FieldConstraints{/*minimum=*/1.0, /*maximum=*/10000.0, {}, {}, {}}));
 
 template <>
 inline constexpr std::string_view dto_name<LogConfiguration> = "LogConfiguration";

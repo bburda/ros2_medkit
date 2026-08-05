@@ -77,6 +77,26 @@ constexpr Presence default_presence() {
 // `opaque_object`) and dispatched in the visitors via the
 // `is_opaque_object_field_v` detection trait below.
 
+/// JSON Schema constraints a field publishes beyond its C++ type.
+///
+/// Every member is unset by default, so a `field()` call that names no
+/// constraints emits exactly what it emitted before this type existed. Only
+/// write a constraint the handler enforces unconditionally: a bound the
+/// gateway reads from a ROS parameter is configuration, and publishing it as
+/// a schema keyword would make the document wrong on any deployment that
+/// changed it. Say those in the `description` instead.
+///
+/// `format` is an override. Numeric width already derives from the member type
+/// (`SchemaWriter` emits `format: int64` for a signed 64-bit integral), so set
+/// this only for a string format the type cannot imply - `date-time`, `uri`.
+struct FieldConstraints {
+  std::optional<double> minimum{};
+  std::optional<double> maximum{};
+  std::optional<std::size_t> max_length{};
+  std::string_view pattern{};
+  std::string_view format{};
+};
+
 /// Binds a JSON key to a struct member plus OpenAPI metadata.
 /// NEVER brace-initialize Field directly: aggregate CTAD is C++20-only.
 /// Always construct via the field() / field_enum() factories below.
@@ -88,16 +108,29 @@ struct Field {
   std::string_view description;
   const std::string_view * enum_values;  // (ptr,count) into an inline constexpr array
   std::size_t enum_count;
+  /// Written by every factory below rather than defaulted at the call sites:
+  /// the three `Field{...}` aggregate initialisations would otherwise trip
+  /// -Wmissing-field-initializers, which the build promotes to an error.
+  FieldConstraints constraints;
 };
 
 template <class C, class M>
 constexpr Field<C, M> field(std::string_view key, M C::*ptr, std::string_view desc = std::string_view{}) {
-  return Field<C, M>{key, ptr, default_presence<M>(), desc, nullptr, 0};
+  return Field<C, M>{key, ptr, default_presence<M>(), desc, nullptr, 0, FieldConstraints{}};
+}
+
+/// Constrained field. C++17 has no designated initialisers, so a call site
+/// spells the unset members out:
+///   field("max_entries", &T::max_entries, "…",
+///         FieldConstraints{/*minimum=*/1.0, /*maximum=*/10000.0, {}, {}, {}})
+template <class C, class M>
+constexpr Field<C, M> field(std::string_view key, M C::*ptr, std::string_view desc, FieldConstraints c) {
+  return Field<C, M>{key, ptr, default_presence<M>(), desc, nullptr, 0, c};
 }
 
 template <class C, class M>
 constexpr Field<C, M> field(std::string_view key, M C::*ptr, Presence p, std::string_view desc = std::string_view{}) {
-  return Field<C, M>{key, ptr, p, desc, nullptr, 0};
+  return Field<C, M>{key, ptr, p, desc, nullptr, 0, FieldConstraints{}};
 }
 
 /// Enum-constrained field: `values` must be an inline constexpr std::string_view array.
@@ -109,7 +142,7 @@ constexpr Field<C, M> field_enum(std::string_view key, M C::*ptr, const std::str
                                  std::string_view desc = std::string_view{}) {
   static_assert(std::is_same_v<M, std::string> || std::is_same_v<M, std::optional<std::string>>,
                 "field_enum requires a std::string or std::optional<std::string> member");
-  return Field<C, M>{key, ptr, default_presence<M>(), desc, values, N};
+  return Field<C, M>{key, ptr, default_presence<M>(), desc, values, N, FieldConstraints{}};
 }
 
 // --- OpaqueObjectField ------------------------------------------------------

@@ -97,7 +97,10 @@ TEST(EntityTypes, ToStringReturnsCorrectValues) {
 TEST(EntityTypes, ResourceCollectionToString) {
   EXPECT_EQ(to_string(ResourceCollection::CONFIGURATIONS), "configurations");
   EXPECT_EQ(to_string(ResourceCollection::DATA), "data");
+  EXPECT_EQ(to_string(ResourceCollection::DATA_CATEGORIES), "data-categories");
+  EXPECT_EQ(to_string(ResourceCollection::DATA_GROUPS), "data-groups");
   EXPECT_EQ(to_string(ResourceCollection::FAULTS), "faults");
+  EXPECT_EQ(to_string(ResourceCollection::FAULT_TRIGGERS), "fault-triggers");
   EXPECT_EQ(to_string(ResourceCollection::OPERATIONS), "operations");
   EXPECT_EQ(to_string(ResourceCollection::BULK_DATA), "bulk-data");
   EXPECT_EQ(to_string(ResourceCollection::DATA_LISTS), "data-lists");
@@ -108,9 +111,23 @@ TEST(EntityTypes, ParseResourceCollection) {
   ASSERT_TRUE(configs.has_value());
   EXPECT_EQ(*configs, ResourceCollection::CONFIGURATIONS);
 
+  // Recognised even though no entity lists it as a capability: parsing a path
+  // segment and advertising a collection are separate questions.
   auto data_lists = parse_resource_collection("data-lists");
   ASSERT_TRUE(data_lists.has_value());
   EXPECT_EQ(*data_lists, ResourceCollection::DATA_LISTS);
+
+  auto categories = parse_resource_collection("data-categories");
+  ASSERT_TRUE(categories.has_value());
+  EXPECT_EQ(*categories, ResourceCollection::DATA_CATEGORIES);
+
+  auto groups = parse_resource_collection("data-groups");
+  ASSERT_TRUE(groups.has_value());
+  EXPECT_EQ(*groups, ResourceCollection::DATA_GROUPS);
+
+  auto fault_triggers = parse_resource_collection("fault-triggers");
+  ASSERT_TRUE(fault_triggers.has_value());
+  EXPECT_EQ(*fault_triggers, ResourceCollection::FAULT_TRIGGERS);
 
   auto invalid = parse_resource_collection("invalid");
   EXPECT_FALSE(invalid.has_value());
@@ -129,12 +146,75 @@ TEST(EntityTypes, ParseEntityType) {
 // EntityCapabilities Tests
 // ============================================================================
 
-TEST(EntityCapabilities, ServerSupportsAllCollections) {
+TEST(EntityCapabilities, ServerSupportsOnlyTheRootMountedCollections) {
+  // `/faults` and `/updates` are the only collections mounted at the API root.
+  // Everything else in the enum is entity-scoped, so listing it here would put
+  // an href into a 404 on the server capability surface.
   auto caps = EntityCapabilities::for_type(SovdEntityType::SERVER);
-  EXPECT_TRUE(caps.supports_collection(ResourceCollection::CONFIGURATIONS));
-  EXPECT_TRUE(caps.supports_collection(ResourceCollection::DATA));
   EXPECT_TRUE(caps.supports_collection(ResourceCollection::FAULTS));
-  EXPECT_TRUE(caps.supports_collection(ResourceCollection::OPERATIONS));
+  EXPECT_TRUE(caps.supports_collection(ResourceCollection::UPDATES));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::CONFIGURATIONS));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::DATA));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::OPERATIONS));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::LOGS));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::LOCKS));
+  EXPECT_FALSE(caps.supports_resource("logs"));
+  EXPECT_FALSE(caps.supports_resource("depends-on"));
+}
+
+// The three collections with no entity-scoped route anywhere. This is the
+// invariant the phantom hrefs violated: `/x/{id}/data-lists`, `/x/{id}/modes`
+// and `/x/{id}/updates` are registered for no entity type, so no capability
+// list may name them.
+TEST(EntityCapabilities, NoEntityAdvertisesACollectionWithoutARoute) {
+  for (auto type : {SovdEntityType::AREA, SovdEntityType::COMPONENT, SovdEntityType::APP, SovdEntityType::FUNCTION}) {
+    auto caps = EntityCapabilities::for_type(type);
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::DATA_LISTS)) << to_string(type);
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::MODES)) << to_string(type);
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::UPDATES)) << to_string(type);
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::COMMUNICATION_LOGS)) << to_string(type);
+  }
+}
+
+// The four-entity-type loop in rest_server.cpp registers these for every type.
+TEST(EntityCapabilities, EveryEntityTypeAdvertisesTheUnconditionalCollections) {
+  for (auto type : {SovdEntityType::AREA, SovdEntityType::COMPONENT, SovdEntityType::APP, SovdEntityType::FUNCTION}) {
+    auto caps = EntityCapabilities::for_type(type);
+    for (auto col : {ResourceCollection::DATA, ResourceCollection::DATA_CATEGORIES, ResourceCollection::DATA_GROUPS,
+                     ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS, ResourceCollection::FAULTS,
+                     ResourceCollection::LOGS, ResourceCollection::BULK_DATA, ResourceCollection::TRIGGERS}) {
+      EXPECT_TRUE(caps.supports_collection(col)) << to_string(type) << " / " << to_string(col);
+    }
+  }
+}
+
+// Routes registered behind an entity-type check: locks and scripts for
+// components and apps, cyclic-subscriptions for everything but areas, and
+// fault-triggers for apps alone.
+TEST(EntityCapabilities, TypeGatedCollectionsMatchTheirRegistrations) {
+  auto area = EntityCapabilities::for_type(SovdEntityType::AREA);
+  auto component = EntityCapabilities::for_type(SovdEntityType::COMPONENT);
+  auto app = EntityCapabilities::for_type(SovdEntityType::APP);
+  auto function = EntityCapabilities::for_type(SovdEntityType::FUNCTION);
+
+  EXPECT_FALSE(area.supports_collection(ResourceCollection::CYCLIC_SUBSCRIPTIONS));
+  EXPECT_TRUE(component.supports_collection(ResourceCollection::CYCLIC_SUBSCRIPTIONS));
+  EXPECT_TRUE(app.supports_collection(ResourceCollection::CYCLIC_SUBSCRIPTIONS));
+  EXPECT_TRUE(function.supports_collection(ResourceCollection::CYCLIC_SUBSCRIPTIONS));
+
+  for (const auto & caps : {component, app}) {
+    EXPECT_TRUE(caps.supports_collection(ResourceCollection::LOCKS));
+    EXPECT_TRUE(caps.supports_collection(ResourceCollection::SCRIPTS));
+  }
+  for (const auto & caps : {area, function}) {
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::LOCKS));
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::SCRIPTS));
+  }
+
+  EXPECT_TRUE(app.supports_collection(ResourceCollection::FAULT_TRIGGERS));
+  EXPECT_FALSE(component.supports_collection(ResourceCollection::FAULT_TRIGGERS));
+  EXPECT_FALSE(area.supports_collection(ResourceCollection::FAULT_TRIGGERS));
+  EXPECT_FALSE(function.supports_collection(ResourceCollection::FAULT_TRIGGERS));
 }
 
 TEST(EntityCapabilities, AreaSupportsCollectionsViaAggregation) {
@@ -160,6 +240,9 @@ TEST(EntityCapabilities, AreaSupportsContains) {
   EXPECT_TRUE(caps.supports_resource("contains"));
   EXPECT_TRUE(caps.supports_resource("subareas"));
   EXPECT_TRUE(caps.supports_resource("docs"));
+  // The route is /areas/{area_id}/components; "related-components" named none.
+  EXPECT_TRUE(caps.supports_resource("components"));
+  EXPECT_FALSE(caps.supports_resource("related-components"));
 }
 
 TEST(EntityCapabilities, ComponentSupportsOperations) {
@@ -180,6 +263,15 @@ TEST(EntityCapabilities, AppSupportsIsLocatedOn) {
 TEST(EntityCapabilities, AppSupportsBelongsTo) {
   auto caps = EntityCapabilities::for_type(SovdEntityType::APP);
   EXPECT_TRUE(caps.supports_resource("belongs-to"));
+}
+
+TEST(EntityCapabilities, FunctionHasNoDependsOnResource) {
+  // /depends-on is registered for components and apps only.
+  auto caps = EntityCapabilities::for_type(SovdEntityType::FUNCTION);
+  EXPECT_TRUE(caps.supports_resource("hosts"));
+  EXPECT_FALSE(caps.supports_resource("depends-on"));
+  EXPECT_TRUE(EntityCapabilities::for_type(SovdEntityType::COMPONENT).supports_resource("depends-on"));
+  EXPECT_TRUE(EntityCapabilities::for_type(SovdEntityType::APP).supports_resource("depends-on"));
 }
 
 TEST(EntityCapabilities, FunctionAggregatesCollections) {

@@ -187,7 +187,9 @@ struct Component {
     }
     j["faults"] = component_url + "/faults";
     j["subcomponents"] = component_url + "/subcomponents";
-    j["related-apps"] = component_url + "/related-apps";
+    // `/hosts` is the registered route that lists a component's apps.
+    // `/related-apps` named no route for any entity type.
+    j["hosts"] = component_url + "/hosts";
     if (!depends_on.empty()) {
       j["depends-on"] = component_url + "/depends-on";
     }

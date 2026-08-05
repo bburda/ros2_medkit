@@ -182,8 +182,12 @@ struct Health {
 
 template <>
 inline constexpr auto dto_fields<Health> = std::make_tuple(
-    field("status", &Health::status), field("timestamp", &Health::timestamp), field("discovery", &Health::discovery),
-    field("x-medkit-data-provider", &Health::x_medkit_data_provider),
+    field("status", &Health::status),
+    field("timestamp", &Health::timestamp,
+          "Gateway wall-clock reading taken while the response was being built, in nanoseconds since the Unix "
+          "epoch. Not monotonic: it follows the host clock, so two readings can move backwards across an NTP "
+          "step and the difference between them is not a reliable elapsed time."),
+    field("discovery", &Health::discovery), field("x-medkit-data-provider", &Health::x_medkit_data_provider),
     field("x-medkit-subscription-executor", &Health::x_medkit_subscription_executor),
     field("x-medkit-entity-cache", &Health::x_medkit_entity_cache), field("x-medkit-sse", &Health::x_medkit_sse),
     field("peers", &Health::peers), field("warning_schema_version", &Health::warning_schema_version),

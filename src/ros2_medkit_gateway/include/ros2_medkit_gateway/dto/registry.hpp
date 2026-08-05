@@ -27,6 +27,7 @@
 #include "ros2_medkit_gateway/dto/cyclic_subscriptions.hpp"
 #include "ros2_medkit_gateway/dto/data.hpp"
 #include "ros2_medkit_gateway/dto/entities.hpp"
+#include "ros2_medkit_gateway/dto/entity_capability.hpp"
 #include "ros2_medkit_gateway/dto/errors.hpp"
 #include "ros2_medkit_gateway/dto/fault_triggers.hpp"
 #include "ros2_medkit_gateway/dto/faults.hpp"
@@ -48,10 +49,10 @@ namespace dto {
 /// The single compile-time list of every named DTO. Each domain header
 /// (Phase 2/3) appends its types here. Order is irrelevant.
 using AllDtos =
-    std::tuple<GenericError, DroppedItem, PeerFailure, XMedkitRos2, XMedkitArea, XMedkitComponent, XMedkitApp, XMedkitFunction,
-               XMedkitCollection, AreaListItem, AreaDetail, ComponentListItem, ComponentDetail, AppListItem, AppDetail,
-               FunctionListItem, FunctionDetail, Collection<AreaListItem>, Collection<ComponentListItem>,
-               Collection<AppListItem>, Collection<FunctionListItem>, FaultListItem,
+    std::tuple<GenericError, DroppedItem, PeerFailure, XMedkitRos2, XMedkitArea, XMedkitComponent, XMedkitApp,
+               XMedkitFunction, XMedkitCollection, EntityCapability, AreaListItem, AreaDetail, ComponentListItem,
+               ComponentDetail, AppListItem, AppDetail, FunctionListItem, FunctionDetail, Collection<AreaListItem>,
+               Collection<ComponentListItem>, Collection<AppListItem>, Collection<FunctionListItem>, FaultListItem,
                Collection<FaultListItem, FaultListXMedkit>, Collection<FaultListItem, FaultListAggXMedkit>,
                FaultListXMedkit, FaultListAggXMedkit, FaultStatus, FaultItem, FaultEnvironmentData, FaultXMedkit,
                FaultDetail, FaultListResult, FaultDetailResult, FaultClearResult,

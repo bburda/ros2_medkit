@@ -24,6 +24,7 @@
 
 #include "ros2_medkit_gateway/dto/aggregation.hpp"
 #include "ros2_medkit_gateway/dto/contract.hpp"
+#include "ros2_medkit_gateway/dto/entity_capability.hpp"
 
 namespace ros2_medkit_gateway {
 namespace dto {
@@ -99,7 +100,7 @@ inline constexpr std::string_view dto_name<XMedkitArea> = "XMedkitArea";
 //   variant           <- comp.variant           (via ext.add())
 //   description       <- comp.description       (via ext.add())
 //   contributors      <- comp.contributors
-//   capabilities      <- capabilities JSON array (via ext.add())
+//   capabilities      <- the same EntityCapability array the response carries at root level
 //   external          <- comp.external, non-ROS external asset classification; emitted true-only on every
 //                        route that carries the component x-medkit, so "absence == not external" holds (#516)
 //
@@ -119,7 +120,7 @@ struct XMedkitComponent {
   std::optional<std::string> variant;
   std::optional<std::string> description;
   std::optional<std::vector<std::string>> contributors;
-  std::optional<nlohmann::json> capabilities;  // free-form JSON array
+  std::optional<std::vector<EntityCapability>> capabilities;
   // Asset-identity nameplate (AssetIdentity::to_json shape: camelCase fields +
   // "_provenance"). Free-form JSON so the DTO layer reuses the exact
   // serialization emitted by Component::to_json and consumed by peer parsing.

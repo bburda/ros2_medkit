@@ -1480,3 +1480,79 @@ TEST_F(RouteRegistryTest, TheRangeRejectionSurvivesOnlyStatus) {
   EXPECT_TRUE(responses.contains("501"));
   EXPECT_FALSE(responses.contains("400")) << "only_status must still suppress the blanket handler statuses";
 }
+
+// =============================================================================
+// body_example
+// =============================================================================
+
+TEST_F(RouteRegistryTest, BodyExampleIsPublishedUnderThePrimaryMediaType) {
+  // The example is what a caller pastes into a request, so it has to land in
+  // the request body's own content entry - beside the schema, not in place of
+  // it. `examples.default.value` is the OpenAPI Example Object form.
+  seed_post(registry_, "/things").tag("Test").summary("Create thing").body_example(nlohmann::json{{"value", "sample"}});
+
+  const auto body = registry_.to_openapi_paths()["/things"]["post"]["requestBody"];
+  const auto & media = body["content"]["application/json"];
+  EXPECT_TRUE(media.contains("schema")) << "the example must not displace the schema";
+  ASSERT_TRUE(media.contains("examples"));
+  EXPECT_EQ(media["examples"]["default"]["value"], (nlohmann::json{{"value", "sample"}}));
+}
+
+TEST_F(RouteRegistryTest, BodyExampleAppliesBeforeTheRequestBodyItAttachesTo) {
+  // Whether the route has a body is read at emission, not at the call, so a
+  // fluent chain that sets the example first still publishes it. Without that
+  // the correctness of a registration would depend on builder-call order,
+  // which nothing at the call site signals.
+  registry_
+      .post<ros2_medkit_gateway::http::NoContent>(
+          "/manual", std::function<Result<ros2_medkit_gateway::http::NoContent>(TypedRequest)>(
+                         [](TypedRequest) -> Result<ros2_medkit_gateway::http::NoContent> {
+                           return ros2_medkit_gateway::http::NoContent{};
+                         }))
+      .tag("Test")
+      .summary("Manual")
+      .body_example(nlohmann::json{{"value", "sample"}})
+      .request_body("Payload", nlohmann::json{{"type", "object"}});
+
+  const auto media = registry_.to_openapi_paths()["/manual"]["post"]["requestBody"]["content"]["application/json"];
+  ASSERT_TRUE(media.contains("examples"));
+  EXPECT_EQ(media["examples"]["default"]["value"], (nlohmann::json{{"value", "sample"}}));
+  EXPECT_FALSE(has_error_mentioning(registry_, "body_example()"));
+}
+
+TEST_F(RouteRegistryTest, AnEmptyBodyExampleIsStillPublished) {
+  // The three cases around this one all pass an object with a key in it, so
+  // they pass under an empty-json sentinel too. This is the case the
+  // `std::optional<nlohmann::json>` member exists for: `json::empty()` is true
+  // for `{}`, `[]` and `null`, so a route documenting "send an empty object"
+  // would have had its example dropped *and* skipped by the
+  // validate_completeness() report - lost with nothing said, which is the one
+  // outcome that report is there to prevent.
+  seed_post(registry_, "/things").tag("Test").summary("Create thing").body_example(nlohmann::json::object());
+
+  const auto media = registry_.to_openapi_paths()["/things"]["post"]["requestBody"]["content"]["application/json"];
+  ASSERT_TRUE(media.contains("examples"));
+  EXPECT_EQ(media["examples"]["default"]["value"], nlohmann::json::object());
+  EXPECT_FALSE(has_error_mentioning(registry_, "body_example()"));
+}
+
+TEST_F(RouteRegistryTest, AnEmptyBodyExampleOnABodylessRouteIsStillReported) {
+  // The other half of the same fix: an empty example must not become invisible
+  // to the completeness check either, or a miscall on a body-less route would
+  // pass silently precisely when the example carries no content to notice.
+  seed_get(registry_, "/things").tag("Test").summary("List things").body_example(nlohmann::json::object());
+
+  EXPECT_FALSE(registry_.to_openapi_paths()["/things"]["get"].contains("requestBody"));
+  EXPECT_TRUE(has_error_mentioning(registry_, "body_example()"));
+}
+
+TEST_F(RouteRegistryTest, BodyExampleOnABodylessRouteIsReportedRatherThanMintingABody) {
+  // A GET takes no payload. Emitting the example anyway would create a
+  // `requestBody` the route does not read and tell a generated client to send
+  // one, so the call is dropped - and dropping it silently is the failure mode
+  // validate_completeness() exists to prevent.
+  seed_get(registry_, "/things").tag("Test").summary("List things").body_example(nlohmann::json{{"value", "sample"}});
+
+  EXPECT_FALSE(registry_.to_openapi_paths()["/things"]["get"].contains("requestBody"));
+  EXPECT_TRUE(has_error_mentioning(registry_, "body_example()"));
+}

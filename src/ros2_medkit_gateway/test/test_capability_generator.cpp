@@ -328,6 +328,57 @@ TEST_F(CapabilityGeneratorTest, GenerateNonexistentComponentReturnsNullopt) {
   EXPECT_FALSE(result.has_value());
 }
 
+// The entity sub-document is the second surface that advertises an entity's
+// collections - the `capabilities` array on the detail response is the first.
+// It is driven by `EntityCapabilities::for_type`, and `/data-lists`, `/modes`
+// and `/updates` used to reach it and be published with a fabricated 200: no
+// entity type registers them.
+//
+// What this pins is the generator's own half of the guarantee. The switch in
+// `add_resource_collection_paths` is exhaustive and gives the four unrouted
+// collections an empty arm, so even a capability list that named one again
+// would produce no path here - `EntityCapabilities.NoEntityAdvertises...`
+// covers the list itself, and the two together are what keep both surfaces
+// clean.
+TEST_F(CapabilityGeneratorTest, EntityDocumentOffersNoCollectionWithoutARoute) {
+  const auto & cache = node_->get_thread_safe_cache();
+  auto components = cache.get_components();
+  ASSERT_FALSE(components.empty()) << "no component discovered - the assertions below would prove nothing";
+  const std::string entity_path = "/components/" + components.front().id;
+
+  auto result = generator_->generate(entity_path);
+  ASSERT_TRUE(result.has_value());
+
+  for (const auto * phantom : {"/data-lists", "/modes", "/updates", "/communication-logs"}) {
+    EXPECT_FALSE(result->at("paths").contains(entity_path + phantom)) << phantom;
+  }
+  // ... while the collections the loop does register are still offered.
+  for (const auto * served : {"/data", "/data-categories", "/data-groups", "/operations", "/configurations", "/faults",
+                              "/logs", "/bulk-data", "/triggers", "/cyclic-subscriptions"}) {
+    EXPECT_TRUE(result->at("paths").contains(entity_path + served)) << served;
+  }
+}
+
+// data-categories and data-groups are registered with `.only_status(501, ...)`,
+// so the sub-document has to say 501 and nothing else. The generic listing it
+// used to fall through to declared a 200 no client can ever observe.
+TEST_F(CapabilityGeneratorTest, NotImplementedCollectionsDeclareOnly501) {
+  const auto & cache = node_->get_thread_safe_cache();
+  auto components = cache.get_components();
+  ASSERT_FALSE(components.empty()) << "no component discovered - the assertions below would prove nothing";
+  const std::string entity_path = "/components/" + components.front().id;
+
+  auto result = generator_->generate(entity_path);
+  ASSERT_TRUE(result.has_value());
+
+  for (const auto * col : {"/data-categories", "/data-groups"}) {
+    const auto & op = result->at("paths").at(entity_path + col).at("get");
+    EXPECT_EQ(op.at("responses").size(), 1u) << col;
+    EXPECT_TRUE(op.at("responses").contains("501")) << col;
+    EXPECT_EQ(op.at("responses").at("501").at("$ref"), "#/components/responses/GenericError") << col;
+  }
+}
+
 // =============================================================================
 // Resource collection - validates entity existence
 // =============================================================================

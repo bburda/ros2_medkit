@@ -653,9 +653,18 @@ TEST(SchemaBuilderStaticTest, DataWriteRequestSchemaComesFromDto) {
 // @verifies REQ_INTEROP_002
 TEST(SchemaBuilderStaticTest, ExecutionUpdateRequestSchemaComesFromDto) {
   // ExecutionUpdateRequest is now generated from the DTO; verify via component_schemas().
-  // capability is a plain string field (no enum constraint) so that custom
-  // x-vendor-* capabilities pass parse_body and reach the handler's own
-  // validation logic.
+  //
+  // capability is a plain string field, and the absence of the enum is the
+  // assertion. `OperationHandlers::update_execution` answers an unrecognised
+  // value with a 400 carrying `supported_capabilities` for the backend the
+  // caller is talking to; a schema-level enum would make `JsonReader` reject
+  // the request first and replace that with a generic body-validation error.
+  // The vocabulary is published as prose on the field instead.
+  //
+  // The previous note here justified this by custom `x-vendor-*` capabilities
+  // "reaching the handler's own validation logic". There is no such branch:
+  // update_execution has no plugin delegation, and every value outside
+  // stop/execute/freeze/reset lands in the same 400.
   const auto & schemas = SchemaBuilder::component_schemas();
   ASSERT_TRUE(schemas.count("ExecutionUpdateRequest") > 0);
   const auto & schema = schemas.at("ExecutionUpdateRequest");

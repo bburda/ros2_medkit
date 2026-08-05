@@ -21,22 +21,26 @@ std::string CapabilityBuilder::capability_to_name(Capability cap) {
   switch (cap) {
     case Capability::DATA:
       return "data";
+    case Capability::DATA_CATEGORIES:
+      return "data-categories";
+    case Capability::DATA_GROUPS:
+      return "data-groups";
     case Capability::OPERATIONS:
       return "operations";
     case Capability::CONFIGURATIONS:
       return "configurations";
     case Capability::FAULTS:
       return "faults";
+    case Capability::FAULT_TRIGGERS:
+      return "fault-triggers";
     case Capability::SUBAREAS:
       return "subareas";
     case Capability::SUBCOMPONENTS:
       return "subcomponents";
-    case Capability::RELATED_COMPONENTS:
-      return "related-components";
+    case Capability::COMPONENTS:
+      return "components";
     case Capability::CONTAINS:
       return "contains";
-    case Capability::RELATED_APPS:
-      return "related-apps";
     case Capability::HOSTS:
       return "hosts";
     case Capability::DEPENDS_ON:
@@ -69,20 +73,22 @@ std::string CapabilityBuilder::capability_to_path(Capability cap) {
   return capability_to_name(cap);
 }
 
-nlohmann::json CapabilityBuilder::build_capabilities(const std::string & entity_type, const std::string & entity_id,
-                                                     const std::vector<Capability> & capabilities) {
-  nlohmann::json result = nlohmann::json::array();
+std::vector<dto::EntityCapability> CapabilityBuilder::build_capabilities(const std::string & entity_type,
+                                                                         const std::string & entity_id,
+                                                                         const std::vector<Capability> & capabilities) {
+  std::vector<dto::EntityCapability> result;
+  result.reserve(capabilities.size());
+
+  // Shared href prefix: /api/v1/{entity_type}/{entity_id}/
+  std::string href_prefix = "/api/v1/";
+  href_prefix.append(entity_type).append("/").append(entity_id).append("/");
 
   for (const auto & cap : capabilities) {
-    nlohmann::json cap_obj;
-    cap_obj["name"] = capability_to_name(cap);
-
-    // Build href: /api/v1/{entity_type}/{entity_id}/{capability_path}
-    std::string href = "/api/v1/";
-    href.append(entity_type).append("/").append(entity_id).append("/").append(capability_to_path(cap));
-    cap_obj["href"] = href;
-
-    result.push_back(cap_obj);
+    dto::EntityCapability item;
+    item.name = capability_to_name(cap);
+    item.href = href_prefix;
+    item.href.append(capability_to_path(cap));
+    result.push_back(std::move(item));
   }
 
   return result;

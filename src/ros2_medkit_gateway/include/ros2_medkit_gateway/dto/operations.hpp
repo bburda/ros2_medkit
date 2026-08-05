@@ -203,8 +203,14 @@ struct ExecutionUpdateRequest {
 };
 
 template <>
-inline constexpr auto dto_fields<ExecutionUpdateRequest> =
-    std::make_tuple(field("capability", &ExecutionUpdateRequest::capability));
+inline constexpr auto dto_fields<ExecutionUpdateRequest> = std::make_tuple(
+    field("capability", &ExecutionUpdateRequest::capability,
+          "SOVD control capability to apply to the running execution: `stop`, `execute`, `freeze` or `reset`. A ROS 2 "
+          "action implements only `stop`, which cancels the goal and answers 202; `execute` answers 409 (cancel first, "
+          "then start a new execution) and `freeze` and `reset` answer 400. Described rather than declared as an "
+          "`enum` on purpose - the handler answers an unknown value with a 400 that names `supported_capabilities` for "
+          "the backend in front of the caller, and a schema-level enum would replace that with a generic "
+          "body-validation error. Same reason `LogConfiguration.severity_filter` carries no enum."));
 
 template <>
 inline constexpr std::string_view dto_name<ExecutionUpdateRequest> = "ExecutionUpdateRequest";

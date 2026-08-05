@@ -77,8 +77,15 @@ struct CyclicSubscriptionCreateRequest {
 template <>
 inline constexpr auto dto_fields<CyclicSubscriptionCreateRequest> =
     std::make_tuple(field("resource", &CyclicSubscriptionCreateRequest::resource),
-                    field("interval", &CyclicSubscriptionCreateRequest::interval),
-                    field("duration", &CyclicSubscriptionCreateRequest::duration),
+                    field("interval", &CyclicSubscriptionCreateRequest::interval,
+                          "Sampling rate, named rather than numeric: `fast`, `normal` or `slow`. Any other value "
+                          "is rejected with 400."),
+                    field("duration", &CyclicSubscriptionCreateRequest::duration,
+                          "How long the subscription runs, in seconds. Must be at least 1 and no more than the "
+                          "gateway's configured ceiling; only the lower bound is a schema constraint, because "
+                          "the ceiling is deployment configuration and a request over it answers 400 naming the "
+                          "limit.",
+                          FieldConstraints{/*minimum=*/1.0, {}, {}, {}, {}}),
                     field("protocol", &CyclicSubscriptionCreateRequest::protocol));
 
 template <>
@@ -99,8 +106,14 @@ struct CyclicSubscriptionUpdateRequest {
 
 template <>
 inline constexpr auto dto_fields<CyclicSubscriptionUpdateRequest> =
-    std::make_tuple(field("interval", &CyclicSubscriptionUpdateRequest::interval),
-                    field("duration", &CyclicSubscriptionUpdateRequest::duration));
+    std::make_tuple(field("interval", &CyclicSubscriptionUpdateRequest::interval,
+                          "New sampling rate, validated exactly as on create: `fast`, `normal` or `slow`, "
+                          "anything else 400. Omit it to leave the rate unchanged."),
+                    field("duration", &CyclicSubscriptionUpdateRequest::duration,
+                          "New run length in seconds, validated exactly as on create: at least 1 and no more "
+                          "than the gateway's configured ceiling. Restarts the countdown from now rather than "
+                          "adding to what is left. Omit it to leave the duration unchanged.",
+                          FieldConstraints{/*minimum=*/1.0, {}, {}, {}, {}}));
 
 template <>
 inline constexpr std::string_view dto_name<CyclicSubscriptionUpdateRequest> = "CyclicSubscriptionUpdateRequest";

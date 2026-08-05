@@ -22,11 +22,36 @@
 #include <vector>
 
 #include "ros2_medkit_gateway/dto/contract.hpp"
+#include "ros2_medkit_gateway/dto/entity_capability.hpp"
 #include "ros2_medkit_gateway/dto/enums.hpp"
 #include "ros2_medkit_gateway/dto/x_medkit.hpp"
 
 namespace ros2_medkit_gateway {
 namespace dto {
+
+// =============================================================================
+// Shared entity-detail members
+// =============================================================================
+
+/// Prose published for every ``_links`` member. The object stays untyped
+/// because its value type is a union: every relation `LinksBuilder` writes is a
+/// path string, but `depends-on` is written straight into the built object as an
+/// array of paths, by the app handler and the function handler both.
+/// `SchemaWriter` walks `dto_fields`, so it has no descriptor for a map whose
+/// values differ in type - naming the relations and their value shapes in prose
+/// is what a client can actually act on, and beats publishing `{}` with no
+/// explanation.
+///
+/// The per-relation conditions, read off `discovery_handlers.cpp`: `self` and
+/// `collection` are unconditional; `parent` needs a `parent_area_id` (areas) or
+/// a `parent_component_id` (components) and is emitted for no other type;
+/// `area` needs `comp.area`; `is-located-on` and `belongs-to` need
+/// `app.component_id`; `depends-on` needs a non-empty `depends_on` list.
+inline constexpr std::string_view kLinksDescription =
+    "HATEOAS relation map. Relations emitted today: self and collection (all entity types), parent "
+    "(areas and components, when the entity has a parent), area (components), is-located-on and "
+    "belongs-to (apps) - each an absolute path - and depends-on (apps and functions), an array of "
+    "absolute paths.";
 
 // =============================================================================
 // Area DTOs
@@ -62,10 +87,10 @@ inline constexpr std::string_view dto_name<AreaListItem> = "AreaListItem";
 //
 // Wire keys:
 //   id, name, description?, tags?,
-//   subareas, components, contains, data, operations, configurations, faults,
-//   logs, bulk-data, triggers,
-//   capabilities (free-form JSON array of {name, href} objects),
-//   _links (free-form JSON object),
+//   subareas, components, contains, data, data-categories, data-groups,
+//   operations, configurations, faults, logs, bulk-data, triggers,
+//   capabilities (array of EntityCapability),
+//   _links (open relation map - see kLinksDescription),
 //   x-medkit
 // -----------------------------------------------------------------------------
 struct AreaDetail {
@@ -79,6 +104,8 @@ struct AreaDetail {
   std::string components;
   std::string contains;
   std::string data;
+  std::string data_categories;  // wire key: "data-categories"
+  std::string data_groups;      // wire key: "data-groups"
   std::string operations;
   std::string configurations;
   std::string faults;
@@ -86,9 +113,9 @@ struct AreaDetail {
   std::string bulk_data;  // wire key: "bulk-data"
   std::string triggers;
   // Free-form fields
-  std::optional<nlohmann::json> capabilities;  // array of {name, href}
-  std::optional<nlohmann::json> links;         // wire key: "_links"
-  std::optional<XMedkitArea> x_medkit;         // wire key: "x-medkit"
+  std::optional<std::vector<EntityCapability>> capabilities;
+  std::optional<nlohmann::json> links;  // wire key: "_links" - see kLinksDescription
+  std::optional<XMedkitArea> x_medkit;  // wire key: "x-medkit"
 };
 
 template <>
@@ -98,11 +125,12 @@ inline constexpr auto dto_fields<AreaDetail> =
                     field("description", &AreaDetail::description), field("tags", &AreaDetail::tags),
                     field("subareas", &AreaDetail::subareas), field("components", &AreaDetail::components),
                     field("contains", &AreaDetail::contains), field("data", &AreaDetail::data),
-                    field("operations", &AreaDetail::operations), field("configurations", &AreaDetail::configurations),
-                    field("faults", &AreaDetail::faults), field("logs", &AreaDetail::logs),
-                    field("bulk-data", &AreaDetail::bulk_data), field("triggers", &AreaDetail::triggers),
-                    field("capabilities", &AreaDetail::capabilities), field("_links", &AreaDetail::links),
-                    field("x-medkit", &AreaDetail::x_medkit));
+                    field("data-categories", &AreaDetail::data_categories),
+                    field("data-groups", &AreaDetail::data_groups), field("operations", &AreaDetail::operations),
+                    field("configurations", &AreaDetail::configurations), field("faults", &AreaDetail::faults),
+                    field("logs", &AreaDetail::logs), field("bulk-data", &AreaDetail::bulk_data),
+                    field("triggers", &AreaDetail::triggers), field("capabilities", &AreaDetail::capabilities),
+                    field("_links", &AreaDetail::links, kLinksDescription), field("x-medkit", &AreaDetail::x_medkit));
 
 template <>
 inline constexpr std::string_view dto_name<AreaDetail> = "AreaDetail";
@@ -142,12 +170,14 @@ inline constexpr std::string_view dto_name<ComponentListItem> = "ComponentListIt
 //
 // Wire keys:
 //   id, name, description?, tags?,
-//   status, data, operations, configurations, faults, subcomponents, hosts, logs,
-//   bulk-data, cyclic-subscriptions, triggers,
-//   scripts? (conditional on script backend), depends-on? (conditional),
+//   status, data, data-categories, data-groups, operations, configurations,
+//   faults, subcomponents, hosts, logs, bulk-data, cyclic-subscriptions,
+//   triggers,
+//   scripts? (conditional on script backend), locks? (conditional on locking),
+//   depends-on? (conditional),
 //   belongs-to? (conditional on area), is-located-on? (not present here - app only),
-//   capabilities (free-form JSON array),
-//   _links (free-form JSON object),
+//   capabilities (array of EntityCapability),
+//   _links (open relation map - see kLinksDescription),
 //   x-medkit
 // -----------------------------------------------------------------------------
 struct ComponentDetail {
@@ -159,6 +189,8 @@ struct ComponentDetail {
   // Always-present resource collection URIs
   std::string status;
   std::string data;
+  std::string data_categories;  // wire key: "data-categories"
+  std::string data_groups;      // wire key: "data-groups"
   std::string operations;
   std::string configurations;
   std::string faults;
@@ -170,11 +202,12 @@ struct ComponentDetail {
   std::string triggers;
   // Conditional URI fields
   std::optional<std::string> scripts;     // present only with script backend
+  std::optional<std::string> locks;       // present only when locking is enabled
   std::optional<std::string> depends_on;  // wire key: "depends-on"
   std::optional<std::string> belongs_to;  // wire key: "belongs-to"
   // Free-form fields
-  std::optional<nlohmann::json> capabilities;
-  std::optional<nlohmann::json> links;       // wire key: "_links"
+  std::optional<std::vector<EntityCapability>> capabilities;
+  std::optional<nlohmann::json> links;       // wire key: "_links" - see kLinksDescription
   std::optional<XMedkitComponent> x_medkit;  // wire key: "x-medkit"
 };
 
@@ -183,15 +216,16 @@ inline constexpr auto dto_fields<ComponentDetail> = std::make_tuple(
     field("id", &ComponentDetail::id), field("name", &ComponentDetail::name),
     field_enum("type", &ComponentDetail::type, kEntityTypeValues), field("description", &ComponentDetail::description),
     field("tags", &ComponentDetail::tags), field("status", &ComponentDetail::status),
-    field("data", &ComponentDetail::data), field("operations", &ComponentDetail::operations),
+    field("data", &ComponentDetail::data), field("data-categories", &ComponentDetail::data_categories),
+    field("data-groups", &ComponentDetail::data_groups), field("operations", &ComponentDetail::operations),
     field("configurations", &ComponentDetail::configurations), field("faults", &ComponentDetail::faults),
     field("subcomponents", &ComponentDetail::subcomponents), field("hosts", &ComponentDetail::hosts),
     field("logs", &ComponentDetail::logs), field("bulk-data", &ComponentDetail::bulk_data),
     field("cyclic-subscriptions", &ComponentDetail::cyclic_subscriptions),
     field("triggers", &ComponentDetail::triggers), field("scripts", &ComponentDetail::scripts),
-    field("depends-on", &ComponentDetail::depends_on), field("belongs-to", &ComponentDetail::belongs_to),
-    field("capabilities", &ComponentDetail::capabilities), field("_links", &ComponentDetail::links),
-    field("x-medkit", &ComponentDetail::x_medkit));
+    field("locks", &ComponentDetail::locks), field("depends-on", &ComponentDetail::depends_on),
+    field("belongs-to", &ComponentDetail::belongs_to), field("capabilities", &ComponentDetail::capabilities),
+    field("_links", &ComponentDetail::links, kLinksDescription), field("x-medkit", &ComponentDetail::x_medkit));
 
 template <>
 inline constexpr std::string_view dto_name<ComponentDetail> = "ComponentDetail";
@@ -230,14 +264,15 @@ inline constexpr std::string_view dto_name<AppListItem> = "AppListItem";
 //
 // Wire keys:
 //   id, name, description?, translation_id?, tags?,
-//   status, data, operations, configurations, faults, logs, bulk-data,
-//   cyclic-subscriptions, triggers,
+//   status, data, data-categories, data-groups, operations, configurations,
+//   fault-triggers, faults, logs, bulk-data, cyclic-subscriptions, triggers,
 //   scripts? (conditional on script backend),
+//   locks? (conditional on locking being enabled),
 //   is-located-on? (conditional on component_id),
 //   belongs-to? (conditional on component_id),
 //   depends-on? (conditional on depends_on list),
-//   capabilities (free-form JSON array),
-//   _links (free-form JSON object),
+//   capabilities (array of EntityCapability),
+//   _links (open relation map - see kLinksDescription),
 //   x-medkit
 // -----------------------------------------------------------------------------
 struct AppDetail {
@@ -250,8 +285,11 @@ struct AppDetail {
   // Always-present resource collection URIs
   std::string status;
   std::string data;
+  std::string data_categories;  // wire key: "data-categories"
+  std::string data_groups;      // wire key: "data-groups"
   std::string operations;
   std::string configurations;
+  std::string fault_triggers;  // wire key: "fault-triggers" (apps only)
   std::string faults;
   std::string logs;
   std::string bulk_data;             // wire key: "bulk-data"
@@ -259,29 +297,31 @@ struct AppDetail {
   std::string triggers;
   // Conditional URI fields
   std::optional<std::string> scripts;        // present only with script backend
+  std::optional<std::string> locks;          // present only when locking is enabled
   std::optional<std::string> is_located_on;  // wire key: "is-located-on"
   std::optional<std::string> belongs_to;     // wire key: "belongs-to"
   std::optional<std::string> depends_on;     // wire key: "depends-on"
   // Free-form fields
-  std::optional<nlohmann::json> capabilities;
-  std::optional<nlohmann::json> links;  // wire key: "_links"
+  std::optional<std::vector<EntityCapability>> capabilities;
+  std::optional<nlohmann::json> links;  // wire key: "_links" - see kLinksDescription
   std::optional<XMedkitApp> x_medkit;   // wire key: "x-medkit"
 };
 
 template <>
-inline constexpr auto dto_fields<AppDetail> =
-    std::make_tuple(field("id", &AppDetail::id), field("name", &AppDetail::name),
-                    field_enum("type", &AppDetail::type, kEntityTypeValues),
-                    field("description", &AppDetail::description), field("translation_id", &AppDetail::translation_id),
-                    field("tags", &AppDetail::tags), field("status", &AppDetail::status),
-                    field("data", &AppDetail::data), field("operations", &AppDetail::operations),
-                    field("configurations", &AppDetail::configurations), field("faults", &AppDetail::faults),
-                    field("logs", &AppDetail::logs), field("bulk-data", &AppDetail::bulk_data),
-                    field("cyclic-subscriptions", &AppDetail::cyclic_subscriptions),
-                    field("triggers", &AppDetail::triggers), field("scripts", &AppDetail::scripts),
-                    field("is-located-on", &AppDetail::is_located_on), field("belongs-to", &AppDetail::belongs_to),
-                    field("depends-on", &AppDetail::depends_on), field("capabilities", &AppDetail::capabilities),
-                    field("_links", &AppDetail::links), field("x-medkit", &AppDetail::x_medkit));
+inline constexpr auto dto_fields<AppDetail> = std::make_tuple(
+    field("id", &AppDetail::id), field("name", &AppDetail::name),
+    field_enum("type", &AppDetail::type, kEntityTypeValues), field("description", &AppDetail::description),
+    field("translation_id", &AppDetail::translation_id), field("tags", &AppDetail::tags),
+    field("status", &AppDetail::status), field("data", &AppDetail::data),
+    field("data-categories", &AppDetail::data_categories), field("data-groups", &AppDetail::data_groups),
+    field("operations", &AppDetail::operations), field("configurations", &AppDetail::configurations),
+    field("fault-triggers", &AppDetail::fault_triggers), field("faults", &AppDetail::faults),
+    field("logs", &AppDetail::logs), field("bulk-data", &AppDetail::bulk_data),
+    field("cyclic-subscriptions", &AppDetail::cyclic_subscriptions), field("triggers", &AppDetail::triggers),
+    field("scripts", &AppDetail::scripts), field("locks", &AppDetail::locks),
+    field("is-located-on", &AppDetail::is_located_on), field("belongs-to", &AppDetail::belongs_to),
+    field("depends-on", &AppDetail::depends_on), field("capabilities", &AppDetail::capabilities),
+    field("_links", &AppDetail::links, kLinksDescription), field("x-medkit", &AppDetail::x_medkit));
 
 template <>
 inline constexpr std::string_view dto_name<AppDetail> = "AppDetail";
@@ -321,10 +361,10 @@ inline constexpr std::string_view dto_name<FunctionListItem> = "FunctionListItem
 //
 // Wire keys:
 //   id, name, description?, translation_id?, tags?,
-//   hosts, data, operations, configurations, faults, logs, bulk-data,
-//   x-medkit-graph, cyclic-subscriptions, triggers,
-//   capabilities (free-form JSON array),
-//   _links (free-form JSON object),
+//   hosts, data, data-categories, data-groups, operations, configurations,
+//   faults, logs, bulk-data, x-medkit-graph, cyclic-subscriptions, triggers,
+//   capabilities (array of EntityCapability),
+//   _links (open relation map - see kLinksDescription),
 //   x-medkit
 // -----------------------------------------------------------------------------
 struct FunctionDetail {
@@ -337,6 +377,8 @@ struct FunctionDetail {
   // Always-present resource collection URIs
   std::string hosts;
   std::string data;
+  std::string data_categories;  // wire key: "data-categories"
+  std::string data_groups;      // wire key: "data-groups"
   std::string operations;
   std::string configurations;
   std::string faults;
@@ -346,8 +388,8 @@ struct FunctionDetail {
   std::string cyclic_subscriptions;  // wire key: "cyclic-subscriptions"
   std::string triggers;
   // Free-form fields
-  std::optional<nlohmann::json> capabilities;
-  std::optional<nlohmann::json> links;      // wire key: "_links"
+  std::optional<std::vector<EntityCapability>> capabilities;
+  std::optional<nlohmann::json> links;      // wire key: "_links" - see kLinksDescription
   std::optional<XMedkitFunction> x_medkit;  // wire key: "x-medkit"
 };
 
@@ -357,11 +399,12 @@ inline constexpr auto dto_fields<FunctionDetail> = std::make_tuple(
     field_enum("type", &FunctionDetail::type, kEntityTypeValues), field("description", &FunctionDetail::description),
     field("translation_id", &FunctionDetail::translation_id), field("tags", &FunctionDetail::tags),
     field("hosts", &FunctionDetail::hosts), field("data", &FunctionDetail::data),
+    field("data-categories", &FunctionDetail::data_categories), field("data-groups", &FunctionDetail::data_groups),
     field("operations", &FunctionDetail::operations), field("configurations", &FunctionDetail::configurations),
     field("faults", &FunctionDetail::faults), field("logs", &FunctionDetail::logs),
     field("bulk-data", &FunctionDetail::bulk_data), field("x-medkit-graph", &FunctionDetail::x_medkit_graph),
     field("cyclic-subscriptions", &FunctionDetail::cyclic_subscriptions), field("triggers", &FunctionDetail::triggers),
-    field("capabilities", &FunctionDetail::capabilities), field("_links", &FunctionDetail::links),
+    field("capabilities", &FunctionDetail::capabilities), field("_links", &FunctionDetail::links, kLinksDescription),
     field("x-medkit", &FunctionDetail::x_medkit));
 
 template <>

@@ -135,6 +135,51 @@ class TestFaultsApi(GatewayTestCase):
         self.assertIn('parameters', data)
         self.assertEqual(data['parameters'].get('fault_code'), 'NONEXISTENT_FAULT')
 
+    def test_both_verbs_reject_an_oversized_fault_code(self):
+        """GET and DELETE both enforce the 256-character `fault_code` bound.
+
+        The OpenAPI document publishes `maxLength: 256` on every route carrying
+        `{fault_code}`, from one table keyed by the parameter name - so it
+        cannot distinguish a route whose handler checks from one whose handler
+        does not, and a bound belongs there only when every handler behind the
+        template rejects. Both verbs are driven so that precondition is tested
+        rather than assumed; the `config_id` half of the same table is covered
+        by `test_configuration_api.test.py`.
+
+        No lock is taken here on purpose. `clear_fault` measures the code
+        *after* `validate_lock_access`, so a competing lock would answer 409
+        before the length check is reached - a real ordering difference from
+        the configuration handlers, and not what this test is pinning.
+
+        @verifies REQ_INTEROP_013
+        @verifies REQ_INTEROP_015
+        """
+        oversized = 'F' * 257
+        url = f'{self.BASE_URL}/apps/lidar_sensor/faults/{oversized}'
+        for verb, call in (
+            ('GET', lambda: requests.get(url, timeout=10)),
+            ('DELETE', lambda: requests.delete(url, timeout=10)),
+        ):
+            with self.subTest(verb=verb):
+                response = call()
+                self.assertEqual(response.status_code, 400, f'{verb}: {response.text}')
+                self.assertIn('error_code', response.json())
+
+        # Control: a code the route serves normally still reaches the store, so
+        # the rejections above are the length gate rather than the route
+        # refusing every long-ish code.
+        #
+        # Deliberately well short of 256 rather than at it. The gateway's gate
+        # is 256, but the fault manager applies a stricter 128
+        # (`kMaxFaultCodeLength`, fault_manager_node.cpp:41) and the gateway
+        # turns that refusal into 503, because its 404-vs-503 split is a
+        # substring match for "not found" on the store's message. So 129..256
+        # answers 503 today even though the document publishes 256 - recorded,
+        # not pinned here, because reconciling the two bounds is a contract
+        # decision spanning both nodes.
+        inside = f'{self.BASE_URL}/apps/lidar_sensor/faults/{"F" * 64}'
+        self.assertEqual(requests.get(inside, timeout=10).status_code, 404)
+
     def test_list_all_faults_globally(self):
         """GET /faults returns all faults across the system.
 

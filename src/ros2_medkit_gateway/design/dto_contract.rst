@@ -127,6 +127,7 @@ defined in ``contract.hpp``:
      std::string_view description;  // OpenAPI property description
      const std::string_view * enum_values;  // allowed string values (or nullptr)
      std::size_t enum_count;
+     FieldConstraints constraints;  // minimum / maximum / maxLength / pattern / format
    };
 
 Fields are never constructed directly. The ``field()`` and ``field_enum()``
@@ -143,6 +144,54 @@ argument:
 
    // Enum-constrained field with inline constexpr string_view array
    field_enum("status", &FaultStatus::aggregated_status, kFaultAggregatedStatusValues)
+
+Schema Constraints (``FieldConstraints``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A field can publish JSON Schema keywords its C++ type does not imply. Every
+member of ``FieldConstraints`` is unset by default, so a ``field()`` call that
+names none emits what it always did. C++17 has no designated initialisers, so
+a call site spells the unset members out:
+
+.. code-block:: cpp
+
+   field("max_entries", &LogConfiguration::max_entries,
+         "Ceiling on how many entries one GET answers with...",
+         FieldConstraints{/*minimum=*/1.0, /*maximum=*/10000.0, {}, {}, {}})
+
+**Only declare a bound the handler enforces unconditionally.** A ceiling the
+gateway reads from a ROS parameter is deployment configuration, and publishing
+it as ``maximum`` makes the document wrong on any deployment that changed it -
+those belong in the ``description``. ``AcquireLockRequest.lock_expiration`` is
+the worked example: ``minimum: 1`` is a constraint because ``LockManager``
+always rejects a non-positive expiration, while the 3600 s ceiling is
+``locking.default_max_expiration`` and is described rather than declared.
+
+Numeric width is derived, not declared: ``schema_of`` emits ``format: int64``
+for a **signed** 64-bit integral. Signedness is part of the test because
+``sizeof(U) == 8`` alone also matches ``uint64_t`` and ``std::size_t``, whose
+upper half the format excludes. Set ``FieldConstraints::format`` only for a
+string format the type cannot imply, such as ``date-time``.
+
+Constraints and ``enum`` are attached through one lambda in
+``derived_object_schema``, so their placement cannot drift: an optional member
+renders as ``{anyOf: [<inner>, {type: null}]}`` and every validation keyword
+goes on the non-null branch ``anyOf[0]``, because one written at the property
+level would apply to the null branch too and reject the ``null`` that
+``anyOf`` advertises. Required members have no ``anyOf`` and take the keyword
+at the top level. The ``description`` is the exception and stays at the
+property level either way: it describes the field, not one branch of its
+schema.
+
+**An enum is not always the right way to publish a vocabulary.** Where the
+handler answers an unrecognised value with an error richer than "value not in
+allowed set" - ``ExecutionUpdateRequest.capability`` names
+``supported_capabilities`` for the backend in front of the caller, and
+``LogConfiguration.severity_filter``'s 400 lists the accepted severities - a
+schema-level ``enum`` makes ``JsonReader`` reject the request first and
+replaces that error with a generic body-validation failure. Both fields
+therefore publish their vocabulary as prose. Use ``field_enum`` where the
+parser rejecting the value is the whole of the validation.
 
 ``dto_fields<T>`` - the Descriptor Tuple
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -572,6 +621,28 @@ Further ``RouteEntry`` knobs shape the published operation:
   them. Declared headers carry no ``required`` flag - OpenAPI response headers
   are optional by definition, which matches headers the gateway sets
   conditionally.
+- ``description(text)`` - the behaviour a caller has to know that the field
+  names and the summary do not carry: what an omitted filter defaults to, what
+  a 202 does and does not promise, what the answer is silently truncated to.
+  Required on every operation, and gated:
+  ``test_openapi_contract.test.py::test_every_operation_has_a_description``
+  fails on any operation that ships with only a ``summary``.
+- ``body_example(json)`` - publish a working request body a caller can copy out
+  of the document, emitted as
+  ``requestBody.content[<primary media type>].examples.default.value``. A
+  ``$ref`` names the fields and their types; it does not say that
+  ``trigger_condition`` needs a ``condition_type`` key, or that ``interval`` is
+  a word rather than a number. Examples live here and nowhere else:
+  ``dto_fields<T>`` is ``inline constexpr`` and could hold only a string
+  literal per property, and putting one on the schema as well would be a second
+  source for one concept. Attaches to the primary body only - the extra
+  encodings ``accepts()`` adds are the same payload in another wire format,
+  where a JSON example would not parse. Whether the route has a body is read at
+  emission, not at the call, so the fluent chain can order the two either way;
+  a route with no body at all drops the example and ``validate_completeness()``
+  reports it rather than minting a body the route does not take.
+  ``test_openapi_contract.test.py::test_non_trivial_request_bodies_carry_an_example``
+  pins the App-entity variant of each route family that carries one.
 - ``gated_on(available, unavailable)`` - the route's backing feature can be
   absent. ``available`` is re-evaluated per request (a manager can appear after
   registration), and when it is false the framework answers with
@@ -748,6 +819,59 @@ What is **not** declared there is the status a healthy peer returns, which is
 copied through verbatim. No finite ``errors({...})`` describes "whatever the
 peer said", and choosing what the document should promise is an
 aggregation-contract question rather than a documentation one.
+
+Path parameters are synthesised, not declared
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``to_openapi_paths()`` walks each route's ``{param}`` templates and emits a
+parameter object for every one the registration did not declare by hand, taking
+its prose - and, where there is one, its length constraint - from a table in
+that function. Almost every route relies on this: the entity-scoped routes are
+registered from loops over the four entity types, and only the fault-trigger
+routes and one ``app_id`` call ``path_param()`` explicitly.
+
+That is why the constraint lives in the table rather than at the call sites.
+``{fault_code}`` and ``{config_id}`` appear on several registrations each, none
+of which describes them today; a per-registration ``path_param(name, desc,
+schema)`` would have to be repeated on each and could be omitted on the next
+route added, whereas the table applies to every route carrying the template and
+there is nothing to forget.
+
+That convenience carries a precondition, and it is the table's one weakness:
+being keyed by parameter *name*, it cannot distinguish a route whose handler
+checks from one whose handler does not. A ``maxLength`` therefore goes in only
+where **every** handler behind the template rejects an over-long value
+unconditionally - 256 for ``fault_code``, 512 for ``config_id`` (256-character
+entity id, ``:``, 256-character parameter name).
+
+The first version of this table did not hold that precondition:
+``ConfigHandlers::delete_configuration`` was the one verb of the three that
+read ``config_id`` without measuring it, while GET and PUT both rejected, so
+four routes published a bound nothing enforced. The check was added rather than
+the ``maxLength`` removed - GET and PUT checking and DELETE not was a real
+inconsistency in the handler family.
+
+Both rows are now driven on every verb they publish to, so the precondition is
+tested rather than assumed:
+``test_configuration_api.test.py::test_06b_every_verb_rejects_an_oversized_config_id``
+covers ``config_id`` on GET, PUT and DELETE, and
+``test_faults_api.test.py::test_both_verbs_reject_an_oversized_fault_code``
+covers ``fault_code`` on GET and DELETE. A new row needs its own, or the bound
+it publishes rests on a reading of the handlers rather than on a run.
+
+One ordering difference the tests deliberately avoid depending on:
+``FaultHandlers::clear_fault`` measures the code *after*
+``validate_lock_access``, where the configuration handlers measure before it.
+The published bound still holds - an over-long value is always rejected - but
+under a competing lock the fault route answers 409 rather than 400.
+
+``config_id`` is the one whose prose carries a contract rather than a
+restatement of its name. On an entity that aggregates several ROS 2 nodes the
+identifier is the ``app_id:param_name`` form the configurations list returns as
+each item's ``id``, and a write of a bare parameter name is refused as
+ambiguous; on a single-node entity it is the bare name and a colon is part of
+it. The earlier description - "the ROS 2 parameter name" - named exactly the
+form the write path rejects.
 
 .. _emitted-status-recorder:
 
@@ -1006,8 +1130,14 @@ the codebase:
 
 Fields backed by ``std::optional<nlohmann::json>`` rather than
 ``opaque_object`` (notably ``extended_data_records`` / ``snapshots`` on
-``FaultEnvironmentData``) follow the same rule: pass the JSON through
-verbatim because the fault reporter plugin owns the shape. The opaque DTO
+``FaultEnvironmentData``, and ``_links`` on the four ``*Detail`` DTOs) follow
+the same rule: pass the JSON through verbatim because something other than the
+DTO layer owns the shape. ``_links`` is the case where the reason is a type
+rather than a plugin: its values are a union - a path string for every relation
+except ``depends-on``, which is an array of paths - and ``SchemaWriter`` walks
+``dto_fields``, so it has no descriptor for a map whose values differ in type.
+The field carries a description naming each relation and its value shape, so a
+generated client reads prose instead of an unexplained ``{}``. The opaque DTO
 marker (``is_opaque_dto_v<T> = true``) plays the analogous role at the
 envelope level: it tells the framework "this whole DTO has a hand-written
 JsonWriter / JsonReader / SchemaWriter trio because its shape is opaque",

@@ -23,31 +23,37 @@
 namespace ros2_medkit_gateway {
 
 /**
- * @brief SOVD Entity Capabilities based on Table 8 and Table 10
+ * @brief SOVD Entity Capabilities (SOVD Table 8 and Table 10, as served)
  *
- * This class encapsulates which resource collections and resources
- * are supported by each entity type according to SOVD specification.
+ * Which resource collections and resources each entity type exposes. The lists
+ * describe the routes `rest_server.cpp::setup_routes()` actually registers, not
+ * the union of what SOVD permits: an entry here becomes an `href` in the
+ * entity's `capabilities` array and a path in its `/docs` sub-document, so a
+ * collection with no route is a dead link rather than a statement of intent.
+ * `for_type` in the .cpp carries the per-type reasoning.
  *
- * Resource Collections:
- * - configurations: SERVER, COMPONENT, APP
- * - data: SERVER, COMPONENT, APP, FUNCTION*
- * - faults: SERVER, COMPONENT, APP
- * - operations: SERVER, COMPONENT, APP, FUNCTION*
- * - (others): SERVER, COMPONENT, APP
+ * Resource collections:
+ * - data, data-categories, data-groups, operations, configurations, faults,
+ *   logs, bulk-data, triggers: AREA, COMPONENT, APP, FUNCTION
+ * - cyclic-subscriptions: COMPONENT, APP, FUNCTION
+ * - locks, scripts: COMPONENT, APP
+ * - fault-triggers: APP
+ * - faults, updates: SERVER (mounted at the API root)
  *
  * Resources:
  * - docs: all
  * - version-info: SERVER only
- * - logs: SERVER, COMPONENT, APP
+ * - logs: COMPONENT, APP
  * - hosts: COMPONENT, FUNCTION
- * - is-located-on: APP only
- * - contains: AREA only
- * - belongs-to: SERVER, COMPONENT, APP
- * - depends-on: SERVER, COMPONENT, APP, FUNCTION
- * - data-categories: SERVER, COMPONENT, APP
- * - data-groups: SERVER, COMPONENT, APP
+ * - is-located-on, belongs-to: APP only
+ * - contains, subareas, components: AREA only
+ * - subcomponents: COMPONENT only
+ * - depends-on: COMPONENT, APP
  *
  * Note: FUNCTION data/operations are aggregated from hosted Apps (read-only).
+ * data-categories and data-groups are registered for every entity type and
+ * answer 501 - a served route reporting no ROS 2 mapping, which is a different
+ * thing from an unregistered one.
  */
 class EntityCapabilities {
  public:

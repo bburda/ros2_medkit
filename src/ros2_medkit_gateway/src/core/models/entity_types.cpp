@@ -44,8 +44,14 @@ std::string to_string(ResourceCollection col) {
       return "configurations";
     case ResourceCollection::DATA:
       return "data";
+    case ResourceCollection::DATA_CATEGORIES:
+      return "data-categories";
+    case ResourceCollection::DATA_GROUPS:
+      return "data-groups";
     case ResourceCollection::FAULTS:
       return "faults";
+    case ResourceCollection::FAULT_TRIGGERS:
+      return "fault-triggers";
     case ResourceCollection::OPERATIONS:
       return "operations";
     case ResourceCollection::BULK_DATA:
@@ -82,7 +88,10 @@ std::optional<ResourceCollection> parse_resource_collection(const std::string & 
   static const std::unordered_map<std::string, ResourceCollection> mapping = {
       {"configurations", ResourceCollection::CONFIGURATIONS},
       {"data", ResourceCollection::DATA},
+      {"data-categories", ResourceCollection::DATA_CATEGORIES},
+      {"data-groups", ResourceCollection::DATA_GROUPS},
       {"faults", ResourceCollection::FAULTS},
+      {"fault-triggers", ResourceCollection::FAULT_TRIGGERS},
       {"operations", ResourceCollection::OPERATIONS},
       {"bulk-data", ResourceCollection::BULK_DATA},
       {"data-lists", ResourceCollection::DATA_LISTS},

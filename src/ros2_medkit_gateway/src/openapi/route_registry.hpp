@@ -164,6 +164,30 @@ class RouteEntry {
   /// client library reaches for by default looks unsupported.
   RouteEntry & accepts(const std::string & content_type, const nlohmann::json & schema);
 
+  /// Publish a working request body a caller can copy out of the document.
+  ///
+  /// A `$ref` names the fields and their types; it does not say that
+  /// `trigger_condition` needs a `condition_type` key, or that `interval` is a
+  /// word rather than a number. The example is the part of the document a
+  /// caller can paste into a request unmodified, so it belongs to the request
+  /// body and lives nowhere else - not in the descriptor, where
+  /// `dto_fields<T>` is `inline constexpr` and could only hold a string
+  /// literal per property, and not on the schema, where it would be a second
+  /// source for one concept.
+  ///
+  /// Emitted as `requestBody.content[<primary media type>].examples.default`.
+  /// Named rather than the singular `example` because that is the form a
+  /// second example could be added to without moving the first. Whether the
+  /// route has a body is read at emission, not here, so the fluent chain can
+  /// call this before or after `request_body()`; a route with no body at all
+  /// drops the example and `validate_completeness()` reports it rather than
+  /// minting a body the route does not take.
+  ///
+  /// Attaches to the primary body only. The extra encodings `accepts()` adds
+  /// are the same payload in another wire format, and a JSON example against
+  /// `application/x-www-form-urlencoded` would not parse.
+  RouteEntry & body_example(nlohmann::json example);
+
   /// Typed response: the schema is a $ref to the DTO's component schema.
   template <class T>
   RouteEntry & response(int status_code, const std::string & desc) {
@@ -457,6 +481,17 @@ class RouteEntry {
   /// `encoding` object for a multipart body: `{<part>: {contentType: ...}}`.
   /// Emitted beside the request body's schema. Empty for every other body.
   nlohmann::json multipart_encoding_{};
+
+  /// Example payload set by body_example(), emitted under the primary body's
+  /// media type. Checked against `request_body_` at emission rather than at the
+  /// call, so the fluent chain can order the two either way.
+  ///
+  /// `optional`, not an empty-json sentinel: `nlohmann::json::empty()` is true
+  /// for `{}`, `[]` and `null`, so a call site legitimately documenting an
+  /// empty body would have its example dropped *and* skipped by the
+  /// validate_completeness() report - the silent loss that report exists to
+  /// make impossible.
+  std::optional<nlohmann::json> body_example_;
 
   std::vector<nlohmann::json> parameters_;
 };

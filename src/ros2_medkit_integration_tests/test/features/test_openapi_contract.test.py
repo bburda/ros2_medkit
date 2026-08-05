@@ -95,6 +95,36 @@ EXPECTED_LOCK_GUARDED = {
     'deleteComponentBulkData', 'deleteAppBulkData',
 }
 
+# Properties whose meaning a client cannot recover from the property name and
+# the JSON type alone, so the document has to spell it out. Not a list of
+# "everything important" - it is the set this file asserts on, and it grows by
+# hand when a field turns out to need prose.
+#
+# Every name was read out of the DTO header before being written here:
+# `dto/locks.hpp` (AcquireLockRequest), `dto/health.hpp` (Health, whose
+# dto_name is `HealthStatus`), `dto/triggers.hpp` (TriggerCreateRequest) and
+# `dto/logs.hpp` (LogConfiguration, which has exactly two members).
+LOAD_BEARING = {
+    'AcquireLockRequest': ['lock_expiration', 'scopes', 'break_lock'],
+    'HealthStatus': ['timestamp'],
+    'TriggerCreateRequest': ['trigger_condition', 'protocol', 'lifetime', 'path'],
+    'LogConfiguration': ['severity_filter', 'max_entries'],
+}
+
+# Operations whose request body carries a copyable example.
+#
+# One operationId per body-carrying route family, not all of them: the four
+# entity types are registered from a single call site in a loop, so the App
+# variant is what proves the call site has the example. A family whose App
+# variant lost its `.body_example(...)` turns this red.
+EXAMPLE_BODIES = {
+    'createAppTrigger',
+    'acquireAppLock',
+    'executeAppOperation',
+    'setAppConfiguration',
+    'startAppScriptExecution',
+}
+
 _SCRIPTS_DIR = tempfile.mkdtemp(prefix='medkit-contract-scripts-')
 
 PYTHON_SCRIPT = '#!/usr/bin/env python3\nimport json\nprint(json.dumps({"result": "ok"}))\n'
@@ -158,6 +188,63 @@ class TestOpenApiContract(GatewayTestCase):
             self.assertNotIn(
                 op_id, seen, f'{where}: operationId collides with {seen.get(op_id)}')
             seen[op_id] = where
+
+    def test_load_bearing_properties_are_described(self):
+        """The properties in LOAD_BEARING carry prose, on whichever branch holds them.
+
+        Scoped to that list - it says nothing about the rest of the document.
+        An optional member renders as ``{anyOf: [<inner>, {type: null}]}``, so
+        the description can sit on the property or on the non-null branch, and
+        both are accepted: which one a property uses is a consequence of its
+        C++ type, not a fact a client cares about.
+        """
+        schemas = self.spec()['components']['schemas']
+        offenders = []
+        for name, props in LOAD_BEARING.items():
+            schema = schemas.get(name)
+            self.assertIsNotNone(schema, f'{name} missing from components/schemas')
+            for prop in props:
+                node = schema.get('properties', {}).get(prop)
+                self.assertIsNotNone(node, f'{name}.{prop} missing')
+                described = node.get('description') or any(
+                    b.get('description') for b in node.get('anyOf', [])
+                    if isinstance(b, dict))
+                if not described:
+                    offenders.append(f'{name}.{prop}')
+        self.assertEqual(offenders, [], f'undocumented: {offenders}')
+
+    def test_every_operation_has_a_description(self):
+        """No operation ships without prose.
+
+        ``summary`` is a one-liner a picker shows; ``description`` is where the
+        behaviour a caller has to know about goes. An operation with only the
+        former is one whose caveats live in the source and nowhere a client can
+        read them.
+        """
+        missing = [f'{m.upper()} {p}' for p, m, op in self.operations()
+                   if not op.get('description')]
+        self.assertEqual(missing, [], f'{len(missing)} operations without description')
+
+    def test_non_trivial_request_bodies_carry_an_example(self):
+        """Each operation in EXAMPLE_BODIES publishes a copyable body.
+
+        A ``$ref`` tells a client the field names and types; it does not tell it
+        that ``trigger_condition`` needs a ``condition_type`` key or that
+        ``interval`` is a word rather than a number. The example is the only
+        part of the document a caller can paste into a request unmodified.
+        """
+        missing = sorted(oid for _, _, op in self.operations()
+                         if (oid := op.get('operationId')) in EXAMPLE_BODIES
+                         and not any('example' in b or 'examples' in b
+                                     for b in (op.get('requestBody') or {})
+                                     .get('content', {}).values()))
+        self.assertEqual(missing, [], f'no example: {missing}')
+        # Guard against a vacuous pass: an operationId that stopped existing
+        # would silently drop out of the comprehension above.
+        present = {op.get('operationId') for _, _, op in self.operations()}
+        self.assertEqual(
+            EXAMPLE_BODIES - present, set(),
+            'EXAMPLE_BODIES names an operation the document lacks')
 
     def test_every_tag_used_is_declared(self):
         """No operation carries a tag missing from the document tag list."""
@@ -945,6 +1032,57 @@ class TestOpenApiContract(GatewayTestCase):
             frontier |= refs_in(body) - seen
         used = {r.split('/')[-1] for r in seen if '/schemas/' in r}
         self.assertEqual(sorted(set(schemas) - used), [], 'unreachable schemas')
+
+    def test_every_advertised_collection_is_served(self):
+        """Nothing an entity advertises answers 404.
+
+        Two surfaces advertise an entity's resource collections and they are
+        built from two different lists: the ``capabilities`` array on
+        ``GET /{type}/{id}`` comes from a per-handler ``CapabilityBuilder``
+        call, the entity's ``/docs`` sub-document from
+        ``EntityCapabilities::for_type``. Both are followed here, for all four
+        entity types, because a collection can be right in one list and wrong
+        in the other.
+
+        A 501 is a served answer - the route exists and reports that the
+        backend does not. A 404 is what this pins: an href the gateway
+        published that no route answers.
+
+        @verifies REQ_INTEROP_002
+        """
+        offenders = []
+        covered = {}
+        for entity_type in ('areas', 'components', 'apps', 'functions'):
+            items = self.get_json(f'/{entity_type}').get('items', [])
+            if not items:
+                # This fixture's demo nodes produce no areas. Skipping keeps
+                # the assertion below honest about what was actually probed;
+                # the per-type lists themselves are pinned by the
+                # `EntityCapabilities` unit tests.
+                continue
+            entity_id = items[0]['id']
+            detail = self.get_json(f'/{entity_type}/{entity_id}')
+            subtree = self.get_json(f'/{entity_type}/{entity_id}/docs')
+            advertised = {c['href'] for c in detail.get('capabilities', [])}
+            advertised |= {f'/api/v1{p}' for p in subtree['paths']}
+            followed = 0
+            for href in sorted(advertised):
+                if '{' in href:
+                    # A templated path names no concrete resource to fetch.
+                    continue
+                resp = requests.get(
+                    f'{self.BASE_URL}{href[len("/api/v1"):]}', timeout=10)
+                followed += 1
+                if resp.status_code == 404:
+                    offenders.append(f'{entity_type}: {href}')
+            covered[entity_type] = followed
+        self.assertEqual(offenders, [], f'advertised but 404: {offenders}')
+        # Guard against a vacuous pass: an entity type that advertised nothing,
+        # or a listing that came back empty, must not read as green.
+        for entity_type in ('components', 'apps', 'functions'):
+            self.assertGreater(
+                covered.get(entity_type, 0), 8,
+                f'{entity_type}: only {covered.get(entity_type, 0)} hrefs followed')
 
 
 @launch_testing.post_shutdown_test()
