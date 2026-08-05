@@ -31,6 +31,7 @@
   <test_depend>ament_index_python</test_depend>
   <test_depend>python3-requests</test_depend>
   <test_depend>python3-jsonschema</test_depend>
+  <test_depend>ament_cmake_flake8</test_depend>
   <test_depend>ros2_medkit_gateway</test_depend>
   <test_depend>ros2_medkit_fault_manager</test_depend>
   <test_depend>ros2_medkit_linux_introspection</test_depend>

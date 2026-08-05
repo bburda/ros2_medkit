@@ -70,7 +70,7 @@ class TestNoHostInfoProviderMode(GatewayTestCase):
         components = comp_data.get('items', [])
         self.assertEqual(
             len(components), 0,
-            f"Expected no components without HostInfoProvider, "
+            f'Expected no components without HostInfoProvider, '
             f"got: {[c.get('id') for c in components]}",
         )
 
@@ -89,7 +89,7 @@ class TestNoHostInfoProviderMode(GatewayTestCase):
         for name in expected:
             self.assertTrue(
                 any(name in aid for aid in app_ids),
-                f"{name} not found in apps: {app_ids}",
+                f'{name} not found in apps: {app_ids}',
             )
 
 

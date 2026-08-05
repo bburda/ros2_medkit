@@ -148,7 +148,7 @@ class TestNamespaceFilter(GatewayTestCase):
         for app_id in app_ids:
             self.assertNotIn(
                 'unmanifested_chassis_sensor', app_id,
-                f"Blacklisted namespace node should not appear: {app_id}",
+                f'Blacklisted namespace node should not appear: {app_id}',
             )
 
     def test_health_shows_gap_fill_filtering(self):
