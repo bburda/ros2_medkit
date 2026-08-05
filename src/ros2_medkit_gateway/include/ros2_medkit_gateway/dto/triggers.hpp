@@ -24,6 +24,7 @@
 #include "ros2_medkit_gateway/dto/entities.hpp"
 #include "ros2_medkit_gateway/dto/enums.hpp"
 #include "ros2_medkit_gateway/dto/sample.hpp"
+#include "ros2_medkit_gateway/dto/schema_writer.hpp"
 
 namespace ros2_medkit_gateway {
 namespace dto {
@@ -134,6 +135,62 @@ inline constexpr std::string_view dto_name<TriggerUpdateRequest> = "TriggerUpdat
 // =============================================================================
 template <>
 inline constexpr std::string_view dto_name<Collection<Trigger>> = "TriggerList";
+
+// =============================================================================
+// trigger_condition: opaque, and saying why.
+//
+// The member is a bare `nlohmann::json`, so the derived schema publishes `{}` -
+// "any JSON at all" - on a *required* field. That is the same content-free
+// declaration the fault and data envelopes were cured of, and it earns the same
+// treatment: mark it opaque and name who decides the shape.
+//
+// Opaque rather than typed because the vocabulary is open. `ConditionRegistry`
+// takes plugin-registered evaluators through `PluginContext`
+// (`get_condition_registry()`), each with its own `condition_type` and its own
+// operands, and the handler forwards every key except `condition_type` to the
+// evaluator untouched. A closed schema would both misdescribe a plugin
+// condition and, if the member were typed, silently drop its operands on read.
+//
+// Schema-only: `JsonWriter` / `JsonReader` keep walking the plain `field()`
+// descriptor, so the reader stays as lenient as it is today and the handler
+// keeps issuing its own 400 for a non-object. Typing the member properly is a
+// separate, larger change - it needs a descriptor that publishes a $ref while
+// leaving the member raw.
+// =============================================================================
+namespace detail {
+inline nlohmann::json trigger_condition_schema() {
+  return nlohmann::json{
+      {"type", "object"},
+      {"additionalProperties", true},
+      {"x-medkit-opaque", true},
+      {"description",
+       "The condition that fires the trigger: a flat object of `condition_type` plus that type's own "
+       "operands. The built-in types are `OnChange` (no operands), `OnChangeTo` (`target_value`), "
+       "`EnterRange` and `LeaveRange` (`lower_bound`, `upper_bound`). The set is open - a plugin can "
+       "register further evaluators through `ConditionRegistry`, conventionally under an `x-` prefixed "
+       "name, with operands of its own - which is why no closed schema is published here."}};
+}
+}  // namespace detail
+
+// SchemaWriter specializations: start from the derived schema so every other
+// member still comes from `dto_fields`, and replace only `trigger_condition`.
+template <>
+struct SchemaWriter<Trigger> {
+  static nlohmann::json schema() {
+    nlohmann::json schema = derived_object_schema<Trigger>();
+    schema["properties"]["trigger_condition"] = detail::trigger_condition_schema();
+    return schema;
+  }
+};
+
+template <>
+struct SchemaWriter<TriggerCreateRequest> {
+  static nlohmann::json schema() {
+    nlohmann::json schema = derived_object_schema<TriggerCreateRequest>();
+    schema["properties"]["trigger_condition"] = detail::trigger_condition_schema();
+    return schema;
+  }
+};
 
 // =============================================================================
 // dto_sample specializations for DTOs with bare nlohmann::json members.

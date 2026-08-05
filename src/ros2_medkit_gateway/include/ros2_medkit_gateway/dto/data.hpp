@@ -191,22 +191,15 @@ template <>
 inline constexpr std::string_view dto_name<DataWriteRequest> = "DataWriteRequest";
 
 // =============================================================================
-// Collection<DataItem> - named "DataList"
-// =============================================================================
-template <>
-inline constexpr std::string_view dto_name<Collection<DataItem>> = "DataList";
-
-// =============================================================================
-// Collection<DataItem, DataListXMedkit> - typed list shape returned by
-// list_data (PR-403 commit 28).
+// Collection<DataItem, DataListXMedkit> - named "DataList", the list shape
+// list_data returns for a ROS 2-backed entity.
 //
-// Same wire shape as the legacy `Collection<DataItem>` named "DataList", but
-// the `x-medkit` payload carries the rich `DataListXMedkit` fields (entity_id,
-// aggregated, aggregation_sources, aggregation_level, total_count, partial,
-// failed_peers, peer_dropped_items) instead of the generic
-// `XMedkitCollection`. The schema name is kept identical to the legacy
-// `DataList` $ref so existing OpenAPI clients are not affected; the
-// difference is purely server-side typing.
+// The `x-medkit` payload is `DataListXMedkit` (entity_id, aggregated,
+// aggregation_sources, aggregation_level, total_count, partial, failed_peers,
+// peer_dropped_items), which is what the handler writes. The single-argument
+// `Collection<DataItem>` used to carry this name too, defaulting `x-medkit` to
+// the generic `XMedkitCollection` no data route has ever emitted; naming only
+// the emitted shape keeps the document from advertising the other one.
 // =============================================================================
 template <>
 inline constexpr std::string_view dto_name<Collection<DataItem, DataListXMedkit>> = "DataList";
@@ -280,7 +273,22 @@ struct JsonReader<DataListResult> {
 template <>
 struct SchemaWriter<DataListResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"description",
+         "Data-resource list whose shape depends on who owns the entity. An entity backed by the ROS 2 "
+         "graph answers with `DataList`. A plugin-owned entity answers with whatever its DataProvider "
+         "returns and the gateway emits that verbatim. Which branch applies is discoverable ahead of the "
+         "call: `x-medkit.source` on the entity's own document (`GET /{entity_type}/{entity_id}`) reads "
+         "`plugin` for a plugin-owned entity."},
+        {"anyOf", nlohmann::json::array(
+                      {nlohmann::json{{"$ref", "#/components/schemas/DataList"}},
+                       nlohmann::json{{"title", "PluginDataList"},
+                                      {"type", "object"},
+                                      {"additionalProperties", true},
+                                      {"x-medkit-opaque", true},
+                                      {"description",
+                                       "Plugin-defined list. The in-tree OPC-UA plugin adds value / unit / "
+                                       "data_type / writable per item. Read the plugin's own documentation."}}})}};
   }
 };
 
@@ -342,7 +350,16 @@ struct JsonReader<DataValue> {
 template <>
 struct SchemaWriter<DataValue> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"type", "object"},
+        {"additionalProperties", true},
+        {"x-medkit-opaque", true},
+        {"description",
+         "One data resource's value. No fixed shape exists: on the ROS 2 path the body carries the live "
+         "message, whose fields come from the topic's IDL type, and on a plugin-owned entity it carries "
+         "whatever the DataProvider returns (an OPC-UA node adds unit / data_type / writable, a UDS DID "
+         "its own record layout). Discover the concrete shape from the item's entry in `GET "
+         "/{entity_type}/{entity_id}/data`, whose `x-medkit` names the ROS 2 message type."}};
   }
 };
 

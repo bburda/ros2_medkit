@@ -159,7 +159,14 @@ tl::expected<http::SseStream, ErrorInfo> SseTransportProvider::make_sse_stream(c
         envelope["payload"] = *sample_result;
       } else {
         json error;
+        // The vendor-error sentinel is only usable with the code it stands in
+        // for: on its own it tells a client a vendor failure happened and not
+        // which one. Every other emitter of the sentinel pairs the two
+        // (primitives.cpp, peer_client.cpp, aggregation_manager.cpp); this one
+        // did not, and `SubscriptionEventFrame.error` now publishes the pair as
+        // its declared shape.
         error["error_code"] = ERR_VENDOR_ERROR;
+        error["vendor_code"] = ERR_X_MEDKIT_RESOURCE_SAMPLE_FAILED;
         error["message"] = sample_result.error();
         envelope["error"] = error;
       }

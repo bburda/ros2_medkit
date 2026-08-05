@@ -104,12 +104,53 @@ struct JsonReader<UpdateDetail> {
   }
 };
 
-// SchemaWriter specialization: free-form object schema, matching the
-// existing escape-hatch convention (see dto/contract.hpp).
+// SchemaWriter specialization. Unlike JsonWriter / JsonReader above, this is
+// NOT a pass-through: SOVD (ISO 17978-3 section 7.18) defines the attribute
+// table, so publishing `{type: object}` withheld a shape the standard already
+// fixes. The keys below are that table; `additionalProperties: true` is what
+// keeps the vendor extensions the reader passes through legal, so typing the
+// schema costs a plugin nothing.
+//
+// Deliberately no `required` list. The four mandatory attributes are mandatory
+// on the *SOVD server*, and the gateway is a pass-through here - it stores
+// whatever `register_update` was given and returns it. Declaring them required
+// would make the document promise something the gateway does not enforce.
 template <>
 struct SchemaWriter<UpdateDetail> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    using nlohmann::json;
+    const json string_array{{"type", "array"}, {"items", {{"type", "string"}}}};
+    return json{
+        {"type", "object"},
+        {"additionalProperties", true},
+        {"description",
+         "Update package metadata, as stored by the UpdateProvider. The attributes below are SOVD's "
+         "(ISO 17978-3 section 7.18); a backend may add its own - Uptane TUF metadata, vendor component "
+         "lists - and the gateway returns those unchanged."},
+        {"properties", json{{"id", {{"type", "string"}, {"description", "Update package identifier."}}},
+                            {"update_name", {{"type", "string"}, {"description", "Display name."}}},
+                            {"update_translation_id",
+                             {{"type", "string"}, {"description", "Translation identifier for the display name."}}},
+                            {"automated",
+                             {{"type", "boolean"},
+                              {"description",
+                               "Whether the update can run unattended. `PUT /updates/{id}/automated` "
+                               "answers 400 when this is false."}}},
+                            {"origins",
+                             {{"type", "array"},
+                              {"items", {{"type", "string"}, {"enum", json::array({"remote", "proximity"})}}},
+                              {"description", "Where the package can be fetched from."}}},
+                            {"notes", {{"type", "string"}, {"description", "Additional descriptive notes."}}},
+                            {"user_activity", {{"type", "string"}, {"description", "Actions the user has to take."}}},
+                            {"preconditions", {{"type", "string"}, {"description", "Preconditions for the update."}}},
+                            {"execution_conditions",
+                             {{"type", "string"}, {"description", "Conditions that must hold during execution."}}},
+                            {"duration", {{"type", "integer"}, {"description", "Estimated duration in seconds."}}},
+                            {"size", {{"type", "integer"}, {"description", "Package size in kilobytes."}}},
+                            {"added_components", string_array},
+                            {"removed_components", string_array},
+                            {"updated_components", string_array},
+                            {"affected_components", string_array}}}};
   }
 };
 
@@ -252,10 +293,31 @@ struct JsonReader<UpdateRegisterRequest> {
   }
 };
 
+// SchemaWriter specialization. Only `id` is declared, and only `id` is
+// required, because that is the entire contract the gateway enforces:
+// post_update checks its presence, type and format and forwards every other
+// key verbatim to `register_update`. SOVD makes the register *request* body
+// manufacturer-specific, so transplanting UpdateDetail's attribute table here
+// would document a validation the gateway does not perform and a shape a
+// backend need not accept.
 template <>
 struct SchemaWriter<UpdateRegisterRequest> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"type", "object"},
+        {"additionalProperties", true},
+        {"required", nlohmann::json::array({"id"})},
+        {"description",
+         "Update package metadata to store. Only `id` is validated by the gateway; every other key is "
+         "forwarded to the UpdateProvider unchanged, so what else belongs here is the backend's contract. "
+         "A backend that follows SOVD will want the `UpdateDetail` attributes, since that is what "
+         "`GET /updates/{update_id}` returns."},
+        {"properties",
+         nlohmann::json{{"id",
+                         {{"type", "string"},
+                          {"description",
+                           "Update package identifier, also the path segment of the `Location` header returned on "
+                           "201. Must be non-empty and free of characters that would not survive a URI path."}}}}}};
   }
 };
 

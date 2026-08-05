@@ -67,52 +67,63 @@ nlohmann::json schema_of() {
   }
 }
 
+/// The object schema derived from `dto_fields<T>`, with no type-specific
+/// overrides applied.
+///
+/// Exposed separately from `SchemaWriter<T>` so a specialisation can start from
+/// the derived schema and replace one property, instead of hand-writing the
+/// whole thing and drifting from the descriptor the writer and reader use.
+template <class T>
+nlohmann::json derived_object_schema() {
+  nlohmann::json props = nlohmann::json::object();
+  nlohmann::json required = nlohmann::json::array();
+  for_each_field<T>([&](const auto & f) {
+    using FieldT = std::decay_t<decltype(f)>;
+    if constexpr (is_opaque_object_field_v<FieldT>) {
+      // Opaque any-object: fixed schema fragment, always required.
+      props[std::string(f.key)] =
+          nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+      required.push_back(std::string(f.key));
+    } else {
+      using MemberT = std::decay_t<decltype(std::declval<T>().*(f.ptr))>;
+      nlohmann::json prop = schema_of<MemberT>();
+      if (!f.description.empty()) {
+        prop["description"] = std::string(f.description);
+      }
+      if (f.enum_count > 0) {
+        nlohmann::json values = nlohmann::json::array();
+        for (std::size_t i = 0; i < f.enum_count; ++i) {
+          values.push_back(std::string(f.enum_values[i]));
+        }
+        // For optional members schema_of() yields {anyOf:[<inner>, {null}]};
+        // attach the enum to the non-null branch ([0]) so the nullable claim
+        // and the enum constraint agree (a top-level enum lacking "null" would
+        // reject the null that anyOf advertises). Required members get the
+        // enum at the top level.
+        if (prop.contains("anyOf") && prop["anyOf"].is_array() && !prop["anyOf"].empty()) {
+          prop["anyOf"][0]["enum"] = values;
+        } else {
+          prop["enum"] = values;
+        }
+      }
+      props[std::string(f.key)] = prop;
+      if (f.presence == Presence::kRequired) {
+        required.push_back(std::string(f.key));
+      }
+    }
+  });
+  nlohmann::json schema = {{"type", "object"}, {"properties", props}};
+  if (!required.empty()) {
+    schema["required"] = required;
+  }
+  return schema;
+}
+
 /// Generates the components/schemas object entry for a DTO type T.
 template <class T>
 struct SchemaWriter {
   static nlohmann::json schema() {
-    nlohmann::json props = nlohmann::json::object();
-    nlohmann::json required = nlohmann::json::array();
-    for_each_field<T>([&](const auto & f) {
-      using FieldT = std::decay_t<decltype(f)>;
-      if constexpr (is_opaque_object_field_v<FieldT>) {
-        // Opaque any-object: fixed schema fragment, always required.
-        props[std::string(f.key)] =
-            nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
-        required.push_back(std::string(f.key));
-      } else {
-        using MemberT = std::decay_t<decltype(std::declval<T>().*(f.ptr))>;
-        nlohmann::json prop = schema_of<MemberT>();
-        if (!f.description.empty()) {
-          prop["description"] = std::string(f.description);
-        }
-        if (f.enum_count > 0) {
-          nlohmann::json values = nlohmann::json::array();
-          for (std::size_t i = 0; i < f.enum_count; ++i) {
-            values.push_back(std::string(f.enum_values[i]));
-          }
-          // For optional members schema_of() yields {anyOf:[<inner>, {null}]};
-          // attach the enum to the non-null branch ([0]) so the nullable claim
-          // and the enum constraint agree (a top-level enum lacking "null" would
-          // reject the null that anyOf advertises). Required members get the
-          // enum at the top level.
-          if (prop.contains("anyOf") && prop["anyOf"].is_array() && !prop["anyOf"].empty()) {
-            prop["anyOf"][0]["enum"] = values;
-          } else {
-            prop["enum"] = values;
-          }
-        }
-        props[std::string(f.key)] = prop;
-        if (f.presence == Presence::kRequired) {
-          required.push_back(std::string(f.key));
-        }
-      }
-    });
-    nlohmann::json schema = {{"type", "object"}, {"properties", props}};
-    if (!required.empty()) {
-      schema["required"] = required;
-    }
-    return schema;
+    return derived_object_schema<T>();
   }
 };
 

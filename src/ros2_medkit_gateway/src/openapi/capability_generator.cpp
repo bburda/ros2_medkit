@@ -27,6 +27,7 @@
 #include "ros2_medkit_gateway/core/http/operation_item_id.hpp"
 #include "ros2_medkit_gateway/core/models/entity_capabilities.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
+#include "ros2_medkit_gateway/core/openapi/document_checks.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/version.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
@@ -147,7 +148,31 @@ nlohmann::json CapabilityGenerator::generate_root() const {
   }
   builder.add_schemas(named_schemas);
 
-  return builder.build();
+  auto document = builder.build();
+
+  // Every named schema has to be reachable from some operation, or a generated
+  // client ships a type it can never receive. Only the assembled document knows
+  // both halves of that question, which is why the check runs here and not in
+  // `RouteRegistry::validate_completeness()`.
+  //
+  // Warned, not asserted: this is a Release build, and a document that ships a
+  // few dead types is still a usable document - refusing to serve it would turn
+  // a documentation defect into an outage.
+  // `test_openapi_contract::test_no_unreachable_schemas` is what turns the
+  // suite red; this line is what a developer sees without running it.
+  const auto orphans = unreachable_schemas(document);
+  if (!orphans.empty()) {
+    std::string names;
+    for (const auto & name : orphans) {
+      names += (names.empty() ? "" : ", ") + name;
+    }
+    RCLCPP_WARN(handlers::HandlerContext::logger(),
+                "OpenAPI document ships %zu schema(s) no operation can reach: %s. Bind each to the route "
+                "that returns it, or drop it from dto::AllDtos.",
+                orphans.size(), names.c_str());
+  }
+
+  return document;
 }
 
 // -----------------------------------------------------------------------------

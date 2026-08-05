@@ -1227,7 +1227,12 @@ Request Transition
    ``configurator``.
 
    - **202:** Transition accepted (the ``Location`` header points to the status URI)
-   - **403:** Caller lacks the required role (``insufficient-access-rights``)
+   - **403:** Two different refusals share this status. The auth middleware
+     rejects a caller without the role above, ahead of the handler, in the
+     RFC 6749 shape (``{"error": "insufficient_scope", ...}``). The lifecycle
+     provider rejects the transition itself in the SOVD shape
+     (``{"error_code": "insufficient-access-rights", ...}``). Read
+     ``error`` vs ``error_code`` to tell them apart.
    - **404:** Entity not found
    - **409:** A precondition was not fulfilled (``precondition-not-fulfilled``)
    - **501:** No lifecycle provider is registered for the entity (``not-implemented``)
@@ -2305,7 +2310,7 @@ Start Execution
       * - ``execution_type``
         - string
         - M
-        - When to run: ``now``, ``on_restart``, ``now_and_on_restart``, ``once_on_restart``
+        - When to run. The shipped backend accepts only ``now``; see the note below
       * - ``parameters``
         - object
         - O
@@ -2573,26 +2578,56 @@ Trigger Events (SSE Stream)
       Content-Type: text/event-stream
       Cache-Control: no-cache
 
-   **EventEnvelope format:**
+   **Frame format:**
 
-   Each event is delivered as an SSE ``data:`` frame containing a JSON
-   EventEnvelope:
+   Each event is one SSE frame carrying an ``id:`` field and a ``data:`` field
+   holding the JSON ``TriggerEventFrame``:
 
    .. code-block:: text
 
+      id: 1
       data: {"timestamp":"2026-03-19T10:30:00.250Z","payload":{"data":{"data":85.5}}}
 
-   When an error occurs during evaluation:
+   The id counts events on this connection from 1, and unlike the fault stream
+   this route does not read ``Last-Event-ID`` - so the id is a position within
+   one connection, not a replay cursor, and reconnecting restarts it at 1.
+
+   A brief disconnect does not by itself lose events. Each trigger holds a
+   queue of up to 100 pending events, filled as conditions fire whether or not
+   a client is attached, and drained on the next connection - so a multishot
+   trigger that is reconnected to promptly delivers what it buffered.
+
+   The queue is in memory and belongs to the trigger's lifetime, not to the
+   connection, so anything that ends or resets the trigger takes the queue with
+   it. Known cases: overflow past 100 discards the oldest; a single-shot
+   trigger terminates on firing, after which its stream answers ``404``; the
+   ``lifetime`` expiring discards the trigger's whole state; deleting the
+   trigger, or restarting the gateway, does the same. Restart loses the queue
+   even for a ``persistent`` trigger - persistence stores the trigger and its
+   last observed value, never its pending events. Treat the buffer as a
+   convenience across a reconnect, not as a delivery guarantee; if you need
+   one, poll the underlying resource rather than relying on the stream.
+
+   While no event is pending, the stream sends a comment line rather than a
+   frame, every 15 seconds:
 
    .. code-block:: text
 
-      data: {"timestamp":"2026-03-19T10:30:00.250Z","error":"Failed to read resource"}
+      :keepalive
 
-   **EventEnvelope fields:**
+   **TriggerEventFrame fields:**
 
    - ``timestamp`` (string) - ISO 8601 timestamp of when the event was generated
-   - ``payload`` (object) - The resource value that satisfied the condition (present on success)
-   - ``error`` (string) - Error description (present on failure, mutually exclusive with payload)
+   - ``payload`` (object) - The observed resource's value at the moment the
+     condition fired - the whole value, not the ``path`` sub-document the
+     condition was evaluated against
+
+   There is no ``error`` member. A trigger frame exists only because a
+   condition fired, so there is no failed-evaluation case to report; a
+   resource that cannot be read simply produces no frame. The *cyclic
+   subscription* stream is the one that reports a failed sample inline - see
+   ``SubscriptionEventFrame`` - and the two are easy to confuse because they
+   are otherwise the same shape.
 
    The stream closes when:
 
@@ -2733,7 +2768,8 @@ use, so a client can tell "this build has no threshold engine" apart from "no
 such app or rule".
 
 ``GET /api/v1/apps/{app_id}/fault-triggers``
-   List the app's rules.
+   List the app's rules. The owning app is the one in the path; it is not
+   repeated in the item, and neither is the engine's internal cross latch.
 
    .. code-block:: json
 
@@ -2741,7 +2777,6 @@ such app or rule".
         "items": [
           {
             "id": "ftr_1",
-            "app_id": "tank_process",
             "data_name": "level",
             "operator": ">=",
             "threshold": 80.0,
@@ -2810,7 +2845,7 @@ If a request exceeds the available tokens, it is rejected with an HTTP 429 statu
 .. code-block:: json
 
    {
-     "error_code": 429,
+     "error_code": "rate-limit-exceeded",
      "message": "Too many requests. Please retry after 10 seconds.",
      "parameters": {
        "retry_after": 10,
@@ -2819,10 +2854,29 @@ If a request exceeds the available tokens, it is rejected with an HTTP 429 statu
      }
    }
 
+.. _rest-authentication:
+
 Authentication Endpoints
 ------------------------
 
 JWT-based authentication with Role-Based Access Control (RBAC).
+
+The ``/auth/*`` endpoints, and the authentication middleware guarding every
+other route, answer errors in the RFC 6749 section 5.2 shape rather than the
+SOVD ``GenericError`` used everywhere else:
+
+.. code-block:: json
+
+   {
+     "error": "invalid_grant",
+     "error_description": "Refresh token is expired or unknown"
+   }
+
+``/auth/authorize`` and ``/auth/token`` accept the request body as either
+``application/json`` or ``application/x-www-form-urlencoded``, the encoding
+RFC 6749 clients default to. ``/auth/revoke`` accepts JSON only, and per
+RFC 7009 section 2.2 answers ``200`` whether or not the submitted token was
+valid - so it never returns ``401``.
 
 .. seealso::
 
@@ -3134,19 +3188,42 @@ the full field listing.
 Error Responses
 ---------------
 
-All error responses follow a consistent format:
+Every error carries the SOVD ``GenericError`` body - a flat object, not a
+nested ``error`` envelope:
 
 .. code-block:: json
 
    {
-     "error": {
-       "code": "ERR_ENTITY_NOT_FOUND",
-       "message": "Entity not found",
-       "details": {
-         "entity_id": "unknown_component"
-       }
+     "error_code": "entity-not-found",
+     "message": "Entity not found",
+     "parameters": {
+       "entity_id": "unknown_component"
      }
    }
+
+``error_code`` and ``message`` are always present. ``parameters`` is
+cause-specific and omitted when there is nothing to add.
+
+A vendor-specific failure carries a **fourth** key. The gateway rewrites
+``error_code`` to the sentinel ``vendor-error`` and moves the real
+``x-medkit-*`` code into ``vendor_code``, so a generic SOVD client sees a code
+it knows while the precise one stays available:
+
+.. code-block:: json
+
+   {
+     "error_code": "vendor-error",
+     "vendor_code": "x-medkit-gateway-shutdown",
+     "message": "Gateway is shutting down"
+   }
+
+Match on ``error_code``, and on ``vendor_code`` when ``error_code`` is
+``vendor-error``. Do not match on ``message`` - it is prose and changes.
+
+The ``/auth/*`` endpoints are the one exception: they answer RFC 6749
+section 5.2 ``{"error": "...", "error_description": "..."}`` instead, as does
+the authentication middleware on the 401 and 403 it returns ahead of any
+route. See :ref:`rest-authentication`.
 
 Common Error Codes
 ~~~~~~~~~~~~~~~~~~
@@ -3168,29 +3245,69 @@ Vendor-specific ``x-medkit-*`` codes are enveloped: the response carries
    * - ``resource-not-found``
      - 404
      - The requested resource (topic, service, parameter) does not exist
+   * - ``operation-not-found``
+     - 404
+     - The named operation does not exist on this entity
    * - ``invalid-request``
      - 400
-     - Invalid request body or missing required parameters
-   * - ``precondition-not-fulfilled``
-     - 409
-     - The resource's current state does not allow the request - e.g.
-       ``execute`` on an execution that is still running
+     - Malformed request body (not valid JSON, or not an object). The same code
+       also appears below with a 409, on a lock acquire collision - read the
+       status, not the code alone, to tell the two apart.
    * - ``invalid-parameter``
      - 400
-     - Invalid parameter value (including malformed entity IDs)
-   * - ``internal-error``
-     - 500
-     - Internal server error
+     - A field or query parameter failed validation. ``parameters.parameter``
+       names the offending one.
+   * - ``collection-not-supported``
+     - 400
+     - This entity type does not serve the requested resource collection
+   * - ``precondition-not-fulfilled``
+     - 409
+     - The request conflicts with current state (e.g. a duplicate
+       ``fault_code`` on a fault-trigger rule)
+   * - ``lock-broken``
+     - 409
+     - A guarded write was refused because another client holds a lock on the
+       entity. ``parameters.lock_id`` names it.
+   * - ``invalid-request``
+     - 409
+     - The request conflicts with the current state of the resource. This is
+       **not** lock-specific - operations use it to refuse re-executing a
+       running operation, for instance - so do not assume lock semantics or a
+       lock-shaped ``parameters``. ``message`` identifies the conflict and
+       ``parameters`` varies with it. For the lock cases and what each one
+       carries, see :ref:`the lock refusal table <rest-lock-refusals>`. The
+       same code also appears with 400 for a malformed body - see the row
+       above.
+   * - ``insufficient-access-rights``
+     - 403
+     - A lifecycle provider refused the transition (``AccessDenied``). Not a
+       lock error - the lock routes never emit this code.
+   * - ``forbidden``
+     - 403
+     - The caller is not the owner of the lock it tried to release or extend
+       (``LockManager``'s ``lock-not-owner``).
+   * - ``payload-too-large``
+     - 413
+     - Upload exceeds the configured size limit
+   * - ``not-implemented``
+     - 501
+     - The feature is not enabled, or no backend is configured for it
+   * - ``service-unavailable``
+     - 503
+     - A backing service (fault store, subscription manager) refused
    * - ``not-responding``
      - 504
      - The underlying ROS 2 entity did not respond in time; the outcome of
        the request is unknown
-   * - ``unauthorized``
-     - 401
-     - Authentication required or token invalid
-   * - ``forbidden``
-     - 403
-     - Insufficient permissions for this operation
+   * - ``rate-limit-exceeded``
+     - 429
+     - Client exceeded its request quota
+   * - ``internal-error``
+     - 500
+     - Unhandled failure. ``parameters.details`` carries the cause.
+   * - ``vendor-error``
+     - varies
+     - A vendor-specific failure; read ``vendor_code`` for the real code
    * - ``x-medkit-plugin-error``
      - 400-599
      - Plugin provider returned an error. Status varies by plugin. Message truncated to 512 chars.
@@ -3204,12 +3321,167 @@ Vendor-specific ``x-medkit-*`` codes are enveloped: the response carries
      - Could not create the underlying ROS 2 subscription (rcl error during slot
        creation). Transient: retry once after a short backoff. Persistent failure
        usually indicates a publisher type mismatch or a missing IDL package.
+   * - ``x-medkit-resource-sample-failed``
+     - n/a
+     - A cyclic subscription's sampler could not read the resource on this
+       tick. Delivered inside the SSE frame's ``error`` object, never as an
+       HTTP status; the stream stays open and the next tick is retried.
    * - ``x-medkit-cold-wait-cap-exceeded``
      - 503
      - Too many concurrent /data callers are waiting on cold (publisher-but-no-data)
        topics. Retry with exponential backoff. ``params.cold_wait_cap`` carries the
        configured cap. Tune via ``data_provider.cold_wait_cap`` and
        ``data_provider.max_parallel_samples`` if this fires under normal load.
+   * - ``x-medkit-ros2-topic-unavailable``
+     - 404
+     - The data resource names a topic the ROS 2 graph does not currently have
+   * - ``x-medkit-ros2-service-unavailable``
+     - 500
+     - A ROS 2 service call backing an operation failed
+   * - ``x-medkit-ros2-action-rejected``
+     - 400
+     - A ROS 2 action server rejected the goal
+   * - ``x-medkit-ros2-action-unavailable``
+     - 500
+     - A ROS 2 action execution failed
+   * - ``x-medkit-ros2-parameter-read-only``
+     - 403
+     - The configuration parameter is declared read-only on the node
+   * - ``x-medkit-update-not-found``
+     - 404
+     - No update package with that id
+   * - ``x-medkit-update-already-exists``
+     - 400
+     - An update package with that id is already registered
+   * - ``x-medkit-update-in-progress``
+     - 409
+     - Another update is executing, or this one is being deleted
+   * - ``x-medkit-update-not-prepared``
+     - 400
+     - ``execute`` was called before ``prepare`` completed
+   * - ``x-medkit-update-not-automated``
+     - 400
+     - ``automated`` was requested on a package whose ``automated`` is false
+   * - ``x-medkit-script-already-exists``
+     - 409
+     - A script with that id already exists
+   * - ``x-medkit-managed-script``
+     - 409
+     - The script is manifest-managed and cannot be modified over REST
+   * - ``x-medkit-script-running``
+     - 409
+     - The script has a running execution and cannot be deleted
+   * - ``x-medkit-script-not-running``
+     - 409
+     - A control action was sent to an execution that is not running
+   * - ``x-medkit-concurrency-limit``
+     - 429
+     - The script backend's concurrent-execution limit was reached
+   * - ``x-medkit-script-too-large``
+     - 413
+     - The uploaded script exceeds the configured size limit
+   * - ``x-medkit-ros2-node-unavailable``
+     - 503
+     - The node backing a configuration read or write did not answer in time
+   * - ``x-medkit-invalid-resource-uri``
+     - 400
+     - A trigger or subscription ``resource`` URI does not parse
+   * - ``x-medkit-entity-mismatch``
+     - 400
+     - A trigger or subscription ``resource`` URI names a different entity than
+       the route it was posted to
+   * - ``x-medkit-collection-not-supported``
+     - 400
+     - The ``resource`` URI names a collection triggers and subscriptions
+       cannot observe
+   * - ``x-medkit-collection-not-available``
+     - 400
+     - The ``resource`` URI names a collection this entity does not serve
+   * - ``x-medkit-unsupported-protocol``
+     - 400
+     - The requested subscription ``protocol`` has no registered transport
+
+The table is kept complete by a check rather than by review:
+``scripts/check_error_codes_documented.py`` (ctest
+``gateway_error_codes_documented``) fails if any ``ERR_*`` declared in
+``error_codes.hpp`` and named anywhere in the gateway's sources, its headers,
+or an in-tree plugin is missing from **this table** - a mention elsewhere in
+this guide does not count. So the claim it backs is exactly: every error code
+this repository can put on the wire appears above.
+
+What that check does not reach, and this sentence therefore does not claim: a
+third-party plugin may raise codes declared nowhere in this repository, and the
+statuses and descriptions in the third column are read from the emitters by
+hand. One code is excluded by name in the script, with its reason -
+``x-medkit-internal-forwarded``, a framework sentinel the error writer returns
+on before rendering anything.
+
+Several codes are reached by more than one internal cause. Locking is where
+that matters most, because its outcomes are spread across five rows above;
+this is every refusal the lock routes can produce:
+
+.. _rest-lock-refusals:
+
+.. list-table:: Lock refusals, by internal cause
+   :header-rows: 1
+   :widths: 26 12 24 38
+
+   * - Internal cause
+     - Status
+     - ``error_code``
+     - Notes
+   * - ``lock-conflict``
+     - 409
+     - ``invalid-request``
+     - Entity already locked. Carries ``existing_lock_id``; retryable with
+       ``break_lock``
+   * - ``lock-not-breakable``
+     - 409
+     - ``invalid-request``
+     - What a ``break_lock`` retry returns when the held lock forbids it. Also
+       carries ``existing_lock_id``
+   * - ``lock-not-owner``
+     - 403
+     - ``forbidden``
+     - Releasing or extending a lock held by another client
+   * - ``lock-not-found``
+     - 404
+     - ``resource-not-found``
+     - No lock on the entity, or it has expired
+   * - ``invalid-expiration``
+     - 400
+     - ``invalid-parameter``
+     - Expiration or extension exceeding the configured maximum. The
+       non-positive branch never gets this far - the handler rejects it first
+       with its own ``invalid-parameter``
+   * - ``lock-required``
+     - 409
+     - ``invalid-request``
+     - The entity's manifest requires a lock for this collection and the caller
+       holds none. Carries ``details``, ``entity_id`` and ``collection``, and -
+       unlike the two rows above - **no** ``existing_lock_id``, because no lock
+       exists to name
+   * - (guarded write)
+     - 409
+     - ``lock-broken``
+     - A write refused because another client's lock covers the collection.
+       Always carries ``entity_id`` and ``collection``; carries ``lock_id`` only
+       when the blocking lock could be identified. Comes from the request
+       handler rather than from ``LockManager``
+
+Three refusals the manager can construct are shadowed by an earlier handler
+check and so do not reach a client in that form: ``lock-disabled`` (the lock
+routes answer ``501`` ``not-implemented`` before ``LockManager`` is consulted),
+unknown scope, and non-positive expiration (``LockHandlers`` validates both
+against the same vocabulary first and emits its own ``400``
+``invalid-parameter``, with ``parameters.invalid_scope`` naming the offending
+scope).
+
+On ``PUT`` / ``DELETE .../locks/{lock_id}`` the ``404`` a client normally meets
+is the handler's - it checks the lock exists and belongs to the entity before
+delegating, and its body carries ``lock_id`` and ``entity_id``. The manager's
+own parameter-free ``404`` is still reachable in the narrow window where the
+lock expires between those two lookups.
 
 .. _rest-range-rejection:
 

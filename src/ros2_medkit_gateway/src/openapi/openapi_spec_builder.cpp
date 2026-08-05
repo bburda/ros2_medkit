@@ -16,6 +16,9 @@
 
 #include "schema_builder.hpp"
 
+#include "ros2_medkit_gateway/dto/auth.hpp"
+#include "ros2_medkit_gateway/dto/schema_writer.hpp"
+
 namespace ros2_medkit_gateway {
 namespace openapi {
 
@@ -129,6 +132,12 @@ nlohmann::json OpenApiSpecBuilder::build() const {
   if (!spec["components"].contains("schemas") || !spec["components"]["schemas"].contains("GenericError")) {
     spec["components"]["schemas"]["GenericError"] = SchemaBuilder::generic_error();
   }
+  // Same for OAuth2Error: the Unauthorized / Forbidden component responses
+  // below reference it unconditionally, and a sub-page spec that never calls
+  // add_schemas() would otherwise ship a $ref pointing at nothing.
+  if (!spec["components"]["schemas"].contains("OAuth2Error")) {
+    spec["components"]["schemas"]["OAuth2Error"] = dto::SchemaWriter<dto::OAuth2Error>::schema();
+  }
   // Uses $ref to components/schemas/GenericError so the schema is defined once
   spec["components"]["responses"]["GenericError"]["description"] = "SOVD GenericError response";
   spec["components"]["responses"]["GenericError"]["content"]["application/json"]["schema"] =
@@ -141,18 +150,24 @@ nlohmann::json OpenApiSpecBuilder::build() const {
   // guards.
   auto & responses = spec["components"]["responses"];
 
-  // AuthMiddleware puts the RFC 6749 `{error, error_description}` shape on the
-  // wire for 401/403, which no component schema describes yet; these two point
-  // at GenericError until that schema exists, because referencing an undefined
-  // component would break the document's ref-resolution contract outright.
+  // The RFC 6749 body the `/auth/*` handlers return. Referenced per-route by
+  // `add_error_ref` when the route's ErrorRenderer is kOAuth2Error, so the
+  // three OAuth2 endpoints stop claiming a SOVD GenericError they never emit.
+  responses["OAuth2Error"]["description"] = "RFC 6749 section 5.2 error response.";
+  responses["OAuth2Error"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("OAuth2Error");
+
+  // AuthMiddleware answers 401 and 403 ahead of routing, on every route, and
+  // both serialise `AuthErrorResponse::to_json()` = {error, error_description}.
+  // That is the RFC 6749 shape, not the SOVD one - these pointed at
+  // GenericError only because no OAuth2Error schema existed to point at.
   responses["Unauthorized"]["description"] = "Authentication is missing or the bearer token is invalid.";
-  responses["Unauthorized"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("GenericError");
+  responses["Unauthorized"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("OAuth2Error");
   responses["Unauthorized"]["headers"]["WWW-Authenticate"] = {
       {"description", "Bearer challenge, e.g. `Bearer realm=\"ros2_medkit_gateway\", error=\"invalid_token\"`."},
       {"schema", {{"type", "string"}}}};
 
   responses["Forbidden"]["description"] = "The token is valid but lacks the scope this operation requires.";
-  responses["Forbidden"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("GenericError");
+  responses["Forbidden"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("OAuth2Error");
 
   // The rate limiter emits the SOVD GenericError shape, so unlike the two
   // above this schema already matches the wire.

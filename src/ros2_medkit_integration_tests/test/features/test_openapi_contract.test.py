@@ -406,29 +406,96 @@ class TestOpenApiContract(GatewayTestCase):
         self.assertGreater(checked, 0, 'No binary downloads in the document')
 
     def test_sse_routes_declare_the_event_stream_media_type(self):
-        """Every SSE route declares ``text/event-stream`` and no frame schema.
+        """Every SSE route declares ``text/event-stream`` and its frame shape.
 
         The media type is what cpp-httplib is handed at
         ``set_chunked_content_provider``, so the document and the wire come
-        from one fact. No schema: the three SSE families put different shapes
-        in ``data:``, and one schema would be wrong for two of them.
+        from one fact.
+
+        The frame schema is per-family, not global: the three families put
+        different shapes in ``data:``, so ``sse()`` declares none and each
+        registration attaches its own. Declaring a schema against
+        ``text/event-stream`` is sound because a ``data:`` field is a JSON
+        document - unlike a binary download, where the media type is the whole
+        description and ``response()`` still refuses a schema.
         """
-        streams = []
+        streams = {}
         for path, method, op in self.operations():
             content = op.get('responses', {}).get('200', {}).get('content', {})
             if 'text/event-stream' not in content:
                 continue
-            streams.append(f'{method.upper()} {path}')
+            where = f'{method.upper()} {path}'
             self.assertEqual(
                 list(content), ['text/event-stream'],
-                f'{method.upper()} {path}: an event stream declares one media type')
-            self.assertNotIn(
-                'schema', content['text/event-stream'],
-                f'{method.upper()} {path}: SSE frames have no single schema to declare')
+                f'{where}: an event stream declares one media type')
+            schema = content['text/event-stream'].get('schema', {})
+            self.assertIn(
+                '$ref', schema, f'{where}: event stream without a frame schema')
+            streams[where] = schema['$ref'].split('/')[-1]
         # Four trigger-event streams (one per entity type), three subscription
         # streams (apps / components / functions) and the global fault stream.
         self.assertEqual(
             len(streams), 8, f'expected 8 SSE routes, found {sorted(streams)}')
+        # Three distinct shapes across the eight routes; a single one would
+        # mean a family had been given another family's schema.
+        self.assertEqual(
+            set(streams.values()),
+            {'TriggerEventFrame', 'SubscriptionEventFrame', 'FaultStreamEvent'},
+            f'frame schemas: {streams}')
+        self.assertEqual(streams['GET /faults/stream'], 'FaultStreamEvent')
+
+    def test_sse_routes_keep_their_stream_headers(self):
+        """Naming the frame shape does not cost the stream its headers.
+
+        The frame schema is attached after ``sse()`` has already declared the
+        200 and its headers. Attaching it with a second ``response(200, ...)``
+        would replace that response object wholesale and silently drop them,
+        which is exactly the kind of loss a reader would not notice.
+        """
+        checked = 0
+        for path, method, op in self.operations():
+            ok = op.get('responses', {}).get('200', {})
+            if 'text/event-stream' not in ok.get('content', {}):
+                continue
+            checked += 1
+            headers = ok.get('headers', {})
+            self.assertIn('Cache-Control', headers, f'{method.upper()} {path}')
+            self.assertIn('X-Accel-Buffering', headers, f'{method.upper()} {path}')
+        self.assertEqual(checked, 8)
+
+    def test_fault_stream_declares_the_replay_header(self):
+        """``Last-Event-ID`` is declared, because the stream sets ``id:``.
+
+        The fault stream is the only one that numbers its frames, and it parses
+        ``Last-Event-ID`` to resume after a drop. Undeclared, the ``id:`` field
+        is a number a client can see and cannot use.
+        """
+        op = self.spec()['paths']['/faults/stream']['get']
+        header = self.header_params(op).get('Last-Event-ID')
+        self.assertIsNotNone(header, 'fault stream without Last-Event-ID')
+        self.assertFalse(
+            header.get('required'),
+            'a first connection has no last event id')
+
+    def test_binary_downloads_still_refuse_a_frame_schema(self):
+        """The SSE relaxation did not open the door for binary bodies.
+
+        ``response()`` publishes a schema against a non-JSON media type only
+        when every declared type carries a JSON document. This pins the other
+        side of that rule: a rosbag download must stay described by its media
+        type alone.
+        """
+        checked = 0
+        for path, method, op in self.operations():
+            if not op.get('x-medkit-partial-content'):
+                continue
+            for code in ('200', '206'):
+                for media_type, media in op['responses'][code]['content'].items():
+                    checked += 1
+                    self.assertNotIn(
+                        'schema', media,
+                        f'{method.upper()} {path}: {code} {media_type} carries a schema')
+        self.assertGreater(checked, 0, 'No binary downloads in the document')
 
     def test_partial_content_routes_declare_the_range_request(self):
         """The response half of the Range contract has a request half.
@@ -693,6 +760,191 @@ class TestOpenApiContract(GatewayTestCase):
             if name not in spec.get('components', {}).get(section, {}):
                 dangling.append(ref)
         self.assertEqual(dangling, [], f'dangling refs: {dangling}')
+
+    def test_auth_endpoints_declare_the_oauth2_error_shape(self):
+        """RFC 6749 endpoints must not declare the SOVD error body.
+
+        `/auth/*` routes set `.error_renderer(kOAuth2Error)`, so every error
+        their handler returns reaches the wire as
+        ``{error, error_description}``. The document used to say
+        ``GenericError`` on all of them, which told a generated client to read
+        ``error_code`` on a body that has no such key.
+        """
+        checked = 0
+        for path, method, op in self.operations():
+            if not path.startswith('/auth/'):
+                continue
+            for code in ('400', '500'):
+                ref = op['responses'].get(code, {}).get('$ref', '<absent>')
+                checked += 1
+                self.assertIn(
+                    'OAuth2Error', ref, f'{method.upper()} {path} [{code}]: {ref}')
+        self.assertTrue(checked, 'No /auth/ operations in the document')
+
+    def test_auth_token_routes_declare_the_credential_rejection(self):
+        """The two credential-checking routes declare their 401.
+
+        Both answer 401 from the handler on bad credentials or a dead refresh
+        token, independently of ``auth.enabled`` - so unlike the middleware's
+        401 it is always reachable. ``/auth/revoke`` is deliberately excluded:
+        RFC 7009 section 2.2 forbids it from revealing whether the token was
+        valid, so it answers 200 either way and declaring a 401 there would
+        publish a status it cannot return.
+        """
+        for path in ('/auth/authorize', '/auth/token'):
+            op = self.spec()['paths'][path]['post']
+            self.assertIn('401', op['responses'], f'{path}: no 401 declared')
+            self.assertIn('OAuth2Error', op['responses']['401'].get('$ref', ''))
+        revoke = self.spec()['paths']['/auth/revoke']['post']
+        self.assertNotIn(
+            '401', revoke['responses'],
+            '/auth/revoke answers 200 for an invalid token (RFC 7009 2.2)')
+
+    def test_auth_endpoints_accept_form_encoding(self):
+        """RFC 6749 clients default to form encoding; the spec must allow it.
+
+        ``AuthorizeRequest::parse_request`` takes either encoding of the same
+        payload. ``/auth/revoke`` parses JSON only and is excluded on purpose.
+        """
+        for path in ('/auth/authorize', '/auth/token'):
+            media = set(
+                (self.spec()['paths'][path]['post'].get('requestBody') or {})
+                .get('content', {}))
+            self.assertEqual(
+                media, {'application/json', 'application/x-www-form-urlencoded'}, path)
+        revoke_media = set(
+            (self.spec()['paths']['/auth/revoke']['post'].get('requestBody') or {})
+            .get('content', {}))
+        self.assertEqual(revoke_media, {'application/json'}, '/auth/revoke is JSON-only')
+
+    def test_generic_error_declares_the_vendor_code(self):
+        """Vendor errors carry a 4th key the schema must declare.
+
+        ``write_generic_error`` rewrites ``error_code`` to the ``vendor-error``
+        sentinel and moves the real ``x-medkit-*`` code into ``vendor_code``.
+        A schema without that key tells a client every vendor failure is the
+        same error.
+        """
+        props = self.spec()['components']['schemas']['GenericError']['properties']
+        self.assertIn('vendor_code', props)
+        self.assertTrue(props['vendor_code'].get('description'))
+
+    def test_generic_error_declares_the_recoverable_parameters(self):
+        """The `parameters` keys a client branches on are schema, not prose.
+
+        `parameters` is open-ended, so its C++ type publishes
+        ``anyOf: [{}, {"type": "null"}]`` - which does not even say "object".
+        The two keys that carry a recovery path are declared as real
+        properties: ``existing_lock_id`` (the lock to break after a 409 from
+        the acquire) and ``lock_id`` (the lock that blocked a guarded write).
+        ``additionalProperties`` stays open, because the diagnostic keys are an
+        open set and a plugin can add its own.
+        """
+        params = self.spec()['components']['schemas']['GenericError']['properties']['parameters']
+        self.assertEqual(params.get('type'), 'object')
+        self.assertTrue(params.get('additionalProperties'))
+        declared = params.get('properties', {})
+        for key in ('existing_lock_id', 'lock_id'):
+            self.assertIn(key, declared, f'{key} is a recovery key, not diagnostic prose')
+            self.assertEqual(declared[key].get('type'), 'string')
+            self.assertTrue(declared[key].get('description'))
+
+    def test_no_request_body_is_an_untyped_bag(self):
+        """A request body is typed, or explicitly marked opaque.
+
+        Two shapes both mean "some JSON, good luck": the
+        ``{"type": "object", "additionalProperties": true}`` placeholder the
+        multipart helper used to install, and the bare ``{"type": "object"}``
+        a hand-written ``request_body`` produced. Neither tells a generated
+        client a single field name, so neither can be used to build a request.
+
+        ``x-medkit-opaque`` is the escape hatch, and it is deliberately a
+        marker a call site has to write: a body whose shape a plugin decides
+        says so, rather than being indistinguishable from one nobody typed.
+        """
+        offenders = []
+        for path, method, op in self.operations():
+            for media, body in (op.get('requestBody') or {}).get('content', {}).items():
+                schema = body.get('schema', {})
+                if '$ref' in schema or schema.get('x-medkit-opaque'):
+                    continue
+                if schema.get('type') == 'object' and 'properties' not in schema:
+                    offenders.append(f'{method.upper()} {path} [{media}]')
+        self.assertEqual(offenders, [], f'untyped request bodies: {offenders}')
+
+    def test_multipart_bodies_name_their_parts(self):
+        """Every multipart body declares its parts, and binary parts an encoding.
+
+        The rule above only proves a multipart body has *some* properties. This
+        one proves the declaration is usable: a part a client must send is in
+        ``required``, and a part carrying bytes says so through
+        ``encoding.<part>.contentType`` - which in OpenAPI 3.1 is the only way
+        to say it, ``format: binary`` having been dropped with the rest of the
+        pre-2020-12 vocabulary.
+        """
+        checked = 0
+        for path, method, op in self.operations():
+            body = (op.get('requestBody') or {}).get(
+                'content', {}).get('multipart/form-data')
+            if body is None:
+                continue
+            checked += 1
+            where = f'{method.upper()} {path}'
+            schema = body.get('schema', {})
+            self.assertTrue(schema.get('properties'), f'{where}: no parts declared')
+            self.assertIn('file', schema['properties'], f'{where}: no file part')
+            self.assertIn(
+                'file', schema.get('required', []),
+                f'{where}: the file part is rejected when absent, so it is required')
+            self.assertEqual(
+                body.get('encoding', {}).get('file', {}).get('contentType'),
+                'application/octet-stream',
+                f'{where}: binary part without an encoding contentType')
+        # Two script uploads (apps / components) and two bulk-data uploads.
+        self.assertEqual(checked, 4, f'expected 4 multipart bodies, found {checked}')
+
+    def test_no_operation_has_a_content_free_body(self):
+        """A schema is typed, or explicitly opaque with a reason.
+
+        ``{"type": "object"}`` and nothing else is not documentation - it is
+        the absence of it, and a generated client turns it into an untyped
+        map. Some bodies genuinely have no fixed shape because a plugin owns
+        it; those stay opaque and say so, naming who decides the shape and
+        where a client discovers it. What this rule forbids is the silent
+        version.
+        """
+        schemas = self.spec()['components']['schemas']
+        opaque = {n for n, s in schemas.items()
+                  if s.get('type') == 'object' and 'properties' not in s}
+        undocumented = sorted(n for n in opaque if not schemas[n].get('description'))
+        self.assertEqual(undocumented, [], f'opaque without a reason: {undocumented}')
+
+    def test_no_unreachable_schemas(self):
+        """Every named schema is reachable from some operation.
+
+        `components/schemas` is unconditionally all of `dto::AllDtos`, so a DTO
+        that stops being a route's response type - or was never one - keeps
+        shipping a named type every generated client materialises and none can
+        ever receive. The walk mirrors `openapi::unreachable_schemas()`, which
+        the gateway runs over the same document and warns about at request time.
+
+        This fixture launches every optional feature gate on purpose: the
+        script and update routes are conditional, so with them off their
+        schemas would show up here as false orphans.
+        """
+        spec = self.spec()
+        schemas = spec['components']['schemas']
+        seen, frontier = set(), refs_in(spec['paths'])
+        while frontier:
+            ref = frontier.pop()
+            if ref in seen:
+                continue
+            seen.add(ref)
+            section, name = ref[len('#/components/'):].split('/', 1)
+            body = spec['components'].get(section, {}).get(name, {})
+            frontier |= refs_in(body) - seen
+        used = {r.split('/')[-1] for r in seen if '/schemas/' in r}
+        self.assertEqual(sorted(set(schemas) - used), [], 'unreachable schemas')
 
 
 @launch_testing.post_shutdown_test()

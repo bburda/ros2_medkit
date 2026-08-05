@@ -92,6 +92,26 @@ struct ResponseHeader {
   nlohmann::json schema{{"type", "string"}};
 };
 
+/// One named part of a `multipart/form-data` request body.
+///
+/// A part with an empty `schema` is a binary part: OpenAPI 3.1 describes those
+/// by media type in `encoding.<part>.contentType`, not by a schema - `format:
+/// binary` is an OpenAPI 3.0 idiom that 3.1 dropped along with the rest of the
+/// pre-JSON-Schema-2020-12 vocabulary.
+struct MultipartPart {
+  /// Part name exactly as the handler looks it up in `MultipartBody.parts`.
+  std::string name;
+  /// Prose a generated client shows for the part.
+  std::string description;
+  /// Schema for a textual part. Empty means binary - see above.
+  nlohmann::json schema{};
+  /// Whether the handler rejects the request when the part is absent.
+  bool required{false};
+  /// Media type published in `encoding.<part>.contentType`. Empty omits the
+  /// encoding entry entirely, which is what a plain text part wants.
+  std::string content_type{};
+};
+
 /// Fluent builder for a single route entry.
 class RouteEntry {
  public:
@@ -120,6 +140,29 @@ class RouteEntry {
 
   RouteEntry & request_body(const std::string & desc, const nlohmann::json & schema,
                             const std::string & content_type = "application/json");
+
+  /// Declare the parts of this route's `multipart/form-data` body.
+  ///
+  /// Replaces the `{"type":"object","additionalProperties":true}` placeholder
+  /// `multipart_upload` installs, which said only "some form fields" - a
+  /// generated client could not learn that the part is called `file`, that it
+  /// is mandatory, or that `metadata` has to be a JSON document.
+  ///
+  /// Reads as one call because the three facts are one contract: the property,
+  /// whether it is required, and the `encoding` entry that says how the part is
+  /// serialised. Declaring them separately is what lets a body publish two
+  /// thirds of itself.
+  RouteEntry & multipart_body(const std::string & desc, const std::vector<MultipartPart> & parts);
+
+  /// Declare a second media type this route's request body is also accepted in.
+  ///
+  /// `/auth/authorize` and `/auth/token` parse both `application/json` and
+  /// RFC 6749's `application/x-www-form-urlencoded` from one handler
+  /// (`AuthorizeRequest::parse_request`), so what they take is one payload in
+  /// two encodings - two `content` entries on one body, not two routes. Without
+  /// this the document names only JSON, and the form encoding every OAuth2
+  /// client library reaches for by default looks unsupported.
+  RouteEntry & accepts(const std::string & content_type, const nlohmann::json & schema);
 
   /// Typed response: the schema is a $ref to the DTO's component schema.
   template <class T>
@@ -182,6 +225,54 @@ class RouteEntry {
   /// Applies to every declared 2xx, which for a derived route is the single
   /// one `TResponse` produced.
   RouteEntry & success_description(const std::string & desc);
+
+  /// Publish `schema` as the wire shape of this route's success body, leaving
+  /// the status derived from the handler's return type.
+  ///
+  /// For the handful of routes whose C++ return type is an opaque envelope
+  /// (`FaultListResult` and friends) purely so the handler can pass a backend's
+  /// JSON through byte-for-byte, while the *wire* shape on the route is
+  /// nonetheless known. Publishing `{"type":"object"}` there tells a generated
+  /// client nothing about a body whose shape is in fact fixed.
+  ///
+  /// Only legitimate when the route has no plugin-delegation branch: a route
+  /// that can hand back a plugin's own JSON has no single wire shape to
+  /// declare, and naming one would promise fields a plugin never sends.
+  ///
+  /// How far that is checked, exactly - and it is narrower than it looks.
+  /// `test_openapi_response_drift` validates a live body against the declared
+  /// 200 schema only for a GET that is **not** SSE-classified and that declares
+  /// `application/json` (it skips `_is_sse_endpoint` operations and reads no
+  /// other media type). So `GET /faults` is mechanically pinned, and every
+  /// other use of this call is not:
+  ///   * the eight SSE frame declarations below are GETs serving
+  ///     `text/event-stream`, which drift skips on both counts - that is why
+  ///     the subscription frame's `vendor_code` needed a hand-written gtest;
+  ///   * a POST or PUT is out of drift's scope entirely.
+  /// Anything but a plain JSON GET therefore needs a wire assertion written
+  /// alongside it, or the declaration rests on nothing.
+  ///
+  /// Also how an `sse()` route names its frame shape. That helper declares the
+  /// 200 and its `text/event-stream` media type but cannot know which of the
+  /// three frame families the caller is registering - and it attaches the
+  /// stream's response headers, which a second `response(200, ...)` would wipe.
+  /// Attaching a schema to `text/event-stream` is sound because an SSE `data:`
+  /// field *is* a JSON document; attaching one to a binary download is not, and
+  /// is refused on that ground.
+  ///
+  /// Not a `response(2xx, ...)` in disguise: this never mints a response, and
+  /// never touches the status, the description, or the declared headers. A call
+  /// on a route with no declared 2xx - or with more than one, or whose 2xx
+  /// carries a media type no JSON Schema can describe - is dropped and reported
+  /// by `validate_completeness()` rather than silently inventing a response.
+  RouteEntry & success_schema(const nlohmann::json & schema);
+
+  /// Typed form of `success_schema`: the schema is a $ref to the DTO's
+  /// component schema, so the published shape and the DTO cannot drift.
+  template <class T>
+  RouteEntry & success_schema() {
+    return success_schema(nlohmann::json{{"$ref", "#/components/schemas/" + std::string(dto::dto_name<T>)}});
+  }
 
   /// Declare a response header this route sets on `status_code`.
   ///
@@ -339,6 +430,11 @@ class RouteEntry {
   /// silently losing a header the handler sets.
   std::vector<int> undeclared_header_statuses_;
 
+  /// Set when success_schema() found no single declared 2xx to attach to. Kept
+  /// so validate_completeness() reports the miscall instead of the route
+  /// quietly keeping the schema derived from its return type.
+  bool success_schema_without_single_2xx_{false};
+
   /// Error statuses declared via errors(), rendered as GenericError $refs
   /// alongside the blanket 400/404/500 set.
   std::vector<int> declared_errors_;
@@ -353,6 +449,14 @@ class RouteEntry {
     std::string content_type;
   };
   std::optional<RequestBodyInfo> request_body_;
+
+  /// Additional encodings the primary request body is also accepted in,
+  /// appended by accepts() and merged into the same `content` object.
+  std::vector<RequestBodyInfo> extra_bodies_;
+
+  /// `encoding` object for a multipart body: `{<part>: {contentType: ...}}`.
+  /// Emitted beside the request body's schema. Empty for every other body.
+  nlohmann::json multipart_encoding_{};
 
   std::vector<nlohmann::json> parameters_;
 };

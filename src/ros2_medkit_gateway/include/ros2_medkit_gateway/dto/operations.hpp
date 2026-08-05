@@ -267,7 +267,16 @@ struct JsonReader<OperationExecutionResult> {
 template <>
 struct SchemaWriter<OperationExecutionResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"type", "object"},
+        {"additionalProperties", true},
+        {"x-medkit-opaque", true},
+        {"description",
+         "Result of a synchronous operation. The shape belongs to the operation, not to this endpoint: on "
+         "the ROS 2 path it is the service response or action result converted field-for-field from its IDL "
+         "type, and on a plugin-owned entity it is whatever the OperationProvider returns (an OPC-UA method "
+         "result, a UDS service response). Discover the concrete shape from the operation's own document, "
+         "`GET /{entity_type}/{entity_id}/operations/{operation_id}`."}};
   }
 };
 

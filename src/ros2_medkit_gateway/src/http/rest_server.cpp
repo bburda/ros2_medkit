@@ -28,6 +28,8 @@
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
 #include "ros2_medkit_gateway/core/http/parameter_error_classification.hpp"
 #include "ros2_medkit_gateway/core/thread_pool_config.hpp"
+#include "ros2_medkit_gateway/dto/fault_triggers.hpp"
+#include "ros2_medkit_gateway/dto/sse_frames.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/detail/status_recorder.hpp"
 #include "ros2_medkit_gateway/ros2/status/ros2_lifecycle_state_reader.hpp"
@@ -439,9 +441,10 @@ void RESTServer::setup_routes() {
         .path_param("app_id", "App (entity) the rules are scoped to")
         // 501 when the engine is not running (feature off, or no plugin loaded).
         .errors({501})
-        .response(200, "Rule list",
-                  nlohmann::json{{"type", "object"},
-                                 {"properties", {{"items", {{"type", "array"}, {"items", {{"type", "object"}}}}}}}});
+        // `array of object` said nothing about a rule. The schema now comes
+        // from the same descriptor the engine's rule_to_json() field names are
+        // documented against.
+        .response<dto::FaultTriggerRuleList>(200, "Rule list");
 
     route_registry_
         ->raw("post", "/apps/{app_id}/fault-triggers",
@@ -496,11 +499,10 @@ void RESTServer::setup_routes() {
             "all rules (409 on duplicates).")
         .operation_id("createFaultTrigger")
         .path_param("app_id", "App (entity) to scope the rule to")
-        .request_body("Fault-trigger rule definition",
-                      nlohmann::json{{"type", "object"}, {"additionalProperties", true}})
+        .request_body<dto::FaultTriggerRuleCreateRequest>("Fault-trigger rule definition")
         // 501 when the engine is not running (feature off, or no plugin loaded).
         .errors({501})
-        .response(201, "Created rule", nlohmann::json{{"type", "object"}})
+        .response<dto::FaultTriggerRule>(201, "Created rule")
         .response_header(
             201, openapi::ResponseHeader{"Location",
                                          "Absolute path of the created rule, API prefix included (`/api/v1/...`).",
@@ -1134,6 +1136,19 @@ void RESTServer::setup_routes() {
           .tag("Bulk Data")
           .summary(std::string("Upload bulk-data for ") + et.singular)
           .description(std::string("Uploads a file to a bulk-data category for this ") + et.singular + ".")
+          // Part names read off BulkDataHandlers::upload. `file` is the only
+          // one whose absence is a 400; `description` is stored as-is and
+          // `metadata` must parse as a JSON object or the request is rejected.
+          .multipart_body("File to store in the category, with optional description and metadata",
+                          {openapi::MultipartPart{"file", "File content. The part's filename becomes the stored name.",
+                                                  nlohmann::json{}, true, "application/octet-stream"},
+                           openapi::MultipartPart{"description", "Free-text description stored alongside the file.",
+                                                  nlohmann::json{{"type", "string"}}, false, ""},
+                           openapi::MultipartPart{"metadata",
+                                                  "JSON object stored alongside the file. Must be an object; anything "
+                                                  "else is rejected with 400.",
+                                                  nlohmann::json{{"type", "object"}, {"additionalProperties", true}},
+                                                  false, "application/json"}})
           .success_description("File uploaded")
           // BulkDataHandlers::upload -> validate_lock_access("bulk-data").
           .lock_guarded()
@@ -1218,7 +1233,12 @@ void RESTServer::setup_routes() {
               })
           .tag("Triggers")
           .summary(std::string("SSE events stream for trigger on ") + et.singular)
-          .description(std::string("Server-Sent Events stream for trigger notifications on this ") + et.singular + ".")
+          .description(std::string("Server-Sent Events stream for trigger notifications on this ") + et.singular +
+                       ". Each frame's `data:` field is a TriggerEventFrame. An idle stream sends "
+                       "`:keepalive` comment lines every 15s, which carry no JSON.")
+          // The frame TriggerManager builds - {timestamp, payload}, no error
+          // branch, unlike the subscription stream beside it.
+          .success_schema<dto::TriggerEventFrame>()
           .gated_on(triggers_available, triggers_unavailable)
           // TriggerHandlers::sse_trigger_events answers 503 once the SSE
           // client limit is reached. The recorder cannot reach it: the fixture
@@ -1305,7 +1325,12 @@ void RESTServer::setup_routes() {
               })
           .tag("Subscriptions")
           .summary(std::string("SSE events stream for cyclic subscription on ") + et.singular)
-          .description(std::string("Server-Sent Events stream for subscription data on this ") + et.singular + ".")
+          .description(std::string("Server-Sent Events stream for subscription data on this ") + et.singular +
+                       ". Each frame's `data:` field is a SubscriptionEventFrame carrying either the sample "
+                       "or the reason there was none; a failed sample does not close the stream.")
+          // SubscriptionTransportProvider::make_sse_stream's envelope -
+          // {timestamp, payload | error}.
+          .success_schema<dto::SubscriptionEventFrame>()
           // Non-HTTP transports (MQTT, WebSocket, Zenoh) cannot produce an HTTP
           // stream: SubscriptionTransportProvider::make_sse_stream answers 501.
           .errors({501})
@@ -1506,6 +1531,19 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Upload diagnostic script for ") + et.singular)
           .description(std::string("Uploads a diagnostic script for this ") + et.singular + ".")
+          // Part names read off ScriptHandlers::upload_script. `file` is the
+          // only one whose absence is a 400; `metadata` must parse as JSON or
+          // the request is rejected.
+          .multipart_body("Script file, with optional metadata",
+                          {openapi::MultipartPart{"file",
+                                                  "Script content. The part's filename becomes the script name and "
+                                                  "decides the interpreter.",
+                                                  nlohmann::json{}, true, "application/octet-stream"},
+                           openapi::MultipartPart{"metadata",
+                                                  "JSON document stored with the script. Malformed JSON is rejected "
+                                                  "with 400.",
+                                                  nlohmann::json{{"type", "object"}, {"additionalProperties", true}},
+                                                  false, "application/json"}})
           .success_description("Script uploaded")
           // DefaultScriptProvider::upload_script -> FileTooLarge
           .errors({413, 501})
@@ -1553,7 +1591,12 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Start script execution for ") + et.singular)
           .description(std::string("Starts execution of a diagnostic script on this ") + et.singular + ".")
-          .request_body("Execution parameters", SB::generic_object_schema())
+          // The handler parses this body by hand (framework escape hatch) so it
+          // can keep its own 400 messages, which is why the schema is declared
+          // here rather than derived from a TBody template parameter. It still
+          // comes from a DTO descriptor, so the declaration and the fields the
+          // handler reads are one edit apart, not two files apart.
+          .request_body<dto::ScriptExecutionRequest>("Execution parameters")
           .success_description("Execution started")
           // DefaultScriptProvider::start_execution -> ConcurrencyLimit
           .errors({429, 501})
@@ -1840,7 +1883,21 @@ void RESTServer::setup_routes() {
           })
       .tag("Faults")
       .summary("Stream fault events (SSE)")
-      .description("Server-Sent Events stream for real-time fault notifications.")
+      .description(
+          "Server-Sent Events stream for real-time fault notifications. Each frame's `data:` field is a "
+          "FaultStreamEvent, and the frame also carries `id:` (a monotonic event id) and `event:` (the "
+          "event type), so a client can resume after a drop rather than restart.")
+      // SSEFaultHandler::format_sse_event's shape - a third one, with no
+      // `payload` key at all.
+      .success_schema<dto::FaultStreamEvent>()
+      // The other half of the replay protocol. The handler parses this header
+      // (sse_fault_handler.cpp) and replays only events newer than the id, so
+      // without it in the document a client has no way to reconnect without
+      // gaps or duplicates - it is the only reason the `id:` field is there.
+      .header_param("Last-Event-ID",
+                    "Id of the last frame the client received. The stream resumes after it, replaying "
+                    "whatever is still buffered. Omit to start from the next new event.",
+                    /*required=*/false)
       .operation_id("streamFaults");
 
   reg.get<dto::FaultListResult>("/faults",
@@ -1850,6 +1907,15 @@ void RESTServer::setup_routes() {
       .tag("Faults")
       .summary("List all faults globally")
       .description("Retrieve all faults across the system.")
+      // The handler's return type is the opaque `FaultListResult` so the fault
+      // store's items and the peers' merged items pass through byte-for-byte
+      // (`JsonReader<FaultListItem>` would drop any vendor key a newer peer
+      // adds). The wire shape here is nonetheless fixed: unlike the per-entity
+      // list this route has no plugin-delegation branch, so it is always the
+      // FaultManager's own list plus other gateways' merged items - never a
+      // plugin's own JSON. Publishing the concrete schema is what lets a
+      // generated client type this body at all.
+      .success_schema<dto::Collection<dto::FaultListItem, dto::FaultListXMedkit>>()
       // 503 when the fault store cannot be read - same branch as the
       // per-entity list, and equally out of the recorder's reach.
       .errors({503})
@@ -2046,7 +2112,15 @@ void RESTServer::setup_routes() {
       .summary("Authorize client")
       .description("Authenticate and obtain authorization tokens.")
       .request_body("Client credentials", SB::ref("AuthCredentials"))
+      // AuthorizeRequest::parse_request accepts either encoding of the same
+      // payload; declaring only JSON hid the one RFC 6749 clients default to.
+      .accepts("application/x-www-form-urlencoded", SB::ref("AuthCredentials"))
       .operation_id("authorize")
+      // Bad client credentials answer 401 independently of `auth.enabled`
+      // (auth_handlers.cpp: authenticate() failure). The middleware's own 401 is
+      // gated on the auth flag, so without this the document declares no 401 at
+      // all on the one route whose whole purpose is to reject bad credentials.
+      .errors({401})
       .error_renderer(openapi::ErrorRenderer::kOAuth2Error);
 
   reg.post<dto::AuthTokenResponse>("/auth/token",
@@ -2057,7 +2131,11 @@ void RESTServer::setup_routes() {
       .summary("Obtain access token")
       .description("Exchange credentials or refresh token for a JWT access token.")
       .request_body("Token request credentials", SB::ref("AuthCredentials"))
+      .accepts("application/x-www-form-urlencoded", SB::ref("AuthCredentials"))
       .operation_id("getToken")
+      // A refresh token that is expired, revoked or unknown answers 401, again
+      // regardless of `auth.enabled`.
+      .errors({401})
       .error_renderer(openapi::ErrorRenderer::kOAuth2Error);
 
   reg.post<dto::AuthRevokeResponse>("/auth/revoke",
@@ -2067,6 +2145,9 @@ void RESTServer::setup_routes() {
       .tag("Authentication")
       .summary("Revoke token")
       .description("Revoke an access or refresh token.")
+      // No `.accepts(...)` and no `.errors({401})`, unlike the two above:
+      // post_revoke parses JSON only, and per RFC 7009 §2.2 it must not reveal
+      // whether the submitted token was valid, so it answers 200 either way.
       .request_body("Token to revoke", SB::ref("AuthRevokeRequest"))
       .operation_id("revokeToken")
       .error_renderer(openapi::ErrorRenderer::kOAuth2Error);

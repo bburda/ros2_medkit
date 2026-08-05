@@ -17,7 +17,9 @@
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <string_view>
 
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/dto/config.hpp"
 #include "ros2_medkit_gateway/dto/contract.hpp"
 #include "ros2_medkit_gateway/dto/data.hpp"
@@ -310,6 +312,25 @@ TEST(DtoErrors, GenericErrorRoundTrips) {
   EXPECT_EQ(j.at("error_code"), "x-medkit-entity-not-found");
   EXPECT_EQ(j.at("message"), "Entity not found");
   EXPECT_FALSE(j.contains("parameters"));
+  // Unset vendor_code stays off the wire, so a non-vendor error is unchanged
+  // by the field's existence.
+  EXPECT_FALSE(j.contains("vendor_code"));
+}
+
+TEST(DtoErrors, GenericErrorCarriesTheVendorCode) {
+  // The shape `write_generic_error` puts on the wire for an x-medkit-* code:
+  // the sentinel in error_code, the real code alongside it. The schema has to
+  // describe both keys or a client sees every vendor failure as one error.
+  dto::GenericError e{ros2_medkit_gateway::ERR_VENDOR_ERROR, "Entity not found", std::nullopt};
+  e.vendor_code = "x-medkit-entity-not-found";
+  const auto j = dto::JsonWriter<dto::GenericError>::write(e);
+  EXPECT_EQ(j.at("error_code"), "vendor-error");
+  EXPECT_EQ(j.at("vendor_code"), "x-medkit-entity-not-found");
+
+  const auto schema = dto::SchemaWriter<dto::GenericError>::schema();
+  EXPECT_TRUE(schema.at("properties").contains("vendor_code"));
+  const auto & required = schema.at("required");
+  EXPECT_EQ(std::find(required.begin(), required.end(), "vendor_code"), required.end());
 }
 
 TEST(DtoEnums, EntityTypeVocabularyHasFourValues) {
@@ -470,12 +491,33 @@ TEST(XMedkitDtos, AllXMedkitSchemasAreObjects) {
 // All-DTO registry round-trip test
 // =============================================================================
 
+/// Every DTO schema describes a JSON object body, one of two ways: a plain
+/// `type: object`, or an `anyOf` whose every branch is one. The union form is
+/// what the pass-through envelopes publish - a route that answers with an
+/// in-tree DTO for a ROS 2-backed entity and with a plugin's own JSON for a
+/// plugin-owned one has two shapes, and collapsing them to `{type: object}`
+/// (which is what those schemas used to say) told a client nothing about
+/// either. The assertion still rejects a scalar or array body.
+void expect_object_shaped(const nlohmann::json & schema, std::string_view name) {
+  if (schema.contains("anyOf")) {
+    ASSERT_TRUE(schema.at("anyOf").is_array()) << name;
+    ASSERT_FALSE(schema.at("anyOf").empty()) << name;
+    for (const auto & branch : schema.at("anyOf")) {
+      // A $ref branch names a schema this same check covers on its own turn.
+      const bool object_branch = branch.contains("$ref") || (branch.contains("type") && branch.at("type") == "object");
+      EXPECT_TRUE(object_branch) << name << " anyOf branch is not an object: " << branch.dump();
+    }
+    return;
+  }
+  EXPECT_EQ(schema.at("type"), "object") << name;
+}
+
 template <class Tuple, std::size_t I>
 void check_one() {
   using D = std::tuple_element_t<I, Tuple>;
   EXPECT_FALSE(dto::dto_name<D>.empty()) << "DTO at index " << I;
   const auto schema = dto::SchemaWriter<D>::schema();
-  EXPECT_EQ(schema.at("type"), "object") << dto::dto_name<D>;
+  expect_object_shaped(schema, dto::dto_name<D>);
 
   // Value-equality round-trip via double-write compare.
   //

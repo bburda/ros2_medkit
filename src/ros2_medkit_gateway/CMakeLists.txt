@@ -363,6 +363,22 @@ if(BUILD_TESTING)
   )
   set_tests_properties(gateway_plugin_header_purity PROPERTIES LABELS "linter")
 
+  # ─── Error-code documentation coverage ────────────────────────────────────
+  # Fails if any ERR_* with a non-test emitter is missing from the REST
+  # guide's error table. The table carries completeness claims that nothing
+  # else checks, and prose is the tier this branch found least durable.
+  #
+  # Interpreter found explicitly rather than relying on Python3_EXECUTABLE
+  # being set: it is a cache variable our build passes on the command line, so
+  # a configure without it would silently register an empty COMMAND.
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(
+    NAME gateway_error_codes_documented
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_error_codes_documented.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  set_tests_properties(gateway_error_codes_documented PROPERTIES LABELS "linter")
+
   # ─── gateway_core link-time smoke test ────────────────────────────────────
   # Compiles a translation unit including a sampling of core/ headers and
   # links exclusively against gateway_core + GTest. No ament_target_dependencies
@@ -1008,6 +1024,13 @@ if(BUILD_TESTING)
   # Capability generator tests (OpenAPI spec generation engine)
   medkit_add_gtest(test_capability_generator test/test_capability_generator.cpp)
   target_link_libraries(test_capability_generator gateway_ros2)
+
+  # Schema reachability tests (orphan detection over a finished document).
+  # gateway_core, not gateway_ros2: unreachable_schemas() takes a nlohmann::json
+  # and touches no ROS type, so it lives in the neutral layer.
+  ament_add_gtest(test_schema_reachability test/test_schema_reachability.cpp)
+  target_link_libraries(test_schema_reachability gateway_core)
+  medkit_test_needs_no_domain(test_schema_reachability)
 
   # Route registry tests (OpenAPI route registration and path conversion)
   medkit_add_gtest(test_route_registry test/test_route_registry.cpp)

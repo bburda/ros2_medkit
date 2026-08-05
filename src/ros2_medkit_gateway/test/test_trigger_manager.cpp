@@ -281,6 +281,35 @@ TEST_F(TriggerManagerTest, SingleShot_RemovedAfterFiring) {
   EXPECT_TRUE(new_trigger.has_value()) << "Capacity should be freed after one-shot cleanup";
 }
 
+// The frame shape `TriggerEventFrame` publishes, pinned at the point that
+// builds it. Multishot so the trigger is not raced away by the single-shot
+// cleanup path, which is why the neighbouring test can only assert
+// conditionally.
+//
+// `success_schema<TriggerEventFrame>()` on the four trigger-event routes is not
+// reached by `test_openapi_response_drift`: it skips SSE-classified GETs and
+// reads only `application/json`. A declaration nothing checks is a declaration
+// that drifts, so the check is written here instead.
+TEST_F(TriggerManagerTest, EventFrameCarriesTimestampAndPayloadAndNoError) {
+  auto req = make_request("sensor", "OnChange");
+  req.multishot = true;
+  auto created = manager_->create(req);
+  ASSERT_TRUE(created.has_value());
+
+  notifier_.notify("data", "sensor", "/temperature", json(42.0));
+  ASSERT_TRUE(manager_->wait_for_event(created->id, std::chrono::milliseconds(2000)));
+
+  auto event = manager_->consume_pending_event(created->id);
+  ASSERT_TRUE(event.has_value());
+  EXPECT_TRUE(event->at("timestamp").is_string());
+  EXPECT_EQ(event->at("payload"), json(42.0));
+  // No error member: a trigger frame exists only because the condition fired,
+  // so unlike SubscriptionEventFrame there is no failed-sample case to report.
+  EXPECT_FALSE(event->contains("error")) << event->dump();
+  // And nothing beyond the two declared members.
+  EXPECT_EQ(event->size(), 2u) << event->dump();
+}
+
 // @verifies REQ_INTEROP_097
 TEST_F(TriggerManagerTest, Multishot_NotifyTwice) {
   auto req = make_request("sensor", "OnChange");
