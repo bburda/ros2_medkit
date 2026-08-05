@@ -774,6 +774,18 @@ IntrospectionResult OpcuaPlugin::introspect(const IntrospectionInput & /*input*/
     app.is_online = client_->is_connected();
     app.source = "plugin";
     app.description = "PLC application with " + std::to_string(def.data_names.size()) + " data points";
+    // Declare the value-bridge topics on the entity that owns the data points.
+    // Graph discovery attributes them to the gateway node (their publisher),
+    // so without this the entity-scoped topic lookup - what resolves a data
+    // trigger's resource_path - comes up empty and the trigger never fires
+    // (issue #584). Mirrors create_value_publishers(): string-typed entries
+    // get no publisher, so they are not declared either.
+    for (const auto * entry : node_map_.entries_for_entity(def.id)) {
+      if (entry->data_type == "string" || entry->ros2_topic.empty()) {
+        continue;
+      }
+      app.topics.publishes.push_back(entry->ros2_topic);
+    }
     result.new_entities.apps.push_back(std::move(app));
 
     // Register capabilities per entity (never type-level): only PLC-backed

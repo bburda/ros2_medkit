@@ -572,6 +572,23 @@ New entities in ``new_entities`` only appear in responses when
 ``allow_new_entities`` is true in the plugin configuration (or an equivalent
 policy is set).
 
+If the plugin publishes ROS 2 topics that back an entity's data points (the
+PLC-bridge pattern: values mirrored to ``/plc/...`` topics), declare them on
+the entity via ``App::topics`` / ``Component::topics``:
+
+.. code-block:: cpp
+
+   App app;
+   app.id = "my_device";
+   app.topics.publishes.push_back("/plc/main/counter");
+
+Runtime graph discovery attributes a topic to the ROS node that publishes it -
+for plugin-published topics that is the gateway's own node, not the plugin
+entity. Without the declaration, entity-scoped topic lookups on the plugin
+entity return nothing, and in particular data triggers
+(``POST /apps/<id>/triggers`` with a ``data/...`` resource) can never resolve
+and never fire. Declare only topics that actually get a publisher.
+
 ScriptProvider Example
 ----------------------
 

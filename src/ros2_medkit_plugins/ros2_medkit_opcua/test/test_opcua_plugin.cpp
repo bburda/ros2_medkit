@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -223,6 +224,44 @@ TEST_F(OpcuaPluginTest, ListDataReturnsItems) {
   EXPECT_EQ(result->content["items"].size(), 2u);
   EXPECT_EQ(result->content["items"][0]["id"], "level");
   EXPECT_EQ(result->content["items"][1]["id"], "pressure");
+}
+
+TEST(OpcuaPluginIntrospectTopics, DeclaresValueBridgeTopicsOnOwningEntity) {
+  // #584: graph discovery attributes /plc/* topics to the gateway node (their
+  // publisher), so the plugin must declare them on the entity that owns the
+  // data points or entity-scoped topic lookup (data trigger resolution) stays
+  // empty. String-typed entries get no publisher and must not be declared.
+  const std::string yaml_path = "/tmp/test_opcua_introspect_topics.yaml";
+  {
+    std::ofstream f(yaml_path);
+    f << R"(
+area_id: test_plc
+component_id: test_runtime
+nodes:
+  - node_id: "ns=2;i=1"
+    entity_id: tank
+    data_name: level
+    data_type: float
+  - node_id: "ns=2;i=2"
+    entity_id: tank
+    data_name: label
+    data_type: string
+)";
+  }
+  OpcuaPlugin plugin;
+  nlohmann::json config;
+  config["node_map_path"] = yaml_path;
+  config["endpoint_url"] = "opc.tcp://127.0.0.1:1";
+  plugin.configure(config);
+
+  auto result = plugin.introspect({});
+  const auto it = std::find_if(result.new_entities.apps.begin(), result.new_entities.apps.end(), [](const App & a) {
+    return a.id == "tank";
+  });
+  ASSERT_NE(it, result.new_entities.apps.end());
+  ASSERT_EQ(it->topics.publishes.size(), 1u) << "only the float entry has a publisher";
+  EXPECT_EQ(it->topics.publishes[0], "/plc/tank/level");
+  EXPECT_TRUE(it->topics.subscribes.empty());
 }
 
 TEST_F(OpcuaPluginTest, ListDataEntityNotFound) {
