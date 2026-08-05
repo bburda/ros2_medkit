@@ -640,6 +640,14 @@ It consists of five main components:
    - Observers (TriggerManager) register callbacks with filters
    - ``notify()`` is non-blocking - pushes to an internal queue processed by a dedicated worker thread
    - Filters support collection, entity_id, and resource_path matching
+   - **Teardown contract:** producers hold a non-owning ``ResourceChangeNotifier *``, so every producer must be
+     quiesced before the notifier is destroyed. ``notify()``'s internal drain guard only protects calls that are
+     already in progress - it cannot help a call that starts after the object is freed. Most producers notify from
+     executor callbacks, which have already stopped by the time ``~GatewayNode`` runs. ``UpdateManager`` is the
+     exception: its prepare/execute tasks run on their own ``std::async`` threads and notify after the backend
+     returns, so ``~GatewayNode`` calls ``UpdateManager::shutdown()`` (step 4b) to join them before step 5 shuts the
+     notifier down. Relying on member declaration order alone is not sufficient - ``update_mgr_`` is declared before
+     ``resource_change_notifier_``, so reverse destruction frees the notifier first.
 
 3. **ConditionRegistry** ``[gateway_core]`` - Thread-safe registry for condition evaluators.
 

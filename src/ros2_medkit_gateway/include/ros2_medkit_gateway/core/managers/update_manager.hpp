@@ -74,7 +74,18 @@ class UpdateManager {
   void set_backend(UpdateProvider * backend);
 
   /// Set optional notifier for broadcasting update status changes to trigger subsystem.
+  /// The notifier is non-owning and MUST outlive every in-flight update task.
+  /// Owners guarantee that by calling shutdown() before the notifier goes away.
   void set_notifier(ResourceChangeNotifier * notifier);
+
+  /// Stop accepting new operations and wait for every in-flight task to finish.
+  ///
+  /// Update tasks run on their own std::async threads and call
+  /// ResourceChangeNotifier::notify() after the backend returns, so they can
+  /// outlive whatever owns the notifier. Owners must call this before the
+  /// notifier (or the backend) is destroyed. Idempotent; also called from the
+  /// destructor, which is the backstop for standalone use.
+  void shutdown();
 
   /// Check if a backend is loaded
   bool has_backend() const;

@@ -14,10 +14,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <future>
+#include <memory>
+#include <string>
 #include <thread>
 
 #include "ros2_medkit_gateway/core/managers/update_manager.hpp"
+#include "ros2_medkit_gateway/core/resource_change_notifier.hpp"
 
 using namespace ros2_medkit_gateway;
 using json = nlohmann::json;
@@ -697,4 +702,98 @@ TEST(UpdateStatusToJson, EmitsNonePhaseForFreshlyRegistered) {
   EXPECT_EQ(j.at("status"), "pending");
   ASSERT_TRUE(j.contains("x-medkit"));
   EXPECT_EQ(j.at("x-medkit").at("phase"), "none");
+}
+
+/// Backend that parks inside prepare() until the test releases it, so a task
+/// can be held demonstrably in flight across a shutdown() call.
+class GatedUpdateBackend : public MockUpdateBackend {
+ public:
+  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
+    entered_.set_value();
+    released_.get_future().wait();
+    return {};
+  }
+
+  /// Blocks until prepare() is actually running on the async task thread.
+  void wait_until_in_prepare() {
+    entered_.get_future().wait();
+  }
+
+  /// Lets prepare() return.
+  void release() {
+    released_.set_value();
+  }
+
+ private:
+  std::promise<void> entered_;
+  std::promise<void> released_;
+};
+
+// Update tasks run on their own std::async threads and call
+// ResourceChangeNotifier::notify() after the backend returns, so they can
+// outlive the notifier. shutdown() is the drain owners rely on: GatewayNode
+// calls it before the notifier is shut down and freed. If shutdown() stops
+// waiting for in-flight tasks, the notify below lands on a destroyed notifier
+// - which is exactly the heap-use-after-free ASan reported from run_prepare().
+TEST(UpdateManagerLifetime, ShutdownDrainsInFlightTasksBeforeNotifierIsDestroyed) {
+  GatedUpdateBackend backend;
+  auto notifier = std::make_unique<ResourceChangeNotifier>();
+
+  std::atomic<int> terminal_notifications{0};
+  notifier->subscribe(NotifierFilter{"updates", "", ""}, [&terminal_notifications](const ResourceChange & change) {
+    if (change.value.value("status", std::string{}) == "completed") {
+      terminal_notifications.fetch_add(1);
+    }
+  });
+
+  UpdateManager manager;
+  manager.set_backend(&backend);
+  manager.set_notifier(notifier.get());
+
+  ASSERT_TRUE(manager.register_update(json{{"id", "gated-pkg"}, {"update_name", "Gated"}}).has_value());
+  ASSERT_TRUE(manager.start_prepare("gated-pkg").has_value());
+  backend.wait_until_in_prepare();
+
+  // The task is now parked inside prepare(), so it has NOT yet notified.
+  // shutdown() must block until it has. Releasing from another thread after a
+  // delay makes that the measured quantity: if shutdown() fails to drain it
+  // returns while the task is still parked, and the check below fires. Without
+  // the delay the task wins the race on its own and the test proves nothing.
+  std::atomic<bool> shutdown_returned{false};
+  std::thread releaser([&backend, &shutdown_returned]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(shutdown_returned.load()) << "shutdown() returned while a task was still inside prepare()";
+    backend.release();
+  });
+
+  manager.shutdown();
+  shutdown_returned.store(true);
+  releaser.join();
+
+  // Draining the notifier delivers everything notify() enqueued. worker_loop()
+  // only exits once the queue is empty, so after this the count is final.
+  notifier->shutdown();
+  EXPECT_EQ(terminal_notifications.load(), 1) << "shutdown() returned before the in-flight task notified";
+
+  // With the task drained, destroying the notifier while the manager is still
+  // alive is safe - the ordering GatewayNode relies on.
+  notifier.reset();
+}
+
+// shutdown() must be safe to call more than once: GatewayNode calls it during
+// teardown and ~UpdateManager calls it again as the standalone backstop.
+TEST(UpdateManagerLifetime, ShutdownIsIdempotentAndRejectsLaterStarts) {
+  MockUpdateBackend backend;
+  UpdateManager manager;
+  manager.set_backend(&backend);
+
+  ASSERT_TRUE(manager.register_update(json{{"id", "pkg"}, {"update_name", "Test"}}).has_value());
+
+  manager.shutdown();
+  manager.shutdown();
+
+  auto prep = manager.start_prepare("pkg");
+  ASSERT_FALSE(prep.has_value());
+  EXPECT_EQ(prep.error().code, UpdateErrorCode::Internal);
 }

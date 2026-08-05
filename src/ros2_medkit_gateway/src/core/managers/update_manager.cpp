@@ -21,14 +21,21 @@ namespace ros2_medkit_gateway {
 UpdateManager::UpdateManager() = default;
 
 UpdateManager::~UpdateManager() {
-  // Signal background tasks to stop accepting new work
-  stopped_ = true;
+  shutdown();
+}
 
+void UpdateManager::shutdown() {
   // Collect all valid futures, then wait OUTSIDE the lock to avoid
   // deadlock (async tasks also acquire mutex_ during execution).
   std::vector<std::future<void>> futures;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Signal background tasks to stop accepting new work. Setting the flag
+    // under mutex_ closes the window where a start_*() call has already passed
+    // its stopped_ check but has not yet launched: those functions re-check the
+    // flag under this same lock, so nothing can be launched past this point and
+    // escape the drain below.
+    stopped_ = true;
     for (auto & [id, state] : states_) {
       if (state && state->active_task.valid()) {
         futures.push_back(std::move(state->active_task));
@@ -38,6 +45,9 @@ UpdateManager::~UpdateManager() {
   for (auto & f : futures) {
     f.wait();
   }
+  // Moving the futures out above leaves every active_task invalid, so a second
+  // call collects nothing and returns immediately - shutdown() is idempotent
+  // without needing a separate guard flag.
 }
 
 void UpdateManager::set_backend(UpdateProvider * backend) {
@@ -188,11 +198,13 @@ tl::expected<void, UpdateError> UpdateManager::start_prepare(const std::string &
   if (!backend_) {
     return tl::make_unexpected(UpdateError{UpdateErrorCode::NoBackend, "No update backend loaded"});
   }
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Checked under mutex_ so a task can never be launched after shutdown() has
+  // taken its snapshot of the in-flight futures (see UpdateManager::shutdown).
   if (stopped_) {
     return tl::make_unexpected(UpdateError{UpdateErrorCode::Internal, "UpdateManager is shutting down"});
   }
-
-  std::lock_guard<std::mutex> lock(mutex_);
 
   // Verify package exists while holding lock to prevent concurrent deletion
   auto pkg = backend_->get_update(id);
@@ -224,11 +236,12 @@ tl::expected<void, UpdateError> UpdateManager::start_execute(const std::string &
   if (!backend_) {
     return tl::make_unexpected(UpdateError{UpdateErrorCode::NoBackend, "No update backend loaded"});
   }
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Checked under mutex_ - see the note in start_prepare().
   if (stopped_) {
     return tl::make_unexpected(UpdateError{UpdateErrorCode::Internal, "UpdateManager is shutting down"});
   }
-
-  std::lock_guard<std::mutex> lock(mutex_);
 
   auto pkg = backend_->get_update(id);
   if (!pkg) {
@@ -255,11 +268,12 @@ tl::expected<void, UpdateError> UpdateManager::start_automated(const std::string
   if (!backend_) {
     return tl::make_unexpected(UpdateError{UpdateErrorCode::NoBackend, "No update backend loaded"});
   }
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Checked under mutex_ - see the note in start_prepare().
   if (stopped_) {
     return tl::make_unexpected(UpdateError{UpdateErrorCode::Internal, "UpdateManager is shutting down"});
   }
-
-  std::lock_guard<std::mutex> lock(mutex_);
 
   auto supported = backend_->supports_automated(id);
   if (!supported) {
