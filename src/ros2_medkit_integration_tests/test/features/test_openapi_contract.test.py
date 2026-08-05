@@ -42,6 +42,59 @@ from ros2_medkit_test_utils.launch_helpers import (
 
 HTTP_METHODS = {'get', 'post', 'put', 'delete', 'patch', 'head', 'options'}
 
+# Operations the document must mark `x-medkit-lock-guarded`.
+#
+# HAND-MAINTAINED, and honestly so. The list cannot be generated: the header
+# read that decides the 409 sits in `HandlerContext::validate_lock_access`,
+# which 12 handlers across 6 files call, and mapping one of those call sites to
+# an operationId would mean evaluating the runtime string concatenation inside
+# the four-entity-type registration loop in `rest_server.cpp`. So what this
+# list gates is the *document* drifting away from it - dropping a
+# `.lock_guarded()` from a registration turns the suite red. It does NOT catch
+# the list drifting away from the handlers: a new route that calls
+# `validate_lock_access` and forgets both the decorator and an entry here
+# passes. Adding a lock check to a handler means editing this list by hand.
+#
+# Grouped by the handler whose lock check they inherit. Entity types are
+# `Area` / `Component` / `App` / `Function`; bulk-data writes exist only for
+# `Component` / `App` (areas and functions get hidden 405 stubs).
+EXPECTED_LOCK_GUARDED = {
+    # DataHandlers::put_data_item -> validate_lock_access("data")
+    'putAreaDataItem', 'putComponentDataItem', 'putAppDataItem',
+    'putFunctionDataItem',
+    # OperationHandlers::create_execution -> validate_lock_access("operations")
+    'executeAreaOperation', 'executeComponentOperation', 'executeAppOperation',
+    'executeFunctionOperation',
+    # OperationHandlers::update_execution -> validate_lock_access("operations")
+    'updateAreaExecution', 'updateComponentExecution', 'updateAppExecution',
+    'updateFunctionExecution',
+    # OperationHandlers::cancel_execution -> validate_lock_access("operations")
+    'cancelAreaExecution', 'cancelComponentExecution', 'cancelAppExecution',
+    'cancelFunctionExecution',
+    # ConfigHandlers::set_configuration -> validate_lock_access("configurations")
+    'setAreaConfiguration', 'setComponentConfiguration', 'setAppConfiguration',
+    'setFunctionConfiguration',
+    # ConfigHandlers::delete_configuration -> validate_lock_access("configurations")
+    'deleteAreaConfiguration', 'deleteComponentConfiguration',
+    'deleteAppConfiguration', 'deleteFunctionConfiguration',
+    # ConfigHandlers::delete_all_configurations -> validate_lock_access("configurations")
+    'deleteAllAreaConfigurations', 'deleteAllComponentConfigurations',
+    'deleteAllAppConfigurations', 'deleteAllFunctionConfigurations',
+    # FaultHandlers::clear_fault -> validate_lock_access("faults")
+    'clearAreaFault', 'clearComponentFault', 'clearAppFault',
+    'clearFunctionFault',
+    # FaultHandlers::clear_all_faults -> validate_lock_access("faults")
+    'clearAllAreaFaults', 'clearAllComponentFaults', 'clearAllAppFaults',
+    'clearAllFunctionFaults',
+    # LogHandlers::put_logs_configuration -> validate_lock_access("logs")
+    'setAreaLogConfiguration', 'setComponentLogConfiguration',
+    'setAppLogConfiguration', 'setFunctionLogConfiguration',
+    # BulkDataHandlers::upload -> validate_lock_access("bulk-data")
+    'uploadComponentBulkData', 'uploadAppBulkData',
+    # BulkDataHandlers::remove -> validate_lock_access("bulk-data")
+    'deleteComponentBulkData', 'deleteAppBulkData',
+}
+
 _SCRIPTS_DIR = tempfile.mkdtemp(prefix='medkit-contract-scripts-')
 
 PYTHON_SCRIPT = '#!/usr/bin/env python3\nimport json\nprint(json.dumps({"result": "ok"}))\n'
@@ -295,6 +348,272 @@ class TestOpenApiContract(GatewayTestCase):
                 'Accept-Ranges', full.get('headers', {}),
                 f'{method.upper()} {path}: 200 without Accept-Ranges')
         self.assertTrue(marked, 'No partial-content routes in the document')
+
+    def header_params(self, op):
+        """Return {name: parameter} for every header parameter of an operation."""
+        return {
+            p['name']: p
+            for p in op.get('parameters', [])
+            if p.get('in') == 'header'
+        }
+
+    def test_no_response_declares_a_null_schema(self):
+        """No response object carries ``"schema": null``.
+
+        A guard, not a fix for a known defect. ``nlohmann::json`` default-
+        constructs to ``null``, so any emitter that stops checking for an empty
+        schema before writing it publishes ``schema: null`` - which a code
+        generator reads as "a body typed null", not as "no body".
+        """
+        offenders = []
+        checked = 0
+        for path, method, op in self.operations():
+            for code, resp in op.get('responses', {}).items():
+                for media_type, media in resp.get('content', {}).items():
+                    checked += 1
+                    if 'schema' in media and media['schema'] is None:
+                        offenders.append(
+                            f'{op.get("operationId")}: {code} {media_type}')
+        self.assertGreater(checked, 0, 'No response content to check')
+        self.assertEqual(offenders, [], f'null schema: {offenders}')
+
+    def test_binary_downloads_are_not_declared_as_json(self):
+        """A range-aware download declares byte media types, never JSON.
+
+        The download body is raw file content. Declaring it under
+        ``application/json`` told every generated client to parse a rosbag as
+        JSON; the schema that came with it,
+        ``{"type": "string", "format": "binary"}``, is an OpenAPI 3.0 idiom
+        that 3.1 dropped, so it was wrong on both axes at once.
+        """
+        checked = 0
+        for path, method, op in self.operations():
+            if not op.get('x-medkit-partial-content'):
+                continue
+            for code in ('200', '206'):
+                content = op.get('responses', {}).get(code, {}).get('content')
+                self.assertTrue(
+                    content, f'{method.upper()} {path}: {code} declares no content')
+                checked += 1
+                self.assertNotIn(
+                    'application/json', content,
+                    f'{method.upper()} {path}: {code} advertises a binary body as JSON')
+                for media_type, media in content.items():
+                    self.assertNotIn(
+                        'schema', media,
+                        f'{method.upper()} {path}: {code} {media_type} carries a schema; '
+                        'a non-JSON body is declared by media type alone')
+        self.assertGreater(checked, 0, 'No binary downloads in the document')
+
+    def test_sse_routes_declare_the_event_stream_media_type(self):
+        """Every SSE route declares ``text/event-stream`` and no frame schema.
+
+        The media type is what cpp-httplib is handed at
+        ``set_chunked_content_provider``, so the document and the wire come
+        from one fact. No schema: the three SSE families put different shapes
+        in ``data:``, and one schema would be wrong for two of them.
+        """
+        streams = []
+        for path, method, op in self.operations():
+            content = op.get('responses', {}).get('200', {}).get('content', {})
+            if 'text/event-stream' not in content:
+                continue
+            streams.append(f'{method.upper()} {path}')
+            self.assertEqual(
+                list(content), ['text/event-stream'],
+                f'{method.upper()} {path}: an event stream declares one media type')
+            self.assertNotIn(
+                'schema', content['text/event-stream'],
+                f'{method.upper()} {path}: SSE frames have no single schema to declare')
+        # Four trigger-event streams (one per entity type), three subscription
+        # streams (apps / components / functions) and the global fault stream.
+        self.assertEqual(
+            len(streams), 8, f'expected 8 SSE routes, found {sorted(streams)}')
+
+    def test_partial_content_routes_declare_the_range_request(self):
+        """The response half of the Range contract has a request half.
+
+        ``Accept-Ranges`` invites the client to send ``Range``; an undeclared
+        ``Range`` parameter leaves a generated client no way to accept.
+        """
+        checked = 0
+        for path, method, op in self.operations():
+            if not op.get('x-medkit-partial-content'):
+                continue
+            checked += 1
+            where = f'{method.upper()} {path}'
+            headers = self.header_params(op)
+            self.assertIn('Range', headers, f'{where}: 206 declared without a Range parameter')
+            self.assertFalse(
+                headers['Range'].get('required'),
+                f'{where}: a download without Range must still serve the whole body')
+        self.assertGreater(checked, 0, 'No partial-content routes in the document')
+
+    def test_every_operation_declares_the_range_rejection(self):
+        """416 is declared on every operation, because httplib answers it there.
+
+        cpp-httplib rejects an unparseable ``Range`` header in
+        ``Server::process_request``, before routing and before any handler, so
+        the status is reachable on every operation rather than only on the six
+        downloads where a ``Range`` is *useful*.
+        """
+        missing = []
+        wrong_shape = []
+        for path, method, op in self.operations():
+            resp = op.get('responses', {}).get('416')
+            if resp is None:
+                missing.append(f'{method.upper()} {path}')
+                continue
+            if resp.get('$ref') != '#/components/responses/GenericError':
+                wrong_shape.append(f'{method.upper()} {path}')
+        self.assertEqual(missing, [], f'operations not declaring 416: {missing}')
+        self.assertEqual(
+            wrong_shape, [], f'416 not declared as a GenericError: {wrong_shape}')
+
+    def test_range_rejection_is_answered_on_a_route_that_declares_it(self):
+        """Drive the declared 416 on the wire, on a route that is not a download.
+
+        The status recorder cannot see this one - no handler runs - so without
+        a wire check the registry-wide declaration would rest on reading
+        cpp-httplib rather than on observing it. ``/health`` is deliberately
+        not a download: if 416 only ever appeared on the six binary routes,
+        declaring it on all of them would be an over-declaration.
+
+        Reading the vendored header alone gets the body wrong. cpp-httplib
+        writes 416 with no body at all; the gateway's own
+        ``set_error_handler`` then fills any body-less error response with a
+        ``GenericError``, which is why the declaration is a ``$ref`` and not a
+        body-less response object. That is only observable against a real
+        gateway, so it is asserted here rather than in the registry unit tests.
+        """
+        declared = self.spec()['paths']['/health']['get']['responses']
+        self.assertIn('416', declared, 'the assertion below would prove nothing')
+
+        r = requests.get(
+            f'{self.BASE_URL}/health', headers={'Range': 'furlongs=1-2'}, timeout=10)
+        self.assertEqual(r.status_code, 416, r.text)
+        body = r.json()
+        for field in ('error_code', 'message', 'parameters'):
+            self.assertIn(
+                field, body, f'416 body is not the declared GenericError shape: {body}')
+
+        # And the same route answers normally without the header, so the 416
+        # above is the Range rejection and not a broken endpoint.
+        ok = requests.get(f'{self.BASE_URL}/health', timeout=10)
+        self.assertEqual(ok.status_code, 200)
+
+    def test_lock_guarded_set_matches_the_handlers(self):
+        """Every route whose handler checks a lock declares the contract.
+
+        Read the failure message before editing either side: the expected set
+        is hand-maintained (see EXPECTED_LOCK_GUARDED), so a mismatch means
+        either a registration lost its ``.lock_guarded()`` or a handler gained
+        a lock check nobody recorded here.
+        """
+        marked = {op.get('operationId') for _, _, op in self.operations()
+                  if op.get('x-medkit-lock-guarded')}
+        self.assertEqual(marked, EXPECTED_LOCK_GUARDED)
+
+    def test_lock_guarded_routes_declare_the_contract(self):
+        """The marker is not a bare label: it carries a header and a 409.
+
+        A route that says it takes part in locking without publishing the
+        ``X-Client-Id`` it reads, or without the 409 it answers to the wrong
+        client, hands a generated client a marker it cannot act on.
+        """
+        marked = 0
+        for path, method, op in self.operations():
+            if not op.get('x-medkit-lock-guarded'):
+                continue
+            marked += 1
+            where = f'{method.upper()} {path}'
+            headers = self.header_params(op)
+            self.assertIn(
+                'X-Client-Id', headers, f'{where}: lock-guarded without X-Client-Id')
+            self.assertFalse(
+                headers['X-Client-Id'].get('required'),
+                f'{where}: X-Client-Id declared required, but a header-less '
+                f'request succeeds while nothing is locked')
+            self.assertIn(
+                '409', op.get('responses', {}), f'{where}: lock-guarded without 409')
+        self.assertTrue(marked, 'No lock-guarded routes in the document')
+
+    def test_lock_guarded_route_answers_the_409_it_declares(self):
+        """A real write by the wrong client answers the documented 409.
+
+        The marker and the 409 are hand-declared, so on their own they prove
+        only that somebody typed them. This drives the lock through the real
+        gateway: client A takes the lock, client B writes, and the status the
+        wire returns has to be the one the document declares.
+        """
+        op = self.spec()['paths']['/apps/{app_id}/data/{data_id}']['put']
+        self.assertTrue(op.get('x-medkit-lock-guarded'), 'putAppDataItem lost the marker')
+        self.assertIn('409', op.get('responses', {}))
+
+        acquired = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/locks',
+            json={'lock_expiration': 300},
+            headers={'X-Client-Id': 'lock_contract_a'},
+            timeout=10,
+        )
+        self.assertEqual(acquired.status_code, 201, acquired.text)
+        self.addCleanup(
+            requests.delete,
+            f'{self.BASE_URL}/apps/temp_sensor/locks/{acquired.json()["id"]}',
+            headers={'X-Client-Id': 'lock_contract_a'},
+            timeout=10,
+        )
+
+        blocked = requests.put(
+            f'{self.BASE_URL}/apps/temp_sensor/data/engine_temperature',
+            json={'type': 'std_msgs/msg/Float64', 'data': {'data': 42.0}},
+            headers={'X-Client-Id': 'lock_contract_b'},
+            timeout=10,
+        )
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+
+    def test_global_fault_clear_reads_the_client_id_without_declaring_409(self):
+        """``DELETE /faults`` publishes the header but not the lock marker.
+
+        It reads ``X-Client-Id`` like the lock-guarded writes but never answers
+        409: locked entities are silently skipped and the request still answers
+        204, with nothing on the response naming what was skipped. Marking it
+        lock-guarded would publish a status it cannot return.
+
+        The 204 also carries ``X-Medkit-Local-Only``, which is asserted here
+        only to keep the two from being confused: it reports that aggregated
+        peers were not cleared, and says nothing about locks.
+        """
+        op = self.spec()['paths']['/faults']['delete']
+        self.assertIn('X-Client-Id', self.header_params(op))
+        self.assertNotIn('x-medkit-lock-guarded', op)
+        local_only = op['responses']['204'].get('headers', {}).get(
+            'X-Medkit-Local-Only')
+        self.assertIsNotNone(local_only)
+        self.assertNotIn(
+            'lock', (local_only.get('description') or '').lower(),
+            'X-Medkit-Local-Only is about peers, not locks')
+
+    def test_no_fan_out_header_is_declared_as_a_string(self):
+        """``X-Medkit-No-Fan-Out`` is presence-only, so it is not a boolean.
+
+        The gateway tests ``has_header`` and never reads the value, so
+        ``X-Medkit-No-Fan-Out: false`` still suppresses fan-out. A boolean
+        schema would promise a generated client the opposite.
+        """
+        declared = 0
+        for path, method, op in self.operations():
+            param = self.header_params(op).get('X-Medkit-No-Fan-Out')
+            if param is None:
+                continue
+            declared += 1
+            where = f'{method.upper()} {path}'
+            self.assertEqual(
+                param.get('schema', {}).get('type'), 'string',
+                f'{where}: X-Medkit-No-Fan-Out is presence-only, not typed')
+            self.assertFalse(
+                param.get('required'), f'{where}: opting out cannot be mandatory')
+        self.assertTrue(declared, 'No fan-out-aware routes in the document')
 
     def test_every_created_or_accepted_declares_location(self):
         """Every 201/202 publishes the `Location` header the handler sets.

@@ -597,15 +597,36 @@ its owner and is one hop by construction.
 populated during periodic cache refresh cycles that fetch entities from all
 healthy peers.
 
+.. _aggregation-fan-out:
+
 **Per-entity resource collections** (data, operations, faults, configurations,
-logs) and the global ``GET /api/v1/faults`` endpoint use real-time **fan-out**
-via ``fan_out_get()`` (handlers call the ``merge_peer_items()`` helper from
-``fan_out_helpers.hpp``): the primary gateway sends the same request to all
+logs) use real-time **fan-out** via ``fan_out_get()``, reached through the
+``merge_peer_items()`` / ``fan_out_collection()`` helpers in
+``fan_out_helpers.hpp``: the primary gateway sends the same request to all
 healthy peers, collects the responses, and merges the ``items`` arrays. If some
 peers fail, the response body includes ``x-medkit.partial: true`` and
-``x-medkit.failed_peers``. Fan-out requests include an
-``X-Medkit-No-Fan-Out`` header to prevent recursive loops when peers have
-bidirectional aggregation.
+``x-medkit.failed_peers``. Fan-out requests carry an ``X-Medkit-No-Fan-Out``
+header, and both helpers return early when the incoming request has it, so a
+peer that aggregates back never fans out a second time. These are the routes
+that declare the header in the OpenAPI document
+(``RouteEntry::fan_out_aware()``).
+
+.. warning::
+
+   The global ``GET /api/v1/faults`` is **not** one of them.
+   ``FaultHandlers::list_all_faults`` calls ``fan_out_get()`` directly rather
+   than through either helper, so it never inspects ``X-Medkit-No-Fan-Out`` -
+   and ``fan_out_get()`` is the code that *sets* the header outbound. Nothing
+   else in ``aggregation/`` guards the loop. Two gateways that peer with each
+   other therefore recurse unbounded on this one route: A queries B, B queries
+   A, and each hop holds a ``std::async`` thread until its timeout, so the
+   thread cost grows with recursion depth.
+
+   The route consequently does not declare the header either - advertising an
+   opt-out it ignores would be worse than silence. Fixing this means routing
+   ``list_all_faults`` through the helper (which changes the per-item wire
+   shape it deliberately preserves) or adding a loop guard inside
+   ``fan_out_get()``; both are aggregation changes, not documentation ones.
 
 **Target-filtered fan-out.** For per-entity paths, ``merge_peer_items()``
 asks ``AggregationManager::get_peer_contributors(id)`` for the list of

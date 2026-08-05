@@ -15,6 +15,7 @@
 #include "route_registry.hpp"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -23,10 +24,17 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/http/detail/forward_response_scope.hpp"
 #include "ros2_medkit_gateway/http/detail/primitives.hpp"
+#include "ros2_medkit_gateway/http/detail/status_recorder.hpp"
+
+#ifdef MEDKIT_STATUS_RECORDER
+#include <mutex>
+#include <tuple>
+#endif
 
 namespace ros2_medkit_gateway {
 
@@ -42,6 +50,66 @@ namespace ros2_medkit_gateway {
 namespace http {
 namespace detail {
 thread_local httplib::Response * tl_forward_response = nullptr;
+
+#ifdef MEDKIT_STATUS_RECORDER
+// Definitions for the test-build-only emitted-status recorder declared in
+// `status_recorder.hpp`. Same placement and the same reason as the sink
+// above: one definition per program, in the core library both static
+// libraries resolve against. Unlike the sink, the recorder needs no
+// thread-local state at all - `StatusRecordingScope` carries the route
+// identity as its own member and `make_error()`'s hook is route-agnostic.
+// See the header for what the recorder observes and what it structurally
+// cannot.
+
+namespace {
+
+struct RecorderState {
+  std::mutex mu;
+  /// (method, OpenAPI templated path, status) actually put on the wire.
+  std::set<std::tuple<std::string, std::string, int>> emitted;
+  /// "file:line -> status" for every `make_error()` that ran.
+  std::set<std::string> error_sites;
+};
+
+RecorderState & recorder_state() {
+  // Function-local static, NOT thread_local: the state is process-wide and
+  // guarded by its own mutex, so it carries none of the initial-exec TLS
+  // hazard that rules out a `static thread_local` in `make_error()`.
+  static RecorderState state;
+  return state;
+}
+
+}  // namespace
+
+void record_error_site(int status, const char * file, int line) {
+  RecorderState & state = recorder_state();
+  std::string site = (file != nullptr ? std::string(file) : std::string("<unknown>")) + ":" + std::to_string(line) +
+                     " -> " + std::to_string(status);
+  const std::lock_guard<std::mutex> lock(state.mu);
+  state.error_sites.insert(std::move(site));
+}
+
+void record_emitted_status(const std::string & method, const std::string & path, int status) {
+  RecorderState & state = recorder_state();
+  const std::lock_guard<std::mutex> lock(state.mu);
+  state.emitted.emplace(method, path, status);
+}
+
+nlohmann::json emitted_status_report() {
+  RecorderState & state = recorder_state();
+  const std::lock_guard<std::mutex> lock(state.mu);
+  nlohmann::json emitted = nlohmann::json::array();
+  for (const auto & [method, path, status] : state.emitted) {
+    emitted.push_back({{"method", method}, {"path", path}, {"status", status}});
+  }
+  nlohmann::json sites = nlohmann::json::array();
+  for (const auto & site : state.error_sites) {
+    sites.push_back(site);
+  }
+  return nlohmann::json{{"emitted", std::move(emitted)}, {"error_sites", std::move(sites)}};
+}
+#endif  // MEDKIT_STATUS_RECORDER
+
 }  // namespace detail
 }  // namespace http
 
@@ -73,6 +141,18 @@ RouteEntry & RouteEntry::response(int status_code, const std::string & desc) {
 
 RouteEntry & RouteEntry::response(int status_code, const std::string & desc, const nlohmann::json & schema) {
   responses_[status_code] = {desc, schema};
+  return *this;
+}
+
+RouteEntry & RouteEntry::response(int status_code, const std::string & desc, const nlohmann::json & schema,
+                                  const std::vector<std::string> & content_types) {
+  if (!schema.empty()) {
+    // Reported, not published, and not asserted - this is a Release build. A
+    // JSON Schema attached to `application/octet-stream` or
+    // `text/event-stream` would describe a body shape nothing validates.
+    schema_on_non_json_statuses_.push_back(status_code);
+  }
+  responses_[status_code] = {desc, {}, {}, content_types};
   return *this;
 }
 
@@ -179,6 +259,10 @@ RouteEntry & RouteEntry::response_header(int status_code, ResponseHeader header)
 }
 
 RouteEntry & RouteEntry::errors(std::initializer_list<int> codes) {
+  return errors(std::vector<int>(codes));
+}
+
+RouteEntry & RouteEntry::errors(const std::vector<int> & codes) {
   for (int code : codes) {
     if (code < 400) {
       // Not an error status. Recording it rather than silently dropping it is
@@ -189,6 +273,36 @@ RouteEntry & RouteEntry::errors(std::initializer_list<int> codes) {
     declared_errors_.push_back(code);
   }
   return *this;
+}
+
+RouteEntry & RouteEntry::lock_guarded() {
+  lock_guarded_ = true;
+  // Optional, not required: a caller that sends no `X-Client-Id` is treated as
+  // an anonymous client, which succeeds while nothing is locked and is refused
+  // once something is. Declaring it required would describe a gateway that
+  // rejects the header-less request outright, which is not what happens.
+  header_param("X-Client-Id",
+               "Identifies the calling client for lock ownership. While a lock protects this "
+               "entity's resource collection, only the client holding it may write; every other "
+               "caller - including one that sends no `X-Client-Id` - is answered 409.",
+               false, nlohmann::json{{"type", "string"}});
+  // Through errors(), not response(): a 409 here carries the SOVD GenericError
+  // body, and errors() is what publishes it against the shared component
+  // response instead of minting a bespoke bodyless one.
+  return errors({409});
+}
+
+RouteEntry & RouteEntry::fan_out_aware() {
+  // The prose deliberately does not promise loop-freedom in general: the
+  // gateway sets this header on its own outbound peer requests, but that only
+  // terminates a recursion on routes that read it - which is exactly the set
+  // carrying this declaration. The global `GET /faults` fans out without
+  // checking it and so is not declared here.
+  return header_param("X-Medkit-No-Fan-Out",
+                      "Present at any value: answer from this gateway alone and do not query "
+                      "aggregated peers. The gateway sets it on its own outbound peer requests, so "
+                      "bidirectional aggregation terminates at the first peer for this operation.",
+                      false, nlohmann::json{{"type", "string"}});
 }
 
 RouteEntry & RouteEntry::only_status(int code, const std::string & desc) {
@@ -382,9 +496,12 @@ RouteEntry & RouteRegistry::sse(const std::string & openapi_path,
   auto & entry = add_route("get", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
   entry.gate_ = gate;
-  // SSE has no JSON schema; mark it explicitly so validate_completeness skips
-  // the success-schema check via its SSE-name heuristic.
-  entry.response(200, "Server-Sent Events stream");
+  // Declared with the media type cpp-httplib is handed two lines above, so the
+  // document and the wire come from one fact rather than from a summary string
+  // containing the word "stream". No frame schema: the three SSE families
+  // (trigger events, subscription data, fault notifications) put different
+  // shapes in `data:`, so a single schema here would be wrong for two of them.
+  entry.response(200, "Server-Sent Events stream", nlohmann::json{}, {"text/event-stream"});
   // Declared here, next to the `set_header` calls above, because that is what
   // stops the two from drifting: the framework owns these headers, so no SSE
   // route can be registered without them and none can document them wrongly.
@@ -396,7 +513,8 @@ RouteEntry & RouteRegistry::sse(const std::string & openapi_path,
 
 RouteEntry &
 RouteRegistry::binary_download(const std::string & openapi_path,
-                               std::function<http::Result<http::BinaryResponse>(http::TypedRequest)> handler) {
+                               std::function<http::Result<http::BinaryResponse>(http::TypedRequest)> handler,
+                               const std::vector<std::string> & media_types) {
   auto renderer = std::make_shared<ErrorRenderer>(ErrorRenderer::kSovdGenericError);
   auto gate = std::make_shared<std::optional<RouteGate>>();
   HandlerFn fn = [handler = std::move(handler), renderer, gate](const httplib::Request & req, httplib::Response & res) {
@@ -438,17 +556,31 @@ RouteRegistry::binary_download(const std::string & openapi_path,
   auto & entry = add_route("get", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
   entry.gate_ = gate;
-  const nlohmann::json binary_schema{{"type", "string"}, {"format", "binary"}};
-
   // The handler never assigns `res.status`, so cpp-httplib decides it: 200, or
-  // 206 when the request carried a satisfiable `Range` - and it fills in
-  // `Content-Range` itself. Advertising `Accept-Ranges` while saying nothing
-  // about what a `Range` request answers would invite clients into an
-  // undocumented response. The `Range` request parameter and the 416 rejection
-  // belong to the full Range contract and are deliberately not declared here.
-  entry.response(200, "Binary download", binary_schema);
-  entry.response(206, "Requested byte range of the file", binary_schema);
+  // 206 when the request carried a `Range` - and it fills in `Content-Range`
+  // itself. Advertising `Accept-Ranges` while saying nothing about what a
+  // `Range` request answers would invite clients into an undocumented response.
+  entry.response(200, "Binary download", nlohmann::json{}, media_types);
+
+  // A multi-range request is answered by wrapping the parts in
+  // `multipart/byteranges` (cpp-httplib `apply_ranges`, the
+  // `req.ranges.size() > 1` branch, which rewrites Content-Type and generates a
+  // boundary). That is a media type the 200 can never carry, so it is declared
+  // on the 206 only, and it is derived from the framework's own behaviour
+  // rather than from what the caller passed in.
+  std::vector<std::string> partial_media_types = media_types;
+  partial_media_types.emplace_back("multipart/byteranges");
+  entry.response(206, "Requested byte range of the file", nlohmann::json{}, partial_media_types);
   entry.mark_partial_content();
+
+  // The request half of the same contract. Optional: without it the route
+  // answers 200 with the whole body, which is the overwhelmingly common case.
+  // ASCII on purpose: every other description the document emits is ASCII, and
+  // the section sign appears in this file only inside comments.
+  entry.header_param("Range",
+                     "Byte range to fetch, per RFC 9110 section 14.2, e.g. `bytes=0-1023`. Several ranges "
+                     "are answered as one `multipart/byteranges` body.",
+                     false, nlohmann::json{{"type", "string"}});
 
   // Set on the response before the content provider takes over, so they ride on
   // whichever status cpp-httplib picks - hence declared on both. Each is
@@ -587,13 +719,38 @@ std::string RouteRegistry::to_regex_path(const std::string & openapi_path, const
 }
 
 // -----------------------------------------------------------------------------
+// entity_scoped - can this route resolve an entity, and therefore forward?
+// -----------------------------------------------------------------------------
+
+bool RouteRegistry::entity_scoped(const std::string & openapi_path) {
+  static const std::array<const char *, 4> kEntityParams = {"{area_id}", "{component_id}", "{app_id}", "{function_id}"};
+  return std::any_of(kEntityParams.begin(), kEntityParams.end(), [&openapi_path](const char * param) {
+    return openapi_path.find(param) != std::string::npos;
+  });
+}
+
+// -----------------------------------------------------------------------------
 // register_all - register all routes with cpp-httplib server
 // -----------------------------------------------------------------------------
 
 void RouteRegistry::register_all(httplib::Server & server, const std::string & api_prefix) const {
   for (const auto & route : routes_) {
     std::string full_path = api_prefix + route.regex_path_;
+#ifdef MEDKIT_STATUS_RECORDER
+    // Test builds only. Mounting point is the one place that knows both the
+    // route's OpenAPI templated path and every response the route produces,
+    // so the recorder attaches here rather than inside the typed wrappers
+    // (which see the handler but not its identity). The identity strings are
+    // captured by value: cpp-httplib owns the resulting std::function and
+    // must not outlive-dangle into the registry's deque.
+    HandlerFn handler = [method = route.method_, path = route.path_,
+                         inner = route.handler_](const httplib::Request & req, httplib::Response & res) {
+      const http::detail::StatusRecordingScope scope(method, path, req, res);
+      inner(req, res);
+    };
+#else
     const auto & handler = route.handler_;
+#endif
 
     if (route.method_ == "get") {
       server.Get(full_path, handler);
@@ -641,10 +798,17 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       operation["x-medkit-alternates"] = true;
     }
     if (route.partial_content_) {
-      // cpp-httplib answers 206 instead of 200 when the request carries a
-      // satisfiable `Range`, so more than one 2xx code is genuine here too -
-      // for a different reason than a variant-returning handler.
+      // cpp-httplib answers 206 instead of 200 whenever the request carries a
+      // `Range` at all, so more than one 2xx code is genuine here too - for a
+      // different reason than a variant-returning handler. Not "a satisfiable
+      // Range": a parseable range past the end of the file still yields 206,
+      // and an unparseable one is rejected with 416 before routing.
       operation["x-medkit-partial-content"] = true;
+    }
+    if (route.lock_guarded_) {
+      // Declared by the registration, never inferred from the handler - see
+      // RouteEntry::lock_guarded() for why that derivation is not available.
+      operation["x-medkit-lock-guarded"] = true;
     }
 
     // Parameters
@@ -737,10 +901,20 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       for (const auto & [code, info] : route.responses_) {
         std::string code_str = std::to_string(code);
         operation["responses"][code_str]["description"] = info.desc;
-        // Guard stays: a default-constructed nlohmann::json is `null`, so
-        // dropping this writes `"schema": null` onto every bodyless 204.
-        if (!info.schema.empty()) {
-          operation["responses"][code_str]["content"]["application/json"]["schema"] = info.schema;
+        if (info.content_types.empty()) {
+          // JSON default. Guard stays: a default-constructed nlohmann::json is
+          // `null`, so dropping it writes `"schema": null` onto every bodyless
+          // 204.
+          if (!info.schema.empty()) {
+            operation["responses"][code_str]["content"]["application/json"]["schema"] = info.schema;
+          }
+        } else {
+          // Non-JSON body: one `content` entry per media type, each an empty
+          // Media Type Object. The absent schema is the point, not an omission
+          // - see RouteEntry::response(status, desc, schema, content_types).
+          for (const auto & media_type : info.content_types) {
+            operation["responses"][code_str]["content"][media_type] = nlohmann::json::object();
+          }
         }
         for (const auto & header : info.headers) {
           auto & header_obj = operation["responses"][code_str]["headers"][header.name];
@@ -783,12 +957,83 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
     // are declared per-route but described once as shared components - that is
     // the only place their headers (`WWW-Authenticate`, `Retry-After`,
     // `X-RateLimit-*`) can live, since no handler return type produces them.
+    //
+    // These run AFTER the `errors()` loop above and `add_response_ref` is
+    // first-wins, so a route that declares a status the middleware also owns
+    // keeps its own: the script manager's concurrency 429 and a lifecycle
+    // provider's AccessDenied 403 both shadow the middleware component on the
+    // routes that declare them. That is deliberate - OpenAPI allows one
+    // response object per status and the route-specific description is the more
+    // useful of the two - but it costs the middleware's headers on those
+    // operations. The body shape is unaffected: Unauthorized, Forbidden and
+    // RateLimited all reference the same GenericError schema. Pinned by
+    // RouteRegistryTest.RouteDeclaredStatusWinsOverTheMiddlewareComponent.
     if (auth_enabled_) {
       add_response_ref("401", "Unauthorized");
       add_response_ref("403", "Forbidden");
     }
     if (rate_limit_enabled_) {
       add_response_ref("429", "RateLimited");
+    }
+
+    // 416 is answered by cpp-httplib itself, before any handler and before
+    // routing: `Server::process_request` rejects an unparseable `Range` header
+    // and writes the response straight out (vendored httplib.h:6616-6622). It
+    // therefore reaches every operation in this document, including paths that
+    // do not exist, which is why it is declared here rather than on the six
+    // download routes - those are where a `Range` is *useful*, not where the
+    // status originates.
+    //
+    // It carries the GenericError body like any other error status, but by a
+    // different route than the rest: cpp-httplib writes no body at all, and
+    // `RESTServer::setup_global_error_handlers` (rest_server.cpp:265-286) fills every
+    // body-less error response with a GenericError on the way out. So the
+    // shape is the same and the $ref is correct - reading only the vendored
+    // header suggests a body-less response, and the gateway's own handler is
+    // what makes that wrong. Pinned on the wire by
+    // test_openapi_contract::test_range_rejection_is_answered_on_a_route_that_declares_it.
+    //
+    // Unlike the limiter's 429 this is gated on nothing: rate limiting is
+    // opt-in, whereas cpp-httplib's Range parsing has no configuration knob
+    // and cannot be turned off.
+    //
+    // Outside only_status() for the same reason as the auth middleware's
+    // 401/403: only_status says the *handler* has one outcome, and no handler
+    // runs before this status is decided.
+    //
+    // The status recorder cannot observe it either - it wraps handlers - so
+    // unlike the statuses derived from recorded runs, this declaration is a
+    // framework-level constant, pinned by
+    // RouteRegistryTest.EveryDocumentedRouteDeclaresTheFrameworkAnsweredRangeRejection.
+    add_error_ref("416");
+
+    // Peer aggregation. When an entity turns out to belong to a peer, the
+    // request is proxied inside `validate_entity_for_route`, and the statuses
+    // the *gateway itself* writes on that path are 502 (peer unknown,
+    // unreachable, or its response over the size cap) and 503 (this gateway is
+    // shutting down and refuses to forward) - see `peer_client.cpp` and
+    // `aggregation_manager.cpp`. Both carry the SOVD GenericError body, so the
+    // shared component describes them correctly.
+    //
+    // Gated the same way as the limiter's 429 and for the same reason:
+    // `aggregation.enabled` defaults false and the AggregationManager is only
+    // constructed when it is set, so with aggregation off no entity is remote
+    // and declaring either status would document an unreachable outcome.
+    //
+    // NOT declared here: the status a healthy peer returns, which is copied
+    // through verbatim (`peer_client.cpp` assigns the peer's own status). No
+    // finite `errors({...})` describes "whatever the peer said", and deciding
+    // what the document should promise there is an aggregation-contract
+    // question, not a documentation one.
+    //
+    // Guarded by `only_status_` as well, for the same reason as the blanket
+    // 400/404/500 above and unlike the middleware refs below: the forward
+    // happens *inside* the handler, so a route that declares itself
+    // single-outcome (the data-categories / data-groups 501 stubs ignore the
+    // request entirely and never resolve an entity) genuinely cannot reach it.
+    if (aggregation_enabled_ && !route.only_status_ && entity_scoped(route.path_)) {
+      add_error_ref("502");
+      add_error_ref("503");
     }
 
     // Use explicit operationId if set, otherwise auto-generate camelCase from path
@@ -896,6 +1141,26 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
                             "; use response() for success and redirect statuses"});
     }
 
+    // A lock-guarded route without its 409 publishes a marker a client cannot
+    // act on. lock_guarded() declares both, so the only way to lose one is a
+    // later only_status(), which clears declared_errors_ and leaves the marker
+    // standing. Reported rather than asserted: this is a release build.
+    const bool declares_409 = std::count(route.declared_errors_.begin(), route.declared_errors_.end(), 409) > 0 ||
+                              route.responses_.count(409) > 0;
+    if (route.lock_guarded_ && !declares_409) {
+      issues.push_back({ValidationIssue::Severity::kError, route_id,
+                        "lock_guarded() marker without a declared 409; a later only_status() clears "
+                        "the status the marker promises"});
+    }
+
+    // A schema handed to the non-JSON response() overload was dropped rather
+    // than attached to a media type it may not describe.
+    for (int code : route.schema_on_non_json_statuses_) {
+      issues.push_back({ValidationIssue::Severity::kError, route_id,
+                        "response() dropped the schema given for non-JSON status " + std::to_string(code) +
+                            "; a non-JSON body is declared by media type, without a schema"});
+    }
+
     // response_header() attaches to an already-declared status. One aimed at a
     // status this route never declares was dropped, so the header the handler
     // sets would be missing from the document with nothing to show for it.
@@ -915,11 +1180,39 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
         }
       }
 
-      // SSE endpoints use text/event-stream, not JSON schema - skip schema check
-      // Convention: SSE endpoints have "SSE" or "stream" in summary
-      bool is_sse = route.summary_.find("SSE") != std::string::npos ||
-                    route.summary_.find("stream") != std::string::npos ||
-                    route.summary_.find("Stream") != std::string::npos;
+      // A 2xx whose body is a non-JSON media type is complete without a schema:
+      // the media type IS the description of the body, and attaching a JSON
+      // Schema to `application/octet-stream` or `text/event-stream` would
+      // describe a shape nothing validates. Covers both escape hatches - the
+      // SSE streams and the range-aware binary downloads - and it reads the
+      // declaration the helper made rather than sniffing the summary string for
+      // the word "stream", so a route cannot acquire the exemption by being
+      // named a certain way.
+      //
+      // The media type has to actually be non-JSON. Accepting any non-empty
+      // `content_types` would exempt a route that declares
+      // `application/json` and no schema, which is precisely the case this
+      // check exists for - a JSON body still owes a shape. That is also the
+      // rule stated in dto_contract.rst and the one
+      // `test_health::test_docs_spec_completeness` enforces on the served
+      // document, so the two gates agree by construction rather than by
+      // coincidence. Pinned by
+      // RouteRegistryTest.SchemaLessJsonSuccessIsStillReported.
+      bool has_non_json_success = false;
+      for (const auto & [code, info] : route.responses_) {
+        if (code < 200 || code >= 300) {
+          continue;
+        }
+        for (const auto & media_type : info.content_types) {
+          if (media_type != "application/json") {
+            has_non_json_success = true;
+            break;
+          }
+        }
+        if (has_non_json_success) {
+          break;
+        }
+      }
 
       // Body-less success statuses need no schema: 204 never carries a body,
       // and a 202 declared without one is an accepted asynchronous transition
@@ -940,7 +1233,8 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
         }
       }
 
-      if (!has_success_response_with_schema && !is_sse && !has_bodyless_success && !has_only_error_responses) {
+      if (!has_success_response_with_schema && !has_non_json_success && !has_bodyless_success &&
+          !has_only_error_responses) {
         issues.push_back({ValidationIssue::Severity::kError, route_id, "Missing response schema for success (2xx)"});
       }
     } else {

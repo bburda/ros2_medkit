@@ -496,7 +496,11 @@ Result<ros2_medkit_gateway::http::BinaryResponse> range_download_handler(TypedRe
 
 RouteEntry & seed_download(RouteRegistry & reg, const std::string & path) {
   std::function<Result<ros2_medkit_gateway::http::BinaryResponse>(TypedRequest)> h = &range_download_handler;
-  return reg.binary_download(path, std::move(h));
+  // Deliberately the single type this fixture's handler serves, with no
+  // catch-all: the production route needs `*/*` because its served set is open,
+  // but a closed list here is what lets the assertions below tell an exact
+  // declaration from a wildcard that would match anything.
+  return reg.binary_download(path, std::move(h), {"application/octet-stream"});
 }
 
 }  // namespace

@@ -13,6 +13,49 @@ All endpoints are prefixed with ``/api/v1``.
    :local:
    :depth: 2
 
+Client Request Headers
+----------------------
+
+Two headers a client may send are read across many endpoints rather than
+belonging to one. Both are optional, and both are declared per-operation in the
+generated OpenAPI document, so a generated client sees them on exactly the
+operations that read them.
+
+``X-Client-Id``
+   Identifies the calling client for :doc:`resource locking <locking>`. Read by
+   every lock-participating write - those operations also carry
+   ``x-medkit-lock-guarded: true`` and declare a ``409``, and
+   :ref:`locking-blocked-operations` lists them. While a lock protects an
+   entity's collection, only the client holding it may write; every other
+   caller, including one that sends no ``X-Client-Id``, is answered ``409``.
+   The lock endpoints themselves also read it: ``POST``/``PUT``/``DELETE``
+   ``/locks`` require it, and the two ``GET`` routes use it only to fill in the
+   ``owned`` field.
+
+   ``DELETE /api/v1/faults`` is the one route that reads it without ever
+   answering ``409``; it silently skips faults on entities locked by another
+   client and still answers ``204``. Nothing on the response reports the skip -
+   ``X-Medkit-Local-Only`` is about aggregated peers, not locks - so re-read the
+   entity's faults to see what survived.
+
+``X-Medkit-No-Fan-Out``
+   Answer from this gateway alone: do not query aggregated peers and do not
+   merge their items. Read by the **per-entity** resource-collection list
+   endpoints (data, operations, configurations, faults, logs) and by ``GET
+   /api/v1/version-info`` - exactly the operations that declare it in the
+   OpenAPI document.
+
+   The gateway sets it on its own outbound peer requests, which stops
+   bidirectional aggregation from recursing **on the routes that check it**.
+   The global ``GET /api/v1/faults`` does not check it, so it neither declares
+   the header nor honours it (see :ref:`the fan-out design note
+   <aggregation-fan-out>`).
+
+   **Presence-only.** The value is never read, so ``X-Medkit-No-Fan-Out:
+   false`` suppresses fan-out exactly like any other value. The OpenAPI schema
+   is a string rather than a boolean for that reason. Omit the header to get
+   the aggregated answer.
+
 Server Capabilities
 -------------------
 
@@ -1692,15 +1735,36 @@ Download a specific bulk-data file.
 
 **Response Headers:**
 
-- ``Content-Type``: ``application/x-mcap`` (MCAP format) or ``application/x-sqlite3`` (db3)
-- ``Content-Disposition``: ``attachment; filename="<recording_id>.mcap"`` (named after the recording actually served, which for a pre-#620 fault-code URL is not the segment the client sent)
+- ``Content-Type``: the media type of the stored artifact - see below
+- ``Content-Disposition``: ``attachment; filename="<name>"``. For a rosbag the
+  name is ``<recording_id>.<format>``: the recording actually served, which for
+  a pre-#620 fault-code URL is not the segment the client sent, and the format
+  is the one persisted at capture time (``mcap`` or ``sqlite3``). For every
+  other category it is the stored item's own name, e.g. ``report.zip``.
 - ``Accept-Ranges``: ``bytes`` - the download is served by a range-aware
   provider, so a client may fetch part of the file
 - ``Access-Control-Expose-Headers``: ``Content-Disposition``
 
-A request carrying a satisfiable ``Range`` header is answered with **206
-Partial Content** and a ``Content-Range: bytes <start>-<end>/<total>`` header
-instead of ``200``; the body is the requested slice.
+**Media types.** The OpenAPI document declares
+``application/x-mcap``, ``application/x-sqlite3`` and
+``application/octet-stream`` for this response, followed by ``*/*``. That is
+not hedging: for the ``rosbags`` category the type is derived from the
+recorded storage format and is one of the three named types, but every other
+category serves back the media type recorded when the file was uploaded, which
+is chosen by the uploading client. Uploading a ``text/csv`` makes the download
+serve ``text/csv``. The named types are declared because they *are*
+derivable; ``*/*`` is declared because the rest genuinely is not.
+
+There is no response schema, for either status. The body is raw file content,
+and OpenAPI 3.1 has no way to say "bytes" - ``format: binary`` was an OpenAPI
+3.0 idiom that 3.1 dropped when it aligned with JSON Schema 2020-12. A
+schema-free media type entry is the accurate description.
+
+**Range requests.** A request carrying a ``Range`` header is answered with
+**206 Partial Content** and a ``Content-Range: bytes <start>-<end>/<total>``
+header instead of ``200``; the body is the requested slice. Several ranges in
+one request are answered as a single ``multipart/byteranges`` body, which is
+declared on the 206 only - the 200 can never carry it.
 
 **Example:**
 
@@ -1708,11 +1772,17 @@ instead of ``200``; the body is the requested slice.
 
    curl -O -J http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/fault_MOTOR_OVERHEAT_1738664999000
 
+   # One byte range
+   curl -H 'Range: bytes=0-1023' \
+     http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/550e8400-e29b-41d4-a716-446655440000
+
 **Response Codes:**
 
 - **200 OK**: File content
 - **206 Partial Content**: The byte range requested via ``Range``, with ``Content-Range``
 - **404 Not Found**: Entity, category, or bulk-data ID not found
+- **416 Range Not Satisfiable**: The ``Range`` header could not be parsed. Not
+  specific to this endpoint - see :ref:`rest-range-rejection`.
 
 Upload Bulk Data
 ~~~~~~~~~~~~~~~~
@@ -2113,6 +2183,48 @@ Upload, manage, and execute diagnostic scripts on entities.
 
 Scripts are available on **Components** and **Apps** entity types.
 The feature must be enabled by setting ``scripts.scripts_dir`` in the gateway configuration.
+
+Script Error Statuses
+~~~~~~~~~~~~~~~~~~~~~
+
+Beyond the usual 400 / 404 / 500, and 501 on every script endpoint when no
+scripts backend is configured, each endpoint answers only what its own backend
+call can produce. With the built-in backend:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 45 55
+
+   * - Endpoint
+     - Extra statuses
+   * - ``POST .../scripts`` (upload)
+     - **413** ``script-file-too-large`` - file over the configured size limit
+   * - ``DELETE .../scripts/{script_id}``
+     - **409** ``script-managed`` (manifest-owned, not editable) or
+       ``script-running``
+   * - ``POST .../scripts/{script_id}/executions``
+     - **429** ``script-concurrency-limit``
+   * - ``PUT .../executions/{execution_id}``
+     - **409** ``script-not-running``
+   * - ``DELETE .../executions/{execution_id}``
+     - **409** ``script-running``
+
+The listing and read endpoints (``GET .../scripts``,
+``GET .../scripts/{script_id}``, ``GET .../executions/{execution_id}``) add
+nothing to the blanket set.
+
+The 429 is the **script manager's** concurrency limit, not the HTTP rate
+limiter's: it is answered whether or not ``rate_limiting.enabled`` is set, and
+carries no ``Retry-After`` or ``X-RateLimit-*`` headers. See
+:ref:`rate-limiting` for the other 429. When the limiter is on, both can answer
+429 on the execution-start route and the document can only describe one: the
+route's own declaration wins, so that operation's 429 is documented as the
+script manager's, without the limiter's headers. The body shape is the same
+either way.
+
+``script-already-exists`` is defined for backends that maintain their own
+registry (a plugin with a SQLite store, say); the built-in backend generates
+ids and never returns it.
 
 Upload Script
 ~~~~~~~~~~~~~
@@ -2634,6 +2746,8 @@ way as every other endpoint.
    the correlation cascade is skipped so the clear stays scoped to the rule's
    own fault.
 
+.. _rate-limiting:
+
 Rate Limiting
 -------------
 
@@ -3071,6 +3185,65 @@ Vendor-specific ``x-medkit-*`` codes are enveloped: the response carries
        topics. Retry with exponential backoff. ``params.cold_wait_cap`` carries the
        configured cap. Tune via ``data_provider.cold_wait_cap`` and
        ``data_provider.max_parallel_samples`` if this fires under normal load.
+
+.. _rest-range-rejection:
+
+Range Rejection (416)
+~~~~~~~~~~~~~~~~~~~~~
+
+Every operation in the OpenAPI document declares **416 Range Not Satisfiable**,
+including operations that have nothing to do with file downloads. This is not
+over-declaration. The HTTP layer parses the ``Range`` header before routing the
+request, so a syntactically invalid ``Range`` is rejected before any handler
+runs - on any path, including paths that do not exist:
+
+.. code-block:: bash
+
+   $ curl -i -H 'Range: furlongs=1-2' http://localhost:8080/api/v1/health
+   HTTP/1.1 416 Range Not Satisfiable
+
+The body is the usual ``GenericError`` shape, which is why the document
+declares it as such rather than as a body-less response: the HTTP layer itself
+writes 416 with an empty body, and the gateway's global error handler then
+fills any body-less error response with a ``GenericError``.
+
+Only the six bulk-data download routes declare a ``Range`` *request* parameter,
+because they are the only routes where sending one is useful. 416 is
+nevertheless reachable everywhere.
+
+416 is not the only status answered this way, and the ``error_code`` in the
+body it produces is a placeholder - see the next section.
+
+.. _rest-framework-error-bodies:
+
+Framework-Produced Error Bodies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some errors are answered by the HTTP layer itself, before any gateway handler
+runs and sometimes before routing. cpp-httplib produces these with an **empty
+body**, and the gateway's global error handler then fills any body-less error
+response with a ``GenericError`` so that clients always receive the same
+envelope. Statuses reaching a client this way include:
+
+- **400** - malformed request line or headers, or an unparseable
+  ``multipart/form-data`` boundary
+- **413** - a form-urlencoded payload over the built-in length cap
+- **414** - request URI too long
+- **416** - unparseable ``Range`` header (see :ref:`rest-range-rejection`)
+- **500** - an exception escaping a handler
+
+**The ``error_code`` on these bodies is a placeholder.** The global handler
+writes ``resource-not-found`` regardless of the actual status, because it runs
+after the fact and has no way to know why the HTTP layer rejected the request.
+So a 413 and a 416 both arrive carrying ``"error_code":
+"resource-not-found"``. (The 404 an unrouted request produces goes through the
+same path, where that code happens to be right - which is why the mismatch is
+easy to miss on the statuses above.)
+
+**Read the HTTP status, not the ``error_code``, whenever the status was not
+produced by a handler.** The codes listed under `Common Error Codes`_ are
+accurate only for errors the gateway itself raises. The ``parameters.status``
+field on these bodies repeats the real status, which is the reliable field.
 
 Plugin Entity Delegation
 ~~~~~~~~~~~~~~~~~~~~~~~~

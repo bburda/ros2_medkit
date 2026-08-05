@@ -24,6 +24,7 @@
 
 #include "ros2_medkit_gateway/core/models/error_info.hpp"
 #include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
+#include "ros2_medkit_gateway/http/detail/status_recorder.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
 #include "ros2_medkit_gateway/http/typed_router.hpp"
 
@@ -66,7 +67,25 @@ inline bool member_is_peer_contributed(const ThreadSafeEntityCache & cache, cons
 /// Build a SOVD-shaped ErrorInfo. Empty `params` are dropped so the wire body
 /// matches the legacy `send_error` default and integration tests stay byte-
 /// identical. Shared by every typed handler (was duplicated per handler TU).
+///
+/// In test builds (`MEDKIT_STATUS_RECORDER`, set from `BUILD_TESTING`) the
+/// call site is recorded so a run can report which of the ~281 error sites it
+/// actually reached - see `http/detail/status_recorder.hpp`. The two extra
+/// parameters default to `__builtin_FILE()` / `__builtin_LINE()`, which
+/// evaluate at the *caller*, so no call site changes. A shipped gateway
+/// compiles neither the parameters nor the call and pays nothing.
+///
+/// The body is written once, under the conditional signature, rather than as
+/// two overloads sharing a helper: the extra inlining frontier that a helper
+/// introduces makes GCC 13's libstdc++ report `-Wnull-dereference` false
+/// positives here (15 of them, verified by compiling this file both ways).
+#ifdef MEDKIT_STATUS_RECORDER
+inline ErrorInfo make_error(int status, const std::string & code, std::string message, nlohmann::json params = {},
+                            const char * site_file = __builtin_FILE(), int site_line = __builtin_LINE()) {
+  http::detail::record_error_site(status, site_file, site_line);
+#else
 inline ErrorInfo make_error(int status, const std::string & code, std::string message, nlohmann::json params = {}) {
+#endif
   ErrorInfo err;
   err.code = code;
   err.message = std::move(message);

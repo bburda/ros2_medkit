@@ -79,6 +79,29 @@ class BulkDataHandlers {
    */
   static std::string get_rosbag_mimetype(const std::string & format);
 
+  /**
+   * @brief Media types `download()` can put on the wire, for the OpenAPI
+   *        document to declare on the six binary-download routes.
+   *
+   * Lives here rather than at the registration because this is the file that
+   * decides the value: the concrete types are exactly the range of
+   * get_rosbag_mimetype(), and a registration cannot see through the handler
+   * to find them.
+   *
+   * The list ends with `*&#47;*` and that entry is load-bearing, not filler. A
+   * non-rosbag category serves BulkDataStore::ItemDescriptor::mime_type, which
+   * is whatever the uploading client put on its multipart part
+   * (bulk_data_store.cpp, `mime_type = content_type.empty() ? ... :
+   * content_type`). Uploading a `text/csv` makes the download serve
+   * `text/csv`, so the served set is open and no finite list is truthful.
+   * Declaring only the three concrete types would under-declare the route -
+   * the defect this document's derivation exists to remove - and declaring
+   * only the catch-all would throw away the part that IS derivable.
+   *
+   * @return Concrete rosbag media types followed by the `*&#47;*` catch-all.
+   */
+  static std::vector<std::string> download_media_types();
+
  private:
   HandlerContext & ctx_;
 

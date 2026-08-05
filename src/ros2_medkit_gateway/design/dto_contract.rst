@@ -87,7 +87,7 @@ erasure, and no separate code-generation step are needed.
            + post_alternates<TBody, TAlt...>(path, handler)
            + del_alternates<TAlt...>(path, handler)
            + sse(path, factory)
-           + binary_download(path, handler)
+           + binary_download(path, handler, media_types)
            + multipart_upload<T>(path, handler)
            + static_asset(path, handler)
            + docs_endpoint(path, handler)
@@ -276,7 +276,7 @@ survivors merged in. No runtime loop over a dynamic registry is required.
 The hand-written schema factories that remain on ``SchemaBuilder`` -
 ``from_ros_msg`` / ``from_ros_srv_request`` / ``from_ros_srv_response`` (for
 dynamic ROS 2 payloads whose field names are not known at compile time) and
-``binary_schema`` / ``generic_object_schema`` - are no longer part of the
+``generic_object_schema`` - are no longer part of the
 ``components/schemas`` map. They are called by the path builder
 (``src/openapi/path_builder.cpp``) to emit *inline* operation schemas for the
 per-topic / per-service / per-action routes, whose request and response shape is
@@ -446,8 +446,11 @@ status it cannot return. Nothing else may set that marker.
 There is exactly one other way a second 2xx is reachable, and it carries its
 own marker rather than reusing that one. ``reg.binary_download`` handlers never
 assign a status, so cpp-httplib answers 200 or **206 Partial Content**
-depending on whether the request carried a satisfiable ``Range`` - it also
-fills in ``Content-Range``. The helper therefore declares both statuses and
+depending on whether the request carried a ``Range`` at all - it also fills in
+``Content-Range``. Note "at all", not "a satisfiable one": a ``Range`` that
+parses but asks for bytes past the end of the file still yields 206, and one
+that does not parse is rejected with 416 before routing, so by the time this
+decision is made every surviving ``Range`` is a parseable one. The helper therefore declares both statuses and
 calls ``RouteEntry::mark_partial_content()``, publishing
 ``x-medkit-partial-content: true``. Two markers, not one: there the handler
 chooses between variant members, here the handler returns one thing and the
@@ -455,12 +458,59 @@ HTTP layer decides how to frame it. A single marker covering both would let the
 contract test wave through a route that declares a status it can never return.
 Nothing outside ``binary_download`` may set it.
 
-Two further ``RouteEntry`` knobs shape the published response set:
+Media types
+~~~~~~~~~~~
+
+A response declared through the JSON overloads is published under
+``application/json``, with the content entry omitted entirely when the schema
+is empty - that is what keeps a 204 body-less rather than giving it a
+``schema: null``.
+
+Non-JSON bodies use the four-argument overload
+``response(status, desc, schema, content_types)``. Each media type becomes its
+own ``content`` entry holding an **empty** Media Type Object. The missing
+schema is the declaration, not an omission, for two independent reasons:
+
+- ``{"type": "string", "format": "binary"}`` is an OpenAPI 3.0 idiom. 3.1
+  aligned with JSON Schema 2020-12, where ``format: binary`` carries no
+  meaning and ``type: string`` actively misdescribes raw bytes.
+- The SSE families emit three different frame shapes, so any single schema
+  would be wrong for two of them.
+
+The ``schema`` argument exists only for signature symmetry and must be empty; a
+caller that passes one has it dropped rather than attached to a media type it
+may not describe, and the miscall is reported by ``validate_completeness()``.
+
+Both completeness gates - ``validate_completeness()`` and the served-document
+check in ``test_health::test_docs_spec_completeness`` - treat a 2xx carrying a
+non-JSON media type as complete without a schema. That replaced an older rule
+that exempted a route when its *summary* contained "SSE" or "stream", so the
+exemption now follows what a route declares rather than what it is named.
+
+**Open media-type sets.** Where the served type is not enumerable the
+declaration says so, by listing the derivable types *and* ``*/*``. The
+bulk-data download is the case in the tree:
+``BulkDataHandlers::download_media_types()`` names the three types
+``get_rosbag_mimetype()`` can return, then ``*/*`` for the store-backed
+categories, which serve back whatever media type the uploading client put on
+its multipart part. Declaring only the concrete types would under-declare the
+route; declaring only ``*/*`` would throw away the half that is derivable.
+
+That declaration is checked against a run, not a review. The integration suite
+downloads real artifacts and asserts the served ``Content-Type`` against the
+document, distinguishing the two halves: a rosbag type must match a **named**
+content key (matching only via ``*/*`` fails), while a client-supplied type may
+match via the catch-all, which the test also asserts is present. Both
+directions have been shown to fail on an injected defect.
+
+Further ``RouteEntry`` knobs shape the published operation:
 
 - ``errors({409, 423})`` - declare error statuses this route can emit beyond
   the blanket set; each is rendered as a ``GenericError`` response ``$ref``.
   Statuses below 400 are ignored and reported by ``validate_completeness()``,
-  because a success status belongs in the return type, not here.
+  because a success status belongs in the return type, not here. This is the
+  one knob whose completeness is checked against a *run* rather than a review -
+  see `Emitted-status recorder`_ below.
 - ``only_status(code, desc)`` - this route has exactly one outcome. Clears every
   other response and suppresses the blanket 400/404/500 injection. The
   auth 401/403 refs stay when authentication is enabled: they come from the
@@ -507,9 +557,55 @@ Two further ``RouteEntry`` knobs shape the published response set:
   because its own backend is unconfigured, e.g. ``LockHandlers`` without a lock
   manager - are declared with plain ``errors({501})`` until a handler-level
   seam exists.
+- ``lock_guarded()`` - this route takes part in entity locking. One call
+  publishes all three halves of that contract: the ``X-Client-Id`` request
+  header the handler reads, the 409 it answers when the entity's collection is
+  locked by a different client, and an ``x-medkit-lock-guarded: true`` operation
+  extension. The header is declared **optional** on purpose - a caller that
+  sends none is an anonymous client, which succeeds while nothing is locked and
+  is refused once something is; declaring it required would describe a gateway
+  that rejects the header-less request outright, which is not what happens.
+
+  Unlike everything else in this section, **this one is declared and not
+  derived, and its test only checks half of it.** The header read that decides
+  the 409 lives in ``HandlerContext::validate_lock_access``, which 12 handlers
+  across 6 files call, and the document is regenerated per ``/docs`` request
+  rather than captured at registration time - so a registration cannot see
+  through that call, and no accessor on ``TypedRequest`` changes that.
+  ``test_openapi_contract.test.py::test_lock_guarded_set_matches_the_handlers``
+  pins the marked set against ``EXPECTED_LOCK_GUARDED``, a hand-maintained
+  literal committed next to the test. That catches the **document** drifting
+  away from the list: dropping a ``.lock_guarded()`` from a registration turns
+  the suite red. It does **not** catch the list drifting away from the
+  handlers - a new route that calls ``validate_lock_access`` and forgets both
+  the decorator and the list entry passes every gate. Adding a lock check to a
+  handler means editing that list by hand.
+
+  Two companion tests keep the marker from degenerating into a label:
+  ``test_lock_guarded_routes_declare_the_contract`` asserts every marked
+  operation really publishes the header and the 409, and
+  ``test_lock_guarded_route_answers_the_409_it_declares`` drives a real locked
+  write through the gateway so the declared status is one the wire returns.
+
+  ``DELETE /faults`` is the deliberate near-miss: it reads ``X-Client-Id`` like
+  every lock-guarded write but never answers 409 - it *skips* faults on
+  entities locked by somebody else and still answers 204. Nothing on the
+  response says which ones were skipped; ``X-Medkit-Local-Only`` on that 204 is
+  about aggregated peers, not locks. It therefore declares the header with its
+  own prose via ``header_param`` and does not call ``lock_guarded()``; marking
+  it would publish a status it cannot return.
+- ``fan_out_aware()`` - this route reads the ``X-Medkit-No-Fan-Out`` request
+  header, i.e. a client can ask it to answer from this gateway alone instead of
+  merging aggregated peers. Carried by the routes whose handlers go through
+  ``fan_out_collection`` or ``merge_peer_items``. The declared schema is a bare
+  string, not a boolean: the gateway tests ``has_header`` and never reads the
+  value, so ``X-Medkit-No-Fan-Out: false`` still suppresses fan-out and a
+  boolean schema would promise a generated client the opposite. Also
+  hand-applied, with the same caveat as ``lock_guarded()`` above.
 
 Every self-check named above (``errors()`` handed a sub-400 status,
-``response_header()`` aimed at an undeclared status, a route with no tag or no
+``response_header()`` aimed at an undeclared status, a ``lock_guarded()`` marker
+whose 409 a later ``only_status()`` cleared, a route with no tag or no
 success schema) reports through ``RouteRegistry::validate_completeness()``, and
 ``RESTServer::report_route_metadata_issues()`` calls it once at start-up and
 logs what it finds. That call is what makes "reported" mean something: before
@@ -542,7 +638,33 @@ can send shapes ``DataWriteRequest`` does not describe; ``/auth/*`` parses
 form-urlencoded), so a missing ``.request_body(...)`` there is a real gap the
 check must keep reporting.
 
-Three statuses never reach a handler at all: the auth middleware answers 401
+A fourth status never reaches a handler either, and it is the only one gated on
+nothing: **416**. cpp-httplib parses the ``Range`` header in
+``Server::process_request``, before routing, and rejects an unparseable one
+outright - on any path, including paths that do not exist. It is therefore
+declared on every operation, next to the blanket 400/404/500, rather than on
+the six download routes where sending a ``Range`` is *useful*. Those six carry
+the ``Range`` request *parameter*; the status itself is universal.
+
+It is declared as a ``GenericError`` ``$ref`` like the other error statuses,
+and getting there needs both halves of the picture: cpp-httplib writes 416 with
+an empty body, and ``RESTServer::setup_global_error_handlers`` then fills any
+body-less error response with a ``GenericError``. Reading only the vendored
+header suggests a body-less response and would have published one - the wire
+assertion in
+``test_openapi_contract.test.py::test_range_rejection_is_answered_on_a_route_that_declares_it``
+is what settles it, deliberately against ``/health`` rather than a download so
+the universality is the thing being proven.
+
+Unlike the limiter's 429 there is no configuration knob to gate it on, and
+unlike a handler status the emitted-status recorder cannot observe it - no
+handler runs. It is therefore a framework-level constant verified by
+``RouteRegistryTest.EveryDocumentedRouteDeclaresTheFrameworkAnsweredRangeRejection``
+plus that wire test, not by a recorded run. It also sits outside
+``only_status()``, for the same reason 401/403 do: that knob constrains what
+the *handler* can return.
+
+Three further statuses never reach a handler: the auth middleware answers 401
 and 403, and the rate limiter answers 429, both ahead of routing. No return
 type can describe them and no ``RouteEntry`` can carry their headers, so they
 are declared once as the shared component responses ``Unauthorized`` (carrying
@@ -551,6 +673,143 @@ are declared once as the shared component responses ``Unauthorized`` (carrying
 Routes reference them - 401/403 when ``set_auth_enabled(true)``, 429 when
 ``set_rate_limit_enabled(true)`` - so the document mentions a middleware status
 exactly when that middleware is live.
+
+The 429 gate covers the **rate limiter's** 429 and nothing else. A handler can
+answer 429 for a reason of its own - the script manager's concurrent-execution
+limit is the one that exists today - and that one is reachable whether or not
+``rate_limiting.enabled`` is set, so it is declared on its route with
+``errors({429})`` like any other handler status. Reading the two as one status
+makes the coverage rule below unsatisfiable: with the limiter off, the document
+would have to both omit 429 (no limiter) and declare it (the execution-start
+route answers it).
+
+Where a route declares a status the middleware also owns, the route wins:
+``add_response_ref`` is first-wins and the ``errors()`` loop runs first. So the
+execution-start route publishes its own ``GenericError`` 429 rather than the
+``RateLimited`` component, and loses that component's ``Retry-After`` and
+``X-RateLimit-*`` headers; a lifecycle route that declares 403 shadows
+``Forbidden`` the same way. OpenAPI allows one response object per status, so
+one description has to lose, and the route-specific one is the more useful.
+The body shape is unaffected - all three components reference the same
+``GenericError`` schema - so what is lost is the header list and the prose.
+Pinned by ``RouteRegistryTest.RouteDeclaredStatusWinsOverTheMiddlewareComponent``
+so the precedence is a decision on record rather than an accident of statement
+order.
+
+A fourth gate, ``set_aggregation_enabled(bool)``, works the same way for peer
+federation. When an entity turns out to belong to a peer, the request is
+proxied from inside ``validate_entity_for_route``, and the statuses the gateway
+itself writes there are 502 (peer unknown, unreachable, or its response over the
+size cap) and 503 (this gateway is shutting down and refuses to forward). They
+are declared on entity-scoped routes only - the entity id has to come from the
+path for the lookup to happen at all - and only when aggregation is on, because
+``aggregation.enabled`` defaults false and the ``AggregationManager`` is only
+constructed when it is set, so with it off no entity can be remote. The gate
+reads the manager pointer rather than the parameter, so it cannot drift from the
+branch it describes. Unlike the middleware refs it also respects
+``only_status``: the forward happens *inside* the handler, so a route that
+declares itself single-outcome genuinely cannot reach it.
+
+What is **not** declared there is the status a healthy peer returns, which is
+copied through verbatim. No finite ``errors({...})`` describes "whatever the
+peer said", and choosing what the document should promise is an
+aggregation-contract question rather than a documentation one.
+
+.. _emitted-status-recorder:
+
+Emitted-status recorder
+-----------------------
+
+Everything above is a *declaration*. ``errors()``, ``response_header()``,
+``lock_guarded()`` - each is something a person typed next to a registration,
+and each can fall behind the handler it describes without any test noticing. A
+new ``make_error(503, ...)`` in a handler nobody re-reads is invisible to every
+check in this document.
+
+The recorder is the one mechanism that notices, and it maintains no list.
+``include/ros2_medkit_gateway/http/detail/status_recorder.hpp`` compiles - in
+test builds only, gated on ``MEDKIT_STATUS_RECORDER``, which
+``CMakeLists.txt`` sets exactly when ``BUILD_TESTING`` is on - two observers:
+
+- ``StatusRecordingScope``, installed by ``RouteRegistry::register_all`` around
+  every mounted handler, which records ``(method, OpenAPI templated path,
+  status)`` for the status that actually reached ``httplib::Response``. It is
+  installed at the mounting point because that is the only place that knows
+  both the route's identity and everything the route can answer. This is the
+  authoritative half: it sees the status the client receives, including one no
+  ``make_error()`` built (a peer-forwarded status, a raw ``res.status`` write,
+  the entity-not-found 404 that comes from ``validate_entity_for_route``).
+- a call in ``make_error()`` that records the ``file:line`` of each error
+  construction, which is what lets a run report *how much* of the ~281-site
+  error surface it exercised rather than implying it saw all of it.
+
+The two halves are deliberately not joined. The scope carries the route
+identity as its own member, so nothing travels out-of-band, and
+``make_error()``'s hook is route-agnostic - it contributes to a site set, not to
+the ``(route, status)`` set the assertion reads. The consequence worth stating:
+``make_error()`` touches no thread-local storage at all, which matters because
+it is an ``inline`` header function whose out-of-line copy lands in
+``gateway_ros2``, linked into six MODULE targets. Route-attributing the sites
+would need an ambient carrier, and that carrier would have to be a
+namespace-scope ``extern thread_local`` (the ``tl_forward_response`` pattern),
+never a function-local ``static thread_local``, which compiles to initial-exec
+TLS a shared object cannot relocate. Not needing it is the stronger position,
+and the wire-status set is strictly more accurate than route-attributed
+construction sites would be.
+
+``test_openapi_error_coverage.test.py`` drives the whole documented surface into
+its error branches - every parameterised operation called with an absent id,
+with a malformed id, and (where a trailing absent id makes the call safe) with a
+real leading entity - then asserts **declared is a superset of observed**. The
+sweep is derived from the served document, so a route added tomorrow is swept
+tomorrow, and its companion assertions stop the rule passing vacuously: the only
+operations allowed to go unreached are state-changing verbs on parameterless
+paths, and at least one observed status must be outside the blanket set.
+
+What the recorder cannot see has to be declared by hand, and that is the whole
+list:
+
+- anything answered ahead of routing - the rate limiter's 429, the auth
+  middleware's 401/403, the CORS reject, the OPTIONS pre-flight;
+- anything cpp-httplib answers itself - 404/405 for an unrouted request, 413
+  over ``set_payload_max_length``, 416 for an **unparseable** ``Range`` (an
+  unsatisfiable-but-parseable one yields 206, not 416);
+- routes mounted straight onto the server rather than through the registry
+  (``/docs``, the Swagger UI subtree);
+- statuses on branches no test run drives - a provider that reports
+  ``AccessDenied``, a fault store that cannot be read, an update already in
+  flight. These are the ``errors({...})`` calls in ``rest_server.cpp`` that
+  carry a "the recorder cannot reach it" comment.
+
+Fourteen ``make_error`` sites pass a **computed** status rather than a literal,
+and they split into two classes that get opposite treatment:
+
+- **Seven are first-party with a finite range**, and are declared. Four go
+  through ``classify_parameter_error``, whose ``ParameterErrorCode`` switch can
+  only produce ``{400, 403, 404, 500, 503}``; three go through ``LockError``,
+  where ``extend`` and ``release`` can only produce ``{400, 403, 404}``. Neither
+  set is copied by hand. The parameter routes declare
+  ``handlers::parameter_error_statuses()``, which runs the classifier over every
+  enumerator - so a new enumerator mapping to a new status widens the
+  declaration with no edit at the registration - and a switch with no
+  ``default`` next to that array makes ``-Werror=switch-enum`` fail the build if
+  somebody adds an enumerator without listing it. The lock claim is behavioural
+  rather than textual, so it is pinned behaviourally:
+  ``LockManagerTest.extend_and_release_answer_only_400_403_404`` drives every
+  reachable failure path of both verbs and asserts the exact status set,
+  including that 409 is **not** among them - only ``acquire`` conflicts.
+- **Seven are plugin-clamped and stay undeclared**: ``make_plugin_error`` in the
+  data, fault, lifecycle and operation handlers passes a provider-supplied
+  status clamped only to 400-599. A plugin can answer any of ~200 statuses, so
+  no finite ``errors({...})`` describes it - the same reason the peer
+  pass-through above is not declared. Left undeclared deliberately, not
+  overlooked: this is the boundary where "declare what the gateway can emit"
+  stops being a finite question, and both sides of it are named here so the
+  next reader does not have to re-derive which half is which.
+
+A shipped gateway compiles none of it: the ``Dockerfile`` builds with
+``-DBUILD_TESTING=OFF``, so ``make_error()`` is byte-identical to what it was
+and ``register_all`` mounts the handler directly.
 
 Escape Hatches
 --------------
@@ -570,17 +829,25 @@ remain compile-time-checked at their boundary.
 - ``reg.sse(path, factory)`` - registers a Server-Sent Events route. The
   factory returns a ``Result<http::SseStream>`` whose ``next_event``
   callback the framework drives via cpp-httplib's chunked content provider.
-  Used by the fault SSE stream and by cyclic-subscription event streams.
-- ``reg.binary_download(path, handler)`` - registers a range-aware binary
-  download. The handler returns a ``Result<http::BinaryResponse>`` carrying
-  ``provider``, ``content_type``, ``filename``, ``supports_ranges``, and
-  ``total_size``; the framework wires ``provider`` into cpp-httplib's
+  Used by the fault SSE stream and by cyclic-subscription event streams. The
+  helper declares ``text/event-stream`` on the 200 from the same string it
+  hands cpp-httplib, and declares **no** frame schema: the three SSE families
+  put different shapes in ``data:``, so one schema would be wrong for two of
+  them.
+- ``reg.binary_download(path, handler, media_types)`` - registers a range-aware
+  binary download. The handler returns a ``Result<http::BinaryResponse>``
+  carrying ``provider``, ``content_type``, ``filename``, ``supports_ranges``,
+  and ``total_size``; the framework wires ``provider`` into cpp-httplib's
   range-aware content-provider machinery so partial-content fetches work
   without manual ``Content-Range`` plumbing. The helper owns the whole header
   and status story for these routes: it sends ``Content-Disposition`` when the
   response names a file and ``Accept-Ranges: bytes`` when the provider is
   range-capable (cpp-httplib only sets the latter for ``HEAD``), and it
-  declares 200, 206, and those headers - see ``mark_partial_content()`` above.
+  declares 200, 206, those headers, the ``Range`` request parameter and
+  ``multipart/byteranges`` on the 206 - see ``mark_partial_content()`` above.
+  ``media_types`` is required rather than defaulted so a new download route
+  cannot inherit another route's answer, and it must cover every value the
+  handler can put in ``BinaryResponse::content_type``.
 - ``reg.multipart_upload<TResponse>(path, handler)`` - registers a
   ``multipart/form-data`` upload. The handler receives ``http::MultipartBody``
   (already parsed by cpp-httplib) and returns
@@ -774,7 +1041,7 @@ The published ``openapi.json`` is assembled mechanically from two sources:
   on the route via the fluent ``RouteEntry`` builder. The per-topic /
   per-service / per-action routes for genuinely dynamic ROS 2 payloads carry an
   *inline* schema built by ``SchemaBuilder``'s ``from_ros_msg`` /
-  ``from_ros_srv_request`` / ``from_ros_srv_response`` / ``binary_schema`` /
+  ``from_ros_srv_request`` / ``from_ros_srv_response`` /
   ``generic_object_schema`` factories (these feed path operations, not
   ``components/schemas``).
 

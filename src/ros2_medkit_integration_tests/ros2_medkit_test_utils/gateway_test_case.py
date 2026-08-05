@@ -1079,3 +1079,47 @@ class GatewayTestCase(unittest.TestCase):
         # Remove leading slash and encode the rest
         topic_path = topic_path[1:]
         return quote(topic_path, safe='')
+
+    def assert_declared_media_type(
+        self, served_content_type, declared_content, *, where, exact,
+    ):
+        """Assert a served ``Content-Type`` is one the document declares.
+
+        The Tier-2 half of the media-type contract: the OpenAPI ``content``
+        keys for a response are only worth anything if the bytes on the wire
+        actually arrive under one of them.
+
+        Parameters
+        ----------
+        served_content_type : str
+            Raw ``Content-Type`` response header. Any parameters
+            (``; charset=...``, ``; boundary=...``) are stripped before
+            matching, since OpenAPI ``content`` keys carry none.
+        declared_content : dict
+            The operation's ``responses[code]['content']`` mapping.
+        where : str
+            Human-readable location for the failure message.
+        exact : bool
+            ``True`` requires a named media-type key and explicitly rejects a
+            match that only succeeds via the ``*/*`` catch-all - that is what
+            keeps the derivable half of an open set from silently degrading
+            into "the wildcard covers it". ``False`` accepts the catch-all and
+            asserts it is present, which is the open half of the same set.
+
+        """
+        media_type = served_content_type.split(';')[0].strip().lower()
+        declared = {k.lower() for k in declared_content}
+        self.assertTrue(
+            declared, f'{where}: response declares no content at all')
+        if exact:
+            self.assertIn(
+                media_type, declared,
+                f'{where}: served {media_type!r}, which the document does not name '
+                f'(declares {sorted(declared)}). A wildcard does not count here - '
+                'this type is derivable from the code and must be declared.',
+            )
+            return
+        self.assertTrue(
+            media_type in declared or '*/*' in declared,
+            f'{where}: served {media_type!r}, not covered by {sorted(declared)}',
+        )

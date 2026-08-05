@@ -193,13 +193,20 @@ class TestHealth(GatewayTestCase):
                     if '$ref' in resp:
                         has_schema = True
                     elif 'content' in resp:
-                        for ct in resp['content'].values():
+                        for media_type, ct in resp['content'].items():
                             if 'schema' in ct:
                                 has_schema = True
-                # SSE endpoints don't have JSON schema
-                summary = op.get('summary', '')
-                if 'SSE' in summary or 'stream' in summary.lower():
-                    has_schema = True
+                            # A non-JSON body is fully described by its media
+                            # type. `format: binary` is an OpenAPI 3.0 idiom
+                            # 3.1 dropped, and the SSE families put three
+                            # different shapes in `data:`, so there is nothing
+                            # truthful to put in a schema here - the absence is
+                            # the declaration. Deliberately keyed on the media
+                            # type and not on 'content' being present: a JSON
+                            # response still owes a schema, which is the
+                            # coverage this rule exists for.
+                            elif media_type != 'application/json':
+                                has_schema = True
                 # An operation that declares no 2xx at all cannot return a
                 # success body to describe - the data-categories / data-groups
                 # stubs declare only their 501. Deliberately narrow: an

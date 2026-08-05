@@ -57,10 +57,6 @@ nlohmann::json SchemaBuilder::generic_object_schema() {
   return {{"type", "object"}};
 }
 
-nlohmann::json SchemaBuilder::binary_schema() {
-  return {{"type", "string"}, {"format", "binary"}};
-}
-
 nlohmann::json SchemaBuilder::ref(const std::string & schema_name) {
   return {{"$ref", "#/components/schemas/" + schema_name}};
 }

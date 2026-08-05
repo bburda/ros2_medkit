@@ -26,8 +26,10 @@
 #include "ros2_medkit_gateway/core/auth/auth_middleware.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/http/parameter_error_classification.hpp"
 #include "ros2_medkit_gateway/core/thread_pool_config.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
+#include "ros2_medkit_gateway/http/detail/status_recorder.hpp"
 #include "ros2_medkit_gateway/ros2/status/ros2_lifecycle_state_reader.hpp"
 
 #include "../openapi/route_registry.hpp"
@@ -331,6 +333,15 @@ void RESTServer::set_trigger_handlers(TriggerManager & trigger_mgr) {
 
 void RESTServer::set_aggregation_manager(AggregationManager * mgr) {
   handler_ctx_->set_aggregation_manager(mgr);
+  // Read the same pointer the forwarding branch reads
+  // (`HandlerContext::validate_entity_for_route` forwards only when
+  // `aggregation_mgr_` is non-null), so the document's 502/503 cannot drift
+  // from the condition that makes them reachable. Called before the first
+  // `/docs` request, and the document is generated per request, so setting it
+  // after `setup_routes()` is fine.
+  if (route_registry_) {
+    route_registry_->set_aggregation_enabled(mgr != nullptr);
+  }
 }
 
 RESTServer::~RESTServer() {
@@ -352,6 +363,19 @@ void RESTServer::setup_routes() {
   srv->Get((api_path("") + R"((.+)/docs$)"), [this](const httplib::Request & req, httplib::Response & res) {
     docs_handlers_->handle_docs_any_path(req, res);
   });
+
+#ifdef MEDKIT_STATUS_RECORDER
+  // Test builds only (BUILD_TESTING; see CMakeLists.txt). Serves what the
+  // emitted-status recorder has observed so far so an integration test can
+  // assert the served document declares every status the gateway actually
+  // put on the wire. Registered straight onto the server rather than through
+  // the RouteRegistry: it must not appear in the document it is used to
+  // check, and it must not be recorded by the recorder it reads.
+  srv->Get(api_path("/x-medkit-status-coverage"), [](const httplib::Request &, httplib::Response & res) {
+    res.status = 200;
+    res.set_content(http::detail::emitted_status_report().dump(), "application/json");
+  });
+#endif
 
 #ifdef ENABLE_SWAGGER_UI
   // Swagger UI - interactive API documentation browser
@@ -525,6 +549,8 @@ void RESTServer::setup_routes() {
       .tag("Server")
       .summary("SOVD version information")
       .description("Returns SOVD specification version and vendor info.")
+      // HealthHandlers::get_version_info -> merge_peer_items (peer vendor blocks).
+      .fan_out_aware()
       .operation_id("getVersionInfo");
 
   // === Discovery - entity collections ===
@@ -620,6 +646,10 @@ void RESTServer::setup_routes() {
         .tag("Data")
         .summary(std::string("Get data item for ") + et.singular)
         .description(std::string("Returns the latest value from a ROS 2 topic for this ") + et.singular + ".")
+        // DataHandlers::get_data_item answers 503 when topic sampling is not
+        // configured. The emitted-status recorder cannot reach it: the test
+        // fixture configures sampling, so no run drives that branch.
+        .errors({503})
         .operation_id(std::string("get") + capitalize(et.singular) + "DataItem");
 
     reg.put<dto::DataValue>(entity_path + "/data/{data_id}",
@@ -630,6 +660,8 @@ void RESTServer::setup_routes() {
         .summary(std::string("Write data item for ") + et.singular)
         .description(std::string("Publishes a value to a ROS 2 topic on this ") + et.singular + ".")
         .request_body("Data value to write", SB::ref("DataWriteRequest"))
+        // DataHandlers::put_data_item -> HandlerContext::validate_lock_access("data").
+        .lock_guarded()
         .operation_id(std::string("put") + capitalize(et.singular) + "DataItem");
 
     // Data-categories. Unconditionally 501: `only_status` drops both the
@@ -669,6 +701,8 @@ void RESTServer::setup_routes() {
         .tag("Data")
         .summary(std::string("List data items for ") + et.singular)
         .description(std::string("Lists all data items (ROS 2 topics) available on this ") + et.singular + ".")
+        // DataHandlers::list_data -> fan_out_collection<DataItem>.
+        .fan_out_aware()
         .operation_id(std::string("list") + capitalize(et.singular) + "Data");
 
     // --- Operations ---
@@ -690,6 +724,8 @@ void RESTServer::setup_routes() {
         .tag("Operations")
         .summary(std::string("List operations for ") + et.singular)
         .description(std::string("Lists all ROS 2 services and actions available on this ") + et.singular + ".")
+        // OperationHandlers::list_operations -> fan_out_collection<OperationItem>.
+        .fan_out_aware()
         .operation_id(std::string("list") + capitalize(et.singular) + "Operations");
 
     // Execution endpoints
@@ -718,6 +754,8 @@ void RESTServer::setup_routes() {
                   "The backing ROS 2 endpoint did not answer inside service_call_timeout_sec "
                   "(not-responding). The work may still be running.",
                   nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
+        // OperationHandlers::create_execution -> validate_lock_access("operations").
+        .lock_guarded()
         .operation_id(std::string("execute") + capitalize(et.singular) + "Operation");
 
     reg.get<dto::Collection<dto::ExecutionId>>(
@@ -761,6 +799,8 @@ void RESTServer::setup_routes() {
                   nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
         .response(504, "No cancel response in time - outcome unknown (not-responding)",
                   nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
+        // OperationHandlers::update_execution -> validate_lock_access("operations").
+        .lock_guarded()
         .operation_id(std::string("update") + capitalize(et.singular) + "Execution");
 
     reg.del<http::NoContent>(entity_path + "/operations/{operation_id}/executions/{execution_id}",
@@ -776,6 +816,8 @@ void RESTServer::setup_routes() {
                   nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
         .response(504, "No cancel response in time - outcome unknown (not-responding)",
                   nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
+        // OperationHandlers::cancel_execution -> validate_lock_access("operations").
+        .lock_guarded()
         .operation_id(std::string("cancel") + capitalize(et.singular) + "Execution");
 
     // Operation item, registered after its own sub-resources. {operation_id}
@@ -812,6 +854,15 @@ void RESTServer::setup_routes() {
         .tag("Configuration")
         .summary(std::string("List configurations for ") + et.singular)
         .description(std::string("Lists all ROS 2 node parameters for this ") + et.singular + ".")
+        // ConfigHandlers::list_configurations -> fan_out_collection<ConfigurationMetaData>.
+        .fan_out_aware()
+        // Parameter failures reach the wire through `classify_parameter_error`,
+        // whose whole range is declared here rather than copied: 403 (the
+        // parameter is read-only) and 503 (the backing node is unreachable or
+        // timed out) are first-party statuses `Ros2ParameterTransport` produces
+        // and no blanket rule adds. Out of the emitted-status recorder's reach -
+        // the fixture's nodes answer and none of their parameters is read-only.
+        .errors(handlers::parameter_error_statuses())
         .operation_id(std::string("list") + capitalize(et.singular) + "Configurations");
 
     reg.get<dto::ConfigurationReadValue>(entity_path + "/configurations/{config_id}",
@@ -821,6 +872,13 @@ void RESTServer::setup_routes() {
         .tag("Configuration")
         .summary(std::string("Get specific configuration for ") + et.singular)
         .description(std::string("Returns a specific ROS 2 node parameter for this ") + et.singular + ".")
+        // Parameter failures reach the wire through `classify_parameter_error`,
+        // whose whole range is declared here rather than copied: 403 (the
+        // parameter is read-only) and 503 (the backing node is unreachable or
+        // timed out) are first-party statuses `Ros2ParameterTransport` produces
+        // and no blanket rule adds. Out of the emitted-status recorder's reach -
+        // the fixture's nodes answer and none of their parameters is read-only.
+        .errors(handlers::parameter_error_statuses())
         .operation_id(std::string("get") + capitalize(et.singular) + "Configuration");
 
     reg.put<dto::ConfigurationWriteRequest, dto::ConfigurationReadValue>(
@@ -832,6 +890,15 @@ void RESTServer::setup_routes() {
         .tag("Configuration")
         .summary(std::string("Set configuration for ") + et.singular)
         .description(std::string("Sets a ROS 2 node parameter value for this ") + et.singular + ".")
+        // ConfigHandlers::set_configuration -> validate_lock_access("configurations").
+        .lock_guarded()
+        // Parameter failures reach the wire through `classify_parameter_error`,
+        // whose whole range is declared here rather than copied: 403 (the
+        // parameter is read-only) and 503 (the backing node is unreachable or
+        // timed out) are first-party statuses `Ros2ParameterTransport` produces
+        // and no blanket rule adds. Out of the emitted-status recorder's reach -
+        // the fixture's nodes answer and none of their parameters is read-only.
+        .errors(handlers::parameter_error_statuses())
         .operation_id(std::string("set") + capitalize(et.singular) + "Configuration");
 
     reg.del<http::NoContent>(entity_path + "/configurations/{config_id}",
@@ -841,6 +908,15 @@ void RESTServer::setup_routes() {
         .tag("Configuration")
         .summary(std::string("Delete configuration for ") + et.singular)
         .description(std::string("Resets a configuration parameter to its default for this ") + et.singular + ".")
+        // ConfigHandlers::delete_configuration -> validate_lock_access("configurations").
+        .lock_guarded()
+        // Parameter failures reach the wire through `classify_parameter_error`,
+        // whose whole range is declared here rather than copied: 403 (the
+        // parameter is read-only) and 503 (the backing node is unreachable or
+        // timed out) are first-party statuses `Ros2ParameterTransport` produces
+        // and no blanket rule adds. Out of the emitted-status recorder's reach -
+        // the fixture's nodes answer and none of their parameters is read-only.
+        .errors(handlers::parameter_error_statuses())
         .operation_id(std::string("delete") + capitalize(et.singular) + "Configuration");
 
     reg.del_alternates<http::NoContent, dto::ConfigurationDeleteMultiStatus>(
@@ -854,6 +930,8 @@ void RESTServer::setup_routes() {
         .tag("Configuration")
         .summary(std::string("Delete all configurations for ") + et.singular)
         .description(std::string("Resets all configuration parameters for this ") + et.singular + ".")
+        // ConfigHandlers::delete_all_configurations -> validate_lock_access("configurations").
+        .lock_guarded()
         .operation_id(std::string("deleteAll") + capitalize(et.singular) + "Configurations");
 
     // --- Faults ---
@@ -875,6 +953,12 @@ void RESTServer::setup_routes() {
         .tag("Faults")
         .summary(std::string("List faults for ") + et.singular)
         .description(std::string("Returns all active faults reported by this ") + et.singular + ".")
+        // FaultHandlers::list_faults -> merge_peer_items.
+        .fan_out_aware()
+        // FaultHandlers::list_faults answers 503 when the fault store cannot
+        // be read. The recorder cannot reach it: the fixture's store is
+        // healthy, so no run drives that branch.
+        .errors({503})
         .operation_id(std::string("list") + capitalize(et.singular) + "Faults")
         .query<dto::FaultEntityListQuery>();
 
@@ -885,6 +969,9 @@ void RESTServer::setup_routes() {
         .tag("Faults")
         .summary(std::string("Get specific fault for ") + et.singular)
         .description("Returns fault details including SOVD status, environment data, and rosbag snapshots.")
+        // 503 when the fault store cannot be read - same branch as the list
+        // routes, and equally out of the recorder's reach.
+        .errors({503})
         .operation_id(std::string("get") + capitalize(et.singular) + "Fault");
 
     reg.del_alternates<http::NoContent, dto::FaultClearResult>(
@@ -896,6 +983,11 @@ void RESTServer::setup_routes() {
         .tag("Faults")
         .summary(std::string("Clear fault for ") + et.singular)
         .description(std::string("Clears a specific fault for this ") + et.singular + ".")
+        // FaultHandlers::clear_fault -> validate_lock_access("faults").
+        .lock_guarded()
+        // 503 when the fault store cannot be read - clear_fault reads the fault
+        // before clearing it, so it answers the same status the read does.
+        .errors({503})
         .operation_id(std::string("clear") + capitalize(et.singular) + "Fault");
 
     reg.del<http::NoContent>(entity_path + "/faults",
@@ -905,6 +997,11 @@ void RESTServer::setup_routes() {
         .tag("Faults")
         .summary(std::string("Clear all faults for ") + et.singular)
         .description(std::string("Clears all faults for this ") + et.singular + ".")
+        // FaultHandlers::clear_all_faults -> validate_lock_access("faults").
+        .lock_guarded()
+        // 503 when the fault store cannot be read - same unreachable-in-test
+        // branch as the list route above.
+        .errors({503})
         .operation_id(std::string("clearAll") + capitalize(et.singular) + "Faults");
 
     // --- Logs ---
@@ -921,6 +1018,12 @@ void RESTServer::setup_routes() {
         .tag("Logs")
         .summary(std::string("Query log entries for ") + et.singular)
         .description(std::string("Queries application log entries for this ") + et.singular + ".")
+        // LogHandlers::get_logs -> fan_out_collection<LogEntry>.
+        .fan_out_aware()
+        // All three log routes answer 503 when no LogManager is attached, or
+        // when it refuses the read. The recorder cannot reach it: the fixture
+        // always has one, so no run drives that branch.
+        .errors({503})
         .operation_id(std::string("list") + capitalize(et.singular) + "Logs")
         .query<dto::LogQuery>();
 
@@ -931,6 +1034,7 @@ void RESTServer::setup_routes() {
         .tag("Logs")
         .summary(std::string("Get log configuration for ") + et.singular)
         .description(std::string("Returns the log filter configuration for this ") + et.singular + ".")
+        .errors({503})  // No LogManager attached - see the list route above.
         .operation_id(std::string("get") + capitalize(et.singular) + "LogConfiguration");
 
     reg.put<dto::LogConfiguration, http::NoContent>(
@@ -941,6 +1045,9 @@ void RESTServer::setup_routes() {
         .tag("Logs")
         .summary(std::string("Update log configuration for ") + et.singular)
         .description(std::string("Updates the log severity filter and max entries for this ") + et.singular + ".")
+        // LogHandlers::put_logs_configuration -> validate_lock_access("logs").
+        .lock_guarded()
+        .errors({503})  // No LogManager attached - see the list route above.
         .operation_id(std::string("set") + capitalize(et.singular) + "LogConfiguration");
 
     // --- Bulk Data ---
@@ -973,10 +1080,12 @@ void RESTServer::setup_routes() {
         .description(std::string("Lists downloadable files in a bulk-data category for this ") + et.singular + ".")
         .operation_id(std::string("list") + capitalize(et.singular) + "BulkDataDescriptors");
 
-    reg.binary_download(entity_path + "/bulk-data/{category_id}/{file_id}",
-                        [this](http::TypedRequest req) -> http::Result<http::BinaryResponse> {
-                          return bulkdata_handlers_->download(req);
-                        })
+    reg.binary_download(
+           entity_path + "/bulk-data/{category_id}/{file_id}",
+           [this](http::TypedRequest req) -> http::Result<http::BinaryResponse> {
+             return bulkdata_handlers_->download(req);
+           },
+           handlers::BulkDataHandlers::download_media_types())
         .tag("Bulk Data")
         .summary(std::string("Download bulk-data file for ") + et.singular)
         .description("Downloads a bulk-data file (binary content).")
@@ -995,6 +1104,12 @@ void RESTServer::setup_routes() {
           .summary(std::string("Upload bulk-data for ") + et.singular)
           .description(std::string("Uploads a file to a bulk-data category for this ") + et.singular + ".")
           .success_description("File uploaded")
+          // BulkDataHandlers::upload -> validate_lock_access("bulk-data").
+          .lock_guarded()
+          // BulkDataHandlers::upload answers 413 when the part exceeds
+          // `bulk_data.max_upload_bytes`. The recorder cannot reach it: the
+          // fixture leaves the limit unbounded, so no run drives it.
+          .errors({413})
           .operation_id(std::string("upload") + capitalize(et.singular) + "BulkData");
 
       reg.del<http::NoContent>(entity_path + "/bulk-data/{category_id}/{file_id}",
@@ -1004,6 +1119,8 @@ void RESTServer::setup_routes() {
           .tag("Bulk Data")
           .summary(std::string("Delete bulk-data file for ") + et.singular)
           .description(std::string("Deletes a bulk-data file for this ") + et.singular + ".")
+          // BulkDataHandlers::remove -> validate_lock_access("bulk-data").
+          .lock_guarded()
           .operation_id(std::string("delete") + capitalize(et.singular) + "BulkData");
     } else {
       // 405 stub routes for entity types that cannot host uploaded bulk-data
@@ -1072,6 +1189,10 @@ void RESTServer::setup_routes() {
           .summary(std::string("SSE events stream for trigger on ") + et.singular)
           .description(std::string("Server-Sent Events stream for trigger notifications on this ") + et.singular + ".")
           .gated_on(triggers_available, triggers_unavailable)
+          // TriggerHandlers::sse_trigger_events answers 503 once the SSE
+          // client limit is reached. The recorder cannot reach it: the fixture
+          // never opens enough concurrent streams.
+          .errors({503})
           .operation_id(std::string("stream") + capitalize(et.singular) + "TriggerEvents");
 
       reg.post<dto::TriggerCreateRequest, http::Created<dto::Trigger>>(
@@ -1085,6 +1206,10 @@ void RESTServer::setup_routes() {
           .description(std::string("Creates a new event trigger for this ") + et.singular + ".")
           .success_description("Trigger created")
           .gated_on(triggers_available, triggers_unavailable)
+          // TriggerHandlers::post_trigger answers 503 when the trigger engine
+          // refuses the rule or the resource subscription fails. The recorder
+          // cannot reach it: the fixture's engine accepts every rule.
+          .errors({503})
           .operation_id(std::string("create") + capitalize(et.singular) + "Trigger");
 
       reg.get<dto::Collection<dto::Trigger>>(
@@ -1165,6 +1290,10 @@ void RESTServer::setup_routes() {
           .summary(std::string("Create cyclic subscription for ") + et.singular)
           .description(std::string("Creates a new cyclic data subscription for this ") + et.singular + ".")
           .success_description("Subscription created")
+          // CyclicSubscriptionHandlers::post_subscription answers 503 when the
+          // subscription manager or the event source refuses. The recorder
+          // cannot reach it: both accept in the fixture.
+          .errors({503})
           .operation_id(std::string("create") + capitalize(et.singular) + "Subscription");
 
       reg.get<dto::Collection<dto::CyclicSubscription>>(
@@ -1228,7 +1357,12 @@ void RESTServer::setup_routes() {
           .description(std::string("Acquires an exclusive lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
           .success_description("Lock acquired")
-          .errors({501})  // Locking disabled: LockHandlers::check_locking_enabled
+          // 409 from LockManager::acquire, passed through verbatim by
+          // post_lock: `lock-conflict` when the entity is already locked and
+          // `break_lock` was not requested, `lock-not-breakable` when it was
+          // but the existing lock forbids it. Acquire is the only lock verb
+          // that can 409 - extend and release answer 400/403/404.
+          .errors({409, 501})  // 501: locking disabled, LockHandlers::check_locking_enabled
           .operation_id(std::string("acquire") + capitalize(et.singular) + "Lock");
 
       reg.get<dto::Collection<dto::Lock>>(entity_path + "/locks",
@@ -1264,7 +1398,13 @@ void RESTServer::setup_routes() {
           .summary(std::string("Extend lock on ") + et.singular)
           .description(std::string("Extends the expiration of a lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
-          .errors({501})  // Locking disabled: LockHandlers::check_locking_enabled
+          // 403 `lock-not-owner` from LockManager, passed through verbatim:
+          // the lock exists but belongs to a different client. Nothing to do
+          // with the auth middleware's 403, so it is declared here and stands
+          // whether or not authentication is on. 400 and 404 (invalid
+          // expiration, no such lock) are in the blanket set already, and 409
+          // is deliberately absent - acquire is the only verb that conflicts.
+          .errors({403, 501})  // 501: locking disabled, LockHandlers::check_locking_enabled
           .operation_id(std::string("extend") + capitalize(et.singular) + "Lock");
 
       reg.del<http::NoContent>(entity_path + "/locks/{lock_id}",
@@ -1275,7 +1415,13 @@ void RESTServer::setup_routes() {
           .summary(std::string("Release lock on ") + et.singular)
           .description(std::string("Releases a lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
-          .errors({501})  // Locking disabled: LockHandlers::check_locking_enabled
+          // 403 `lock-not-owner` from LockManager, passed through verbatim:
+          // the lock exists but belongs to a different client. Nothing to do
+          // with the auth middleware's 403, so it is declared here and stands
+          // whether or not authentication is on. 400 and 404 (invalid
+          // expiration, no such lock) are in the blanket set already, and 409
+          // is deliberately absent - acquire is the only verb that conflicts.
+          .errors({403, 501})  // 501: locking disabled, LockHandlers::check_locking_enabled
           .operation_id(std::string("release") + capitalize(et.singular) + "Lock");
     }
 
@@ -1290,6 +1436,35 @@ void RESTServer::setup_routes() {
     // template parameters; per-route .request_body() / .response() builder
     // calls stay only where the schema differs (multipart upload + free-form
     // start-execution body).
+    //
+    // All eight routes funnel backend failures through one total mapper,
+    // `script_backend_error` (script_handlers.cpp), but the mapper's totality
+    // is NOT a licence to declare its whole range everywhere: what each route
+    // can answer is what its own `ScriptProvider` method returns. Declared per
+    // route against the shipped `DefaultScriptProvider`, so
+    // `GET .../scripts` does not tell a client it might answer 413:
+    //
+    //   list_scripts      - no backend error at all
+    //   get_script        - NotFound / Internal
+    //   upload_script     - FileTooLarge (413), InvalidInput, Internal
+    //   delete_script     - ManagedScript / AlreadyRunning (409), NotFound, Internal
+    //   start_execution   - ConcurrencyLimit (429), UnsupportedType, InvalidInput, NotFound
+    //   get_execution     - NotFound
+    //   control_execution - NotRunning (409), InvalidInput, NotFound
+    //   delete_execution  - AlreadyRunning (409), NotFound
+    //
+    // The 429 is the script manager's concurrency limit, not the HTTP rate
+    // limiter's: it is reachable whether or not `rate_limiting.enabled` is set,
+    // which is why it is declared on the one route that answers it rather than
+    // by the registry's limiter gate. 409 / 413 / 429 are all out of the
+    // emitted-status recorder's reach - they need a backend in a state no
+    // integration fixture puts it in.
+    //
+    // A `ScriptProvider` plugin may return codes its `DefaultScriptProvider`
+    // counterpart never does (`AlreadyExists` exists for exactly that, see
+    // `script_provider.hpp`). These declarations describe the shipped backend;
+    // widening them to the mapper's full range for every route would make the
+    // document describe no backend at all.
     if (script_handlers_ && (et_type_str == "apps" || et_type_str == "components")) {
       reg.multipart_upload<http::Created<dto::ScriptUploadResponse>>(
              entity_path + "/scripts",
@@ -1301,7 +1476,8 @@ void RESTServer::setup_routes() {
           .summary(std::string("Upload diagnostic script for ") + et.singular)
           .description(std::string("Uploads a diagnostic script for this ") + et.singular + ".")
           .success_description("Script uploaded")
-          .errors({501})  // No scripts backend configured
+          // DefaultScriptProvider::upload_script -> FileTooLarge
+          .errors({413, 501})
           .operation_id(std::string("upload") + capitalize(et.singular) + "Script");
 
       reg.get<dto::ScriptList>(entity_path + "/scripts",
@@ -1311,7 +1487,8 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("List scripts for ") + et.singular)
           .description(std::string("Lists all diagnostic scripts for this ") + et.singular + ".")
-          .errors({501})  // No scripts backend configured
+          // DefaultScriptProvider::list_scripts returns no backend error
+          .errors({501})
           .operation_id(std::string("list") + capitalize(et.singular) + "Scripts");
 
       reg.get<dto::ScriptMetadata>(entity_path + "/scripts/{script_id}",
@@ -1321,7 +1498,8 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Get script metadata for ") + et.singular)
           .description(std::string("Returns metadata of a specific script for this ") + et.singular + ".")
-          .errors({501})  // No scripts backend configured
+          // DefaultScriptProvider::get_script -> NotFound / Internal only
+          .errors({501})
           .operation_id(std::string("get") + capitalize(et.singular) + "Script");
 
       reg.del<http::NoContent>(entity_path + "/scripts/{script_id}",
@@ -1331,7 +1509,8 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Delete script for ") + et.singular)
           .description(std::string("Deletes a diagnostic script from this ") + et.singular + ".")
-          .errors({501})  // No scripts backend configured
+          // DefaultScriptProvider::delete_script -> ManagedScript / AlreadyRunning
+          .errors({409, 501})
           .operation_id(std::string("delete") + capitalize(et.singular) + "Script");
 
       reg.post<http::Accepted<dto::ScriptExecution>>(
@@ -1345,7 +1524,8 @@ void RESTServer::setup_routes() {
           .description(std::string("Starts execution of a diagnostic script on this ") + et.singular + ".")
           .request_body("Execution parameters", SB::generic_object_schema())
           .success_description("Execution started")
-          .errors({501})  // No scripts backend configured
+          // DefaultScriptProvider::start_execution -> ConcurrencyLimit
+          .errors({429, 501})
           .operation_id(std::string("start") + capitalize(et.singular) + "ScriptExecution");
 
       reg.get<dto::ScriptExecution>(entity_path + "/scripts/{script_id}/executions/{execution_id}",
@@ -1355,7 +1535,8 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Get execution status for ") + et.singular)
           .description("Returns the current status of a script execution.")
-          .errors({501})  // No scripts backend configured
+          // DefaultScriptProvider::get_script -> NotFound / Internal only
+          .errors({501})
           .operation_id(std::string("get") + capitalize(et.singular) + "ScriptExecution");
 
       reg.put<dto::ScriptControlRequest, dto::ScriptExecution>(
@@ -1367,7 +1548,8 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Terminate script execution for ") + et.singular)
           .description("Sends a control command (e.g., terminate) to a running script execution.")
-          .errors({501})  // No scripts backend configured
+          // DefaultScriptProvider::control_execution -> NotRunning
+          .errors({409, 501})
           .operation_id(std::string("control") + capitalize(et.singular) + "ScriptExecution");
 
       reg.del<http::NoContent>(entity_path + "/scripts/{script_id}/executions/{execution_id}",
@@ -1377,7 +1559,8 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Remove completed execution for ") + et.singular)
           .description("Removes a completed script execution record.")
-          .errors({501})  // No scripts backend configured
+          // DefaultScriptProvider::delete_execution -> AlreadyRunning
+          .errors({409, 501})
           .operation_id(std::string("remove") + capitalize(et.singular) + "ScriptExecution");
     }
 
@@ -1565,10 +1748,12 @@ void RESTServer::setup_routes() {
       .description("Lists bulk-data descriptors for a subarea.")
       .operation_id("listSubareaBulkDataDescriptors");
 
-  reg.binary_download("/areas/{area_id}/subareas/{subarea_id}/bulk-data/{category_id}/{file_id}",
-                      [this](http::TypedRequest req) -> http::Result<http::BinaryResponse> {
-                        return bulkdata_handlers_->download(req);
-                      })
+  reg.binary_download(
+         "/areas/{area_id}/subareas/{subarea_id}/bulk-data/{category_id}/{file_id}",
+         [this](http::TypedRequest req) -> http::Result<http::BinaryResponse> {
+           return bulkdata_handlers_->download(req);
+         },
+         handlers::BulkDataHandlers::download_media_types())
       .tag("Bulk Data")
       .summary("Download bulk-data file for subarea")
       .description("Downloads a bulk-data file for a subarea.")
@@ -1594,10 +1779,12 @@ void RESTServer::setup_routes() {
       .description("Lists bulk-data descriptors for a subcomponent.")
       .operation_id("listSubcomponentBulkDataDescriptors");
 
-  reg.binary_download("/components/{component_id}/subcomponents/{subcomponent_id}/bulk-data/{category_id}/{file_id}",
-                      [this](http::TypedRequest req) -> http::Result<http::BinaryResponse> {
-                        return bulkdata_handlers_->download(req);
-                      })
+  reg.binary_download(
+         "/components/{component_id}/subcomponents/{subcomponent_id}/bulk-data/{category_id}/{file_id}",
+         [this](http::TypedRequest req) -> http::Result<http::BinaryResponse> {
+           return bulkdata_handlers_->download(req);
+         },
+         handlers::BulkDataHandlers::download_media_types())
       .tag("Bulk Data")
       .summary("Download bulk-data file for subcomponent")
       .description("Downloads a bulk-data file for a subcomponent.")
@@ -1632,6 +1819,9 @@ void RESTServer::setup_routes() {
       .tag("Faults")
       .summary("List all faults globally")
       .description("Retrieve all faults across the system.")
+      // 503 when the fault store cannot be read - same branch as the
+      // per-entity list, and equally out of the recorder's reach.
+      .errors({503})
       .operation_id("listAllFaults")
       .query<dto::FaultListQuery>();
 
@@ -1649,6 +1839,24 @@ void RESTServer::setup_routes() {
       .response_header(204, openapi::ResponseHeader{"X-Medkit-Local-Only",
                                                     "`true` when only the local FaultManager was cleared; faults held "
                                                     "by aggregated peers are untouched and must be cleared per peer."})
+      // Reads `X-Client-Id` like every lock-guarded write, but deliberately not
+      // `.lock_guarded()`: FaultHandlers::clear_all_faults_global never answers
+      // 409. It consults the lock manager per fault and *skips* the ones on
+      // entities locked by somebody else, then answers 204 anyway. Marking it
+      // lock-guarded would publish a 409 this route cannot return - the exact
+      // defect the marker exists to make visible.
+      //
+      // Nothing on the response reports which faults were skipped. The
+      // `X-Medkit-Local-Only` header declared above is set unconditionally and
+      // is about aggregated peers, not locks - do not read it as the skip
+      // signal. A client that needs to know re-reads the entity's faults.
+      .header_param("X-Client-Id",
+                    "Identifies the calling client for lock ownership. Faults on entities locked by "
+                    "a different client are silently skipped rather than cleared, and the request "
+                    "still answers 204 - re-read the entity's faults to see what survived.",
+                    false, nlohmann::json{{"type", "string"}})
+      // 503 when the fault store cannot be read - see the list route above.
+      .errors({503})
       .operation_id("clearAllFaults")
       .query<dto::FaultClearQuery>();
 
@@ -1723,6 +1931,11 @@ void RESTServer::setup_routes() {
       .description("Prepares an update for execution (downloads, validates).")
       .success_description("Update preparation started")
       .gated_on(updates_available, kUpdate501)
+      // 409 when another update is already in progress or this one is being
+      // deleted (update_handlers.cpp maps UpdateErrorCode::InProgress and
+      // ::Deleting). The recorder cannot reach it: no fixture drives two
+      // overlapping updates.
+      .errors({409})
       .operation_id("prepareUpdate");
 
   reg.put<http::Accepted<http::NoContent>>(
@@ -1736,6 +1949,11 @@ void RESTServer::setup_routes() {
       .description("Starts executing a prepared update.")
       .success_description("Update execution started")
       .gated_on(updates_available, kUpdate501)
+      // 409 when another update is already in progress or this one is being
+      // deleted (update_handlers.cpp maps UpdateErrorCode::InProgress and
+      // ::Deleting). The recorder cannot reach it: no fixture drives two
+      // overlapping updates.
+      .errors({409})
       .operation_id("executeUpdate");
 
   reg.put<http::Accepted<http::NoContent>>(
@@ -1749,6 +1967,11 @@ void RESTServer::setup_routes() {
       .description("Runs a fully automated update (prepare + execute).")
       .success_description("Automated update started")
       .gated_on(updates_available, kUpdate501)
+      // 409 when another update is already in progress or this one is being
+      // deleted (update_handlers.cpp maps UpdateErrorCode::InProgress and
+      // ::Deleting). The recorder cannot reach it: no fixture drives two
+      // overlapping updates.
+      .errors({409})
       .operation_id("automateUpdate");
 
   reg.get<dto::UpdateDetail>("/updates/{update_id}",
@@ -1769,6 +1992,11 @@ void RESTServer::setup_routes() {
       .summary("Delete update")
       .description("Removes an update registration.")
       .gated_on(updates_available, kUpdate501)
+      // 409 when another update is already in progress or this one is being
+      // deleted (update_handlers.cpp maps UpdateErrorCode::InProgress and
+      // ::Deleting). The recorder cannot reach it: no fixture drives two
+      // overlapping updates.
+      .errors({409})
       .operation_id("deleteUpdate");
 
   // === Authentication ===
@@ -1843,7 +2071,16 @@ void RESTServer::setup_routes() {
           .tag("Lifecycle")
           .summary(std::string("Request lifecycle transition '") + action + "'")
           .success_description("Lifecycle transition accepted")
-          .errors({501})  // No LifecycleProvider, or the provider reports the transition unsupported
+          // 501: no LifecycleProvider, or the provider reports the transition
+          // unsupported. 403 and 409 come from the same total mapper
+          // (`to_error_info`, lifecycle_handlers.cpp): the provider can refuse
+          // the transition outright (AccessDenied) or report the entity is not
+          // in a state that allows it (PreconditionFailed). Neither is the auth
+          // middleware's 403 or a lock 409 - they are the provider's own
+          // answers, so they are declared here whether or not auth is on. The
+          // recorder cannot reach them: the fixture has no provider at all, so
+          // every run stops at the 501.
+          .errors({403, 409, 501})
           .operation_id(std::string("put").append(entity_cap).append("Status").append(action_cap));
     }
 
@@ -1853,7 +2090,9 @@ void RESTServer::setup_routes() {
                                           })
         .tag("Lifecycle")
         .summary(std::string("Get ") + et_lc.second + " lifecycle status")
-        .errors({501})  // LifecycleProvider reports the entity unsupported
+        // 501 when the provider reports the entity unsupported; 403/409 from
+        // the same mapper - see the transition routes above.
+        .errors({403, 409, 501})
         .operation_id(std::string("get") + entity_cap + "Status");
   }
 
