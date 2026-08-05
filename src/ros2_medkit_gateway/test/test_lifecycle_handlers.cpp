@@ -558,8 +558,9 @@ TEST_F(LifecycleHandlersWithProviderTest, TransitionAcceptedReturns202WithLocati
   auto result = handlers_->handle_transition(req, "restart");
   ASSERT_TRUE(result.has_value());
   const auto & att = result->second;
-  ASSERT_TRUE(att.status_override.has_value());
-  EXPECT_EQ(*att.status_override, 202);
+  // 202 is declared by the Accepted<> return type, not by a runtime override.
+  EXPECT_EQ(http::dto_alternate_status<decltype(result->first)>::value, 202);
+  EXPECT_FALSE(att.status_override.has_value());
   bool found_location = false;
   for (const auto & [name, value] : att.headers) {
     if (name == "Location") {

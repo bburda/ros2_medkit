@@ -31,6 +31,7 @@ import unittest
 
 import launch_testing
 import launch_testing.actions
+import requests
 
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
@@ -42,6 +43,8 @@ from ros2_medkit_test_utils.launch_helpers import (
 HTTP_METHODS = {'get', 'post', 'put', 'delete', 'patch', 'head', 'options'}
 
 _SCRIPTS_DIR = tempfile.mkdtemp(prefix='medkit-contract-scripts-')
+
+PYTHON_SCRIPT = '#!/usr/bin/env python3\nimport json\nprint(json.dumps({"result": "ok"}))\n'
 
 
 def generate_test_description():
@@ -116,6 +119,147 @@ class TestOpenApiContract(GatewayTestCase):
         for path in self.spec()['paths']:
             self.assertTrue(path.startswith('/'), f'{path}: missing leading slash')
             self.assertNotIn('//', path, f'{path}: empty path segment')
+
+    def declared_success_status(self, path, method):
+        """Return the single 2xx status the document declares for an operation."""
+        op = self.spec()['paths'][path][method]
+        codes = sorted(c for c in op.get('responses', {}) if c.startswith('2'))
+        self.assertEqual(
+            len(codes), 1,
+            f'{method.upper()} {path}: expected exactly one declared 2xx, got {codes}')
+        return int(codes[0])
+
+    def test_trigger_create_answers_with_the_declared_status(self):
+        """POST /apps/{app_id}/triggers answers with its declared 2xx."""
+        declared = self.declared_success_status('/apps/{app_id}/triggers', 'post')
+        resp = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/triggers',
+            json={
+                'resource': '/api/v1/apps/temp_sensor/faults',
+                'trigger_condition': {'condition_type': 'OnChange'},
+                'multishot': True,
+            },
+            timeout=10,
+        )
+        self.assertEqual(resp.status_code, declared, resp.text)
+        self.addCleanup(
+            requests.delete,
+            f'{self.BASE_URL}/apps/temp_sensor/triggers/{resp.json()["id"]}',
+            timeout=10,
+        )
+
+    def test_lock_acquire_answers_with_the_declared_status(self):
+        """POST /apps/{app_id}/locks answers with its declared 2xx."""
+        declared = self.declared_success_status('/apps/{app_id}/locks', 'post')
+        resp = requests.post(
+            f'{self.BASE_URL}/apps/calibration/locks',
+            json={'lock_expiration': 60},
+            headers={'X-Client-Id': 'contract_client'},
+            timeout=10,
+        )
+        self.assertEqual(resp.status_code, declared, resp.text)
+        self.addCleanup(
+            requests.delete,
+            f'{self.BASE_URL}/apps/calibration/locks/{resp.json()["id"]}',
+            headers={'X-Client-Id': 'contract_client'},
+            timeout=10,
+        )
+
+    def test_subscription_create_answers_with_the_declared_status(self):
+        """POST /apps/{app_id}/cyclic-subscriptions answers with its declared 2xx."""
+        declared = self.declared_success_status(
+            '/apps/{app_id}/cyclic-subscriptions', 'post')
+        resp = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/cyclic-subscriptions',
+            json={
+                'resource': '/api/v1/apps/temp_sensor/faults',
+                'interval': 'normal',
+                'duration': 60,
+            },
+            timeout=10,
+        )
+        self.assertEqual(resp.status_code, declared, resp.text)
+        self.addCleanup(
+            requests.delete,
+            f'{self.BASE_URL}/apps/temp_sensor/cyclic-subscriptions/'
+            f'{resp.json()["id"]}',
+            timeout=10,
+        )
+
+    def test_script_routes_answer_with_the_declared_status(self):
+        """Script upload (201) and execution start (202) match the document.
+
+        The execution POST is the only converted route in this fixture whose
+        declared success status is 202, so it is what proves an Accepted<T>
+        return type reaches the wire as 202 rather than 200.
+        """
+        upload_declared = self.declared_success_status('/apps/{app_id}/scripts', 'post')
+        upload = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/scripts',
+            files={'file': ('contract.py', PYTHON_SCRIPT, 'application/octet-stream')},
+            timeout=10,
+        )
+        self.assertEqual(upload.status_code, upload_declared, upload.text)
+        script_id = upload.json()['id']
+        self.addCleanup(
+            requests.delete,
+            f'{self.BASE_URL}/apps/temp_sensor/scripts/{script_id}',
+            timeout=10,
+        )
+
+        exec_declared = self.declared_success_status(
+            '/apps/{app_id}/scripts/{script_id}/executions', 'post')
+        self.assertEqual(exec_declared, 202)
+        start = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/scripts/{script_id}/executions',
+            json={'execution_type': 'now'},
+            timeout=10,
+        )
+        self.assertEqual(start.status_code, exec_declared, start.text)
+
+    def test_every_success_response_is_described(self):
+        """No declared 2xx ships without prose a client can show."""
+        undescribed = []
+        for path, method, op in self.operations():
+            for code, resp in op.get('responses', {}).items():
+                if code.startswith('2') and not resp.get('description'):
+                    undescribed.append(f'{op.get("operationId")}: {code}')
+        self.assertEqual(undescribed, [], f'no description: {undescribed}')
+
+    def test_no_success_response_is_described_as_no_content(self):
+        """Only 204 may be called "No content".
+
+        The description is auto-filled from the declared status, so a 201 or
+        202 labelled "No content" means the fill lost track of the status - the
+        same drift between status and document this suite exists to catch, one
+        layer down in the prose.
+        """
+        mislabelled = []
+        checked = 0
+        for path, method, op in self.operations():
+            for code, resp in op.get('responses', {}).items():
+                if not code.startswith('2') or code == '204':
+                    continue
+                checked += 1
+                if 'no content' in (resp.get('description') or '').lower():
+                    mislabelled.append(
+                        f'{op.get("operationId")}: {code} = {resp["description"]!r}')
+        # The body-less 202 routes (lifecycle transitions, update prepare /
+        # execute / automated) are the ones that used to be labelled "No
+        # content"; if the fixture stops exposing them this test would pass
+        # while guarding nothing.
+        self.assertGreater(checked, 0, 'No non-204 success responses to check')
+        self.assertEqual(mislabelled, [], f'mislabelled: {mislabelled}')
+
+    def test_no_operation_declares_a_status_it_cannot_return(self):
+        """Multiple 2xx codes only where the handler returns a variant."""
+        offenders = []
+        for path, method, op in self.operations():
+            codes = {c for c in op.get('responses', {}) if c.startswith('2')}
+            if len(codes) < 2 or op.get('x-medkit-alternates'):
+                continue
+            offenders.append(f'{op.get("operationId")}: {sorted(codes)}')
+        self.assertEqual(offenders, [], f'phantom success: {offenders}')
 
     def test_every_ref_resolves(self):
         """No $ref points at a component the document does not define."""

@@ -723,18 +723,18 @@ void RESTServer::setup_routes() {
         .description("Returns the current status and result of a specific execution.")
         .operation_id(std::string("get") + capitalize(et.singular) + "Execution");
 
-    reg.put<dto::ExecutionUpdateRequest, dto::OperationExecution>(
+    reg.put<dto::ExecutionUpdateRequest, http::Accepted<dto::OperationExecution>>(
            entity_path + "/operations/{operation_id}/executions/{execution_id}",
-           std::function<http::Result<std::pair<dto::OperationExecution, http::ResponseAttachments>>(
+           std::function<http::Result<std::pair<http::Accepted<dto::OperationExecution>, http::ResponseAttachments>>(
                http::TypedRequest, dto::ExecutionUpdateRequest)>{
                [this](http::TypedRequest req, const dto::ExecutionUpdateRequest & body)
-                   -> http::Result<std::pair<dto::OperationExecution, http::ResponseAttachments>> {
+                   -> http::Result<std::pair<http::Accepted<dto::OperationExecution>, http::ResponseAttachments>> {
                  return operation_handlers_->update_execution(req, body);
                }})
         .tag("Operations")
         .summary(std::string("Update execution for ") + et.singular)
         .description("Sends a control command to a running execution.")
-        .response(202, "Accepted (asynchronous control)", SB::ref("OperationExecution"))
+        .success_description("Accepted (asynchronous control)")
         // 400/404/500 come from the registry's automatic response-level
         // GenericError $ref; the remaining statuses this route can return
         // need manual declarations, or the generated SDK has no branch for
@@ -969,16 +969,16 @@ void RESTServer::setup_routes() {
     // Upload: only for apps and components (405 for areas and functions)
     std::string et_type_str = et.type;
     if (et_type_str == "apps" || et_type_str == "components") {
-      reg.multipart_upload<dto::BulkDataDescriptor>(
+      reg.multipart_upload<http::Created<dto::BulkDataDescriptor>>(
              entity_path + "/bulk-data/{category_id}",
              [this](http::TypedRequest req, const http::MultipartBody & body)
-                 -> http::Result<std::pair<dto::BulkDataDescriptor, http::ResponseAttachments>> {
+                 -> http::Result<std::pair<http::Created<dto::BulkDataDescriptor>, http::ResponseAttachments>> {
                return bulkdata_handlers_->upload(req, body);
              })
           .tag("Bulk Data")
           .summary(std::string("Upload bulk-data for ") + et.singular)
           .description(std::string("Uploads a file to a bulk-data category for this ") + et.singular + ".")
-          .response(201, "File uploaded", SB::ref("BulkDataDescriptor"))
+          .success_description("File uploaded")
           .operation_id(std::string("upload") + capitalize(et.singular) + "BulkData");
 
       reg.del<http::NoContent>(entity_path + "/bulk-data/{category_id}/{file_id}",
@@ -1059,10 +1059,10 @@ void RESTServer::setup_routes() {
           .description(std::string("Server-Sent Events stream for trigger notifications on this ") + et.singular + ".")
           .operation_id(std::string("stream") + capitalize(et.singular) + "TriggerEvents");
 
-      reg.post<dto::TriggerCreateRequest, dto::Trigger>(
+      reg.post<dto::TriggerCreateRequest, http::Created<dto::Trigger>>(
              entity_path + "/triggers",
-             [this, make_not_available_error](http::TypedRequest req, dto::TriggerCreateRequest body)
-                 -> http::Result<std::pair<dto::Trigger, http::ResponseAttachments>> {
+             [this, make_not_available_error](
+                 http::TypedRequest req, dto::TriggerCreateRequest body) -> http::Result<http::Created<dto::Trigger>> {
                if (!trigger_handlers_) {
                  return tl::unexpected(make_not_available_error());
                }
@@ -1071,7 +1071,7 @@ void RESTServer::setup_routes() {
           .tag("Triggers")
           .summary(std::string("Create trigger for ") + et.singular)
           .description(std::string("Creates a new event trigger for this ") + et.singular + ".")
-          .response(201, "Trigger created", SB::ref("Trigger"))
+          .success_description("Trigger created")
           .operation_id(std::string("create") + capitalize(et.singular) + "Trigger");
 
       reg.get<dto::Collection<dto::Trigger>>(
@@ -1149,16 +1149,16 @@ void RESTServer::setup_routes() {
           .description(std::string("Server-Sent Events stream for subscription data on this ") + et.singular + ".")
           .operation_id(std::string("stream") + capitalize(et.singular) + "SubscriptionEvents");
 
-      reg.post<dto::CyclicSubscriptionCreateRequest, dto::CyclicSubscription>(
+      reg.post<dto::CyclicSubscriptionCreateRequest, http::Created<dto::CyclicSubscription>>(
              entity_path + "/cyclic-subscriptions",
-             [this](http::TypedRequest req, dto::CyclicSubscriptionCreateRequest body)
-                 -> http::Result<std::pair<dto::CyclicSubscription, http::ResponseAttachments>> {
+             [this](http::TypedRequest req,
+                    dto::CyclicSubscriptionCreateRequest body) -> http::Result<http::Created<dto::CyclicSubscription>> {
                return cyclic_sub_handlers_->post_subscription(req, std::move(body));
              })
           .tag("Subscriptions")
           .summary(std::string("Create cyclic subscription for ") + et.singular)
           .description(std::string("Creates a new cyclic data subscription for this ") + et.singular + ".")
-          .response(201, "Subscription created", SB::ref("CyclicSubscription"))
+          .success_description("Subscription created")
           .operation_id(std::string("create") + capitalize(et.singular) + "Subscription");
 
       reg.get<dto::Collection<dto::CyclicSubscription>>(
@@ -1211,17 +1211,17 @@ void RESTServer::setup_routes() {
       // emit 201 + Location without re-introducing httplib::Response.
       static const nlohmann::json client_id_schema = {{"type", "string"}, {"minLength", 1}, {"maxLength", 256}};
 
-      reg.post<dto::AcquireLockRequest, dto::Lock>(
+      reg.post<dto::AcquireLockRequest, http::Created<dto::Lock>>(
              entity_path + "/locks",
-             [this](http::TypedRequest req,
-                    dto::AcquireLockRequest body) -> http::Result<std::pair<dto::Lock, http::ResponseAttachments>> {
+             [this](http::TypedRequest req, dto::AcquireLockRequest body)
+                 -> http::Result<std::pair<http::Created<dto::Lock>, http::ResponseAttachments>> {
                return lock_handlers_->post_lock(req, std::move(body));
              })
           .tag("Locking")
           .summary(std::string("Acquire lock on ") + et.singular)
           .description(std::string("Acquires an exclusive lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
-          .response(201, "Lock acquired", SB::ref("Lock"))
+          .success_description("Lock acquired")
           .operation_id(std::string("acquire") + capitalize(et.singular) + "Lock");
 
       reg.get<dto::Collection<dto::Lock>>(entity_path + "/locks",
@@ -1280,16 +1280,16 @@ void RESTServer::setup_routes() {
     // calls stay only where the schema differs (multipart upload + free-form
     // start-execution body).
     if (script_handlers_ && (et_type_str == "apps" || et_type_str == "components")) {
-      reg.multipart_upload<dto::ScriptUploadResponse>(
+      reg.multipart_upload<http::Created<dto::ScriptUploadResponse>>(
              entity_path + "/scripts",
              [this](http::TypedRequest req, const http::MultipartBody & body)
-                 -> http::Result<std::pair<dto::ScriptUploadResponse, http::ResponseAttachments>> {
+                 -> http::Result<std::pair<http::Created<dto::ScriptUploadResponse>, http::ResponseAttachments>> {
                return script_handlers_->upload_script(req, body);
              })
           .tag("Scripts")
           .summary(std::string("Upload diagnostic script for ") + et.singular)
           .description(std::string("Uploads a diagnostic script for this ") + et.singular + ".")
-          .response(201, "Script uploaded", SB::ref("ScriptUploadResponse"))
+          .success_description("Script uploaded")
           .operation_id(std::string("upload") + capitalize(et.singular) + "Script");
 
       reg.get<dto::ScriptList>(entity_path + "/scripts",
@@ -1319,16 +1319,17 @@ void RESTServer::setup_routes() {
           .description(std::string("Deletes a diagnostic script from this ") + et.singular + ".")
           .operation_id(std::string("delete") + capitalize(et.singular) + "Script");
 
-      reg.post<dto::ScriptExecution>(entity_path + "/scripts/{script_id}/executions",
-                                     [this](http::TypedRequest req)
-                                         -> http::Result<std::pair<dto::ScriptExecution, http::ResponseAttachments>> {
-                                       return script_handlers_->start_execution(req);
-                                     })
+      reg.post<http::Accepted<dto::ScriptExecution>>(
+             entity_path + "/scripts/{script_id}/executions",
+             [this](http::TypedRequest req)
+                 -> http::Result<std::pair<http::Accepted<dto::ScriptExecution>, http::ResponseAttachments>> {
+               return script_handlers_->start_execution(req);
+             })
           .tag("Scripts")
           .summary(std::string("Start script execution for ") + et.singular)
           .description(std::string("Starts execution of a diagnostic script on this ") + et.singular + ".")
           .request_body("Execution parameters", SB::generic_object_schema())
-          .response(202, "Execution started", SB::ref("ScriptExecution"))
+          .success_description("Execution started")
           .operation_id(std::string("start") + capitalize(et.singular) + "ScriptExecution");
 
       reg.get<dto::ScriptExecution>(entity_path + "/scripts/{script_id}/executions/{execution_id}",
@@ -1662,10 +1663,10 @@ void RESTServer::setup_routes() {
       .operation_id("listUpdates")
       .query<dto::UpdateListQuery>();
 
-  reg.post<dto::UpdateRegisterRequest, dto::UpdateRegisterResponse>(
+  reg.post<dto::UpdateRegisterRequest, http::Created<dto::UpdateRegisterResponse>>(
          "/updates",
          [this](http::TypedRequest req, dto::UpdateRegisterRequest body)
-             -> http::Result<std::pair<dto::UpdateRegisterResponse, http::ResponseAttachments>> {
+             -> http::Result<std::pair<http::Created<dto::UpdateRegisterResponse>, http::ResponseAttachments>> {
            if (!update_handlers_) {
              return tl::unexpected(kUpdate501);
            }
@@ -1674,7 +1675,7 @@ void RESTServer::setup_routes() {
       .tag("Updates")
       .summary("Register a software update")
       .description("Registers a new software update descriptor.")
-      .response(201, "Update registered", SB::ref("UpdateRegisterResponse"))
+      .success_description("Update registered")
       .operation_id("registerUpdate");
 
   reg.get<dto::UpdateStatus>("/updates/{update_id}/status",
@@ -1689,9 +1690,10 @@ void RESTServer::setup_routes() {
       .description("Returns the current status and progress of an update.")
       .operation_id("getUpdateStatus");
 
-  reg.put<http::NoContent>(
+  reg.put<http::Accepted<http::NoContent>>(
          "/updates/{update_id}/prepare",
-         [this](http::TypedRequest req) -> http::Result<std::pair<http::NoContent, http::ResponseAttachments>> {
+         [this](http::TypedRequest req)
+             -> http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>> {
            if (!update_handlers_) {
              return tl::unexpected(kUpdate501);
            }
@@ -1700,12 +1702,13 @@ void RESTServer::setup_routes() {
       .tag("Updates")
       .summary("Prepare update for execution")
       .description("Prepares an update for execution (downloads, validates).")
-      .response(202, "Update preparation started")
+      .success_description("Update preparation started")
       .operation_id("prepareUpdate");
 
-  reg.put<http::NoContent>(
+  reg.put<http::Accepted<http::NoContent>>(
          "/updates/{update_id}/execute",
-         [this](http::TypedRequest req) -> http::Result<std::pair<http::NoContent, http::ResponseAttachments>> {
+         [this](http::TypedRequest req)
+             -> http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>> {
            if (!update_handlers_) {
              return tl::unexpected(kUpdate501);
            }
@@ -1714,12 +1717,13 @@ void RESTServer::setup_routes() {
       .tag("Updates")
       .summary("Execute update")
       .description("Starts executing a prepared update.")
-      .response(202, "Update execution started")
+      .success_description("Update execution started")
       .operation_id("executeUpdate");
 
-  reg.put<http::NoContent>(
+  reg.put<http::Accepted<http::NoContent>>(
          "/updates/{update_id}/automated",
-         [this](http::TypedRequest req) -> http::Result<std::pair<http::NoContent, http::ResponseAttachments>> {
+         [this](http::TypedRequest req)
+             -> http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>> {
            if (!update_handlers_) {
              return tl::unexpected(kUpdate501);
            }
@@ -1728,7 +1732,7 @@ void RESTServer::setup_routes() {
       .tag("Updates")
       .summary("Run automated update")
       .description("Runs a fully automated update (prepare + execute).")
-      .response(202, "Automated update started")
+      .success_description("Automated update started")
       .operation_id("automateUpdate");
 
   reg.get<dto::UpdateDetail>("/updates/{update_id}",
@@ -1818,14 +1822,15 @@ void RESTServer::setup_routes() {
           cap_next = false;
         }
       }
-      reg.put<http::NoContent>(base_lc + "/status/" + action,
-                               [this, action_str](http::TypedRequest req)
-                                   -> http::Result<std::pair<http::NoContent, http::ResponseAttachments>> {
-                                 return lifecycle_handlers_->handle_transition(req, action_str);
-                               })
+      reg.put<http::Accepted<http::NoContent>>(
+             base_lc + "/status/" + action,
+             [this, action_str](http::TypedRequest req)
+                 -> http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>> {
+               return lifecycle_handlers_->handle_transition(req, action_str);
+             })
           .tag("Lifecycle")
           .summary(std::string("Request lifecycle transition '") + action + "'")
-          .response(202, "Lifecycle transition accepted")
+          .success_description("Lifecycle transition accepted")
           .operation_id(std::string("put").append(entity_cap).append("Status").append(action_cap));
     }
 

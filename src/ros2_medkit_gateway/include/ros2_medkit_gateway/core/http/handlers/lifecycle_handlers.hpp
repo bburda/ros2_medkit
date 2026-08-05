@@ -54,8 +54,8 @@ class LifecycleHandlers {
 
   /// PUT /{entity}/status/{action} - request a lifecycle transition.
   /// Returns 202 + Location on acceptance, or 501 when no provider is registered.
-  http::Result<std::pair<http::NoContent, http::ResponseAttachments>> handle_transition(const http::TypedRequest & req,
-                                                                                        std::string_view transition);
+  http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>>
+  handle_transition(const http::TypedRequest & req, std::string_view transition);
 
  private:
   HandlerContext & ctx_;

@@ -168,8 +168,8 @@ std::string LockHandlers::format_expiration(std::chrono::steady_clock::time_poin
 // Handler implementations
 // ============================================================================
 
-http::Result<std::pair<dto::Lock, http::ResponseAttachments>> LockHandlers::post_lock(const http::TypedRequest & req,
-                                                                                      dto::AcquireLockRequest body) {
+http::Result<std::pair<http::Created<dto::Lock>, http::ResponseAttachments>>
+LockHandlers::post_lock(const http::TypedRequest & req, dto::AcquireLockRequest body) {
   if (auto guard = check_locking_enabled(); !guard) {
     return tl::unexpected(guard.error());
   }
@@ -235,8 +235,8 @@ http::Result<std::pair<dto::Lock, http::ResponseAttachments>> LockHandlers::post
 
     auto lock_dto = lock_info_to_dto(*result, client_id);
     http::ResponseAttachments att;
-    att.with_status(201).with_header("Location", std::string(req.path()) + "/" + result->lock_id);
-    return std::make_pair(std::move(lock_dto), std::move(att));
+    att.with_header("Location", std::string(req.path()) + "/" + result->lock_id);
+    return std::make_pair(http::Created<dto::Lock>{std::move(lock_dto)}, std::move(att));
 
   } catch (const std::exception & e) {
     return tl::unexpected(

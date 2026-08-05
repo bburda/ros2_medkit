@@ -47,9 +47,9 @@ class UpdateHandlers {
   http::Result<dto::UpdateDetail> get_update(const http::TypedRequest & req);
 
   /// POST /updates - register a new update descriptor. On success returns the
-  /// `UpdateRegisterResponse` body with a 201 status override and a
+  /// `UpdateRegisterResponse` body as 201 Created plus a
   /// `Location: /api/v1/updates/<id>` header.
-  http::Result<std::pair<dto::UpdateRegisterResponse, http::ResponseAttachments>>
+  http::Result<std::pair<http::Created<dto::UpdateRegisterResponse>, http::ResponseAttachments>>
   post_update(const http::TypedRequest & req, dto::UpdateRegisterRequest body);
 
   /// DELETE /updates/{update_id} - 204 No Content on success.
@@ -57,15 +57,18 @@ class UpdateHandlers {
 
   /// PUT /updates/{update_id}/prepare - 202 Accepted + `Location: .../status`
   /// header, kicks the background prepare task.
-  http::Result<std::pair<http::NoContent, http::ResponseAttachments>> put_prepare(const http::TypedRequest & req);
+  http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>>
+  put_prepare(const http::TypedRequest & req);
 
   /// PUT /updates/{update_id}/execute - 202 Accepted + `Location: .../status`
   /// header, kicks the background execute task.
-  http::Result<std::pair<http::NoContent, http::ResponseAttachments>> put_execute(const http::TypedRequest & req);
+  http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>>
+  put_execute(const http::TypedRequest & req);
 
   /// PUT /updates/{update_id}/automated - 202 Accepted + `Location: .../status`
   /// header, kicks the background prepare+execute task.
-  http::Result<std::pair<http::NoContent, http::ResponseAttachments>> put_automated(const http::TypedRequest & req);
+  http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>>
+  put_automated(const http::TypedRequest & req);
 
   /// GET /updates/{update_id}/status - returns the current async-task state.
   http::Result<dto::UpdateStatus> get_status(const http::TypedRequest & req);

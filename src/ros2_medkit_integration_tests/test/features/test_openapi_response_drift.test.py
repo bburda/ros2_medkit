@@ -349,6 +349,56 @@ class TestOpenApiResponseDrift(GatewayTestCase):
             + '\n'.join(violations),
         )
 
+    def test_update_routes_answer_with_the_declared_status(self):
+        """POST /updates and PUT /updates/{id}/prepare match the document.
+
+        The drift loop above only exercises GET against 200, so the derived
+        success status of a write route has no other wire coverage. The
+        prepare PUT is the body-less 202 shape (``Accepted<NoContent>``) the
+        lifecycle transitions share; no lifecycle provider ships with the
+        gateway, so this is where that shape is proven end to end.
+
+        @verifies REQ_INTEROP_002
+        """
+        spec = self._fetch_spec()
+
+        def declared(path, method):
+            op = spec['paths'][path][method]
+            codes = sorted(c for c in op.get('responses', {}) if c.startswith('2'))
+            self.assertEqual(
+                len(codes), 1,
+                f'{method.upper()} {path}: expected exactly one declared 2xx, '
+                f'got {codes}')
+            return int(codes[0])
+
+        pkg_id = 'declared-status-pkg'
+        requests.delete(f'{self.BASE_URL}/updates/{pkg_id}', timeout=5)
+        self.addCleanup(
+            requests.delete, f'{self.BASE_URL}/updates/{pkg_id}', timeout=5
+        )
+
+        register_declared = declared('/updates', 'post')
+        self.assertEqual(register_declared, 201)
+        register = requests.post(
+            f'{self.BASE_URL}/updates',
+            json={
+                'id': pkg_id,
+                'update_name': 'Declared status package',
+                'automated': False,
+                'origins': ['proximity'],
+            },
+            timeout=5,
+        )
+        self.assertEqual(register.status_code, register_declared, register.text)
+
+        prepare_declared = declared('/updates/{update_id}/prepare', 'put')
+        self.assertEqual(prepare_declared, 202)
+        prepare = requests.put(
+            f'{self.BASE_URL}/updates/{pkg_id}/prepare', timeout=5
+        )
+        self.assertEqual(prepare.status_code, prepare_declared, prepare.text)
+        self.assertEqual(prepare.text, '', 'Accepted<NoContent> must send no body')
+
     def test_update_status_payload_uses_nested_x_medkit(self):
         """Specific guard for issue #385: /updates/{id}/status payload.
 

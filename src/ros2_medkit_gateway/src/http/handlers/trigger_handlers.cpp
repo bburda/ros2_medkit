@@ -113,8 +113,8 @@ TriggerHandlers::TriggerHandlers(HandlerContext & ctx, TriggerManager & trigger_
 // ---------------------------------------------------------------------------
 // POST - create trigger
 // ---------------------------------------------------------------------------
-http::Result<std::pair<dto::Trigger, http::ResponseAttachments>>
-TriggerHandlers::post_trigger(const http::TypedRequest & req, dto::TriggerCreateRequest body) {
+http::Result<http::Created<dto::Trigger>> TriggerHandlers::post_trigger(const http::TypedRequest & req,
+                                                                        dto::TriggerCreateRequest body) {
   auto id_result = read_entity_id(req);
   if (!id_result) {
     return tl::unexpected(id_result.error());
@@ -335,9 +335,7 @@ TriggerHandlers::post_trigger(const http::TypedRequest & req, dto::TriggerCreate
 
   auto event_source = build_event_source(*result);
   auto trigger_dto = trigger_info_to_dto(*result, event_source);
-  http::ResponseAttachments att;
-  att.with_status(201);
-  return std::make_pair(std::move(trigger_dto), std::move(att));
+  return http::Created<dto::Trigger>{std::move(trigger_dto)};
 }
 
 // ---------------------------------------------------------------------------

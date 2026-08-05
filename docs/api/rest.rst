@@ -3371,6 +3371,13 @@ OpenAPI spec describing the available operations at that level.
 **Features:**
 
 - Specs include SOVD extensions (``x-sovd-version``, ``x-sovd-data-category``)
+- Each operation declares exactly one success status, derived from the handler's
+  C++ return type. The few operations whose handler can genuinely answer with one
+  of several success shapes (``POST .../operations/{operation_id}/executions``,
+  ``DELETE .../faults/{fault_code}``,
+  ``DELETE .../configurations``) carry ``x-medkit-alternates: true`` and list every
+  alternative under its own status code. A generated client can therefore branch on
+  status only where that marker is present.
 - Entity-level specs reflect actual capabilities from the runtime entity cache
 - Specs are cached per entity cache generation for performance
 - Plugin-registered vendor routes appear in path-scoped specs when the requested

@@ -322,27 +322,62 @@ plus, on POST / PUT / PATCH overloads, an already-parsed ``TBody``:
            // ... return result ...
          });
 
-When a handler needs to override the success status (201 + Location, 204 +
-custom header, ...) the pair-returning overload makes the framework apply
-``ResponseAttachments`` after the body is written:
+Success Status Lives in the Return Type
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A handler that completes with something other than 200 says so in its return
+type, not at runtime. ``http::Created<T>`` declares 201 and ``http::Accepted<T>``
+declares 202; both are transparent wrappers whose payload is ``T``:
 
 .. code-block:: cpp
 
-   reg.post<dto::Req, dto::Resp>(
-         "/...",
-         [](http::TypedRequest, dto::Req)
-             -> http::Result<std::pair<dto::Resp, http::ResponseAttachments>> {
-           dto::Resp r;
-           http::ResponseAttachments att;
-           att.status_override = 201;
-           att.headers.emplace_back("Location", "/resources/123");
-           return std::make_pair(std::move(r), std::move(att));
+   reg.post<dto::TriggerCreateRequest, http::Created<dto::Trigger>>(
+         "/{entity}/triggers",
+         [](http::TypedRequest, dto::TriggerCreateRequest)
+             -> http::Result<http::Created<dto::Trigger>> {
+           dto::Trigger t;
+           return http::Created<dto::Trigger>{std::move(t)};
          });
 
-The framework writes the response body via ``JsonWriter<TResponse>``, applies
-the attachments, and renders any error branch via the route's configured
-``ErrorRenderer`` (``kSovdGenericError`` by default; the ``/auth/*`` routes
-opt into ``kOAuth2Error`` to emit the RFC 6749 wire shape).
+The registry reads ``http::dto_alternate_status<TResponse>`` for the status and
+``http::status_payload_t<TResponse>`` for everything else - the schema ``$ref``,
+the ``has_dto_shape_v`` assertion and the body writer. An unwrapped ``TResponse``
+is its own payload, so a plain DTO still means 200 and ``http::NoContent`` still
+means 204. ``http::Accepted<http::NoContent>`` is the shape for an accepted
+asynchronous transition that sends no body (202, empty).
+
+This is what keeps the document honest: the declared status and the status on
+the wire come from one type, so they cannot disagree. Writing the status at the
+call site instead - ``.response(201, ...)`` beside a handler that returns 200 -
+is what previously let 45 operations advertise a success status their handler
+could never emit.
+
+``ResponseAttachments`` remains the channel for everything that is *not* the
+status: extra headers on the success response, and the rare runtime status
+override. The pair-returning overloads carry it alongside the (possibly
+wrapped) response:
+
+.. code-block:: cpp
+
+   reg.post<dto::Req, http::Created<dto::Resp>>(
+         "/...",
+         [](http::TypedRequest, dto::Req)
+             -> http::Result<std::pair<http::Created<dto::Resp>, http::ResponseAttachments>> {
+           dto::Resp r;
+           http::ResponseAttachments att;
+           att.with_header("Location", "/resources/123");
+           return std::make_pair(http::Created<dto::Resp>{std::move(r)}, std::move(att));
+         });
+
+When the attachments carry no ``status_override``, the framework falls back to
+``dto_alternate_status<TResponse>`` - never to a literal 200/204 - so wrapping a
+paired response is enough to move both the wire status and the declared one.
+
+The framework writes the response body via
+``JsonWriter<status_payload_t<TResponse>>``, applies the attachments, and renders
+any error branch via the route's configured ``ErrorRenderer``
+(``kSovdGenericError`` by default; the ``/auth/*`` routes opt into
+``kOAuth2Error`` to emit the RFC 6749 wire shape).
 
 Type-System Guarantees
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -352,19 +387,50 @@ gate, so any non-DTO type passed as ``TResponse`` or ``TBody`` rejects at
 compile time with a contract-aware diagnostic. ``has_dto_shape_v<T>`` is true
 when either ``is_dto_v<T>`` (a regular field-walking DTO) or
 ``is_opaque_dto_v<T>`` (a hand-written opaque DTO envelope) is true; the
-``NoContent`` marker is the third accepted shape and triggers a 204
-empty-body branch in ``write_success_body``.
+``NoContent`` marker is the third accepted shape and triggers an empty-body
+branch in ``write_success_body``. The gate is applied to
+``status_payload_t<TResponse>``, so ``Created<T>`` / ``Accepted<T>`` are
+accepted exactly when ``T`` is - the wrappers deliberately have no
+``dto_fields`` / ``dto_name`` specialization of their own.
 
-The OpenAPI schema slot for every typed route is wired automatically from
-``TResponse`` and ``TBody`` (and from the alternates in
+The OpenAPI status **and** schema slot for every typed route is wired
+automatically from ``TResponse`` and ``TBody`` (and from the alternates in
 ``post_alternates<TBody, TAlt...>`` / ``del_alternates<TAlt...>``). The
-registry calls ``RouteEntry::response<T>(200, "")`` /
-``RouteEntry::request_body<TB>("")`` so the wire JSON and the published
-schema cannot drift: the same C++ type names both. Hand-attached
-``.response(...)`` / ``.request_body(...)`` calls are reserved for non-200
-status documentation (404 / 409 / ...) and for the rare body-less typed
-``post`` / ``put`` overloads that parse non-JSON bodies (form-urlencoded
-auth) and need an explicit OpenAPI ``request_body`` annotation.
+registry calls
+``RouteEntry::response<status_payload_t<TResponse>>(dto_alternate_status<TResponse>::value, ...)``
+/ ``RouteEntry::request_body<TB>("")`` so neither the status nor the schema can
+drift from the handler: the same C++ type names all three.
+
+Hand-attached ``.response(...)`` calls are therefore reserved for statuses the
+*framework cannot see* - error statuses beyond the blanket 400/404/500 set, and
+the ``request_body(...)`` annotation the rare body-less typed ``post`` / ``put``
+overloads need when they parse non-JSON bodies (form-urlencoded auth). Never
+hand-attach a 2xx: it restates something the return type already decides, and
+if the two disagree the route publishes both.
+
+To author the prose a generated client shows for a success response, use
+``.success_description("Trigger created")``. It rewrites the description of the
+already-derived 2xx and touches neither the status nor the schema. Without it
+the framework publishes a status-appropriate default ("Created", "Accepted",
+"No content", "Successful response").
+
+Routes whose handler genuinely returns a ``std::variant`` - the
+``post_alternates`` / ``del_alternates`` helpers - legitimately declare more
+than one 2xx. Those helpers call ``RouteEntry::mark_alternates()`` themselves,
+which publishes the ``x-medkit-alternates: true`` operation extension, so the
+document contract test can tell a real variant from a route that declares a
+status it cannot return. Nothing else may set that marker.
+
+Two further ``RouteEntry`` knobs shape the published response set:
+
+- ``errors({409, 423})`` - declare error statuses this route can emit beyond
+  the blanket set; each is rendered as a ``GenericError`` response ``$ref``.
+  Statuses below 400 are ignored and reported by ``validate_completeness()``,
+  because a success status belongs in the return type, not here.
+- ``only_status(code, desc)`` - this route has exactly one outcome. Clears every
+  other response and suppresses the blanket 400/404/500 injection. The
+  auth 401/403 refs stay when authentication is enabled: they come from the
+  middleware ahead of the handler and are reachable on every route.
 
 Escape Hatches
 --------------
@@ -394,8 +460,9 @@ remain compile-time-checked at their boundary.
 - ``reg.multipart_upload<TResponse>(path, handler)`` - registers a
   ``multipart/form-data`` upload. The handler receives ``http::MultipartBody``
   (already parsed by cpp-httplib) and returns
-  ``Result<std::pair<TResponse, http::ResponseAttachments>>`` so it can pin
-  201 + ``Location`` on successful uploads. Used by bulk-data POST/PUT.
+  ``Result<std::pair<TResponse, http::ResponseAttachments>>``. Uploads declare
+  201 through ``TResponse`` (``http::Created<dto::BulkDataDescriptor>``) and use
+  the attachments only for the ``Location`` header. Used by bulk-data POST/PUT.
 - ``reg.static_asset(path, handler)`` - serves bytes already in memory
   (Swagger UI bundles, embedded HTML/JS/CSS) as
   ``Result<http::StaticAsset>`` carrying ``bytes``, ``content_type``, and
@@ -411,9 +478,11 @@ remain compile-time-checked at their boundary.
   ``reg.del_alternates<TAlt...>(path, handler)`` - register multi-shape
   responses. The active variant alternative is dispatched to its
   ``dto_alternate_status<T>::value`` (default 200; specialize per type, for
-  example ``Accepted`` -> 202, ``NoContent`` -> 204). The published spec
-  lists every alternative under its own status code, and the wire status is
-  picked by the active alternative at call time.
+  example ``NoContent`` -> 204, ``Created<T>`` -> 201, ``Accepted<T>`` -> 202).
+  The published spec lists every alternative under its own status code, and the
+  wire status is picked by the active alternative at call time. Both helpers
+  call ``mark_alternates()``, so these are the only operations allowed to carry
+  more than one 2xx.
 
 Plugin-Owned Routes (``PluginContext::register_route()``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -111,11 +111,10 @@ class OperationHandlers {
 
   /// PUT /{entity}/operations/{op_id}/executions/{exec_id} - update execution.
   ///
-  /// Returns `OperationExecution` + attachments so the supported `stop`
-  /// capability can emit 202 + `Location` (the SOVD async-update convention)
-  /// while the success body stays 200 for any future synchronous capability
-  /// that might land.
-  http::Result<std::pair<dto::OperationExecution, http::ResponseAttachments>>
+  /// Only the `stop` capability succeeds, and it is asynchronous, so the
+  /// return type declares 202 Accepted. The attachments companion carries the
+  /// `Location` header (the SOVD async-update convention).
+  http::Result<std::pair<http::Accepted<dto::OperationExecution>, http::ResponseAttachments>>
   update_execution(const http::TypedRequest & req, const dto::ExecutionUpdateRequest & body);
 
  private:

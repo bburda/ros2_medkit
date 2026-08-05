@@ -83,7 +83,7 @@ CyclicSubscriptionHandlers::CyclicSubscriptionHandlers(HandlerContext & ctx, Sub
 // ---------------------------------------------------------------------------
 // POST - create subscription
 // ---------------------------------------------------------------------------
-http::Result<std::pair<dto::CyclicSubscription, http::ResponseAttachments>>
+http::Result<http::Created<dto::CyclicSubscription>>
 CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
                                               dto::CyclicSubscriptionCreateRequest body) {
   auto id_result = read_entity_id(req);
@@ -204,9 +204,7 @@ CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
   }
 
   auto sub_dto = subscription_to_dto(*result, *event_source_result);
-  http::ResponseAttachments att;
-  att.with_status(201);
-  return std::make_pair(std::move(sub_dto), std::move(att));
+  return http::Created<dto::CyclicSubscription>{std::move(sub_dto)};
 }
 
 // ---------------------------------------------------------------------------

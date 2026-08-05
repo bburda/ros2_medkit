@@ -56,8 +56,9 @@ struct ParsedResourceUri {
  * The SSE event-stream route uses the `reg.sse<>` escape hatch and returns a
  * `Result<SseStream>` factory; the framework drives the chunked content
  * provider. The transport's `make_sse_stream` builds the `next_event` closure.
- * CRUD POST uses the attachments variant so it can override the status to 201
- * without re-introducing a `httplib::Response &` parameter.
+ * CRUD POST returns `Created<CyclicSubscription>` so the 201 status lives in
+ * the signature and the generated document cannot declare a status the handler
+ * never emits.
  */
 class CyclicSubscriptionHandlers {
  public:
@@ -67,10 +68,9 @@ class CyclicSubscriptionHandlers {
 
   /// POST /{entity}/cyclic-subscriptions - create subscription.
   ///
-  /// On success returns the new `CyclicSubscription` body with a 201 status
-  /// override.
-  http::Result<std::pair<dto::CyclicSubscription, http::ResponseAttachments>>
-  post_subscription(const http::TypedRequest & req, dto::CyclicSubscriptionCreateRequest body);
+  /// On success returns the new `CyclicSubscription` body as 201 Created.
+  http::Result<http::Created<dto::CyclicSubscription>> post_subscription(const http::TypedRequest & req,
+                                                                         dto::CyclicSubscriptionCreateRequest body);
 
   /// GET /{entity}/cyclic-subscriptions - list all subscriptions for entity.
   http::Result<dto::Collection<dto::CyclicSubscription>> get_subscriptions(const http::TypedRequest & req);

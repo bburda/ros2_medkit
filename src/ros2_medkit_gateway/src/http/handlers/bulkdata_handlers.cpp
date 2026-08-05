@@ -562,7 +562,7 @@ http::Result<http::BinaryResponse> BulkDataHandlers::download(const http::TypedR
 // POST /{entity}/bulk-data/{category_id} - multipart upload (201 + Location)
 // ---------------------------------------------------------------------------
 
-http::Result<std::pair<dto::BulkDataDescriptor, http::ResponseAttachments>>
+http::Result<std::pair<http::Created<dto::BulkDataDescriptor>, http::ResponseAttachments>>
 BulkDataHandlers::upload(const http::TypedRequest & req, const http::MultipartBody & body) {
   auto path_info = parse_path(req);
   if (!path_info) {
@@ -674,8 +674,8 @@ BulkDataHandlers::upload(const http::TypedRequest & req, const http::MultipartBo
   }
 
   http::ResponseAttachments att;
-  att.with_status(201).with_header("Location", req.path() + "/" + stored.id);
-  return std::make_pair(std::move(descriptor), std::move(att));
+  att.with_header("Location", req.path() + "/" + stored.id);
+  return std::make_pair(http::Created<dto::BulkDataDescriptor>{std::move(descriptor)}, std::move(att));
 }
 
 // ---------------------------------------------------------------------------

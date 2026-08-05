@@ -66,8 +66,8 @@ class BulkDataHandlers {
   http::Result<http::BinaryResponse> download(const http::TypedRequest & req);
 
   /// POST /{entity}/bulk-data/{category_id} - multipart upload, 201 + Location.
-  http::Result<std::pair<dto::BulkDataDescriptor, http::ResponseAttachments>> upload(const http::TypedRequest & req,
-                                                                                     const http::MultipartBody & body);
+  http::Result<std::pair<http::Created<dto::BulkDataDescriptor>, http::ResponseAttachments>>
+  upload(const http::TypedRequest & req, const http::MultipartBody & body);
 
   /// DELETE /{entity}/bulk-data/{category_id}/{file_id} - 204 No Content.
   http::Result<http::NoContent> remove(const http::TypedRequest & req);

@@ -194,7 +194,7 @@ http::Result<dto::LifecycleStatusResponse> LifecycleHandlers::handle_get_status(
 // PUT /{entity}/status/{action}
 // =============================================================================
 
-http::Result<std::pair<http::NoContent, http::ResponseAttachments>>
+http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>>
 LifecycleHandlers::handle_transition(const http::TypedRequest & req, std::string_view transition) {
   auto id_raw = req.path_param("1");
   if (!id_raw) {
@@ -220,8 +220,8 @@ LifecycleHandlers::handle_transition(const http::TypedRequest & req, std::string
           return tl::make_unexpected(to_error_info(result.error()));
         }
         http::ResponseAttachments att;
-        att.with_status(202).with_header("Location", base + "/status");
-        return std::make_pair(http::NoContent{}, std::move(att));
+        att.with_header("Location", base + "/status");
+        return std::make_pair(http::Accepted<http::NoContent>{http::NoContent{}}, std::move(att));
       } catch (const std::exception & e) {
         RCLCPP_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw for entity '%s': %s", entity_id.c_str(),
                      e.what());

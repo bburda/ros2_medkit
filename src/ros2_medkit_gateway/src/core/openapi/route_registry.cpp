@@ -15,6 +15,7 @@
 #include "route_registry.hpp"
 
 #include <algorithm>
+#include <initializer_list>
 #include <memory>
 #include <set>
 #include <string>
@@ -132,6 +133,41 @@ RouteEntry & RouteEntry::operation_id(const std::string & id) {
 
 RouteEntry & RouteEntry::hidden() {
   hidden_ = true;
+  return *this;
+}
+
+RouteEntry & RouteEntry::mark_alternates() {
+  alternates_ = true;
+  return *this;
+}
+
+RouteEntry & RouteEntry::success_description(const std::string & desc) {
+  for (auto & [code, info] : responses_) {
+    if (code >= 200 && code < 300) {
+      info.desc = desc;
+    }
+  }
+  return *this;
+}
+
+RouteEntry & RouteEntry::errors(std::initializer_list<int> codes) {
+  for (int code : codes) {
+    if (code < 400) {
+      // Not an error status. Recording it rather than silently dropping it is
+      // what turns a miscall into a validate_completeness() issue.
+      rejected_error_codes_.push_back(code);
+      continue;
+    }
+    declared_errors_.push_back(code);
+  }
+  return *this;
+}
+
+RouteEntry & RouteEntry::only_status(int code, const std::string & desc) {
+  responses_.clear();
+  declared_errors_.clear();
+  only_status_ = true;
+  responses_[code] = {desc, {}};
   return *this;
 }
 
@@ -466,6 +502,10 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
     if (route.deprecated_) {
       operation["deprecated"] = true;
     }
+    if (route.alternates_) {
+      // The handler returns a variant, so more than one 2xx code is genuine.
+      operation["x-medkit-alternates"] = true;
+    }
 
     // Parameters
     if (!route.parameters_.empty()) {
@@ -566,9 +606,19 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       }
     };
 
-    add_error_ref("400");
-    add_error_ref("404");
-    add_error_ref("500");
+    for (int code : route.declared_errors_) {
+      add_error_ref(std::to_string(code));
+    }
+
+    // `only_status()` states the route has exactly one outcome, so the blanket
+    // set would document statuses it can never emit. The auth refs below stay:
+    // 401/403 come from the auth middleware ahead of the handler and are
+    // reachable on every route regardless of what the handler can return.
+    if (!route.only_status_) {
+      add_error_ref("400");
+      add_error_ref("404");
+      add_error_ref("500");
+    }
 
     if (auth_enabled_) {
       add_error_ref("401");
@@ -672,6 +722,14 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
       issues.push_back({ValidationIssue::Severity::kError, route_id, "Missing tag"});
     }
 
+    // errors() only accepts 4xx/5xx. A success or redirect status passed there
+    // was dropped, so report it rather than let the route quietly lose it.
+    for (int code : route.rejected_error_codes_) {
+      issues.push_back({ValidationIssue::Severity::kError, route_id,
+                        "errors() ignored non-error status " + std::to_string(code) +
+                            "; use response() for success and redirect statuses"});
+    }
+
     // Check response schemas for non-DELETE methods
     if (route.method_ != "delete") {
       bool has_success_response_with_schema = false;
@@ -688,8 +746,15 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
                     route.summary_.find("stream") != std::string::npos ||
                     route.summary_.find("Stream") != std::string::npos;
 
-      // 204 No Content responses don't need a schema
-      bool has_204 = route.responses_.count(204) > 0;
+      // Body-less success statuses need no schema: 204 never carries a body,
+      // and a 202 declared without one is an accepted asynchronous transition
+      // (`Accepted<NoContent>`). Mirrors the "202 without content is OK"
+      // branch of the served-document completeness gate.
+      bool has_bodyless_success = route.responses_.count(204) > 0;
+      if (auto accepted = route.responses_.find(202);
+          accepted != route.responses_.end() && accepted->second.schema.empty()) {
+        has_bodyless_success = true;
+      }
 
       // Endpoints that only return errors (e.g., 405) don't need success schemas
       bool has_only_error_responses = !route.responses_.empty();
@@ -700,7 +765,7 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
         }
       }
 
-      if (!has_success_response_with_schema && !is_sse && !has_204 && !has_only_error_responses) {
+      if (!has_success_response_with_schema && !is_sse && !has_bodyless_success && !has_only_error_responses) {
         issues.push_back({ValidationIssue::Severity::kError, route_id, "Missing response schema for success (2xx)"});
       }
     } else {
