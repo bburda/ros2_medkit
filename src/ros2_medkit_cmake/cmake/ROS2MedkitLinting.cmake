@@ -27,13 +27,32 @@ option(ENABLE_CLANG_TIDY "Register clang-tidy as a CTest target" OFF)
 
 # ament_clang_tidy defaults to --jobs 1, so one CTest test analyses a whole
 # package one translation unit at a time while the rest of the machine idles.
-# CTest-level parallelism does not help: each package registers a single
-# clang_tidy test, and the largest package dominates the wall clock.
+# CTest-level parallelism does not help: a participating package registers a
+# single clang_tidy test, so --ctest-args -j has nothing to overlap.
 #
-# Analysing in parallel WITHIN the test is the lever. Because several package
-# tests can still run concurrently, keep the CTest job count for clang-tidy low
-# (scripts/test.sh runs the tidy preset serially) or peak memory becomes
-# packages x jobs x ~0.5 GB per clang-tidy process.
+# Analysing in parallel WITHIN the test is the lever. What still runs packages
+# concurrently is colcon's --parallel-workers, so that is what has to come down
+# when clang-tidy runs (scripts/test.sh pins --parallel-workers 1 in the tidy
+# preset) or peak memory becomes packages x jobs x the per-process footprint.
+#
+# That footprint is why the default is capped rather than set to the core count.
+# Measured on the gateway package, memory scales linearly at ~1.2 GiB per job
+# while wall clock does not:
+#
+#   jobs=2   1078 s    2.6 GiB      jobs=8    359 s    9.4 GiB
+#   jobs=4    595 s    4.7 GiB      jobs=16   272 s   17.4 GiB
+#
+# The default is sized so one package fits an 8 GB machine, which puts it at 2.
+# That is the slow end of the curve on purpose: the alternative is a default
+# that works only on the biggest machine anyone here has, and 17.4 GiB for a
+# single package is not something we can assume. Raise it where the memory is
+# there: ./scripts/test.sh tidy --jobs <n> reconfigures and runs in one step.
+#
+# Over-subscribing is guarded only through that script. ament_clang_tidy derives
+# its exit status from the warnings it parsed, so a clang-tidy killed by the OOM
+# reaper contributes nothing and the test passes as if the package were clean.
+# The script scans the per-test logs for the failure marker and fails the run; a
+# bare colcon test -R clang_tidy does not.
 include(ProcessorCount)
 # Invoked lower-case: CMake command names are case-insensitive, and the
 # repository's cmake-lint gate rejects mixed case.
@@ -41,8 +60,12 @@ processorcount(_ros2_medkit_host_cores)
 if(_ros2_medkit_host_cores EQUAL 0)
   set(_ros2_medkit_host_cores 1)
 endif()
-set(ROS2_MEDKIT_CLANG_TIDY_JOBS "${_ros2_medkit_host_cores}"
-    CACHE STRING "Number of clang-tidy processes per package (default: host core count)")
+set(_ros2_medkit_clang_tidy_jobs 2)
+if(_ros2_medkit_host_cores LESS _ros2_medkit_clang_tidy_jobs)
+  set(_ros2_medkit_clang_tidy_jobs "${_ros2_medkit_host_cores}")
+endif()
+set(ROS2_MEDKIT_CLANG_TIDY_JOBS "${_ros2_medkit_clang_tidy_jobs}"
+    CACHE STRING "Number of clang-tidy processes per package (default: min(host cores, 2))")
 
 # Capture at include-time: inside a function CMAKE_CURRENT_LIST_DIR resolves to the caller.
 set(_ROS2_MEDKIT_CLANG_TIDY_CONFIG "${CMAKE_CURRENT_LIST_DIR}/.clang-tidy")

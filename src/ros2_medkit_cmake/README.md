@@ -10,7 +10,7 @@ build acceleration, and centralized linting configuration across all packages.
 | `ROS2MedkitCcache.cmake` | Auto-detect and configure ccache with PCH-aware sloppiness settings |
 | `ROS2MedkitCompat.cmake` | Multi-distro compatibility shims for ROS 2 Humble, Jazzy, and Lyrical |
 | `ROS2MedkitCoverage.cmake` | gcov/lcov instrumentation behind `-DENABLE_COVERAGE=ON` |
-| `ROS2MedkitLinting.cmake` | Centralized clang-tidy configuration (opt-in locally, mandatory in CI) |
+| `ROS2MedkitLinting.cmake` | Centralized clang-tidy configuration (opt-in local gate; CI runs `run-clang-tidy` instead) |
 | `ROS2MedkitSanitizers.cmake` | ASan / TSan / UBSan behind `-DSANITIZER=asan,ubsan` |
 | `ROS2MedkitTestDomain.cmake` | Per-package `ROS_DOMAIN_ID` allocation for test isolation |
 | `ROS2MedkitWarnings.cmake` | Shared warning flags and vendored-code relaxations |
@@ -26,21 +26,58 @@ Resolves dependency differences across ROS 2 distributions:
 
 ### ROS2MedkitLinting
 
-Registers the package's `clang_tidy` CTest test behind `-DENABLE_CLANG_TIDY=ON`
-(off by default locally, on in CI).
+Registers the package's `clang_tidy` CTest test behind `-DENABLE_CLANG_TIDY=ON`,
+off by default. This is a local gate: CI does not use it. The `clang-tidy` job
+in `.github/workflows/quality.yml` configures with `-DENABLE_CLANG_TIDY=OFF` and
+runs `run-clang-tidy` over the compilation database instead.
 
-Each package registers exactly one such test, so CTest-level parallelism only
-overlaps packages - the largest package still decides the wall clock. The
-analysis is therefore parallelised **inside** the test:
+A participating package registers exactly one such test - packages that exclude
+`ament_cmake_clang_tidy` and never call `ros2_medkit_clang_tidy()` register none.
+colcon runs a separate `ctest` per package, so `--ctest-args -j` has nothing to
+parallelise: CTest only ever sees one matching test. The analysis is therefore
+parallelised **inside** the test:
 
 - `-DROS2_MEDKIT_CLANG_TIDY_JOBS=<n>` at configure time sets how many
-  `clang-tidy` processes one package runs. It defaults to the host core count.
+  `clang-tidy` processes one package runs. It defaults to `min(host cores, 2)`,
+  falling back to 1 where CMake cannot determine the core count.
 - `ros2_medkit_clang_tidy(JOBS <n>)` overrides it for a single package.
+- `./scripts/test.sh tidy --jobs <n>` is the everyday switch. The count is baked
+  into the CTest command at configure time, so the script reconfigures the
+  clang-tidy packages first - a couple of seconds, no recompilation. The value
+  then sticks in the CMake cache, so every `tidy` run prints the count in
+  effect.
 
-Because the parallelism lives inside each test, run the package tests one at a
-time - `./scripts/test.sh tidy` already passes `-j 1` to CTest. Running both
-levels at once multiplies peak memory by the number of packages, and a
-`clang-tidy` process on this codebase holds roughly half a gigabyte.
+How many packages analyse at once is colcon's `--parallel-workers`, not
+CTest's `-j`. Because the parallelism now lives inside each test, the package
+tests must run one at a time: `./scripts/test.sh tidy` pins
+`--parallel-workers 1` and ignores a caller's override, because running both
+levels at once multiplies peak memory by the number of packages.
+
+The footprint is large enough that the default is capped rather than set to the
+core count. Measured on `ros2_medkit_gateway`, a 16-core host:
+
+| `JOBS`        | wall clock | peak resident |
+|---------------|-----------:|--------------:|
+| 2 *(default)* |   17min58s |       2.6 GiB |
+| 4             |    9min55s |       4.7 GiB |
+| 8             |    6min00s |       9.4 GiB |
+| 16            |    4min32s |      17.4 GiB |
+
+Memory scales linearly at roughly 1.2 GiB per job - a single `clang-tidy`
+process holds 1.4 GiB at its peak - while wall clock does not. The default is
+sized so that one package fits an 8 GB machine, which puts it at 2. That is
+deliberately the slow end of the curve: the alternative is a default that only
+works on the largest machine anyone here has.
+
+If you have the memory, take it - `./scripts/test.sh tidy --jobs 8` roughly
+triples the speed for 9.4 GiB.
+
+Over-subscribing is guarded, but only through the script. `ament_clang_tidy`
+derives its exit status from the warnings it managed to parse, so a `clang-tidy`
+process killed by the OOM reaper contributes nothing and the test passes as if
+the package were clean. `./scripts/test.sh tidy` scans the per-test logs for the
+`failed with error code` marker and fails the run instead, naming the packages
+that lost coverage. A bare `colcon test -R clang_tidy` has no such guard.
 
 ### ROS2MedkitCoverage
 

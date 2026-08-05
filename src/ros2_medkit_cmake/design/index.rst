@@ -31,8 +31,13 @@ The package provides four CMake modules installed to the ament index:
 
 3. **ROS2MedkitLinting.cmake** - Centralized clang-tidy configuration
 
-   - Provides ``ENABLE_CLANG_TIDY`` option (default OFF, mandatory in CI)
-   - Provides ``ros2_medkit_clang_tidy()`` function with optional ``HEADER_FILTER`` and ``TIMEOUT`` arguments
+   - Provides ``ENABLE_CLANG_TIDY`` option (default OFF; a local gate only, CI
+     configures it OFF and runs ``run-clang-tidy`` over the compilation database)
+   - Provides ``ros2_medkit_clang_tidy()`` function with optional ``HEADER_FILTER``,
+     ``TIMEOUT`` and ``JOBS`` arguments
+   - Provides ``ROS2_MEDKIT_CLANG_TIDY_JOBS`` (default ``min(host cores, 2)``),
+     capped so one package fits an 8 GB machine; memory scales linearly at
+     roughly 1.2 GiB per job. Switch it with ``./scripts/test.sh tidy --jobs <n>``
    - References the shared ``.clang-tidy`` config file from the installed module directory
 
 4. **ROS2MedkitCompat.cmake** - Multi-distro compatibility layer
