@@ -18,6 +18,11 @@ project(ros2_medkit_graph_provider)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Without this the package exports no compile_commands.json, so clang-tidy run
+# standalone - as the pre-push hook runs it - cannot resolve the gateway headers
+# this plugin includes and reports them as missing on files that compile clean.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Shared cmake modules (multi-distro compat)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
