@@ -981,6 +981,9 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
       }
       return "";
     });
+    trigger_mgr_->set_warn_log_fn([this](const std::string & message) {
+      RCLCPP_WARN(get_logger(), "%s", message.c_str());
+    });
     trigger_topic_subscriber_->set_retry_callback([this]() {
       trigger_mgr_->retry_unresolved_triggers();
     });

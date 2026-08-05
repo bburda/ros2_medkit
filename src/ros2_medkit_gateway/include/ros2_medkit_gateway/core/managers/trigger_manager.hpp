@@ -164,6 +164,15 @@ class TriggerManager {
   /// Set the topic name resolver. Called by GatewayNode after cache is available.
   void set_resolve_topic_fn(ResolveTopicFn fn);
 
+  /// Operator-facing warning sink (transport-agnostic; GatewayNode wires it to
+  /// the ROS logger). Used when deferred resolution gives up on a trigger.
+  using WarnLogFn = std::function<void(const std::string & message)>;
+  void set_warn_log_fn(WarnLogFn fn);
+
+  /// How long deferred resolution keeps retrying before giving up.
+  /// Default 60 s; tests shrink it to exercise the expiry path.
+  void set_unresolved_timeout(std::chrono::seconds timeout);
+
   /// Retry resolving data triggers whose topic names were unknown at creation.
   /// Called periodically (today: from the rclcpp adapter's retry tick) so
   /// that triggers stuck without a topic name get a chance to subscribe.
@@ -293,7 +302,8 @@ class TriggerManager {
   };
   std::vector<UnresolvedTrigger> unresolved_data_triggers_;  // guarded by triggers_mutex_
   ResolveTopicFn resolve_topic_fn_;                          // guarded by triggers_mutex_
-  static constexpr int kUnresolvedTimeoutSec = 60;
+  WarnLogFn warn_log_fn_;                                    // guarded by triggers_mutex_
+  std::chrono::seconds unresolved_timeout_{60};              // guarded by triggers_mutex_
 };
 
 }  // namespace ros2_medkit_gateway
