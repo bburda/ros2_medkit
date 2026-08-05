@@ -423,10 +423,15 @@ TEST_F(TriggerManagerRoutingTest, UnresolvedTriggerExpiryWarnsAndStopsRetrying) 
   EXPECT_NE(warnings[0].find("/counter"), std::string::npos) << warnings[0];
 
   // The entry is gone: later ticks are silent, and the trigger itself is
-  // still registered (the expiry only stops the resolution retries).
+  // still registered and ACTIVE - with no subscription behind it, exactly the
+  // silently-dead state the warning is there to expose.
   manager_->retry_unresolved_triggers();
   EXPECT_EQ(warnings.size(), 1u);
-  EXPECT_EQ(manager_->list("plc_app").size(), 1u);
+  auto listed = manager_->list("plc_app");
+  ASSERT_EQ(listed.size(), 1u);
+  EXPECT_EQ(listed[0].status, TriggerStatus::ACTIVE);
+  EXPECT_TRUE(listed[0].resolved_topic_name.empty());
+  EXPECT_EQ(transport_->total_subscribes(), 0u) << "giving up must not leave a live subscription behind";
 }
 
 TEST_F(TriggerManagerRoutingTest, NonDataTriggerDoesNotSubscribe) {

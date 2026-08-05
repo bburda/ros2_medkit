@@ -119,7 +119,10 @@ void prune_plugin_unserved_capabilities(std::vector<CapabilityBuilder::Capabilit
   auto drop = [&caps](CapabilityBuilder::Capability cap) {
     caps.erase(std::remove(caps.begin(), caps.end(), cap), caps.end());
   };
-  if (!pmgr->get_data_provider_for_entity(entity_id)) {
+  if (!pmgr->get_data_provider_for_entity(entity_id) && !pmgr->has_entity_data_route(entity_id)) {
+    // Only prune when NEITHER serving path exists: data_handlers now falls
+    // back to the plugin's own x-plc-data route, so an entity with that route
+    // serves /data even without a DataProvider.
     drop(CapabilityBuilder::Capability::DATA);
   }
   if (!pmgr->get_operation_provider_for_entity(entity_id)) {

@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef ROS2_MEDKIT_GATEWAY__CORE__DATA_POINT_SUGGEST_HPP_
-#define ROS2_MEDKIT_GATEWAY__CORE__DATA_POINT_SUGGEST_HPP_
+#pragma once
 
 // Suggestion helpers for "data point does not exist" errors. PLC plugins
 // register symbols under a sanitized leaf name (MAIN.counter -> counter), so
@@ -22,6 +21,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -71,20 +71,29 @@ inline std::string suggest_data_point(const std::string & input, const std::vect
   if (!leaf.empty() && std::find(names.begin(), names.end(), leaf) != names.end()) {
     return leaf;
   }
-  const size_t budget = std::max<size_t>(2, input.size() / 4);
-  size_t best_dist = budget + 1;
+  // Each candidate distance gets the budget of the string it was measured
+  // against: a long namespace prefix must not buy a short leaf a huge budget
+  // (MAIN.Very.Long.Prefix.rpm would otherwise "suggest" whatever is nearest
+  // to a three-letter leaf).
+  const size_t input_budget = std::max<size_t>(2, input.size() / 4);
+  const size_t leaf_budget = std::max<size_t>(2, leaf.size() / 4);
+  size_t best_score = SIZE_MAX;
   std::string best;
   for (const auto & name : names) {
-    size_t d = edit_distance(input, name);
+    const size_t d_input = edit_distance(input, name);
+    size_t score = d_input <= input_budget ? d_input : SIZE_MAX;
     if (!leaf.empty()) {
-      d = std::min(d, edit_distance(leaf, name));
+      const size_t d_leaf = edit_distance(leaf, name);
+      if (d_leaf <= leaf_budget && d_leaf < score) {
+        score = d_leaf;
+      }
     }
-    if (d < best_dist || (d == best_dist && name < best)) {
-      best_dist = d;
+    if (score < best_score || (score == best_score && score != SIZE_MAX && name < best)) {
+      best_score = score;
       best = name;
     }
   }
-  return best_dist <= budget ? best : std::string{};
+  return best_score != SIZE_MAX ? best : std::string{};
 }
 
 /// Up to n names ordered by edit distance to the input (ties alphabetical),
@@ -112,5 +121,3 @@ inline std::vector<std::string> closest_data_points(const std::string & input, c
 }
 
 }  // namespace ros2_medkit_gateway
-
-#endif  // ROS2_MEDKIT_GATEWAY__CORE__DATA_POINT_SUGGEST_HPP_

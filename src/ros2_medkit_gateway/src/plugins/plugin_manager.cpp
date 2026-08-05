@@ -384,6 +384,37 @@ void PluginManager::register_routes(httplib::Server & server, const std::string 
   }
 }
 
+bool PluginManager::has_entity_data_route(const std::string & entity_id) {
+  const std::string full_path = std::string(API_BASE_PATH) + "/apps/" + entity_id + "/x-plc-data";
+  std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
+  auto own_it = entity_ownership_.find(entity_id);
+  if (own_it == entity_ownership_.end()) {
+    return false;
+  }
+  for (auto & lp : plugins_) {
+    if (!lp.load_result.plugin || lp.load_result.plugin->name() != own_it->second) {
+      continue;
+    }
+    if (!cache_routes_locked(lp)) {
+      return false;
+    }
+    for (const auto & route : lp.routes) {
+      if (route.method != "GET") {
+        continue;
+      }
+      try {
+        if (std::regex_match(full_path, std::regex(API_BASE_PATH + ("/" + route.pattern)))) {
+          return true;
+        }
+      } catch (const std::regex_error &) {
+        continue;
+      }
+    }
+    break;
+  }
+  return false;
+}
+
 std::optional<nlohmann::json> PluginManager::fetch_entity_data_via_route(const std::string & entity_id,
                                                                          const std::string & item) {
   const std::string full_path =

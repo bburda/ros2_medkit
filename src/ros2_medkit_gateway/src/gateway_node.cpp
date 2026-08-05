@@ -984,6 +984,14 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     trigger_mgr_->set_warn_log_fn([this](const std::string & message) {
       RCLCPP_WARN(get_logger(), "%s", message.c_str());
     });
+    // The deferred-resolution budget must outlive at least one full discovery
+    // refresh: plugin-declared topics only reach the entity cache on a refresh
+    // pass, and refresh_interval_ms is configurable up to 60 s - equal to the
+    // old fixed budget, which made "resolves on a later tick" false at the
+    // extreme. Two refresh cycles keeps the reasoning true for every allowed
+    // configuration.
+    trigger_mgr_->set_unresolved_timeout(
+        std::max(std::chrono::seconds(60), std::chrono::seconds(2 * refresh_interval_ms_ / 1000)));
     trigger_topic_subscriber_->set_retry_callback([this]() {
       trigger_mgr_->retry_unresolved_triggers();
     });
