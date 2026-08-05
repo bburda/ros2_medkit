@@ -1509,14 +1509,33 @@ Query and manage faults.
    **Response codes:**
 
    - **200:** Fault details
-   - **404:** Fault not found, or reported by an app outside this entity's scope
+   - **400:** ``fault_code`` empty or longer than 256 characters
+   - **404:** Fault not found, reported by an app outside this entity's scope,
+     or declined by the fault manager
    - **503:** Fault manager unavailable
 
 ``DELETE /api/v1/components/{id}/faults/{fault_code}``
    Clear a fault.
 
    - **204:** Fault cleared
-   - **404:** Fault not found, or reported by an app outside this entity's scope
+   - **400:** ``fault_code`` empty or longer than 256 characters
+   - **404:** Fault not found, reported by an app outside this entity's scope,
+     or declined by the fault manager
+   - **503:** Fault manager unavailable
+
+.. note::
+
+   ``503`` on these two routes means the fault manager did not answer - it is
+   absent, still starting, or timed out. A fault manager that answers and
+   declines the request is reported as ``404``, not ``503``: it is reachable
+   and healthy, and the request is what it would not serve. That covers a
+   ``fault_code`` it does not hold and one it will not accept - it restricts
+   codes to alphanumerics, underscore, hyphen and dot, a narrower set than the
+   ``maxLength`` the OpenAPI document publishes, so a short code containing
+   anything else is admitted by the gateway and answered ``404``.
+
+   Both nodes bound ``fault_code`` at the published 256 characters, so every
+   length the document admits reaches the fault manager.
 
 ``DELETE /api/v1/components/{id}/faults``
    Clear all faults for an entity.

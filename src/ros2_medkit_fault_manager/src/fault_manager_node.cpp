@@ -38,8 +38,22 @@ namespace ros2_medkit_fault_manager {
 
 namespace {
 
-/// Maximum allowed length for fault_code
-constexpr size_t kMaxFaultCodeLength = 128;
+/// Maximum allowed length for fault_code.
+///
+/// Matches the bound the gateway enforces on every route carrying
+/// `{fault_code}` and publishes as that parameter's `maxLength`. The two are
+/// one contract seen from two nodes, so they have to be the same number: while
+/// this was the lower of the two, a code the document called well-formed was
+/// admitted by the gateway and then refused here, and the refusal reached the
+/// client as a server error.
+///
+/// Nothing downstream constrains it further. Every column holding a fault code
+/// is SQLite `TEXT`, which is unbounded, and every `fault_code` field in the
+/// message and service definitions is an unbounded `string`. `RosbagCapture`
+/// is the one consumer with a limit of its own - it names a directory after
+/// the code - and it bounds its own path component rather than relying on this
+/// value.
+constexpr size_t kMaxFaultCodeLength = 256;
 
 /// Validate fault_code format
 /// @param fault_code The fault code to validate

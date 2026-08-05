@@ -657,3 +657,62 @@ TEST(FaultListItemSchema, UnknownSeverityLabelIsAcceptedByEnum) {
   ASSERT_TRUE(parsed.has_value()) << "UNKNOWN severity_label rejected by FaultListItem enum";
   EXPECT_EQ(dto::JsonWriter<dto::FaultListItem>::write(parsed.value()), wire);
 }
+
+// =============================================================================
+// classify_fault_failure - 404-vs-503 on a failed fault-manager call
+// =============================================================================
+//
+// The split has to rest on which layer failed, not on how the failure reads.
+// It rested on a substring match for "not found" over the store's message, so
+// a refusal the fault manager worded any other way - its own `fault_code`
+// validation among them - was served as 503, telling the client the gateway
+// had a problem when the request did.
+
+// A fault the store does not hold. The wording here is the fault manager's
+// own, and the classification must not depend on it.
+// @verifies REQ_INTEROP_013
+// @verifies REQ_INTEROP_015
+TEST(ClassifyFaultFailureTest, DeclinedIsAClientError) {
+  const auto err =
+      FaultHandlers::classify_fault_failure(ros2_medkit_gateway::FaultFailure::Declined, "Fault not found: NO_SUCH",
+                                            "Failed to get fault", "app_id", "lidar_sensor", "NO_SUCH");
+  EXPECT_EQ(err.http_status, 404);
+  EXPECT_EQ(err.code, ros2_medkit_gateway::ERR_RESOURCE_NOT_FOUND);
+  EXPECT_EQ(err.params["details"], "Fault not found: NO_SUCH");
+  EXPECT_EQ(err.params["app_id"], "lidar_sensor");
+  EXPECT_EQ(err.params["fault_code"], "NO_SUCH");
+}
+
+// The regression case: a refusal that never contains "not found". Before the
+// classification was typed, this fell through the substring match to 503.
+// @verifies REQ_INTEROP_013
+// @verifies REQ_INTEROP_015
+TEST(ClassifyFaultFailureTest, ARefusalWordedAnyOtherWayIsStillAClientError) {
+  for (const char * message : {"fault_code exceeds maximum length of 256",
+                               "fault_code contains invalid character '~'. Only alphanumeric, underscore, hyphen, "
+                               "and dot are allowed",
+                               "fault_code cannot contain '..'", "some wording nobody has written yet"}) {
+    const auto err = FaultHandlers::classify_fault_failure(ros2_medkit_gateway::FaultFailure::Declined, message,
+                                                           "Failed to get fault", "app_id", "lidar_sensor", "F~F");
+    EXPECT_EQ(err.http_status, 404) << "declined refusal reported as " << err.http_status
+                                    << " for message: " << message;
+    EXPECT_LT(err.http_status, 500) << "a refusal must never be a server error: " << message;
+  }
+}
+
+// The other direction must keep working: a fault manager that never answered
+// is a real server-side failure and has to stay 503, or an outage would be
+// indistinguishable from a missing fault.
+// @verifies REQ_INTEROP_013
+// @verifies REQ_INTEROP_015
+TEST(ClassifyFaultFailureTest, UnavailableIsAServerError) {
+  for (const char * message :
+       {"GetFault service not available", "GetFault service call timed out", "GetFault transport not initialised"}) {
+    const auto err = FaultHandlers::classify_fault_failure(ros2_medkit_gateway::FaultFailure::Unavailable, message,
+                                                           "Failed to clear fault", "component_id", "host", "CODE");
+    EXPECT_EQ(err.http_status, 503) << "message: " << message;
+    EXPECT_EQ(err.code, ros2_medkit_gateway::ERR_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(err.message, "Failed to clear fault");
+    EXPECT_EQ(err.params["details"], message);
+  }
+}

@@ -506,7 +506,16 @@ Rosbag Configuration Options
      - Directory for bag files. Empty string uses system temp directory
        (``/tmp``). Bags are named ``fault_{code}_{timestamp}/`` after the first
        fault of the recording; faults that attached during its post-roll window
-       are served from that same directory.
+       are served from that same directory. From a fault code of about 224
+       characters the name keeps only a leading slice of the code, followed by
+       a digest of the whole of it, so two long codes sharing a prefix are
+       overwhelmingly unlikely to land on one directory. The threshold is not
+       the 255-byte limit on a path component - at 224 the directory name is
+       still only 244 bytes - but the room reserved inside that limit for the
+       data file rosbag2 writes *within* the directory, which is named after
+       it. Nothing reconstructs this name - the path is recorded in the
+       database when the bag is written - so the shortening is not something
+       callers need to reproduce.
    * - ``snapshots.rosbag.auto_cleanup``
      - ``true``
      - Automatically delete a fault's bag when it is cleared. A recording

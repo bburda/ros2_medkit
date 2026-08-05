@@ -2313,6 +2313,63 @@ TEST_F(RosbagCaptureIntegrationTest, ConfirmedWithoutPrefailed) {
   capture.stop();
 }
 
+// The fault services accept a code of up to `kMaxFaultCodeLength` (256), and
+// this names a directory after one. Those two limits answer to different
+// things - one to the published API contract, one to `NAME_MAX` - so the name
+// has to hold at the longest code the services will admit rather than assume
+// the validator keeps it short. It did not before: at 256 the component ran to
+// 276 bytes and the bag was silently never written, because the failure is
+// caught and logged inside `flush_to_bag`.
+TEST(RosbagBagDirectoryNameTest, StaysWithinNameMaxAtTheLongestAcceptedFaultCode) {
+  // Budgeted against a file rosbag2 actually creates. The storage plugins name
+  // the data file "<component>_<n>.<ext>" with a `.db3` or `.mcap` extension -
+  // "sqlite3" is a storage id and never appears in a filename - so the longest
+  // that reaches in practice is "_999.mcap".
+  constexpr size_t kNameMax = 255;
+  const std::string longest_writer_suffix = "_999.mcap";
+  constexpr int64_t kTimestampMs = 1785441426087;
+
+  for (size_t length : {size_t{1}, size_t{128}, size_t{223}, size_t{224}, size_t{256}}) {
+    const std::string code(length, 'F');
+    const std::string name = RosbagCapture::bag_directory_name(code, kTimestampMs);
+    EXPECT_LE(name.size() + longest_writer_suffix.size(), kNameMax)
+        << "component " << name.size() << " bytes at fault_code length " << length;
+    EXPECT_EQ(name.rfind("fault_", 0), 0u);
+    EXPECT_NE(name.find(std::to_string(kTimestampMs)), std::string::npos);
+  }
+}
+
+// Below the budget the code is carried whole - the bound must not shorten
+// every name, only the ones that would not fit.
+TEST(RosbagBagDirectoryNameTest, KeepsAShortFaultCodeVerbatim) {
+  EXPECT_EQ(RosbagCapture::bag_directory_name("MOTOR_OVERHEAT", 1785441426087), "fault_MOTOR_OVERHEAT_1785441426087");
+}
+
+// The collision truncation introduces, pinned at the timestamp that makes it
+// reachable. Two distinct codes agreeing on every kept byte must still name
+// different directories: `rosbag_files.file_path` has no UNIQUE constraint and
+// two rows sharing one bag is a supported state, so a collision would be
+// written rather than refused, and the losing writer's failure is swallowed by
+// `flush_to_bag`. Same millisecond on purpose - the timestamp cannot be what
+// separates them here.
+TEST(RosbagBagDirectoryNameTest, TruncatedCodesSharingEveryKeptByteStillDiffer) {
+  constexpr int64_t kSameTimestampMs = 1785441426087;
+  const std::string a(256, 'F');
+  const std::string b = std::string(255, 'F') + "G";
+  ASSERT_EQ(a.substr(0, 200), b.substr(0, 200)) << "the two codes must share the kept prefix for this to bite";
+
+  EXPECT_NE(RosbagCapture::bag_directory_name(a, kSameTimestampMs),
+            RosbagCapture::bag_directory_name(b, kSameTimestampMs));
+}
+
+// The same code must always name the same directory, or a lookup built from a
+// remembered path would miss.
+TEST(RosbagBagDirectoryNameTest, IsDeterministicForOneCode) {
+  const std::string code(256, 'F');
+  EXPECT_EQ(RosbagCapture::bag_directory_name(code, 1785441426087),
+            RosbagCapture::bag_directory_name(code, 1785441426087));
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

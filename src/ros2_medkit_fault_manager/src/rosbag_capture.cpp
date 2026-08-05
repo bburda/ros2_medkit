@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1244,6 +1245,69 @@ RosbagCapture::FlushResult RosbagCapture::flush_to_bag(const std::string & fault
   }
 }
 
+namespace {
+
+/// 64-bit FNV-1a of @p text as 16 lowercase hex digits. Used only to keep two
+/// truncated bag directory names apart, never to identify a fault, so a
+/// non-cryptographic digest is the right tool for it.
+std::string fnv1a_hex(const std::string & text) {
+  uint64_t hash = 14695981039346656037ULL;
+  for (const char character : text) {
+    // `char` is signed here, so widen through `unsigned char` to hash the byte
+    // value rather than a sign-extended one.
+    hash ^= static_cast<uint64_t>(static_cast<unsigned char>(character));
+    hash *= 1099511628211ULL;
+  }
+  std::ostringstream oss;
+  oss << std::hex << std::setw(16) << std::setfill('0') << hash;
+  return oss.str();
+}
+
+}  // namespace
+
+std::string RosbagCapture::bag_directory_name(const std::string & fault_code, int64_t timestamp_ms) {
+  // One path component may be 255 bytes. rosbag2's storage plugins write the
+  // data file inside the directory as "<component>_<n>.<ext>", where the
+  // extension is the one the plugin produces - ".db3" or ".mcap"; "sqlite3" is
+  // a storage id, not a suffix, and no file is ever named that. The longest
+  // that reaches in practice is "_999.mcap", 9 bytes.
+  //
+  // That 9 is worst-case for *our* configuration, not for rosbag2 in general:
+  // `storage_preset_profile` is left unset (see the StorageOptions built in
+  // `flush_to_bag`), so sqlite3 runs journal_mode=MEMORY and writes no
+  // sidecars. Under rosbag2's `resilient` preset the WAL sidecar would make it
+  // "_999.db3-wal", 12 bytes - which is exactly the reserve and no more. So 12
+  // is headroom against a wider split index today, and the margin that keeps a
+  // preset change from silently overrunning tomorrow.
+  constexpr size_t kNameMax = 255;
+  constexpr size_t kWriterSuffixBudget = 12;
+  // 16 hex digits of digest plus the '_' separating them from the kept prefix.
+  constexpr size_t kDigestFieldWidth = 17;
+
+  const std::string prefix = "fault_";
+  const std::string suffix = "_" + std::to_string(timestamp_ms);
+  const size_t fixed = prefix.size() + suffix.size() + kWriterSuffixBudget;
+  const size_t code_budget = kNameMax > fixed ? kNameMax - fixed : 0;
+
+  if (fault_code.size() <= code_budget) {
+    return prefix + fault_code + suffix;
+  }
+
+  // Truncating on its own would let two distinct codes sharing a long prefix
+  // name one directory, and nothing downstream would reject that:
+  // `rosbag_files.file_path` carries no UNIQUE constraint, and two rows
+  // pointing at one bag is a supported state rather than an error - it is how
+  // a burst of correlated faults shares a recording, which is what
+  // `path_shared_with_other_fault` exists to protect. So the collision would
+  // be written rather than refused, and the losing writer's failure is caught
+  // and logged inside `flush_to_bag` - the same silent loss this bound was
+  // added to remove. A digest of the whole code separates them: 64-bit FNV-1a
+  // is collision-resistant rather than collision-free, so this bounds the risk
+  // at roughly 2^-64 per pair rather than eliminating it outright.
+  const size_t kept = code_budget > kDigestFieldWidth ? code_budget - kDigestFieldWidth : 0;
+  return prefix + fault_code.substr(0, kept) + "_" + fnv1a_hex(fault_code) + suffix;
+}
+
 std::string RosbagCapture::generate_bag_path(const std::string & fault_code) const {
   std::string base_path;
 
@@ -1258,10 +1322,7 @@ std::string RosbagCapture::generate_bag_path(const std::string & fault_code) con
   auto now = std::chrono::system_clock::now();
   auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
-  std::ostringstream oss;
-  oss << base_path << "/fault_" << fault_code << "_" << timestamp;
-
-  return oss.str();
+  return base_path + "/" + bag_directory_name(fault_code, timestamp);
 }
 
 size_t RosbagCapture::calculate_bag_size(const std::string & bag_path) const {

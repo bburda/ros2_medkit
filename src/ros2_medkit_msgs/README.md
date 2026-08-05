@@ -82,7 +82,7 @@ Report a fault event (FAILED or PASSED) to the FaultManager.
 **Request:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `fault_code` | string | Global identifier (UPPER_SNAKE_CASE, max 64 chars) |
+| `fault_code` | string | Global identifier (UPPER_SNAKE_CASE, max 256 chars; alphanumerics, `_`, `-` and `.` only) |
 | `event_type` | uint8 | Event type: EVENT_FAILED (0) or EVENT_PASSED (1) |
 | `severity` | uint8 | Severity level (0-3, only for FAILED events) |
 | `description` | string | Human-readable description (only for FAILED events) |

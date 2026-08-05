@@ -212,6 +212,22 @@ dto::FaultDetailResult wrap_detail_result(json payload) {
 
 }  // namespace
 
+// Rationale and parameter contract are documented on the declaration in
+// fault_handlers.hpp. In short: 503 is reserved for a call that never got an
+// answer; anything the fault manager answered is a client error.
+ErrorInfo FaultHandlers::classify_fault_failure(FaultFailure failure, const std::string & error_message,
+                                                const std::string & unavailable_summary, const std::string & id_field,
+                                                const std::string & entity_id, const std::string & fault_code) {
+  const json params{{"details", error_message}, {id_field, entity_id}, {"fault_code", fault_code}};
+  switch (failure) {
+    case FaultFailure::Declined:
+      return make_error(404, ERR_RESOURCE_NOT_FOUND, "Fault not found", params);
+    case FaultFailure::Unavailable:
+      break;
+  }
+  return make_error(503, ERR_SERVICE_UNAVAILABLE, unavailable_summary, params);
+}
+
 bool FaultHandlers::fault_in_source_scope(const json & fault, const std::set<std::string> & source_fqns) {
   // Thin wrapper preserving the public static API; the scope logic now lives in
   // the neutral core helper shared with the ROS 2 plugin-context fault path.
@@ -786,15 +802,8 @@ http::Result<dto::FaultDetailResult> FaultHandlers::get_fault(const http::TypedR
 
     auto result = fault_mgr->get_fault_with_env(fault_code, "");
     if (!result.success) {
-      if (result.error_message.find("not found") != std::string::npos ||
-          result.error_message.find("Fault not found") != std::string::npos) {
-        return tl::make_unexpected(make_error(
-            404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
-            json{{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
-      }
-      return tl::make_unexpected(make_error(
-          503, ERR_SERVICE_UNAVAILABLE, "Failed to get fault",
-          json{{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
+      return tl::make_unexpected(classify_fault_failure(result.failure, result.error_message, "Failed to get fault",
+                                                        entity_info.id_field, entity_id, fault_code));
     }
 
     // Build SOVD-compliant response from the transport-supplied JSON shape.
@@ -931,16 +940,9 @@ FaultHandlers::clear_fault(const http::TypedRequest & req) {
     // Verify the fault is in this entity's scope BEFORE clearing.
     auto get_result = fault_mgr->get_fault_with_env(fault_code, "");
     if (!get_result.success) {
-      if (get_result.error_message.find("not found") != std::string::npos ||
-          get_result.error_message.find("Fault not found") != std::string::npos) {
-        return tl::make_unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
-                                              json{{"details", get_result.error_message},
-                                                   {entity_info.id_field, entity_id},
-                                                   {"fault_code", fault_code}}));
-      }
-      return tl::make_unexpected(make_error(
-          503, ERR_SERVICE_UNAVAILABLE, "Failed to clear fault",
-          json{{"details", get_result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
+      return tl::make_unexpected(classify_fault_failure(get_result.failure, get_result.error_message,
+                                                        "Failed to clear fault", entity_info.id_field, entity_id,
+                                                        fault_code));
     }
 
     const auto & cache = ctx_.node()->get_thread_safe_cache();
@@ -959,15 +961,8 @@ FaultHandlers::clear_fault(const http::TypedRequest & req) {
 
     auto result = fault_mgr->clear_fault(fault_code, /*skip_correlation_auto_clear=*/true);
     if (!result.success) {
-      if (result.error_message.find("not found") != std::string::npos ||
-          result.error_message.find("Fault not found") != std::string::npos) {
-        return tl::make_unexpected(make_error(
-            404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
-            json{{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
-      }
-      return tl::make_unexpected(make_error(
-          503, ERR_SERVICE_UNAVAILABLE, "Failed to clear fault",
-          json{{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
+      return tl::make_unexpected(classify_fault_failure(result.failure, result.error_message, "Failed to clear fault",
+                                                        entity_info.id_field, entity_id, fault_code));
     }
     return Outcome{http::NoContent{}};
   } catch (const std::exception & e) {
