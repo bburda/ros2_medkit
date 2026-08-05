@@ -243,9 +243,53 @@ void RESTServer::setup_pre_routing_handler() {
     return;
   }
 
+  // Answer from the pre-routing handler without stranding the request body.
+  //
+  // cpp-httplib runs this handler at the top of `Server::routing()`, *before*
+  // it reads the payload off the socket, and treats `Handled` as "response is
+  // complete" - it writes the answer and goes straight back to waiting for the
+  // next request on the same keep-alive connection. The unread payload is still
+  // sitting there, so that next request gets parsed starting at somebody's JSON
+  // body, fails the request-line parse and is answered 400. The client sees a
+  // rejection on a request it got right, blamed on the wrong request; that is
+  // how a viewer's 403 on a POST turned into a 400 on the following probe when
+  // this file's RBAC contract test first ran.
+  //
+  // RFC 9112 section 9.6 is explicit about the case: a server that responds
+  // before reading the whole body signals `Connection: close`. Conforming
+  // clients then retire the connection rather than reuse a desynchronised one.
+  //
+  // That is the whole fix available from here, and it is a signal to the
+  // client rather than an actual close. Three limits, all of them real:
+  //
+  //   * the handler has no access to the stream, so it cannot drain the body
+  //     itself;
+  //   * it cannot close the connection either. `connection_closed` is decided
+  //     from the *request* headers before routing (`httplib.h`, Server::
+  //     process_request), so a response header does not reach it and the
+  //     server loop goes on waiting for another request on the socket;
+  //   * the response therefore carries `Connection: close` *and* the
+  //     `Keep-Alive: timeout=..., max=...` cpp-httplib adds whenever
+  //     `close_connection` is false (httplib.h, write_response_core). The two
+  //     contradict each other on the wire. `Connection: close` wins for any
+  //     client that reads it, which is what makes this work in practice, but
+  //     a client that honours the `Keep-Alive` instead still reuses the socket
+  //     and still sees the spurious 400.
+  //
+  // Closing the gap properly means reading the body before the pre-routing
+  // handler runs, which is cpp-httplib's decision, not ours.
+  auto handled = [](const httplib::Request & req, httplib::Response & res) {
+    const std::string content_length = req.get_header_value("Content-Length");
+    const bool carries_body = (!content_length.empty() && content_length != "0") || req.has_header("Transfer-Encoding");
+    if (carries_body) {
+      res.set_header("Connection", "close");
+    }
+    return httplib::Server::HandlerResponse::Handled;
+  };
+
   // Set up pre-routing handler for CORS and Authentication
   // This handler runs before any route handler
-  srv->set_pre_routing_handler([this](const httplib::Request & req, httplib::Response & res) {
+  srv->set_pre_routing_handler([this, handled](const httplib::Request & req, httplib::Response & res) {
     // 1. Handle CORS (existing logic)
     if (cors_config_.enabled) {
       std::string origin = req.get_header_value("Origin");
@@ -270,7 +314,7 @@ void RESTServer::setup_pre_routing_handler() {
         } else {
           res.status = 403;
         }
-        return httplib::Server::HandlerResponse::Handled;
+        return handled(req, res);
       }
     }
 
@@ -280,7 +324,7 @@ void RESTServer::setup_pre_routing_handler() {
       RateLimiter::apply_headers(rl_result, res);
       if (!rl_result.allowed) {
         RateLimiter::apply_rejection(rl_result, res);
-        return httplib::Server::HandlerResponse::Handled;
+        return handled(req, res);
       }
     }
 
@@ -294,7 +338,7 @@ void RESTServer::setup_pre_routing_handler() {
 
       if (!result.allowed) {
         AuthMiddleware::apply_to_response(result, res);
-        return httplib::Server::HandlerResponse::Handled;
+        return handled(req, res);
       }
     }
 
@@ -356,15 +400,83 @@ void RESTServer::setup_routes() {
     throw std::runtime_error("No server instance available for route setup");
   }
 
-  // === Docs routes - MUST be before data/config item routes to avoid (.+) capture collision ===
-  // These use special regex patterns that don't map cleanly to OpenAPI {param} style,
-  // so they are registered directly with the server rather than through the route registry.
-  srv->Get(api_path("/docs"), [this](const httplib::Request & req, httplib::Response & res) {
-    docs_handlers_->handle_docs_root(req, res);
-  });
-  srv->Get((api_path("") + R"((.+)/docs$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    docs_handlers_->handle_docs_any_path(req, res);
-  });
+  // === Docs routes ===
+  //
+  // Added to the registry ahead of every other route, and that is load-bearing
+  // rather than tidy: cpp-httplib matches in registration order and
+  // `RouteRegistry::register_all` preserves the order routes were added, so
+  // going first is what keeps `/apps/x/data/some/topic/docs` reaching the docs
+  // handler instead of being swallowed by the data-item route's trailing
+  // `(.+)`.
+  //
+  // The three routes mounted straight onto the server further down still
+  // precede these, because `register_all` runs at the end of this function.
+  // Of their patterns only `/swagger-ui/([^/]+)` can also match a `/docs`
+  // request - on the single URI `/api/v1/swagger-ui/docs`, and only in a build
+  // configured with `-DENABLE_SWAGGER_UI=ON`.
+  //
+  // Through the registry, not straight onto the server, so the document
+  // contains the endpoint that serves it. `<entity-path>/docs` needs the raw
+  // escape hatch because its `(.+)` prefix is a whole entity or resource path
+  // rather than a `{param}` segment - see `docs_subtree`.
+  route_registry_
+      ->docs_endpoint("/docs",
+                      [this](http::TypedRequest req) -> http::Result<std::string> {
+                        return docs_handlers_->handle_docs_root(req);
+                      })
+      .tag("Server")
+      .requires_role(UserRole::VIEWER)
+      .summary("Capability description")
+      .description(
+          "Returns the OpenAPI 3.1 document describing every endpoint this gateway serves, including the routes "
+          "loaded plugins mount. This is the SOVD capability description for the server as a whole; append `/docs` "
+          "to any entity or resource path for the sub-document scoped to it.")
+      .operation_id("getCapabilityDescription")
+      // 501 when `docs.enabled` is false - the routes stay mounted and report
+      // the capability is off rather than vanishing into a 404.
+      .errors({501});
+
+  route_registry_
+      // No `api_path(...)` on the regex: `register_all` prepends the API
+      // prefix to every route's pattern, so writing it here would mount the
+      // route at `/api/v1/api/v1/...`.
+      ->docs_subtree("/{entity_path}/docs", R"((.+)/docs$)",
+                     [this](const httplib::Request & req, httplib::Response & res) {
+                       docs_handlers_->handle_docs_any_path(req, res);
+                     })
+      .tag("Server")
+      // VIEWER, and because the pattern this derives is a catch-all, it grants
+      // a viewer *any* GET path ending in `/docs` - `/api/v1/a/b/c/d/docs`
+      // included. That is wider than the entity paths the handler resolves, and
+      // it is deliberately left alone rather than narrowed to the four entity
+      // types.
+      //
+      // Narrowing would put the permission below the route. This route's regex
+      // really does match any `.../docs`, so a tighter entry would answer 403
+      // on paths the handler serves - the precise defect deriving the pattern
+      // from the regex exists to prevent - and would turn today's honest 404 on
+      // a nonsense prefix into a 403.
+      //
+      // Nor does the breadth expose a plugin route ending in `/docs`: this
+      // route is mounted by `register_all` at the end of `setup_routes()`,
+      // while `PluginManager::register_routes` runs after it, and cpp-httplib
+      // matches in registration order. Such a plugin route is already shadowed
+      // at the router and never served at all - a routing problem, not a
+      // permission one, and one narrowing this entry would not fix.
+      .requires_role(UserRole::VIEWER)
+      .summary("Scoped capability description")
+      .description(
+          "Returns the OpenAPI 3.1 document scoped to one entity, resource collection or resource - the SOVD "
+          "context-specific capability description. 404 when the prefix names nothing this gateway serves.")
+      .operation_id("getScopedCapabilityDescription")
+      .path_param("entity_path",
+                  "The entity or resource path the description is scoped to, without a leading slash - for example "
+                  "`apps`, `apps/temp_sensor` or `apps/temp_sensor/data`. It is a whole path rather than one segment, "
+                  "so its slashes must be sent unescaped.")
+      // No `.response(200, ...)` here: `docs_subtree` attaches it, the way
+      // `docs_endpoint` does. Success statuses come from the registration, not
+      // from the call site - see design/dto_contract.rst.
+      .errors({501});
 
 #ifdef MEDKIT_STATUS_RECORDER
   // Test builds only (BUILD_TESTING; see CMakeLists.txt). Serves what the
@@ -433,6 +545,7 @@ void RESTServer::setup_routes() {
                 res.set_content(nlohmann::json{{"items", items}}.dump(2), "application/json");
               })
         .tag("FaultTriggers")
+        .requires_role(UserRole::VIEWER)
         .summary("List fault-trigger rules")
         .description(
             "Threshold rules on the app's discovered data points; each fires a fault on cross "
@@ -492,6 +605,7 @@ void RESTServer::setup_routes() {
                 res.set_content(FaultTriggerEngine::rule_to_json(*created).dump(2), "application/json");
               })
         .tag("FaultTriggers")
+        .requires_role(UserRole::OPERATOR)
         .summary("Create a fault-trigger rule")
         .description(
             "Body: data_name, operator (>, <, >=, <=, ==), threshold, fault_code, severity "
@@ -533,6 +647,7 @@ void RESTServer::setup_routes() {
                 res.status = 204;
               })
         .tag("FaultTriggers")
+        .requires_role(UserRole::OPERATOR)
         .summary("Delete a fault-trigger rule")
         .description(
             "Removes the rule; a currently-asserted fault from it is cleared "
@@ -566,6 +681,7 @@ void RESTServer::setup_routes() {
                          return health_handlers_->get_health(req);
                        })
       .tag("Server")
+      .requires_role(UserRole::VIEWER)
       .summary("Health check")
       .description("Returns gateway health status.")
       .operation_id("getHealth");
@@ -575,6 +691,7 @@ void RESTServer::setup_routes() {
                                return health_handlers_->get_root(req);
                              })
       .tag("Server")
+      .requires_role(UserRole::VIEWER)
       .summary("API overview")
       .description("Returns gateway metadata, available endpoints, and capabilities.")
       .operation_id("getRoot");
@@ -584,6 +701,7 @@ void RESTServer::setup_routes() {
                               return health_handlers_->get_version_info(req);
                             })
       .tag("Server")
+      .requires_role(UserRole::VIEWER)
       .summary("SOVD version information")
       .description("Returns SOVD specification version and vendor info.")
       // HealthHandlers::get_version_info -> merge_peer_items (peer vendor blocks).
@@ -601,6 +719,7 @@ void RESTServer::setup_routes() {
            return discovery_handlers_->get_areas(req);
          })
       .tag("Discovery")
+      .requires_role(UserRole::VIEWER)
       .summary("List areas")
       .description("Lists all discovered areas in the system.")
       .operation_id("listAreas");
@@ -611,6 +730,7 @@ void RESTServer::setup_routes() {
            return discovery_handlers_->get_apps(req);
          })
       .tag("Discovery")
+      .requires_role(UserRole::VIEWER)
       .summary("List apps")
       .description("Lists all discovered apps (ROS 2 nodes) in the system.")
       .operation_id("listApps");
@@ -621,6 +741,7 @@ void RESTServer::setup_routes() {
            return discovery_handlers_->get_components(req);
          })
       .tag("Discovery")
+      .requires_role(UserRole::VIEWER)
       .summary("List components")
       .description("Lists all discovered components in the system.")
       .operation_id("listComponents");
@@ -631,6 +752,7 @@ void RESTServer::setup_routes() {
            return discovery_handlers_->get_functions(req);
          })
       .tag("Discovery")
+      .requires_role(UserRole::VIEWER)
       .summary("List functions")
       .description("Lists all discovered functions in the system.")
       .operation_id("listFunctions");
@@ -681,6 +803,7 @@ void RESTServer::setup_routes() {
                               return data_handlers_->get_data_item(req);
                             })
         .tag("Data")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Get data item for ") + et.singular)
         .description(std::string("Returns the latest value from a ROS 2 topic for this ") + et.singular + ".")
         // DataHandlers::get_data_item answers 503 when topic sampling is not
@@ -694,6 +817,7 @@ void RESTServer::setup_routes() {
                               return data_handlers_->put_data_item(req);
                             })
         .tag("Data")
+        .requires_role(UserRole::OPERATOR)
         .summary(std::string("Write data item for ") + et.singular)
         .description(std::string("Publishes a value to a ROS 2 topic on this ") + et.singular + ".")
         .request_body("Data value to write", SB::ref("DataWriteRequest"))
@@ -709,6 +833,7 @@ void RESTServer::setup_routes() {
                               return data_handlers_->data_categories(req);
                             })
         .tag("Data")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List data categories for ") + et.singular)
         .description(std::string("Lists available data categories for this ") + et.singular + ".")
         .only_status(501, "Data categories are not implemented for ROS 2")
@@ -720,6 +845,7 @@ void RESTServer::setup_routes() {
                               return data_handlers_->data_groups(req);
                             })
         .tag("Data")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List data groups for ") + et.singular)
         .description(std::string("Lists available data groups for this ") + et.singular + ".")
         .only_status(501, "Data groups are not implemented for ROS 2")
@@ -736,6 +862,7 @@ void RESTServer::setup_routes() {
                                    return data_handlers_->list_data(req);
                                  })
         .tag("Data")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List data items for ") + et.singular)
         .description(std::string("Lists all data items (ROS 2 topics) available on this ") + et.singular + ".")
         // DataHandlers::list_data -> fan_out_collection<DataItem>.
@@ -759,6 +886,7 @@ void RESTServer::setup_routes() {
              return operation_handlers_->list_operations(req);
            })
         .tag("Operations")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List operations for ") + et.singular)
         .description(std::string("Lists all ROS 2 services and actions available on this ") + et.singular + ".")
         // OperationHandlers::list_operations -> fan_out_collection<OperationItem>.
@@ -777,6 +905,7 @@ void RESTServer::setup_routes() {
                  return operation_handlers_->create_execution(req, std::move(body));
                }})
         .tag("Operations")
+        .requires_role(UserRole::OPERATOR)
         .summary(std::string("Start operation execution for ") + et.singular)
         .description("Starts a new execution. Returns 200 for synchronous, 202 for asynchronous operations.")
         // 400/404/500 come from the registry's automatic response-level
@@ -807,6 +936,7 @@ void RESTServer::setup_routes() {
              return operation_handlers_->list_executions(req);
            })
         .tag("Operations")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List operation executions for ") + et.singular)
         .description(std::string("Lists all executions of an operation on this ") + et.singular + ".")
         .operation_id(std::string("list") + capitalize(et.singular) + "Executions");
@@ -816,6 +946,7 @@ void RESTServer::setup_routes() {
                                        return operation_handlers_->get_execution(req);
                                      })
         .tag("Operations")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Get execution status for ") + et.singular)
         .description("Returns the current status and result of a specific execution.")
         .operation_id(std::string("get") + capitalize(et.singular) + "Execution");
@@ -829,6 +960,7 @@ void RESTServer::setup_routes() {
                  return operation_handlers_->update_execution(req, body);
                }})
         .tag("Operations")
+        .requires_role(UserRole::OPERATOR)
         .summary(std::string("Update execution for ") + et.singular)
         .description("Sends a control command to a running execution.")
         .success_description("Accepted (asynchronous control)")
@@ -851,6 +983,7 @@ void RESTServer::setup_routes() {
                                return operation_handlers_->cancel_execution(req);
                              })
         .tag("Operations")
+        .requires_role(UserRole::OPERATOR)
         .summary(std::string("Cancel execution for ") + et.singular)
         .description("Cancels a running execution.")
         // Same cancel-outcome statuses as PUT-stop (issue #576);
@@ -872,6 +1005,7 @@ void RESTServer::setup_routes() {
                                     return operation_handlers_->get_operation(req);
                                   })
         .tag("Operations")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Get operation details for ") + et.singular)
         .description(std::string("Returns operation details including request/response schema for this ") +
                      et.singular + ".")
@@ -895,6 +1029,7 @@ void RESTServer::setup_routes() {
              return config_handlers_->list_configurations(req);
            })
         .tag("Configuration")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List configurations for ") + et.singular)
         .description(std::string("Lists all ROS 2 node parameters for this ") + et.singular + ".")
         // ConfigHandlers::list_configurations -> fan_out_collection<ConfigurationMetaData>.
@@ -913,6 +1048,7 @@ void RESTServer::setup_routes() {
                                            return config_handlers_->get_configuration(req);
                                          })
         .tag("Configuration")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Get specific configuration for ") + et.singular)
         .description(std::string("Returns a specific ROS 2 node parameter for this ") + et.singular + ".")
         // Parameter failures reach the wire through `classify_parameter_error`,
@@ -931,6 +1067,7 @@ void RESTServer::setup_routes() {
              return config_handlers_->set_configuration(req, std::move(body));
            })
         .tag("Configuration")
+        .requires_role(UserRole::CONFIGURATOR)
         .summary(std::string("Set configuration for ") + et.singular)
         .description(std::string("Sets a ROS 2 node parameter value for this ") + et.singular + ".")
         // `data` is the preferred key; `value` is the legacy alias the handler
@@ -952,6 +1089,7 @@ void RESTServer::setup_routes() {
                                return config_handlers_->delete_configuration(req);
                              })
         .tag("Configuration")
+        .requires_role(UserRole::CONFIGURATOR)
         .summary(std::string("Delete configuration for ") + et.singular)
         .description(std::string("Resets a configuration parameter to its default for this ") + et.singular + ".")
         // ConfigHandlers::delete_configuration -> validate_lock_access("configurations").
@@ -974,6 +1112,7 @@ void RESTServer::setup_routes() {
                  return config_handlers_->delete_all_configurations(req);
                }})
         .tag("Configuration")
+        .requires_role(UserRole::CONFIGURATOR)
         .summary(std::string("Delete all configurations for ") + et.singular)
         .description(std::string("Resets all configuration parameters for this ") + et.singular + ".")
         // ConfigHandlers::delete_all_configurations -> validate_lock_access("configurations").
@@ -997,6 +1136,7 @@ void RESTServer::setup_routes() {
                                     return fault_handlers_->list_faults(req);
                                   })
         .tag("Faults")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List faults for ") + et.singular)
         .description(std::string("Returns all active faults reported by this ") + et.singular + ".")
         // FaultHandlers::list_faults -> merge_peer_items.
@@ -1013,6 +1153,7 @@ void RESTServer::setup_routes() {
                                       return fault_handlers_->get_fault(req);
                                     })
         .tag("Faults")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Get specific fault for ") + et.singular)
         .description("Returns fault details including SOVD status, environment data, and rosbag snapshots.")
         // 503 when the fault store cannot be read - same branch as the list
@@ -1027,6 +1168,7 @@ void RESTServer::setup_routes() {
                  return fault_handlers_->clear_fault(req);
                }})
         .tag("Faults")
+        .requires_role(UserRole::OPERATOR)
         .summary(std::string("Clear fault for ") + et.singular)
         .description(std::string("Clears a specific fault for this ") + et.singular + ".")
         // FaultHandlers::clear_fault -> validate_lock_access("faults").
@@ -1041,6 +1183,7 @@ void RESTServer::setup_routes() {
                                return fault_handlers_->clear_all_faults(req);
                              })
         .tag("Faults")
+        .requires_role(UserRole::OPERATOR)
         .summary(std::string("Clear all faults for ") + et.singular)
         .description(std::string("Clears all faults for this ") + et.singular + ".")
         // FaultHandlers::clear_all_faults -> validate_lock_access("faults").
@@ -1062,6 +1205,7 @@ void RESTServer::setup_routes() {
              return log_handlers_->get_logs(req);
            })
         .tag("Logs")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Query log entries for ") + et.singular)
         .description(
             std::string("Queries application log entries for this ") + et.singular +
@@ -1088,6 +1232,7 @@ void RESTServer::setup_routes() {
                                      return log_handlers_->get_logs_configuration(req);
                                    })
         .tag("Logs")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Get log configuration for ") + et.singular)
         .description(std::string("Returns the log filter configuration for this ") + et.singular + ".")
         .errors({503})  // No LogManager attached - see the list route above.
@@ -1099,6 +1244,7 @@ void RESTServer::setup_routes() {
              return log_handlers_->put_logs_configuration(req, std::move(body));
            })
         .tag("Logs")
+        .requires_role(UserRole::CONFIGURATOR)
         .summary(std::string("Update log configuration for ") + et.singular)
         .description(std::string("Updates the log severity filter and max entries for this ") + et.singular + ".")
         // LogHandlers::put_logs_configuration -> validate_lock_access("logs").
@@ -1122,6 +1268,7 @@ void RESTServer::setup_routes() {
                                          return bulkdata_handlers_->list_categories(req);
                                        })
         .tag("Bulk Data")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List bulk-data categories for ") + et.singular)
         .description(std::string("Lists bulk-data categories (e.g., rosbag snapshots) for this ") + et.singular + ".")
         .operation_id(std::string("list") + capitalize(et.singular) + "BulkDataCategories");
@@ -1132,6 +1279,7 @@ void RESTServer::setup_routes() {
              return bulkdata_handlers_->list_descriptors(req);
            })
         .tag("Bulk Data")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("List bulk-data descriptors for ") + et.singular)
         .description(std::string("Lists downloadable files in a bulk-data category for this ") + et.singular + ".")
         .operation_id(std::string("list") + capitalize(et.singular) + "BulkDataDescriptors");
@@ -1143,6 +1291,7 @@ void RESTServer::setup_routes() {
            },
            handlers::BulkDataHandlers::download_media_types())
         .tag("Bulk Data")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Download bulk-data file for ") + et.singular)
         .description("Downloads a bulk-data file (binary content).")
         .operation_id(std::string("download") + capitalize(et.singular) + "BulkData");
@@ -1157,6 +1306,7 @@ void RESTServer::setup_routes() {
                return bulkdata_handlers_->upload(req, body);
              })
           .tag("Bulk Data")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Upload bulk-data for ") + et.singular)
           .description(std::string("Uploads a file to a bulk-data category for this ") + et.singular + ".")
           // Part names read off BulkDataHandlers::upload. `file` is the only
@@ -1186,6 +1336,7 @@ void RESTServer::setup_routes() {
                                  return bulkdata_handlers_->remove(req);
                                })
           .tag("Bulk Data")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Delete bulk-data file for ") + et.singular)
           .description(std::string("Deletes a bulk-data file for this ") + et.singular + ".")
           // BulkDataHandlers::remove -> validate_lock_access("bulk-data").
@@ -1206,6 +1357,7 @@ void RESTServer::setup_routes() {
                                   return tl::unexpected(std::move(err));
                                 })
           .tag("Bulk Data")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Upload bulk-data for ") + et.singular + " (not supported)")
           .description("Bulk data upload is not supported for this entity type.")
           .response(405, "Method not allowed")
@@ -1220,6 +1372,7 @@ void RESTServer::setup_routes() {
                                  return tl::unexpected(std::move(err));
                                })
           .tag("Bulk Data")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Delete bulk-data file for ") + et.singular + " (not supported)")
           .description("Bulk data deletion is not supported for this entity type.")
           .response(405, "Method not allowed")
@@ -1255,6 +1408,7 @@ void RESTServer::setup_routes() {
                 return trigger_handlers_->sse_trigger_events(req);
               })
           .tag("Triggers")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("SSE events stream for trigger on ") + et.singular)
           .description(std::string("Server-Sent Events stream for trigger notifications on this ") + et.singular +
                        ". Each frame's `data:` field is a TriggerEventFrame. An idle stream sends "
@@ -1276,6 +1430,7 @@ void RESTServer::setup_routes() {
                return trigger_handlers_->post_trigger(req, std::move(body));
              })
           .tag("Triggers")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Create trigger for ") + et.singular)
           .description(std::string("Creates a new event trigger for this ") + et.singular + ".")
           .body_example(nlohmann::json{
@@ -1299,6 +1454,7 @@ void RESTServer::setup_routes() {
                return trigger_handlers_->get_triggers(req);
              })
           .tag("Triggers")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("List triggers for ") + et.singular)
           .description(std::string("Lists all triggers configured for this ") + et.singular + ".")
           .gated_on(triggers_available, triggers_unavailable)
@@ -1309,6 +1465,7 @@ void RESTServer::setup_routes() {
                               return trigger_handlers_->get_trigger(req);
                             })
           .tag("Triggers")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get trigger for ") + et.singular)
           .description(std::string("Returns details of a specific trigger on this ") + et.singular + ".")
           .gated_on(triggers_available, triggers_unavailable)
@@ -1320,6 +1477,7 @@ void RESTServer::setup_routes() {
                return trigger_handlers_->put_trigger(req, body);
              })
           .tag("Triggers")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Update trigger for ") + et.singular)
           .description(std::string("Updates a trigger configuration on this ") + et.singular + ".")
           .gated_on(triggers_available, triggers_unavailable)
@@ -1330,6 +1488,7 @@ void RESTServer::setup_routes() {
                                  return trigger_handlers_->del_trigger(req);
                                })
           .tag("Triggers")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Delete trigger for ") + et.singular)
           .description(std::string("Deletes a trigger from this ") + et.singular + ".")
           .gated_on(triggers_available, triggers_unavailable)
@@ -1354,6 +1513,7 @@ void RESTServer::setup_routes() {
                 return cyclic_sub_handlers_->sse_subscription_events(req);
               })
           .tag("Subscriptions")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("SSE events stream for cyclic subscription on ") + et.singular)
           .description(std::string("Server-Sent Events stream for subscription data on this ") + et.singular +
                        ". Each frame's `data:` field is a SubscriptionEventFrame carrying either the sample "
@@ -1373,6 +1533,7 @@ void RESTServer::setup_routes() {
                return cyclic_sub_handlers_->post_subscription(req, std::move(body));
              })
           .tag("Subscriptions")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Create cyclic subscription for ") + et.singular)
           .description(std::string("Creates a new cyclic data subscription for this ") + et.singular + ".")
           .success_description("Subscription created")
@@ -1388,6 +1549,7 @@ void RESTServer::setup_routes() {
                return cyclic_sub_handlers_->get_subscriptions(req);
              })
           .tag("Subscriptions")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("List cyclic subscriptions for ") + et.singular)
           .description(std::string("Lists all cyclic subscriptions for this ") + et.singular + ".")
           .operation_id(std::string("list") + capitalize(et.singular) + "Subscriptions");
@@ -1397,6 +1559,7 @@ void RESTServer::setup_routes() {
                                          return cyclic_sub_handlers_->get_subscription(req);
                                        })
           .tag("Subscriptions")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get cyclic subscription for ") + et.singular)
           .description(std::string("Returns details of a specific subscription on this ") + et.singular + ".")
           .operation_id(std::string("get") + capitalize(et.singular) + "Subscription");
@@ -1408,6 +1571,7 @@ void RESTServer::setup_routes() {
                return cyclic_sub_handlers_->put_subscription(req, std::move(body));
              })
           .tag("Subscriptions")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Update cyclic subscription for ") + et.singular)
           .description(std::string("Updates a subscription configuration on this ") + et.singular + ".")
           .operation_id(std::string("update") + capitalize(et.singular) + "Subscription");
@@ -1417,6 +1581,7 @@ void RESTServer::setup_routes() {
                                  return cyclic_sub_handlers_->del_subscription(req);
                                })
           .tag("Subscriptions")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Delete cyclic subscription for ") + et.singular)
           .description(std::string("Deletes a cyclic subscription from this ") + et.singular + ".")
           .operation_id(std::string("delete") + capitalize(et.singular) + "Subscription");
@@ -1439,6 +1604,7 @@ void RESTServer::setup_routes() {
                return lock_handlers_->post_lock(req, std::move(body));
              })
           .tag("Locking")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Acquire lock on ") + et.singular)
           .description(
               std::string("Acquires an exclusive lock on this ") + et.singular +
@@ -1464,6 +1630,7 @@ void RESTServer::setup_routes() {
                                             return lock_handlers_->get_locks(req);
                                           })
           .tag("Locking")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("List locks on ") + et.singular)
           .description(std::string("Lists all active locks on this ") + et.singular + ".")
           .header_param("X-Client-Id", "When provided, the 'owned' field indicates whether this client owns the lock",
@@ -1476,6 +1643,7 @@ void RESTServer::setup_routes() {
                            return lock_handlers_->get_lock(req);
                          })
           .tag("Locking")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get lock details for ") + et.singular)
           .description(std::string("Returns details of a specific lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "When provided, the 'owned' field indicates whether this client owns the lock",
@@ -1489,6 +1657,7 @@ void RESTServer::setup_routes() {
                return lock_handlers_->put_lock(req, body);
              })
           .tag("Locking")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Extend lock on ") + et.singular)
           .description(std::string("Extends the expiration of a lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
@@ -1506,6 +1675,7 @@ void RESTServer::setup_routes() {
                                  return lock_handlers_->del_lock(req);
                                })
           .tag("Locking")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Release lock on ") + et.singular)
           .description(std::string("Releases a lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
@@ -1567,6 +1737,7 @@ void RESTServer::setup_routes() {
                return script_handlers_->upload_script(req, body);
              })
           .tag("Scripts")
+          .requires_role(UserRole::CONFIGURATOR)
           .summary(std::string("Upload diagnostic script for ") + et.singular)
           .description(std::string("Uploads a diagnostic script for this ") + et.singular + ".")
           // Part names read off ScriptHandlers::upload_script. `file` is the
@@ -1592,6 +1763,7 @@ void RESTServer::setup_routes() {
                                  return script_handlers_->list_scripts(req);
                                })
           .tag("Scripts")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("List scripts for ") + et.singular)
           .description(std::string("Lists all diagnostic scripts for this ") + et.singular + ".")
           // DefaultScriptProvider::list_scripts returns no backend error
@@ -1603,6 +1775,7 @@ void RESTServer::setup_routes() {
                                      return script_handlers_->get_script(req);
                                    })
           .tag("Scripts")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get script metadata for ") + et.singular)
           .description(std::string("Returns metadata of a specific script for this ") + et.singular + ".")
           // DefaultScriptProvider::get_script -> NotFound / Internal only
@@ -1614,6 +1787,7 @@ void RESTServer::setup_routes() {
                                  return script_handlers_->delete_script(req);
                                })
           .tag("Scripts")
+          .requires_role(UserRole::CONFIGURATOR)
           .summary(std::string("Delete script for ") + et.singular)
           .description(std::string("Deletes a diagnostic script from this ") + et.singular + ".")
           // DefaultScriptProvider::delete_script -> ManagedScript / AlreadyRunning
@@ -1627,6 +1801,7 @@ void RESTServer::setup_routes() {
                return script_handlers_->start_execution(req);
              })
           .tag("Scripts")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Start script execution for ") + et.singular)
           .description(std::string("Starts execution of a diagnostic script on this ") + et.singular + ".")
           // The handler parses this body by hand (framework escape hatch) so it
@@ -1650,6 +1825,7 @@ void RESTServer::setup_routes() {
                                       return script_handlers_->get_execution(req);
                                     })
           .tag("Scripts")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get execution status for ") + et.singular)
           .description("Returns the current status of a script execution.")
           // DefaultScriptProvider::get_script -> NotFound / Internal only
@@ -1663,6 +1839,7 @@ void RESTServer::setup_routes() {
                return script_handlers_->control_execution(req, body);
              })
           .tag("Scripts")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Terminate script execution for ") + et.singular)
           .description("Sends a control command (e.g., terminate) to a running script execution.")
           // DefaultScriptProvider::control_execution -> NotRunning
@@ -1674,6 +1851,7 @@ void RESTServer::setup_routes() {
                                  return script_handlers_->delete_execution(req);
                                })
           .tag("Scripts")
+          .requires_role(UserRole::OPERATOR)
           .summary(std::string("Remove completed execution for ") + et.singular)
           .description("Removes a completed script execution record.")
           // DefaultScriptProvider::delete_execution -> AlreadyRunning
@@ -1689,6 +1867,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_area_components(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("List components in area")
           .description("Lists components belonging to this area.")
           .operation_id("listAreaComponents");
@@ -1699,6 +1878,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_subareas(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("List subareas")
           .description("Lists subareas within this area.")
           .operation_id("listSubareas");
@@ -1709,6 +1889,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_area_contains(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("List entities contained in area")
           // Components only, not "all entities": the handler walks the area and
           // its descendant subareas collecting `get_components_for_area` and
@@ -1728,6 +1909,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_subcomponents(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("List subcomponents")
           .description("Lists subcomponents of this component.")
           .operation_id("listSubcomponents");
@@ -1738,6 +1920,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_component_hosts(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("List component hosts")
           .description("Lists apps hosted by this component.")
           .operation_id("listComponentHosts");
@@ -1748,6 +1931,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_component_depends_on(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("List component dependencies")
           .description("Lists components this component depends on.")
           .operation_id("listComponentDependencies");
@@ -1760,6 +1944,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_app_is_located_on(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("Get app host component")
           .description("Returns the component hosting this app as a single-element collection.")
           .operation_id("getAppHost");
@@ -1770,6 +1955,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_app_belongs_to(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("Get app parent area")
           .description(
               "Returns the area this app belongs to via its parent component, as a 0-or-1 element "
@@ -1782,6 +1968,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_app_depends_on(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("List app dependencies")
           .description("Lists apps this app depends on.")
           .operation_id("listAppDependencies");
@@ -1794,6 +1981,7 @@ void RESTServer::setup_routes() {
                return discovery_handlers_->get_function_hosts(req);
              })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary("List function hosts")
           // The handler resolves the function's host ids through
           // `cache.get_app(...)` and returns AppListItem with `/api/v1/apps/`
@@ -1813,6 +2001,7 @@ void RESTServer::setup_routes() {
                                  return discovery_handlers_->get_area(req);
                                })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get ") + et.singular + " details")
           .description(std::string("Returns ") + et.singular +
                        " details with capabilities and resource collection URIs.")
@@ -1823,6 +2012,7 @@ void RESTServer::setup_routes() {
                                       return discovery_handlers_->get_component(req);
                                     })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get ") + et.singular + " details")
           .description(std::string("Returns ") + et.singular +
                        " details with capabilities and resource collection URIs.")
@@ -1833,6 +2023,7 @@ void RESTServer::setup_routes() {
                                 return discovery_handlers_->get_app(req);
                               })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get ") + et.singular + " details")
           .description(std::string("Returns ") + et.singular +
                        " details with capabilities and resource collection URIs.")
@@ -1843,6 +2034,7 @@ void RESTServer::setup_routes() {
                                      return discovery_handlers_->get_function(req);
                                    })
           .tag("Discovery")
+          .requires_role(UserRole::VIEWER)
           .summary(std::string("Get ") + et.singular + " details")
           .description(std::string("Returns ") + et.singular +
                        " details with capabilities and resource collection URIs.")
@@ -1862,6 +2054,7 @@ void RESTServer::setup_routes() {
                                        return bulkdata_handlers_->list_categories(req);
                                      })
       .tag("Bulk Data")
+      .requires_role(UserRole::VIEWER)
       .summary("List bulk-data categories for subarea")
       .description("Lists bulk-data categories for a subarea.")
       .operation_id("listSubareaBulkDataCategories");
@@ -1872,6 +2065,7 @@ void RESTServer::setup_routes() {
            return bulkdata_handlers_->list_descriptors(req);
          })
       .tag("Bulk Data")
+      .requires_role(UserRole::VIEWER)
       .summary("List bulk-data descriptors for subarea")
       .description("Lists bulk-data descriptors for a subarea.")
       .operation_id("listSubareaBulkDataDescriptors");
@@ -1883,6 +2077,7 @@ void RESTServer::setup_routes() {
          },
          handlers::BulkDataHandlers::download_media_types())
       .tag("Bulk Data")
+      .requires_role(UserRole::VIEWER)
       .summary("Download bulk-data file for subarea")
       .description("Downloads a bulk-data file for a subarea.")
       .operation_id("downloadSubareaBulkData");
@@ -1893,6 +2088,7 @@ void RESTServer::setup_routes() {
                                        return bulkdata_handlers_->list_categories(req);
                                      })
       .tag("Bulk Data")
+      .requires_role(UserRole::VIEWER)
       .summary("List bulk-data categories for subcomponent")
       .description("Lists bulk-data categories for a subcomponent.")
       .operation_id("listSubcomponentBulkDataCategories");
@@ -1903,6 +2099,7 @@ void RESTServer::setup_routes() {
            return bulkdata_handlers_->list_descriptors(req);
          })
       .tag("Bulk Data")
+      .requires_role(UserRole::VIEWER)
       .summary("List bulk-data descriptors for subcomponent")
       .description("Lists bulk-data descriptors for a subcomponent.")
       .operation_id("listSubcomponentBulkDataDescriptors");
@@ -1914,6 +2111,7 @@ void RESTServer::setup_routes() {
          },
          handlers::BulkDataHandlers::download_media_types())
       .tag("Bulk Data")
+      .requires_role(UserRole::VIEWER)
       .summary("Download bulk-data file for subcomponent")
       .description("Downloads a bulk-data file for a subcomponent.")
       .operation_id("downloadSubcomponentBulkData");
@@ -1936,6 +2134,7 @@ void RESTServer::setup_routes() {
             return sse_fault_handler_->sse_stream(req);
           })
       .tag("Faults")
+      .requires_role(UserRole::VIEWER)
       .summary("Stream fault events (SSE)")
       .description(
           "Server-Sent Events stream for real-time fault notifications. Each frame's `data:` field is a "
@@ -1959,6 +2158,7 @@ void RESTServer::setup_routes() {
                                   return fault_handlers_->list_all_faults(req);
                                 })
       .tag("Faults")
+      .requires_role(UserRole::VIEWER)
       .summary("List all faults globally")
       .description("Retrieve all faults across the system.")
       // The handler's return type is the opaque `FaultListResult` so the fault
@@ -1982,6 +2182,7 @@ void RESTServer::setup_routes() {
            return fault_handlers_->clear_all_faults_global(req);
          })
       .tag("Faults")
+      .requires_role(UserRole::OPERATOR)
       .summary("Clear all faults globally")
       // "Across the entire system" was wrong twice over: the request never
       // leaves this gateway, and an omitted `status` clears two of the four
@@ -2051,6 +2252,7 @@ void RESTServer::setup_routes() {
                              return update_handlers_->get_updates(req);
                            })
       .tag("Updates")
+      .requires_role(UserRole::VIEWER)
       .summary("List software updates")
       .description("Lists all registered software updates.")
       .gated_on(updates_available, kUpdate501)
@@ -2064,6 +2266,7 @@ void RESTServer::setup_routes() {
            return update_handlers_->post_update(req, std::move(body));
          })
       .tag("Updates")
+      .requires_role(UserRole::CONFIGURATOR)
       .summary("Register a software update")
       .description("Registers a new software update descriptor.")
       .success_description("Update registered")
@@ -2075,6 +2278,7 @@ void RESTServer::setup_routes() {
                                return update_handlers_->get_status(req);
                              })
       .tag("Updates")
+      .requires_role(UserRole::VIEWER)
       .summary("Get update status")
       .description("Returns the current status and progress of an update.")
       .gated_on(updates_available, kUpdate501)
@@ -2087,6 +2291,7 @@ void RESTServer::setup_routes() {
            return update_handlers_->put_prepare(req);
          })
       .tag("Updates")
+      .requires_role(UserRole::CONFIGURATOR)
       .summary("Prepare update for execution")
       .description("Prepares an update for execution (downloads, validates).")
       .success_description("Update preparation started")
@@ -2105,6 +2310,7 @@ void RESTServer::setup_routes() {
            return update_handlers_->put_execute(req);
          })
       .tag("Updates")
+      .requires_role(UserRole::CONFIGURATOR)
       .summary("Execute update")
       .description("Starts executing a prepared update.")
       .success_description("Update execution started")
@@ -2123,6 +2329,7 @@ void RESTServer::setup_routes() {
            return update_handlers_->put_automated(req);
          })
       .tag("Updates")
+      .requires_role(UserRole::CONFIGURATOR)
       .summary("Run automated update")
       .description("Runs a fully automated update (prepare + execute).")
       .success_description("Automated update started")
@@ -2139,6 +2346,7 @@ void RESTServer::setup_routes() {
                                return update_handlers_->get_update(req);
                              })
       .tag("Updates")
+      .requires_role(UserRole::VIEWER)
       .summary("Get update details")
       .description("Returns details of a specific update.")
       .gated_on(updates_available, kUpdate501)
@@ -2149,6 +2357,7 @@ void RESTServer::setup_routes() {
                              return update_handlers_->del_update(req);
                            })
       .tag("Updates")
+      .requires_role(UserRole::CONFIGURATOR)
       .summary("Delete update")
       .description("Removes an update registration.")
       .gated_on(updates_available, kUpdate501)
@@ -2172,6 +2381,7 @@ void RESTServer::setup_routes() {
                                      return auth_handlers_->post_authorize(req);
                                    })
       .tag("Authentication")
+      .public_route()
       .summary("Authorize client")
       .description("Authenticate and obtain authorization tokens.")
       .request_body("Client credentials", SB::ref("AuthCredentials"))
@@ -2191,6 +2401,7 @@ void RESTServer::setup_routes() {
                                      return auth_handlers_->post_token(req);
                                    })
       .tag("Authentication")
+      .public_route()
       .summary("Obtain access token")
       .description("Exchange credentials or refresh token for a JWT access token.")
       .request_body("Token request credentials", SB::ref("AuthCredentials"))
@@ -2206,6 +2417,7 @@ void RESTServer::setup_routes() {
                                       return auth_handlers_->post_revoke(req);
                                     })
       .tag("Authentication")
+      .public_route()
       .summary("Revoke token")
       .description("Revoke an access or refresh token.")
       // No `.accepts(...)` and no `.errors({401})`, unlike the two above:
@@ -2226,6 +2438,14 @@ void RESTServer::setup_routes() {
 
     for (const auto & action : {"start", "restart", "force-restart", "shutdown", "force-shutdown"}) {
       std::string action_str = action;
+      // The one registration in this file whose role is not fixed at the call
+      // site: `shutdown` and `force-shutdown` tear the entity down and stay
+      // behind CONFIGURATOR, while start/restart/force-restart bring it back
+      // and are OPERATOR's. Written as a condition on the loop variable rather
+      // than as two registrations, because everything else about the five
+      // routes is identical and splitting them would invite the copies to
+      // drift.
+      const bool destructive_transition = action_str == "shutdown" || action_str == "force-shutdown";
       // Capitalise action for operation ID: "force-restart" -> "ForceRestart"
       std::string action_cap;
       bool cap_next = true;
@@ -2244,6 +2464,7 @@ void RESTServer::setup_routes() {
                return lifecycle_handlers_->handle_transition(req, action_str);
              })
           .tag("Lifecycle")
+          .requires_role(destructive_transition ? UserRole::CONFIGURATOR : UserRole::OPERATOR)
           .summary(std::string("Request lifecycle transition '") + action + "'")
           .description(std::string("Asks the entity's LifecycleProvider to perform the '") + action +
                        "' transition. The 202 says the request was accepted, not that the transition finished: it "
@@ -2271,6 +2492,7 @@ void RESTServer::setup_routes() {
                                             return lifecycle_handlers_->handle_get_status(req);
                                           })
         .tag("Lifecycle")
+        .requires_role(UserRole::VIEWER)
         .summary(std::string("Get ") + et_lc.second + " lifecycle status")
         .description(
             "Reports whether the entity is `ready` or `notReady`, and which lifecycle transitions can be "
@@ -2289,6 +2511,26 @@ void RESTServer::setup_routes() {
 
   // Register all routes with cpp-httplib
   route_registry_->register_all(*srv, API_BASE_PATH);
+
+  // The RBAC table, derived from the registrations just made rather than
+  // restated in a second file that has to be kept in step with them. Two
+  // sources, merged, and the split is the honest one:
+  //
+  //   * the registry's derivation covers every route mounted above, each entry
+  //     carrying the role its `requires_role(...)` declared, expanded to that
+  //     role and every stronger one;
+  //   * `residual_route_permissions()` covers what the registry never sees -
+  //     the plugin routes `PluginManager::register_routes` mounts below, the
+  //     Swagger UI pages, and in test builds the status recorder.
+  //
+  // Done here, not in the AuthManager constructor: the manager is built before
+  // the routes exist. Done before `start()`, which is the only thread-safety
+  // this needs - every request thread that reads the table is created by the
+  // listen call that follows.
+  if (auth_manager_) {
+    auth_manager_->add_route_permissions(route_registry_->route_permissions(API_BASE_PATH));
+    auth_manager_->add_route_permissions(AuthConfig::residual_route_permissions());
+  }
 
   report_route_metadata_issues();
 }

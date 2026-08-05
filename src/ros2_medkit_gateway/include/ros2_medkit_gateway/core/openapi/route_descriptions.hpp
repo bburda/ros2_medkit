@@ -97,6 +97,32 @@ class SchemaDesc {
     return *this;
   }
 
+  /// Attach prose. Applied last in a chain, so it lands on the outermost
+  /// node - including the `anyOf` wrapper `or_null()` produces, which is
+  /// where a client reads it from.
+  SchemaDesc & description(const std::string & text) {
+    json_["description"] = text;
+    return *this;
+  }
+
+  /// Constrain a string schema to a closed set of values. Only write this
+  /// where the emitter genuinely cannot produce anything else - an enum a
+  /// handler can step outside makes a generated client reject a real body.
+  SchemaDesc & enum_values(const std::vector<std::string> & values) {
+    json_["enum"] = values;
+    return *this;
+  }
+
+  /// Widen the schema to `<current> | null`, the OpenAPI 3.1 spelling of a
+  /// key that is always present and sometimes JSON `null`. Not the same as
+  /// leaving a key out of `required`: that says the key may be absent.
+  SchemaDesc & or_null() {
+    nlohmann::json inner = std::move(json_);
+    json_ = nlohmann::json::object();
+    json_["anyOf"] = nlohmann::json::array({std::move(inner), nlohmann::json{{"type", "null"}}});
+    return *this;
+  }
+
   // Convert to JSON
   nlohmann::json to_json() const {
     return json_;
@@ -115,6 +141,42 @@ class OperationDesc {
   // Set the operation description text
   OperationDesc & description(std::string desc) {
     description_ = std::move(desc);
+    return *this;
+  }
+
+  /// Set the OpenAPI tag. The gateway declares every tag a folded plugin
+  /// operation uses in the document's global tag list, so a plugin may pick
+  /// its own name here without the document acquiring an undeclared tag.
+  OperationDesc & tag(std::string name) {
+    tag_ = std::move(name);
+    return *this;
+  }
+
+  /// Set the operationId. It has to be unique across the whole document, not
+  /// just across this plugin: generated clients turn it into a method name,
+  /// and the gateway's own operationIds share the namespace. Prefixing with
+  /// the plugin's name is the way to stay out of their way.
+  OperationDesc & operation_id(std::string id) {
+    operation_id_ = std::move(id);
+    return *this;
+  }
+
+  /// Declare the role a caller needs. Published as a security requirement
+  /// naming `bearerAuth` with the role as its scope - the same shape the
+  /// gateway's own routes use. The role must be the one `AuthConfig`'s
+  /// permission table actually grants for this path: the document is read as
+  /// a statement about the gateway's enforcement, not about what the plugin
+  /// would prefer.
+  OperationDesc & requires_role(std::string role) {
+    role_ = std::move(role);
+    security_declared_ = true;
+    return *this;
+  }
+
+  /// Declare the operation reachable with no token at all (`security: []`).
+  OperationDesc & public_route() {
+    role_.clear();
+    security_declared_ = true;
     return *this;
   }
 
@@ -159,12 +221,41 @@ class OperationDesc {
     return *this;
   }
 
+  /// Declare an error status as a reference to one of the document's shared
+  /// response components (`GenericError`, `Unauthorized`, ...). A plugin
+  /// handler's errors reach the wire through `PluginResponse::send_error`,
+  /// which writes the SOVD `GenericError` body, so `GenericError` is the
+  /// component that describes them - spelling the body out inline instead
+  /// would publish a second, drifting copy of it.
+  OperationDesc & error_response(int status_code, const std::string & component) {
+    responses_[std::to_string(status_code)] = nlohmann::json{{"$ref", "#/components/responses/" + component}};
+    return *this;
+  }
+
   // Convert to JSON
   nlohmann::json to_json() const {
     nlohmann::json j;
 
+    if (!tag_.empty()) {
+      j["tags"] = nlohmann::json::array({tag_});
+    }
+
+    if (!operation_id_.empty()) {
+      j["operationId"] = operation_id_;
+    }
+
     if (!description_.empty()) {
       j["description"] = description_;
+    }
+
+    if (security_declared_) {
+      if (role_.empty()) {
+        j["security"] = nlohmann::json::array();
+      } else {
+        nlohmann::json requirement = nlohmann::json::object();
+        requirement["bearerAuth"] = nlohmann::json::array({role_});
+        j["security"] = nlohmann::json::array({std::move(requirement)});
+      }
     }
 
     if (!parameters_.empty()) {
@@ -185,6 +276,10 @@ class OperationDesc {
 
  private:
   std::string description_;
+  std::string tag_;
+  std::string operation_id_;
+  std::string role_;
+  bool security_declared_ = false;
   std::vector<nlohmann::json> parameters_;
   SchemaDesc request_body_;
   bool has_request_body_ = false;

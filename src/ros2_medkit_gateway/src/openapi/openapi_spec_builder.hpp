@@ -55,8 +55,18 @@ class OpenApiSpecBuilder {
   /// Merge schemas into components/schemas.
   OpenApiSpecBuilder & add_schemas(const nlohmann::json & schemas);
 
-  /// Add a security scheme and corresponding global security requirement.
-  OpenApiSpecBuilder & security_scheme(const std::string & name, const nlohmann::json & scheme);
+  /// Add a security scheme, and by default the matching document-level
+  /// security requirement.
+  ///
+  /// The two are separable because they say different things. The scheme is
+  /// a definition - "this document refers to a bearer token called `name`" -
+  /// and an operation cannot name a scheme the document does not define, so
+  /// any per-operation `security` requires it. The document-level
+  /// requirement is a claim about enforcement: it says *every* request needs
+  /// that token. Pass `document_level_requirement = false` to register the
+  /// definition without making that claim.
+  OpenApiSpecBuilder & security_scheme(const std::string & name, const nlohmann::json & scheme,
+                                       bool document_level_requirement = true);
 
   /// Build the complete OpenAPI 3.1.0 document.
   nlohmann::json build() const;
@@ -81,6 +91,7 @@ class OpenApiSpecBuilder {
   struct SecuritySchemeEntry {
     std::string name;
     nlohmann::json scheme;
+    bool document_level_requirement;
   };
   std::vector<SecuritySchemeEntry> security_schemes_;
 

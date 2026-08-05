@@ -676,5 +676,6 @@ Additional Design Documents
    entity_cache_architecture
    hardening
    lifecycle
+   openapi_derivation
    plugin_entity_notifications
    ros2_subscription_architecture

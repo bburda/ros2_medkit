@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <map>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <string>
@@ -35,6 +36,24 @@ namespace openapi {
 /// `components/responses` from `OpenApiSpecBuilder`, neither of which the
 /// registry can read. Only the assembled document knows both halves.
 std::set<std::string> unreachable_schemas(const nlohmann::json & document);
+
+/// The entries of `pool` that a `$ref` chain rooted in `subtree` can reach,
+/// resolving each hop through `pool` itself.
+///
+/// The inverse of the walk above, and it exists for the sub-documents: a
+/// `<entity-path>/docs` document publishes a slice of the API surface, and the
+/// schemas its operations name have to travel with it - a `$ref` into a
+/// `components/schemas` entry the document does not carry is a reference no
+/// client can resolve. Shipping the whole pool instead would put every DTO the
+/// gateway knows on every entity page.
+///
+/// Only `components/schemas` references are followed. References into other
+/// component sections - `#/components/responses/GenericError` and the
+/// middleware-owned responses beside it - are emitted unconditionally by
+/// `OpenApiSpecBuilder::build()`, so a sub-document carries them whether or not
+/// an operation names one.
+std::map<std::string, nlohmann::json> referenced_schemas(const nlohmann::json & subtree,
+                                                         const std::map<std::string, nlohmann::json> & pool);
 
 }  // namespace openapi
 }  // namespace ros2_medkit_gateway

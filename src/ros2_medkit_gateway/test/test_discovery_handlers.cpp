@@ -1082,14 +1082,24 @@ TEST_F(DiscoveryHandlersFixtureTest, GetFunctionUnknownIdReturns404) {
 }
 
 // @verifies REQ_INTEROP_003
-TEST_F(DiscoveryHandlersFixtureTest, GetFunctionReturnsCapabilitiesAndGraphLink) {
+// The `x-medkit-graph` link is emitted off the entity's capability list, and
+// nothing in the gateway puts that capability there - only a plugin does. This
+// fixture loads none, so the key must be absent: it used to be written
+// unconditionally, which published a URI that answered 404 on every gateway
+// running without the graph provider. The other half of the pair - the link
+// present, and equal to the capability href, with the plugin loaded - is
+// `test_graph_provider_plugin.test.py::test_01_function_detail_includes_graph_capability`,
+// because registering a plugin capability needs a real loaded plugin.
+//
+// @verifies REQ_INTEROP_003
+TEST_F(DiscoveryHandlersFixtureTest, GetFunctionOmitsGraphLinkWithoutAPlugin) {
   httplib::Request req;
   auto typed_req = make_typed_request(req, "/api/v1/functions/navigation", R"(/api/v1/functions/([^/]+))");
 
   auto result = handlers_->get_function(typed_req);
   auto body = body_json(result);
   EXPECT_EQ(body["hosts"], "/api/v1/functions/navigation/hosts");
-  EXPECT_EQ(body["x-medkit-graph"], "/api/v1/functions/navigation/x-medkit-graph");
+  EXPECT_FALSE(body.contains("x-medkit-graph"));
   EXPECT_EQ(body["_links"]["self"], "/api/v1/functions/navigation");
   EXPECT_EQ(body["x-medkit"]["source"], "manifest");
 }

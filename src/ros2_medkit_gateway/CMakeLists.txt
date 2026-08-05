@@ -379,6 +379,18 @@ if(BUILD_TESTING)
   )
   set_tests_properties(gateway_error_codes_documented PROPERTIES LABELS "linter")
 
+  # ─── Design-document test citations ───────────────────────────────────────
+  # Fails if a design document names a test that no longer exists. The docs
+  # say which mechanism is enforced by which check, and they say it by naming
+  # the check; a rename in the test tree falsifies every such sentence at once
+  # and nothing else would notice.
+  add_test(
+    NAME gateway_doc_test_citations
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_doc_test_citations.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  set_tests_properties(gateway_doc_test_citations PROPERTIES LABELS "linter")
+
   # ─── gateway_core link-time smoke test ────────────────────────────────────
   # Compiles a translation unit including a sampling of core/ headers and
   # links exclusively against gateway_core + GTest. No ament_target_dependencies

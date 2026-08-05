@@ -263,15 +263,24 @@ TokenValidationResult AuthManager::validate_token(const std::string & token, Tok
   return result;
 }
 
+void AuthManager::add_route_permissions(const RoutePermissions & permissions) {
+  for (const auto & [role, entries] : permissions) {
+    permissions_[role].insert(entries.begin(), entries.end());
+  }
+}
+
 AuthorizationResult AuthManager::check_authorization(UserRole role, const std::string & method,
                                                      const std::string & path) const {
   AuthorizationResult result;
 
-  const auto & role_permissions = AuthConfig::get_role_permissions();
-  auto it = role_permissions.find(role);
-  if (it == role_permissions.end()) {
+  auto it = permissions_.find(role);
+  if (it == permissions_.end()) {
     result.authorized = false;
-    result.error = "Unknown role";
+    // Not "unknown role" any more: every enumerator is a role the gateway
+    // knows, and reaching here means the table was never given entries for it
+    // (see add_route_permissions). Saying "unknown role" would send a reader
+    // hunting for a typo in the token instead of a gap in the table.
+    result.error = "No permissions are configured for this role";
     return result;
   }
 

@@ -17,6 +17,7 @@
 #include <httplib.h>
 
 #include <nlohmann/json.hpp>
+#include <string>
 
 #include "ros2_medkit_gateway/core/models/error_info.hpp"
 
@@ -61,10 +62,11 @@ namespace detail {
  * `PluginResponse` (plugin shim that lets plugins emit responses without
  * going through HandlerContext), and the two remaining legacy raw-route
  * handlers that have not yet migrated to the typed router and so still
- * write `httplib::Response` directly: `DocsHandlers` (the `/docs` +
- * `<path>/docs` per-path capability description routes registered outside
- * the route registry because their regex shape does not map cleanly to the
- * typed router's OpenAPI path-template grammar) and `SSEFaultHandler` (the
+ * write `httplib::Response` directly: `DocsHandlers` (the
+ * `<entity-path>/docs` scoped capability description, whose `(.+)/docs`
+ * prefix is a whole entity or resource path rather than a `{param}` segment
+ * the typed router can name; the plain `/docs` next to it is typed, and the
+ * Swagger UI routes serve non-JSON bodies) and `SSEFaultHandler` (the
  * legacy `handle_stream` entry kept for the in-process unit test fixture).
  *
  * Handler code cannot default-construct the token, so cannot call the
@@ -124,6 +126,29 @@ struct PrimitivesAccessForTesting;
 constexpr int kKeepCurrentStatus = 0;
 
 void write_json_body(FrameworkOrPluginAccess token, httplib::Response & res, const nlohmann::json & body,
+                     int status = 200);
+
+/**
+ * @brief Write an already-serialized JSON document.
+ *
+ * Same status sentinel and same `application/json` content type as
+ * `write_json_body`; the difference is only that the caller has the JSON
+ * text rather than a DOM. It exists for the `/docs` routes, which cache
+ * capability documents serialized so that serving one does not have to
+ * copy a parsed DOM (see `openapi::CapabilityGenerator`).
+ *
+ * `body` must be what `nlohmann::json::dump(2)` produces for the document,
+ * which is what `write_json_body` would have written - that equality is what
+ * lets the two writers be used interchangeably on the same route. Nothing
+ * here validates it; the caller owns that.
+ *
+ * @param token Framework access token (constructible only by friends).
+ * @param res HTTP response to mutate.
+ * @param body Serialized JSON document.
+ * @param status HTTP status code; pass `kKeepCurrentStatus` to leave
+ *               `res.status` unchanged. Defaults to 200.
+ */
+void write_json_text(FrameworkOrPluginAccess token, httplib::Response & res, const std::string & body,
                      int status = 200);
 
 /**

@@ -466,6 +466,73 @@ For entity-scoped endpoints, register a matching capability via ``register_capab
 or ``register_entity_capability()`` in ``set_context()`` so the endpoint appears in the
 entity's capabilities array in discovery responses.
 
+Documenting a Plugin Route
+--------------------------
+
+``get_routes()`` mounts a route; it does not describe one. A plugin route is
+mounted straight onto the HTTP server by ``PluginManager``, so the gateway's
+``RouteRegistry`` - the source of the OpenAPI document - knows nothing about it,
+and a client reading ``GET /api/v1/docs`` sees no trace of it.
+
+Export the optional C symbol ``describe_plugin_routes`` to fix that. The gateway
+resolves it with ``dlsym`` for each loaded plugin, skipping any that does not
+have it, and folds what it returns into the root document served at
+``GET /api/v1/docs``:
+
+.. code-block:: cpp
+
+   #include "ros2_medkit_gateway/core/openapi/route_descriptions.hpp"
+
+   extern "C" GATEWAY_PLUGIN_EXPORT openapi::RouteDescriptions describe_plugin_routes() {
+     openapi::RouteDescriptionBuilder builder;
+
+     openapi::OperationDesc op;
+     op.tag("Traces")
+         .operation_id("getAppTraces")
+         .requires_role("admin")
+         .description("What the endpoint does, and what a caller has to know about it.")
+         .path_param("app_id", "The app identifier")
+         .response(200, openapi::SchemaDesc::object()
+                            .property("entity", openapi::SchemaDesc::string())
+                            .required({"entity"}),
+                   "Traces for the app")
+         .error_response(404, "GenericError");
+
+     builder.add("/apps/{app_id}/x-medkit-traces")
+         .summary("Get app traces")
+         .get(std::move(op));
+
+     return builder.build();
+   }
+
+The path key is the OpenAPI template a client fills in, not the cpp-httplib
+regex ``get_routes()`` mounts - keep the two in step by hand, because nothing
+checks that they agree.
+
+What the gateway adds, so a plugin need not:
+
+- ``x-medkit-plugin-served: true`` on every folded operation. It is what tells
+  the test suite that the emitted-status recorder is structurally unable to
+  observe this route, rather than that a run failed to reach it.
+- ``416``, which cpp-httplib answers for an unparseable ``Range`` header before
+  routing, on every operation.
+- A global tag entry for whatever tag the operation declares.
+
+What the plugin owns, and what the document contract requires of it:
+
+- A **unique** ``operationId``. It shares one namespace with every gateway
+  operation, and a collision turns the contract test red.
+- A ``summary`` (on the path) and a ``description`` (on the operation).
+- The role in ``requires_role()`` must be the one ``AuthConfig``'s permission
+  table grants for that path. Note that ``*`` in that table matches a single
+  path segment, so a vendor collection under ``/functions/{id}/...`` is not
+  covered by the ``viewer`` entries for ``/functions/*``.
+- Every error status the handler can answer, as an ``error_response(...)``
+  reference to ``GenericError`` - the body ``PluginResponse::send_error`` writes.
+
+``route_descriptions.hpp`` is header-only and free of ``httplib``, so including
+it does not couple the plugin to the gateway's vendored copy.
+
 Cyclic Subscription Extensions
 -------------------------------
 
@@ -847,6 +914,9 @@ each SOVD ``Function`` entity. It lives in a separate colcon package,
   (``healthy``, ``degraded``, or ``broken``).
 - Supports cyclic subscriptions on the ``x-medkit-graph`` collection so clients can
   stream live graph updates.
+- Exports ``describe_plugin_routes``, so its endpoint and the shape of the graph
+  document appear in ``GET /api/v1/docs`` like any gateway route. It is the worked
+  example for `Documenting a Plugin Route`_.
 
 **Package layout**
 

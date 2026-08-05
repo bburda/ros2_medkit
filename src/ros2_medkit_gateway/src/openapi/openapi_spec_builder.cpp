@@ -68,8 +68,9 @@ OpenApiSpecBuilder & OpenApiSpecBuilder::add_schemas(const nlohmann::json & sche
   return *this;
 }
 
-OpenApiSpecBuilder & OpenApiSpecBuilder::security_scheme(const std::string & name, const nlohmann::json & scheme) {
-  security_schemes_.push_back({name, scheme});
+OpenApiSpecBuilder & OpenApiSpecBuilder::security_scheme(const std::string & name, const nlohmann::json & scheme,
+                                                         bool document_level_requirement) {
+  security_schemes_.push_back({name, scheme, document_level_requirement});
   return *this;
 }
 
@@ -181,13 +182,19 @@ nlohmann::json OpenApiSpecBuilder::build() const {
       {"X-RateLimit-Reset",
        {{"description", "Unix timestamp at which the window resets."}, {"schema", {{"type", "string"}}}}}};
 
-  // 7. Security schemes (if any)
-  if (!security_schemes_.empty()) {
-    spec["security"] = nlohmann::json::array();
-    for (const auto & ss : security_schemes_) {
-      spec["components"]["securitySchemes"][ss.name] = ss.scheme;
-      spec["security"].push_back({{ss.name, nlohmann::json::array()}});
+  // 7. Security schemes (if any). A scheme registered without a
+  // document-level requirement still lands in `components/securitySchemes` -
+  // that is what lets a single operation name it - but adds no `security`
+  // entry, so the document does not claim every request needs a token.
+  for (const auto & ss : security_schemes_) {
+    spec["components"]["securitySchemes"][ss.name] = ss.scheme;
+    if (!ss.document_level_requirement) {
+      continue;
     }
+    if (!spec.contains("security")) {
+      spec["security"] = nlohmann::json::array();
+    }
+    spec["security"].push_back({{ss.name, nlohmann::json::array()}});
   }
 
   return spec;

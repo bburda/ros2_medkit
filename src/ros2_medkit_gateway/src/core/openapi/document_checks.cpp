@@ -14,7 +14,9 @@
 
 #include "ros2_medkit_gateway/core/openapi/document_checks.hpp"
 
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ros2_medkit_gateway {
@@ -124,6 +126,34 @@ std::set<std::string> unreachable_schemas(const nlohmann::json & document) {
     }
   }
   return unreachable;
+}
+
+std::map<std::string, nlohmann::json> referenced_schemas(const nlohmann::json & subtree,
+                                                         const std::map<std::string, nlohmann::json> & pool) {
+  std::vector<std::string> frontier;
+  collect_refs(subtree, frontier);
+
+  std::map<std::string, nlohmann::json> reached;
+  std::set<std::string> seen;
+  while (!frontier.empty()) {
+    const std::string ref = std::move(frontier.back());
+    frontier.pop_back();
+    if (!seen.insert(ref).second) {
+      continue;
+    }
+    std::string section;
+    std::string name;
+    if (!split_ref(ref, section, name) || section != "schemas") {
+      continue;
+    }
+    const auto entry = pool.find(name);
+    if (entry == pool.end()) {
+      continue;  // dangling $ref - a different defect, reported by its own test
+    }
+    reached.emplace(name, entry->second);
+    collect_refs(entry->second, frontier);
+  }
+  return reached;
 }
 
 }  // namespace openapi

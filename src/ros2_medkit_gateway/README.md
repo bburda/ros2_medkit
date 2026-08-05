@@ -124,8 +124,13 @@ overloading the SOVD `/triggers` contract.
 ### API Documentation (OpenAPI)
 
 - `GET /api/v1/docs` - Full OpenAPI 3.1.0 specification
-- `GET /api/v1/{entity_type}/{id}/docs` - Entity-scoped OpenAPI spec
+- `GET /api/v1/{entity_path}/docs` - Scoped OpenAPI spec, where `{entity_path}` is any
+  entity or resource path (`apps`, `apps/temp_sensor`, `apps/temp_sensor/data`, ...)
 - `GET /api/v1/swagger-ui` - Interactive Swagger UI (requires build with `-DENABLE_SWAGGER_UI=ON`)
+
+Both `/docs` routes are described in the document they serve. So are the routes a
+loaded plugin mounts, provided it exports `describe_plugin_routes`; those carry
+`x-medkit-plugin-served: true`.
 
 ### Status and Lifecycle Endpoints
 
@@ -151,7 +156,10 @@ overloading the SOVD `/triggers` contract.
 - `GET /api/v1/{entity}/{id}/x-medkit-procfs` - Process info (procfs plugin)
 - `GET /api/v1/{entity}/{id}/x-medkit-systemd` - Systemd unit status
 - `GET /api/v1/{entity}/{id}/x-medkit-container` - Container runtime info
-- `GET /api/v1/{entity}/{id}/x-medkit-graph` - ROS 2 graph details
+- `GET /api/v1/functions/{function_id}/x-medkit-graph` - ROS 2 dataflow graph for a
+  Function. Functions only: the graph provider mounts the route on
+  `functions/([^/]+)/x-medkit-graph` and registers the capability for that entity type
+  alone.
 
 ### API Reference
 

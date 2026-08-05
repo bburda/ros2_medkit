@@ -72,7 +72,14 @@
  *   request line, 416 for an **unparseable** `Range` (an unsatisfiable but
  *   parseable one yields 206, not 416).
  * - Routes registered straight onto the server rather than through the
- *   registry (`/docs`, the Swagger UI subtree, this endpoint).
+ *   registry: the Swagger UI subtree, this endpoint, and every route a
+ *   plugin mounts through `PluginManager::register_routes`. The last of
+ *   those *is* in the served document - the gateway folds each plugin's
+ *   `describe_plugin_routes()` output into it - so it marks them
+ *   `x-medkit-plugin-served`, which is how
+ *   `test_openapi_error_coverage` tells "unreachable by this recorder" from
+ *   "unreached, and that is a defect". The two `/docs` routes used to be in
+ *   this list and no longer are: they go through the registry.
  * - Any status on a code path the test run never drives.
  *
  * Those are declared by hand; the recorder's own output is what says which.

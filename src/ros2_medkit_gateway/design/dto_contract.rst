@@ -37,6 +37,15 @@ by three template visitors to produce the wire JSON, the OpenAPI schema, and
 the request-body parser. Adding a field to the struct and its descriptor
 automatically updates all three outputs.
 
+The same argument governs everything the document says about a *route*, not
+just about a payload, and it does not always reach the same strength.
+:doc:`openapi_derivation` states the rule that produced the mechanisms below -
+if a fact can be derived from the handler it must not be declared separately,
+and where it cannot the declaration lives at a seam that also does the work -
+and records which enforcement tier each mechanism actually reaches. Read it
+first if the question is "what stops this from going stale?" rather than "how
+do I use it?".
+
 Architecture
 ------------
 
@@ -91,7 +100,7 @@ erasure, and no separate code-generation step are needed.
            + multipart_upload<T>(path, handler)
            + static_asset(path, handler)
            + docs_endpoint(path, handler)
-           + docs_subtree(regex, handler)
+           + docs_subtree(openapi_path, regex, handler)
        }
 
        class OpenApiSpecBuilder {
@@ -370,6 +379,8 @@ plus, on POST / PUT / PATCH overloads, an already-parsed ``TBody``:
              -> http::Result<dto::MyResponse> {
            // ... return result ...
          });
+
+.. _success-status-from-the-return-type:
 
 Success Status Lives in the Return Type
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -674,9 +685,10 @@ Further ``RouteEntry`` knobs shape the published operation:
   Unlike everything else in this section, **this one is declared and not
   derived, and its test only checks half of it.** The header read that decides
   the 409 lives in ``HandlerContext::validate_lock_access``, which 12 handlers
-  across 6 files call, and the document is regenerated per ``/docs`` request
-  rather than captured at registration time - so a registration cannot see
-  through that call, and no accessor on ``TypedRequest`` changes that.
+  across 6 files call, and the document is built from the live route table when
+  ``/docs`` is served rather than captured at registration time - so a
+  registration cannot see through that call, and no accessor on
+  ``TypedRequest`` changes that.
   ``test_openapi_contract.test.py::test_lock_guarded_set_matches_the_handlers``
   pins the marked set against ``EXPECTED_LOCK_GUARDED``, a hand-maintained
   literal committed next to the test. That catches the **document** drifting
@@ -932,8 +944,14 @@ list:
 - anything cpp-httplib answers itself - 404/405 for an unrouted request, 413
   over ``set_payload_max_length``, 416 for an **unparseable** ``Range`` (an
   unsatisfiable-but-parseable one yields 206, not 416);
-- routes mounted straight onto the server rather than through the registry
-  (``/docs``, the Swagger UI subtree);
+- routes mounted straight onto the server rather than through the registry -
+  the Swagger UI subtree in ``-DENABLE_SWAGGER_UI=ON`` builds, the status
+  recorder's own coverage endpoint, and anything a plugin mounts through
+  ``PluginManager::register_routes``. The two ``/docs`` routes are **not** in
+  this group: they are ``docs_endpoint`` / ``docs_subtree`` registrations, so
+  ``register_all`` mounts them and the recorder wraps them like any other
+  route. A plugin-served operation is excluded from the coverage assertion by
+  its ``x-medkit-plugin-served`` marker rather than by a list;
 - statuses on branches no test run drives - a provider that reports
   ``AccessDenied``, a fault store that cannot be read, an update already in
   flight. These are the ``errors({...})`` calls in ``rest_server.cpp`` that
@@ -1069,9 +1087,14 @@ remain compile-time-checked at their boundary.
   at the given path. The handler returns ``Result<nlohmann::json>``; this is
   the only built-in route allowed to use raw ``nlohmann::json`` as
   ``TResponse``, because the body is the spec itself.
-- ``reg.docs_subtree(regex, handler)`` - catch-all for the Swagger UI subtree
-  (asset paths without a fixed shape). Hidden from the OpenAPI output so it
-  does not pollute the generated spec.
+- ``reg.docs_subtree(openapi_path, regex, handler)`` - a route whose URI is a
+  cpp-httplib regex the OpenAPI path grammar cannot express. Its one caller
+  outside the unit tests is the ``<entity-path>/docs`` sub-document, mounted on
+  ``(.+)/docs$`` because the prefix it captures is a whole entity or resource
+  path. ``openapi_path``
+  is what the document publishes and ``regex`` is what cpp-httplib matches;
+  they are separate arguments so the regex never reaches the document as a
+  path key.
 - ``reg.post_alternates<TBody, TAlt...>(path, handler)`` /
   ``reg.del_alternates<TAlt...>(path, handler)`` - register multi-shape
   responses. The active variant alternative is dispatched to its
@@ -1311,6 +1334,17 @@ no visibility of either component block, so only the assembled document can
 answer the question. Its unit tests are ``test_schema_reachability``, which
 links ``gateway_core`` - the function touches no ROS type.
 
+``openapi::referenced_schemas(subtree, pool)`` in the same header is the inverse
+walk, and it exists for the scoped ``<entity-path>/docs`` documents. Those are a
+projection of the root document's ``paths`` (``paths_under()`` filters by path
+segment, ``strip_entity_path_parameter()`` removes the ``in: path`` parameter a
+substituted id answered), so their operations ``$ref`` named schemas while the
+document carries only what ``OpenApiSpecBuilder`` always emits. Shipping the
+whole ``AllDtos`` pool on every entity page is the alternative;
+``referenced_schemas`` ships the transitive closure the slice actually reaches.
+``CapabilityGeneratorTest.SubDocumentCarriesTheSchemasItReferences`` walks every
+``$ref`` in five scoped documents and fails on one that resolves to nothing.
+
 Optional fields are now emitted as ``anyOf: [<inner>, {type: "null"}]``
 (OpenAPI 3.1 idiom) so generated clients see ``T | null`` rather than
 ``T | undefined``. That matches the wire reality of the gateway: optional
@@ -1427,13 +1461,70 @@ checklist plus the DTO steps above:
    ``reg.get<T>`` / ``reg.post<TBody, T>`` / ``reg.del<T>`` / the matching
    alternates or escape-hatch helper. Use the dual-path pattern for entity
    types that share the same route shape.
-5. Update ``handle_root`` endpoint list in ``health_handlers.cpp`` to mirror
+5. Declare the route's weakest permitted caller with
+   ``.requires_role(UserRole::...)`` - see "Route Authorization" below. This is
+   not optional: ``validate_completeness()`` reports a route without it as an
+   error, because authorization fails closed and the route would answer 403 for
+   every role below ADMIN.
+6. Update ``handle_root`` endpoint list in ``health_handlers.cpp`` to mirror
    the new route.
-6. Add URI field to entity detail response if the new route is a resource
+7. Add URI field to entity detail response if the new route is a resource
    collection.
-7. Write a unit test using ``JsonWriter<T>::write()`` and
+8. Write a unit test using ``JsonWriter<T>::write()`` and
    ``JsonReader<T>::read()`` directly - no HTTP server needed.
-8. Write an integration test that calls the live endpoint.
+9. Write an integration test that calls the live endpoint.
+
+Route Authorization
+-------------------
+
+A route's RBAC rule is a property of the route, so it is declared where the
+route is registered:
+
+.. code-block:: cpp
+
+   reg.put<dto::ConfigurationWriteRequest, dto::ConfigurationReadValue>(...)
+       .tag("Configuration")
+       .requires_role(UserRole::CONFIGURATOR)
+       ...
+
+That one call feeds two consumers, which is the whole reason it lives on the
+registration rather than in a table beside it:
+
+- ``RouteRegistry::route_permissions(api_prefix)`` turns it into the
+  ``"<METHOD>:<pattern>"`` entries ``AuthManager::check_authorization``
+  matches against. ``RESTServer::setup_routes()`` merges those into the manager
+  before the server starts listening, together with
+  ``AuthConfig::residual_route_permissions()`` for the routes the registry never
+  sees (plugin routes, Swagger UI, the test-build status recorder).
+- ``to_openapi_paths()`` publishes it as
+  ``security: [{bearerAuth: [<role>]}]`` on the operation - the same shape a
+  plugin's ``OperationDesc::requires_role`` emits.
+  ``CapabilityGenerator::generate_impl()`` strips every per-operation
+  requirement again when ``auth.enabled`` is false, once, over the assembled
+  document.
+
+Two translations happen inside ``route_permissions()``:
+
+- The pattern is derived from the route's **cpp-httplib regex**, not from its
+  OpenAPI path. ``([^/]+)`` becomes ``*`` and ``(.+)`` becomes ``**``, which is
+  what keeps the slash-spanning parameters (``{data_id}``, ``{config_id}``) and
+  the ``<entity-path>/docs`` catch-all reachable. Deriving from ``{param}``
+  alone would make all three single-segment.
+- Roles are expanded upward. ``AuthConfig`` has no inheritance -
+  ``check_authorization`` looks up exactly one role's set - so a route
+  declaring ``OPERATOR`` is written into OPERATOR, CONFIGURATOR and ADMIN.
+
+``public_route()`` is the only alternative to ``requires_role()``, and it is
+legitimate only where the middleware exempts the path before the table is
+consulted at all - today ``/auth/*``, which both ``AllAuthRequirementPolicy``
+and ``WriteOnlyAuthRequirementPolicy`` let through by prefix. It emits
+``security: []`` and contributes no permission entry.
+
+The declaration is required on ``hidden()`` routes too. Hidden removes a route
+from the document, not from the router: the request still arrives and still
+meets the permission table.
+``test_rbac_contract.test.py`` is the end-to-end check that the published role
+and the enforced role are the same role.
 
 Collection<T, XMedkitT> Parametrisation
 ---------------------------------------

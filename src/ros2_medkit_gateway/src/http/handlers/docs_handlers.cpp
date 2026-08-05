@@ -15,6 +15,7 @@
 #include "ros2_medkit_gateway/core/http/handlers/docs_handlers.hpp"
 
 #include <string>
+#include <utility>
 
 #include "../../openapi/capability_generator.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
@@ -29,8 +30,23 @@
 namespace ros2_medkit_gateway {
 namespace handlers {
 
-void DocsHandlers::write_json(httplib::Response & res, const nlohmann::json & body) {
-  http::detail::write_json_body(http::detail::FrameworkOrPluginAccess{}, res, body);
+namespace {
+
+/// The error a typed docs handler returns. Same three fields the raw
+/// `write_error` below fills in, so the two `/docs` routes answer with the
+/// same body whichever way they are mounted.
+ErrorInfo make_docs_error(int status, const std::string & code, const std::string & message) {
+  ErrorInfo err;
+  err.code = code;
+  err.message = message;
+  err.http_status = status;
+  return err;
+}
+
+}  // namespace
+
+void DocsHandlers::write_json_text(httplib::Response & res, const std::string & body) {
+  http::detail::write_json_text(http::detail::FrameworkOrPluginAccess{}, res, body);
 }
 
 void DocsHandlers::write_error(httplib::Response & res, int status, const std::string & code,
@@ -59,18 +75,16 @@ DocsHandlers::DocsHandlers(HandlerContext & ctx, GatewayNode & node, PluginManag
 
 DocsHandlers::~DocsHandlers() = default;
 
-void DocsHandlers::handle_docs_root(const httplib::Request & /*req*/, httplib::Response & res) {
+http::Result<std::string> DocsHandlers::handle_docs_root(http::TypedRequest /*req*/) {
   if (!docs_enabled_) {
-    DocsHandlers::write_error(res, 501, ERR_NOT_IMPLEMENTED, "Capability description is disabled");
-    return;
+    return tl::unexpected(make_docs_error(501, ERR_NOT_IMPLEMENTED, "Capability description is disabled"));
   }
 
-  auto spec = generator_->generate("/");
+  auto spec = generator_->generate_serialized("/");
   if (!spec) {
-    DocsHandlers::write_error(res, 500, ERR_INTERNAL_ERROR, "Failed to generate capability description");
-    return;
+    return tl::unexpected(make_docs_error(500, ERR_INTERNAL_ERROR, "Failed to generate capability description"));
   }
-  DocsHandlers::write_json(res, *spec);
+  return std::move(*spec);
 }
 
 void DocsHandlers::handle_docs_any_path(const httplib::Request & req, httplib::Response & res) {
@@ -80,13 +94,13 @@ void DocsHandlers::handle_docs_any_path(const httplib::Request & req, httplib::R
   }
 
   auto base_path = req.matches[1].str();
-  auto spec = generator_->generate(base_path);
+  auto spec = generator_->generate_serialized(base_path);
   if (!spec) {
     DocsHandlers::write_error(res, 404, ERR_RESOURCE_NOT_FOUND,
                               "No capability description available for the requested path");
     return;
   }
-  DocsHandlers::write_json(res, *spec);
+  DocsHandlers::write_json_text(res, *spec);
 }
 
 #ifdef ENABLE_SWAGGER_UI

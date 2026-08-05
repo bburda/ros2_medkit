@@ -254,11 +254,174 @@ class TestOpenApiContract(GatewayTestCase):
                 self.assertIn(
                     tag, declared, f'{method.upper()} {path}: tag "{tag}" not declared')
 
+    def test_capability_description_endpoints_are_documented(self):
+        """The document describes the endpoints that serve it.
+
+        Both `/docs` routes used to be mounted straight onto the HTTP server,
+        so the one document every client fetches was the one that never
+        mentioned how it got there. The scoped `<entity-path>/docs`
+        sub-documents were worse off: nothing in any response links to one, so
+        outside the hand-written prose in `docs/api/rest.rst` there was no
+        machine-readable statement that they exist at all.
+        """
+        paths = self.spec()['paths']
+        self.assertIn('/docs', paths)
+        self.assertIn('/{entity_path}/docs', paths)
+        # The regex the route is actually mounted on must not leak into a
+        # path key: `(.+)/docs$` is not something a client can fill in.
+        self.assertEqual(
+            [p for p in paths if '(' in p], [],
+            'a cpp-httplib regex reached the document as a path key')
+
+    def test_docs_routes_keep_their_json_content_type(self):
+        """Both `/docs` routes answer `application/json`, indented, and repeat byte-for-byte.
+
+        The generator caches these documents serialized rather than as parsed
+        DOMs, and both routes write that text straight to the response. Three
+        things a client depends on have to survive that: the header it selects
+        on, the 2-space indentation the gateway's JSON convention promises, and
+        a repeat request answering the same bytes - the last being what says a
+        cache hit and a cache miss are indistinguishable on the wire.
+
+        The two routes reach the response by different writers (the typed
+        router for `/docs`, the raw handler for the scoped one), so both are
+        checked. Exact `dump(2)` canonicality is asserted in
+        ``test_docs_handlers.cpp``, where nlohmann itself is available to
+        define it; Python's ``json.dumps`` is not byte-equivalent.
+        """
+        for endpoint in ('/docs', '/apps/docs'):
+            with self.subTest(endpoint=endpoint):
+                response = self.get_raw(endpoint)
+                self.assertEqual(
+                    response.headers.get('Content-Type'), 'application/json',
+                    f'{endpoint}: Content-Type moved')
+                body = response.content.decode('utf-8')
+                json.loads(body)  # must still parse
+                second_line = body.split('\n')[1]
+                self.assertTrue(
+                    second_line.startswith('  "') and not second_line.startswith('   '),
+                    f'{endpoint}: body is not indented with 2 spaces')
+                repeat = self.get_raw(endpoint).content.decode('utf-8')
+                self.assertEqual(
+                    body, repeat,
+                    f'{endpoint}: a repeat request answered different bytes')
+
+    def test_plugin_routes_are_documented(self):
+        """A route a plugin serves and an entity links to is in the document.
+
+        This fixture loads the graph provider, which exports
+        `describe_plugin_routes`. Plugin routes are mounted outside the
+        `RouteRegistry`, so nothing else in the document would mention them.
+        """
+        op = self.spec()['paths'].get('/functions/{function_id}/x-medkit-graph', {}).get('get')
+        self.assertIsNotNone(op, 'the graph provider route is not documented')
+        self.assertTrue(
+            op.get('x-medkit-plugin-served'),
+            'a folded plugin operation must say it is plugin-served - '
+            'test_openapi_error_coverage reads that marker')
+        # The gateway declares whatever tag a plugin picks, so the document
+        # cannot acquire an undeclared one from a plugin.
+        declared = {t['name'] for t in self.spec().get('tags', [])}
+        for tag in op.get('tags', []):
+            self.assertIn(tag, declared)
+
+    def test_no_operation_publishes_a_role_when_auth_is_off(self):
+        """A document this gateway serves does not claim a role it never checks.
+
+        Scoped to every operation, not to the plugin-served ones: the rule is a
+        property of the gateway, not of where an operation came from, and the
+        gateway applies it once over the finished document. Today only the
+        plugin-folded operation declares a role - `RouteEntry` has no role API
+        yet - so this reads as a plugin assertion, but it is the same assertion
+        that must hold for the gateway's own routes once they declare one, and
+        it will start covering them without an edit.
+
+        This fixture runs with `auth.enabled` false, and
+        `AuthManager::requires_authentication` returns false outright in that
+        configuration - every caller is admitted. The graph provider's
+        `describe_plugin_routes` declares `requires_role("admin")`, and the
+        gateway strips the requirement rather than publish one it does not
+        honour. The scheme *definition* stays: a definition nothing requires
+        claims nothing, and it is what lets the auth-on document name it.
+
+        The opposite direction - auth on, requirement present - is
+        `test_auth::test_02b_plugin_operation_publishes_its_role_when_auth_is_on`.
+        """
+        spec = self.spec()
+        self.assertFalse(
+            spec.get('security'),
+            'no document-level requirement with authentication disabled')
+        offenders = sorted(
+            op.get('operationId', f'{m.upper()} {p}')
+            for p, m, op in self.operations() if 'security' in op)
+        self.assertEqual(
+            offenders, [],
+            f'operations publishing a role a disabled gateway ignores: {offenders}')
+        # Guard against a vacuous pass: the plugin operation whose description
+        # declares a role has to be in this document for the rule above to have
+        # had anything to strip.
+        graph = spec['paths'].get(
+            '/functions/{function_id}/x-medkit-graph', {}).get('get')
+        self.assertIsNotNone(graph, 'nothing here declared a role to strip')
+        self.assertIn(
+            'bearerAuth', spec.get('components', {}).get('securitySchemes', {}),
+            'the scheme definition is registered whatever auth.enabled says')
+
     def test_no_malformed_path_keys(self):
         """Path keys have a leading slash and no empty segments."""
         for path in self.spec()['paths']:
             self.assertTrue(path.startswith('/'), f'{path}: missing leading slash')
             self.assertNotIn('//', path, f'{path}: empty path segment')
+
+    def test_entity_id_parameters_follow_the_projection_naming(self):
+        """Every entity-id path parameter is `<singular>_id`.
+
+        ``CapabilityGenerator::entity_template`` derives the parameter name of
+        an entity segment by dropping a trailing ``s`` and appending ``_id``,
+        and the ``<entity-path>/docs`` projection substitutes the caller's id on
+        that name. A route registered as ``/components/{comp_id}/...`` would
+        therefore never be substituted, and would disappear from the
+        **entity-scoped** spec while still being served - silently, because the
+        projection reports the routes it recognises rather than failing on one
+        it does not.
+
+        Scoped deliberately: it survives in the *collection*-level spec.
+        ``generate_entity_collection`` passes no bindings, so it substitutes
+        nothing and filters on the collection prefix alone -
+        ``GET /components/docs`` still lists ``/components/{comp_id}/hosts``.
+        Only a document whose prefix carries the id loses the route.
+
+        The convention is otherwise only stated in a comment. A total drift
+        would show up in ``test_docs_endpoint``; a single renamed route would
+        not, which is what this closes.
+
+        Two limits, since this checks less than its name suggests. The keyword
+        tuple below is hardcoded while the route side reads the explicit
+        singular table in ``rest_server.cpp``, so a **new** entity type is
+        unchecked here and this still passes. And the non-vacuity floor is
+        loose: 141 pairs exist today, so losing every ``functions``, ``areas``,
+        ``subareas`` and ``subcomponents`` pair would leave 83 and still clear
+        it. Both bound how much drift this notices, not whether what it
+        notices is real.
+
+        @verifies REQ_INTEROP_002
+        """
+        keywords = ('areas', 'subareas', 'components', 'subcomponents',
+                    'apps', 'functions')
+        offenders = []
+        checked = 0
+        for path in self.spec()['paths']:
+            segments = path.strip('/').split('/')
+            for parent, child in zip(segments, segments[1:]):
+                if parent not in keywords or not child.startswith('{'):
+                    continue
+                checked += 1
+                expected = '{' + parent[:-1] + '_id}'
+                if child != expected:
+                    offenders.append(f'{path}: {child} should be {expected}')
+        self.assertEqual(offenders, [], f'entity id parameter naming: {offenders}')
+        # A document with no entity-scoped templates would pass vacuously.
+        self.assertGreater(checked, 50, f'only {checked} entity segments examined')
 
     def declared_success_status(self, path, method):
         """Return the single 2xx status the document declares for an operation."""
@@ -1039,10 +1202,15 @@ class TestOpenApiContract(GatewayTestCase):
         Two surfaces advertise an entity's resource collections and they are
         built from two different lists: the ``capabilities`` array on
         ``GET /{type}/{id}`` comes from a per-handler ``CapabilityBuilder``
-        call, the entity's ``/docs`` sub-document from
-        ``EntityCapabilities::for_type``. Both are followed here, for all four
-        entity types, because a collection can be right in one list and wrong
-        in the other.
+        call, the entity's ``/docs`` sub-document is projected out of the route
+        registry. Both are followed here, for all four entity types, because a
+        collection can be right in one list and wrong in the other.
+
+        Only the sub-document paths that declare a ``get`` are followed. Since
+        the sub-document became a projection it holds every method the gateway
+        serves under the entity, and ``PUT /{type}/{id}/status/restart`` has no
+        GET to answer - a 404 there would say nothing about whether the route
+        exists.
 
         A 501 is a served answer - the route exists and reports that the
         backend does not. A 404 is what this pins: an href the gateway
@@ -1064,7 +1232,9 @@ class TestOpenApiContract(GatewayTestCase):
             detail = self.get_json(f'/{entity_type}/{entity_id}')
             subtree = self.get_json(f'/{entity_type}/{entity_id}/docs')
             advertised = {c['href'] for c in detail.get('capabilities', [])}
-            advertised |= {f'/api/v1{p}' for p in subtree['paths']}
+            advertised |= {f'/api/v1{p}'
+                           for p, item in subtree['paths'].items()
+                           if 'get' in item}
             followed = 0
             for href in sorted(advertised):
                 if '{' in href:

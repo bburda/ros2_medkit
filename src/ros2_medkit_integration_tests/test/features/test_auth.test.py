@@ -37,7 +37,10 @@ from ros2_medkit_test_utils.constants import (
     get_test_port,
 )
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
-from ros2_medkit_test_utils.launch_helpers import create_gateway_node
+from ros2_medkit_test_utils.launch_helpers import (
+    create_gateway_node,
+    graph_provider_params,
+)
 
 AUTH_PORT = get_test_port()
 AUTH_BASE_URL = f'http://127.0.0.1:{AUTH_PORT}{API_BASE_PATH}'
@@ -63,6 +66,11 @@ def generate_test_description():
                 'viewer:viewer_secret:viewer',
                 'configurator:configurator_secret:configurator',
             ],
+            # The auth-on half of the per-operation `security` pair. This is
+            # the only fixture in the suite with authentication enabled AND a
+            # plugin that describes a route, so it is the only place the
+            # published-requirement direction can be driven.
+            **graph_provider_params(),
         },
     )
 
@@ -93,6 +101,32 @@ class TestAuthenticationIntegration(GatewayTestCase):
         self.assertIn('auth', data)
         self.assertTrue(data['auth']['enabled'])
         self.assertEqual(data['auth']['algorithm'], 'HS256')
+
+    def test_02b_plugin_operation_publishes_its_role_when_auth_is_on(self):
+        """With auth enabled the document publishes the role an operation needs.
+
+        The other half of this pair is
+        ``test_openapi_contract::test_no_operation_publishes_a_role_when_auth_is_off``:
+        the same gateway code, the same plugin, the opposite ``auth.enabled``.
+        Splitting it across two fixtures is not a convenience - a single
+        gateway has one value of ``auth.enabled``, and the whole point of the
+        rule is that the document follows it.
+
+        The role is ``admin`` because ``AuthConfig``'s ``*`` matches a single
+        path segment, so no ``viewer`` entry under ``/functions/*`` reaches
+        this collection and only ADMIN's ``GET:/api/v1/**`` does.
+        """
+        spec = requests.get(f'{self.BASE_URL}/docs', timeout=10).json()
+        op = spec['paths'].get(
+            '/functions/{function_id}/x-medkit-graph', {}).get('get')
+        self.assertIsNotNone(
+            op, 'the graph provider route is not documented; the fixture must '
+                'load the plugin for this test to mean anything')
+        self.assertEqual(op.get('security'), [{'bearerAuth': ['admin']}])
+        # A requirement may only name a scheme the document defines.
+        self.assertIn(
+            'bearerAuth',
+            spec.get('components', {}).get('securitySchemes', {}))
 
     def test_03_authenticate_valid_credentials(self):
         """@verifies REQ_INTEROP_086 - Authentication with valid credentials."""

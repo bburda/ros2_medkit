@@ -41,6 +41,17 @@ enum class UserRole {
 };
 
 /**
+ * @brief RBAC permission entries, keyed by role.
+ *
+ * Each entry is `"<METHOD>:<path pattern>"`, where the pattern is matched by
+ * `AuthManager::matches_path`: `*` covers one path segment and `**` covers any
+ * number. There is no role inheritance - a role's set has to list everything
+ * that role may do, which is why the derivation in
+ * `RouteRegistry::route_permissions()` expands each declaration upward.
+ */
+using RoutePermissions = std::unordered_map<UserRole, std::unordered_set<std::string>>;
+
+/**
  * @brief Authentication requirement level
  */
 enum class AuthRequirement {
@@ -80,9 +91,19 @@ struct AuthConfig {
   // Pre-configured clients (for development/testing)
   std::vector<ClientCredentials> clients;
 
-  // Role-to-permissions mapping (built-in defaults)
-  // Permissions are HTTP method + path patterns
-  static const std::unordered_map<UserRole, std::unordered_set<std::string>> & get_role_permissions();
+  /// Permission entries for the routes the `RouteRegistry` does not hold.
+  ///
+  /// The gateway's own routes derive their entries from their registration
+  /// (`RouteRegistry::route_permissions()`). Three families of route are
+  /// mounted straight onto the cpp-httplib server instead and so cannot:
+  /// plugin routes (`PluginManager::register_routes`), the Swagger UI pages
+  /// (`-DENABLE_SWAGGER_UI=ON` builds only) and, in test builds, the emitted
+  /// status recorder. This is the whole residual list for them, and it is
+  /// deliberately short: ADMIN's four `**` entries, which is what has always
+  /// covered those paths and is why a plugin operation's published role reads
+  /// `admin`. Nothing weaker reaches them - a viewer token on a plugin route
+  /// is 403, before and after the derivation.
+  static const RoutePermissions & residual_route_permissions();
 };
 
 /**
