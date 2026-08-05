@@ -21,6 +21,9 @@ single ``create_test_launch(...)`` call.
 Node names, namespaces, and parameters match ``demo_nodes.launch.py`` exactly.
 """
 
+import os
+
+from ament_index_python.packages import get_package_prefix
 from launch import LaunchDescription
 from launch.actions import TimerAction
 import launch_ros.actions
@@ -402,6 +405,43 @@ def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True,
         actions.append(launch_ros.actions.Node(**node_kwargs))
 
     return actions
+
+
+# ---------------------------------------------------------------------------
+# Gateway parameter presets
+# ---------------------------------------------------------------------------
+
+def full_feature_gateway_params(scripts_dir):
+    """Gateway parameters that turn on every optional feature gate.
+
+    The OpenAPI contract test asserts over the maximal route surface, so
+    scripts, updates, triggers, locking and the graph provider plugin must all
+    be live. Without this the gated routes are absent and assertions about them
+    pass vacuously.
+
+    Parameters
+    ----------
+    scripts_dir : str
+        Directory for uploaded diagnostic scripts. A non-empty value is what
+        enables the scripts feature.
+
+    Returns
+    -------
+    dict
+        Parameter overrides for ``create_test_launch(gateway_params=...)``.
+
+    """
+    graph_plugin = os.path.join(
+        get_package_prefix('ros2_medkit_graph_provider'), 'lib',
+        'ros2_medkit_graph_provider', 'libros2_medkit_graph_provider_plugin.so')
+    return {
+        'updates.enabled': True,
+        'scripts.scripts_dir': scripts_dir,
+        'triggers.enabled': True,
+        'locking.enabled': True,
+        'plugins': ['graph_provider'],
+        'plugins.graph_provider.path': graph_plugin,
+    }
 
 
 # ---------------------------------------------------------------------------
