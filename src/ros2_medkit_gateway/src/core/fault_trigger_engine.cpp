@@ -21,6 +21,8 @@
 #include <fstream>
 #include <utility>
 
+#include "ros2_medkit_gateway/core/data_point_suggest.hpp"
+
 namespace ros2_medkit_gateway {
 
 namespace {
@@ -150,17 +152,26 @@ tl::expected<FaultTriggerRule, std::pair<int, std::string>> FaultTriggerEngine::
   if (data_point_names_) {
     const auto names = data_point_names_(rule.app_id);
     if (names.has_value() && std::find(names->begin(), names->end(), rule.data_name) == names->end()) {
-      std::string available;
+      // ~200 PLC symbols make an alphabetical prefix useless: rank by edit
+      // distance so the neighborhood of the typo is what gets listed, and
+      // resolve the deterministic MAIN.counter -> counter mapping outright.
       constexpr size_t kMaxListed = 20;
-      for (size_t i = 0; i < names->size() && i < kMaxListed; ++i) {
-        available += (i == 0 ? "" : ", ") + (*names)[i];
+      const auto listed = closest_data_points(rule.data_name, *names, kMaxListed);
+      std::string available;
+      for (size_t i = 0; i < listed.size(); ++i) {
+        available += (i == 0 ? "" : ", ") + listed[i];
       }
-      if (names->size() > kMaxListed) {
-        available += ", ...";
+      std::string msg = "data point '" + rule.data_name + "' does not exist on app '" + rule.app_id + "'";
+      const std::string suggestion = suggest_data_point(rule.data_name, *names);
+      if (!suggestion.empty()) {
+        msg += " - did you mean '" + suggestion + "'?";
       }
-      return tl::make_unexpected(
-          std::make_pair(400, "data point '" + rule.data_name + "' does not exist on app '" + rule.app_id + "'" +
-                                  (available.empty() ? std::string{} : " (available: " + available + ")")));
+      if (!available.empty()) {
+        msg += names->size() > kMaxListed ? " (" + std::to_string(names->size()) + " available, closest " +
+                                                std::to_string(listed.size()) + ": " + available + ")"
+                                          : " (available: " + available + ")";
+      }
+      return tl::make_unexpected(std::make_pair(400, std::move(msg)));
     }
   }
 
