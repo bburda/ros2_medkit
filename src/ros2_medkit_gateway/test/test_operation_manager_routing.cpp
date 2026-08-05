@@ -15,6 +15,8 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -119,13 +121,31 @@ class MockActionTransport : public ActionTransport {
 
   void subscribe_status(const std::string & action_path, StatusCallback callback) override {
     subscribed_paths_.push_back(action_path);
+    // Idempotent, exactly like Ros2ActionTransport::subscribe_status: while a
+    // subscription for the path still exists, re-subscribing keeps the first
+    // callback and creates nothing. A double that silently re-armed itself
+    // here could not observe the window this models.
+    if (callbacks_.count(action_path) > 0) {
+      return;
+    }
     callbacks_[action_path] = std::move(callback);
   }
 
   void unsubscribe_status(const std::string & action_path) override {
+    // One-shot re-entry: stand in for an HTTP worker that lands between the
+    // manager releasing subscriptions_mutex_ and this call. Production reaches
+    // exactly this interleaving - the manager holds no lock here.
+    if (reentry_ != nullptr) {
+      auto reentry = std::move(reentry_);
+      reentry_ = nullptr;
+      reentry();
+    }
     unsubscribed_paths_.push_back(action_path);
     callbacks_.erase(action_path);
   }
+
+  /// Runs once, inside the next unsubscribe_status call, before it erases.
+  std::function<void()> reentry_;
 
   /// Test helper to fire a status update on a previously subscribed path.
   void fire_status(const std::string & action_path, const std::string & goal_id, ActionGoalStatus status) {
@@ -388,6 +408,52 @@ TEST(OperationManagerRoutingTest, GetLatestGoalForActionPicksMostRecent) {
   auto latest = mgr.get_latest_goal_for_action("/p/a");
   ASSERT_TRUE(latest.has_value());
   EXPECT_EQ(latest->goal_id, second.goal_id);
+}
+
+// The unsubscribe veto only helps if it holds for the whole operation. The
+// manager releases subscriptions_mutex_ before calling the transport, so a
+// goal sent into that gap re-flags the path (a no-op at the transport, whose
+// subscription still exists) and then has that subscription destroyed by the
+// unsubscribe already in flight. End state: goal tracked, manager believes the
+// path is subscribed, no status stream - and nothing repairs it, because
+// subscribe_to_action_status short-circuits on the flag. That is precisely the
+// state the cancel-timeout reconciliation cannot survive.
+TEST(OperationManagerRoutingTest, UnsubscribeKeepsTheStreamForAGoalThatArrivesDuringTheTransportCall) {
+  auto svc = std::make_shared<MockServiceTransport>();
+  auto act = std::make_shared<MockActionTransport>();
+  OperationManager mgr(svc, act, nullptr, /*timeout=*/2);
+  const std::string path = "/p/a";
+  const std::string late_goal = "00000000000000000000000000000009";
+
+  // A path that was subscribed and whose goals have all just been cleaned up.
+  mgr.subscribe_to_action_status(path);
+  ASSERT_TRUE(mgr.get_goals_for_action(path).empty());
+
+  act->reentry_ = [&mgr, &path, &late_goal]() {
+    ActionGoalInfo info;
+    info.goal_id = late_goal;
+    info.action_path = path;
+    info.action_type = "example_interfaces/action/Fibonacci";
+    info.entity_id = "engine";
+    info.status = ActionGoalStatus::EXECUTING;
+    info.created_at = std::chrono::system_clock::now();
+    info.last_update = info.created_at;
+    mgr.inject_tracked_goal_for_testing(std::move(info));
+    mgr.subscribe_to_action_status(path);
+  };
+
+  mgr.unsubscribe_from_action_status(path);
+
+  ASSERT_FALSE(mgr.get_goals_for_action(path).empty()) << "the late goal must still be tracked";
+  EXPECT_EQ(act->callbacks_.count(path), 1u) << "a tracked goal lost its status stream";
+
+  // The stream must still reach the tracking map - a live callback that is
+  // never invoked would be an equally dead stream.
+  act->fire_status(path, late_goal, ActionGoalStatus::CANCELED);
+  auto tracked = mgr.get_tracked_goal(late_goal);
+  ASSERT_TRUE(tracked.has_value());
+  EXPECT_EQ(tracked->status, ActionGoalStatus::CANCELED)
+      << "status frames no longer reach a goal the manager believes is subscribed";
 }
 
 }  // namespace ros2_medkit_gateway
