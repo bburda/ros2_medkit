@@ -76,6 +76,15 @@ std::string BulkDataHandlers::get_rosbag_mimetype(const std::string & format) {
   return "application/octet-stream";
 }
 
+std::vector<std::string> BulkDataHandlers::download_media_types() {
+  // The first three are the complete range of get_rosbag_mimetype() directly
+  // above - add a branch there and this list needs the type it returns. The
+  // catch-all covers the store-backed categories, whose type is client-supplied
+  // at upload and therefore not enumerable here; see the header for why the
+  // route declares both halves rather than picking one.
+  return {"application/x-mcap", "application/x-sqlite3", "application/octet-stream", "*/*"};
+}
+
 std::string BulkDataHandlers::resolve_rosbag_file_path(const std::string & path) {
   // If it's a regular file, return as-is
   if (std::filesystem::is_regular_file(path)) {

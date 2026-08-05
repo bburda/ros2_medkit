@@ -100,6 +100,24 @@ class RouteEntry {
   RouteEntry & description(const std::string & desc);
   RouteEntry & response(int status_code, const std::string & desc);
   RouteEntry & response(int status_code, const std::string & desc, const nlohmann::json & schema);
+
+  /// Declare a response whose body is **not** JSON.
+  ///
+  /// Each media type becomes its own `content` entry with an empty Media Type
+  /// Object - deliberately **no schema**. Two independent reasons:
+  /// `{"type":"string","format":"binary"}` is an OpenAPI 3.0 idiom that 3.1
+  /// dropped (3.1 aligned with JSON Schema 2020-12, where `format: binary` has
+  /// no meaning and a `string` type actively misdescribes raw bytes); and the
+  /// SSE routes emit three different frame shapes, so one schema here would be
+  /// wrong for at least two of them.
+  ///
+  /// `schema` is accepted for signature symmetry with the JSON overloads and
+  /// must be empty; a non-empty schema is recorded and reported by
+  /// `validate_completeness()` rather than published against a media type it
+  /// may not describe.
+  RouteEntry & response(int status_code, const std::string & desc, const nlohmann::json & schema,
+                        const std::vector<std::string> & content_types);
+
   RouteEntry & request_body(const std::string & desc, const nlohmann::json & schema,
                             const std::string & content_type = "application/json");
 
@@ -184,6 +202,44 @@ class RouteEntry {
   /// success and redirect statuses.
   RouteEntry & errors(std::initializer_list<int> codes);
 
+  /// Same, for a set computed at run time rather than written at the call site.
+  /// Exists so a route can declare `handlers::parameter_error_statuses()` -
+  /// derived by running the classifier over its whole enum - instead of a
+  /// hand-copied list that goes stale when the enum grows.
+  RouteEntry & errors(const std::vector<int> & codes);
+
+  /// Declare that this route takes part in entity locking: it reads the
+  /// caller's `X-Client-Id` and answers 409 when the entity's resource
+  /// collection is locked by a different client.
+  ///
+  /// Three declarations in one call because they are one contract - the
+  /// request header, the 409, and an `x-medkit-lock-guarded: true` operation
+  /// extension a generated client or a contract test can select on. Splitting
+  /// them is what lets a route publish two thirds of the contract.
+  ///
+  /// **Hand-applied, and only half-checked - do not read it as derived.** The
+  /// header read that decides the 409 lives in
+  /// `HandlerContext::validate_lock_access`, which 12 handlers call; a
+  /// registration cannot see through that call, and the document is
+  /// regenerated per `/docs` request rather than captured at registration
+  /// time. Nothing therefore infers this marker from the handler: omitting the
+  /// call on a new lock-checking route ships a route that can 409 without
+  /// saying so, and no build or test failure follows.
+  /// `test_openapi_contract.test.py::test_lock_guarded_set_matches_the_handlers`
+  /// pins the marked set against a hand-maintained list, which catches the
+  /// *document* drifting from that list - not the list drifting from the
+  /// handlers.
+  RouteEntry & lock_guarded();
+
+  /// Declare the `X-Medkit-No-Fan-Out` request header this route reads.
+  ///
+  /// Presence-only: `TypedRequest::fan_out_disabled()` and the
+  /// `fan_out_helpers` guards test `has_header` and never look at the value.
+  /// The declared schema is therefore a bare string, not a boolean - a client
+  /// sending `false` still suppresses fan-out, and a boolean schema would
+  /// promise the opposite.
+  RouteEntry & fan_out_aware();
+
   /// This route can only ever return `code`. Clears every other response and
   /// suppresses the blanket 400/404/500 injection.
   RouteEntry & only_status(int code, const std::string & desc);
@@ -232,6 +288,8 @@ class RouteEntry {
   bool alternates_{false};
   /// Set by mark_partial_content(); emitted as `x-medkit-partial-content: true`.
   bool partial_content_{false};
+  /// Set by lock_guarded(); emitted as `x-medkit-lock-guarded: true`.
+  bool lock_guarded_{false};
   /// Set by only_status(); suppresses the blanket 400/404/500 injection.
   bool only_status_{false};
   /// Set by the *attachments* body-less typed `put<TResponse>` overload - the
@@ -261,8 +319,20 @@ class RouteEntry {
     /// aggregate predate the field and must keep compiling warning-free under
     /// -Wmissing-field-initializers.
     std::vector<ResponseHeader> headers{};
+    /// Media types this response's body can carry. Empty is the JSON default:
+    /// the emitter writes `application/json` iff `schema` is non-empty, which
+    /// is what every DTO-backed route wants and keeps a 204 content-free.
+    /// Non-empty means a non-JSON body, and each entry is emitted with no
+    /// schema - see the four-argument `response()` for why. NSDMI for the same
+    /// aggregate-initialisation reason as `headers`.
+    std::vector<std::string> content_types{};
   };
   std::map<int, ResponseInfo> responses_;
+
+  /// Statuses whose non-JSON `response()` also carried a schema. The schema was
+  /// dropped rather than published against a media type it may not describe;
+  /// kept so validate_completeness() reports the miscall.
+  std::vector<int> schema_on_non_json_statuses_;
 
   /// Statuses passed to response_header() that no response declares. Kept so
   /// validate_completeness() reports the miscall rather than the document
@@ -448,8 +518,22 @@ class RouteRegistry {
                    std::function<http::Result<http::SseStream>(http::TypedRequest)> stream_factory);
 
   /// Register a binary download (range-aware where the provider supports it).
+  ///
+  /// `media_types` is what the route publishes as the response body's possible
+  /// media types, and it is a required argument rather than a default so a new
+  /// download route cannot inherit somebody else's answer. It must cover every
+  /// value the handler can put in `BinaryResponse::content_type`; where that
+  /// set is open (a store that echoes a client-supplied type) the list carries
+  /// `*/*` as its catch-all alongside the types that *are* derivable.
+  ///
+  /// The helper owns the whole Range contract - 200, 206, `Accept-Ranges`,
+  /// `Content-Range`, the `Range` parameter, and the `x-medkit-partial-content`
+  /// marker - because cpp-httplib produces the 206 from the request, not from
+  /// the handler. Declaring any part of it at a call site would let a route
+  /// publish some of the contract and not the rest.
   RouteEntry & binary_download(const std::string & openapi_path,
-                               std::function<http::Result<http::BinaryResponse>(http::TypedRequest)> handler);
+                               std::function<http::Result<http::BinaryResponse>(http::TypedRequest)> handler,
+                               const std::vector<std::string> & media_types);
 
   /// Register a `multipart/form-data` upload endpoint. The handler receives
   /// the typed request plus the parsed multipart body, and returns a typed
@@ -514,6 +598,17 @@ class RouteRegistry {
     rate_limit_enabled_ = enabled;
   }
 
+  /// Set whether peer aggregation is enabled (controls 502/503 in OpenAPI
+  /// output). `aggregation.enabled` defaults false and the AggregationManager
+  /// is only constructed when it is set, so with aggregation off an entity can
+  /// never be remote and neither status is reachable. When it is on, any route
+  /// that resolves an entity may find that entity owned by a peer and answer
+  /// with the gateway's own peer-failure statuses instead of the handler's -
+  /// see `entity_scoped()` for which routes those are.
+  void set_aggregation_enabled(bool enabled) {
+    aggregation_enabled_ = enabled;
+  }
+
   /// Escape hatch for JSON routes without typed DTOs (e.g. the fault-trigger
   /// CRUD): registers a raw cpp-httplib handler under an OpenAPI-style path so
   /// the route shows up in the generated spec, Swagger UI and the endpoint
@@ -539,6 +634,15 @@ class RouteRegistry {
   std::deque<RouteEntry> routes_;
   bool auth_enabled_{false};
   bool rate_limit_enabled_{false};
+  bool aggregation_enabled_{false};
+
+  /// True when `openapi_path` carries one of the four entity-id path
+  /// parameters, which is exactly the condition under which a handler can call
+  /// `HandlerContext::validate_entity_for_route` and therefore hit the
+  /// peer-forwarding branch. Derived from the path rather than from a list:
+  /// the entity id has to come from the path for the lookup to happen at all,
+  /// so there is no route that forwards without one.
+  static bool entity_scoped(const std::string & openapi_path);
 
   // ---------------------------------------------------------------------------
   // Typed-handler wrapper helpers.

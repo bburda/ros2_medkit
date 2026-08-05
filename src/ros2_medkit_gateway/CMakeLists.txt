@@ -53,6 +53,18 @@ find_package(OpenSSL REQUIRED)
 # This enables the httplib::SSLServer class for HTTPS support
 add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
 
+# Emitted-status recorder (include/ros2_medkit_gateway/http/detail/status_recorder.hpp).
+# Instruments make_error() and every registry-mounted route so
+# test_openapi_error_coverage can assert the OpenAPI document declares every
+# status the gateway actually serves. Directory scope and set before any
+# target is created, because make_error() is an inline function shared by 13
+# translation units - a per-target definition would give it two bodies and
+# break ODR. A shipped gateway compiles none of it: the Dockerfile builds with
+# -DBUILD_TESTING=OFF.
+if(BUILD_TESTING)
+  add_compile_definitions(MEDKIT_STATUS_RECORDER)
+endif()
+
 # Vendored header-only libraries (no network access on ROS build farm)
 # tl::expected v1.3.1 (CC0) - https://github.com/TartanLlama/expected
 add_library(tl_expected_iface INTERFACE)

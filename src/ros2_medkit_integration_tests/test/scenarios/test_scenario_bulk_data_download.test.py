@@ -151,6 +151,41 @@ class TestScenarioBulkDataDownload(GatewayTestCase):
             # Other formats — just verify we have content
             self.assertGreater(len(content), 0)
 
+    def test_04_rosbag_media_type_is_named_in_the_document(self):
+        """The served rosbag ``Content-Type`` is a named ``content`` key.
+
+        Tier 2 for the derivable half of the download's media-type set. A
+        rosbag type comes from ``BulkDataHandlers::get_rosbag_mimetype``, whose
+        range is finite, so the document must name it rather than fall back on
+        the ``*/*`` catch-all that exists for client-supplied uploads - passing
+        via the wildcard is treated as a failure here on purpose.
+
+        @verifies REQ_INTEROP_073
+        """
+        rosbag_id = self.wait_for_fault_with_rosbag(
+            self.LIDAR_ENDPOINT, max_wait=30.0,
+        )
+        if rosbag_id is None:
+            self.fail('No rosbag available for media-type test')
+
+        spec = requests.get(f'{self.BASE_URL}/docs', timeout=10).json()
+        path = '/apps/{app_id}/bulk-data/{category_id}/{file_id}'
+        declared = (
+            spec['paths'][path]['get']
+            .get('responses', {}).get('200', {}).get('content', {})
+        )
+
+        response = self.get_raw(
+            f'{self.LIDAR_ENDPOINT}/bulk-data/rosbags/{rosbag_id}',
+            timeout=30,
+            stream=True,
+        )
+        self.assert_declared_media_type(
+            response.headers.get('Content-Type', ''), declared,
+            where='rosbag download', exact=True,
+        )
+        response.close()
+
 
 @launch_testing.post_shutdown_test()
 class TestShutdown(unittest.TestCase):

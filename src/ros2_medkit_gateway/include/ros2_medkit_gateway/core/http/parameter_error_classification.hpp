@@ -15,6 +15,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "ros2_medkit_gateway/core/configuration/parameter_types.hpp"
 
@@ -33,6 +34,16 @@ struct ParameterErrorClassification {
 /// carries `ParameterErrorCode::NONE` is a gateway-side defect and maps to 500
 /// internal-error - it is never guessed from the free-form message text.
 ParameterErrorClassification classify_parameter_error(const ParameterResult & result);
+
+/// Every HTTP status `classify_parameter_error` can produce, ascending and
+/// deduplicated.
+///
+/// Computed by running the classifier over every `ParameterErrorCode`, not by
+/// listing statuses by hand: the routes that surface parameter failures declare
+/// their error set from this, so a new enumerator mapping to a new status
+/// widens those declarations with no edit at the registrations. Hand-listing is
+/// what let three 503-emitting sites go undeclared earlier in this work.
+const std::vector<int> & parameter_error_statuses();
 
 }  // namespace handlers
 }  // namespace ros2_medkit_gateway

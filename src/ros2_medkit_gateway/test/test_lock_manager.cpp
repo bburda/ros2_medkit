@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -75,6 +76,65 @@ class LockManagerTest : public ::testing::Test {
     return cfg;
   }
 };
+
+// =========================================================================
+// Status surface - what the OpenAPI declarations for extend/release rest on
+// =========================================================================
+
+// The registrations for `extend{E}Lock` / `release{E}Lock` declare 403 on top
+// of the blanket 400/404/500, and deliberately NOT 409. Both halves of that are
+// claims about this class, so they are checked here rather than trusted: the
+// verbs must be able to produce 403, and must never produce 409 (only `acquire`
+// conflicts). Driving every reachable failure path is what makes the second
+// half meaningful - an assertion that "no 409 was seen" is worthless if the
+// paths that could produce one were never taken.
+TEST_F(LockManagerTest, extend_and_release_answer_only_400_403_404) {
+  std::set<int> seen;
+  auto record = [&seen](int status) {
+    seen.insert(status);
+  };
+
+  LockManager mgr(cache_, make_config());
+  auto held = mgr.acquire("comp1", "client_a", {}, 300);
+  ASSERT_TRUE(held.has_value()) << held.error().message;
+
+  // No lock on this entity at all.
+  auto missing_extend = mgr.extend("comp2", "client_a", 60);
+  ASSERT_FALSE(missing_extend.has_value());
+  record(missing_extend.error().status_code);
+  auto missing_release = mgr.release("comp2", "client_a");
+  ASSERT_FALSE(missing_release.has_value());
+  record(missing_release.error().status_code);
+
+  // Lock exists but belongs to somebody else - the 403 the routes declare.
+  auto wrong_extend = mgr.extend("comp1", "client_b", 60);
+  ASSERT_FALSE(wrong_extend.has_value());
+  record(wrong_extend.error().status_code);
+  EXPECT_EQ(wrong_extend.error().code, "lock-not-owner");
+  auto wrong_release = mgr.release("comp1", "client_b");
+  ASSERT_FALSE(wrong_release.has_value());
+  record(wrong_release.error().status_code);
+  EXPECT_EQ(wrong_release.error().code, "lock-not-owner");
+
+  // Invalid extension durations.
+  auto zero = mgr.extend("comp1", "client_a", 0);
+  ASSERT_FALSE(zero.has_value());
+  record(zero.error().status_code);
+  auto too_long = mgr.extend("comp1", "client_a", 99999999);
+  ASSERT_FALSE(too_long.has_value());
+  record(too_long.error().status_code);
+
+  // Locking switched off.
+  LockManager disabled(cache_, make_config(false));
+  auto off_extend = disabled.extend("comp1", "client_a", 60);
+  ASSERT_FALSE(off_extend.has_value());
+  record(off_extend.error().status_code);
+  auto off_release = disabled.release("comp1", "client_a");
+  ASSERT_FALSE(off_release.has_value());
+  record(off_release.error().status_code);
+
+  EXPECT_EQ(seen, (std::set<int>{400, 403, 404})) << "extend/release status surface changed";
+}
 
 // =========================================================================
 // Acquire tests

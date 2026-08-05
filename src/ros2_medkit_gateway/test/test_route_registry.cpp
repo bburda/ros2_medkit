@@ -561,6 +561,89 @@ TEST_F(RouteRegistryTest, OptionalHeaderParamHasRequiredFalse) {
 }
 
 // =============================================================================
+// lock_guarded() / fan_out_aware()
+// =============================================================================
+
+namespace {
+
+/// Find a parameter by name in an operation's parameter array.
+const nlohmann::json * find_param(const nlohmann::json & params, const std::string & name) {
+  for (const auto & p : params) {
+    if (p.contains("name") && p["name"] == name) {
+      return &p;
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_F(RouteRegistryTest, LockGuardedDeclaresHeaderStatusAndMarker) {
+  seed_post(registry_, "/apps/{app_id}/data/{data_id}").tag("Data").lock_guarded();
+
+  auto paths = registry_.to_openapi_paths();
+  auto & op = paths["/apps/{app_id}/data/{data_id}"]["post"];
+
+  // contains() first: get<bool>() on an absent key throws json::type_error,
+  // which reports as a crashed test rather than a failed expectation.
+  ASSERT_TRUE(op.contains("x-medkit-lock-guarded")) << "marker not emitted";
+  EXPECT_TRUE(op["x-medkit-lock-guarded"].get<bool>());
+  ASSERT_TRUE(op["responses"].contains("409")) << "the 409 the marker promises is missing";
+
+  const auto * client_id = find_param(op["parameters"], "X-Client-Id");
+  ASSERT_NE(client_id, nullptr) << "X-Client-Id not declared";
+  EXPECT_EQ((*client_id)["in"], "header");
+  // Optional: a header-less request succeeds while nothing is locked, so
+  // declaring it required would describe a gateway that rejects it outright.
+  EXPECT_FALSE((*client_id)["required"].get<bool>());
+  EXPECT_EQ((*client_id)["schema"]["type"], "string");
+}
+
+TEST_F(RouteRegistryTest, UnguardedRouteCarriesNoLockMarker) {
+  seed_get(registry_, "/apps/{app_id}/data").tag("Data");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & op = paths["/apps/{app_id}/data"]["get"];
+
+  EXPECT_FALSE(op.contains("x-medkit-lock-guarded"));
+  EXPECT_FALSE(op["responses"].contains("409"));
+}
+
+TEST_F(RouteRegistryTest, LockGuardedMarkerWithoutA409IsReported) {
+  // only_status() clears declared_errors_, so it is the one way to keep the
+  // marker while dropping the status it promises. The registry has to report
+  // that rather than publish a marker no client can act on.
+  seed_del(registry_, "/apps/{app_id}/bulk-data/{file_id}")
+      .tag("Bulk Data")
+      .lock_guarded()
+      .only_status(501, "Not implemented");
+
+  auto issues = registry_.validate_completeness();
+  bool reported = false;
+  for (const auto & issue : issues) {
+    if (issue.severity == ValidationIssue::Severity::kError &&
+        issue.message.find("lock_guarded() marker without a declared 409") != std::string::npos) {
+      reported = true;
+    }
+  }
+  EXPECT_TRUE(reported) << "a marker without its 409 passed validate_completeness()";
+}
+
+TEST_F(RouteRegistryTest, FanOutAwareDeclaresPresenceOnlyHeader) {
+  seed_get(registry_, "/apps/{app_id}/logs").tag("Logs").fan_out_aware();
+
+  auto paths = registry_.to_openapi_paths();
+  const auto * param = find_param(paths["/apps/{app_id}/logs"]["get"]["parameters"], "X-Medkit-No-Fan-Out");
+
+  ASSERT_NE(param, nullptr) << "X-Medkit-No-Fan-Out not declared";
+  EXPECT_EQ((*param)["in"], "header");
+  EXPECT_FALSE((*param)["required"].get<bool>());
+  // The gateway tests has_header and never reads the value, so `false` also
+  // suppresses fan-out. A boolean schema would promise the opposite.
+  EXPECT_EQ((*param)["schema"]["type"], "string");
+}
+
+// =============================================================================
 // to_endpoint_list (Fix 23)
 // =============================================================================
 
@@ -1007,6 +1090,101 @@ TEST_F(RouteRegistryTest, RateLimitedStatusAbsentWhenLimiterIsOff) {
   EXPECT_FALSE(paths["/items"]["get"]["responses"].contains("429"));
 }
 
+TEST_F(RouteRegistryTest, PeerFailureStatusesFollowTheAggregationGate) {
+  // With aggregation on, an entity can be owned by a peer, and the proxy path
+  // inside validate_entity_for_route answers 502 (peer unknown / unreachable /
+  // oversized response) or 503 (this gateway is shutting down) instead of the
+  // handler. Only entity-scoped routes can reach it: the entity id has to come
+  // from the path for the lookup to happen at all.
+  registry_.set_aggregation_enabled(true);
+  seed_get(registry_, "/apps/{app_id}/data").tag("Test").summary("List data");
+  seed_get(registry_, "/health").tag("Test").summary("Health");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & entity = paths["/apps/{app_id}/data"]["get"]["responses"];
+  EXPECT_EQ(entity["502"]["$ref"].get<std::string>(), "#/components/responses/GenericError");
+  EXPECT_EQ(entity["503"]["$ref"].get<std::string>(), "#/components/responses/GenericError");
+
+  // A route with no entity to resolve never forwards, so declaring the peer
+  // statuses there would document an outcome it cannot produce.
+  auto & health = paths["/health"]["get"]["responses"];
+  ASSERT_TRUE(health.contains("200")) << "route missing; absence check would be vacuous";
+  EXPECT_FALSE(health.contains("502"));
+  EXPECT_FALSE(health.contains("503"));
+}
+
+TEST_F(RouteRegistryTest, PeerFailureStatusesRespectOnlyStatus) {
+  // `only_status` asserts the route has exactly one outcome. The forward
+  // happens inside the handler, not ahead of it, so a single-outcome route -
+  // the data-categories / data-groups stubs ignore the request entirely and
+  // never resolve an entity - cannot reach the peer path. Adding 502/503 there
+  // would publish two statuses the route can never return, on the one
+  // declaration whose whole meaning is that it returns one.
+  registry_.set_aggregation_enabled(true);
+  seed_get(registry_, "/apps/{app_id}/data-categories")
+      .tag("Test")
+      .summary("Data categories")
+      .only_status(501, "Not implemented");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & responses = paths["/apps/{app_id}/data-categories"]["get"]["responses"];
+  EXPECT_TRUE(responses.contains("501"));
+  EXPECT_FALSE(responses.contains("502"));
+  EXPECT_FALSE(responses.contains("503"));
+  // What `only_status` constrains is the set of statuses the *handler* can
+  // produce, and 501 is still the whole of that set. It was previously spelled
+  // `responses.size() == 1`, which silently also asserted that nothing outside
+  // the handler contributes a status - true until cpp-httplib's pre-routing
+  // Range rejection was declared. 416 is answered before this route is reached
+  // (Server::process_request, vendored httplib.h:6616-6622), so excluding it
+  // here would document the stub as unable to answer a status it demonstrably
+  // does answer. Narrowed to the claim that was actually meant, rather than
+  // exempting the route.
+  auto handler_statuses = responses;
+  handler_statuses.erase("416");
+  EXPECT_EQ(handler_statuses.size(), 1U) << responses.dump();
+}
+
+TEST_F(RouteRegistryTest, PeerFailureStatusesAbsentWhenAggregationIsOff) {
+  // aggregation.enabled defaults false and the AggregationManager is only
+  // constructed when it is set, so no entity can be remote and neither status
+  // is reachable.
+  seed_get(registry_, "/apps/{app_id}/data").tag("Test").summary("List data");
+  auto paths = registry_.to_openapi_paths();
+  auto & responses = paths["/apps/{app_id}/data"]["get"]["responses"];
+  ASSERT_TRUE(responses.contains("200")) << "route missing; absence check would be vacuous";
+  EXPECT_FALSE(responses.contains("502"));
+  EXPECT_FALSE(responses.contains("503"));
+}
+
+TEST_F(RouteRegistryTest, RouteDeclaredStatusWinsOverTheMiddlewareComponent) {
+  // A handler can answer a status the middleware also owns: the script
+  // manager's concurrency 429 collides with the rate limiter's, and a
+  // lifecycle provider's AccessDenied 403 collides with the auth middleware's.
+  // OpenAPI allows exactly one response object per status, so one of the two
+  // descriptions has to lose. The route's own declaration wins, because
+  // `add_response_ref` is first-wins and the `errors()` loop runs first.
+  //
+  // What that costs is the *headers*: the operation below documents 429 as the
+  // route's GenericError and therefore without `Retry-After` / `X-RateLimit-*`.
+  // The body shape is unaffected - Unauthorized, Forbidden and RateLimited all
+  // point at the same GenericError schema - so the loss is the header list and
+  // the prose, not the payload. This test exists so that precedence is a
+  // decision on record rather than an accident of statement order.
+  registry_.set_auth_enabled(true);
+  registry_.set_rate_limit_enabled(true);
+  seed_get(registry_, "/items").tag("Test").summary("List items").errors({403, 429});
+
+  auto paths = registry_.to_openapi_paths();
+  auto & responses = paths["/items"]["get"]["responses"];
+  EXPECT_EQ(responses["429"]["$ref"].get<std::string>(), "#/components/responses/GenericError");
+  EXPECT_EQ(responses["403"]["$ref"].get<std::string>(), "#/components/responses/GenericError");
+  // 401 is not declared by the route, so the middleware component still wins
+  // there - which is what makes this a precedence test rather than a test that
+  // the middleware refs were dropped altogether.
+  EXPECT_EQ(responses["401"]["$ref"].get<std::string>(), "#/components/responses/Unauthorized");
+}
+
 // =============================================================================
 // Request-body completeness reads the registration, not the HTTP method
 // =============================================================================
@@ -1106,4 +1284,199 @@ TEST_F(RouteRegistryTest, TypedPutWithABodyIsStillSatisfiedAutomatically) {
 
   EXPECT_FALSE(has_error_mentioning(registry_, "request body"));
   EXPECT_TRUE(registry_.to_openapi_paths()["/items"]["put"].contains("requestBody"));
+}
+
+// =============================================================================
+// Media types: a non-JSON body is declared by media type, without a schema
+// =============================================================================
+
+namespace {
+
+Result<ros2_medkit_gateway::http::BinaryResponse> seed_blob_handler(TypedRequest /*req*/) {
+  ros2_medkit_gateway::http::BinaryResponse resp;
+  resp.content_type = "application/octet-stream";
+  resp.total_size = 0;
+  resp.provider = [](uint64_t, uint64_t, httplib::DataSink & sink) -> bool {
+    sink.done();
+    return false;
+  };
+  return resp;
+}
+
+RouteEntry & seed_blob(RouteRegistry & reg, const std::string & path, const std::vector<std::string> & media_types) {
+  std::function<Result<ros2_medkit_gateway::http::BinaryResponse>(TypedRequest)> h = &seed_blob_handler;
+  return reg.binary_download(path, std::move(h), media_types);
+}
+
+}  // namespace
+
+TEST_F(RouteRegistryTest, NonJsonResponseIsDeclaredUnderItsOwnMediaTypeWithoutASchema) {
+  // `format: binary` under `application/json` was wrong twice over: the media
+  // type is not JSON, and `{"type":"string","format":"binary"}` is an OpenAPI
+  // 3.0 idiom that 3.1 dropped. The absence of a schema is the assertion, not
+  // an oversight - there is nothing truthful to put there for raw bytes.
+  seed_blob(registry_, "/blob", {"application/octet-stream"}).tag("Test").summary("Download");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & content = paths["/blob"]["get"]["responses"]["200"]["content"];
+  ASSERT_TRUE(content.contains("application/octet-stream"));
+  EXPECT_FALSE(content.contains("application/json")) << "a binary body must not be advertised as JSON";
+  EXPECT_FALSE(content["application/octet-stream"].contains("schema"));
+  EXPECT_EQ(nlohmann::json(content["application/octet-stream"]), nlohmann::json::object());
+}
+
+TEST_F(RouteRegistryTest, EveryDeclaredMediaTypeReachesTheDocument) {
+  // The open-set case: the concrete types AND the catch-all have to survive to
+  // the document, because the route's whole claim is that it serves the three
+  // it can name plus anything the store recorded.
+  seed_blob(registry_, "/blob", {"application/x-mcap", "application/x-sqlite3", "application/octet-stream", "*/*"})
+      .tag("Test")
+      .summary("Download");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & content = paths["/blob"]["get"]["responses"]["200"]["content"];
+  for (const char * expected : {"application/x-mcap", "application/x-sqlite3", "application/octet-stream", "*/*"}) {
+    EXPECT_TRUE(content.contains(expected)) << expected << " was declared but is missing from the document";
+  }
+}
+
+TEST_F(RouteRegistryTest, MultiRangeMediaTypeIsDeclaredOnThe206Only) {
+  // cpp-httplib answers a multi-range request by rewriting Content-Type to
+  // `multipart/byteranges` and generating a boundary (apply_ranges, the
+  // req.ranges.size() > 1 branch). The 200 can never carry it, so declaring it
+  // there would be the same over-declaration this document is being cleaned of.
+  seed_blob(registry_, "/blob", {"application/octet-stream"}).tag("Test").summary("Download");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & responses = paths["/blob"]["get"]["responses"];
+  EXPECT_TRUE(responses["206"]["content"].contains("multipart/byteranges"));
+  EXPECT_TRUE(responses["206"]["content"].contains("application/octet-stream"));
+  EXPECT_FALSE(responses["200"]["content"].contains("multipart/byteranges"));
+}
+
+TEST_F(RouteRegistryTest, BinaryDownloadDeclaresTheRangeRequestHeader) {
+  // The request half of the contract the 206/Content-Range/Accept-Ranges
+  // declarations answer. Optional, because omitting it serves the whole body.
+  seed_blob(registry_, "/blob", {"application/octet-stream"}).tag("Test").summary("Download");
+
+  auto paths = registry_.to_openapi_paths();
+  const auto & params = paths["/blob"]["get"]["parameters"];
+  bool found = false;
+  for (const auto & p : params) {
+    if (p.value("name", "") == "Range") {
+      found = true;
+      EXPECT_EQ(p.value("in", ""), "header");
+      EXPECT_FALSE(p.value("required", true)) << "a download without Range must still serve the whole body";
+      EXPECT_FALSE(p.value("description", "").empty());
+    }
+  }
+  EXPECT_TRUE(found) << "Accept-Ranges is advertised but no Range parameter is declared";
+}
+
+TEST_F(RouteRegistryTest, NonJsonResponseGivenASchemaReportsItInsteadOfPublishingIt) {
+  // The overload takes a schema argument for symmetry with the JSON ones. A
+  // caller that passes one has misunderstood the contract, and the schema is
+  // dropped rather than attached to a media type it may not describe - so the
+  // miscall must surface through the same channel as the other route-metadata
+  // defects, not vanish.
+  registry_
+      .get<RouteRegistryTestSeedDto>("/thing",
+                                     std::function<Result<RouteRegistryTestSeedDto>(TypedRequest)>(&seed_get_handler))
+      .tag("Test")
+      .summary("Thing")
+      .response(200, "Bytes", json{{"type", "string"}}, {"application/octet-stream"});
+
+  EXPECT_TRUE(has_error_mentioning(registry_, "dropped the schema"));
+  auto paths = registry_.to_openapi_paths();
+  EXPECT_FALSE(paths["/thing"]["get"]["responses"]["200"]["content"]["application/octet-stream"].contains("schema"));
+}
+
+TEST_F(RouteRegistryTest, NonJsonSuccessSatisfiesTheSchemaCompletenessCheck) {
+  // The completeness gate reads the declared media type rather than sniffing
+  // the summary for the word "stream", so an SSE or download route is complete
+  // because of what it declares, not because of what it is called.
+  seed_blob(registry_, "/blob", {"application/octet-stream"}).tag("Test").summary("Download");
+
+  EXPECT_FALSE(has_error_mentioning(registry_, "Missing response schema"));
+}
+
+TEST_F(RouteRegistryTest, SchemaLessJsonSuccessIsStillReported) {
+  // The exemption is for a body the media type already describes, so it turns
+  // on the type being non-JSON - not merely on `content_types` being set. A 2xx
+  // declaring `application/json` with no schema is exactly what the check
+  // exists to catch, and accepting it would make the C++ gate looser than both
+  // the documented rule and the served-document gate in test_health.
+  registry_
+      .get<RouteRegistryTestSeedDto>("/thing",
+                                     std::function<Result<RouteRegistryTestSeedDto>(TypedRequest)>(&seed_get_handler))
+      .tag("Test")
+      .summary("Thing")
+      .response(200, "A JSON body with no shape", json{}, {"application/json"});
+
+  EXPECT_TRUE(has_error_mentioning(registry_, "Missing response schema"));
+}
+
+TEST_F(RouteRegistryTest, MixedMediaTypeSuccessIsExemptOnTheNonJsonEntry) {
+  // ...and one non-JSON entry alongside JSON is still exempt, matching how the
+  // served-document gate walks the content map. Without this the tightening
+  // above could be over-read into "any mention of application/json disqualifies
+  // the route", which would report a route that legitimately serves both.
+  seed_blob(registry_, "/blob", {"application/json", "application/octet-stream"}).tag("Test").summary("Download");
+
+  EXPECT_FALSE(has_error_mentioning(registry_, "Missing response schema"));
+}
+
+TEST_F(RouteRegistryTest, AJsonRouteWithNoSchemaIsStillReported) {
+  // ...and the exemption must not have widened into "any 2xx is fine". A route
+  // declaring a 200 with neither a schema nor a media type is the case the
+  // check exists for.
+  registry_.raw("get", "/plain", [](const httplib::Request &, httplib::Response &) {})
+      .tag("Test")
+      .summary("Plain")
+      .response(200, "Something");
+
+  EXPECT_TRUE(has_error_mentioning(registry_, "Missing response schema"));
+}
+
+TEST_F(RouteRegistryTest, EveryDocumentedRouteDeclaresTheFrameworkAnsweredRangeRejection) {
+  // 416 comes from cpp-httplib's own pre-routing Range parsing
+  // (Server::process_request, vendored httplib.h:6616-6622), so it is reachable
+  // on every operation - including paths that do not exist - and no handler
+  // ever runs. That puts it outside what the status recorder can observe, which
+  // is why this framework-level constant is pinned here instead.
+  //
+  // It refs GenericError like the other error statuses. Note that the vendored
+  // header alone does NOT show that: cpp-httplib writes 416 with an empty body,
+  // and it is the gateway's own `set_error_handler`
+  // (RESTServer::setup_global_error_handlers) that fills every body-less error
+  // response with a GenericError. This registry harness installs no such
+  // handler, so a wire assertion made *here* would show an empty body and
+  // mislead; the wire half lives in the integration suite, against a real
+  // gateway.
+  seed_get(registry_, "/health").tag("Server").summary("Health");
+  seed_post(registry_, "/items").tag("Test").summary("Create");
+  seed_del(registry_, "/items/{item_id}").tag("Test").summary("Delete");
+
+  auto paths = registry_.to_openapi_paths();
+  for (const auto & [path, item] : paths.items()) {
+    for (const auto & [method, op] : item.items()) {
+      ASSERT_TRUE(op["responses"].contains("416")) << method << " " << path << " does not declare 416";
+      EXPECT_EQ(op["responses"]["416"].value("$ref", ""), "#/components/responses/GenericError")
+          << method << " " << path << ": 416 carries the same body as every other error status";
+    }
+  }
+}
+
+TEST_F(RouteRegistryTest, TheRangeRejectionSurvivesOnlyStatus) {
+  // only_status() says the *handler* has one outcome. 416 is decided before the
+  // handler is reached, so - like the auth middleware's 401/403 - it is outside
+  // that guard. Clearing it here would document the 501 stubs as unable to
+  // answer a status they demonstrably do answer.
+  seed_get(registry_, "/stub").tag("Test").summary("Stub").only_status(501, "Not implemented");
+
+  auto paths = registry_.to_openapi_paths();
+  const auto & responses = paths["/stub"]["get"]["responses"];
+  EXPECT_TRUE(responses.contains("416"));
+  EXPECT_TRUE(responses.contains("501"));
+  EXPECT_FALSE(responses.contains("400")) << "only_status must still suppress the blanket handler statuses";
 }

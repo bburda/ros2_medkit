@@ -147,6 +147,92 @@ Release a lock. Requires ``X-Client-Id`` header (must be lock owner).
 
 **Response:** 204 No Content
 
+.. _locking-blocked-operations:
+
+Which Operations a Lock Blocks
+------------------------------
+
+The five endpoints above manage locks. A lock only means something because
+*other* endpoints honour it: every write below reads the caller's
+``X-Client-Id`` and answers ``409`` when the entity's collection is held by a
+different client. Sending no ``X-Client-Id`` makes the caller anonymous - the
+write succeeds while nothing is locked and is refused once something is - so
+the header is optional on these routes, not required.
+
+Each row applies to all four entity types (``areas``, ``components``, ``apps``,
+``functions``) except bulk-data, which only exists for ``components`` and
+``apps``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 45 20 35
+
+   * - Endpoint
+     - Lock scope
+     - Operation IDs
+   * - ``PUT /{entity}/data/{data_id}``
+     - ``data``
+     - ``put{Area,Component,App,Function}DataItem``
+   * - ``POST /{entity}/operations/{id}/executions``
+     - ``operations``
+     - ``execute{...}Operation``
+   * - ``PUT /{entity}/operations/{id}/executions/{exec_id}``
+     - ``operations``
+     - ``update{...}Execution``
+   * - ``DELETE /{entity}/operations/{id}/executions/{exec_id}``
+     - ``operations``
+     - ``cancel{...}Execution``
+   * - ``PUT /{entity}/configurations/{config_id}``
+     - ``configurations``
+     - ``set{...}Configuration``
+   * - ``DELETE /{entity}/configurations/{config_id}``
+     - ``configurations``
+     - ``delete{...}Configuration``
+   * - ``DELETE /{entity}/configurations``
+     - ``configurations``
+     - ``deleteAll{...}Configurations``
+   * - ``DELETE /{entity}/faults/{fault_code}``
+     - ``faults``
+     - ``clear{...}Fault``
+   * - ``DELETE /{entity}/faults``
+     - ``faults``
+     - ``clearAll{...}Faults``
+   * - ``PUT /{entity}/logs/configuration``
+     - ``logs``
+     - ``set{...}LogConfiguration``
+   * - ``POST /{entity}/bulk-data/{category_id}``
+     - ``bulk-data``
+     - ``upload{Component,App}BulkData``
+   * - ``DELETE /{entity}/bulk-data/{category_id}/{file_id}``
+     - ``bulk-data``
+     - ``delete{Component,App}BulkData``
+
+Every one of these operations carries ``x-medkit-lock-guarded: true`` in the
+generated OpenAPI document, alongside the ``X-Client-Id`` parameter and the
+``409`` response, so a generated client can select the lock-participating
+surface without pattern-matching on paths.
+
+The marker is applied per route at registration time, not inferred from the
+handler. It is pinned by
+``test_openapi_contract.test.py::test_lock_guarded_set_matches_the_handlers``
+against a hand-maintained list, which catches the document losing a marker but
+cannot catch a *new* lock-checking handler that was never added to the list.
+Adding a lock check to a handler means updating that list too.
+
+The One Exception: Global Fault Clear
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``DELETE /api/v1/faults`` reads ``X-Client-Id`` like the writes above but never
+answers ``409``. It walks every fault, **skips** the ones whose reporting
+entity is locked by another client, clears the rest, and answers ``204``.
+Nothing on the response says which faults were skipped - the
+``X-Medkit-Local-Only: true`` header that 204 also carries is set
+unconditionally and reports that aggregated *peers* were not cleared, not that
+a lock intervened. A caller who needs to know re-reads the entity's faults to
+see what survived. The operation declares ``X-Client-Id`` but carries no
+``x-medkit-lock-guarded`` marker, because it cannot return the ``409`` the
+marker implies.
+
 Error Responses
 ---------------
 

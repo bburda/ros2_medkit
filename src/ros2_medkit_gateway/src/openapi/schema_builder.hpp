@@ -56,9 +56,6 @@ class SchemaBuilder {
   /// Generic object schema (for dynamic ROS 2 message payloads)
   static nlohmann::json generic_object_schema();
 
-  /// Binary content schema (for file downloads)
-  static nlohmann::json binary_schema();
-
   /// Returns a $ref JSON object pointing to a named component schema.
   static nlohmann::json ref(const std::string & schema_name);
 

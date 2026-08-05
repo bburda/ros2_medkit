@@ -423,6 +423,108 @@ class TestScenarioBulkDataUpload(GatewayTestCase):
         item_ids2 = [i['id'] for i in list_r2.json().get('items', [])]
         self.assertNotIn(item_id, item_ids2)
 
+    def _download_content_declaration(self, code='200'):
+        """Return the declared ``content`` map of the app bulk-data download."""
+        spec = requests.get(f'{self.BASE_URL}/docs', timeout=10).json()
+        path = '/apps/{app_id}/bulk-data/{category_id}/{file_id}'
+        operation = spec['paths'][path]['get']
+        return operation.get('responses', {}).get(code, {}).get('content', {})
+
+    def test_21_download_serves_a_media_type_the_document_declares(self):
+        """The served ``Content-Type`` is one the document declares.
+
+        Tier 2 for media types: the ``content`` keys are only worth something
+        if the bytes arrive under one of them. Both halves of the declared set
+        are exercised deliberately, because they fail in opposite directions -
+        dropping the concrete types leaves the route claiming only ``*/*``, and
+        dropping ``*/*`` leaves it claiming a closed set it does not honour.
+
+        @verifies REQ_INTEROP_073
+        """
+        declared = self._download_content_declaration()
+        self.assertIn(
+            '*/*', declared,
+            'a store-backed category echoes the uploader mime type, so the '
+            'declared set has to stay open',
+        )
+
+        base_url = f'{self.BASE_URL}/apps/{self.test_app_id}/bulk-data/calibration'
+
+        # Derivable half: the store's own default, which the document names.
+        octet = requests.post(
+            base_url,
+            files={'file': ('mt_octet.bin', b'bytes', 'application/octet-stream')},
+            timeout=10,
+        )
+        self.assertEqual(octet.status_code, 201)
+        octet_dl = requests.get(f'{base_url}/{octet.json()["id"]}', timeout=10)
+        self.assertEqual(octet_dl.status_code, 200)
+        self.assert_declared_media_type(
+            octet_dl.headers.get('Content-Type', ''), declared,
+            where='download of an octet-stream upload', exact=True,
+        )
+
+        # Open half: an uploader-chosen type nothing in the gateway enumerates.
+        # This is the concrete reason the catch-all is in the declaration - the
+        # served type is genuinely outside any list the code could produce.
+        text = requests.post(
+            base_url,
+            files={'file': ('mt_text.csv', b'a,b\n1,2\n', 'text/csv')},
+            timeout=10,
+        )
+        self.assertEqual(text.status_code, 201)
+        text_dl = requests.get(f'{base_url}/{text.json()["id"]}', timeout=10)
+        self.assertEqual(text_dl.status_code, 200)
+        self.assertNotIn(
+            'text/csv', {k.lower() for k in declared},
+            'if text/csv were ever enumerable this test would stop proving '
+            'that the catch-all is load-bearing',
+        )
+        self.assert_declared_media_type(
+            text_dl.headers.get('Content-Type', ''), declared,
+            where='download of a text/csv upload', exact=False,
+        )
+
+    def test_22_multi_range_download_serves_the_declared_206_media_type(self):
+        """A multi-range request answers ``multipart/byteranges``, as declared.
+
+        The 206 declares a media type the 200 cannot carry, and it comes from
+        the HTTP layer rewriting ``Content-Type`` rather than from the handler,
+        so nothing else in the suite would notice it drifting.
+
+        @verifies REQ_INTEROP_073
+        """
+        base_url = f'{self.BASE_URL}/apps/{self.test_app_id}/bulk-data/calibration'
+        upload = requests.post(
+            base_url,
+            files={'file': ('ranges.bin', b'0123456789abcdef', 'application/octet-stream')},
+            timeout=10,
+        )
+        self.assertEqual(upload.status_code, 201)
+        url = f'{base_url}/{upload.json()["id"]}'
+
+        declared_206 = self._download_content_declaration('206')
+
+        single = requests.get(url, headers={'Range': 'bytes=4-7'}, timeout=10)
+        self.assertEqual(single.status_code, 206)
+        self.assertEqual(single.content, b'4567')
+        self.assertEqual(single.headers.get('Content-Range'), 'bytes 4-7/16')
+        self.assert_declared_media_type(
+            single.headers.get('Content-Type', ''), declared_206,
+            where='single-range download', exact=True,
+        )
+
+        multi = requests.get(url, headers={'Range': 'bytes=0-3,8-11'}, timeout=10)
+        self.assertEqual(multi.status_code, 206)
+        self.assert_declared_media_type(
+            multi.headers.get('Content-Type', ''), declared_206,
+            where='multi-range download', exact=True,
+        )
+        self.assertTrue(
+            multi.headers.get('Content-Type', '').startswith('multipart/byteranges'),
+            f'expected a byteranges body, got {multi.headers.get("Content-Type")!r}',
+        )
+
 
 @launch_testing.post_shutdown_test()
 class TestShutdown(unittest.TestCase):
