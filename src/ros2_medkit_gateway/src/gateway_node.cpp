@@ -1707,6 +1707,18 @@ GatewayNode::~GatewayNode() {
   if (trigger_mgr_) {
     trigger_mgr_->shutdown();
   }
+  // 4b. Drain in-flight update tasks BEFORE the notifier is shut down and
+  //     freed. Update tasks run on their own std::async threads (not the
+  //     executor), and each calls ResourceChangeNotifier::notify() once the
+  //     backend returns. ~UpdateManager is what joins them, but update_mgr_ is
+  //     declared before resource_change_notifier_, so reverse member
+  //     destruction frees the notifier FIRST - a task still inside prepare()
+  //     then wrote to freed memory (ASan heap-use-after-free in notify()).
+  //     Draining here makes the join order explicit instead of a consequence of
+  //     declaration order.
+  if (update_mgr_) {
+    update_mgr_->shutdown();
+  }
   // 5. Shutdown resource change notifier (stops worker thread)
   if (resource_change_notifier_) {
     resource_change_notifier_->shutdown();
