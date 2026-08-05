@@ -540,9 +540,33 @@ void OperationManager::unsubscribe_from_action_status(const std::string & action
       was_subscribed = true;
     }
   }
-  if (was_subscribed && action_transport_) {
-    action_transport_->unsubscribe_status(action_path);
+  if (!was_subscribed || !action_transport_) {
+    return;
   }
+  action_transport_->unsubscribe_status(action_path);
+
+  // The veto above only covers the decision, not the transport call: this
+  // runs with no lock held, so a goal sent meanwhile has already re-flagged
+  // the path and received a no-op from the transport (whose subscription was
+  // still alive at that instant) - and the call just above then destroyed it.
+  // The flag would keep subscribe_to_action_status short-circuiting forever,
+  // so repair the pair here instead: clear the flag and subscribe again.
+  //
+  // Deliberately NOT solved by holding subscriptions_mutex_ across the
+  // transport call. That would add a lock-order edge from our mutex into
+  // rclcpp's subscription create/destroy path, which neither this method nor
+  // subscribe_to_action_status has today. The residual window is one transport
+  // call wide and self-healing, and the status stream is TRANSIENT_LOCAL, so
+  // the fresh subscription is delivered the goal's latest status sample on
+  // match rather than waiting for the next publish.
+  if (!has_goals_for_action(action_path)) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+    subscribed_paths_.erase(action_path);
+  }
+  subscribe_to_action_status(action_path);
 }
 
 void OperationManager::on_status_callback(const std::string & action_path, const std::string & goal_id,

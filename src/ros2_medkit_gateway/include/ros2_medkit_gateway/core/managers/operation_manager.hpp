@@ -168,8 +168,15 @@ class OperationManager {
   void subscribe_to_action_status(const std::string & action_path);
 
   /// Unsubscribe from action status updates. Idempotent, and a no-op while
-  /// any goal for the path is still tracked - a tracked goal without its
-  /// status stream can never be reconciled by the cancel-timeout path.
+  /// any goal for the path is still tracked.
+  ///
+  /// Postcondition (the property that matters, and the one that is testable):
+  /// on return, every path with a tracked goal has a live status stream. That
+  /// is stated as a postcondition rather than as atomicity on purpose - a goal
+  /// sent while the transport call is in flight does briefly race it, and this
+  /// method repairs that pair before returning instead of holding a lock
+  /// across rclcpp. A tracked goal without its status stream can never be
+  /// reconciled by the cancel-timeout path, so the repair is not optional.
   void unsubscribe_from_action_status(const std::string & action_path);
 
   /// Resolved service / action call budget in seconds. Every service call and
