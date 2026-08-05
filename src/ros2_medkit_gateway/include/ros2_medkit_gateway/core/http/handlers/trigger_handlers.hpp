@@ -57,8 +57,9 @@ struct TriggerParsedResourceUri {
  * `Result<SseStream>` factory; the framework drives the chunked content
  * provider. The forwarding-scope primitive (commit 17) is installed by the
  * framework so peer-forwarding still works for entities owned by a remote
- * gateway. CRUD POST uses the attachments variant so it can override the
- * status to 201 without re-introducing a `httplib::Response &` parameter.
+ * gateway. CRUD POST returns `Created<Trigger>` so the 201 status lives in the
+ * signature and the generated document cannot declare a status the handler
+ * never emits.
  */
 class TriggerHandlers {
  public:
@@ -66,9 +67,9 @@ class TriggerHandlers {
 
   /// POST /{entity}/triggers - create trigger.
   ///
-  /// On success returns the new `Trigger` body with a 201 status override.
-  http::Result<std::pair<dto::Trigger, http::ResponseAttachments>> post_trigger(const http::TypedRequest & req,
-                                                                                dto::TriggerCreateRequest body);
+  /// On success returns the new `Trigger` body as 201 Created.
+  http::Result<http::Created<dto::Trigger>> post_trigger(const http::TypedRequest & req,
+                                                         dto::TriggerCreateRequest body);
 
   /// GET /{entity}/triggers - list all triggers for entity.
   http::Result<dto::Collection<dto::Trigger>> get_triggers(const http::TypedRequest & req);

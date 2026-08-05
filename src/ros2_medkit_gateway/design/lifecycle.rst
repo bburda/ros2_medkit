@@ -57,7 +57,7 @@ The lifecycle routes are registered **outside** the four-entity-type loop in
      // other; registration order within the loop is arbitrary.
      for (const auto & action :
           {"start", "restart", "force-restart", "shutdown", "force-shutdown"}) {
-       reg.put<http::NoContent>(base_lc + "/status/" + action, ...);
+       reg.put<http::Accepted<http::NoContent>>(base_lc + "/status/" + action, ...);
      }
      reg.get<dto::LifecycleStatusResponse>(base_lc + "/status", ...);
    }
@@ -138,7 +138,7 @@ It follows the same typed-DTO style as ``OperationProvider``.
    package "core/http/handlers/" {
        class LifecycleHandlers {
            + handle_get_status(req): Result<LifecycleStatusResponse>
-           + handle_transition(req, transition): Result<pair<NoContent, ResponseAttachments>>
+           + handle_transition(req, transition): Result<pair<Accepted<NoContent>, ResponseAttachments>>
            - ctx_: HandlerContext
            - plugin_mgr_: PluginManager*
        }
@@ -243,8 +243,8 @@ Transition Flow
    end
 
    provider --> handler : expected<monostate, ...> (success)
-   handler -> handler : build ResponseAttachments (202, Location header)
-   handler --> reg : pair<NoContent, ResponseAttachments>
+   handler -> handler : build ResponseAttachments (Location header only)
+   handler --> reg : pair<Accepted<NoContent>, ResponseAttachments>
    reg --> Client : 202 Accepted\nLocation: /api/v1/apps/{id}/status
 
    @enduml
@@ -254,6 +254,12 @@ pointing to ``GET /{entity}/{id}/status``. The client polls that endpoint to
 observe the state change. The provider is responsible for initiating the
 substrate-level operation (e.g., calling a ROS 2 lifecycle service or
 sending a signal to a process manager); it returns immediately on acceptance.
+
+The 202 is declared by the handler's return type
+(``http::Accepted<http::NoContent>``), not set at runtime, so the OpenAPI
+document and the wire status come from one place and cannot disagree. The
+``ResponseAttachments`` companion carries only the ``Location`` header. See
+:doc:`dto_contract` for the status-wrapper contract.
 
 SOVD Requirement Coverage
 --------------------------

@@ -38,7 +38,7 @@ class ScriptHandlers {
   ScriptHandlers(HandlerContext & ctx, ScriptManager * script_manager);
 
   /// POST /{entity}/scripts - multipart upload, returns 201 + Location.
-  http::Result<std::pair<dto::ScriptUploadResponse, http::ResponseAttachments>>
+  http::Result<std::pair<http::Created<dto::ScriptUploadResponse>, http::ResponseAttachments>>
   upload_script(const http::TypedRequest & req, const http::MultipartBody & body);
 
   /// GET /{entity}/scripts - list scripts, typed HATEOAS envelope.
@@ -51,7 +51,7 @@ class ScriptHandlers {
   http::Result<http::NoContent> delete_script(const http::TypedRequest & req);
 
   /// POST /{entity}/scripts/{script_id}/executions - start, returns 202 + Location.
-  http::Result<std::pair<dto::ScriptExecution, http::ResponseAttachments>>
+  http::Result<std::pair<http::Accepted<dto::ScriptExecution>, http::ResponseAttachments>>
   start_execution(const http::TypedRequest & req);
 
   /// GET /{entity}/scripts/{script_id}/executions/{execution_id} - get status.

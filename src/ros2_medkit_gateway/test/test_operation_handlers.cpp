@@ -900,10 +900,11 @@ TEST_F(OperationHandlersFixtureTest, UpdateExecutionStopReturnsAcceptedAndLocati
   auto goal_info = get_tracked_goal_or_fail(execution_id);
 
   if (result.has_value()) {
-    const auto & exec = result.value().first;
+    const auto & exec = result.value().first.value;
     const auto & att = result.value().second;
-    ASSERT_TRUE(att.status_override.has_value());
-    EXPECT_EQ(*att.status_override, 202);
+    // 202 is declared by the Accepted<> return type, not by a runtime override.
+    EXPECT_EQ(http::dto_alternate_status<decltype(result.value().first)>::value, 202);
+    EXPECT_FALSE(att.status_override.has_value());
     bool has_location = false;
     for (const auto & [k, v] : att.headers) {
       if (k == "Location") {

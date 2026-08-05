@@ -408,7 +408,7 @@ class ScriptHandlersErrorMappingTest : public ::testing::Test {
   }
 
   /// Helper: call start_execution with entity "ecu" and trigger the mock error.
-  http::Result<std::pair<dto::ScriptExecution, http::ResponseAttachments>>
+  http::Result<std::pair<http::Accepted<dto::ScriptExecution>, http::ResponseAttachments>>
   call_start_execution_with_error(ScriptBackendError err, httplib::Request & req_storage) {
     mock_provider_->succeed = false;
     mock_provider_->error_code = err;
@@ -515,8 +515,11 @@ TEST_F(ScriptHandlersErrorMappingTest, UploadReturns201WithLocation) {
   auto result = handlers_->upload_script(typed, body);
 
   ASSERT_TRUE(result.has_value());
-  const auto & [upload_resp, att] = result.value();
-  EXPECT_EQ(att.status_override.value_or(0), 201);
+  const auto & [created, att] = result.value();
+  const auto & upload_resp = created.value;
+  // 201 is declared by the Created<> return type, not by a runtime override.
+  EXPECT_EQ(http::dto_alternate_status<decltype(result.value().first)>::value, 201);
+  EXPECT_FALSE(att.status_override.has_value());
 
   // Location header is appended to ResponseAttachments::headers.
   bool found_location = false;
@@ -565,8 +568,11 @@ TEST_F(ScriptHandlersErrorMappingTest, StartExecutionReturns202WithLocation) {
   auto result = handlers_->start_execution(typed);
 
   ASSERT_TRUE(result.has_value());
-  const auto & [exec_dto, att] = result.value();
-  EXPECT_EQ(att.status_override.value_or(0), 202);
+  const auto & [accepted, att] = result.value();
+  const auto & exec_dto = accepted.value;
+  // 202 is declared by the Accepted<> return type, not by a runtime override.
+  EXPECT_EQ(http::dto_alternate_status<decltype(result.value().first)>::value, 202);
+  EXPECT_FALSE(att.status_override.has_value());
 
   bool found_location = false;
   for (const auto & [name, value] : att.headers) {

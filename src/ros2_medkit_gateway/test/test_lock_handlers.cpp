@@ -33,6 +33,7 @@
 #include "ros2_medkit_gateway/core/managers/lock_manager.hpp"
 #include "ros2_medkit_gateway/dto/locks.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
+#include "ros2_medkit_gateway/http/alternate_status.hpp"
 #include "ros2_medkit_gateway/http/typed_router.hpp"
 
 using json = nlohmann::json;
@@ -50,6 +51,7 @@ using ros2_medkit_gateway::handlers::LockHandlers;
 using ros2_medkit_gateway::http::TypedRequest;
 
 namespace dto = ros2_medkit_gateway::dto;
+namespace http = ros2_medkit_gateway::http;
 
 namespace {
 
@@ -290,12 +292,14 @@ TEST_F(LockHandlersTest, AcquireLockOnComponentReturns201) {
 
   auto result = handlers_->post_lock(typed_req, body);
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->second.status_override.value_or(0), 201);
+  // 201 is declared by the Created<> return type, not by a runtime override.
+  EXPECT_EQ(http::dto_alternate_status<decltype(result->first)>::value, 201);
+  EXPECT_FALSE(result->second.status_override.has_value());
   // Location header set to <request-path>/<lock-id>
   ASSERT_FALSE(result->second.headers.empty());
   EXPECT_EQ(result->second.headers[0].first, "Location");
 
-  const auto & lock = result->first;
+  const auto & lock = result->first.value;
   EXPECT_FALSE(lock.id.empty());
   EXPECT_TRUE(lock.owned);
   EXPECT_FALSE(lock.lock_expiration.empty());
@@ -319,9 +323,11 @@ TEST_F(LockHandlersTest, AcquireLockOnAppReturns201) {
 
   auto result = handlers_->post_lock(typed_req, body);
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->second.status_override.value_or(0), 201);
+  // 201 is declared by the Created<> return type, not by a runtime override.
+  EXPECT_EQ(http::dto_alternate_status<decltype(result->first)>::value, 201);
+  EXPECT_FALSE(result->second.status_override.has_value());
 
-  const auto & lock = result->first;
+  const auto & lock = result->first.value;
   EXPECT_FALSE(lock.id.empty());
   EXPECT_TRUE(lock.owned);
   ASSERT_TRUE(lock.scopes.has_value());
@@ -557,7 +563,7 @@ TEST_F(LockHandlersTest, GetLockReturns200) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // Get the lock
   httplib::Request req;
@@ -597,7 +603,7 @@ TEST_F(LockHandlersTest, ExtendLockReturns204) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // Extend
   httplib::Request req;
@@ -621,7 +627,7 @@ TEST_F(LockHandlersTest, ExtendLockNotOwnerReturns403) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // Try to extend as client_b - should fail with 403
   httplib::Request req;
@@ -647,7 +653,7 @@ TEST_F(LockHandlersTest, ExtendLockWithoutClientIdReturns400) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // No X-Client-Id header
   httplib::Request req;
@@ -676,7 +682,7 @@ TEST_F(LockHandlersTest, ReleaseLockReturns204) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // Release
   httplib::Request req;
@@ -702,7 +708,7 @@ TEST_F(LockHandlersTest, ReleaseLockNotOwnerReturns403) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // Try to release as client_b - should fail with 403
   httplib::Request req;
@@ -755,8 +761,10 @@ TEST_F(LockHandlersTest, AcquireLockOnAppPathReturns201) {
 
   auto result = handlers_->post_lock(typed_req, body);
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->second.status_override.value_or(0), 201);
-  const auto & lock = result->first;
+  // 201 is declared by the Created<> return type, not by a runtime override.
+  EXPECT_EQ(http::dto_alternate_status<decltype(result->first)>::value, 201);
+  EXPECT_FALSE(result->second.status_override.has_value());
+  const auto & lock = result->first.value;
   EXPECT_TRUE(lock.owned);
   ASSERT_TRUE(lock.scopes.has_value());
   EXPECT_EQ(lock.scopes->size(), 2u);
@@ -793,7 +801,7 @@ TEST_F(LockHandlersTest, GetLockOnAppPathReturns200) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // Get
   httplib::Request req;
@@ -815,7 +823,7 @@ TEST_F(LockHandlersTest, ExtendLockOnAppPathReturns204) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // Extend
   httplib::Request req;
@@ -839,7 +847,7 @@ TEST_F(LockHandlersTest, ReleaseLockOnAppPathReturns204) {
   acquire_body.lock_expiration = 300;
   auto acquire_res = handlers_->post_lock(acquire_typed, acquire_body);
   ASSERT_TRUE(acquire_res.has_value());
-  const std::string lock_id = acquire_res->first.id;
+  const std::string lock_id = acquire_res->first.value.id;
 
   // Release
   httplib::Request req;
@@ -877,8 +885,9 @@ TEST_F(LockHandlersTest, AcquireLockWithBreakReplacesExisting) {
   auto res2 = handlers_->post_lock(typed_req2, body2);
 
   ASSERT_TRUE(res2.has_value());
-  EXPECT_EQ(res2->second.status_override.value_or(0), 201);
-  EXPECT_TRUE(res2->first.owned);
+  EXPECT_EQ(http::dto_alternate_status<decltype(res2->first)>::value, 201);
+  EXPECT_FALSE(res2->second.status_override.has_value());
+  EXPECT_TRUE(res2->first.value.owned);
 }
 
 int main(int argc, char ** argv) {

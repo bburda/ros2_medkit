@@ -62,11 +62,11 @@ class LockHandlers {
    *
    * Request body: `AcquireLockRequest` (validated at framework level).
    * Requires X-Client-Id header.
-   * On success returns the new `Lock` body with a 201 status override and a
+   * On success returns the new `Lock` body as 201 Created plus a
    * `Location: <request-path>/<lock-id>` header.
    */
-  http::Result<std::pair<dto::Lock, http::ResponseAttachments>> post_lock(const http::TypedRequest & req,
-                                                                          dto::AcquireLockRequest body);
+  http::Result<std::pair<http::Created<dto::Lock>, http::ResponseAttachments>> post_lock(const http::TypedRequest & req,
+                                                                                         dto::AcquireLockRequest body);
 
   /**
    * @brief GET /{entity_type}/{entity_id}/locks - list locks on entity.

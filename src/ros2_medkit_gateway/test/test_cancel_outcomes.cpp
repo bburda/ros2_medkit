@@ -515,10 +515,11 @@ TEST_F(CancelOutcomesFixtureTest, PutStopTimeoutWithCancelingStatusReturns202) {
 
   ASSERT_TRUE(result.has_value()) << "stop must reconcile against the status stream: " << result.error().code << ": "
                                   << result.error().message;
-  const auto & att = result.value().second;
-  ASSERT_TRUE(att.status_override.has_value());
-  EXPECT_EQ(*att.status_override, 202);
-  EXPECT_EQ(result.value().first.status, "running");
+  // The 202 is carried by the return type, not by an attachment: the router
+  // reads dto_alternate_status<Accepted<T>>, so the handler sets no override.
+  static_assert(http::dto_alternate_status<http::Accepted<dto::OperationExecution>>::value == 202);
+  EXPECT_FALSE(result.value().second.status_override.has_value());
+  EXPECT_EQ(result.value().first.value.status, "running");
   EXPECT_EQ(tracked_status_or_fail(), ActionGoalStatus::CANCELING);
 }
 
@@ -584,13 +585,13 @@ TEST_F(CancelOutcomesFixtureTest, PutStopReconciledBodyStatusAgreesWithGetExecut
 
   ASSERT_TRUE(result.has_value()) << "stop must reconcile against the status stream: " << result.error().code << ": "
                                   << result.error().message;
-  ASSERT_TRUE(result.value().second.status_override.has_value());
-  EXPECT_EQ(*result.value().second.status_override, 202);
+  static_assert(http::dto_alternate_status<http::Accepted<dto::OperationExecution>>::value == 202);
+  EXPECT_FALSE(result.value().second.status_override.has_value());
 
   auto get_typed = make_execution_request();
   auto exec = handlers_->get_execution(get_typed);
   ASSERT_TRUE(exec.has_value());
-  EXPECT_EQ(result.value().first.status, exec->status)
+  EXPECT_EQ(result.value().first.value.status, exec->status)
       << "the 202 body contradicts an immediate GET of the same execution";
 }
 

@@ -67,6 +67,29 @@ static_assert(kValidatorVariantOrderingOk<void>, "ErrorInfo must be the first va
 template <class T>
 using ValidatorResult = tl::expected<T, std::variant<ErrorInfo, Forwarded>>;
 
+/// Carries a response's HTTP status in its type, so the route registry derives
+/// the declared status from the handler's signature and the document cannot
+/// drift from the wire.
+///
+/// Needed where the payload type does not imply the status on its own: a
+/// `dto::Trigger` is a 201 body when created and a 200 body when read, so the
+/// status cannot live on the DTO. Wrapping is what distinguishes the two.
+///
+/// The registry never introspects the wrapper - it asks
+/// `dto_alternate_status<T>` for the status and `status_payload_t<T>` for the
+/// schema, the serializer and the static assertions.
+template <class T>
+struct Created {
+  T value;
+};
+
+/// See Created. Declares 202 Accepted. `Accepted<NoContent>` is the shape for
+/// an asynchronous transition that returns no body.
+template <class T>
+struct Accepted {
+  T value;
+};
+
 /// Side-channel a handler can attach to its successful response when the
 /// default "200 OK + DTO body" is not enough. Examples:
 ///   - 201 Created with a `Location` header for POST creating a resource.
