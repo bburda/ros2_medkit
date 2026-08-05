@@ -54,6 +54,28 @@ enum class ErrorRenderer {
   kOAuth2Error,       ///< RFC 6749 §5.2 `{"error","error_description"}`
 };
 
+/// Availability guard for a route whose backing feature can be absent.
+///
+/// The framework evaluates `available` once per request from *inside* the
+/// typed wrapper - after the request body has been parsed - so a malformed
+/// body sent to a gated-off route still answers 400 rather than the gate's
+/// status. `unavailable` is rendered through the route's `ErrorRenderer`, so
+/// the wire shape is identical to the same `ErrorInfo` returned by the handler.
+struct RouteGate {
+  /// Re-evaluated per request: the manager backing a feature can appear after
+  /// the route is registered, so a value snapshotted at registration would be
+  /// permanently wrong.
+  std::function<bool()> available;
+  /// Returned when `available()` is false.
+  ErrorInfo unavailable;
+};
+
+/// Shared handle to a route's gate. An empty optional means "no gate". Held by
+/// shared_ptr for the same reason as `ErrorRenderer`: the typed wrapper closure
+/// captures the handle when the route is registered and must observe a
+/// `.gated_on(...)` applied to the returned `RouteEntry` afterwards.
+using GateHandle = std::shared_ptr<std::optional<RouteGate>>;
+
 /// Fluent builder for a single route entry.
 class RouteEntry {
  public:
@@ -124,6 +146,20 @@ class RouteEntry {
   /// suppresses the blanket 400/404/500 injection.
   RouteEntry & only_status(int code, const std::string & desc);
 
+  /// Guard this route with an availability predicate **and** declare the status
+  /// the guard returns, in one call. A feature gate written as an inline
+  /// `if (!handlers_) return tl::unexpected(...)` inside the handler lambda is
+  /// invisible to the document generator; expressed here it is not.
+  ///
+  /// `available` is re-evaluated per request (see `RouteGate`). `unavailable`
+  /// is rendered through this route's `ErrorRenderer` from inside the typed
+  /// wrapper, after body parsing, so a malformed body still answers 400.
+  ///
+  /// The status is declared via `errors()`, which means a sub-400
+  /// `unavailable.http_status` is rejected and surfaced by
+  /// `validate_completeness()` rather than silently published.
+  RouteEntry & gated_on(std::function<bool()> available, ErrorInfo unavailable);
+
   /// Hide this route from the OpenAPI spec output.
   /// The route is still registered with cpp-httplib and serves HTTP requests,
   /// but it won't appear in the generated spec or client code.
@@ -159,6 +195,11 @@ class RouteEntry {
   /// Heap-allocated so the typed wrapper closure can hold a stable handle to
   /// the renderer choice and observe later `.error_renderer(...)` updates.
   std::shared_ptr<ErrorRenderer> error_renderer_{std::make_shared<ErrorRenderer>(ErrorRenderer::kSovdGenericError)};
+
+  /// Heap-allocated for the same reason as `error_renderer_`: the typed wrapper
+  /// closure captures this handle at registration time, and `.gated_on(...)` is
+  /// called on the `RouteEntry` the registration returned - i.e. afterwards.
+  GateHandle gate_{std::make_shared<std::optional<RouteGate>>()};
 
   struct ResponseInfo {
     std::string desc;
@@ -462,35 +503,43 @@ class RouteRegistry {
   static void write_typed_error(httplib::Response & res, const ErrorInfo & err,
                                 const std::shared_ptr<ErrorRenderer> & renderer_ptr);
 
+  /// Evaluate a route's gate. When the route is gated off this renders the
+  /// gate's `ErrorInfo` through `renderer` and returns true, meaning the
+  /// handler must not run. Every typed wrapper calls it at the point the
+  /// hand-written `if (!handlers_)` guard used to sit: after the request body
+  /// has been parsed, so a malformed body still answers 400.
+  static bool gate_blocked(httplib::Response & res, const GateHandle & gate,
+                           const std::shared_ptr<ErrorRenderer> & renderer);
+
   /// Build the body-less typed HandlerFn (GET/DELETE/SSE-factory-style).
   template <class TResponse>
   static HandlerFn wrap_body_less(std::function<http::Result<TResponse>(http::TypedRequest)> handler,
-                                  std::shared_ptr<ErrorRenderer> renderer);
+                                  std::shared_ptr<ErrorRenderer> renderer, GateHandle gate);
 
   /// Build the body-less typed HandlerFn whose return type is
   /// `Result<pair<T, ResponseAttachments>>`.
   template <class TResponse>
   static HandlerFn wrap_body_less_with_attachments(
       std::function<http::Result<std::pair<TResponse, http::ResponseAttachments>>(http::TypedRequest)> handler,
-      std::shared_ptr<ErrorRenderer> renderer);
+      std::shared_ptr<ErrorRenderer> renderer, GateHandle gate);
 
   /// Build the body-bearing typed HandlerFn.
   template <class TBody, class TResponse>
   static HandlerFn wrap_with_body(std::function<http::Result<TResponse>(http::TypedRequest, TBody)> handler,
-                                  std::shared_ptr<ErrorRenderer> renderer);
+                                  std::shared_ptr<ErrorRenderer> renderer, GateHandle gate);
 
   /// Build the body-bearing typed HandlerFn whose return type carries
   /// ResponseAttachments.
   template <class TBody, class TResponse>
   static HandlerFn wrap_with_body_attachments(
       std::function<http::Result<std::pair<TResponse, http::ResponseAttachments>>(http::TypedRequest, TBody)> handler,
-      std::shared_ptr<ErrorRenderer> renderer);
+      std::shared_ptr<ErrorRenderer> renderer, GateHandle gate);
 
   /// Build the alternates-returning HandlerFn (POST flavour).
   template <class TBody, class... TAlt>
   static HandlerFn
   wrap_post_alternates(std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest, TBody)> handler,
-                       std::shared_ptr<ErrorRenderer> renderer);
+                       std::shared_ptr<ErrorRenderer> renderer, GateHandle gate);
 
   /// Build the alternates+attachments HandlerFn (POST flavour). The active
   /// alternative drives the default status via `dto_alternate_status`; the
@@ -501,12 +550,12 @@ class RouteRegistry {
       std::function<http::Result<std::pair<std::variant<TAlt...>, http::ResponseAttachments>>(http::TypedRequest,
                                                                                               TBody)>
           handler,
-      std::shared_ptr<ErrorRenderer> renderer);
+      std::shared_ptr<ErrorRenderer> renderer, GateHandle gate);
 
   /// Build the alternates-returning HandlerFn (DELETE flavour).
   template <class... TAlt>
   static HandlerFn wrap_del_alternates(std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest)> handler,
-                                       std::shared_ptr<ErrorRenderer> renderer);
+                                       std::shared_ptr<ErrorRenderer> renderer, GateHandle gate);
 };
 
 // =============================================================================
@@ -602,14 +651,17 @@ void RouteRegistry::write_success_body(httplib::Response & res, const TResponse 
 
 template <class TResponse>
 HandlerFn RouteRegistry::wrap_body_less(std::function<http::Result<TResponse>(http::TypedRequest)> handler,
-                                        std::shared_ptr<ErrorRenderer> renderer) {
-  return [handler = std::move(handler), renderer = std::move(renderer)](const httplib::Request & req,
-                                                                        httplib::Response & res) {
+                                        std::shared_ptr<ErrorRenderer> renderer, GateHandle gate) {
+  return [handler = std::move(handler), renderer = std::move(renderer),
+          gate = std::move(gate)](const httplib::Request & req, httplib::Response & res) {
     // The forwarding scope makes the typed `validate_entity_for_route`
     // overload able to stream the proxied response body to `res` when an
     // entity is owned by a remote peer. Handlers never see the response, so
     // the framework installs the channel around the handler invocation.
     http::detail::ForwardResponseScope forward_scope(&res);
+    if (gate_blocked(res, gate, renderer)) {
+      return;
+    }
     http::TypedRequest typed_req(req);
     auto outcome = handler(typed_req);
     if (outcome.has_value()) {
@@ -623,10 +675,13 @@ HandlerFn RouteRegistry::wrap_body_less(std::function<http::Result<TResponse>(ht
 template <class TResponse>
 HandlerFn RouteRegistry::wrap_body_less_with_attachments(
     std::function<http::Result<std::pair<TResponse, http::ResponseAttachments>>(http::TypedRequest)> handler,
-    std::shared_ptr<ErrorRenderer> renderer) {
-  return [handler = std::move(handler), renderer = std::move(renderer)](const httplib::Request & req,
-                                                                        httplib::Response & res) {
+    std::shared_ptr<ErrorRenderer> renderer, GateHandle gate) {
+  return [handler = std::move(handler), renderer = std::move(renderer),
+          gate = std::move(gate)](const httplib::Request & req, httplib::Response & res) {
     http::detail::ForwardResponseScope forward_scope(&res);
+    if (gate_blocked(res, gate, renderer)) {
+      return;
+    }
     http::TypedRequest typed_req(req);
     auto outcome = handler(typed_req);
     if (outcome.has_value()) {
@@ -645,9 +700,9 @@ HandlerFn RouteRegistry::wrap_body_less_with_attachments(
 
 template <class TBody, class TResponse>
 HandlerFn RouteRegistry::wrap_with_body(std::function<http::Result<TResponse>(http::TypedRequest, TBody)> handler,
-                                        std::shared_ptr<ErrorRenderer> renderer) {
-  return [handler = std::move(handler), renderer = std::move(renderer)](const httplib::Request & req,
-                                                                        httplib::Response & res) {
+                                        std::shared_ptr<ErrorRenderer> renderer, GateHandle gate) {
+  return [handler = std::move(handler), renderer = std::move(renderer),
+          gate = std::move(gate)](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope: lets the typed validate_entity_for_route stream a
     // proxied response when the entity is owned by a remote peer (see
     // wrap_body_less). Without it, remote-entity writes return Forwarded with
@@ -656,6 +711,12 @@ HandlerFn RouteRegistry::wrap_with_body(std::function<http::Result<TResponse>(ht
     auto body = detail::parse_request_body<TBody>(req);
     if (!body.has_value()) {
       write_typed_error(res, body.error(), renderer);
+      return;
+    }
+    // Deliberately after the body parse: a malformed payload sent to a route
+    // whose feature is off is still a malformed payload, and answering 501
+    // there would hide the client's own bug.
+    if (gate_blocked(res, gate, renderer)) {
       return;
     }
     http::TypedRequest typed_req(req);
@@ -671,14 +732,18 @@ HandlerFn RouteRegistry::wrap_with_body(std::function<http::Result<TResponse>(ht
 template <class TBody, class TResponse>
 HandlerFn RouteRegistry::wrap_with_body_attachments(
     std::function<http::Result<std::pair<TResponse, http::ResponseAttachments>>(http::TypedRequest, TBody)> handler,
-    std::shared_ptr<ErrorRenderer> renderer) {
-  return [handler = std::move(handler), renderer = std::move(renderer)](const httplib::Request & req,
-                                                                        httplib::Response & res) {
+    std::shared_ptr<ErrorRenderer> renderer, GateHandle gate) {
+  return [handler = std::move(handler), renderer = std::move(renderer),
+          gate = std::move(gate)](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope for remote-peer entities (see wrap_body_less / wrap_with_body).
     http::detail::ForwardResponseScope forward_scope(&res);
     auto body = detail::parse_request_body<TBody>(req);
     if (!body.has_value()) {
       write_typed_error(res, body.error(), renderer);
+      return;
+    }
+    // Gate after the body parse (see wrap_with_body).
+    if (gate_blocked(res, gate, renderer)) {
       return;
     }
     http::TypedRequest typed_req(req);
@@ -700,14 +765,18 @@ HandlerFn RouteRegistry::wrap_with_body_attachments(
 template <class TBody, class... TAlt>
 HandlerFn RouteRegistry::wrap_post_alternates(
     std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest, TBody)> handler,
-    std::shared_ptr<ErrorRenderer> renderer) {
-  return [handler = std::move(handler), renderer = std::move(renderer)](const httplib::Request & req,
-                                                                        httplib::Response & res) {
+    std::shared_ptr<ErrorRenderer> renderer, GateHandle gate) {
+  return [handler = std::move(handler), renderer = std::move(renderer),
+          gate = std::move(gate)](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope for remote-peer entities (see wrap_body_less / wrap_with_body).
     http::detail::ForwardResponseScope forward_scope(&res);
     auto body = detail::parse_request_body<TBody>(req);
     if (!body.has_value()) {
       write_typed_error(res, body.error(), renderer);
+      return;
+    }
+    // Gate after the body parse (see wrap_with_body).
+    if (gate_blocked(res, gate, renderer)) {
       return;
     }
     http::TypedRequest typed_req(req);
@@ -730,14 +799,18 @@ template <class TBody, class... TAlt>
 HandlerFn RouteRegistry::wrap_post_alternates_with_attachments(
     std::function<http::Result<std::pair<std::variant<TAlt...>, http::ResponseAttachments>>(http::TypedRequest, TBody)>
         handler,
-    std::shared_ptr<ErrorRenderer> renderer) {
-  return [handler = std::move(handler), renderer = std::move(renderer)](const httplib::Request & req,
-                                                                        httplib::Response & res) {
+    std::shared_ptr<ErrorRenderer> renderer, GateHandle gate) {
+  return [handler = std::move(handler), renderer = std::move(renderer),
+          gate = std::move(gate)](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope for remote-peer entities (see wrap_body_less / wrap_with_body).
     http::detail::ForwardResponseScope forward_scope(&res);
     auto body = detail::parse_request_body<TBody>(req);
     if (!body.has_value()) {
       write_typed_error(res, body.error(), renderer);
+      return;
+    }
+    // Gate after the body parse (see wrap_with_body).
+    if (gate_blocked(res, gate, renderer)) {
       return;
     }
     http::TypedRequest typed_req(req);
@@ -762,11 +835,14 @@ HandlerFn RouteRegistry::wrap_post_alternates_with_attachments(
 template <class... TAlt>
 HandlerFn
 RouteRegistry::wrap_del_alternates(std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest)> handler,
-                                   std::shared_ptr<ErrorRenderer> renderer) {
-  return [handler = std::move(handler), renderer = std::move(renderer)](const httplib::Request & req,
-                                                                        httplib::Response & res) {
+                                   std::shared_ptr<ErrorRenderer> renderer, GateHandle gate) {
+  return [handler = std::move(handler), renderer = std::move(renderer),
+          gate = std::move(gate)](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope for remote-peer entities (see wrap_body_less / wrap_with_body).
     http::detail::ForwardResponseScope forward_scope(&res);
+    if (gate_blocked(res, gate, renderer)) {
+      return;
+    }
     http::TypedRequest typed_req(req);
     auto outcome = handler(typed_req);
     if (outcome.has_value()) {
@@ -794,7 +870,7 @@ RouteEntry & RouteRegistry::get(const std::string & openapi_path,
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed get<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("get", openapi_path, /*placeholder*/ HandlerFn{});
-  entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
         http::dto_alternate_status<TResponse>::value,
@@ -814,7 +890,7 @@ RouteEntry & RouteRegistry::get(
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed get<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("get", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
         http::dto_alternate_status<TResponse>::value,
@@ -834,7 +910,7 @@ RouteEntry & RouteRegistry::post(const std::string & openapi_path,
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed post<TB,T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
@@ -856,7 +932,7 @@ RouteEntry & RouteRegistry::post(
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed post<TB,T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
@@ -876,7 +952,7 @@ RouteEntry & RouteRegistry::post(const std::string & openapi_path,
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed post<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   // No automatic request_body schema: body-less typed POST is reserved for
   // routes that parse the body manually (e.g. form-urlencoded auth endpoints).
   // Callers attach an explicit `.request_body(...)` to populate the OpenAPI
@@ -900,7 +976,7 @@ RouteEntry & RouteRegistry::post(
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed post<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
         http::dto_alternate_status<TResponse>::value,
@@ -920,7 +996,7 @@ RouteEntry & RouteRegistry::put(const std::string & openapi_path,
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed put<TB,T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("put", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
@@ -942,7 +1018,7 @@ RouteEntry & RouteRegistry::put(
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed put<TB,T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("put", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
@@ -962,7 +1038,7 @@ RouteEntry & RouteRegistry::put(const std::string & openapi_path,
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed put<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("put", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   // No automatic request_body schema: body-less typed PUT is reserved for
   // routes that take no payload at all (e.g. /updates/{id}/prepare).
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
@@ -984,7 +1060,7 @@ RouteEntry & RouteRegistry::put(
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed put<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("put", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
         http::dto_alternate_status<TResponse>::value,
@@ -1004,7 +1080,7 @@ RouteEntry & RouteRegistry::patch(const std::string & openapi_path,
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed patch<TB,T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("patch", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
@@ -1026,7 +1102,7 @@ RouteEntry & RouteRegistry::patch(
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed patch<TB,T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("patch", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
@@ -1046,7 +1122,7 @@ RouteEntry & RouteRegistry::del(const std::string & openapi_path,
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed del<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("delete", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
         http::dto_alternate_status<TResponse>::value,
@@ -1066,7 +1142,7 @@ RouteEntry & RouteRegistry::del(
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed del<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("delete", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
     entry.template response<http::status_payload_t<TResponse>>(
         http::dto_alternate_status<TResponse>::value,
@@ -1101,7 +1177,7 @@ RouteRegistry::post_alternates(const std::string & openapi_path,
                                std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest, TBody)> handler) {
   static_assert(dto::is_dto_v<TBody>, "post_alternates: TBody must be a DTO");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_post_alternates<TBody, TAlt...>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_post_alternates<TBody, TAlt...>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
   (detail::add_alternate_response<TAlt>(entry), ...);
   entry.mark_alternates();
@@ -1115,7 +1191,8 @@ RouteEntry & RouteRegistry::post_alternates(
         handler) {
   static_assert(dto::is_dto_v<TBody>, "post_alternates: TBody must be a DTO");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_post_alternates_with_attachments<TBody, TAlt...>(std::move(handler), entry.error_renderer_);
+  entry.handler_ =
+      wrap_post_alternates_with_attachments<TBody, TAlt...>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
   (detail::add_alternate_response<TAlt>(entry), ...);
   entry.mark_alternates();
@@ -1127,7 +1204,7 @@ RouteEntry &
 RouteRegistry::del_alternates(const std::string & openapi_path,
                               std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest)> handler) {
   auto & entry = add_route("delete", openapi_path, HandlerFn{});
-  entry.handler_ = wrap_del_alternates<TAlt...>(std::move(handler), entry.error_renderer_);
+  entry.handler_ = wrap_del_alternates<TAlt...>(std::move(handler), entry.error_renderer_, entry.gate_);
   (detail::add_alternate_response<TAlt>(entry), ...);
   entry.mark_alternates();
   return entry;
@@ -1147,9 +1224,13 @@ RouteEntry & RouteRegistry::multipart_upload(
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "multipart_upload<T>: T must be a DTO (or NoContent)");
   auto renderer = std::make_shared<ErrorRenderer>(ErrorRenderer::kSovdGenericError);
-  HandlerFn fn = [handler = std::move(handler), renderer](const httplib::Request & req, httplib::Response & res) {
+  auto gate = std::make_shared<std::optional<RouteGate>>();
+  HandlerFn fn = [handler = std::move(handler), renderer, gate](const httplib::Request & req, httplib::Response & res) {
     // Forwarding scope for remote-peer entities (see wrap_body_less / wrap_with_body).
     http::detail::ForwardResponseScope forward_scope(&res);
+    if (gate_blocked(res, gate, renderer)) {
+      return;
+    }
     http::MultipartBody body;
     // body.parts default-constructs empty; the loop below populates it from req.files.
     // cpp-httplib exposes parsed multipart entries via `req.files`; surface
@@ -1181,6 +1262,7 @@ RouteEntry & RouteRegistry::multipart_upload(
   };
   auto & entry = add_route("post", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
+  entry.gate_ = gate;
   entry.request_body("Multipart upload", nlohmann::json{{"type", "object"}, {"additionalProperties", true}},
                      "multipart/form-data");
   if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {

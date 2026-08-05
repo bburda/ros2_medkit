@@ -620,7 +620,9 @@ void RESTServer::setup_routes() {
         .request_body("Data value to write", SB::ref("DataWriteRequest"))
         .operation_id(std::string("put") + capitalize(et.singular) + "DataItem");
 
-    // Data-categories (returns 501 - not yet implemented)
+    // Data-categories. Unconditionally 501: `only_status` drops both the
+    // fabricated 200 (the DataValue return type is a placeholder the handler
+    // never produces) and the blanket 400/404/500 the route cannot emit either.
     reg.get<dto::DataValue>(entity_path + "/data-categories",
                             [this](http::TypedRequest req) -> http::Result<dto::DataValue> {
                               return data_handlers_->data_categories(req);
@@ -628,9 +630,10 @@ void RESTServer::setup_routes() {
         .tag("Data")
         .summary(std::string("List data categories for ") + et.singular)
         .description(std::string("Lists available data categories for this ") + et.singular + ".")
+        .only_status(501, "Data categories are not implemented for ROS 2")
         .operation_id(std::string("list") + capitalize(et.singular) + "DataCategories");
 
-    // Data-groups (returns 501 - not yet implemented)
+    // Data-groups. Unconditionally 501 (see data-categories above).
     reg.get<dto::DataValue>(entity_path + "/data-groups",
                             [this](http::TypedRequest req) -> http::Result<dto::DataValue> {
                               return data_handlers_->data_groups(req);
@@ -638,6 +641,7 @@ void RESTServer::setup_routes() {
         .tag("Data")
         .summary(std::string("List data groups for ") + et.singular)
         .description(std::string("Lists available data groups for this ") + et.singular + ".")
+        .only_status(501, "Data groups are not implemented for ROS 2")
         .operation_id(std::string("list") + capitalize(et.singular) + "DataGroups");
 
     // Data collection (all topics). Returns the opaque `DataListResult` envelope
@@ -1033,97 +1037,84 @@ void RESTServer::setup_routes() {
     // attachments variant to emit 201 without re-introducing httplib::Response.
     // The SSE event-stream uses the `reg.sse<>` escape hatch.
     //
-    // Triggers can be optional: if the manager is absent, the typed handler
-    // wrappers below return a 501 ErrorInfo so the wire shape matches the
-    // legacy "Triggers not available" SOVD GenericError exactly.
+    // Triggers can be optional: if the manager is absent, `.gated_on(...)`
+    // short-circuits the route with the "Triggers not available" SOVD
+    // GenericError. Expressing the gate on the registration instead of inside
+    // each lambda is what puts the 501 into the generated document.
     {
-      auto make_not_available_error = []() {
-        ErrorInfo err;
-        err.code = ERR_NOT_IMPLEMENTED;
-        err.message = "Triggers not available";
-        err.http_status = 501;
-        return err;
+      auto triggers_available = [this] {
+        return trigger_handlers_ != nullptr;
       };
+      ErrorInfo triggers_unavailable;
+      triggers_unavailable.code = ERR_NOT_IMPLEMENTED;
+      triggers_unavailable.message = "Triggers not available";
+      triggers_unavailable.http_status = 501;
 
       // SSE events stream - registered before CRUD routes so the more specific
       // path takes precedence in cpp-httplib's first-match routing.
       reg.sse(entity_path + "/triggers/{trigger_id}/events",
-              [this, make_not_available_error](http::TypedRequest req) -> http::Result<http::SseStream> {
-                if (!trigger_handlers_) {
-                  return tl::unexpected(make_not_available_error());
-                }
+              [this](http::TypedRequest req) -> http::Result<http::SseStream> {
                 return trigger_handlers_->sse_trigger_events(req);
               })
           .tag("Triggers")
           .summary(std::string("SSE events stream for trigger on ") + et.singular)
           .description(std::string("Server-Sent Events stream for trigger notifications on this ") + et.singular + ".")
+          .gated_on(triggers_available, triggers_unavailable)
           .operation_id(std::string("stream") + capitalize(et.singular) + "TriggerEvents");
 
       reg.post<dto::TriggerCreateRequest, http::Created<dto::Trigger>>(
              entity_path + "/triggers",
-             [this, make_not_available_error](
-                 http::TypedRequest req, dto::TriggerCreateRequest body) -> http::Result<http::Created<dto::Trigger>> {
-               if (!trigger_handlers_) {
-                 return tl::unexpected(make_not_available_error());
-               }
+             [this](http::TypedRequest req,
+                    dto::TriggerCreateRequest body) -> http::Result<http::Created<dto::Trigger>> {
                return trigger_handlers_->post_trigger(req, std::move(body));
              })
           .tag("Triggers")
           .summary(std::string("Create trigger for ") + et.singular)
           .description(std::string("Creates a new event trigger for this ") + et.singular + ".")
           .success_description("Trigger created")
+          .gated_on(triggers_available, triggers_unavailable)
           .operation_id(std::string("create") + capitalize(et.singular) + "Trigger");
 
       reg.get<dto::Collection<dto::Trigger>>(
              entity_path + "/triggers",
-             [this, make_not_available_error](http::TypedRequest req) -> http::Result<dto::Collection<dto::Trigger>> {
-               if (!trigger_handlers_) {
-                 return tl::unexpected(make_not_available_error());
-               }
+             [this](http::TypedRequest req) -> http::Result<dto::Collection<dto::Trigger>> {
                return trigger_handlers_->get_triggers(req);
              })
           .tag("Triggers")
           .summary(std::string("List triggers for ") + et.singular)
           .description(std::string("Lists all triggers configured for this ") + et.singular + ".")
+          .gated_on(triggers_available, triggers_unavailable)
           .operation_id(std::string("list") + capitalize(et.singular) + "Triggers");
 
       reg.get<dto::Trigger>(entity_path + "/triggers/{trigger_id}",
-                            [this, make_not_available_error](http::TypedRequest req) -> http::Result<dto::Trigger> {
-                              if (!trigger_handlers_) {
-                                return tl::unexpected(make_not_available_error());
-                              }
+                            [this](http::TypedRequest req) -> http::Result<dto::Trigger> {
                               return trigger_handlers_->get_trigger(req);
                             })
           .tag("Triggers")
           .summary(std::string("Get trigger for ") + et.singular)
           .description(std::string("Returns details of a specific trigger on this ") + et.singular + ".")
+          .gated_on(triggers_available, triggers_unavailable)
           .operation_id(std::string("get") + capitalize(et.singular) + "Trigger");
 
       reg.put<dto::TriggerUpdateRequest, dto::Trigger>(
              entity_path + "/triggers/{trigger_id}",
-             [this, make_not_available_error](http::TypedRequest req,
-                                              dto::TriggerUpdateRequest body) -> http::Result<dto::Trigger> {
-               if (!trigger_handlers_) {
-                 return tl::unexpected(make_not_available_error());
-               }
+             [this](http::TypedRequest req, dto::TriggerUpdateRequest body) -> http::Result<dto::Trigger> {
                return trigger_handlers_->put_trigger(req, body);
              })
           .tag("Triggers")
           .summary(std::string("Update trigger for ") + et.singular)
           .description(std::string("Updates a trigger configuration on this ") + et.singular + ".")
+          .gated_on(triggers_available, triggers_unavailable)
           .operation_id(std::string("update") + capitalize(et.singular) + "Trigger");
 
-      reg.del<http::NoContent>(
-             entity_path + "/triggers/{trigger_id}",
-             [this, make_not_available_error](http::TypedRequest req) -> http::Result<http::NoContent> {
-               if (!trigger_handlers_) {
-                 return tl::unexpected(make_not_available_error());
-               }
-               return trigger_handlers_->del_trigger(req);
-             })
+      reg.del<http::NoContent>(entity_path + "/triggers/{trigger_id}",
+                               [this](http::TypedRequest req) -> http::Result<http::NoContent> {
+                                 return trigger_handlers_->del_trigger(req);
+                               })
           .tag("Triggers")
           .summary(std::string("Delete trigger for ") + et.singular)
           .description(std::string("Deletes a trigger from this ") + et.singular + ".")
+          .gated_on(triggers_available, triggers_unavailable)
           .operation_id(std::string("delete") + capitalize(et.singular) + "Trigger");
     }
 
@@ -1147,6 +1138,9 @@ void RESTServer::setup_routes() {
           .tag("Subscriptions")
           .summary(std::string("SSE events stream for cyclic subscription on ") + et.singular)
           .description(std::string("Server-Sent Events stream for subscription data on this ") + et.singular + ".")
+          // Non-HTTP transports (MQTT, WebSocket, Zenoh) cannot produce an HTTP
+          // stream: SubscriptionTransportProvider::make_sse_stream answers 501.
+          .errors({501})
           .operation_id(std::string("stream") + capitalize(et.singular) + "SubscriptionEvents");
 
       reg.post<dto::CyclicSubscriptionCreateRequest, http::Created<dto::CyclicSubscription>>(
@@ -1222,6 +1216,7 @@ void RESTServer::setup_routes() {
           .description(std::string("Acquires an exclusive lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
           .success_description("Lock acquired")
+          .errors({501})  // Locking disabled: LockHandlers::check_locking_enabled
           .operation_id(std::string("acquire") + capitalize(et.singular) + "Lock");
 
       reg.get<dto::Collection<dto::Lock>>(entity_path + "/locks",
@@ -1233,6 +1228,7 @@ void RESTServer::setup_routes() {
           .description(std::string("Lists all active locks on this ") + et.singular + ".")
           .header_param("X-Client-Id", "When provided, the 'owned' field indicates whether this client owns the lock",
                         false, client_id_schema)
+          .errors({501})  // Locking disabled: LockHandlers::check_locking_enabled
           .operation_id(std::string("list") + capitalize(et.singular) + "Locks");
 
       reg.get<dto::Lock>(entity_path + "/locks/{lock_id}",
@@ -1244,6 +1240,7 @@ void RESTServer::setup_routes() {
           .description(std::string("Returns details of a specific lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "When provided, the 'owned' field indicates whether this client owns the lock",
                         false, client_id_schema)
+          .errors({501})  // Locking disabled: LockHandlers::check_locking_enabled
           .operation_id(std::string("get") + capitalize(et.singular) + "Lock");
 
       reg.put<dto::ExtendLockRequest, http::NoContent>(
@@ -1255,6 +1252,7 @@ void RESTServer::setup_routes() {
           .summary(std::string("Extend lock on ") + et.singular)
           .description(std::string("Extends the expiration of a lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
+          .errors({501})  // Locking disabled: LockHandlers::check_locking_enabled
           .operation_id(std::string("extend") + capitalize(et.singular) + "Lock");
 
       reg.del<http::NoContent>(entity_path + "/locks/{lock_id}",
@@ -1265,6 +1263,7 @@ void RESTServer::setup_routes() {
           .summary(std::string("Release lock on ") + et.singular)
           .description(std::string("Releases a lock on this ") + et.singular + ".")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
+          .errors({501})  // Locking disabled: LockHandlers::check_locking_enabled
           .operation_id(std::string("release") + capitalize(et.singular) + "Lock");
     }
 
@@ -1290,6 +1289,7 @@ void RESTServer::setup_routes() {
           .summary(std::string("Upload diagnostic script for ") + et.singular)
           .description(std::string("Uploads a diagnostic script for this ") + et.singular + ".")
           .success_description("Script uploaded")
+          .errors({501})  // No scripts backend configured
           .operation_id(std::string("upload") + capitalize(et.singular) + "Script");
 
       reg.get<dto::ScriptList>(entity_path + "/scripts",
@@ -1299,6 +1299,7 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("List scripts for ") + et.singular)
           .description(std::string("Lists all diagnostic scripts for this ") + et.singular + ".")
+          .errors({501})  // No scripts backend configured
           .operation_id(std::string("list") + capitalize(et.singular) + "Scripts");
 
       reg.get<dto::ScriptMetadata>(entity_path + "/scripts/{script_id}",
@@ -1308,6 +1309,7 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Get script metadata for ") + et.singular)
           .description(std::string("Returns metadata of a specific script for this ") + et.singular + ".")
+          .errors({501})  // No scripts backend configured
           .operation_id(std::string("get") + capitalize(et.singular) + "Script");
 
       reg.del<http::NoContent>(entity_path + "/scripts/{script_id}",
@@ -1317,6 +1319,7 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Delete script for ") + et.singular)
           .description(std::string("Deletes a diagnostic script from this ") + et.singular + ".")
+          .errors({501})  // No scripts backend configured
           .operation_id(std::string("delete") + capitalize(et.singular) + "Script");
 
       reg.post<http::Accepted<dto::ScriptExecution>>(
@@ -1330,6 +1333,7 @@ void RESTServer::setup_routes() {
           .description(std::string("Starts execution of a diagnostic script on this ") + et.singular + ".")
           .request_body("Execution parameters", SB::generic_object_schema())
           .success_description("Execution started")
+          .errors({501})  // No scripts backend configured
           .operation_id(std::string("start") + capitalize(et.singular) + "ScriptExecution");
 
       reg.get<dto::ScriptExecution>(entity_path + "/scripts/{script_id}/executions/{execution_id}",
@@ -1339,6 +1343,7 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Get execution status for ") + et.singular)
           .description("Returns the current status of a script execution.")
+          .errors({501})  // No scripts backend configured
           .operation_id(std::string("get") + capitalize(et.singular) + "ScriptExecution");
 
       reg.put<dto::ScriptControlRequest, dto::ScriptExecution>(
@@ -1350,6 +1355,7 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Terminate script execution for ") + et.singular)
           .description("Sends a control command (e.g., terminate) to a running script execution.")
+          .errors({501})  // No scripts backend configured
           .operation_id(std::string("control") + capitalize(et.singular) + "ScriptExecution");
 
       reg.del<http::NoContent>(entity_path + "/scripts/{script_id}/executions/{execution_id}",
@@ -1359,6 +1365,7 @@ void RESTServer::setup_routes() {
           .tag("Scripts")
           .summary(std::string("Remove completed execution for ") + et.singular)
           .description("Removes a completed script execution record.")
+          .errors({501})  // No scripts backend configured
           .operation_id(std::string("remove") + capitalize(et.singular) + "ScriptExecution");
     }
 
@@ -1630,9 +1637,9 @@ void RESTServer::setup_routes() {
   // === Software Updates ===
   //
   // PR-403 commit 22: 8 update routes migrated to typed RouteRegistry API.
-  // The handler instance may be null when no backend plugin is loaded; each
-  // typed lambda short-circuits with a 501 ErrorInfo in that case so the
-  // routes remain in the OpenAPI spec.
+  // The handler instance may be null when no backend plugin is loaded;
+  // `.gated_on(...)` short-circuits every route with a 501 in that case, so the
+  // routes stay in the OpenAPI spec AND the spec declares the 501.
   //
   // - GET    /updates                          -> Result<UpdateList>
   // - POST   /updates                          -> attachments (201 + Location)
@@ -1649,17 +1656,18 @@ void RESTServer::setup_routes() {
     err.http_status = 501;
     return err;
   }();
+  auto updates_available = [this] {
+    return update_handlers_ != nullptr;
+  };
 
   reg.get<dto::UpdateList>("/updates",
                            [this](http::TypedRequest req) -> http::Result<dto::UpdateList> {
-                             if (!update_handlers_) {
-                               return tl::unexpected(kUpdate501);
-                             }
                              return update_handlers_->get_updates(req);
                            })
       .tag("Updates")
       .summary("List software updates")
       .description("Lists all registered software updates.")
+      .gated_on(updates_available, kUpdate501)
       .operation_id("listUpdates")
       .query<dto::UpdateListQuery>();
 
@@ -1667,96 +1675,82 @@ void RESTServer::setup_routes() {
          "/updates",
          [this](http::TypedRequest req, dto::UpdateRegisterRequest body)
              -> http::Result<std::pair<http::Created<dto::UpdateRegisterResponse>, http::ResponseAttachments>> {
-           if (!update_handlers_) {
-             return tl::unexpected(kUpdate501);
-           }
            return update_handlers_->post_update(req, std::move(body));
          })
       .tag("Updates")
       .summary("Register a software update")
       .description("Registers a new software update descriptor.")
       .success_description("Update registered")
+      .gated_on(updates_available, kUpdate501)
       .operation_id("registerUpdate");
 
   reg.get<dto::UpdateStatus>("/updates/{update_id}/status",
                              [this](http::TypedRequest req) -> http::Result<dto::UpdateStatus> {
-                               if (!update_handlers_) {
-                                 return tl::unexpected(kUpdate501);
-                               }
                                return update_handlers_->get_status(req);
                              })
       .tag("Updates")
       .summary("Get update status")
       .description("Returns the current status and progress of an update.")
+      .gated_on(updates_available, kUpdate501)
       .operation_id("getUpdateStatus");
 
   reg.put<http::Accepted<http::NoContent>>(
          "/updates/{update_id}/prepare",
          [this](http::TypedRequest req)
              -> http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>> {
-           if (!update_handlers_) {
-             return tl::unexpected(kUpdate501);
-           }
            return update_handlers_->put_prepare(req);
          })
       .tag("Updates")
       .summary("Prepare update for execution")
       .description("Prepares an update for execution (downloads, validates).")
       .success_description("Update preparation started")
+      .gated_on(updates_available, kUpdate501)
       .operation_id("prepareUpdate");
 
   reg.put<http::Accepted<http::NoContent>>(
          "/updates/{update_id}/execute",
          [this](http::TypedRequest req)
              -> http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>> {
-           if (!update_handlers_) {
-             return tl::unexpected(kUpdate501);
-           }
            return update_handlers_->put_execute(req);
          })
       .tag("Updates")
       .summary("Execute update")
       .description("Starts executing a prepared update.")
       .success_description("Update execution started")
+      .gated_on(updates_available, kUpdate501)
       .operation_id("executeUpdate");
 
   reg.put<http::Accepted<http::NoContent>>(
          "/updates/{update_id}/automated",
          [this](http::TypedRequest req)
              -> http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>> {
-           if (!update_handlers_) {
-             return tl::unexpected(kUpdate501);
-           }
            return update_handlers_->put_automated(req);
          })
       .tag("Updates")
       .summary("Run automated update")
       .description("Runs a fully automated update (prepare + execute).")
       .success_description("Automated update started")
+      .gated_on(updates_available, kUpdate501)
       .operation_id("automateUpdate");
 
   reg.get<dto::UpdateDetail>("/updates/{update_id}",
                              [this](http::TypedRequest req) -> http::Result<dto::UpdateDetail> {
-                               if (!update_handlers_) {
-                                 return tl::unexpected(kUpdate501);
-                               }
                                return update_handlers_->get_update(req);
                              })
       .tag("Updates")
       .summary("Get update details")
       .description("Returns details of a specific update.")
+      .gated_on(updates_available, kUpdate501)
       .operation_id("getUpdate");
 
   reg.del<http::NoContent>("/updates/{update_id}",
                            [this](http::TypedRequest req) -> http::Result<http::NoContent> {
-                             if (!update_handlers_) {
-                               return tl::unexpected(kUpdate501);
-                             }
                              return update_handlers_->del_update(req);
                            })
       .tag("Updates")
       .summary("Delete update")
       .description("Removes an update registration.")
+      .gated_on(updates_available, kUpdate501)
       .operation_id("deleteUpdate");
 
   // === Authentication ===
@@ -1831,6 +1825,7 @@ void RESTServer::setup_routes() {
           .tag("Lifecycle")
           .summary(std::string("Request lifecycle transition '") + action + "'")
           .success_description("Lifecycle transition accepted")
+          .errors({501})  // No LifecycleProvider, or the provider reports the transition unsupported
           .operation_id(std::string("put").append(entity_cap).append("Status").append(action_cap));
     }
 
@@ -1840,6 +1835,7 @@ void RESTServer::setup_routes() {
                                           })
         .tag("Lifecycle")
         .summary(std::string("Get ") + et_lc.second + " lifecycle status")
+        .errors({501})  // LifecycleProvider reports the entity unsupported
         .operation_id(std::string("get") + entity_cap + "Status");
   }
 
