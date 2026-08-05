@@ -404,12 +404,22 @@ void RESTServer::setup_routes() {
       res.set_content(err.dump(2), "application/json");
     };
 
+    // The engine only exists when the feature is on and at least one plugin is
+    // loaded. That is the same "route mounted, backend absent" shape as the
+    // `/updates` and `/triggers` gates, so it answers the same way they do:
+    // 501 not-implemented. The 404 it used to answer said the *rule collection*
+    // did not exist, which is indistinguishable from an unknown app and told a
+    // client to go looking for an id instead of enabling a feature.
+    auto ft_engine_absent = [ft_json_error](httplib::Response & res) {
+      ft_json_error(res, 501, "fault-trigger engine is not enabled", ERR_NOT_IMPLEMENTED);
+    };
+
     route_registry_
         ->raw("get", "/apps/{app_id}/fault-triggers",
-              [this, ft_json_error](const httplib::Request & req, httplib::Response & res) {
+              [this, ft_engine_absent](const httplib::Request & req, httplib::Response & res) {
                 auto * engine = node_->get_fault_trigger_engine();
                 if (!engine) {
-                  ft_json_error(res, 404, "fault-trigger engine is not enabled");
+                  ft_engine_absent(res);
                   return;
                 }
                 const std::string app_id = req.matches.size() > 1 ? req.matches[1].str() : std::string{};
@@ -427,16 +437,18 @@ void RESTServer::setup_routes() {
             "and auto-clears on recovery.")
         .operation_id("listFaultTriggers")
         .path_param("app_id", "App (entity) the rules are scoped to")
+        // 501 when the engine is not running (feature off, or no plugin loaded).
+        .errors({501})
         .response(200, "Rule list",
                   nlohmann::json{{"type", "object"},
                                  {"properties", {{"items", {{"type", "array"}, {"items", {{"type", "object"}}}}}}}});
 
     route_registry_
         ->raw("post", "/apps/{app_id}/fault-triggers",
-              [this, ft_json_error](const httplib::Request & req, httplib::Response & res) {
+              [this, ft_json_error, ft_engine_absent](const httplib::Request & req, httplib::Response & res) {
                 auto * engine = node_->get_fault_trigger_engine();
                 if (!engine) {
-                  ft_json_error(res, 404, "fault-trigger engine is not enabled");
+                  ft_engine_absent(res);
                   return;
                 }
                 const std::string app_id = req.matches.size() > 1 ? req.matches[1].str() : std::string{};
@@ -450,7 +462,22 @@ void RESTServer::setup_routes() {
                 }
                 auto created = engine->create(app_id, body);
                 if (!created) {
-                  ft_json_error(res, created.error().first, created.error().second);
+                  // The engine reports three statuses and they are three
+                  // different failures. Letting them all fall through to the
+                  // status-shaped default told a client that an unknown app was
+                  // a missing sub-resource and that a duplicate fault_code was a
+                  // malformed parameter it could fix by editing the body.
+                  const int status = created.error().first;
+                  const char * code = ERR_INVALID_PARAMETER;
+                  if (status == 404) {
+                    // The rule names an app the entity registry does not know.
+                    code = ERR_ENTITY_NOT_FOUND;
+                  } else if (status == 409) {
+                    // fault_code is the fault store's primary key, so uniqueness
+                    // is a precondition on the request, not a field format.
+                    code = ERR_PRECONDITION_NOT_FULFILLED;
+                  }
+                  ft_json_error(res, status, created.error().second, code);
                   return;
                 }
                 // Raw route: the typed registry's automatic 201 `Location`
@@ -471,6 +498,8 @@ void RESTServer::setup_routes() {
         .path_param("app_id", "App (entity) to scope the rule to")
         .request_body("Fault-trigger rule definition",
                       nlohmann::json{{"type", "object"}, {"additionalProperties", true}})
+        // 501 when the engine is not running (feature off, or no plugin loaded).
+        .errors({501})
         .response(201, "Created rule", nlohmann::json{{"type", "object"}})
         .response_header(
             201, openapi::ResponseHeader{"Location",
@@ -483,10 +512,10 @@ void RESTServer::setup_routes() {
 
     route_registry_
         ->raw("delete", "/apps/{app_id}/fault-triggers/{trigger_id}",
-              [this, ft_json_error](const httplib::Request & req, httplib::Response & res) {
+              [this, ft_json_error, ft_engine_absent](const httplib::Request & req, httplib::Response & res) {
                 auto * engine = node_->get_fault_trigger_engine();
                 if (!engine) {
-                  ft_json_error(res, 404, "fault-trigger engine is not enabled");
+                  ft_engine_absent(res);
                   return;
                 }
                 const std::string app_id = req.matches.size() > 1 ? req.matches[1].str() : std::string{};
@@ -505,6 +534,8 @@ void RESTServer::setup_routes() {
         .operation_id("deleteFaultTrigger")
         .path_param("app_id", "App (entity) the rule is scoped to")
         .path_param("trigger_id", "Rule id as returned on create")
+        // 501 when the engine is not running (feature off, or no plugin loaded).
+        .errors({501})
         .response(204, "Deleted");
   }
 

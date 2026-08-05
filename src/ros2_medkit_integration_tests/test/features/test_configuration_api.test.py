@@ -287,6 +287,39 @@ class TestConfigurationApi(GatewayTestCase):
         # SOVD format expects "data" field
         self.assertIn('data', data['message'].lower())
 
+    def test_07b_set_configuration_unconvertible_value(self):
+        """A value that cannot become the parameter's type is 400, not 500.
+
+        A mixed-type array makes the JSON->ParameterValue conversion throw, and
+        the throw used to land in the transport's outer catch, which reports
+        INTERNAL_ERROR and so answers 500 - the gateway taking the blame for a
+        body the caller chose. Both write paths are covered: temp_sensor is a
+        remote node (parameter service round trip) and the gateway node is its
+        own, and the conversion sits on both.
+
+        @verifies REQ_INTEROP_050
+        """
+        remote = requests.put(
+            f'{self.BASE_URL}/apps/temp_sensor/configurations/publish_rate',
+            json={'data': [1, 'not-a-number']},
+            timeout=10
+        )
+        self.assertEqual(remote.status_code, 400, remote.text)
+        self.assertEqual(remote.json()['error_code'], 'invalid-parameter')
+
+        own = requests.put(
+            f'{self.BASE_URL}/apps/ros2_medkit_gateway/configurations'
+            '/refresh_interval_ms',
+            json={'data': [1, 'not-a-number']},
+            timeout=10
+        )
+        self.assertEqual(own.status_code, 400, own.text)
+        self.assertEqual(own.json()['error_code'], 'invalid-parameter')
+
+        # The rejected write must not have changed anything.
+        after = self.get_json('/apps/temp_sensor/configurations/publish_rate')
+        self.assertEqual(after['x-medkit']['parameter']['value'], 2.0)
+
     def test_08_root_endpoint_includes_configurations(self):
         """Root endpoint lists configurations endpoints and capability.
 

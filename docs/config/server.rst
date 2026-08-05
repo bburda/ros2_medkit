@@ -988,7 +988,10 @@ the backend functionality (see `Plugin Framework`_ above).
    * - ``updates.enabled``
      - bool
      - ``false``
-     - Enable/disable software updates endpoints. When disabled, ``/updates`` routes are not registered.
+     - Enable/disable the software updates backend. The ``/updates`` routes are
+       always registered and always documented; when this is ``false`` - or when
+       no ``UpdateProvider`` plugin is loaded - every one of them answers
+       ``501``.
 
 Example:
 
