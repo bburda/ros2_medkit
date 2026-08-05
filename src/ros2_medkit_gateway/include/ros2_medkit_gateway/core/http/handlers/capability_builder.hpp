@@ -19,6 +19,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "ros2_medkit_gateway/dto/entity_capability.hpp"
+
 namespace ros2_medkit_gateway {
 namespace handlers {
 
@@ -31,7 +33,7 @@ namespace handlers {
  * @example
  * using Cap = CapabilityBuilder::Capability;
  * std::vector<Cap> caps = {Cap::DATA, Cap::OPERATIONS, Cap::CONFIGURATIONS};
- * auto json = CapabilityBuilder::build_capabilities("components", "my-comp", caps);
+ * auto items = CapabilityBuilder::build_capabilities("components", "my-comp", caps);
  *
  * @verifies REQ_DISCOVERY_003 Entity capabilities
  */
@@ -39,17 +41,44 @@ class CapabilityBuilder {
  public:
   /**
    * @brief Available capability types for SOVD entities.
+   *
+   * Each enumerator names a route registered for the entity types that list it
+   * in `discovery_handlers.cpp`. The name doubles as the path segment, so an
+   * enumerator with no route produces an `href` that 404s - which is why
+   * `RELATED_COMPONENTS` and `RELATED_APPS` are gone: `/related-components` and
+   * `/related-apps` are registered for no entity type, and the route an area
+   * really serves is `/areas/{area_id}/components` (`COMPONENTS` below).
+   *
+   * What is checked, by what, and what is not:
+   *
+   * - Every enumerator has an arm in `capability_to_name` - enforced by the
+   *   **compiler**, `-Werror=switch-enum`. Adding one here without an arm does
+   *   not build.
+   * - No arm resolves to the `"unknown"` placeholder or an empty segment -
+   *   `CapabilityBuilderTest.NamesEveryEnumerator`. The compiler cannot see
+   *   this: an arm that returns the placeholder is a handled enumerator.
+   * - Every enumerator a handler list actually uses reaches a route that does
+   *   not 404 - `test_openapi_contract::test_every_advertised_collection_is_served`,
+   *   which follows each `href` against a live gateway.
+   *
+   * Not checked: that every enumerator is listed by some entity type. The four
+   * lists are function-local in `discovery_handlers.cpp`, so an enumerator no
+   * list uses is dead rather than wrong, and nothing here will say so. Pinning
+   * it would mean declaring the per-type membership a second time, which is the
+   * duplicated-fact problem this file already has three copies of.
    */
   enum class Capability {
     DATA,                  ///< Entity has data endpoints
+    DATA_CATEGORIES,       ///< Entity has a data-categories endpoint (answers 501)
+    DATA_GROUPS,           ///< Entity has a data-groups endpoint (answers 501)
     OPERATIONS,            ///< Entity has operations (services/actions)
     CONFIGURATIONS,        ///< Entity has configurations (parameters)
     FAULTS,                ///< Entity has fault management
+    FAULT_TRIGGERS,        ///< Entity has fault-trigger threshold rules (apps only)
     SUBAREAS,              ///< Entity has child areas (areas only)
     SUBCOMPONENTS,         ///< Entity has child components (components only)
-    RELATED_COMPONENTS,    ///< Entity has related components (areas only)
+    COMPONENTS,            ///< Entity has member components (areas only)
     CONTAINS,              ///< Entity contains other entities (areas->components)
-    RELATED_APPS,          ///< Entity has related apps (components only)
     HOSTS,                 ///< Entity has host apps (functions/components)
     DEPENDS_ON,            ///< Entity has dependencies (components only)
     IS_LOCATED_ON,         ///< Entity has parent component (apps only)
@@ -64,15 +93,16 @@ class CapabilityBuilder {
   };
 
   /**
-   * @brief Build capabilities JSON array for an entity.
+   * @brief Build the capabilities array for an entity.
    *
    * @param entity_type The entity type (e.g., "areas", "components", "apps", "functions")
    * @param entity_id The entity identifier
    * @param capabilities Vector of capability types to include
-   * @return JSON array of capability objects with name and href
+   * @return One dto::EntityCapability per requested capability, in order
    */
-  static nlohmann::json build_capabilities(const std::string & entity_type, const std::string & entity_id,
-                                           const std::vector<Capability> & capabilities);
+  static std::vector<dto::EntityCapability> build_capabilities(const std::string & entity_type,
+                                                               const std::string & entity_id,
+                                                               const std::vector<Capability> & capabilities);
 
   /**
    * @brief Convert capability enum to string name.

@@ -71,9 +71,25 @@ struct AcquireLockRequest {
 };
 
 template <>
-inline constexpr auto dto_fields<AcquireLockRequest> =
-    std::make_tuple(field("lock_expiration", &AcquireLockRequest::lock_expiration),
-                    field("scopes", &AcquireLockRequest::scopes), field("break_lock", &AcquireLockRequest::break_lock));
+inline constexpr auto dto_fields<AcquireLockRequest> = std::make_tuple(
+    field("lock_expiration", &AcquireLockRequest::lock_expiration,
+          "How long the lock lives, in seconds from the moment the gateway grants it - a duration, unlike the "
+          "`lock_expiration` on the Lock response, which is an ISO 8601 instant. Must be at least 1 and no more "
+          "than the configured ceiling (`locking.default_max_expiration`, 3600 s unless a manifest overrides it "
+          "for the entity); only the lower bound is a schema constraint, because the ceiling is deployment "
+          "configuration. Extending a lock restarts the countdown from the new value - it does not add to what "
+          "is left. Reaching the expiry is not the same as releasing the lock; the acquire operation says how "
+          "they differ.",
+          FieldConstraints{/*minimum=*/1.0, {}, {}, {}, {}}),
+    field("scopes", &AcquireLockRequest::scopes,
+          "Resource collections the lock covers, from `data`, `operations`, `configurations`, `faults`, `modes`, "
+          "`scripts`, `bulk-data`, `logs` and `cyclic-subscriptions` (the set `valid_lock_scopes()` accepts; any "
+          "other value is rejected with 400). Omitted or empty locks every collection."),
+    field("break_lock", &AcquireLockRequest::break_lock,
+          "Take the lock even though another client already holds one. Without it an existing lock answers 409 "
+          "`lock-conflict`; with it, an existing lock the entity's configuration marks non-breakable answers 409 "
+          "`lock-not-breakable` instead. Either way the 409 body carries the blocking lock's id in "
+          "`parameters.existing_lock_id`."));
 
 template <>
 inline constexpr std::string_view dto_name<AcquireLockRequest> = "AcquireLockRequest";

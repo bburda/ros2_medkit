@@ -162,10 +162,21 @@ class TestScenarioDiscoveryManifest(GatewayTestCase):
     def test_05_area_components(self):
         """GET /areas/{id}/components returns components in area.
 
+        The area's `capabilities` array must advertise the same route. Areas were
+        the one entity type whose relationship endpoint was served and named in
+        `AreaDetail.components` but missing from the capability array, so a
+        client reading only that array could not find it.
+
         @verifies REQ_INTEROP_006
         """
         data = self.get_json('/areas/engine/components')
         self.assertIn('items', data)
+
+        area = self.get_json('/areas/engine')
+        advertised = {c['name']: c['href'] for c in area['capabilities']}
+        self.assertIn('components', advertised)
+        self.assertEqual(
+            advertised['components'], '/api/v1/areas/engine/components')
 
     # =========================================================================
     # Components

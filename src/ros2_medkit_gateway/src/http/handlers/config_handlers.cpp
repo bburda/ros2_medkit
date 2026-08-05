@@ -723,6 +723,18 @@ http::Result<http::NoContent> ConfigHandlers::delete_configuration(const http::T
   }
   const std::string param_id = *param_id_result;
 
+  // Same bound, and in the same position, as `set_configuration`: validate the
+  // caller's own inputs before consulting the lock, because a malformed id is
+  // the client's bug rather than a contended resource. `read_param_id` checks
+  // only that the capture is present, so without this DELETE was the one verb
+  // in the family accepting an unbounded parameter id - and the OpenAPI
+  // document publishes `maxLength: 512` on every route carrying `{config_id}`,
+  // this one included.
+  if (param_id.empty() || param_id.length() > kMaxAggregatedParamIdLength) {
+    return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER, "Invalid parameter ID",
+                                     json{{"details", "Parameter ID is empty or too long"}}));
+  }
+
   auto entity_result = ctx_.validate_entity_for_route(req, entity_id);
   if (!entity_result) {
     return tl::unexpected(flatten_validator_error(entity_result.error()));

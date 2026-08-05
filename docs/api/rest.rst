@@ -309,9 +309,10 @@ Areas
    .. note::
 
       **ros2_medkit extension:** Areas support resource collections beyond the SOVD spec,
-      which only defines them for apps and components. Areas provide ``/data``, ``/operations``,
-      ``/configurations``, ``/faults``, ``/logs`` (namespace prefix aggregation), read-only
-      ``/bulk-data``, and ``/triggers``. See :ref:`sovd-compliance` for details.
+      which only defines them for apps and components. Areas provide ``/data``,
+      ``/data-categories``, ``/data-groups``, ``/operations``, ``/configurations``,
+      ``/faults``, ``/logs`` (namespace prefix aggregation), read-only ``/bulk-data``,
+      and ``/triggers``. See :ref:`sovd-compliance` for details.
 
 Components
 ~~~~~~~~~~
@@ -3596,7 +3597,34 @@ use cases benefit.
 **Pragmatic Extensions:**
 
 The SOVD spec defines resource collections only for apps and components. ros2_medkit
-extends this to areas and functions where aggregation makes practical sense:
+extends this to areas and functions where aggregation makes practical sense.
+
+The matrix below transcribes ``EntityCapabilities::for_type``. That drives the
+paths in an entity's ``/docs`` sub-document, and the collection check in
+``validate_collection_access_typed``. It is **not** where the ``capabilities``
+array of ``GET /{entity-type}/{id}`` comes from: that array is built from a
+second, independent list, the ``CapabilityBuilder::Capability`` vector each
+handler in ``discovery_handlers.cpp`` assembles. The two surfaces overlap but
+are not the same set - the component array also carries ``status``,
+``subcomponents``, ``hosts`` and ``depends-on``, and the area array
+``subareas``, ``contains`` and ``components``, none of which are resource
+collections and so none of which appear in the table.
+
+The transcription is by hand. What is checked mechanically is the property the
+table exists to describe:
+``test_openapi_contract::test_every_advertised_collection_is_served`` takes the
+first discovered entity of each type, follows every non-templated ``href`` in
+its ``capabilities`` array **and** every path in its ``/docs`` sub-document
+against a live gateway, and fails on a 404 - so it covers both surfaces,
+including where they disagree. Its fixture discovers no areas, so the Areas
+column below is covered by the ``EntityCapabilities`` unit tests instead, which
+assert the per-type lists directly. ``501`` is a served answer, not a missing
+one: see ``data-categories`` and ``data-groups`` below.
+
+Collections named by the SOVD standard that the gateway does **not** serve
+per entity - ``data-lists``, ``modes`` and ``communication-logs`` - are absent
+from the table and from every capability list. ``updates`` is server-scoped
+only (``/api/v1/updates``), never mounted under an entity.
 
 .. list-table:: Resource Collection Support Matrix
    :header-rows: 1
@@ -3613,6 +3641,18 @@ extends this to areas and functions where aggregation makes practical sense:
      - yes
      - yes
      - aggregated
+     - apps, components
+   * - data-categories
+     - 501
+     - 501
+     - 501
+     - 501
+     - apps, components
+   * - data-groups
+     - 501
+     - 501
+     - 501
+     - 501
      - apps, components
    * - operations
      - aggregated
@@ -3656,12 +3696,41 @@ extends this to areas and functions where aggregation makes practical sense:
      - yes
      - \-
      - apps, components
+   * - locks
+     - \-
+     - yes
+     - yes
+     - \-
+     - apps, components
    * - triggers
      - yes (x-medkit)
      - yes
      - yes
      - yes (x-medkit)
      - apps, components
+   * - fault-triggers
+     - \-
+     - \-
+     - yes (x-medkit)
+     - \-
+     - not in SOVD
+
+Three rows depend on configuration, and the two advertising surfaces answer
+differently, which is worth stating rather than leaving to be discovered:
+
+- ``locks``: the routes are always registered for components and apps and answer
+  ``501`` when there is no lock manager (``locking.enabled`` off). The
+  ``capabilities`` entry and the ``locks`` URI field follow the lock manager; the
+  ``/docs`` sub-document lists ``/locks`` unconditionally, because
+  ``for_type(COMPONENT)`` does.
+- ``scripts``: the same shape. ``ScriptManager`` is constructed unconditionally,
+  so all eight script routes are always registered for components and apps, and
+  they answer ``501`` until a backend exists - either a plugin
+  ``ScriptProvider`` or a non-empty ``scripts.scripts_dir``. The
+  ``capabilities`` entry follows the backend; the sub-document lists
+  ``/scripts`` unconditionally.
+- ``fault-triggers``: always registered and always advertised, for apps only;
+  with no fault-trigger engine running the routes answer ``501``.
 
 Other extensions beyond SOVD:
 

@@ -270,6 +270,39 @@ class TestConfigurationApi(GatewayTestCase):
         self.assertIn('parameters', data)
         self.assertEqual(data['parameters'].get('id'), 'nonexistent_param')
 
+    def test_06b_every_verb_rejects_an_oversized_config_id(self):
+        """GET, PUT and DELETE all enforce the 512-character `config_id` bound.
+
+        The OpenAPI document publishes `maxLength: 512` on every route carrying
+        `{config_id}`, from one table keyed by the parameter name - so it cannot
+        distinguish a route whose handler checks from one whose handler does
+        not. DELETE was that route: it read the capture and never measured it,
+        while GET and PUT both rejected. All three verbs are driven here so the
+        published bound is backed on each of them rather than on two out of
+        three. The `fault_code` half of the same table is covered by
+        `test_faults_api.test.py`.
+
+        @verifies REQ_INTEROP_049
+        @verifies REQ_INTEROP_050
+        @verifies REQ_INTEROP_052
+        """
+        oversized = 'p' * 513
+        base = f'{self.BASE_URL}/apps/temp_sensor/configurations/{oversized}'
+        for verb, call in (
+            ('GET', lambda: requests.get(base, timeout=10)),
+            ('PUT', lambda: requests.put(base, json={'data': 1.0}, timeout=10)),
+            ('DELETE', lambda: requests.delete(base, timeout=10)),
+        ):
+            with self.subTest(verb=verb):
+                response = call()
+                self.assertEqual(response.status_code, 400, f'{verb}: {response.text}')
+                self.assertIn('error_code', response.json())
+
+        # A 512-character id is inside the bound, so the rejection above is the
+        # length check and not the route refusing every long-ish name.
+        at_limit = f'{self.BASE_URL}/apps/temp_sensor/configurations/{"p" * 512}'
+        self.assertEqual(requests.get(at_limit, timeout=10).status_code, 404)
+
     def test_07_set_configuration_missing_value(self):
         """PUT configurations/{param_name} returns 400 when value missing.
 

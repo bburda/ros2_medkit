@@ -28,11 +28,11 @@ TEST(CapabilityBuilderTest, BuildsCorrectCapabilities) {
 
   auto result = CapabilityBuilder::build_capabilities("components", "test-comp", caps);
 
-  ASSERT_EQ(result.size(), 2);
-  EXPECT_EQ(result[0]["name"], "data");
-  EXPECT_EQ(result[0]["href"], "/api/v1/components/test-comp/data");
-  EXPECT_EQ(result[1]["name"], "operations");
-  EXPECT_EQ(result[1]["href"], "/api/v1/components/test-comp/operations");
+  ASSERT_EQ(result.size(), 2u);
+  EXPECT_EQ(result[0].name, "data");
+  EXPECT_EQ(result[0].href, "/api/v1/components/test-comp/data");
+  EXPECT_EQ(result[1].name, "operations");
+  EXPECT_EQ(result[1].href, "/api/v1/components/test-comp/operations");
 }
 
 TEST(CapabilityBuilderTest, BuildsEmptyArray) {
@@ -40,38 +40,64 @@ TEST(CapabilityBuilderTest, BuildsEmptyArray) {
 
   auto result = CapabilityBuilder::build_capabilities("areas", "test-area", caps);
 
-  EXPECT_TRUE(result.is_array());
-  EXPECT_EQ(result.size(), 0);
+  EXPECT_TRUE(result.empty());
 }
 
 TEST(CapabilityBuilderTest, BuildsAllCapabilities) {
-  std::vector<Cap> caps = {Cap::DATA,          Cap::OPERATIONS,         Cap::CONFIGURATIONS, Cap::FAULTS, Cap::SUBAREAS,
-                           Cap::SUBCOMPONENTS, Cap::RELATED_COMPONENTS, Cap::RELATED_APPS,   Cap::HOSTS};
+  std::vector<Cap> caps = {Cap::DATA,          Cap::OPERATIONS, Cap::CONFIGURATIONS, Cap::FAULTS, Cap::SUBAREAS,
+                           Cap::SUBCOMPONENTS, Cap::COMPONENTS, Cap::CONTAINS,       Cap::HOSTS};
 
   auto result = CapabilityBuilder::build_capabilities("entities", "test-id", caps);
 
-  EXPECT_EQ(result.size(), 9);
+  EXPECT_EQ(result.size(), 9u);
 }
 
 TEST(CapabilityBuilderTest, CapabilityToNameReturnsCorrectStrings) {
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::DATA), "data");
+  EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::DATA_CATEGORIES), "data-categories");
+  EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::DATA_GROUPS), "data-groups");
+  EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::FAULT_TRIGGERS), "fault-triggers");
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::OPERATIONS), "operations");
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::CONFIGURATIONS), "configurations");
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::FAULTS), "faults");
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::SUBAREAS), "subareas");
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::SUBCOMPONENTS), "subcomponents");
-  EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::RELATED_COMPONENTS), "related-components");
-  EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::RELATED_APPS), "related-apps");
+  // `/areas/{area_id}/components`, the route an area really serves. The
+  // `related-components` / `related-apps` enumerators this replaced named
+  // segments no entity type registers.
+  EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::COMPONENTS), "components");
+  EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::CONTAINS), "contains");
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::HOSTS), "hosts");
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::LOGS), "logs");
   EXPECT_EQ(CapabilityBuilder::capability_to_name(Cap::STATUS), "status");
 }
 
+// `-Werror=switch-enum` already refuses an enumerator with no arm, so what this
+// adds is the case the compiler cannot see: an arm that *is* present but
+// resolves to the `"unknown"` placeholder the `default:` returns, which would
+// render an href of `/api/v1/{type}/{id}/unknown`.
+//
+// Scope: the name table only. An enumerator that no handler list uses is dead
+// and invisible to this and every other check - see the header comment for why
+// pinning that would cost a duplicated fact.
+TEST(CapabilityBuilderTest, NamesEveryEnumerator) {
+  // Range end is the last enumerator; extend it when the enum grows - the
+  // static_assert below is what makes forgetting that fail to compile.
+  constexpr auto kLast = Cap::STATUS;
+  static_assert(static_cast<int>(kLast) == 21, "Capability gained or lost an enumerator - update kLast");
+
+  for (int i = 0; i <= static_cast<int>(kLast); ++i) {
+    const auto cap = static_cast<Cap>(i);
+    EXPECT_NE(CapabilityBuilder::capability_to_name(cap), "unknown") << "enumerator " << i << " has no name arm";
+    EXPECT_FALSE(CapabilityBuilder::capability_to_name(cap).empty()) << "enumerator " << i;
+  }
+}
+
 TEST(CapabilityBuilderTest, CapabilityToPathMatchesName) {
   // For all capabilities, the path segment matches the name
   EXPECT_EQ(CapabilityBuilder::capability_to_path(Cap::DATA), CapabilityBuilder::capability_to_name(Cap::DATA));
-  EXPECT_EQ(CapabilityBuilder::capability_to_path(Cap::RELATED_COMPONENTS),
-            CapabilityBuilder::capability_to_name(Cap::RELATED_COMPONENTS));
+  EXPECT_EQ(CapabilityBuilder::capability_to_path(Cap::COMPONENTS),
+            CapabilityBuilder::capability_to_name(Cap::COMPONENTS));
   EXPECT_EQ(CapabilityBuilder::capability_to_path(Cap::LOGS), CapabilityBuilder::capability_to_name(Cap::LOGS));
 }
 
@@ -83,10 +109,10 @@ TEST(CapabilityBuilderTest, BuildsForDifferentEntityTypes) {
   auto apps_result = CapabilityBuilder::build_capabilities("apps", "app1", caps);
   auto functions_result = CapabilityBuilder::build_capabilities("functions", "f1", caps);
 
-  EXPECT_EQ(areas_result[0]["href"], "/api/v1/areas/a1/data");
-  EXPECT_EQ(components_result[0]["href"], "/api/v1/components/c1/data");
-  EXPECT_EQ(apps_result[0]["href"], "/api/v1/apps/app1/data");
-  EXPECT_EQ(functions_result[0]["href"], "/api/v1/functions/f1/data");
+  EXPECT_EQ(areas_result[0].href, "/api/v1/areas/a1/data");
+  EXPECT_EQ(components_result[0].href, "/api/v1/components/c1/data");
+  EXPECT_EQ(apps_result[0].href, "/api/v1/apps/app1/data");
+  EXPECT_EQ(functions_result[0].href, "/api/v1/functions/f1/data");
 }
 
 // =============================================================================

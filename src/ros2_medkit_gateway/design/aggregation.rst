@@ -163,13 +163,20 @@ entities instead.
 Resource Collections on Functions and Areas
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Functions and Areas support the same resource collections as Components and Apps:
+Functions and Areas expose the aggregating subset of the collections Components
+and Apps expose:
 
 - **data** - Aggregated topic data from all hosted entities
 - **operations** - Aggregated services and actions from hosted entities
 - **configurations** - Aggregated parameters from hosted entities
 - **faults** - Aggregated faults from hosted entities
 - **logs** - Aggregated log entries from hosted entities
+
+They do not expose ``locks`` or ``scripts`` (components and apps only), nor
+``fault-triggers`` (apps only); Areas additionally have no
+``cyclic-subscriptions``. What each entity type serves - and therefore what it
+advertises in its ``capabilities`` array - is the matrix in
+:ref:`sovd-compliance`.
 
 Requests to ``/functions/{id}/data`` are fan-out queries that collect data from
 all entities listed in the Function's ``hosts`` field. Similarly, Area resource

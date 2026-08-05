@@ -38,22 +38,36 @@ enum class SovdEntityType {
  * @brief SOVD Resource Collections (Table 7)
  *
  * Standardized collections of diagnostic resources that entities may expose.
+ *
+ * An enumerator here names a collection the SOVD model knows about. It says
+ * nothing about whether the gateway serves it: a collection joins an entity's
+ * capability list in `EntityCapabilities::for_type` only once an entity-scoped
+ * route answers it, because every entry in that list becomes an `href` a client
+ * follows and a path in the entity's `/docs` sub-document. No entity type lists
+ * the four enumerators marked "no entity-scoped route" below for that reason -
+ * `UPDATES` appears only in the SERVER list, whose collections are the ones
+ * mounted at the API root. They are kept so a manifest or a plugin that later
+ * serves one has a name for it, and so `parse_resource_collection` still
+ * recognises the segment rather than reporting it as an unknown collection.
  */
 enum class ResourceCollection {
   CONFIGURATIONS,        ///< Configuration resources (ROS 2 parameters)
   DATA,                  ///< Static and dynamic data (topic subscriptions)
+  DATA_CATEGORIES,       ///< Data categories (route answers 501 - no ROS 2 mapping)
+  DATA_GROUPS,           ///< Data groups (route answers 501 - no ROS 2 mapping)
   FAULTS,                ///< Fault resources (DiagnosticStatus messages)
+  FAULT_TRIGGERS,        ///< Threshold rules that raise a fault (apps only, x-medkit)
   OPERATIONS,            ///< Operation resources (services + actions)
   BULK_DATA,             ///< Bulk data resources (large topic payloads)
-  DATA_LISTS,            ///< Combined data resources (multi-topic groups)
-  LOCKS,                 ///< Lock resources (lifecycle states)
-  MODES,                 ///< Mode resources (node modes)
+  DATA_LISTS,            ///< Combined data resources - no entity-scoped route
+  LOCKS,                 ///< Lock resources (exclusive entity access)
+  MODES,                 ///< Mode resources - no entity-scoped route
   CYCLIC_SUBSCRIPTIONS,  ///< Cyclic subscriptions (topic polling)
   LOGS,                  ///< Application log entries (/rosout)
-  COMMUNICATION_LOGS,    ///< Communication logs (CAN/UDS/DoIP - not implemented)
+  COMMUNICATION_LOGS,    ///< Communication logs (CAN/UDS/DoIP) - no entity-scoped route
   TRIGGERS,              ///< Trigger resources (event topics)
-  SCRIPTS,               ///< Script resources (not mapped in ROS 2)
-  UPDATES                ///< Update packages (not mapped in ROS 2)
+  SCRIPTS,               ///< Diagnostic script resources
+  UPDATES                ///< Update packages - server-scoped only, no entity-scoped route
 };
 
 /**

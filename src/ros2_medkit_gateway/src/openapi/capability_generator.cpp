@@ -788,23 +788,49 @@ void CapabilityGenerator::add_resource_collection_paths(nlohmann::json & paths, 
         paths[col_path] = path_builder.build_logs_collection(entity_path);
         add_log_configuration_path(paths, col_path, entity_path);
         break;
-      case ResourceCollection::DATA_LISTS:
+      // Registered for every entity type and unconditionally 501: the routes
+      // carry `.only_status(501, ...)`, so a 200 here would be a success a
+      // client can never observe.
+      case ResourceCollection::DATA_CATEGORIES:
+      case ResourceCollection::DATA_GROUPS: {
+        nlohmann::json not_implemented;
+        nlohmann::json get_op;
+        get_op["tags"] = nlohmann::json::array({"Data"});
+        get_op["summary"] = "List " + to_string(col) + " for " + entity_id;
+        get_op["description"] = "Not implemented for ROS 2 - this route always answers 501.";
+        get_op["responses"]["501"] = nlohmann::json{{"$ref", "#/components/responses/GenericError"}};
+        not_implemented["get"] = std::move(get_op);
+        paths[col_path] = std::move(not_implemented);
+        break;
+      }
+
+      // Served, but with no dedicated builder in this file yet, so the listing
+      // is generic. `to_openapi_paths()` already holds each of these routes
+      // with its real statuses and schema; projecting the sub-document out of
+      // the registry is what removes the last of this hand-written half.
       case ResourceCollection::LOCKS:
-      case ResourceCollection::MODES:
-      case ResourceCollection::COMMUNICATION_LOGS:
       case ResourceCollection::TRIGGERS:
       case ResourceCollection::SCRIPTS:
+      case ResourceCollection::FAULT_TRIGGERS: {
+        nlohmann::json generic_path;
+        nlohmann::json get_op;
+        get_op["summary"] = "List " + to_string(col) + " for " + entity_id;
+        get_op["responses"]["200"]["description"] = "Successful response";
+        generic_path["get"] = std::move(get_op);
+        paths[col_path] = std::move(generic_path);
+        break;
+      }
+
+      // No entity-scoped route, so no entity type lists one of these and the
+      // loop cannot reach these labels. (`UPDATES` is in the SERVER list, and
+      // SERVER never reaches this function - it is called for the four entity
+      // types only.) They are spelled out rather than folded into a `default:`
+      // so that adding an enumerator fails the build here
+      // (-Werror=switch-enum) instead of silently acquiring a fabricated 200.
+      case ResourceCollection::DATA_LISTS:
+      case ResourceCollection::MODES:
+      case ResourceCollection::COMMUNICATION_LOGS:
       case ResourceCollection::UPDATES:
-      default:
-        // For other collections we don't have specific builders, add generic listing
-        {
-          nlohmann::json generic_path;
-          nlohmann::json get_op;
-          get_op["summary"] = "List " + to_string(col) + " for " + entity_id;
-          get_op["responses"]["200"]["description"] = "Successful response";
-          generic_path["get"] = std::move(get_op);
-          paths[col_path] = std::move(generic_path);
-        }
         break;
     }
   }

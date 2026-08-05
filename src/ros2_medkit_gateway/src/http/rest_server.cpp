@@ -496,7 +496,11 @@ void RESTServer::setup_routes() {
         .description(
             "Body: data_name, operator (>, <, >=, <=, ==), threshold, fault_code, severity "
             "(INFO|WARNING|ERROR|CRITICAL), optional active. fault_code must be unique across "
-            "all rules (409 on duplicates).")
+            "all rules (409 on duplicates). The rule is level-triggered, not edge-triggered: while the value "
+            "stays past the threshold the engine re-reports the fault on every poll, so it confirms whatever "
+            "the fault manager's debounce threshold is and stays asserted until the value comes back. A poll "
+            "that cannot read the source neither reports nor clears - the rule holds whatever state it was in, "
+            "so a source that goes unreadable while the fault is asserted leaves it asserted.")
         .operation_id("createFaultTrigger")
         .path_param("app_id", "App (entity) to scope the rule to")
         .request_body<dto::FaultTriggerRuleCreateRequest>("Fault-trigger rule definition")
@@ -787,6 +791,12 @@ void RESTServer::setup_routes() {
                   "The backing ROS 2 endpoint did not answer inside service_call_timeout_sec "
                   "(not-responding). The work may still be running.",
                   nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
+        // `parameters` is what the handler reads first for both branches (the
+        // `goal` / `request` aliases are the fallbacks), and its contents are
+        // the ROS service request or action goal, whose shape comes from the
+        // operation - read it from GET .../operations/{operation_id}. The
+        // example shows the envelope, which is what every operation shares.
+        .body_example(nlohmann::json{{"parameters", nlohmann::json{{"target_temperature", 85.0}}}})
         // OperationHandlers::create_execution -> validate_lock_access("operations").
         .lock_guarded()
         .operation_id(std::string("execute") + capitalize(et.singular) + "Operation");
@@ -923,6 +933,9 @@ void RESTServer::setup_routes() {
         .tag("Configuration")
         .summary(std::string("Set configuration for ") + et.singular)
         .description(std::string("Sets a ROS 2 node parameter value for this ") + et.singular + ".")
+        // `data` is the preferred key; `value` is the legacy alias the handler
+        // falls back to. Showing `data` is what steers a new client onto it.
+        .body_example(nlohmann::json{{"data", 85.0}})
         // ConfigHandlers::set_configuration -> validate_lock_access("configurations").
         .lock_guarded()
         // Parameter failures reach the wire through `classify_parameter_error`,
@@ -1050,7 +1063,15 @@ void RESTServer::setup_routes() {
            })
         .tag("Logs")
         .summary(std::string("Query log entries for ") + et.singular)
-        .description(std::string("Queries application log entries for this ") + et.singular + ".")
+        .description(
+            std::string("Queries application log entries for this ") + et.singular +
+            ". Served, unless a LogProvider plugin is registered, from the gateway's own log buffer and filtered "
+            "by the entity's log configuration: the effective severity floor is the stricter of that "
+            "configuration and the request's own `severity`, so asking for `debug` against a configuration set "
+            "to `error` still returns errors and above; and the answer is then capped at the configuration's "
+            "`max_entries`, most recent kept - silently, with nothing on the response saying it was cut and no "
+            "way to page past it. Both of those filter the answer rather than the buffer. A registered "
+            "LogProvider serves the query itself, and neither applies to it.")
         // LogHandlers::get_logs -> fan_out_collection<LogEntry>.
         .fan_out_aware()
         // All three log routes answer 503 when no LogManager is attached, or
@@ -1255,6 +1276,13 @@ void RESTServer::setup_routes() {
           .tag("Triggers")
           .summary(std::string("Create trigger for ") + et.singular)
           .description(std::string("Creates a new event trigger for this ") + et.singular + ".")
+          .body_example(nlohmann::json{
+              {"resource", "/api/v1/apps/temp_sensor/data/engine_temperature"},
+              {"trigger_condition",
+               nlohmann::json{{"condition_type", "EnterRange"}, {"lower_bound", 90.0}, {"upper_bound", 120.0}}},
+              {"path", "/data"},
+              {"multishot", true},
+              {"lifetime", 3600}})
           .success_description("Trigger created")
           .gated_on(triggers_available, triggers_unavailable)
           // TriggerHandlers::post_trigger answers 503 when the trigger engine
@@ -1410,8 +1438,16 @@ void RESTServer::setup_routes() {
              })
           .tag("Locking")
           .summary(std::string("Acquire lock on ") + et.singular)
-          .description(std::string("Acquires an exclusive lock on this ") + et.singular + ".")
+          .description(
+              std::string("Acquires an exclusive lock on this ") + et.singular +
+              ", covering either the whole entity or the resource collections named in `scopes`. While it "
+              "holds, a write to a covered collection by any other client - including one sending no "
+              "`X-Client-Id` - is answered 409. Letting the lock reach its expiry is not the same as releasing "
+              "it: on expiry the gateway also deletes this entity's cyclic subscriptions, unless `scopes` was "
+              "given and left `cyclic-subscriptions` out. `DELETE /{entity}/locks/{lock_id}` never touches them.")
           .header_param("X-Client-Id", "Unique client identifier for lock ownership", true, client_id_schema)
+          .body_example(
+              nlohmann::json{{"lock_expiration", 300}, {"scopes", nlohmann::json::array({"data", "configurations"})}})
           .success_description("Lock acquired")
           // 409 from LockManager::acquire, passed through verbatim by
           // post_lock: `lock-conflict` when the entity is already locked and
@@ -1597,6 +1633,11 @@ void RESTServer::setup_routes() {
           // comes from a DTO descriptor, so the declaration and the fields the
           // handler reads are one edit apart, not two files apart.
           .request_body<dto::ScriptExecutionRequest>("Execution parameters")
+          // `now` is the only execution_type the shipped backend accepts; a
+          // ScriptProvider plugin defines its own vocabulary. `parameters` is
+          // the script's own shape - read `parameters_schema` from GET
+          // .../scripts/{script_id}.
+          .body_example(nlohmann::json{{"execution_type", "now"}, {"parameters", nlohmann::json{{"iterations", 3}}}})
           .success_description("Execution started")
           // DefaultScriptProvider::start_execution -> ConcurrencyLimit
           .errors({429, 501})
@@ -1667,7 +1708,14 @@ void RESTServer::setup_routes() {
              })
           .tag("Discovery")
           .summary("List entities contained in area")
-          .description("Lists all entities contained in this area.")
+          // Components only, not "all entities": the handler walks the area and
+          // its descendant subareas collecting `get_components_for_area` and
+          // returns ComponentListItem. Apps reached through those components
+          // are not in this answer.
+          .description(
+              "Lists the components in this area, including those in its subareas. Components only - the apps "
+              "those components host are reached through the component, and the subareas themselves through "
+              "`/areas/{area_id}/subareas`.")
           .operation_id("listAreaContains");
     }
 
@@ -1745,7 +1793,11 @@ void RESTServer::setup_routes() {
              })
           .tag("Discovery")
           .summary("List function hosts")
-          .description("Lists components hosting this function.")
+          // The handler resolves the function's host ids through
+          // `cache.get_app(...)` and returns AppListItem with `/api/v1/apps/`
+          // hrefs, so the previous "components hosting this function" named
+          // the wrong entity type in the one place a client reads to find out.
+          .description("Lists the apps that host this function.")
           .operation_id("listFunctionHosts");
     }
 
@@ -1929,7 +1981,16 @@ void RESTServer::setup_routes() {
          })
       .tag("Faults")
       .summary("Clear all faults globally")
-      .description("Clears all faults across the entire system.")
+      // "Across the entire system" was wrong twice over: the request never
+      // leaves this gateway, and an omitted `status` clears two of the four
+      // states rather than all of them.
+      .description(
+          "Clears the faults this gateway's own FaultManager holds. In an aggregated deployment the peers are "
+          "not touched, which the 204 reports through `X-Medkit-Local-Only`; clear those per peer. Which faults "
+          "go is the `status` filter's decision, and omitting it does not mean all of them - it means pending "
+          "and confirmed, leaving already-cleared and healed records in place. Faults on entities another client "
+          "has locked are skipped silently and the request still answers 204, with nothing on the response "
+          "naming what survived.")
       // A 204 cannot carry a body, so the "peers were not cleared" caveat this
       // route ships travels as a header - which makes declaring it the only way
       // a generated client can see it at all.
@@ -2182,6 +2243,13 @@ void RESTServer::setup_routes() {
              })
           .tag("Lifecycle")
           .summary(std::string("Request lifecycle transition '") + action + "'")
+          .description(std::string("Asks the entity's LifecycleProvider to perform the '") + action +
+                       "' transition. The 202 says the request was accepted, not that the transition finished: it "
+                       "carries no body, and the outcome is observed by polling `GET " +
+                       base_lc +
+                       "/status`, which the `Location` header names. Whether this transition is implemented at all is "
+                       "the provider's decision - without one, or where the provider reports it unsupported, the route "
+                       "answers 501.")
           .success_description("Lifecycle transition accepted")
           // 501: no LifecycleProvider, or the provider reports the transition
           // unsupported. 403 and 409 come from the same total mapper
@@ -2202,6 +2270,15 @@ void RESTServer::setup_routes() {
                                           })
         .tag("Lifecycle")
         .summary(std::string("Get ") + et_lc.second + " lifecycle status")
+        .description(
+            "Reports whether the entity is `ready` or `notReady`, and which lifecycle transitions can be "
+            "requested on it. A registered LifecycleProvider answers both; the transition fields it returns are "
+            "the transitions it implements, and they are the only place the document commits to a transition "
+            "being available on a given entity. Without a provider the gateway derives readiness itself and "
+            "returns no transition fields at all, which is the same entity for which every `PUT "
+            "/{entity}/status/{action}` answers 501. That derivation reads a managed ROS 2 node's own lifecycle "
+            "state where the node exposes one - `active` is the only ready state - and otherwise falls back to "
+            "the node being present in the ROS graph; a component is ready unless every app it hosts is offline.")
         // 501 when the provider reports the entity unsupported; 403/409 from
         // the same mapper - see the transition routes above.
         .errors({403, 409, 501})

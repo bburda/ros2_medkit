@@ -87,7 +87,11 @@ inline constexpr std::string_view dto_name<Trigger> = "Trigger";
 //   multishot        - fire multiple times (optional)
 //   persistent       - survive server restarts (optional)
 //   lifetime         - lifetime in seconds, must be > 0 (optional)
-//   path             - JSON Pointer delivery path (optional)
+//   path             - JSON Pointer selecting the part of the observed value the
+//                      condition is evaluated against, max 1024 chars (optional).
+//                      NOT a delivery path: TriggerManager applies it to the
+//                      incoming value before evaluating, and skips any update in
+//                      which it does not resolve.
 //   log_settings     - free-form log capture settings (optional)
 // =============================================================================
 struct TriggerCreateRequest {
@@ -104,10 +108,26 @@ struct TriggerCreateRequest {
 template <>
 inline constexpr auto dto_fields<TriggerCreateRequest> = std::make_tuple(
     field("resource", &TriggerCreateRequest::resource),
+    // trigger_condition's prose lives on the schema override below, which
+    // replaces this property wholesale - see detail::trigger_condition_schema.
     field("trigger_condition", &TriggerCreateRequest::trigger_condition),
-    field("protocol", &TriggerCreateRequest::protocol), field("multishot", &TriggerCreateRequest::multishot),
-    field("persistent", &TriggerCreateRequest::persistent), field("lifetime", &TriggerCreateRequest::lifetime),
-    field("path", &TriggerCreateRequest::path), field("log_settings", &TriggerCreateRequest::log_settings));
+    field("protocol", &TriggerCreateRequest::protocol,
+          "Transport the trigger's events are delivered over. `sse` is the only value the gateway accepts and is "
+          "what an omitted field means; anything else is rejected with 400."),
+    field("multishot", &TriggerCreateRequest::multishot), field("persistent", &TriggerCreateRequest::persistent),
+    field("lifetime", &TriggerCreateRequest::lifetime,
+          "How long the trigger stays active, in seconds from creation. Omit it and the trigger never expires on "
+          "its own - it lives until it is deleted, or until a single-shot trigger fires. `PUT "
+          "/{entity}/triggers/{trigger_id}` restarts the countdown from the new value rather than adding to what "
+          "is left.",
+          FieldConstraints{/*minimum=*/1.0, {}, {}, {}, {}}),
+    field("path", &TriggerCreateRequest::path,
+          "JSON Pointer (RFC 6901) selecting the part of the observed resource the condition is evaluated "
+          "against, e.g. `/data/temperature`. Omit it to evaluate the whole value. An update in which the "
+          "pointer does not resolve is skipped rather than treated as a change, so a pointer that never matches "
+          "yields a trigger that never fires. Maximum 1024 characters.",
+          FieldConstraints{{}, {}, /*max_length=*/1024U, {}, {}}),
+    field("log_settings", &TriggerCreateRequest::log_settings));
 
 template <>
 inline constexpr std::string_view dto_name<TriggerCreateRequest> = "TriggerCreateRequest";

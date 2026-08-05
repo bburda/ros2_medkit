@@ -125,9 +125,11 @@ struct Area {
       j["translationId"] = translation_id;
     }
 
-    // Capabilities as URI references (SOVD compliant)
+    // Capabilities as URI references (SOVD compliant). Both name a route
+    // `rest_server.cpp` registers for areas - `/related-components` did not,
+    // and was the last spelling of a segment no entity type serves.
     j["subareas"] = area_url + "/subareas";
-    j["related-components"] = area_url + "/related-components";
+    j["components"] = area_url + "/components";
 
     // x-medkit extension for ROS 2 specific info
     j["x-medkit"] = {{"entityType", type}, {"namespace", namespace_path}};

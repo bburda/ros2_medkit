@@ -214,6 +214,11 @@ RouteEntry & RouteEntry::accepts(const std::string & content_type, const nlohman
   return *this;
 }
 
+RouteEntry & RouteEntry::body_example(nlohmann::json example) {
+  body_example_ = std::move(example);
+  return *this;
+}
+
 RouteEntry & RouteEntry::path_param(const std::string & name, const std::string & desc) {
   nlohmann::json param;
   param["name"] = name;
@@ -936,31 +941,76 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
         }
         std::string pname = route.path_.substr(pos + 1, close - pos - 1);
         if (explicit_params.find(pname) == explicit_params.end()) {
-          // Auto-generate path parameter with description
-          static const std::unordered_map<std::string, std::string> kParamDescriptions = {
-              {"area_id", "The area identifier"},
-              {"component_id", "The component identifier"},
-              {"app_id", "The app identifier"},
-              {"function_id", "The function identifier"},
+          // Auto-generated path parameters. Every route carrying `{fault_code}`
+          // or `{config_id}` is registered from a loop over the four entity
+          // types, and none of them declares the parameter by hand, so this
+          // table is the one place either is described - which is why the
+          // length the handler enforces is a column here rather than a
+          // per-registration call that a new route could forget.
+          //
+          // `max_length` 0 means "no length constraint published".
+          //
+          // **Precondition, and it is on you to keep it.** This table is keyed
+          // by parameter *name*, so a bound written here is published on EVERY
+          // route carrying that template - it cannot say "this route's handler
+          // checks, that one's does not", and nothing verifies the mapping. So
+          // only fill it where *every* handler behind the template rejects an
+          // over-long value unconditionally. The first version of this table
+          // broke that: `delete_configuration` was the one verb of the three
+          // that never measured `config_id`, and the 512 was published on its
+          // routes anyway. That check now exists.
+          //
+          // Both rows are covered on every verb they publish to, so the
+          // precondition is tested rather than asserted:
+          //   config_id  - test_configuration_api.test.py
+          //                ::test_06b_every_verb_rejects_an_oversized_config_id
+          //                (GET / PUT / DELETE)
+          //   fault_code - test_faults_api.test.py
+          //                ::test_both_verbs_reject_an_oversized_fault_code
+          //                (GET / DELETE)
+          // A new row needs its own, or the bound it publishes rests on a
+          // reading of the handlers rather than on a run.
+          struct PathParamInfo {
+            const char * description;
+            std::size_t max_length;
+          };
+          static const std::unordered_map<std::string, PathParamInfo> kParamDescriptions = {
+              {"area_id", {"The area identifier", 0}},
+              {"component_id", {"The component identifier", 0}},
+              {"app_id", {"The app identifier", 0}},
+              {"function_id", {"The function identifier", 0}},
               {"data_id",
-               "The data item identifier (ROS 2 topic name), or 'member_id:topic' when more than one member of "
-               "the entity contributes an item under that name"},
+               {"The data item identifier (ROS 2 topic name), or 'member_id:topic' when more than one member of "
+                "the entity contributes an item under that name",
+                0}},
               {"operation_id",
-               "The operation identifier (service or action short name), or 'member_id:operation' when more than "
-               "one member of the entity exposes that name, or the ROS 2 path without its leading slash when one "
-               "provider exposes that short name at more than one path"},
-              {"execution_id", "The execution identifier"},
-              {"config_id", "The configuration parameter identifier (ROS 2 parameter name)"},
-              {"fault_code", "The fault code identifier"},
-              {"subscription_id", "The cyclic subscription identifier"},
-              {"category_id", "The bulk data category identifier"},
-              {"file_id", "The bulk data file identifier"},
-              {"update_id", "The software update identifier"},
-              {"subarea_id", "The subarea identifier"},
-              {"subcomponent_id", "The subcomponent identifier"},
-              {"trigger_id", "The trigger identifier"},
-              {"lock_id", "The lock identifier"},
-              {"script_id", "The script identifier"},
+               {"The operation identifier (service or action short name), or 'member_id:operation' when more than "
+                "one member of the entity exposes that name, or the ROS 2 path without its leading slash when one "
+                "provider exposes that short name at more than one path",
+                0}},
+              {"execution_id", {"The execution identifier", 0}},
+              // Not simply "the ROS 2 parameter name": on an entity backed by
+              // more than one node a write of a bare name is rejected with 400
+              // (`config_handlers.cpp`, "Aggregated configuration requires
+              // app_id prefix"), and it is the prefixed form the list response
+              // hands back as each item's `id`. 512 = 256 (entity id) + 1 (`:`)
+              // + 256 (parameter name).
+              {"config_id",
+               {"The configuration parameter identifier. On an entity that aggregates several ROS 2 nodes this is "
+                "the `app_id:param_name` form the configurations list returns as each item's `id`, and a write of "
+                "a bare parameter name is rejected as ambiguous; on a single-node entity it is the bare parameter "
+                "name and a colon in it is part of the name. Maximum 512 characters.",
+                512}},
+              {"fault_code", {"The fault code identifier. Maximum 256 characters.", 256}},
+              {"subscription_id", {"The cyclic subscription identifier", 0}},
+              {"category_id", {"The bulk data category identifier", 0}},
+              {"file_id", {"The bulk data file identifier", 0}},
+              {"update_id", {"The software update identifier", 0}},
+              {"subarea_id", {"The subarea identifier", 0}},
+              {"subcomponent_id", {"The subcomponent identifier", 0}},
+              {"trigger_id", {"The trigger identifier", 0}},
+              {"lock_id", {"The lock identifier", 0}},
+              {"script_id", {"The script identifier", 0}},
           };
           nlohmann::json param;
           param["name"] = pname;
@@ -968,7 +1018,14 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
           param["required"] = true;
           param["schema"] = {{"type", "string"}};
           auto desc_it = kParamDescriptions.find(pname);
-          param["description"] = (desc_it != kParamDescriptions.end()) ? desc_it->second : "The " + pname + " value";
+          if (desc_it != kParamDescriptions.end()) {
+            param["description"] = desc_it->second.description;
+            if (desc_it->second.max_length > 0) {
+              param["schema"]["maxLength"] = desc_it->second.max_length;
+            }
+          } else {
+            param["description"] = "The " + pname + " value";
+          }
           if (!operation.contains("parameters")) {
             operation["parameters"] = nlohmann::json::array();
           }
@@ -987,6 +1044,11 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       }
       if (!route.multipart_encoding_.empty()) {
         operation["requestBody"]["content"][ct]["encoding"] = route.multipart_encoding_;
+      }
+      // Primary media type only: the extra encodings below are the same payload
+      // in another wire format, and a JSON example would not parse as one.
+      if (route.body_example_.has_value()) {
+        operation["requestBody"]["content"][ct]["examples"]["default"]["value"] = *route.body_example_;
       }
       // Further encodings of the same payload (the auth endpoints' RFC 6749
       // form encoding). Merged into the same content object, because they are
@@ -1304,6 +1366,14 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
       issues.push_back({ValidationIssue::Severity::kError, route_id,
                         "success_schema() was dropped: the route declares no single 2xx to attach to, or "
                         "that 2xx carries a media type no JSON Schema can describe"});
+    }
+
+    // body_example() attaches to a declared request body. On a route with none
+    // the example is dropped rather than minting a body the route does not
+    // take, which would tell a client to send a payload the handler ignores.
+    if (route.body_example_.has_value() && !route.request_body_.has_value()) {
+      issues.push_back({ValidationIssue::Severity::kError, route_id,
+                        "body_example() was dropped: the route declares no request body to attach it to"});
     }
 
     // Check response schemas for non-DELETE methods

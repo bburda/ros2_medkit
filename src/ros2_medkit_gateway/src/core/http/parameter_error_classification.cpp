@@ -112,6 +112,7 @@ ParameterErrorClassification classify_parameter_error(const ParameterResult & re
 const std::vector<int> & parameter_error_statuses() {
   static const std::vector<int> statuses = [] {
     std::vector<int> out;
+    out.reserve(kAllParameterErrorCodes.size());
     for (ParameterErrorCode code : kAllParameterErrorCodes) {
       out.push_back(classify_error_code(code).status_code);
     }

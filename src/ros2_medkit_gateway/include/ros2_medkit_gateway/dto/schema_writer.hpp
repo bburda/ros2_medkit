@@ -58,7 +58,14 @@ nlohmann::json schema_of() {
   } else if constexpr (std::is_same_v<U, bool>) {
     return nlohmann::json{{"type", "boolean"}};
   } else if constexpr (std::is_integral_v<U>) {
-    return nlohmann::json{{"type", "integer"}};
+    nlohmann::json integer{{"type", "integer"}};
+    // `format: int64` asserts a signed 64-bit range, so it is derived from
+    // signedness as well as width: `sizeof(U) == 8` alone also matches
+    // `uint64_t` and `std::size_t`, whose upper half the format excludes.
+    if constexpr (sizeof(U) == 8 && std::is_signed_v<U>) {
+      integer["format"] = "int64";
+    }
+    return integer;
   } else if constexpr (std::is_floating_point_v<U>) {
     return nlohmann::json{{"type", "number"}};
   } else {
@@ -87,24 +94,49 @@ nlohmann::json derived_object_schema() {
     } else {
       using MemberT = std::decay_t<decltype(std::declval<T>().*(f.ptr))>;
       nlohmann::json prop = schema_of<MemberT>();
+      // The description stays at the property level even for a nullable
+      // member: it describes the field, not one branch of its schema, and a
+      // reader shows it either way. Everything below is a *validation*
+      // keyword, which is why it goes somewhere else.
       if (!f.description.empty()) {
         prop["description"] = std::string(f.description);
       }
+      // For optional members schema_of() yields {anyOf:[<inner>, {null}]}.
+      // A validation keyword written at the property level would apply to the
+      // null branch too and reject the null that anyOf advertises, so it goes
+      // on the non-null branch ([0]). Required members have no anyOf and take
+      // it at the top level. One lambda for the enum and every constraint, so
+      // the two placements cannot drift apart.
+      auto attach = [&prop](const char * keyword, nlohmann::json value) {
+        if (prop.contains("anyOf") && prop["anyOf"].is_array() && !prop["anyOf"].empty()) {
+          prop["anyOf"][0][keyword] = std::move(value);
+        } else {
+          prop[keyword] = std::move(value);
+        }
+      };
       if (f.enum_count > 0) {
         nlohmann::json values = nlohmann::json::array();
         for (std::size_t i = 0; i < f.enum_count; ++i) {
           values.push_back(std::string(f.enum_values[i]));
         }
-        // For optional members schema_of() yields {anyOf:[<inner>, {null}]};
-        // attach the enum to the non-null branch ([0]) so the nullable claim
-        // and the enum constraint agree (a top-level enum lacking "null" would
-        // reject the null that anyOf advertises). Required members get the
-        // enum at the top level.
-        if (prop.contains("anyOf") && prop["anyOf"].is_array() && !prop["anyOf"].empty()) {
-          prop["anyOf"][0]["enum"] = values;
-        } else {
-          prop["enum"] = values;
-        }
+        attach("enum", values);
+      }
+      if (f.constraints.minimum.has_value()) {
+        attach("minimum", *f.constraints.minimum);
+      }
+      if (f.constraints.maximum.has_value()) {
+        attach("maximum", *f.constraints.maximum);
+      }
+      if (f.constraints.max_length.has_value()) {
+        attach("maxLength", *f.constraints.max_length);
+      }
+      if (!f.constraints.pattern.empty()) {
+        attach("pattern", std::string(f.constraints.pattern));
+      }
+      // Last, so an explicit format overrides the one derived from the member
+      // type (`int64` for a signed 64-bit integral).
+      if (!f.constraints.format.empty()) {
+        attach("format", std::string(f.constraints.format));
       }
       props[std::string(f.key)] = prop;
       if (f.presence == Presence::kRequired) {
