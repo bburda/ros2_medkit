@@ -683,7 +683,7 @@ BulkDataHandlers::upload(const http::TypedRequest & req, const http::MultipartBo
   }
 
   http::ResponseAttachments att;
-  att.with_location(req.path() + "/" + stored.id);
+  att.with_location(child_resource_path(req.path(), stored.id));
   return std::make_pair(http::Created<dto::BulkDataDescriptor>{std::move(descriptor)}, std::move(att));
 }
 

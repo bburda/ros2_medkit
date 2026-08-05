@@ -43,6 +43,47 @@ inline std::string api_path(const std::string & endpoint) {
 }
 
 /**
+ * @brief A request path in the form the route regexes actually match
+ *
+ * `RouteRegistry::to_regex_path` anchors every route with `"/?$"`, so a client
+ * may append a trailing slash to any URI and still be routed. Nothing
+ * normalises the path afterwards, so `httplib::Request::path` keeps whatever
+ * the client sent.
+ *
+ * Any handler that echoes the request path back - in a `Location` header, an
+ * `href`, a `_links` entry - must run it through here first, or it publishes a
+ * URI that differs from the canonical one for the same resource.
+ *
+ * @param path Raw request path (e.g. "/api/v1/apps/x/scripts/")
+ * @return The same path without trailing slashes ("/api/v1/apps/x/scripts");
+ *         a path that is only slashes collapses to "/"
+ */
+inline std::string canonical_request_path(const std::string & path) {
+  size_t end = path.size();
+  while (end > 1 && path[end - 1] == '/') {
+    --end;
+  }
+  return path.substr(0, end);
+}
+
+/**
+ * @brief URI of a child of the resource this request addressed
+ *
+ * The `Location` of a resource a POST just created. Built from the request's
+ * own path so it names the collection the caller addressed, and canonicalised
+ * so a stray trailing slash cannot produce an empty path segment: `([^/]+)` in
+ * every route regex refuses to match one, so `/apps/x/scripts//new_id` is a
+ * `Location` that 404s.
+ *
+ * @param path Raw request path of the collection that was POSTed to
+ * @param child_id Id of the newly created child resource
+ * @return Absolute, API-prefixed URI of the child
+ */
+inline std::string child_resource_path(const std::string & path, const std::string & child_id) {
+  return canonical_request_path(path) + "/" + child_id;
+}
+
+/**
  * @brief Extract expected entity type from request path
  *
  * Parses the URL path to determine which entity type the route expects.

@@ -22,6 +22,7 @@
 #include <variant>
 
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_gateway/core/http/http_utils.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_support.hpp"
 
 using json = nlohmann::json;
@@ -235,7 +236,7 @@ LockHandlers::post_lock(const http::TypedRequest & req, dto::AcquireLockRequest 
 
     auto lock_dto = lock_info_to_dto(*result, client_id);
     http::ResponseAttachments att;
-    att.with_location(std::string(req.path()) + "/" + result->lock_id);
+    att.with_location(child_resource_path(req.path(), result->lock_id));
     return std::make_pair(http::Created<dto::Lock>{std::move(lock_dto)}, std::move(att));
 
   } catch (const std::exception & e) {

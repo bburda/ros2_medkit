@@ -1054,7 +1054,11 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
     return tl::make_unexpected(lookup.error());
   }
   const auto & ops = lookup->ops;
-  const std::string id_field = (lookup->entity_type == "app") ? "app_id" : "component_id";
+  // `EntityInfo` already carries the right key for all four types; the previous
+  // "app_id if it is an app, else component_id" put `component_id` in the error
+  // params of every area and function caller whose goal was rejected, naming a
+  // field the caller never sent.
+  const std::string & id_field = entity_info.id_field;
 
   auto parsed = http::parse_member_qualified_id(operation_id, ops.is_aggregated);
   if (parsed.has_member && !names_a_member(ops, parsed.member_id)) {
@@ -1132,7 +1136,9 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
       // prefix from an apps/components pair points areas and functions
       // clients - the route is registered for all four entity types - into
       // the components collection, and bypasses api_path() besides.
-      const std::string location = req.path() + "/" + action_result.goal_id;
+      // child_resource_path drops a caller trailing slash, which would
+      // otherwise make the Location a double slash that answers 404.
+      const std::string location = child_resource_path(req.path(), action_result.goal_id);
 
       http::ResponseAttachments att;
       att.with_location(location);
@@ -1516,8 +1522,9 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
       // The execution resource IS the request target for PUT, so echo the
       // requested path: the route is registered for apps, components, areas
       // and functions alike, and a hand-built apps/components pair sends an
-      // areas client into the wrong collection.
-      const std::string & location = req.path();
+      // areas client into the wrong collection. Canonicalised so the header
+      // does not echo a caller's trailing slash.
+      const std::string location = canonical_request_path(req.path());
 
       // Render the tracked status rather than assuming "running": the
       // reconcile set includes CANCELED, which GET reports as "failed", and

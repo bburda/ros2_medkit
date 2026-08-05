@@ -484,7 +484,7 @@ void RESTServer::setup_routes() {
                 // declaration cannot reach here, so the header is set - and
                 // declared below - by hand. `req.path` already carries the API
                 // prefix, matching the form every other 201 uses.
-                res.set_header("Location", req.path + "/" + created->id);
+                res.set_header("Location", child_resource_path(req.path, created->id));
                 res.status = 201;
                 res.set_content(FaultTriggerEngine::rule_to_json(*created).dump(2), "application/json");
               })
