@@ -489,8 +489,10 @@ ros2_medkit_gateway:
     # When enabled, a plugin implementing UpdateProvider is required to provide
     # the backend functionality. Without such a plugin, endpoints return 501.
     updates:
-      # Enable/disable /updates endpoints
-      # When false, update routes are not registered
+      # Enable/disable the /updates backend.
+      # The routes are always registered and always appear in the OpenAPI
+      # document; when this is false (or no UpdateProvider plugin is loaded)
+      # every one of them answers 501 not-implemented.
       # Default: false
       enabled: false
 

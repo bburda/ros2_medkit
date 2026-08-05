@@ -1046,6 +1046,12 @@ Execute Operations
         "status": "running"
       }
 
+   The ``202`` carries a ``Location`` header naming the new execution. It is
+   the request path plus the execution id, so it stays inside the collection
+   the caller addressed: a POST to ``/api/v1/functions/powertrain/...`` is
+   answered with a ``/api/v1/functions/powertrain/...`` execution URI, never a
+   ``/components/`` one.
+
 ``GET /api/v1/components/{id}/operations/{operation_id}/executions``
    List all executions for an operation. Actions return their goals; a service
    returns an empty ``items`` array, because a service call leaves no execution
@@ -1279,7 +1285,9 @@ Manage ROS 2 node parameters.
 
    - **Content-Type:** application/json
    - **200:** Parameter updated
-   - **400:** Invalid value
+   - **400:** Invalid value - the node rejected it, or it cannot be converted to
+     the parameter's type at all (e.g. a mixed-type array). Both are the
+     caller's body, so both are ``400``, never ``500``.
    - **404:** Parameter not found
 
    **Example:**
@@ -2709,6 +2717,12 @@ The routes are part of the generated OpenAPI spec (``/api/v1/docs``, tag
 ``FaultTriggers``), so generated clients and Swagger UI discover them the same
 way as every other endpoint.
 
+The engine runs only when ``fault_triggers.enabled`` is true *and* at least one
+plugin is loaded. Without it the routes stay mounted and answer ``501``
+(``not-implemented``) - the same shape the ``/updates`` and ``/triggers`` gates
+use, so a client can tell "this build has no threshold engine" apart from "no
+such app or rule".
+
 ``GET /api/v1/apps/{app_id}/fault-triggers``
    List the app's rules.
 
@@ -2736,10 +2750,12 @@ way as every other endpoint.
    (default ``true``). Returns ``201`` with the created rule and a ``Location``
    header pointing to it.
 
-   Validation: ``400`` for missing/invalid fields or a ``data_name`` the app
-   does not expose (when enumerable); ``409`` when the ``fault_code`` is
-   already used by another rule - fault codes are global to the fault store,
-   so two rules sharing one would fight over the same fault.
+   Validation: ``400`` (``invalid-parameter``) for missing/invalid fields or a
+   ``data_name`` the app does not expose (when enumerable); ``404``
+   (``entity-not-found``) when the app itself was never discovered; ``409``
+   (``precondition-not-fulfilled``) when the ``fault_code`` is already used by
+   another rule - fault codes are global to the fault store, so two rules
+   sharing one would fight over the same fault.
 
 ``DELETE /api/v1/apps/{app_id}/fault-triggers/{trigger_id}``
    Remove a rule (``204``). A fault currently asserted by the rule is cleared;

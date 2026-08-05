@@ -33,11 +33,18 @@ import launch_testing
 import launch_testing.actions
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
+from ros2_medkit_test_utils.constants import (
+    ALLOWED_EXIT_CODES,
+    API_BASE_PATH,
+    get_test_port,
+)
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
-from ros2_medkit_test_utils.launch_helpers import create_test_launch
+from ros2_medkit_test_utils.launch_helpers import create_gateway_node, create_test_launch
 
 PLUGIN_APP = 'test_route_plc_app'
+
+PORT_ENGINE_OFF = get_test_port(1)
+URL_ENGINE_OFF = f'http://localhost:{PORT_ENGINE_OFF}{API_BASE_PATH}'
 
 
 def _get_plugin_path(so_name):
@@ -46,7 +53,7 @@ def _get_plugin_path(so_name):
 
 
 def generate_test_description():
-    return create_test_launch(
+    launch_description, context = create_test_launch(
         demo_nodes=['temp_sensor'],
         fault_manager=True,
         gateway_params={
@@ -56,6 +63,20 @@ def generate_test_description():
             'fault_triggers.poll_interval_ms': 200,
         },
     )
+    # Second gateway with the engine switched off, so the "backend absent"
+    # answer can be asserted on the same route set as the live one.
+    gateway_engine_off = create_gateway_node(
+        name='gateway_fault_triggers_off',
+        port=PORT_ENGINE_OFF,
+        extra_params={
+            'server.host': '127.0.0.1',
+            'fault_triggers.enabled': False,
+        },
+    )
+    # Prepend so it comes up alongside the primary gateway, before ReadyToTest.
+    launch_description.entities.insert(0, gateway_engine_off)
+    context['gateway_fault_triggers_off'] = gateway_engine_off
+    return launch_description, context
 
 
 class TestFaultTriggersApi(GatewayTestCase):
@@ -191,6 +212,69 @@ class TestFaultTriggersApi(GatewayTestCase):
             f'{self.BASE_URL}/apps/test_route_plc_down_app/fault-triggers'
             f"/{rule['id']}", timeout=10)
         self.assertEqual(resp.status_code, 204)
+
+    def test_08_engine_absent_answers_501_on_every_verb(self):
+        """No engine is a missing backend, not a missing rule.
+
+        The gateway used to answer 404/``resource-not-found`` here, which is the
+        same answer an unknown rule id gets - it told a client to go hunting for
+        an id when what it had to do was turn the feature on. It now answers the
+        gate shape ``/updates`` and ``/triggers`` use.
+        """
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            try:
+                if requests.get(f'{URL_ENGINE_OFF}/health', timeout=2).status_code == 200:
+                    break
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(0.5)
+        else:
+            self.fail('gateway_fault_triggers_off never became healthy')
+
+        base = f'{URL_ENGINE_OFF}/apps/{PLUGIN_APP}/fault-triggers'
+        responses = [
+            requests.get(base, timeout=10),
+            requests.post(base, json={'data_name': 'level', 'operator': '>',
+                                      'threshold': 1.0, 'fault_code': 'OFF_RULE',
+                                      'severity': 'ERROR'}, timeout=10),
+            requests.delete(f'{base}/ftr_1', timeout=10),
+        ]
+        for resp in responses:
+            self.assertEqual(resp.status_code, 501, resp.text)
+            self.assertEqual(resp.json()['error_code'], 'not-implemented')
+
+    def test_09_create_error_codes_name_the_failure(self):
+        """400, 404 and 409 each carry their own error code.
+
+        All three used to fall through one status-shaped default, so an unknown
+        app read as a missing sub-resource and a duplicate ``fault_code`` read as
+        a malformed field the caller could fix by editing the body.
+        """
+        bad_field = self._create({'data_name': 'level', 'operator': '~',
+                                  'threshold': 1.0, 'fault_code': 'CODE_SHAPE_A',
+                                  'severity': 'ERROR'})
+        self.assertEqual(bad_field.status_code, 400, bad_field.text)
+        self.assertEqual(bad_field.json()['error_code'], 'invalid-parameter')
+
+        ghost = requests.post(
+            f'{self.BASE_URL}/apps/ghost_app_for_codes/fault-triggers',
+            json={'data_name': 'level', 'operator': '>', 'threshold': 1.0,
+                  'fault_code': 'CODE_SHAPE_B', 'severity': 'ERROR'}, timeout=10)
+        self.assertEqual(ghost.status_code, 404, ghost.text)
+        self.assertEqual(ghost.json()['error_code'], 'entity-not-found')
+
+        first = self._create({'data_name': 'level', 'operator': '>=',
+                              'threshold': 80.0, 'fault_code': 'CODE_SHAPE_C',
+                              'severity': 'ERROR'})
+        self.assertEqual(first.status_code, 201, first.text)
+        self.addCleanup(requests.delete, self._url(f"/{first.json()['id']}"), timeout=10)
+
+        dup = self._create({'data_name': 'level', 'operator': '>=',
+                            'threshold': 90.0, 'fault_code': 'CODE_SHAPE_C',
+                            'severity': 'ERROR'})
+        self.assertEqual(dup.status_code, 409, dup.text)
+        self.assertEqual(dup.json()['error_code'], 'precondition-not-fulfilled')
 
     # ------------------------------------------------------------------
     # Helpers

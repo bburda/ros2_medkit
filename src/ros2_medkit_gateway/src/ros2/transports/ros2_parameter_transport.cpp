@@ -632,7 +632,21 @@ ParameterResult Ros2ParameterTransport::set_parameter(const std::string & node_n
         return result;
       }
       auto current_value = node_->get_parameter(param_name).get_parameter_value();
-      rclcpp::ParameterValue param_value = json_to_parameter_value(value, current_value.get_type());
+      // Conversion runs in its own try so a value the CLIENT sent that cannot
+      // become this parameter's type reports as INVALID_VALUE (400), not as the
+      // INTERNAL_ERROR (500) the outer catch would give it. A heterogeneous
+      // array is the easy way in: nlohmann throws type_error out of
+      // `get<std::vector<int64_t>>()` and nothing about that is the gateway's
+      // fault.
+      rclcpp::ParameterValue param_value;
+      try {
+        param_value = json_to_parameter_value(value, current_value.get_type());
+      } catch (const std::exception & e) {
+        result.success = false;
+        result.error_message = "Value cannot be converted for parameter '" + param_name + "': " + e.what();
+        result.error_code = ParameterErrorCode::INVALID_VALUE;
+        return result;
+      }
       auto set_result = node_->set_parameter(rclcpp::Parameter(param_name, param_value));
       if (!set_result.successful) {
         result.success = false;
@@ -714,8 +728,18 @@ ParameterResult Ros2ParameterTransport::set_parameter(const std::string & node_n
 
     // json_to_parameter_value can throw on bad CLIENT input (e.g. malformed value for
     // the parameter's type). It runs OUTSIDE any mark scope so a bad client value never
-    // negative-caches a healthy node; the outer catch maps a throw to INTERNAL_ERROR.
-    rclcpp::ParameterValue param_value = json_to_parameter_value(value, hint_type);
+    // negative-caches a healthy node, and it is caught HERE rather than by the outer
+    // catch: the outer catch reports INTERNAL_ERROR, which the classifier turns into a
+    // 500 and so blames the gateway for a body the caller chose.
+    rclcpp::ParameterValue param_value;
+    try {
+      param_value = json_to_parameter_value(value, hint_type);
+    } catch (const std::exception & e) {
+      result.success = false;
+      result.error_message = "Value cannot be converted for parameter '" + param_name + "': " + e.what();
+      result.error_code = ParameterErrorCode::INVALID_VALUE;
+      return result;
+    }
     rclcpp::Parameter param(param_name, param_value);
 
     std::vector<rcl_interfaces::msg::SetParametersResult> results;

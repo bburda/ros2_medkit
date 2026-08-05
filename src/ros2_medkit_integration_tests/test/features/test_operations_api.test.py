@@ -28,7 +28,7 @@ import launch_testing
 import launch_testing.actions
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
+from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, API_BASE_PATH
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
@@ -424,6 +424,43 @@ class TestOperationsApi(GatewayTestCase):
         data = response.json()
         self.assertIn('items', data)
         self.assertIsInstance(data['items'], list)
+
+    def test_async_execution_location_resolves(self):
+        """The 202 `Location` names the execution under the addressed collection.
+
+        The gateway used to build this header from a two-way "app or else
+        component" choice, so an execution started through `/functions/...` or
+        `/areas/...` was handed a `/components/...` URI that resolves to
+        nothing. The fixture discovers the `powertrain` function from the demo
+        nodes' namespace, and `long_calibration` is an action on it, so this
+        drives the branch that was wrong.
+
+        @verifies REQ_INTEROP_035
+        """
+        self.wait_for_operation('/functions/powertrain', 'long_calibration')
+
+        ops = self.get_json('/functions/powertrain/operations')['items']
+        actions = [o for o in ops if o.get('asynchronous_execution')]
+        self.assertTrue(actions, 'no action discovered on the function')
+
+        resp = requests.post(
+            f'{self.BASE_URL}/functions/powertrain/operations'
+            f'/{actions[0]["id"]}/executions',
+            json={}, timeout=15)
+        self.assertEqual(resp.status_code, 202, resp.text)
+
+        location = resp.headers.get('Location')
+        execution_id = resp.json()['id']
+        self.assertEqual(
+            location,
+            f'{API_BASE_PATH}/functions/powertrain/operations'
+            f'/{actions[0]["id"]}/executions/{execution_id}')
+
+        # The header is only worth anything if it resolves.
+        follow_url = self.BASE_URL + location[len(API_BASE_PATH):]
+        self.addCleanup(requests.delete, follow_url, timeout=10)
+        follow = requests.get(follow_url, timeout=10)
+        self.assertEqual(follow.status_code, 200, follow.text)
 
     def test_create_execution_for_service(self):
         """POST /{entity}/operations/{op-id}/executions calls service and returns.
