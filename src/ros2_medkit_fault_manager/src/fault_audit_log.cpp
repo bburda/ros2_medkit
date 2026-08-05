@@ -59,6 +59,12 @@ class Stmt {
     }
   }
 
+  // All five special members are declared because the destructor is: a class
+  // that finalizes a raw sqlite3_stmt must not be copied or moved. The moves
+  // were already suppressed by the user-declared destructor and copies, so
+  // spelling them out changes nothing at any call site - every use in this
+  // file is a direct-initialized local - and states the intent the compiler
+  // was inferring.
   Stmt(const Stmt &) = delete;
   Stmt & operator=(const Stmt &) = delete;
   Stmt(Stmt &&) = delete;

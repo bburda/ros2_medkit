@@ -46,6 +46,24 @@ class TypeCache {
   /// Delete copy assignment
   TypeCache & operator=(const TypeCache &) = delete;
 
+  /// Delete move constructor
+  ///
+  /// Already suppressed by the copy declarations above; spelled out so the
+  /// class declares the whole set rather than leaving two members to be
+  /// inferred.
+  TypeCache(TypeCache &&) = delete;
+
+  /// Delete move assignment
+  TypeCache & operator=(TypeCache &&) = delete;
+
+  /// Defaulted destructor
+  ///
+  /// The only instance is the function-local static in `instance()`, so this
+  /// runs at static destruction exactly as the implicit destructor did, over
+  /// the same members in the same order. `cache_` holds non-owning pointers
+  /// into dynmsg's type supports, so there is nothing here to release.
+  ~TypeCache() = default;
+
   /// Get type info for a message type (C++ introspection)
   ///
   /// @param package_name Package name (e.g., "std_msgs")
