@@ -226,10 +226,14 @@ class PluginManager : public LogProviderRegistry {
    * thread-safe (already the contract across concurrent HTTP workers; this
    * entry point just adds one more caller).
    *
+   * @param item optional data point name; when non-empty the single-item
+   *        route (x-plc-data/<item>) is dispatched instead of the list.
+   *
    * @return Parsed JSON body on a 200 response; nullopt when the entity is
    *         not plugin-owned, no route matches, or the handler fails.
    */
-  std::optional<nlohmann::json> fetch_entity_data_via_route(const std::string & entity_id);
+  std::optional<nlohmann::json> fetch_entity_data_via_route(const std::string & entity_id,
+                                                            const std::string & item = "");
 
   /// Check if an entity is owned by a plugin
   /// @return Plugin name if owned, nullopt otherwise

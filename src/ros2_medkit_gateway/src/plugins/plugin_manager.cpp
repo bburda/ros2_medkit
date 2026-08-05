@@ -384,8 +384,10 @@ void PluginManager::register_routes(httplib::Server & server, const std::string 
   }
 }
 
-std::optional<nlohmann::json> PluginManager::fetch_entity_data_via_route(const std::string & entity_id) {
-  const std::string full_path = std::string(API_BASE_PATH) + "/apps/" + entity_id + "/x-plc-data";
+std::optional<nlohmann::json> PluginManager::fetch_entity_data_via_route(const std::string & entity_id,
+                                                                         const std::string & item) {
+  const std::string full_path =
+      std::string(API_BASE_PATH) + "/apps/" + entity_id + "/x-plc-data" + (item.empty() ? "" : "/" + item);
 
   // Copy the owning plugin's matching GET handler out under the lock and
   // invoke it after release: handlers run arbitrary plugin code that may call
