@@ -42,6 +42,10 @@ class SqliteStatement {
     }
   }
 
+  // See the identical note on `Stmt` in fault_audit_log.cpp: the moves were
+  // already suppressed by the user-declared destructor and copies, and every
+  // use in this file is a direct-initialized local, so declaring them deleted
+  // is a statement of intent rather than a change.
   SqliteStatement(const SqliteStatement &) = delete;
   SqliteStatement & operator=(const SqliteStatement &) = delete;
   SqliteStatement(SqliteStatement &&) = delete;
