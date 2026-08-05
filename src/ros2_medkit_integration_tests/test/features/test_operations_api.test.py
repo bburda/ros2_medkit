@@ -462,6 +462,71 @@ class TestOperationsApi(GatewayTestCase):
         follow = requests.get(follow_url, timeout=10)
         self.assertEqual(follow.status_code, 200, follow.text)
 
+    def test_executions_list_on_a_function(self):
+        """The executions collection exists on every entity that lists the action.
+
+        `/functions/{id}/operations/{op}/executions` used to 404 with
+        `entity-not-found` - the handler reached for the component cache and
+        then the app cache and gave up - immediately after the very same
+        function had listed that operation.
+
+        @verifies REQ_INTEROP_036
+        """
+        self.wait_for_operation('/functions/powertrain', 'long_calibration')
+        base = (f'{self.BASE_URL}/functions/powertrain/operations'
+                '/long_calibration/executions')
+
+        started = requests.post(base, json={}, timeout=15)
+        self.assertEqual(started.status_code, 202, started.text)
+        execution_id = started.json()['id']
+        self.addCleanup(requests.delete, f'{base}/{execution_id}', timeout=10)
+
+        listed = requests.get(base, timeout=10)
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertIn(execution_id, [i['id'] for i in listed.json()['items']])
+
+    def test_execution_is_scoped_to_the_entity_that_started_it(self):
+        """A goal id is not a global handle.
+
+        An execution started through one entity used to be readable, stoppable
+        and cancellable through any other entity's URI - the handler looked the
+        goal up by id alone and never asked who owned it. Everything the
+        collection endpoint lists for an entity must be exactly what its item
+        endpoints resolve.
+
+        @verifies REQ_INTEROP_036
+        """
+        self.wait_for_operation('/functions/powertrain', 'long_calibration')
+        owner = (f'{self.BASE_URL}/functions/powertrain/operations'
+                 '/long_calibration/executions')
+
+        started = requests.post(owner, json={'parameters': {'order': 40}}, timeout=15)
+        self.assertEqual(started.status_code, 202, started.text)
+        execution_id = started.json()['id']
+        self.addCleanup(requests.delete, f'{owner}/{execution_id}', timeout=10)
+
+        # The owning entity resolves it.
+        self.assertEqual(
+            requests.get(f'{owner}/{execution_id}', timeout=10).status_code, 200)
+
+        # A different entity does not - not for reads, stops or cancels.
+        intruder = (f'{self.BASE_URL}/apps/long_calibration/operations'
+                    '/long_calibration/executions')
+        self.assertEqual(
+            requests.get(f'{intruder}/{execution_id}', timeout=10).status_code, 404)
+        self.assertEqual(
+            requests.put(f'{intruder}/{execution_id}',
+                         json={'capability': 'stop'}, timeout=10).status_code, 404)
+        self.assertEqual(
+            requests.delete(f'{intruder}/{execution_id}', timeout=10).status_code, 404)
+        self.assertNotIn(
+            execution_id,
+            [i['id'] for i in requests.get(intruder, timeout=10).json()['items']])
+
+        # ... and the intruding cancel did not actually stop it.
+        still_there = requests.get(f'{owner}/{execution_id}', timeout=10)
+        self.assertEqual(still_there.status_code, 200, still_there.text)
+
     def test_create_execution_for_service(self):
         """POST /{entity}/operations/{op-id}/executions calls service and returns.
 
