@@ -187,7 +187,8 @@ class MockPlcRoutePlugin : public GatewayPlugin {
          }},
         // Longer sibling pattern must not shadow the exact match above.
         {"GET", R"(apps/([^/]+)/x-plc-data/([^/]+))",
-         [](const PluginRequest & /*req*/, PluginResponse & res) {
+         [this](const PluginRequest & req, PluginResponse & res) {
+           last_path_ = req.path();
            res.send_json({{"single", true}});
          }},
     };
@@ -540,13 +541,18 @@ TEST(PluginManagerTest, FetchEntityDataViaRouteDispatchesOwningPluginHandler) {
 
 TEST(PluginManagerTest, FetchEntityDataViaRouteSingleItemDispatchesItemRoute) {
   PluginManager mgr;
-  mgr.add_plugin(std::make_unique<MockPlcRoutePlugin>());
+  auto plugin = std::make_unique<MockPlcRoutePlugin>();
+  auto * raw = plugin.get();
+  mgr.add_plugin(std::move(plugin));
   mgr.configure_plugins();
   mgr.register_entity_ownership("mock_plc", {"plc_app"});
 
   auto body = mgr.fetch_entity_data_via_route("plc_app", "level");
   ASSERT_TRUE(body.has_value());
   EXPECT_EQ((*body)["single"], true);
+  // The item must actually reach the dispatched path - a regression to the
+  // list route would still answer 200 here.
+  EXPECT_EQ(raw->last_path_, "/api/v1/apps/plc_app/x-plc-data/level");
 }
 
 TEST(PluginManagerTest, FetchEntityDataViaRouteUnownedEntityReturnsNullopt) {

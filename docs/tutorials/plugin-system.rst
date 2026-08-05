@@ -574,7 +574,13 @@ policy is set).
 
 If the plugin publishes ROS 2 topics that back an entity's data points (the
 PLC-bridge pattern: values mirrored to ``/plc/...`` topics), declare them on
-the entity via ``App::topics`` / ``Component::topics``:
+the entity via ``App::topics`` / ``Component::topics``. This works for
+entities the plugin itself adds in ``new_entities``. It does NOT work as an
+enrichment of an app that runtime discovery already found: for live-data
+fields the runtime layer is authoritative and the plugin layer is enrichment,
+so a ``topics`` list declared on a shadow of a runtime-discovered app is
+dropped by the merge. If you need extra topics on a runtime-discovered app,
+bind them through a manifest instead:
 
 .. code-block:: cpp
 

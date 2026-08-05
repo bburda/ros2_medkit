@@ -778,13 +778,13 @@ IntrospectionResult OpcuaPlugin::introspect(const IntrospectionInput & /*input*/
     // Graph discovery attributes them to the gateway node (their publisher),
     // so without this the entity-scoped topic lookup - what resolves a data
     // trigger's resource_path - comes up empty and the trigger never fires
-    // (issue #584). Mirrors create_value_publishers(): string-typed entries
-    // get no publisher, so they are not declared either.
+    // (issue #584). entry_has_value_publisher is the same predicate
+    // create_value_publishers() uses, so declaration and publication cannot
+    // drift apart.
     for (const auto * entry : node_map_.entries_for_entity(def.id)) {
-      if (entry->data_type == "string" || entry->ros2_topic.empty()) {
-        continue;
+      if (entry_has_value_publisher(*entry)) {
+        app.topics.publishes.push_back(entry->ros2_topic);
       }
-      app.topics.publishes.push_back(entry->ros2_topic);
     }
     result.new_entities.apps.push_back(std::move(app));
 
@@ -1308,7 +1308,7 @@ void OpcuaPlugin::create_value_publishers() {
     if (publishers_.count(entry.node_id_str) > 0) {
       continue;  // already created (e.g. a previous call before a reconnect)
     }
-    if (entry.data_type == "string") {
+    if (!entry_has_value_publisher(entry)) {
       log_info("PLC bridge: skipping non-numeric " + entry.node_id_str + " (data_type=" + entry.data_type + ")");
       continue;
     }

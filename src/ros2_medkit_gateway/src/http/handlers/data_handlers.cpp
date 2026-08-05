@@ -221,8 +221,25 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
     if (data_prov == nullptr) {
       // PLC bridges serve live values through their own x-plc-data route
       // instead of a DataProvider - dispatch it in-process (same path the
-      // freeze-frame capture uses) so /data works for them too.
+      // freeze-frame capture uses) so /data works for them too. The vendor
+      // shape differs from the DataProvider one (name = data name, no id, no
+      // category), and SOVD requires id on every item - normalize here so
+      // /data items always carry id/name/category regardless of which plugin
+      // path produced them; vendor extras pass through untouched.
       if (auto via_route = pmgr ? pmgr->fetch_entity_data_via_route(entity_id) : std::nullopt) {
+        if (via_route->contains("items") && (*via_route)["items"].is_array()) {
+          for (auto & item : (*via_route)["items"]) {
+            if (!item.is_object()) {
+              continue;
+            }
+            if (!item.contains("id") && item.contains("name")) {
+              item["id"] = item["name"];
+            }
+            if (!item.contains("category")) {
+              item["category"] = "currentData";
+            }
+          }
+        }
         return dto::DataListResult{std::move(*via_route)};
       }
       return tl::make_unexpected(

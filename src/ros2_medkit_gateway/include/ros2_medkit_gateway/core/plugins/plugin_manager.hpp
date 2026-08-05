@@ -235,6 +235,12 @@ class PluginManager : public LogProviderRegistry {
   std::optional<nlohmann::json> fetch_entity_data_via_route(const std::string & entity_id,
                                                             const std::string & item = "");
 
+  /// Whether the entity's owning plugin registered a GET data route
+  /// (x-plc-data) that fetch_entity_data_via_route() could dispatch. Cheap
+  /// route-table check, no handler invocation - capability advertising uses
+  /// it so /data is only announced where a read can actually be served.
+  bool has_entity_data_route(const std::string & entity_id);
+
   /// Check if an entity is owned by a plugin
   /// @return Plugin name if owned, nullopt otherwise
   std::optional<std::string> get_entity_owner(const std::string & entity_id) const;

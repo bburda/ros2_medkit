@@ -262,6 +262,19 @@ nodes:
   ASSERT_EQ(it->topics.publishes.size(), 1u) << "only the float entry has a publisher";
   EXPECT_EQ(it->topics.publishes[0], "/plc/tank/level");
   EXPECT_TRUE(it->topics.subscribes.empty());
+  // Both call sites (create_value_publishers and the declaration above) share
+  // entry_has_value_publisher(), so the predicate itself must classify these
+  // two fixture entries the way the declaration did - if either call site
+  // stops using the predicate, review must catch it here.
+  NodeMap map;
+  ASSERT_TRUE(map.load(yaml_path));
+  std::vector<std::string> predicate_topics;
+  for (const auto & e : map.entries()) {
+    if (entry_has_value_publisher(e)) {
+      predicate_topics.push_back(e.ros2_topic);
+    }
+  }
+  EXPECT_EQ(it->topics.publishes, predicate_topics);
 }
 
 TEST_F(OpcuaPluginTest, ListDataEntityNotFound) {

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <optional>
 #include <regex>
 #include <string>
 #include <unordered_set>
@@ -31,6 +32,7 @@
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/core/providers/data_provider.hpp"
 #include "ros2_medkit_gateway/entity_freeze_frame_capture.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_support.hpp"
@@ -230,17 +232,37 @@ TriggerHandlers::post_trigger(const http::TypedRequest & req, dto::TriggerCreate
     if (resolved_topic_name.empty() && entity_result->is_plugin) {
       // Plugin data points are enumerable right now, so a name the plugin does
       // not have can be rejected outright with a suggestion - parking it would
-      // create a permanently ACTIVE trigger that never fires. Same enumeration
-      // as the fault-trigger engine, so "exists" means "the in-process data
-      // route can read it"; nullopt (plugin busy/unreadable) falls through to
-      // the late-binding path below. An EXISTING point that merely failed to
-      // resolve also falls through: the entity cache lags the plugin's live
-      // node map by up to one refresh cycle (<= 60 s, inside the retry
-      // budget), so a point merged at runtime resolves on a later tick, and a
+      // create a permanently ACTIVE trigger that never fires. DataProvider
+      // first (covers plugin Components and DataProvider-only plugins), the
+      // apps-scoped x-plc-data route as the fallback - the same order
+      // data_handlers uses. Enumeration failure (plugin busy, link down, no
+      // provider and no route) falls through to the late-binding path below,
+      // as does an EXISTING point that merely failed to resolve: the entity
+      // cache lags the plugin's live node map by up to one refresh cycle
+      // (the retry budget is sized against it in gateway_node), and a
       // genuinely topic-less point surfaces through the retry-expiry warning.
       auto * pmgr = ctx_.node()->get_plugin_manager();
-      auto content = pmgr ? pmgr->fetch_entity_data_via_route(entity_id) : std::nullopt;
-      if (content) {
+      std::optional<nlohmann::json> content;
+      if (pmgr != nullptr) {
+        if (auto * data_prov = pmgr->get_data_provider_for_entity(entity_id)) {
+          try {
+            if (auto result = data_prov->list_data(entity_id)) {
+              content = result->content;
+            }
+          } catch (...) {
+            // Enumeration is advisory here - a throwing provider must not
+            // break trigger creation, it just skips the strict check.
+          }
+        }
+        if (!content) {
+          content = pmgr->fetch_entity_data_via_route(entity_id);
+        }
+      }
+      // Same liveness guard as the fault-trigger enumeration in gateway_node:
+      // a bridge with a dead PLC link answers 200 with connected=false and an
+      // empty list, which must read as "unreadable right now", never as "this
+      // entity has zero data points".
+      if (content && EntityFreezeFrameCapture::content_has_live_data(*content)) {
         const auto values = EntityFreezeFrameCapture::values_from_list_content(*content);
         if (values.is_object()) {
           std::vector<std::string> names;

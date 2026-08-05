@@ -277,6 +277,15 @@ struct PlcEntityDef {
 };
 
 /// Manages the OPC-UA NodeId to SOVD entity mapping, loaded from YAML
+/// Single source of truth for "does this entry get a ROS 2 value publisher":
+/// create_value_publishers() creates one exactly for these entries, and
+/// introspect() declares exactly these topics on the owning entity - the two
+/// must never drift apart or triggers bind to forever-idle topics (medkit
+/// issue #584).
+inline bool entry_has_value_publisher(const NodeMapEntry & entry) {
+  return entry.data_type != "string" && !entry.ros2_topic.empty();
+}
+
 class NodeMap {
  public:
   NodeMap() = default;

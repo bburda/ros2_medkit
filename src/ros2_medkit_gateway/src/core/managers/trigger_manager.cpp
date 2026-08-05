@@ -137,71 +137,83 @@ void TriggerManager::retry_unresolved_triggers() {
     return;
   }
 
-  std::lock_guard<std::mutex> lock(triggers_mutex_);
+  // Collected under the lock, emitted after release: warn_log_fn_ is an
+  // arbitrary external callback and must not run under triggers_mutex_.
+  std::vector<std::string> warnings;
+  WarnLogFn warn_fn;
+  {
+    std::lock_guard<std::mutex> lock(triggers_mutex_);
 
-  if (unresolved_data_triggers_.empty() || !resolve_topic_fn_ || !topic_transport_) {
-    return;
-  }
-
-  auto now = std::chrono::steady_clock::now();
-  std::vector<size_t> resolved_indices;
-  std::vector<size_t> expired_indices;
-
-  for (size_t i = 0; i < unresolved_data_triggers_.size(); ++i) {
-    auto & entry = unresolved_data_triggers_[i];
-
-    if (now - entry.created_at > unresolved_timeout_) {
-      // Give up loudly: the trigger stays registered and ACTIVE, but with no
-      // subscription it will never fire. Silence here is a dead alarm the
-      // operator believes in.
-      expired_indices.push_back(i);
-      if (warn_log_fn_) {
-        warn_log_fn_("trigger '" + entry.trigger_id + "': gave up resolving resource_path '" + entry.resource_path +
-                     "' to a topic for entity '" + entry.entity_id + "' after " +
-                     std::to_string(unresolved_timeout_.count()) +
-                     " s. The trigger stays active but cannot fire; delete it and recreate it once the topic exists.");
-      }
-      continue;
+    if (unresolved_data_triggers_.empty() || !resolve_topic_fn_ || !topic_transport_) {
+      return;
     }
 
-    std::string topic_name = resolve_topic_fn_(entry.entity_id, entry.resource_path);
-    if (!topic_name.empty()) {
-      // Update the trigger's resolved_topic_name + register a transport
-      // handle whose lifetime is tied to the trigger entry (cleared on
-      // remove()/cleanup_expired_trigger()).
-      auto it = triggers_.find(entry.trigger_id);
-      if (it != triggers_.end()) {
-        std::lock_guard<std::mutex> state_lock(it->second->mtx);
-        it->second->info.resolved_topic_name = topic_name;
+    auto now = std::chrono::steady_clock::now();
+    std::vector<size_t> resolved_indices;
+    std::vector<size_t> expired_indices;
+
+    for (size_t i = 0; i < unresolved_data_triggers_.size(); ++i) {
+      auto & entry = unresolved_data_triggers_[i];
+
+      if (now - entry.created_at > unresolved_timeout_) {
+        // Give up loudly: the trigger stays registered and ACTIVE, but with no
+        // subscription it will never fire. Silence here is a dead alarm the
+        // operator believes in.
+        expired_indices.push_back(i);
+        warnings.push_back("trigger '" + entry.trigger_id + "': gave up resolving resource_path '" +
+                           entry.resource_path + "' to a topic for entity '" + entry.entity_id + "' after " +
+                           std::to_string(unresolved_timeout_.count()) +
+                           " s. The trigger stays active but cannot fire; delete it and recreate it once the topic "
+                           "exists.");
+        continue;
       }
-      const std::string trigger_id = entry.trigger_id;
-      const std::string entity_id = entry.entity_id;
-      const std::string resource_path = entry.resource_path;
-      auto handle = topic_transport_->subscribe(
-          topic_name, /*msg_type=*/"", [this, entity_id, resource_path](const nlohmann::json & sample) {
-            notifier_.notify("data", entity_id, resource_path, sample, ChangeType::UPDATED);
-          });
-      if (handle) {
-        topic_handles_[trigger_id] = std::move(handle);
-        resolved_indices.push_back(i);
-      } else {
-        // Subscribe failed (rclcpp threw inside TriggerTopicSubscriber).
-        // Keep the trigger on the pending list so the next retry tick can
-        // try again; the subscriber has already logged the root cause.
-        // Without this guard the trigger would be marked resolved but
-        // never deliver samples.
-        // Index intentionally NOT added to resolved_indices.
+
+      std::string topic_name = resolve_topic_fn_(entry.entity_id, entry.resource_path);
+      if (!topic_name.empty()) {
+        // Update the trigger's resolved_topic_name + register a transport
+        // handle whose lifetime is tied to the trigger entry (cleared on
+        // remove()/cleanup_expired_trigger()).
+        auto it = triggers_.find(entry.trigger_id);
+        if (it != triggers_.end()) {
+          std::lock_guard<std::mutex> state_lock(it->second->mtx);
+          it->second->info.resolved_topic_name = topic_name;
+        }
+        const std::string trigger_id = entry.trigger_id;
+        const std::string entity_id = entry.entity_id;
+        const std::string resource_path = entry.resource_path;
+        auto handle = topic_transport_->subscribe(
+            topic_name, /*msg_type=*/"", [this, entity_id, resource_path](const nlohmann::json & sample) {
+              notifier_.notify("data", entity_id, resource_path, sample, ChangeType::UPDATED);
+            });
+        if (handle) {
+          topic_handles_[trigger_id] = std::move(handle);
+          resolved_indices.push_back(i);
+        } else {
+          // Subscribe failed (rclcpp threw inside TriggerTopicSubscriber).
+          // Keep the trigger on the pending list so the next retry tick can
+          // try again; the subscriber has already logged the root cause.
+          // Without this guard the trigger would be marked resolved but
+          // never deliver samples.
+          // Index intentionally NOT added to resolved_indices.
+        }
       }
     }
+
+    // Remove resolved and expired entries (reverse order to maintain indices)
+    std::vector<size_t> to_remove;
+    to_remove.insert(to_remove.end(), resolved_indices.begin(), resolved_indices.end());
+    to_remove.insert(to_remove.end(), expired_indices.begin(), expired_indices.end());
+    std::sort(to_remove.rbegin(), to_remove.rend());
+    for (size_t idx : to_remove) {
+      unresolved_data_triggers_.erase(unresolved_data_triggers_.begin() + static_cast<std::ptrdiff_t>(idx));
+    }
+    warn_fn = warn_log_fn_;
   }
 
-  // Remove resolved and expired entries (reverse order to maintain indices)
-  std::vector<size_t> to_remove;
-  to_remove.insert(to_remove.end(), resolved_indices.begin(), resolved_indices.end());
-  to_remove.insert(to_remove.end(), expired_indices.begin(), expired_indices.end());
-  std::sort(to_remove.rbegin(), to_remove.rend());
-  for (size_t idx : to_remove) {
-    unresolved_data_triggers_.erase(unresolved_data_triggers_.begin() + static_cast<std::ptrdiff_t>(idx));
+  if (warn_fn) {
+    for (const auto & w : warnings) {
+      warn_fn(w);
+    }
   }
 }
 
