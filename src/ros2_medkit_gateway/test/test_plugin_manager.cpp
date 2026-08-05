@@ -538,6 +538,17 @@ TEST(PluginManagerTest, FetchEntityDataViaRouteDispatchesOwningPluginHandler) {
   EXPECT_EQ(raw->last_path_, "/api/v1/apps/plc_app/x-plc-data");
 }
 
+TEST(PluginManagerTest, FetchEntityDataViaRouteSingleItemDispatchesItemRoute) {
+  PluginManager mgr;
+  mgr.add_plugin(std::make_unique<MockPlcRoutePlugin>());
+  mgr.configure_plugins();
+  mgr.register_entity_ownership("mock_plc", {"plc_app"});
+
+  auto body = mgr.fetch_entity_data_via_route("plc_app", "level");
+  ASSERT_TRUE(body.has_value());
+  EXPECT_EQ((*body)["single"], true);
+}
+
 TEST(PluginManagerTest, FetchEntityDataViaRouteUnownedEntityReturnsNullopt) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockPlcRoutePlugin>());

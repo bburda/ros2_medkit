@@ -219,6 +219,12 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
     auto * pmgr = ctx_.node()->get_plugin_manager();
     auto * data_prov = pmgr ? pmgr->get_data_provider_for_entity(entity_id) : nullptr;
     if (data_prov == nullptr) {
+      // PLC bridges serve live values through their own x-plc-data route
+      // instead of a DataProvider - dispatch it in-process (same path the
+      // freeze-frame capture uses) so /data works for them too.
+      if (auto via_route = pmgr ? pmgr->fetch_entity_data_via_route(entity_id) : std::nullopt) {
+        return dto::DataListResult{std::move(*via_route)};
+      }
       return tl::make_unexpected(
           make_error(404, ERR_RESOURCE_NOT_FOUND, "No data provider for plugin entity '" + entity_id + "'"));
     }
@@ -334,6 +340,10 @@ http::Result<dto::DataValue> DataHandlers::get_data_item(const http::TypedReques
     auto * pmgr = ctx_.node()->get_plugin_manager();
     auto * data_prov = pmgr ? pmgr->get_data_provider_for_entity(entity_id) : nullptr;
     if (data_prov == nullptr) {
+      // Same x-plc-data route fallback as list_data above, single-item form.
+      if (auto via_route = pmgr ? pmgr->fetch_entity_data_via_route(entity_id, topic_name) : std::nullopt) {
+        return dto::DataValue{std::move(*via_route)};
+      }
       return tl::make_unexpected(
           make_error(404, ERR_RESOURCE_NOT_FOUND, "No data provider for plugin entity '" + entity_id + "'"));
     }
