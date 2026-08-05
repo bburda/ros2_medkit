@@ -966,10 +966,14 @@ and they split into two classes that get opposite treatment:
   where ``extend`` and ``release`` can only produce ``{400, 403, 404}``. Neither
   set is copied by hand. The parameter routes declare
   ``handlers::parameter_error_statuses()``, which runs the classifier over every
-  enumerator - so a new enumerator mapping to a new status widens the
-  declaration with no edit at the registration - and a switch with no
-  ``default`` next to that array makes ``-Werror=switch-enum`` fail the build if
-  somebody adds an enumerator without listing it. The lock claim is behavioural
+  enumerator listed in ``kAllParameterErrorCodes`` - so a new enumerator mapping
+  to a new status widens the declaration with no edit at the registration, once
+  it has been added to that hand-written array. ``-Werror=switch-enum`` alone
+  did not force that: it demands a ``case``, and a build with the cases added
+  and the array left short compiled clean while the registrations silently
+  dropped a status. The enum ends in a ``COUNT`` sentinel and the array's size
+  is ``static_assert``-ed against it, which is what makes the array's
+  completeness a compiler check rather than a convention. The lock claim is behavioural
   rather than textual, so it is pinned behaviourally:
   ``LockManagerTest.extend_and_release_answer_only_400_403_404`` drives every
   reachable failure path of both verbs and asserts the exact status set,
@@ -1466,8 +1470,12 @@ checklist plus the DTO steps above:
    not optional: ``validate_completeness()`` reports a route without it as an
    error, because authorization fails closed and the route would answer 403 for
    every role below ADMIN.
-6. Update ``handle_root`` endpoint list in ``health_handlers.cpp`` to mirror
-   the new route.
+6. Nothing to do for the root endpoint list: ``get_root`` derives it from the
+   registry, so registering the route advertises it. Routes a plugin mounts
+   itself are derived too, from ``RouteDescriptions::endpoints()``. Swagger UI
+   is the only hand-written entry left. That the list and the document agree is
+   checked by
+   ``test_openapi_contract.test.py::test_the_root_list_and_the_document_agree``.
 7. Add URI field to entity detail response if the new route is a resource
    collection.
 8. Write a unit test using ``JsonWriter<T>::write()`` and

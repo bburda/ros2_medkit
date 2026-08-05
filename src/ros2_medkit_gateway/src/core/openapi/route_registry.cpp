@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -367,17 +368,21 @@ RouteEntry & RouteEntry::errors(const std::vector<int> & codes) {
   return *this;
 }
 
-RouteEntry & RouteEntry::lock_guarded() {
-  lock_guarded_ = true;
+RouteEntry & RouteEntry::lock_client_header(const std::string & desc) {
+  lock_client_header_ = true;
   // Optional, not required: a caller that sends no `X-Client-Id` is treated as
   // an anonymous client, which succeeds while nothing is locked and is refused
   // once something is. Declaring it required would describe a gateway that
   // rejects the header-less request outright, which is not what happens.
-  header_param("X-Client-Id",
-               "Identifies the calling client for lock ownership. While a lock protects this "
-               "entity's resource collection, only the client holding it may write; every other "
-               "caller - including one that sends no `X-Client-Id` - is answered 409.",
-               false, nlohmann::json{{"type", "string"}});
+  return header_param("X-Client-Id", desc, false, nlohmann::json{{"type", "string"}});
+}
+
+RouteEntry & RouteEntry::lock_guarded() {
+  lock_guarded_ = true;
+  lock_client_header(
+      "Identifies the calling client for lock ownership. While a lock protects this "
+      "entity's resource collection, only the client holding it may write; every other "
+      "caller - including one that sends no `X-Client-Id` - is answered 409.");
   // Through errors(), not response(): a 409 here carries the SOVD GenericError
   // body, and errors() is what publishes it against the shared component
   // response instead of minting a bespoke bodyless one.
@@ -885,6 +890,26 @@ void RouteRegistry::register_all(httplib::Server & server, const std::string & a
 // to_openapi_paths - generate OpenAPI paths object
 // -----------------------------------------------------------------------------
 
+bool RouteRegistry::auth_enforced_on(const RouteEntry & route) const {
+  // Same two terms, same order, as `AuthManager::requires_authentication`.
+  if (!auth_enabled_) {
+    return false;
+  }
+  if (auth_policy_ == nullptr) {
+    return true;
+  }
+  // The policy is written against the request line: `WriteOnlyAuth
+  // RequirementPolicy` compares the method to upper-case literals and
+  // `AllAuthRequirementPolicy` matches the path prefix the client sends. The
+  // registry stores neither in that form, so both are converted back here
+  // rather than the policies being loosened to accept the registry's.
+  std::string method_upper = route.method_;
+  for (char & c : method_upper) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return auth_policy_->requires_authentication(method_upper, auth_api_prefix_ + route.path_);
+}
+
 nlohmann::json RouteRegistry::to_openapi_paths() const {
   nlohmann::json paths = nlohmann::json::object();
 
@@ -920,7 +945,22 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       // and an unparseable one is rejected with 416 before routing.
       operation["x-medkit-partial-content"] = true;
     }
-    if (route.lock_guarded_) {
+    // `lock_guarded()` is a registration-time declaration; whether this gateway
+    // has a LockManager at all is a deployment setting, and the marker, the
+    // `X-Client-Id` parameter and the 409 are one contract that stands or falls
+    // together. With `locking.enabled` off `GatewayNode` never builds the
+    // manager, `HandlerContext::validate_lock_access` returns success without
+    // reading the header, and no write can be refused - so all three come out,
+    // and the document stops promising serialised writes on a gateway whose own
+    // root reports `capabilities.locking: false`.
+    //
+    // The header is keyed separately from the marker because the two sets are
+    // not the same: `DELETE /faults` declares the header through
+    // `lock_client_header()` and deliberately carries no marker, since it skips
+    // locked faults rather than refusing.
+    const bool drop_lock_contract = route.lock_guarded_ && !locking_enabled_;
+    const bool drop_lock_header = route.lock_client_header_ && !locking_enabled_;
+    if (route.lock_guarded_ && locking_enabled_) {
       // Declared by the registration, never inferred from the handler - see
       // RouteEntry::lock_guarded() for why that derivation is not available.
       operation["x-medkit-lock-guarded"] = true;
@@ -929,6 +969,26 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
     // Parameters
     if (!route.parameters_.empty()) {
       operation["parameters"] = route.parameters_;
+      if (drop_lock_header) {
+        // Erases the first `X-Client-Id` and stops. That is the one
+        // `lock_client_header()` pushed *provided no route both declares one of
+        // its own and carries the locking flag* - true of every route today,
+        // and not enforced anywhere. A route that did both would lose whichever
+        // declaration came first. The lock CRUD routes are unaffected: they
+        // declare theirs through plain `header_param` and never set the flag,
+        // so this branch does not run for them at all.
+        auto & params = operation["parameters"];
+        for (auto it = params.begin(); it != params.end(); ++it) {
+          const auto name = it->find("name");
+          if (name != it->end() && *name == "X-Client-Id") {
+            params.erase(it);
+            break;
+          }
+        }
+        if (params.empty()) {
+          operation.erase("parameters");
+        }
+      }
     }
 
     // Also extract path parameters from the path template and add them
@@ -1158,7 +1218,20 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       add_response_ref(code, oauth2 ? "OAuth2Error" : "GenericError");
     };
 
+    // Skips exactly one 409 - the one `lock_guarded()` pushed - rather than
+    // every 409 on the route, so a lock-guarded route that also declared a 409
+    // of its own would keep it. `declared_errors_` is a vector and keeps the
+    // duplicate, which is what makes counting the right instrument here.
+    // Nothing is removed from `declared_errors_` itself: `validate_completeness`
+    // reads it to catch a later `only_status()` clearing the status this
+    // marker promises, and that check is about the registration, not about the
+    // deployment.
+    int lock_409_to_drop = drop_lock_contract ? 1 : 0;
     for (int code : route.declared_errors_) {
+      if (code == 409 && lock_409_to_drop > 0) {
+        --lock_409_to_drop;
+        continue;
+      }
       add_error_ref(std::to_string(code));
     }
 
@@ -1172,10 +1245,17 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       add_error_ref("500");
     }
 
-    // The middleware answers these ahead of routing, on every route, so they
-    // are declared per-route but described once as shared components - that is
-    // the only place their headers (`WWW-Authenticate`, `Retry-After`,
-    // `X-RateLimit-*`) can live, since no handler return type produces them.
+    // The middleware answers these ahead of routing, so they are declared
+    // per-route but described once as shared components - that is the only
+    // place their headers (`WWW-Authenticate`, `Retry-After`, `X-RateLimit-*`)
+    // can live, since no handler return type produces them.
+    //
+    // "Ahead of routing" is not "on every route" for the auth pair, and
+    // reading it that way is what this key corrects. The rate limiter really
+    // does run on every non-OPTIONS request; the auth middleware runs
+    // `AuthManager::requires_authentication`, which consults a policy, and
+    // under `require_auth_for: write` or `none` that policy admits routes this
+    // document used to promise a 401 on.
     //
     // These run AFTER the `errors()` loop above and `add_response_ref` is
     // first-wins, so a route that declares a status the middleware also owns
@@ -1187,7 +1267,7 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
     // operations. The body shape is unaffected: Unauthorized, Forbidden and
     // RateLimited all reference the same GenericError schema. Pinned by
     // RouteRegistryTest.RouteDeclaredStatusWinsOverTheMiddlewareComponent.
-    if (auth_enabled_) {
+    if (auth_enforced_on(route)) {
       add_response_ref("401", "Unauthorized");
       add_response_ref("403", "Forbidden");
     }

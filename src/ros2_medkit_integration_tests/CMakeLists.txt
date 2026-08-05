@@ -317,10 +317,19 @@ if(BUILD_TESTING)
   # so an earlier case's closed stream is not attributed to the relay. That is
   # deliberate - a shorter wait would pass for a gateway that never released
   # the slot at all.
+  #
+  # test_auth_policy_contract launches three full-feature gateways, one per
+  # auth.require_auth_for value, and sends a real unauthenticated request at
+  # every operation each of them documents. That is the measurement - the
+  # published requirement is compared against what the middleware actually
+  # does - and it costs three startups plus several hundred requests, two of
+  # which wait out a fault-service timeout. It does not fit the 120s the
+  # feature glob assigns.
   set(_MEDKIT_TEST_TIMEOUT_OVERRIDES
     test_aggregation_time_budgets 300
     test_peer_failure_reasons 300
     test_aggregator_fault_stream 420
+    test_auth_policy_contract 300
     test_rosbag_boundary_download 180
     test_rosbag_history_download 180
     test_grouping_entity_aggregation 300

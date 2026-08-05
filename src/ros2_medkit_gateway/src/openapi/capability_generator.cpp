@@ -15,9 +15,11 @@
 #include "capability_generator.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -25,6 +27,8 @@
 #include "path_builder.hpp"
 
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/http/member_qualified_id.hpp"
+#include "ros2_medkit_gateway/core/http/operation_item_id.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
 #include "ros2_medkit_gateway/core/openapi/document_checks.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
@@ -38,42 +42,65 @@ namespace openapi {
 namespace {
 
 /// The one bearer-token scheme any document that mentions security refers to.
-/// The description is part of the definition because the name alone overstates
-/// what a given gateway does: `auth.enabled` decides whether the token is
-/// *checked*, and a document served by a gateway with it off would otherwise
-/// read as if it were.
+///
+/// The description is part of the definition because the name alone says
+/// nothing about what a *given* gateway does with a token, and the document is
+/// served by that gateway. It describes the state this document is already in
+/// rather than the settings that produced it: every operation states its own
+/// requirement, and the 401/403 an operation declares is one it can answer.
 nlohmann::json bearer_scheme() {
   return nlohmann::json{{"type", "http"},
                         {"scheme", "bearer"},
                         {"bearerFormat", "JWT"},
                         {"description",
-                         "JWT bearer token. Where an operation carries a `security` requirement, the scope on that "
-                         "requirement is the role the gateway's permission table grants for its path, and an empty "
-                         "requirement (`security: []`) marks an operation reachable with no token at all. Whether "
-                         "any of it is enforced is a deployment setting: with `auth.enabled` off the gateway serves "
-                         "every operation unauthenticated, which is why this document carries no top-level "
-                         "`security` requirement in that configuration. With it on, `auth.require_auth_for` decides "
-                         "how much is checked - under `write` a GET is served without a token even though its "
-                         "operation names the role the table would grant."}};
+                         "JWT bearer token. Every operation states its own requirement, and it is the requirement "
+                         "this gateway enforces as configured: a scope names the role the permission table grants "
+                         "for that operation, and the empty requirement (`security: []`) marks an operation "
+                         "reachable with no token at all. The `Unauthorized` and `Forbidden` responses appear on "
+                         "exactly the operations the authentication middleware can refuse. Both follow "
+                         "`auth.enabled` together with `auth.require_auth_for`: under `write` the GETs carry the "
+                         "empty requirement and no refusal statuses, under `none` so does every operation, and with "
+                         "`auth.enabled` off the document drops per-operation requirements and the document-level "
+                         "one alike. Re-read the document after changing either setting - it is generated per "
+                         "gateway, not per release."}};
 }
 
-/// Remove every per-operation `security` requirement from an assembled
-/// document, leaving the scheme definitions and the document-level
-/// requirement alone. Walks whatever `paths` contains, so it does not care
-/// which producer wrote an operation.
-void strip_per_operation_security(nlohmann::json & document) {
+/// The five verbs an OpenAPI Path Item Object can carry that this gateway
+/// registers. Anything else under a path item (`parameters`, `summary`,
+/// vendor extensions) is not an operation and must not be rewritten as one.
+bool is_operation_key(const std::string & key) {
+  return key == "get" || key == "post" || key == "put" || key == "patch" || key == "delete";
+}
+
+/// An OpenAPI method key as the request line spells it. The auth policies
+/// compare against upper-case literals; a document spells its methods in
+/// lower case.
+std::string to_upper(std::string method) {
+  for (char & c : method) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return method;
+}
+
+/// Call `visit(METHOD, path, operation)` for every operation in an assembled
+/// document. Walks whatever `paths` contains, so it does not care which
+/// producer wrote an operation - registry, plugin fold, or the concrete items
+/// a `<entity-path>/docs` sub-document projects.
+template <typename Visitor>
+void for_each_operation(nlohmann::json & document, Visitor && visit) {
   auto paths = document.find("paths");
   if (paths == document.end() || !paths->is_object()) {
     return;
   }
-  for (auto & path_item : *paths) {
-    if (!path_item.is_object()) {
+  for (auto path_it = paths->begin(); path_it != paths->end(); ++path_it) {
+    if (!path_it.value().is_object()) {
       continue;
     }
-    for (auto & operation : path_item) {
-      if (operation.is_object()) {
-        operation.erase("security");
+    for (auto op_it = path_it.value().begin(); op_it != path_it.value().end(); ++op_it) {
+      if (!op_it.value().is_object() || !is_operation_key(op_it.key())) {
+        continue;
       }
+      visit(to_upper(op_it.key()), path_it.key(), op_it.value());
     }
   }
 }
@@ -137,20 +164,64 @@ std::optional<nlohmann::json> CapabilityGenerator::generate_impl(const std::stri
   //
   // The rule is a property of the *gateway*, not of where an operation came
   // from: this document is served from `/docs` by a running gateway and
-  // describes it, and `AuthManager::requires_authentication` returns false
-  // outright when `!config_.enabled` (`auth_manager.cpp:316-319`), so with
-  // authentication off every caller is admitted and no operation may publish a
-  // role. Two producers emit one - `RouteEntry::requires_role` through
-  // `RouteRegistry::to_openapi_paths()`, and a plugin's
+  // describes it. Two producers emit a requirement - `RouteEntry::
+  // requires_role` through `RouteRegistry::to_openapi_paths()`, and a plugin's
   // `OperationDesc::requires_role` through the fold - and both reach every
   // `<entity-path>/docs` sub-document as well, because those are a projection
   // of the same two. Putting the rule in either producer would have meant a
   // second copy in the other. Here it sits after all of them, so a new one
   // inherits it.
-  if (document.has_value() && !ctx_.auth_config().enabled) {
-    strip_per_operation_security(*document);
+  if (document.has_value()) {
+    project_security_onto_enforcement(*document);
   }
   return document;
+}
+
+void CapabilityGenerator::project_security_onto_enforcement(nlohmann::json & document) const {
+  // Two configurations, two different corrections, because the document-level
+  // requirement differs between them.
+  //
+  // With `auth.enabled` off the middleware admits every caller and the
+  // document carries no document-level `security` (`openapi_spec_builder`
+  // only adds one when auth is on), so an operation that publishes nothing
+  // already reads as "no token needed" - erasing is enough, and is what a
+  // reader of the scheme description expects.
+  if (!ctx_.auth_config().enabled) {
+    for_each_operation(document, [](const std::string &, const std::string &, nlohmann::json & operation) {
+      operation.erase("security");
+    });
+    return;
+  }
+
+  // With it on the document *does* carry `security: [{bearerAuth: []}]`, and
+  // an operation that publishes nothing inherits it - so erasing here would
+  // say the opposite of the intent. OpenAPI's override for "reachable with no
+  // token" is the explicit empty list, which is also exactly what
+  // `RouteEntry::public_route()` already emits for `/auth/*`; writing it on
+  // every operation the policy admits puts those routes and the ones a
+  // permissive `require_auth_for` opens on the same footing.
+  const auto * auth_manager = ctx_.auth_manager();
+  if (auth_manager == nullptr) {
+    return;
+  }
+  for_each_operation(document,
+                     [auth_manager](const std::string & method, const std::string & path, nlohmann::json & operation) {
+                       // `requires_authentication` is the middleware's own predicate, called on
+                       // the same request line a client would send: the path keys here are
+                       // relative to the API base, and the concrete ids a sub-document publishes
+                       // substitute for the templates without changing what the *reachable*
+                       // policies match - all three key on the method and the `/api/v1/auth/`
+                       // prefix, neither of which a substitution touches.
+                       //
+                       // `ConfigurableAuthRequirementPolicy` matches whole path patterns and
+                       // would care, but nothing constructs it: `AuthManager` builds its policy
+                       // from `require_auth_for`, which has exactly three values. That is also
+                       // what makes `test_auth_policy_contract`'s three gateways a *complete*
+                       // sweep of the policy input space rather than a sample of it.
+                       if (!auth_manager->requires_authentication(method, std::string(API_BASE_PATH) + path)) {
+                         operation["security"] = nlohmann::json::array();
+                       }
+                     });
 }
 
 std::optional<nlohmann::json> CapabilityGenerator::build_document(const std::string & base_path) const {
@@ -542,12 +613,167 @@ nlohmann::json CapabilityGenerator::generate_specific_resource(const ResolvedPat
   return build_subtree_document(resolved.resource_id, paths);
 }
 
+bool CapabilityGenerator::adopt_projected_framework(nlohmann::json & item, const nlohmann::json & paths,
+                                                    const std::string & sibling_key) {
+  // A concrete item and the templated route it sits beside are the *same
+  // route* - `/apps/x/data/temperature` is served by the handler registered at
+  // `/apps/{app_id}/data/{data_id}`. Only the payload schema differs, because
+  // only the payload schema depends on which topic was named.
+  //
+  // So everything that is not the payload is taken from the projected sibling
+  // rather than rebuilt here. That is what closes four ways these items used to
+  // contradict the document they sit in: no `security` at all where the sibling
+  // published `viewer`/`operator`, no 416 where the sibling declared one, no
+  // lock 409 on the write, and 401/403 carrying an inline SOVD `GenericError`
+  // schema where the middleware answers the RFC 6749 shape the `Unauthorized`
+  // and `Forbidden` components describe.
+  //
+  // Inheriting beats restating: the sibling already tracks `auth.require_auth_for`,
+  // `locking.enabled`, rate limiting and aggregation, so a concrete item cannot
+  // drift from the gateway's configuration without the projection drifting too.
+  // Returns false when the sibling is not there, and the caller must then leave
+  // the projection alone rather than write the un-enriched item over it. The
+  // first version returned void on a miss and the caller wrote regardless,
+  // which is how `<entity>/operations/<op>/docs` came to publish an operation
+  // with no `security` and no 416 on a gateway that answers 401 for it: at
+  // specific-resource scope `project()` has already substituted the item id
+  // into the path *key*, so the templated key this used to look for does not
+  // exist there. The key is now supplied by the caller, which knows which scope
+  // it is in, and a miss is a refusal rather than a silent pass-through.
+  const auto sibling = paths.find(sibling_key);
+  if (sibling == paths.end() || !sibling->is_object()) {
+    return false;
+  }
+  for (auto method_it = item.begin(); method_it != item.end(); ++method_it) {
+    if (!method_it.value().is_object()) {
+      continue;  // `x-sovd-*` path-item extensions
+    }
+    const auto projected = sibling->find(method_it.key());
+    if (projected == sibling->end() || !projected->is_object()) {
+      // The path item is there but this verb is not, so this method has no
+      // contract to inherit and would go out un-enriched. Refusing the whole
+      // item is the same answer as a missing path item, for the same reason.
+      return false;
+    }
+    auto & operation = method_it.value();
+
+    const auto security = projected->find("security");
+    if (security != projected->end()) {
+      operation["security"] = *security;
+    }
+
+    // `lock_guarded()` declares the marker, the `X-Client-Id` parameter and the
+    // 409 as one contract (`route_registry.cpp`). Inheriting the 409 alone
+    // published a lock conflict with nothing saying who gets refused, which is
+    // the split that call exists to prevent.
+    //
+    // Path parameters are dropped: at collection scope the sibling still
+    // carries its own unbound id (`{data_id}`, `{operation_id}`), and a
+    // concrete path has no placeholder for it. Header parameters describe the
+    // request either way and come across.
+    const auto lock_marker = projected->find("x-medkit-lock-guarded");
+    if (lock_marker != projected->end()) {
+      operation["x-medkit-lock-guarded"] = *lock_marker;
+    }
+    const auto parameters = projected->find("parameters");
+    if (parameters != projected->end() && parameters->is_array()) {
+      nlohmann::json inherited = nlohmann::json::array();
+      for (const auto & parameter : *parameters) {
+        const auto in = parameter.find("in");
+        if (in != parameter.end() && *in == "path") {
+          continue;
+        }
+        inherited.push_back(parameter);
+      }
+      if (!inherited.empty()) {
+        operation["parameters"] = std::move(inherited);
+      }
+    }
+
+    // A request body the item did not build - which is every one where the ROS
+    // type is unknown, i.e. all of them today. The sibling's named
+    // `$ref: DataWriteRequest` says the same thing better than an envelope
+    // whose `data` member is `x-medkit-schema-unavailable`.
+    const auto request_body = projected->find("requestBody");
+    if (request_body != projected->end() && !operation.contains("requestBody")) {
+      operation["requestBody"] = *request_body;
+    }
+
+    // Non-2xx always comes from the sibling, so the inline error bodies give way
+    // to the shared components. 2xx is filled in only where the item built none
+    // - and it builds none, because the gateway envelopes every response
+    // (`DataValue`, `OperationDetail`) rather than returning the bare message.
+    // A locally built 2xx would be a second, contradictory answer for one route.
+    const auto responses = projected->find("responses");
+    if (responses == projected->end() || !responses->is_object()) {
+      continue;
+    }
+    for (auto resp_it = responses->begin(); resp_it != responses->end(); ++resp_it) {
+      const bool success = !resp_it.key().empty() && resp_it.key()[0] == '2';
+      if (success && operation["responses"].contains(resp_it.key())) {
+        continue;
+      }
+      operation["responses"][resp_it.key()] = resp_it.value();
+    }
+  }
+  return true;
+}
+
 void CapabilityGenerator::add_cache_derived_items(nlohmann::json & paths, const ResolvedPath & resolved,
                                                   const std::string & entity_path) const {
   const std::string collection_path = entity_path + "/" + resolved.resource_collection;
   const auto & cache = node_.get_thread_safe_cache();
-  const PathBuilder path_builder(schema_builder_, ctx_.auth_config().enabled);
+  const PathBuilder path_builder(schema_builder_);
   const bool one_item = !resolved.resource_id.empty();
+
+  // Where the projected operation for these items lives, which differs by
+  // scope and is the whole reason this is computed here rather than guessed
+  // inside the adopter:
+  //
+  //  * collection scope - `project()` bound the entity id and nothing else, so
+  //    the item route is still templated: `/apps/x/data/{data_id}`.
+  //  * specific-resource scope - it bound the item id too, so the projection
+  //    already sits at the concrete key: `/apps/x/data/parameter_events`.
+  //
+  // At specific-resource scope the item is therefore written *at that same
+  // key*, replacing a projection with the enriched version of itself.
+  // The item parameter's name is read from the served routes, the same way
+  // `generate_specific_resource` reads it, rather than spelled out here. Two
+  // spellings of one fact meant renaming `{data_id}` in the registry would have
+  // silently discarded every built item - and until this round no test would
+  // have noticed.
+  const auto [template_prefix, template_bindings] = entity_template(resolved, true);
+  (void)template_bindings;
+  const auto item_parameter =
+      single_parameter_segment_under(served_paths(), template_prefix + "/" + resolved.resource_collection);
+  const std::string sibling_key = one_item ? collection_path + "/" + resolved.resource_id
+                                           : collection_path + "/{" + item_parameter.value_or("") + "}";
+  if (!one_item && !item_parameter.has_value()) {
+    return;  // No templated item route to inherit from; nothing here can be honest.
+  }
+
+  // A resource id reaches here with its leading `/` already stripped by
+  // `PathResolver`, while a ROS topic name keeps one - `parameter_events`
+  // against `/parameter_events`. Comparing them raw matched nothing, so at
+  // specific-resource scope no data item was built at all and the payload
+  // schema, the entire reason these items exist, was absent from exactly the
+  // document a client asks for when it wants one topic.
+  auto names_match = [](const std::string & lhs, const std::string & rhs) {
+    const auto strip = [](const std::string & value) {
+      return !value.empty() && value.front() == '/' ? value.substr(1) : value;
+    };
+    return strip(lhs) == strip(rhs);
+  };
+
+  // Enrich first, write only on success. A built item that could not take the
+  // framework half from its sibling is strictly worse than the projection it
+  // would replace: the projection is a truthful account of the route minus the
+  // payload schema, the raw item is neither.
+  auto emit = [&](const std::string & key, nlohmann::json item) {
+    if (adopt_projected_framework(item, paths, sibling_key)) {
+      paths[key] = std::move(item);
+    }
+  };
 
   // A data point or operation the cache does not know needs nothing here: the
   // projection already published the item route's own description at that key,
@@ -557,10 +783,11 @@ void CapabilityGenerator::add_cache_derived_items(nlohmann::json & paths, const 
   if (resolved.resource_collection == "data") {
     auto data = cache.get_entity_data(resolved.entity_id);
     for (const auto & topic : data.topics) {
-      if (one_item && topic.name != resolved.resource_id) {
+      if (one_item && !names_match(topic.name, resolved.resource_id)) {
         continue;
       }
-      paths[collection_path + "/" + topic.name] = path_builder.build_data_item(entity_path, topic);
+      emit(one_item ? sibling_key : collection_path + "/" + topic.name,
+           path_builder.build_data_item(entity_path, topic));
     }
     return;
   }
@@ -591,17 +818,58 @@ void CapabilityGenerator::add_cache_derived_items(nlohmann::json & paths, const 
     }
   }
 
+  // The id documented for an item has to be the id the collection emits, or
+  // the document describes a request the gateway then refuses - and a path key
+  // two operations produce documents one of them and drops the other, because
+  // the second `paths[key] = ...` overwrites the first. Both halves follow the
+  // collection's own rule: `operation_item_half` decides the item half, and a
+  // short name more than one member carries is qualified with its owner.
+  std::unordered_map<std::string, size_t> short_name_counts;
   for (const auto & svc : ops.services) {
-    if (one_item && svc.name != resolved.resource_id) {
-      continue;
-    }
-    paths[collection_path + "/" + svc.name] = path_builder.build_operation_item(entity_path, svc);
+    ++short_name_counts[svc.name];
   }
   for (const auto & action : ops.actions) {
-    if (one_item && action.name != resolved.resource_id) {
-      continue;
+    ++short_name_counts[action.name];
+  }
+  const auto owner_of = [&ops](const std::string & full_path) -> std::string {
+    auto owner = ops.owner_by_path.find(full_path);
+    return owner != ops.owner_by_path.end() ? owner->second : std::string{};
+  };
+  const auto addressed_by_path = http::operation_paths_addressed_by_path(ops);
+  const auto operation_id_of = [&](const std::string & name, const std::string & full_path) -> std::string {
+    std::string item_half = http::operation_item_half(name, full_path, addressed_by_path);
+    const std::string owner = owner_of(full_path);
+    if (short_name_counts[name] < 2 || owner.empty()) {
+      return item_half;
     }
-    paths[collection_path + "/" + action.name] = path_builder.build_operation_item(entity_path, action);
+    return http::make_member_qualified_id(owner, item_half);
+  };
+
+  // A specific-resource request may name its owning member, which is how the
+  // collection addresses a short name that more than one member exposes.
+  // Matching the bare half alone would document one member's operation under
+  // the other member's id.
+  const auto requested = http::parse_member_qualified_id(resolved.resource_id, ops.is_aggregated);
+  const auto owned_by_requested = [&ops, &requested](const std::string & full_path) {
+    if (!requested.has_member) {
+      return true;
+    }
+    auto owner = ops.owner_by_path.find(full_path);
+    return owner != ops.owner_by_path.end() && owner->second == requested.member_id;
+  };
+
+  const auto emit_operation = [&](const auto & op) {
+    if (one_item && !(names_match(op.name, requested.item_id) && owned_by_requested(op.full_path))) {
+      return;
+    }
+    emit(one_item ? sibling_key : collection_path + "/" + operation_id_of(op.name, op.full_path),
+         path_builder.build_operation_item(entity_path, op));
+  };
+  for (const auto & svc : ops.services) {
+    emit_operation(svc);
+  }
+  for (const auto & action : ops.actions) {
+    emit_operation(action);
   }
 }
 
@@ -616,9 +884,10 @@ nlohmann::json CapabilityGenerator::plugin_paths() const {
 
   // A plugin's declared role is carried through unchanged here. Whether the
   // gateway is in a configuration that honours it is not a question about the
-  // fold, so it is not answered in the fold - `generate_impl` strips every
+  // fold, so it is not answered in the fold - `generate_impl` rewrites every
   // per-operation requirement once, over the finished document, for whatever
   // producer wrote it.
+  const auto * auth_manager = ctx_.auth_manager();
   nlohmann::json paths = nlohmann::json::object();
   for (const auto & desc : plugin_mgr_->collect_route_descriptions()) {
     auto paths_json = desc.to_json();  // CapabilityGenerator is friend
@@ -627,6 +896,15 @@ nlohmann::json CapabilityGenerator::plugin_paths() const {
         if (!operation.is_object()) {
           continue;
         }
+        // First-wins, like `RouteRegistry`'s `add_response_ref`: a status the
+        // plugin described itself keeps the plugin's description. Everything
+        // stamped below goes through it.
+        auto add_response_ref = [&operation](const std::string & code, const std::string & component) {
+          auto & responses = operation["responses"];
+          if (!responses.contains(code)) {
+            responses[code] = nlohmann::json{{"$ref", "#/components/responses/" + component}};
+          }
+        };
         // What separates a plugin operation from a gateway one, and the
         // reason it has to be visible in the document rather than inferred
         // from the path: a plugin route is mounted straight onto the HTTP
@@ -642,7 +920,27 @@ nlohmann::json CapabilityGenerator::plugin_paths() const {
         // `route_registry.cpp`). Stamped here rather than left to the
         // plugin: it is a fact about the HTTP server the plugin is mounted
         // on, not about the plugin.
-        operation["responses"]["416"] = nlohmann::json{{"$ref", "#/components/responses/GenericError"}};
+        add_response_ref("416", "GenericError");
+
+        // The auth middleware is pre-routing too, and the argument for 416 is
+        // the argument for these: `PluginManager::register_routes` mounts a
+        // plugin route on the same `httplib::Server` the middleware's
+        // pre-routing handler runs on, so an anonymous caller meets the
+        // middleware before the plugin's handler. Measured on the graph
+        // provider's `GET /functions/{function_id}/x-medkit-graph` under
+        // `require_auth_for: all`: no token 401, a viewer token 403, an admin
+        // token 200, and the document used to declare none of it.
+        //
+        // Keyed on the same predicate the registry uses, so a plugin route and
+        // a registry route on one gateway cannot disagree about whether the
+        // middleware answers them. Under a policy that admits the operation
+        // nothing is stamped, and `project_security_onto_enforcement` gives it
+        // the empty requirement to match.
+        if (auth_manager != nullptr &&
+            auth_manager->requires_authentication(to_upper(method), std::string(API_BASE_PATH) + key)) {
+          add_response_ref("401", "Unauthorized");
+          add_response_ref("403", "Forbidden");
+        }
       }
       paths[key] = item;
     }

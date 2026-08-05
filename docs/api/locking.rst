@@ -212,6 +212,15 @@ generated OpenAPI document, alongside the ``X-Client-Id`` parameter and the
 ``409`` response, so a generated client can select the lock-participating
 surface without pattern-matching on paths.
 
+All three appear only on a gateway that has a lock manager. With
+``locking.enabled`` set to ``false`` no ``LockManager`` is built,
+``validate_lock_access`` returns success without reading the header, and no
+write can be refused for a lock - so the marker, the parameter and the ``409``
+are all absent from that gateway's document, which then matches the
+``capabilities.locking: false`` its own root reports. The ``/locks`` endpoints
+stay in the document either way and answer ``501``. Pinned by
+``test_locking_disabled_contract.test.py``.
+
 The marker is applied per route at registration time, not inferred from the
 handler. It is pinned by
 ``test_openapi_contract.test.py::test_lock_guarded_set_matches_the_handlers``
@@ -232,6 +241,11 @@ a lock intervened. A caller who needs to know re-reads the entity's faults to
 see what survived. The operation declares ``X-Client-Id`` but carries no
 ``x-medkit-lock-guarded`` marker, because it cannot return the ``409`` the
 marker implies.
+
+Its ``X-Client-Id`` follows ``locking.enabled`` like the marker does, through
+``RouteEntry::lock_client_header()`` rather than a plain ``header_param``: with
+locking off there is no lock manager to consult, nothing is ever skipped, and
+the header is not declared.
 
 Error Responses
 ---------------

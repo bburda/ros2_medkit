@@ -38,6 +38,10 @@ operations that read them.
    ``X-Medkit-Local-Only`` is about aggregated peers, not locks - so re-read the
    entity's faults to see what survived.
 
+   Everything in this entry describes a gateway with ``locking.enabled`` on.
+   With it off the header is declared on the ``/locks`` endpoints only, since
+   those are the only routes that still read it; see :doc:`locking`.
+
 ``X-Medkit-No-Fan-Out``
    Answer from this gateway alone: do not query aggregated peers and do not
    merge their items. Read by the **per-entity** resource-collection list
@@ -3983,21 +3987,79 @@ Every scoped spec is a **projection of the root document**: the paths at or
 below the requested path, with the ids the request named substituted into the
 templates and the ``in: path`` parameters those substitutions answered removed.
 For a projected path, what a scoped spec says about an operation is what the
-root spec says about it - status codes, schemas, roles and all - and a
-collection appears in it exactly when a route answers that collection.
+root spec says about it - status codes, schemas, roles and all.
 
-The exception is the concrete data and operation item paths described below,
-which are built from the entity cache rather than projected. They carry the ROS
-2 payload schema, which is why they exist; because they are built rather than
-projected, nothing reaches them *from* the registration, so what they say about
-an operation is narrower than what the root spec says about the templated route
-they sit beside. Measured on a component's ``/data`` spec: the projected
-``GET /data/{data_id}`` declares ``200, 400, 404, 416, 500, 503`` and the
-``PUT`` declares ``200, 400, 404, 409, 416, 500``, while a concrete
-``/data/<topic>`` declares ``200, 400, 404, 500`` on both - no 416, no 409 on
-the lock-guarded write, and with ``auth.enabled`` on no ``security``
-requirement either. Read the templated sibling beside them for the full outcome
-set.
+Which prefixes resolve at all is narrower than which paths the gateway serves.
+``PathResolver`` recognises a fixed set of resource-collection keywords -
+``data``, ``data-categories``, ``data-groups``, ``operations``, ``faults``,
+``configurations``, ``logs``, ``bulk-data``, ``cyclic-subscriptions``,
+``triggers``, ``updates``, ``hosts`` - and nothing else. ``locks``, ``status``,
+``scripts`` and ``fault-triggers`` answer ``200`` on the collection and are
+advertised as URI fields on the entity detail response, but
+``<entity-path>/docs`` answers ``404`` for them. Read the root document for
+those.
+
+The concrete data and operation item paths described below are the one thing in
+a scoped spec that is *built* from the entity cache rather than projected. What
+they add is the path itself - one key per discovered topic, service and action,
+which SOVD asks for and one ``/data/{data_id}`` registration cannot give - and
+the ``x-sovd-*`` extensions that go with it.
+
+.. warning::
+
+   **They add no payload schema today, on any gateway.** All four sites that
+   build a ``TopicData`` push an empty type
+   (``thread_safe_entity_cache.cpp``), so a topic's ROS 2 type never reaches
+   this builder in any discovery mode. That is structural, not a property of
+   one fixture. The ``/data`` listing does resolve the type - it is under
+   ``x-medkit.ros2.type`` and ``x-medkit.type_info`` on each item - by a path
+   this projection does not use. Until that type is wired through, read the
+   listing for a topic's shape and treat these paths as addresses rather than
+   schemas.
+
+Everything else a built item says is copied from the projected route it sits
+beside, because the two are the *same route*: ``/apps/x/data/temperature`` is
+served by the handler registered at ``/apps/{app_id}/data/{data_id}``. Four
+things are copied - the declared ``security``, the responses, the
+``x-medkit-lock-guarded`` marker, and the non-path parameters (in practice
+``X-Client-Id``; the fan-out header is declared on collection *listing* routes,
+which are never an item's sibling). Path parameters are not, because a concrete
+path has no placeholder for them, and ``operationId`` is not, because it must
+stay unique across the document.
+
+So a built item declares the same ``401``/``403`` components the middleware
+actually answers with, the same ``416``, and the whole lock contract together -
+the ``409``, the marker and ``X-Client-Id``, which
+:ref:`locking <locking-blocked-operations>` treats as one declaration. It
+follows ``auth.require_auth_for`` and ``locking.enabled`` for the same reason:
+the projection does, and this is a copy of it.
+
+**Responses are copied too, including the 2xx.** The gateway envelopes every
+read - ``GET .../data/{data_id}`` answers ``DataValue``, ``GET
+.../operations/{operation_id}`` answers ``OperationDetail`` - so a body built
+from the ROS 2 message or service-response type would be a second,
+contradictory answer for one route rather than a more specific one. The request
+body is copied on the same terms: a built ``PUT`` publishes its own envelope
+only where the topic's type is known, and inherits ``$ref: DataWriteRequest``
+otherwise, which today is always.
+
+A built operation item carries a ``GET`` only. The gateway registers no
+``POST`` at ``/{entity}/operations/{operation_id}`` - execution is
+``POST /{entity}/operations/{operation_id}/executions``, which the projection
+publishes beside it - so a ``POST`` on the concrete path answers ``404``. The
+ROS service-response schema belongs to that execution result and is not
+published anywhere today.
+
+Both scopes work this way, and the generator has to know which it is in: a
+scoped spec substitutes the ids it was given into the path **keys**, so at
+``<entity>/data/docs`` the sibling is still ``/data/{data_id}`` while at
+``<entity>/data/<topic>/docs`` it has already become ``/data/<topic>``. A built
+item whose sibling is not found is discarded rather than published
+un-inherited. Where a projection sits at that key - specific-resource scope -
+the projection survives; where none does, the item is simply absent. That
+second case is reachable: a nested path such as
+``/areas/robot/components/robot-controller/data/temperature/docs`` projects
+nothing, and answers with empty ``paths``.
 
 ``GET /api/v1/docs``
    Returns the full OpenAPI spec for the gateway root, including all server-level

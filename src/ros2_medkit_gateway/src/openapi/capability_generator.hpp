@@ -198,6 +198,24 @@ class CapabilityGenerator {
   /// returns still goes through `generate_impl`'s document-wide pass.
   std::optional<nlohmann::json> build_document(const std::string & base_path) const;
 
+  /// Rewrite every per-operation `security` requirement so it states what the
+  /// running gateway's auth middleware does to that operation, whichever
+  /// producer wrote it. See the implementation for the two configurations.
+  void project_security_onto_enforcement(nlohmann::json & document) const;
+
+  /// Give a cache-derived item everything the projected route it sits beside
+  /// already says - the declared role, every non-2xx status, the lock marker
+  /// and the non-path parameters - leaving only the ROS payload locally built.
+  ///
+  /// `sibling_key` is that route's key in `paths`, which differs by scope:
+  /// templated at collection scope, already concrete at specific-resource
+  /// scope, because `project()` substitutes bindings into path keys.
+  ///
+  /// @return false when no such operation is there, in which case `item` is
+  ///   unusable and the caller must not write it over the projection.
+  [[nodiscard]] static bool adopt_projected_framework(nlohmann::json & item, const nlohmann::json & paths,
+                                                      const std::string & sibling_key);
+
   /// Build a cache key for the given path, invalidating the cache if the
   /// entity cache generation has changed.
   std::string get_cache_key(const std::string & path) const;

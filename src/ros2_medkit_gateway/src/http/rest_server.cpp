@@ -159,9 +159,20 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   // the registry lazily at request time, so the pointer is valid.
   route_registry_ = std::make_unique<openapi::RouteRegistry>();
   route_registry_->set_auth_enabled(auth_config_.enabled);
+  // The second half of the enforcement condition. `auth_manager_` is only
+  // constructed when auth is on, and it outlives the registry (both are
+  // members of this server, declared in that order), so the borrowed policy
+  // stays valid for as long as the registry can be asked.
+  route_registry_->set_auth_policy(auth_manager_ ? auth_manager_->auth_policy() : nullptr, API_BASE_PATH);
   // Read the same flag the middleware branch above reads, so the document
   // declares 429 exactly when the limiter is live.
   route_registry_->set_rate_limit_enabled(rate_limit_config.enabled);
+  // Read the manager's existence rather than the parameter: `GatewayNode`
+  // builds it only when `locking.enabled` is set, and it is the manager's
+  // absence that `HandlerContext::validate_lock_access` short-circuits on. This
+  // is the same source `get_root` reports `capabilities.locking` from, so the
+  // document and the root cannot disagree.
+  route_registry_->set_locking_enabled(node_->get_lock_manager() != nullptr);
 
   // Taken before the handlers that read it: /health reports how much of the
   // SSE client cap is in use, and a tracker fetched afterwards would reach
@@ -467,7 +478,12 @@ void RESTServer::setup_routes() {
       .summary("Scoped capability description")
       .description(
           "Returns the OpenAPI 3.1 document scoped to one entity, resource collection or resource - the SOVD "
-          "context-specific capability description. 404 when the prefix names nothing this gateway serves.")
+          "context-specific capability description. 404 when the prefix does not resolve, which is narrower "
+          "than the paths this gateway serves: `PathResolver` recognises the SOVD resource collections "
+          "(`data`, `data-categories`, `data-groups`, `operations`, `faults`, `configurations`, `logs`, "
+          "`bulk-data`, `cyclic-subscriptions`, `triggers`, `updates`, `hosts`) and no others, so `locks`, "
+          "`status`, `scripts` and `fault-triggers` answer 200 on the collection and 404 here. Read the root "
+          "document for those.")
       .operation_id("getScopedCapabilityDescription")
       .path_param("entity_path",
                   "The entity or resource path the description is scoped to, without a leading slash - for example "
@@ -2211,11 +2227,14 @@ void RESTServer::setup_routes() {
       // `X-Medkit-Local-Only` header declared above is set unconditionally and
       // is about aggregated peers, not locks - do not read it as the skip
       // signal. A client that needs to know re-reads the entity's faults.
-      .header_param("X-Client-Id",
-                    "Identifies the calling client for lock ownership. Faults on entities locked by "
-                    "a different client are silently skipped rather than cleared, and the request "
-                    "still answers 204 - re-read the entity's faults to see what survived.",
-                    false, nlohmann::json{{"type", "string"}})
+      // `lock_client_header`, not `header_param`: the description below is a
+      // claim about locking, so it comes out with `locking.enabled` like the
+      // rest of them. Declared with a plain header_param it survived on a
+      // gateway that has no lock manager to skip anything.
+      .lock_client_header(
+          "Identifies the calling client for lock ownership. Faults on entities locked by "
+          "a different client are silently skipped rather than cleared, and the request "
+          "still answers 204 - re-read the entity's faults to see what survived.")
       // 503 when the fault store cannot be read - see the list route above.
       .errors({503})
       .operation_id("clearAllFaults")

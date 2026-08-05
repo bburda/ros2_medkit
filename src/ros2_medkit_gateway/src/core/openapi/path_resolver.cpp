@@ -31,6 +31,17 @@ const std::unordered_set<std::string> & entity_type_keywords() {
 }
 
 /// Resource collection keywords recognized by the SOVD API.
+///
+/// Hand-written, and **narrower than the collections the gateway serves** -
+/// which is a live gap, not an oversight in this list alone. `locks`,
+/// `status`, `scripts` and `fault-triggers` all answer 200 on the collection
+/// and are advertised as URI fields on the entity detail response, yet
+/// `<entity-path>/docs` answers 404 for them because this set does not name
+/// them. Adding a keyword here is not sufficient to close that: the resolved
+/// category has to have a producer in `CapabilityGenerator`, so widening this
+/// set is a feature rather than a one-line fix. Until then the route's own
+/// description says which prefixes resolve, rather than claiming the 404 means
+/// the gateway does not serve the path.
 const std::unordered_set<std::string> & resource_collection_keywords() {
   static const std::unordered_set<std::string> keywords = {
       "data", "data-categories", "data-groups",          "operations", "faults",  "configurations",

@@ -132,9 +132,15 @@ class TestHealth(GatewayTestCase):
     def test_endpoint_list_names_each_route_once(self):
         """The endpoints list names each mounted route exactly once.
 
-        It is the route registry's list plus a short hand-written tail for the
-        routes mounted outside the registry. Moving a route into the registry
+        It is the route registry's list, plus every route a loaded plugin
+        mounts straight onto the HTTP server, plus a short hand-written tail
+        for what is mounted outside both. Moving a route into the registry
         without deleting its hand-written entry lists it twice.
+
+        Whether the list *agrees with the document* is a different question and
+        is checked in
+        ``test_openapi_contract.test.py::test_the_root_list_and_the_document_agree``;
+        this one only asks that nothing is named twice.
 
         Compared with parameter *names* erased, not as literal strings. The
         entry this was written for was spelled ``{entity-path}`` by hand and
