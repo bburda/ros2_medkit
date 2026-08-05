@@ -14,6 +14,7 @@
 
 #include "ros2_medkit_gateway/core/http/handlers/trigger_handlers.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <regex>
@@ -21,12 +22,16 @@
 #include <unordered_set>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 
+#include "ros2_medkit_gateway/core/data_point_suggest.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/entity_freeze_frame_capture.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_support.hpp"
 
@@ -220,6 +225,43 @@ TriggerHandlers::post_trigger(const http::TypedRequest & req, dto::TriggerCreate
                               parsed->resource_path) == 0)) {
         resolved_topic_name = topic.name;
         break;
+      }
+    }
+    if (resolved_topic_name.empty() && entity_result->is_plugin) {
+      // Plugin data points are enumerable right now, so a name the plugin does
+      // not have can be rejected outright with a suggestion - parking it would
+      // create a permanently ACTIVE trigger that never fires. Same enumeration
+      // as the fault-trigger engine, so "exists" means "the in-process data
+      // route can read it"; nullopt (plugin busy/unreadable) falls through to
+      // the late-binding path below. An EXISTING point that merely failed to
+      // resolve also falls through: the entity cache lags the plugin's live
+      // node map by up to one refresh cycle (<= 60 s, inside the retry
+      // budget), so a point merged at runtime resolves on a later tick, and a
+      // genuinely topic-less point surfaces through the retry-expiry warning.
+      auto * pmgr = ctx_.node()->get_plugin_manager();
+      auto content = pmgr ? pmgr->fetch_entity_data_via_route(entity_id) : std::nullopt;
+      if (content) {
+        const auto values = EntityFreezeFrameCapture::values_from_list_content(*content);
+        if (values.is_object()) {
+          std::vector<std::string> names;
+          names.reserve(values.size());
+          for (auto it = values.begin(); it != values.end(); ++it) {
+            names.push_back(it.key());
+          }
+          const std::string data_name = parsed->resource_path.substr(1);
+          if (std::find(names.begin(), names.end(), data_name) == names.end()) {
+            std::string msg = "data point '" + data_name + "' does not exist on entity '" + entity_id + "'";
+            json params{
+                {"parameter", "resource"}, {"resource_path", parsed->resource_path}, {"available_count", names.size()}};
+            const std::string suggestion = suggest_data_point(data_name, names);
+            if (!suggestion.empty()) {
+              msg += " - did you mean '" + suggestion + "'?";
+              params["did_you_mean"] = suggestion;
+            }
+            params["closest"] = closest_data_points(data_name, names, 20);
+            return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER, msg, params));
+          }
+        }
       }
     }
     if (resolved_topic_name.empty()) {

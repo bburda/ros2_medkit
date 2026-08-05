@@ -396,6 +396,39 @@ TEST_F(TriggerManagerRoutingTest, RestoreQueuesPersistentTriggerOnSubscribeFailu
   restored_mgr->shutdown();
 }
 
+TEST_F(TriggerManagerRoutingTest, UnresolvedTriggerExpiryWarnsAndStopsRetrying) {
+  // #584: an unresolved data trigger used to be dropped from the retry list
+  // after the timeout with no trace, leaving a permanently ACTIVE trigger
+  // that can never fire. The expiry must be loud.
+  std::vector<std::string> warnings;
+  manager_->set_warn_log_fn([&warnings](const std::string & m) {
+    warnings.push_back(m);
+  });
+  manager_->set_resolve_topic_fn([](const std::string &, const std::string &) {
+    return std::string{};
+  });
+
+  auto created = manager_->create(make_data_request("plc_app", /*resolved_topic=*/"", "/counter"));
+  ASSERT_TRUE(created.has_value()) << created.error().message;
+
+  // Within the timeout: retry ticks stay silent.
+  manager_->retry_unresolved_triggers();
+  EXPECT_TRUE(warnings.empty());
+
+  // Shrink the timeout so the next tick expires the entry.
+  manager_->set_unresolved_timeout(std::chrono::seconds(0));
+  manager_->retry_unresolved_triggers();
+  ASSERT_EQ(warnings.size(), 1u);
+  EXPECT_NE(warnings[0].find(created->id), std::string::npos) << warnings[0];
+  EXPECT_NE(warnings[0].find("/counter"), std::string::npos) << warnings[0];
+
+  // The entry is gone: later ticks are silent, and the trigger itself is
+  // still registered (the expiry only stops the resolution retries).
+  manager_->retry_unresolved_triggers();
+  EXPECT_EQ(warnings.size(), 1u);
+  EXPECT_EQ(manager_->list("plc_app").size(), 1u);
+}
+
 TEST_F(TriggerManagerRoutingTest, NonDataTriggerDoesNotSubscribe) {
   // Faults / configurations / etc. don't go through the topic transport.
   TriggerCreateRequest req;

@@ -122,6 +122,16 @@ void TriggerManager::set_resolve_topic_fn(ResolveTopicFn fn) {
   resolve_topic_fn_ = std::move(fn);
 }
 
+void TriggerManager::set_warn_log_fn(WarnLogFn fn) {
+  std::lock_guard<std::mutex> lock(triggers_mutex_);
+  warn_log_fn_ = std::move(fn);
+}
+
+void TriggerManager::set_unresolved_timeout(std::chrono::seconds timeout) {
+  std::lock_guard<std::mutex> lock(triggers_mutex_);
+  unresolved_timeout_ = timeout;
+}
+
 void TriggerManager::retry_unresolved_triggers() {
   if (shutdown_flag_.load()) {
     return;
@@ -140,8 +150,17 @@ void TriggerManager::retry_unresolved_triggers() {
   for (size_t i = 0; i < unresolved_data_triggers_.size(); ++i) {
     auto & entry = unresolved_data_triggers_[i];
 
-    if (now - entry.created_at > std::chrono::seconds(kUnresolvedTimeoutSec)) {
+    if (now - entry.created_at > unresolved_timeout_) {
+      // Give up loudly: the trigger stays registered and ACTIVE, but with no
+      // subscription it will never fire. Silence here is a dead alarm the
+      // operator believes in.
       expired_indices.push_back(i);
+      if (warn_log_fn_) {
+        warn_log_fn_("trigger '" + entry.trigger_id + "': gave up resolving resource_path '" + entry.resource_path +
+                     "' to a topic for entity '" + entry.entity_id + "' after " +
+                     std::to_string(unresolved_timeout_.count()) +
+                     " s. The trigger stays active but cannot fire; delete it and recreate it once the topic exists.");
+      }
       continue;
     }
 
