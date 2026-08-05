@@ -104,11 +104,39 @@ TEST(FaultTriggerEngineTest, CreateRejectsNonexistentDataPoint) {
   EXPECT_NE(bogus.error().second.find("level"), std::string::npos) << "message should list the available points";
   EXPECT_TRUE(engine.list("tank").empty());
 
+  // Source-notation symbol: the deterministic sanitized-leaf mapping is
+  // suggested outright (MAIN.Level -> level).
+  auto namespaced = engine.create("tank", make_body("MAIN.Level", ">", 10.0, "F", "ERROR"));
+  ASSERT_FALSE(namespaced);
+  EXPECT_NE(namespaced.error().second.find("did you mean 'level'?"), std::string::npos) << namespaced.error().second;
+
   // Existing point passes.
   EXPECT_TRUE(engine.create("tank", make_body("level", ">", 50.0, "F", "ERROR")));
 
   // Points not enumerable right now (nullopt): creation must not be blocked.
   EXPECT_TRUE(engine.create("other_app", make_body("anything", ">", 1.0, "F2", "ERROR")));
+}
+
+TEST(FaultTriggerEngineTest, NonexistentDataPointListsClosestNamesNotAlphabeticalPrefix) {
+  // Regression for the field report in #584: ~25 system symbols sorted before
+  // the name the operator needed, and the alphabetical 20-entry cut dropped
+  // it. The truncated list must be ranked by distance to the input.
+  auto names = [](const std::string &) -> std::optional<std::vector<std::string>> {
+    std::vector<std::string> v;
+    for (int i = 10; i < 40; ++i) {
+      v.push_back("adsigrp_sym_" + std::to_string(i));
+    }
+    v.push_back("counter");
+    return v;
+  };
+  FaultTriggerEngine engine("", nullptr, nullptr, nullptr, nullptr, names);
+
+  auto miss = engine.create("plc", make_body("MAIN.counter", ">", 1.0, "F", "ERROR"));
+  ASSERT_FALSE(miss);
+  const auto & msg = miss.error().second;
+  EXPECT_NE(msg.find("did you mean 'counter'?"), std::string::npos) << msg;
+  EXPECT_NE(msg.find("31 available, closest 20: counter"), std::string::npos)
+      << "ranked list should surface the near-match first: " << msg;
 }
 
 TEST(FaultTriggerEngineTest, CreateWithoutEnumeratorSkipsExistenceCheck) {
