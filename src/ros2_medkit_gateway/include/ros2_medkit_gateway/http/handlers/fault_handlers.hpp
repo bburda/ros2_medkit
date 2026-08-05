@@ -21,6 +21,7 @@
 #include <variant>
 #include <vector>
 
+#include "ros2_medkit_gateway/core/faults/fault_types.hpp"
 #include "ros2_medkit_gateway/dto/faults.hpp"
 #include "ros2_medkit_gateway/entity_freeze_frame_capture.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
@@ -176,6 +177,33 @@ class FaultHandlers {
    * and indirectly via the per-entity collection routes.
    */
   static bool fault_in_source_scope(const nlohmann::json & fault, const std::set<std::string> & source_fqns);
+
+  /**
+   * @brief Map a failed fault-manager call onto an HTTP error.
+   *
+   * Only a call that never obtained an answer is the server's fault. Anything
+   * the fault manager itself answered - a code it does not hold, a code it
+   * refuses to accept - is a condition of the request and is reported as 404,
+   * which is what the fault routes document as well.
+   *
+   * The classification comes from `FaultFailure`, which the transport sets
+   * from whether it received a response. It was previously derived from the
+   * store's message text, and so any refusal worded in a way the matcher did
+   * not anticipate - the fault manager's own `fault_code` validation among
+   * them - was served to the client as 503.
+   *
+   * Public for direct unit testing; called by `get_fault` and `clear_fault`.
+   *
+   * @param failure Which layer failed, as reported by the transport.
+   * @param error_message The store's message, passed through as `details`.
+   * @param unavailable_summary Summary for the 503 case, per calling verb.
+   * @param id_field Entity id field name for the error parameters.
+   * @param entity_id Entity the request addressed.
+   * @param fault_code Fault code the request addressed.
+   */
+  static ErrorInfo classify_fault_failure(FaultFailure failure, const std::string & error_message,
+                                          const std::string & unavailable_summary, const std::string & id_field,
+                                          const std::string & entity_id, const std::string & fault_code);
 
   /**
    * @brief Merge zero-config entity freeze-frames into environment data.

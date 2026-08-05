@@ -1071,7 +1071,9 @@ void RESTServer::setup_routes() {
             "to `error` still returns errors and above; and the answer is then capped at the configuration's "
             "`max_entries`, most recent kept - silently, with nothing on the response saying it was cut and no "
             "way to page past it. Both of those filter the answer rather than the buffer. A registered "
-            "LogProvider serves the query itself, and neither applies to it.")
+            "LogProvider serves the query itself and applies its own severity floor and cap instead - except "
+            "on an area or a component, where the entity's own logs and the namespace-prefix query are merged "
+            "and the union is re-capped at the configuration's `max_entries` whichever of the two produced it.")
         // LogHandlers::get_logs -> fan_out_collection<LogEntry>.
         .fan_out_aware()
         // All three log routes answer 503 when no LogManager is attached, or

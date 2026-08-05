@@ -960,6 +960,27 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
           // that never measured `config_id`, and the 512 was published on its
           // routes anyway. That check now exists.
           //
+          // "Unconditionally" means no branch inside the handler skips the
+          // measurement - not that it is the first thing the request meets.
+          // The five handlers behind these two templates do not agree on where
+          // it sits, so an over-long value on an *unknown* entity gets one of
+          // two answers depending on the verb:
+          //   `get_configuration`, `get_fault`, `clear_fault`  resolve the
+          //       entity first -> 404
+          //   `set_configuration`, `delete_configuration`      measure first
+          //       -> 400
+          // The entity-id check those last two run beforehand does not close
+          // the gap: `validate_entity_id` is format-only and never consults the
+          // cache. `clear_fault` also takes `validate_lock_access` before
+          // measuring, so a competing lock answers 409.
+          //
+          // None of that weakens the precondition - every route publishing a
+          // bound does reject an over-long value. Only the status a caller sees
+          // when it is *also* wrong about something else differs, and that
+          // split is an accident of handlers written at different times rather
+          // than a decision anyone recorded. It is deliberately not pinned by a
+          // test: pinning it would make an accident load-bearing.
+          //
           // Both rows are covered on every verb they publish to, so the
           // precondition is tested rather than asserted:
           //   config_id  - test_configuration_api.test.py

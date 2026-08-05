@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <nlohmann/json.hpp>
 #include <string>
 
@@ -21,13 +22,38 @@ namespace ros2_medkit_gateway {
 
 using json = nlohmann::json;
 
+/// Which layer failed a fault-management call. Meaningful only when the
+/// outcome's `success` is false.
+///
+/// The distinction is structural, not textual. A transport knows for a fact
+/// whether it obtained an answer from the fault manager, and that is the only
+/// thing that separates a server-side failure from a client-side one: a fault
+/// manager that answered and declined is healthy, and the request is what was
+/// at fault, however the refusal happens to be worded. Reading the words
+/// instead cannot make that call - the message is prose the fault manager is
+/// free to change, and any wording a matcher did not anticipate is
+/// indistinguishable from an outage.
+enum class FaultFailure : uint8_t {
+  /// The fault manager answered and declined: no such fault, a code it will
+  /// not accept, or a fault outside the requested scope. A client error.
+  Declined,
+  /// No answer was obtained at all - the service was missing, uninitialised,
+  /// or timed out. The only genuinely server-side case.
+  Unavailable,
+};
+
 /// Outcome of a fault-management operation that returns JSON. `data` carries
 /// the response body the handler will serve on success; remains empty on
 /// errors.
+///
+/// `failure` defaults to `Declined` so that a producer which reports a failure
+/// without classifying it cannot manufacture a server error: 503 has to be
+/// asked for, and only a transport that failed to get an answer asks.
 struct FaultResult {
   bool success;
   json data;
   std::string error_message;
+  FaultFailure failure = FaultFailure::Declined;
 };
 
 /// Neutral outcome of `get_fault_with_env`. `data` carries
@@ -39,6 +65,7 @@ struct FaultWithEnvJsonResult {
   bool success;
   std::string error_message;
   json data;
+  FaultFailure failure = FaultFailure::Declined;
 };
 
 }  // namespace ros2_medkit_gateway

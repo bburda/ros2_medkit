@@ -155,6 +155,32 @@ class RosbagCapture {
   /// engages and nothing driving the capture can exercise it.
   static int64_t bounded_history_ns(int64_t now_wall_ns, int64_t oldest_msg_wall_ns, int64_t now_steady_ns,
                                     int64_t capture_started_steady_ns);
+  /// Build the single path component naming a fault's bag directory.
+  ///
+  /// `NAME_MAX` caps one path component at 255 bytes, and rosbag2 writes the
+  /// data file inside the directory as `<component>_<n>.<ext>`, so the
+  /// component has to leave that room too. A `fault_code` long enough to
+  /// overrun the budget is kept only up to a bounded prefix, which is why this
+  /// does not simply trust the validator's maximum: the two limits answer to
+  /// different things, and a code the fault services accept must still yield a
+  /// directory the filesystem will take.
+  ///
+  /// A truncated name carries a digest of the whole code, and has to: two
+  /// distinct codes sharing a long prefix would otherwise name one directory,
+  /// and nothing downstream would reject it. `rosbag_files.file_path` has no
+  /// UNIQUE constraint, and two rows pointing at one bag is a supported state
+  /// rather than an error - it is how a burst of correlated faults shares a
+  /// recording. The collision would be written, not refused, and the losing
+  /// writer's failure is swallowed by `flush_to_bag`.
+  ///
+  /// Shortening costs no lookup. A bag is found through the `rosbag_files`
+  /// table, which stores the path it was created with, so nothing recomputes
+  /// this name from a fault code.
+  ///
+  /// Static + public so the budget is testable without a live recording.
+  /// @param fault_code Validated fault code (no `/`, so no traversal).
+  /// @param timestamp_ms Milliseconds since the epoch, taken by the caller.
+  static std::string bag_directory_name(const std::string & fault_code, int64_t timestamp_ms);
 
  private:
   /// Outcome of a ring-buffer flush. "Nothing was buffered" and "the bag could not

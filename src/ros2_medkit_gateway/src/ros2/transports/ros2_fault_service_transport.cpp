@@ -178,6 +178,7 @@ FaultResult Ros2FaultServiceTransport::report_fault(const std::string & fault_co
       "ReportFault", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -221,6 +222,7 @@ FaultResult Ros2FaultServiceTransport::list_faults(const std::string & source_id
       "ListFaults", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -295,6 +297,7 @@ FaultWithEnvJsonResult Ros2FaultServiceTransport::get_fault_with_env(const std::
       "GetFault", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -333,6 +336,7 @@ FaultResult Ros2FaultServiceTransport::get_fault(const std::string & fault_code,
   FaultResult result;
   result.success = env_result.success;
   result.error_message = env_result.error_message;
+  result.failure = env_result.failure;
 
   if (env_result.success) {
     result.data = env_result.data["fault"];
@@ -353,6 +357,7 @@ FaultResult Ros2FaultServiceTransport::clear_fault(const std::string & fault_cod
       "ClearFault", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -381,6 +386,7 @@ FaultResult Ros2FaultServiceTransport::get_snapshots(const std::string & fault_c
       "GetSnapshots", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -419,6 +425,7 @@ FaultResult Ros2FaultServiceTransport::get_rosbag(const std::string & fault_code
       "GetRosbag", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -446,6 +453,7 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
       "ListRosbags", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 

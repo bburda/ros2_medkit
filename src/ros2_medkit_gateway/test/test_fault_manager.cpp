@@ -30,14 +30,17 @@
 #include "ros2_medkit_gateway/ros2/transports/ros2_fault_service_transport.hpp"
 #include "ros2_medkit_gateway/trigger_fault_subscriber.hpp"
 #include "ros2_medkit_msgs/msg/fault_event.hpp"
+#include "ros2_medkit_msgs/srv/get_fault.hpp"
 #include "ros2_medkit_msgs/srv/get_rosbag.hpp"
 #include "ros2_medkit_msgs/srv/get_snapshots.hpp"
 
 using namespace std::chrono_literals;
+using ros2_medkit_gateway::FaultFailure;
 using ros2_medkit_gateway::FaultManager;
 using ros2_medkit_gateway::ResourceChange;
 using ros2_medkit_gateway::ResourceChangeNotifier;
 using ros2_medkit_gateway::TriggerFaultSubscriber;
+using ros2_medkit_msgs::srv::GetFault;
 using ros2_medkit_msgs::srv::GetRosbag;
 using ros2_medkit_msgs::srv::GetSnapshots;
 
@@ -627,6 +630,54 @@ TEST_F(FaultManagerTest, GetRosbagNotFound) {
 
   EXPECT_FALSE(result.success);
   EXPECT_EQ(result.error_message, "No rosbag file available for fault");
+}
+
+// =============================================================================
+// FaultFailure - which layer failed, as the transport reports it
+// =============================================================================
+//
+// The handler's 404-vs-503 split reads this flag, so the transport is the one
+// place that decides which of the two a caller sees. These pin both readings
+// against the live transport, because a mapping that is only tested against a
+// hand-set flag would not notice the transport ceasing to set it.
+
+// No fault manager on the graph: no answer was obtained, so this is the one
+// case that is genuinely the server's failure and must stay 503-worthy.
+// @verifies REQ_INTEROP_013
+TEST_F(FaultManagerTest, GetFaultWithNoServiceReportsUnavailable) {
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
+
+  // No service is created, so the call cannot obtain a response.
+  auto result = fault_manager.get_fault_with_env("TEST_FAULT");
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.failure, FaultFailure::Unavailable)
+      << "a fault manager that never answered must not be reported as a client error: " << result.error_message;
+}
+
+// The fault manager answered and declined. It is reachable and healthy, so
+// this is a condition of the request however the refusal is worded - the
+// wording used here is its own `fault_code` validation message, which no
+// substring match for "not found" would have caught.
+// @verifies REQ_INTEROP_013
+TEST_F(FaultManagerTest, GetFaultRefusedByTheStoreReportsDeclined) {
+  auto service = node_->create_service<GetFault>(
+      "/fault_manager/get_fault",
+      [](const std::shared_ptr<GetFault::Request> & /*request*/, const std::shared_ptr<GetFault::Response> & response) {
+        response->success = false;
+        response->error_message = "fault_code contains invalid character '~'";
+      });
+
+  start_spinning();
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
+
+  auto result = fault_manager.get_fault_with_env("F~F");
+  stop_spinning();
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.failure, FaultFailure::Declined)
+      << "a refusal from a reachable fault manager must not be reported as a server failure";
+  EXPECT_EQ(result.error_message, "fault_code contains invalid character '~'");
 }
 
 int main(int argc, char ** argv) {
