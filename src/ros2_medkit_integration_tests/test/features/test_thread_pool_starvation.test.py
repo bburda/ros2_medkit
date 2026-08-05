@@ -47,6 +47,7 @@ from ros2_medkit_test_utils.constants import (
     API_BASE_PATH,
     get_test_port,
     get_time_scale,
+    sanitizers_enabled,
 )
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_gateway_node
@@ -65,6 +66,25 @@ EXECUTOR_THREADS = 3
 EXECUTOR_THREADS_FLOOR = 1
 EXECUTOR_THREADS_CEILING = 256
 EXECUTOR_THREADS_INVALID = 0  # below the floor -> must clamp to 1
+
+# The upper endpoint is exercised at its documented value in a normal build and
+# at a smaller one under a sanitizer. Not a convenience: a TSan-instrumented
+# gateway with 256 executor threads did not finish shutting down inside
+# launch_testing's grace period, so it was escalated SIGINT -> SIGTERM ->
+# SIGKILL and the suite reported exit code -9 for a gateway that had started,
+# logged its bound and served /health correctly. Unsanitized the same teardown
+# costs nothing measurable (the whole test runs in ~1.3 s), so the cost is
+# instrumentation, not the gateway.
+#
+# CONSEQUENCE, stated so nobody reads more coverage into a green sanitizer run
+# than it has: under a sanitizer this file does NOT pin the documented ceiling.
+# It pins that a large, genuinely multi-threaded executor is accepted and
+# serves. The ceiling itself is pinned by every normal build - jazzy, humble,
+# lyrical, coverage and Pixi all run this test unsanitized.
+SANITIZED_EXECUTOR_THREADS_CEILING = 16
+CEILING_UNDER_TEST = (
+    SANITIZED_EXECUTOR_THREADS_CEILING if sanitizers_enabled() else EXECUTOR_THREADS_CEILING
+)
 
 
 def generate_test_description():
@@ -86,7 +106,7 @@ def generate_test_description():
     gw_ceiling = create_gateway_node(
         port=get_test_port(2),
         name='gateway_threads_ceiling',
-        extra_params={'server.executor_threads': EXECUTOR_THREADS_CEILING},
+        extra_params={'server.executor_threads': CEILING_UNDER_TEST},
     )
     gw_invalid = create_gateway_node(
         port=get_test_port(3),
@@ -147,13 +167,18 @@ class TestThreadPoolStarvationGuard(GatewayTestCase):
         )
 
     def test_executor_threads_ceiling_applied(self, proc_output, gw_ceiling):
-        """The documented range ceiling (256) is accepted and applied as-is."""
+        """The range ceiling is accepted and applied as-is.
+
+        `CEILING_UNDER_TEST` is the documented 256 in a normal build and a
+        smaller value under a sanitizer - see the constant for why.
+        """
         proc_output.assertWaitFor(
-            'Main executor bounded to 256 threads', process=gw_ceiling, timeout=15,
+            f'Main executor bounded to {CEILING_UNDER_TEST} threads',
+            process=gw_ceiling, timeout=15,
         )
 
     def test_executor_threads_ceiling_gateway_serves_requests(self):
-        """The 256-thread gateway actually serves, not just logs its bound.
+        """The high-thread-count gateway actually serves, not just logs its bound.
 
         Every other assertion in the clamp sweep reads a log line, so a
         regression that logged the clamped count and then failed to bring the
@@ -174,7 +199,8 @@ class TestThreadPoolStarvationGuard(GatewayTestCase):
                 last_error = repr(exc)
             time.sleep(0.5)
         self.fail(
-            f'the executor_threads=256 gateway never served /health: {last_error}'
+            f'the executor_threads={CEILING_UNDER_TEST} gateway never served '
+            f'/health: {last_error}'
         )
 
     def test_executor_threads_invalid_clamps_to_floor(self, proc_output, gw_invalid):

@@ -371,6 +371,11 @@ jobs:
           # Same factor as the ctest TIMEOUT rewrite above, for the wall-clock
           # budgets tests assert internally - ctest's clock cannot reach those.
           MEDKIT_TEST_TIME_SCALE: 3
+          # Lets tests size instrumented-only-expensive resources down (e.g. a
+          # 256-thread executor whose teardown outlives launch_testing's grace
+          # period under instrumentation). Detection also falls back to the
+          # sanitizer's own *SAN_OPTIONS, so this is belt and braces.
+          MEDKIT_TEST_SANITIZED: 1
         run: |
           source /opt/ros/jazzy/setup.bash
           source install/setup.bash
@@ -483,6 +488,11 @@ jobs:
           # Same factor as the ctest TIMEOUT rewrite above, for the wall-clock
           # budgets tests assert internally - ctest's clock cannot reach those.
           MEDKIT_TEST_TIME_SCALE: 3
+          # Lets tests size instrumented-only-expensive resources down (e.g. a
+          # 256-thread executor whose teardown outlives launch_testing's grace
+          # period under instrumentation). Detection also falls back to the
+          # sanitizer's own *SAN_OPTIONS, so this is belt and braces.
+          MEDKIT_TEST_SANITIZED: 1
         run: |
           export TSAN_OPTIONS="halt_on_error=0:history_size=4:suppressions=$(pwd)/tsan_suppressions.txt"
           source /opt/ros/jazzy/setup.bash

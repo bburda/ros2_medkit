@@ -42,6 +42,29 @@ def get_time_scale():
     return scale if scale >= 1.0 else 1.0
 
 
+def sanitizers_enabled():
+    """Return True when running against a sanitizer-instrumented build.
+
+    Some resources are affordable in a normal build and not under ASan/TSan -
+    most obviously threads, which each carry shadow and history state and which
+    the runtime has to tear down one by one. A test that sizes such a resource
+    at its documented maximum can exceed launch_testing's shutdown grace period
+    under instrumentation and have the process SIGKILLed, which then reads as a
+    product failure rather than as instrumentation cost.
+
+    Detected from the sanitizer runtimes' own configuration variables, which
+    the ASan and TSan jobs already set, so a future sanitizer job cannot forget
+    to opt in. ``MEDKIT_TEST_SANITIZED`` forces it on for a local reproduction
+    (any value except empty / ``0`` / ``false``).
+    """
+    forced = os.environ.get('MEDKIT_TEST_SANITIZED', '').strip()
+    if forced and forced.lower() not in ('0', 'false'):
+        return True
+    return any(
+        os.environ.get(name) for name in ('ASAN_OPTIONS', 'TSAN_OPTIONS', 'UBSAN_OPTIONS')
+    )
+
+
 def get_test_port(offset=0):
     """Return the assigned test port plus an optional offset.
 
