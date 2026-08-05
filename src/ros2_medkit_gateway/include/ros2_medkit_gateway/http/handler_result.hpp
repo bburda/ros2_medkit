@@ -114,6 +114,23 @@ struct ResponseAttachments {
     headers.emplace_back(std::move(name), std::move(value));
     return *this;
   }
+
+  /// Fluent setter for the `Location` header of a 201 / 202 response.
+  ///
+  /// `uri` is the absolute, API-prefixed path form every `href` in the
+  /// document already uses (`/api/v1/apps/x/triggers/7`). Build it with
+  /// `api_path(...)` when the handler assembles the target from parts, or pass
+  /// `req.path() + "/" + id` when the new resource is a child of the request
+  /// path - `TypedRequest::path()` is already prefixed. Never hand-roll the
+  /// `"/api/v1/"` literal: that is what let three different spellings of the
+  /// same URI accumulate across the handlers.
+  ///
+  /// The route registry declares this header on every derived 201 / 202, so a
+  /// handler that returns `Created<T>` / `Accepted<T>` without calling this
+  /// publishes a header it does not send.
+  ResponseAttachments & with_location(std::string uri) {
+    return with_header("Location", std::move(uri));
+  }
 };
 
 }  // namespace http

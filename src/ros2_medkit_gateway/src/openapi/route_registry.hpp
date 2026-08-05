@@ -76,6 +76,22 @@ struct RouteGate {
 /// `.gated_on(...)` applied to the returned `RouteEntry` afterwards.
 using GateHandle = std::shared_ptr<std::optional<RouteGate>>;
 
+/// One response header a route publishes, as an OpenAPI Header Object.
+///
+/// Response headers are optional by definition in OpenAPI (there is no
+/// `required` on the emitted object here), which matches how the gateway sets
+/// them: `Content-Disposition` only when the download names a file,
+/// `Accept-Ranges` only when the provider is range-capable.
+struct ResponseHeader {
+  /// Header field name as it appears on the wire, e.g. `Location`.
+  std::string name;
+  /// Prose a generated client shows for the header.
+  std::string description;
+  /// OpenAPI schema for the value. Defaults to a plain string, which is what
+  /// every header the gateway sets is.
+  nlohmann::json schema{{"type", "string"}};
+};
+
 /// Fluent builder for a single route entry.
 class RouteEntry {
  public:
@@ -127,6 +143,18 @@ class RouteEntry {
   /// that declares a status it can never return.
   RouteEntry & mark_alternates();
 
+  /// Mark this route as answering 206 to a `Range` request, emitted as
+  /// `x-medkit-partial-content: true`. Set by the `binary_download` helper.
+  ///
+  /// This is the second - and only other - legitimate source of a multi-2xx
+  /// operation, and it is deliberately a different marker from
+  /// `mark_alternates()`: there the handler chooses between variant members,
+  /// here the handler returns one thing and cpp-httplib turns it into 200 or
+  /// 206 depending on the request. Collapsing the two would let the document
+  /// contract test wave through a route that declares a status it can never
+  /// return. Nothing outside `binary_download` may set this.
+  RouteEntry & mark_partial_content();
+
   /// Author the prose published for this route's success response(s), leaving
   /// the status and the schema derived from the handler's return type. Use it
   /// instead of a hand-attached `response(201, "Trigger created", ref(...))`:
@@ -136,6 +164,20 @@ class RouteEntry {
   /// Applies to every declared 2xx, which for a derived route is the single
   /// one `TResponse` produced.
   RouteEntry & success_description(const std::string & desc);
+
+  /// Declare a response header this route sets on `status_code`.
+  ///
+  /// The status must already be declared - it comes from the handler's return
+  /// type for every derived route - because a header is a property of a
+  /// response, not a response of its own. Attaching one to an undeclared
+  /// status would otherwise mint a description-less response object and put a
+  /// status in the document the handler cannot return; instead the call is
+  /// dropped and reported by `validate_completeness()`.
+  ///
+  /// Re-declaring the same header name on the same status replaces it, so the
+  /// framework's automatic `Location` declaration can be overridden with
+  /// route-specific prose.
+  RouteEntry & response_header(int status_code, ResponseHeader header);
 
   /// Declare additional error statuses this route can emit. Statuses below 400
   /// are ignored and reported by validate_completeness() - use response() for
@@ -188,8 +230,19 @@ class RouteEntry {
   bool hidden_{false};
   /// Set by mark_alternates(); emitted as `x-medkit-alternates: true`.
   bool alternates_{false};
+  /// Set by mark_partial_content(); emitted as `x-medkit-partial-content: true`.
+  bool partial_content_{false};
   /// Set by only_status(); suppresses the blanket 400/404/500 injection.
   bool only_status_{false};
+  /// Set by the *attachments* body-less typed `put<TResponse>` overload - the
+  /// fire-and-forget state-machine kicks, which are the only registrations that
+  /// take no payload at all. Without it validate_completeness() infers "PUT
+  /// therefore a request body" from the method and reports 13 shipped routes
+  /// that are correct as written - noise that would train readers to ignore the
+  /// whole channel. Deliberately NOT set by the plain body-less `put` or by
+  /// `post<TResponse>`: both of those parse a body by hand, so a missing
+  /// declaration there is a genuine gap the check must keep reporting.
+  bool takes_no_request_body_{false};
   std::string operation_id_;
 
   /// Heap-allocated so the typed wrapper closure can hold a stable handle to
@@ -204,8 +257,17 @@ class RouteEntry {
   struct ResponseInfo {
     std::string desc;
     nlohmann::json schema;
+    /// NSDMI, not a bare member: the three brace-initialisations of this
+    /// aggregate predate the field and must keep compiling warning-free under
+    /// -Wmissing-field-initializers.
+    std::vector<ResponseHeader> headers{};
   };
   std::map<int, ResponseInfo> responses_;
+
+  /// Statuses passed to response_header() that no response declares. Kept so
+  /// validate_completeness() reports the miscall rather than the document
+  /// silently losing a header the handler sets.
+  std::vector<int> undeclared_header_statuses_;
 
   /// Error statuses declared via errors(), rendered as GenericError $refs
   /// alongside the blanket 400/404/500 set.
@@ -445,6 +507,13 @@ class RouteRegistry {
     auth_enabled_ = enabled;
   }
 
+  /// Set whether rate limiting is enabled (controls 429 in OpenAPI output).
+  /// The limiter runs pre-routing on every non-OPTIONS request, so when it is
+  /// on, 429 is reachable on every route and the document has to say so.
+  void set_rate_limit_enabled(bool enabled) {
+    rate_limit_enabled_ = enabled;
+  }
+
   /// Escape hatch for JSON routes without typed DTOs (e.g. the fault-trigger
   /// CRUD): registers a raw cpp-httplib handler under an OpenAPI-style path so
   /// the route shows up in the generated spec, Swagger UI and the endpoint
@@ -469,6 +538,7 @@ class RouteRegistry {
 
   std::deque<RouteEntry> routes_;
   bool auth_enabled_{false};
+  bool rate_limit_enabled_{false};
 
   // ---------------------------------------------------------------------------
   // Typed-handler wrapper helpers.
@@ -619,6 +689,60 @@ inline const char * default_success_description(int status) {
     default:
       return "Successful response";
   }
+}
+
+/// True when `TResponse` fixes a status whose declared response carries a
+/// `Location` header - i.e. exactly the statuses `declare_location_header`
+/// publishes one for.
+///
+/// The obligation and the means to meet it live in different places: the
+/// status comes from the return type, but only the `ResponseAttachments`
+/// overloads give a handler any way to set a header. This trait is what lets
+/// the non-attachments overloads reject the combination at compile time
+/// instead of shipping a route that advertises a header it cannot send.
+template <class TResponse>
+inline constexpr bool kStatusRequiresAttachments =
+    http::dto_alternate_status<TResponse>::value == 201 || http::dto_alternate_status<TResponse>::value == 202;
+
+/// Declare the `Location` header a 201 / 202 answer carries, deriving the fact
+/// that it carries one from the status the return type already fixed.
+///
+/// RFC 9110 §15.3.2: a 201 identifies the resource it created with `Location`.
+/// The gateway's 202 answers apply the same convention to the resource whose
+/// status the client polls (`/updates/{id}/status`, `/{entity}/status`, an
+/// execution). Every handler behind a `Created<T>` / `Accepted<T>` return type
+/// sets the header, so declaring it here - rather than at each registration -
+/// is what keeps the two from drifting apart one route at a time.
+inline void declare_location_header(RouteEntry & entry, int status) {
+  if (status != 201 && status != 202) {
+    return;
+  }
+  entry.response_header(
+      status,
+      ResponseHeader{"Location",
+                     status == 201
+                         ? "Absolute path of the created resource, API prefix included (`/api/v1/...`)."
+                         : "Absolute path of the resource whose status tracks this request, API prefix included.",
+                     nlohmann::json{{"type", "string"}, {"format", "uri-reference"}}});
+}
+
+/// Declare the one success response a typed route derives from `TResponse`:
+/// status from `dto_alternate_status`, schema from `status_payload_t`, prose
+/// from the status, and the `Location` header when the status implies one.
+///
+/// Every typed registration entry point funnels through here so the derivation
+/// exists once. A hand-rolled copy at a registration site is how a route ends
+/// up with a status and a document that disagree.
+template <class TResponse>
+inline void declare_derived_response(RouteEntry & entry) {
+  constexpr int status = http::dto_alternate_status<TResponse>::value;
+  using Payload = http::status_payload_t<TResponse>;
+  if constexpr (std::is_same_v<Payload, http::NoContent>) {
+    entry.response(status, default_success_description(status));
+  } else {
+    entry.template response<Payload>(status, default_success_description(status));
+  }
+  declare_location_header(entry, status);
 }
 
 }  // namespace detail
@@ -869,16 +993,12 @@ RouteEntry & RouteRegistry::get(const std::string & openapi_path,
   static_assert(dto::has_dto_shape_v<http::status_payload_t<TResponse>> ||
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed get<T>: T must be a DTO (or NoContent)");
+  static_assert(!detail::kStatusRequiresAttachments<TResponse>,
+                "201/202 must use the ResponseAttachments overload: the document declares a Location "
+                "header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("get", openapi_path, /*placeholder*/ HandlerFn{});
   entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -891,14 +1011,7 @@ RouteEntry & RouteRegistry::get(
                 "typed get<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("get", openapi_path, HandlerFn{});
   entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -909,17 +1022,13 @@ RouteEntry & RouteRegistry::post(const std::string & openapi_path,
   static_assert(dto::has_dto_shape_v<http::status_payload_t<TResponse>> ||
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed post<TB,T>: T must be a DTO (or NoContent)");
+  static_assert(!detail::kStatusRequiresAttachments<TResponse>,
+                "201/202 must use the ResponseAttachments overload: the document declares a Location "
+                "header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
   entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -934,14 +1043,7 @@ RouteEntry & RouteRegistry::post(
   auto & entry = add_route("post", openapi_path, HandlerFn{});
   entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -951,20 +1053,16 @@ RouteEntry & RouteRegistry::post(const std::string & openapi_path,
   static_assert(dto::has_dto_shape_v<http::status_payload_t<TResponse>> ||
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed post<T>: T must be a DTO (or NoContent)");
+  static_assert(!detail::kStatusRequiresAttachments<TResponse>,
+                "201/202 must use the ResponseAttachments overload: the document declares a Location "
+                "header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
   entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   // No automatic request_body schema: body-less typed POST is reserved for
   // routes that parse the body manually (e.g. form-urlencoded auth endpoints).
   // Callers attach an explicit `.request_body(...)` to populate the OpenAPI
   // spec.
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -977,14 +1075,7 @@ RouteEntry & RouteRegistry::post(
                 "typed post<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
   entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -995,17 +1086,13 @@ RouteEntry & RouteRegistry::put(const std::string & openapi_path,
   static_assert(dto::has_dto_shape_v<http::status_payload_t<TResponse>> ||
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed put<TB,T>: T must be a DTO (or NoContent)");
+  static_assert(!detail::kStatusRequiresAttachments<TResponse>,
+                "201/202 must use the ResponseAttachments overload: the document declares a Location "
+                "header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("put", openapi_path, HandlerFn{});
   entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -1020,14 +1107,7 @@ RouteEntry & RouteRegistry::put(
   auto & entry = add_route("put", openapi_path, HandlerFn{});
   entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -1037,18 +1117,19 @@ RouteEntry & RouteRegistry::put(const std::string & openapi_path,
   static_assert(dto::has_dto_shape_v<http::status_payload_t<TResponse>> ||
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed put<T>: T must be a DTO (or NoContent)");
+  static_assert(!detail::kStatusRequiresAttachments<TResponse>,
+                "201/202 must use the ResponseAttachments overload: the document declares a Location "
+                "header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("put", openapi_path, HandlerFn{});
   entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
-  // No automatic request_body schema: body-less typed PUT is reserved for
-  // routes that take no payload at all (e.g. /updates/{id}/prepare).
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  // No automatic request_body schema, and deliberately NOT exempt from the
+  // completeness check: this overload's caller reads the body itself
+  // (`PUT /{entity}/data/{data_id}` parses free-form JSON by hand so
+  // plugin-owned entities can accept shapes `DataWriteRequest` does not
+  // describe), exactly like the body-less typed POST. A route here that omits
+  // `.request_body(...)` has a real gap in its document, so it must still be
+  // reported. The payload-free routes live on the attachments overload below.
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -1061,14 +1142,13 @@ RouteEntry & RouteRegistry::put(
                 "typed put<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("put", openapi_path, HandlerFn{});
   entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  // This is the payload-free shape: a fire-and-forget state-machine kick that
+  // answers 202 with a `Location` (`/updates/{id}/prepare`, the lifecycle
+  // transitions). Recording that on the route lets validate_completeness() read
+  // it instead of inferring "PUT therefore a body" from the method. The plain
+  // body-less overload above is NOT exempt - its caller parses a body by hand.
+  entry.takes_no_request_body_ = true;
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -1079,17 +1159,13 @@ RouteEntry & RouteRegistry::patch(const std::string & openapi_path,
   static_assert(dto::has_dto_shape_v<http::status_payload_t<TResponse>> ||
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed patch<TB,T>: T must be a DTO (or NoContent)");
+  static_assert(!detail::kStatusRequiresAttachments<TResponse>,
+                "201/202 must use the ResponseAttachments overload: the document declares a Location "
+                "header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("patch", openapi_path, HandlerFn{});
   entry.handler_ = wrap_with_body<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -1104,14 +1180,7 @@ RouteEntry & RouteRegistry::patch(
   auto & entry = add_route("patch", openapi_path, HandlerFn{});
   entry.handler_ = wrap_with_body_attachments<TBody, TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -1121,16 +1190,12 @@ RouteEntry & RouteRegistry::del(const std::string & openapi_path,
   static_assert(dto::has_dto_shape_v<http::status_payload_t<TResponse>> ||
                     std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>,
                 "typed del<T>: T must be a DTO (or NoContent)");
+  static_assert(!detail::kStatusRequiresAttachments<TResponse>,
+                "201/202 must use the ResponseAttachments overload: the document declares a Location "
+                "header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("delete", openapi_path, HandlerFn{});
   entry.handler_ = wrap_body_less<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -1143,14 +1208,7 @@ RouteEntry & RouteRegistry::del(
                 "typed del<T>: T must be a DTO (or NoContent)");
   auto & entry = add_route("delete", openapi_path, HandlerFn{});
   entry.handler_ = wrap_body_less_with_attachments<TResponse>(std::move(handler), entry.error_renderer_, entry.gate_);
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 
@@ -1167,6 +1225,7 @@ inline void add_alternate_response(RouteEntry & entry) {
                   "alternate variant member must be a DTO (regular or opaque) or NoContent");
     entry.template response<TAlt>(status, default_success_description(status));
   }
+  declare_location_header(entry, status);
 }
 
 }  // namespace detail
@@ -1176,6 +1235,9 @@ RouteEntry &
 RouteRegistry::post_alternates(const std::string & openapi_path,
                                std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest, TBody)> handler) {
   static_assert(dto::is_dto_v<TBody>, "post_alternates: TBody must be a DTO");
+  static_assert((!detail::kStatusRequiresAttachments<TAlt> && ...),
+                "a 201/202 alternate must use the ResponseAttachments overload: the document declares a "
+                "Location header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("post", openapi_path, HandlerFn{});
   entry.handler_ = wrap_post_alternates<TBody, TAlt...>(std::move(handler), entry.error_renderer_, entry.gate_);
   entry.template request_body<TBody>("");
@@ -1203,6 +1265,9 @@ template <class... TAlt>
 RouteEntry &
 RouteRegistry::del_alternates(const std::string & openapi_path,
                               std::function<http::Result<std::variant<TAlt...>>(http::TypedRequest)> handler) {
+  static_assert((!detail::kStatusRequiresAttachments<TAlt> && ...),
+                "a 201/202 alternate must use the ResponseAttachments overload: the document declares a "
+                "Location header for those statuses, and only that overload lets the handler send one");
   auto & entry = add_route("delete", openapi_path, HandlerFn{});
   entry.handler_ = wrap_del_alternates<TAlt...>(std::move(handler), entry.error_renderer_, entry.gate_);
   (detail::add_alternate_response<TAlt>(entry), ...);
@@ -1265,14 +1330,7 @@ RouteEntry & RouteRegistry::multipart_upload(
   entry.gate_ = gate;
   entry.request_body("Multipart upload", nlohmann::json{{"type", "object"}, {"additionalProperties", true}},
                      "multipart/form-data");
-  if constexpr (!std::is_same_v<http::status_payload_t<TResponse>, http::NoContent>) {
-    entry.template response<http::status_payload_t<TResponse>>(
-        http::dto_alternate_status<TResponse>::value,
-        detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  } else {
-    entry.response(http::dto_alternate_status<TResponse>::value,
-                   detail::default_success_description(http::dto_alternate_status<TResponse>::value));
-  }
+  detail::declare_derived_response<TResponse>(entry);
   return entry;
 }
 

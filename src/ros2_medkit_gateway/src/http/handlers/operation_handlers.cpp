@@ -1092,7 +1092,7 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
       const std::string location = req.path() + "/" + action_result.goal_id;
 
       http::ResponseAttachments att;
-      att.with_header("Location", location);
+      att.with_location(location);
       // dto_alternate_status<ExecutionCreateAsync> == 202, so the framework
       // emits the 202 status without an explicit override here.
       return SuccessPair{ResultVariant{std::move(async_dto)}, std::move(att)};
@@ -1484,7 +1484,7 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
       exec_dto.status = sovd_status_from_ros2(tracked->status);
 
       http::ResponseAttachments att;
-      att.with_header("Location", location);
+      att.with_location(location);
       return SuccessPair{http::Accepted<dto::OperationExecution>{std::move(exec_dto)}, std::move(att)};
     }
     json params{{"entity_id", entity_id},

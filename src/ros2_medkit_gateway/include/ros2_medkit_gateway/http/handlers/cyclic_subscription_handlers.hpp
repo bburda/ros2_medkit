@@ -68,9 +68,10 @@ class CyclicSubscriptionHandlers {
 
   /// POST /{entity}/cyclic-subscriptions - create subscription.
   ///
-  /// On success returns the new `CyclicSubscription` body as 201 Created.
-  http::Result<http::Created<dto::CyclicSubscription>> post_subscription(const http::TypedRequest & req,
-                                                                         dto::CyclicSubscriptionCreateRequest body);
+  /// On success returns the new `CyclicSubscription` body as 201 Created, with
+  /// the `Location` header naming the subscription that was created.
+  http::Result<std::pair<http::Created<dto::CyclicSubscription>, http::ResponseAttachments>>
+  post_subscription(const http::TypedRequest & req, dto::CyclicSubscriptionCreateRequest body);
 
   /// GET /{entity}/cyclic-subscriptions - list all subscriptions for entity.
   http::Result<dto::Collection<dto::CyclicSubscription>> get_subscriptions(const http::TypedRequest & req);

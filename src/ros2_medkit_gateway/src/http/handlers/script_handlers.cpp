@@ -249,7 +249,7 @@ ScriptHandlers::upload_script(const http::TypedRequest & req, const http::Multip
     upload_resp.name = result->name;
 
     http::ResponseAttachments att;
-    att.with_header("Location", script_path);
+    att.with_location(script_path);
     return std::make_pair(http::Created<dto::ScriptUploadResponse>{std::move(upload_resp)}, std::move(att));
   } catch (const std::exception & e) {
     return tl::unexpected(make_error(500, ERR_INTERNAL_ERROR, e.what()));
@@ -427,7 +427,7 @@ ScriptHandlers::start_execution(const http::TypedRequest & req) {
         api_path("/" + entity_type_segment + "/" + entity_id + "/scripts/" + script_id + "/executions/" + result->id);
 
     http::ResponseAttachments att;
-    att.with_header("Location", exec_path);
+    att.with_location(exec_path);
     return std::make_pair(http::Accepted<dto::ScriptExecution>{execution_info_to_dto(*result)}, std::move(att));
   } catch (const std::exception & e) {
     return tl::unexpected(make_error(500, ERR_INTERNAL_ERROR, e.what()));

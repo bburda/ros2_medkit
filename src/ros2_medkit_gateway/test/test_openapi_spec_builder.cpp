@@ -202,6 +202,38 @@ TEST_F(OpenApiSpecBuilderTest, AlwaysIncludesGenericErrorResponse) {
 }
 
 // =============================================================================
+// Middleware-owned responses always present
+// =============================================================================
+
+TEST_F(OpenApiSpecBuilderTest, AlwaysIncludesMiddlewareOwnedResponses) {
+  // The auth and rate-limit middleware answer 401/403/429 ahead of routing, so
+  // no route's return type can describe them and no RouteEntry can carry their
+  // headers. Every document defines them, which is also what keeps the
+  // per-route $refs to them resolvable.
+  auto spec = builder_.info("API", "1.0.0").build();
+  auto & responses = spec["components"]["responses"];
+
+  ASSERT_TRUE(responses.contains("Unauthorized"));
+  EXPECT_TRUE(responses["Unauthorized"]["headers"].contains("WWW-Authenticate"));
+
+  ASSERT_TRUE(responses.contains("Forbidden"));
+  EXPECT_FALSE(responses["Forbidden"]["description"].get<std::string>().empty());
+
+  ASSERT_TRUE(responses.contains("RateLimited"));
+  for (const char * header : {"Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"}) {
+    EXPECT_TRUE(responses["RateLimited"]["headers"].contains(header)) << header;
+  }
+
+  // Every one of them refs a schema this document also defines, so a generated
+  // client can resolve the error body.
+  for (const char * name : {"Unauthorized", "Forbidden", "RateLimited"}) {
+    const auto ref = responses[name]["content"]["application/json"]["schema"]["$ref"].get<std::string>();
+    const auto schema_name = ref.substr(ref.rfind('/') + 1);
+    EXPECT_TRUE(spec["components"]["schemas"].contains(schema_name)) << name << " -> " << ref;
+  }
+}
+
+// =============================================================================
 // Contact info
 // =============================================================================
 

@@ -350,6 +350,11 @@ class TestScenarioBulkDataUpload(GatewayTestCase):
         # Check Content-Disposition
         cd = dl_r.headers.get('Content-Disposition', '')
         self.assertIn('hello.txt', cd)
+        # The download is served through a range-aware content provider, so it
+        # advertises the unit it accepts (RFC 9110 14.3). cpp-httplib only fills
+        # this in for HEAD, so a missing value means the framework stopped
+        # setting it and the OpenAPI document now advertises a header we drop.
+        self.assertEqual(dl_r.headers.get('Accept-Ranges'), 'bytes')
 
     def test_18_download_nonexistent_returns_404(self):
         """GET download with fake ID returns 404.

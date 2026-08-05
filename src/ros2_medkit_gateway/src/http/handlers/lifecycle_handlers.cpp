@@ -21,6 +21,7 @@
 #include <tl/expected.hpp>
 
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_gateway/core/http/http_utils.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/providers/lifecycle_provider.hpp"
 #include "ros2_medkit_gateway/core/status/lifecycle_state_reader.hpp"
@@ -81,8 +82,7 @@ http::Result<dto::LifecycleStatusResponse> LifecycleHandlers::handle_get_status(
   }
   const auto & entity = *entity_result;
 
-  const std::string base =
-      std::string("/api/v1/") + (entity.type == EntityType::APP ? "apps/" : "components/") + entity.id;
+  const std::string base = api_path((entity.type == EntityType::APP ? "/apps/" : "/components/") + entity.id);
 
   // Delegate to LifecycleProvider when one is registered for this entity.
   if (plugin_mgr_) {
@@ -208,8 +208,7 @@ LifecycleHandlers::handle_transition(const http::TypedRequest & req, std::string
   }
   const auto & entity = *entity_result;
 
-  const std::string base =
-      std::string("/api/v1/") + (entity.type == EntityType::APP ? "apps/" : "components/") + entity.id;
+  const std::string base = api_path((entity.type == EntityType::APP ? "/apps/" : "/components/") + entity.id);
 
   if (plugin_mgr_) {
     auto * provider = plugin_mgr_->get_lifecycle_provider_for_entity(entity_id);
@@ -220,7 +219,7 @@ LifecycleHandlers::handle_transition(const http::TypedRequest & req, std::string
           return tl::make_unexpected(to_error_info(result.error()));
         }
         http::ResponseAttachments att;
-        att.with_header("Location", base + "/status");
+        att.with_location(base + "/status");
         return std::make_pair(http::Accepted<http::NoContent>{http::NoContent{}}, std::move(att));
       } catch (const std::exception & e) {
         RCLCPP_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw for entity '%s': %s", entity_id.c_str(),
