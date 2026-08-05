@@ -97,6 +97,7 @@ using ros2_medkit_gateway::http::ResponseAttachments;
 using ros2_medkit_gateway::http::Result;
 using ros2_medkit_gateway::http::TypedRequest;
 using ros2_medkit_gateway::openapi::ErrorRenderer;
+using ros2_medkit_gateway::openapi::RouteEntry;
 using ros2_medkit_gateway::openapi::RouteRegistry;
 
 namespace {
@@ -309,18 +310,28 @@ TEST(TypedRouteRegistry, AttachmentsApplyStatusAndHeaders) {
 
 TEST(TypedRouteRegistry, PostAlternatesPicksStatusFromActiveVariant) {
   // AltA -> 202 (specialized above), AltB -> 200 (default).
+  //
+  // The attachments overload is not incidental here: a 202 alternate makes the
+  // registry declare a `Location` header on that response, and only this
+  // overload gives the handler a channel to send one. The non-attachments
+  // overload rejects the combination at compile time. What this test proves is
+  // unchanged - the status still comes from the active alternate, not from the
+  // attachments, which carry nothing.
   RouteRegistry reg;
   using VarT = std::variant<TypedRouteAltA, TypedRouteAltB>;
-  std::function<Result<VarT>(TypedRequest, TypedRouteTestReq)> handler =
-      [](TypedRequest /*req*/, const TypedRouteTestReq & body) -> Result<VarT> {
+  using PairT = std::pair<VarT, ros2_medkit_gateway::http::ResponseAttachments>;
+  std::function<Result<PairT>(TypedRequest, TypedRouteTestReq)> handler =
+      [](TypedRequest /*req*/, const TypedRouteTestReq & body) -> Result<PairT> {
+    ros2_medkit_gateway::http::ResponseAttachments att;
     if (body.greeting == "a") {
       TypedRouteAltA a;
       a.a = "alt-a";
-      return VarT{a};
+      att.with_location("/api/v1/test/alt/a");
+      return PairT{VarT{a}, std::move(att)};
     }
     TypedRouteAltB b;
     b.b = 99;
-    return VarT{b};
+    return PairT{VarT{b}, std::move(att)};
   };
   reg.post_alternates<TypedRouteTestReq, TypedRouteAltA, TypedRouteAltB>("/test/alt", std::move(handler))
       .tag("Test")
@@ -334,6 +345,7 @@ TEST(TypedRouteRegistry, PostAlternatesPicksStatusFromActiveVariant) {
     auto r = cli.Post("/api/v1/test/alt", req_body.dump(), "application/json");
     ASSERT_TRUE(r);
     EXPECT_EQ(r->status, 202) << "AltA must use the specialized 202 status";
+    EXPECT_EQ(r->get_header_value("Location"), "/api/v1/test/alt/a");
     auto body = nlohmann::json::parse(r->body);
     EXPECT_EQ(body["a"], "alt-a");
   }
@@ -457,4 +469,89 @@ TEST(TypedRouteRegistry, DocsSubtreeRegexRoutes) {
   ASSERT_TRUE(r);
   EXPECT_EQ(r->status, 200);
   EXPECT_EQ(r->body, "docs:foo/bar.html");
+}
+
+// =============================================================================
+// 7. binary_download: the Range contract the document now advertises
+// =============================================================================
+
+namespace {
+
+// Range-capable download over a fixed in-memory payload. `provider` honours
+// offset/length, which is what makes cpp-httplib's range machinery usable.
+constexpr std::string_view kDownloadPayload = "0123456789abcdef";
+
+Result<ros2_medkit_gateway::http::BinaryResponse> range_download_handler(TypedRequest /*req*/) {
+  ros2_medkit_gateway::http::BinaryResponse resp;
+  resp.content_type = "application/octet-stream";
+  resp.filename = "payload.bin";
+  resp.supports_ranges = true;
+  resp.total_size = kDownloadPayload.size();
+  resp.provider = [](uint64_t offset, uint64_t length, httplib::DataSink & sink) -> bool {
+    sink.write(kDownloadPayload.data() + offset, static_cast<std::size_t>(length));
+    return true;
+  };
+  return resp;
+}
+
+RouteEntry & seed_download(RouteRegistry & reg, const std::string & path) {
+  std::function<Result<ros2_medkit_gateway::http::BinaryResponse>(TypedRequest)> h = &range_download_handler;
+  return reg.binary_download(path, std::move(h));
+}
+
+}  // namespace
+
+TEST(TypedRouteRegistry, BinaryDownloadSendsAcceptRangesOnAPlainGet) {
+  // The document declares `Accept-Ranges` on the 200. cpp-httplib only fills it
+  // in for HEAD, so if the framework ever stops setting it the document starts
+  // advertising a header nobody sends.
+  RouteRegistry reg;
+  seed_download(reg, "/test/blob").tag("Test").summary("Download");
+
+  auto s = start_server(reg);
+  httplib::Client cli("127.0.0.1", s.port);
+  auto r = cli.Get("/api/v1/test/blob");
+  ASSERT_TRUE(r);
+  EXPECT_EQ(r->status, 200);
+  EXPECT_EQ(r->get_header_value("Accept-Ranges"), "bytes");
+  EXPECT_NE(r->get_header_value("Content-Disposition").find("payload.bin"), std::string::npos);
+  EXPECT_EQ(r->body, std::string(kDownloadPayload));
+}
+
+TEST(TypedRouteRegistry, BinaryDownloadAnswers206WithContentRangeForARangeRequest) {
+  // The 206 is not the handler's doing - it never assigns res.status, so
+  // cpp-httplib picks it from a non-empty req.ranges. This is the wire proof
+  // behind declaring 206 and `Content-Range` in the document.
+  RouteRegistry reg;
+  seed_download(reg, "/test/blob").tag("Test").summary("Download");
+
+  auto s = start_server(reg);
+  httplib::Client cli("127.0.0.1", s.port);
+  auto r = cli.Get("/api/v1/test/blob", {{"Range", "bytes=4-7"}});
+  ASSERT_TRUE(r);
+  EXPECT_EQ(r->status, 206);
+  EXPECT_EQ(r->body, "4567");
+  EXPECT_EQ(r->get_header_value("Content-Range"), "bytes 4-7/16");
+  EXPECT_EQ(r->get_header_value("Accept-Ranges"), "bytes");
+}
+
+TEST(TypedRouteRegistry, BinaryDownloadDeclaresBothSuccessStatusesAndMarksItself) {
+  // Two 2xx codes are only legitimate because the route says why - the document
+  // contract test reads `x-medkit-partial-content` to tell this apart from a
+  // route declaring a status it can never return.
+  RouteRegistry reg;
+  seed_download(reg, "/test/blob").tag("Test").summary("Download");
+
+  auto paths = reg.to_openapi_paths();
+  auto & op = paths["/test/blob"]["get"];
+  EXPECT_TRUE(op["x-medkit-partial-content"].get<bool>());
+  EXPECT_FALSE(op.contains("x-medkit-alternates")) << "partial content is not variant dispatch";
+
+  auto & responses = op["responses"];
+  ASSERT_TRUE(responses.contains("200"));
+  ASSERT_TRUE(responses.contains("206"));
+  EXPECT_TRUE(responses["200"]["headers"].contains("Accept-Ranges"));
+  EXPECT_TRUE(responses["200"]["headers"].contains("Content-Disposition"));
+  EXPECT_TRUE(responses["206"]["headers"].contains("Content-Range"));
+  EXPECT_FALSE(responses["206"]["description"].get<std::string>().empty());
 }

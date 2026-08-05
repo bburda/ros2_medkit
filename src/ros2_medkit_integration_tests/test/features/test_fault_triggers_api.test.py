@@ -115,6 +115,12 @@ class TestFaultTriggersApi(GatewayTestCase):
         self.assertEqual(resp.status_code, 201, resp.text)
         rule = resp.json()
         self.assertTrue(rule['id'])
+        # This route is a raw registration, so the Location the document
+        # declares for its 201 is set by hand - the typed registry's automatic
+        # declaration cannot reach it. Assert the two agree.
+        self.assertEqual(
+            resp.headers.get('Location'),
+            f'/api/v1/apps/{PLUGIN_APP}/fault-triggers/{rule["id"]}')
 
         listed = requests.get(self._url(), timeout=10).json()['items']
         self.assertIn(rule['id'], [r['id'] for r in listed])

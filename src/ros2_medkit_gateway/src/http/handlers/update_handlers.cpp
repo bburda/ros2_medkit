@@ -269,7 +269,7 @@ UpdateHandlers::post_update(const http::TypedRequest & /*req*/, dto::UpdateRegis
     dto::UpdateRegisterResponse resp;
     resp.id = id;
     http::ResponseAttachments att;
-    att.with_header("Location", api_path("/updates/" + id));
+    att.with_location(api_path("/updates/" + id));
     return std::make_pair(http::Created<dto::UpdateRegisterResponse>{std::move(resp)}, std::move(att));
   } catch (const std::exception & e) {
     return tl::unexpected(make_internal_error("post_update", e));
@@ -322,7 +322,7 @@ UpdateHandlers::put_prepare(const http::TypedRequest & req) {
       return tl::unexpected(map_prepare_error(result.error()));
     }
     http::ResponseAttachments att;
-    att.with_header("Location", api_path("/updates/" + id + "/status"));
+    att.with_location(api_path("/updates/" + id + "/status"));
     return std::make_pair(http::Accepted<http::NoContent>{http::NoContent{}}, std::move(att));
   } catch (const std::exception & e) {
     return tl::unexpected(make_internal_error("put_prepare", e));
@@ -350,7 +350,7 @@ UpdateHandlers::put_execute(const http::TypedRequest & req) {
       return tl::unexpected(map_execute_error(result.error()));
     }
     http::ResponseAttachments att;
-    att.with_header("Location", api_path("/updates/" + id + "/status"));
+    att.with_location(api_path("/updates/" + id + "/status"));
     return std::make_pair(http::Accepted<http::NoContent>{http::NoContent{}}, std::move(att));
   } catch (const std::exception & e) {
     return tl::unexpected(make_internal_error("put_execute", e));
@@ -378,7 +378,7 @@ UpdateHandlers::put_automated(const http::TypedRequest & req) {
       return tl::unexpected(map_automated_error(result.error()));
     }
     http::ResponseAttachments att;
-    att.with_header("Location", api_path("/updates/" + id + "/status"));
+    att.with_location(api_path("/updates/" + id + "/status"));
     return std::make_pair(http::Accepted<http::NoContent>{http::NoContent{}}, std::move(att));
   } catch (const std::exception & e) {
     return tl::unexpected(make_internal_error("put_automated", e));

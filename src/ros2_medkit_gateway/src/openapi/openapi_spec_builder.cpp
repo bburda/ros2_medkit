@@ -134,6 +134,38 @@ nlohmann::json OpenApiSpecBuilder::build() const {
   spec["components"]["responses"]["GenericError"]["content"]["application/json"]["schema"] =
       SchemaBuilder::ref("GenericError");
 
+  // 6b. Middleware-owned responses. 401/403/429 never reach a handler - the
+  // auth and rate-limit middleware answer them ahead of routing - so no route's
+  // return type can describe them and no `RouteEntry` can carry their headers.
+  // They are declared once here and referenced from every route the middleware
+  // guards.
+  auto & responses = spec["components"]["responses"];
+
+  // AuthMiddleware puts the RFC 6749 `{error, error_description}` shape on the
+  // wire for 401/403, which no component schema describes yet; these two point
+  // at GenericError until that schema exists, because referencing an undefined
+  // component would break the document's ref-resolution contract outright.
+  responses["Unauthorized"]["description"] = "Authentication is missing or the bearer token is invalid.";
+  responses["Unauthorized"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("GenericError");
+  responses["Unauthorized"]["headers"]["WWW-Authenticate"] = {
+      {"description", "Bearer challenge, e.g. `Bearer realm=\"ros2_medkit_gateway\", error=\"invalid_token\"`."},
+      {"schema", {{"type", "string"}}}};
+
+  responses["Forbidden"]["description"] = "The token is valid but lacks the scope this operation requires.";
+  responses["Forbidden"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("GenericError");
+
+  // The rate limiter emits the SOVD GenericError shape, so unlike the two
+  // above this schema already matches the wire.
+  responses["RateLimited"]["description"] = "The client exceeded its request quota.";
+  responses["RateLimited"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("GenericError");
+  responses["RateLimited"]["headers"] = {
+      {"Retry-After", {{"description", "Seconds to wait before retrying."}, {"schema", {{"type", "string"}}}}},
+      {"X-RateLimit-Limit", {{"description", "Requests permitted per window."}, {"schema", {{"type", "string"}}}}},
+      {"X-RateLimit-Remaining",
+       {{"description", "Requests left in the current window."}, {"schema", {{"type", "string"}}}}},
+      {"X-RateLimit-Reset",
+       {{"description", "Unix timestamp at which the window resets."}, {"schema", {{"type", "string"}}}}}};
+
   // 7. Security schemes (if any)
   if (!security_schemes_.empty()) {
     spec["security"] = nlohmann::json::array();

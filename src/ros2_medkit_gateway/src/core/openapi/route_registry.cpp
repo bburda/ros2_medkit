@@ -143,11 +143,37 @@ RouteEntry & RouteEntry::mark_alternates() {
   return *this;
 }
 
+RouteEntry & RouteEntry::mark_partial_content() {
+  partial_content_ = true;
+  return *this;
+}
+
 RouteEntry & RouteEntry::success_description(const std::string & desc) {
   for (auto & [code, info] : responses_) {
     if (code >= 200 && code < 300) {
       info.desc = desc;
     }
+  }
+  return *this;
+}
+
+RouteEntry & RouteEntry::response_header(int status_code, ResponseHeader header) {
+  auto it = responses_.find(status_code);
+  if (it == responses_.end()) {
+    // No assert: this is a release build, and an assert compiled out would let
+    // the header vanish silently. Record the miscall so validate_completeness()
+    // surfaces it at startup instead.
+    undeclared_header_statuses_.push_back(status_code);
+    return *this;
+  }
+  auto & headers = it->second.headers;
+  auto existing = std::find_if(headers.begin(), headers.end(), [&header](const ResponseHeader & h) {
+    return h.name == header.name;
+  });
+  if (existing != headers.end()) {
+    *existing = std::move(header);
+  } else {
+    headers.push_back(std::move(header));
   }
   return *this;
 }
@@ -359,6 +385,12 @@ RouteEntry & RouteRegistry::sse(const std::string & openapi_path,
   // SSE has no JSON schema; mark it explicitly so validate_completeness skips
   // the success-schema check via its SSE-name heuristic.
   entry.response(200, "Server-Sent Events stream");
+  // Declared here, next to the `set_header` calls above, because that is what
+  // stops the two from drifting: the framework owns these headers, so no SSE
+  // route can be registered without them and none can document them wrongly.
+  entry.response_header(200, ResponseHeader{"Cache-Control", "Always `no-cache`; event streams are never cached."});
+  entry.response_header(
+      200, ResponseHeader{"X-Accel-Buffering", "Always `no`; disables response buffering in nginx-style proxies."});
   return entry;
 }
 
@@ -385,6 +417,10 @@ RouteRegistry::binary_download(const std::string & openapi_path,
       res.set_header("Content-Disposition", "attachment; filename=\"" + *bin->filename + "\"");
     }
     if (bin->supports_ranges) {
+      // RFC 9110 §14.3: a range-capable resource advertises the unit it accepts.
+      // cpp-httplib only fills this in for HEAD, so a GET would otherwise serve
+      // partial content no client knew it could ask for.
+      res.set_header("Accept-Ranges", "bytes");
       res.set_content_provider(static_cast<std::size_t>(bin->total_size), bin->content_type,
                                [bin](std::size_t offset, std::size_t length, httplib::DataSink & sink) -> bool {
                                  return bin->provider(static_cast<std::uint64_t>(offset),
@@ -402,7 +438,33 @@ RouteRegistry::binary_download(const std::string & openapi_path,
   auto & entry = add_route("get", openapi_path, std::move(fn));
   entry.error_renderer_ = renderer;
   entry.gate_ = gate;
-  entry.response(200, "Binary download", nlohmann::json{{"type", "string"}, {"format", "binary"}});
+  const nlohmann::json binary_schema{{"type", "string"}, {"format", "binary"}};
+
+  // The handler never assigns `res.status`, so cpp-httplib decides it: 200, or
+  // 206 when the request carried a satisfiable `Range` - and it fills in
+  // `Content-Range` itself. Advertising `Accept-Ranges` while saying nothing
+  // about what a `Range` request answers would invite clients into an
+  // undocumented response. The `Range` request parameter and the 416 rejection
+  // belong to the full Range contract and are deliberately not declared here.
+  entry.response(200, "Binary download", binary_schema);
+  entry.response(206, "Requested byte range of the file", binary_schema);
+  entry.mark_partial_content();
+
+  // Set on the response before the content provider takes over, so they ride on
+  // whichever status cpp-httplib picks - hence declared on both. Each is
+  // conditional on the BinaryResponse the handler returned (a filename, a
+  // range-capable provider), which is why none is `required`: OpenAPI response
+  // headers are optional by definition.
+  const ResponseHeader content_disposition{
+      "Content-Disposition", "`attachment; filename=\"...\"` when the download names a file. Absent otherwise."};
+  const ResponseHeader accept_ranges{"Accept-Ranges",
+                                     "`bytes` when the download supports range requests. Absent otherwise."};
+  entry.response_header(200, content_disposition);
+  entry.response_header(200, accept_ranges);
+  entry.response_header(206, content_disposition);
+  entry.response_header(206, accept_ranges);
+  entry.response_header(
+      206, ResponseHeader{"Content-Range", "`bytes <start>-<end>/<total>` for the range that was served."});
   return entry;
 }
 
@@ -578,6 +640,12 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       // The handler returns a variant, so more than one 2xx code is genuine.
       operation["x-medkit-alternates"] = true;
     }
+    if (route.partial_content_) {
+      // cpp-httplib answers 206 instead of 200 when the request carries a
+      // satisfiable `Range`, so more than one 2xx code is genuine here too -
+      // for a different reason than a variant-returning handler.
+      operation["x-medkit-partial-content"] = true;
+    }
 
     // Parameters
     if (!route.parameters_.empty()) {
@@ -589,8 +657,17 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
     {
       std::set<std::string> explicit_params;
       for (const auto & p : route.parameters_) {
-        if (p.value("in", "") == "path") {
-          explicit_params.insert(p.value("name", ""));
+        // Looked up with find()/get_ref() rather than value(): the latter runs
+        // nlohmann's from_json conversion machinery, which GCC inlines into a
+        // -Wnull-dereference false positive here, and it silently inserted an
+        // empty name for a parameter object missing "name".
+        const auto in_it = p.find("in");
+        if (in_it == p.end() || *in_it != "path") {
+          continue;
+        }
+        const auto name_it = p.find("name");
+        if (name_it != p.end() && name_it->is_string()) {
+          explicit_params.insert(name_it->get_ref<const std::string &>());
         }
       }
 
@@ -660,8 +737,15 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       for (const auto & [code, info] : route.responses_) {
         std::string code_str = std::to_string(code);
         operation["responses"][code_str]["description"] = info.desc;
+        // Guard stays: a default-constructed nlohmann::json is `null`, so
+        // dropping this writes `"schema": null` onto every bodyless 204.
         if (!info.schema.empty()) {
           operation["responses"][code_str]["content"]["application/json"]["schema"] = info.schema;
+        }
+        for (const auto & header : info.headers) {
+          auto & header_obj = operation["responses"][code_str]["headers"][header.name];
+          header_obj["description"] = header.description;
+          header_obj["schema"] = header.schema;
         }
       }
     } else {
@@ -672,10 +756,13 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
     // Add standard error responses as $ref to GenericError component.
     // Response-level $ref (not nested in content/schema) - the referenced
     // component is a complete response object with description and schema.
-    auto add_error_ref = [&operation](const std::string & code) {
+    auto add_response_ref = [&operation](const std::string & code, const std::string & component) {
       if (!operation["responses"].contains(code)) {
-        operation["responses"][code] = {{"$ref", "#/components/responses/GenericError"}};
+        operation["responses"][code] = {{"$ref", "#/components/responses/" + component}};
       }
+    };
+    auto add_error_ref = [&add_response_ref](const std::string & code) {
+      add_response_ref(code, "GenericError");
     };
 
     for (int code : route.declared_errors_) {
@@ -692,9 +779,16 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
       add_error_ref("500");
     }
 
+    // The middleware answers these ahead of routing, on every route, so they
+    // are declared per-route but described once as shared components - that is
+    // the only place their headers (`WWW-Authenticate`, `Retry-After`,
+    // `X-RateLimit-*`) can live, since no handler return type produces them.
     if (auth_enabled_) {
-      add_error_ref("401");
-      add_error_ref("403");
+      add_response_ref("401", "Unauthorized");
+      add_response_ref("403", "Forbidden");
+    }
+    if (rate_limit_enabled_) {
+      add_response_ref("429", "RateLimited");
     }
 
     // Use explicit operationId if set, otherwise auto-generate camelCase from path
@@ -802,6 +896,15 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
                             "; use response() for success and redirect statuses"});
     }
 
+    // response_header() attaches to an already-declared status. One aimed at a
+    // status this route never declares was dropped, so the header the handler
+    // sets would be missing from the document with nothing to show for it.
+    for (int code : route.undeclared_header_statuses_) {
+      issues.push_back({ValidationIssue::Severity::kError, route_id,
+                        "response_header() targeted undeclared status " + std::to_string(code) +
+                            "; declare the status first (success statuses come from the return type)"});
+    }
+
     // Check response schemas for non-DELETE methods
     if (route.method_ != "delete") {
       bool has_success_response_with_schema = false;
@@ -847,8 +950,15 @@ std::vector<ValidationIssue> RouteRegistry::validate_completeness() const {
       }
     }
 
-    // POST/PUT must have request_body
-    if ((route.method_ == "post" || route.method_ == "put") && !route.request_body_.has_value()) {
+    // POST/PUT must have request_body, unless the registration overload already
+    // said the route takes none. The body-less typed `put<TResponse>` is
+    // reserved for payload-free state-machine kicks (`/updates/{id}/prepare`,
+    // the lifecycle transitions); demanding a body schema of those reports 13
+    // shipped routes that are correct as written. The body-less typed
+    // `post<TResponse>` is NOT exempt: its contract is that the handler parses
+    // a non-JSON body itself, so a missing declaration there is a real gap.
+    if ((route.method_ == "post" || route.method_ == "put") && !route.request_body_.has_value() &&
+        !route.takes_no_request_body_) {
       // Exception: endpoints returning 405 (method not allowed) don't need request body
       bool is_405 = route.responses_.count(405) > 0;
       // Exception: PUT endpoints returning 204 (e.g., log config) don't need request body schema

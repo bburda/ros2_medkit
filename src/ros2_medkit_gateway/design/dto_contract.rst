@@ -365,13 +365,35 @@ wrapped) response:
              -> http::Result<std::pair<http::Created<dto::Resp>, http::ResponseAttachments>> {
            dto::Resp r;
            http::ResponseAttachments att;
-           att.with_header("Location", "/resources/123");
+           att.with_location(api_path("/resources/123"));
            return std::make_pair(http::Created<dto::Resp>{std::move(r)}, std::move(att));
          });
 
 When the attachments carry no ``status_override``, the framework falls back to
 ``dto_alternate_status<TResponse>`` - never to a literal 200/204 - so wrapping a
 paired response is enough to move both the wire status and the declared one.
+
+``with_location(uri)`` is the typed form of the ``Location`` attachment, and it
+is not merely sugar. The registry declares a ``Location`` response header on
+*every* derived 201 and 202, because ``Created<T>`` / ``Accepted<T>`` already
+told it the status - so a handler behind one of those return types that does
+not call ``with_location`` publishes a header it never sends.
+
+The obligation is enforced where it can be. The non-attachments overloads -
+``get`` / ``post`` / ``put`` / ``patch`` / ``del<TResponse>`` and the
+non-attachments ``post_alternates`` / ``del_alternates`` - give a handler no
+channel for a header at all, so they ``static_assert`` against a ``TResponse``
+(or a variant alternate) whose status is 201 or 202. A route that would
+advertise ``Location`` and be structurally unable to send it does not compile.
+What the type system cannot see is a *pair-returning* handler that simply
+forgets the call; that half is covered by the document contract test, which
+asserts every declared 201/202 carries the header and that a real 201 puts it
+on the wire. ``uri`` is the
+absolute, API-prefixed path form every ``href`` in the document uses: build it
+with ``api_path(...)``, or pass ``req.path() + "/" + id`` when the new resource
+is a child of the request path (``TypedRequest::path()`` is already prefixed).
+Writing the ``"/api/v1/"`` literal by hand is what let three spellings of the
+same URI accumulate across the handlers.
 
 The framework writes the response body via
 ``JsonWriter<status_payload_t<TResponse>>``, applies the attachments, and renders
@@ -421,6 +443,18 @@ which publishes the ``x-medkit-alternates: true`` operation extension, so the
 document contract test can tell a real variant from a route that declares a
 status it cannot return. Nothing else may set that marker.
 
+There is exactly one other way a second 2xx is reachable, and it carries its
+own marker rather than reusing that one. ``reg.binary_download`` handlers never
+assign a status, so cpp-httplib answers 200 or **206 Partial Content**
+depending on whether the request carried a satisfiable ``Range`` - it also
+fills in ``Content-Range``. The helper therefore declares both statuses and
+calls ``RouteEntry::mark_partial_content()``, publishing
+``x-medkit-partial-content: true``. Two markers, not one: there the handler
+chooses between variant members, here the handler returns one thing and the
+HTTP layer decides how to frame it. A single marker covering both would let the
+contract test wave through a route that declares a status it can never return.
+Nothing outside ``binary_download`` may set it.
+
 Two further ``RouteEntry`` knobs shape the published response set:
 
 - ``errors({409, 423})`` - declare error statuses this route can emit beyond
@@ -439,6 +473,21 @@ Two further ``RouteEntry`` knobs shape the published response set:
   *is* safe with respect to ``gated_on()`` in either order - a live gate is a
   second reachable outcome, so ``only_status`` re-declares the gate's status
   rather than dropping it.
+- ``response_header(status, {name, description, schema})`` - declare a header
+  this route sets on an **already declared** status. A header is a property of
+  a response, so a call aimed at a status no response declares is dropped and
+  reported by ``validate_completeness()`` rather than minting a
+  description-less response object for a status the handler cannot return
+  (a release build compiles ``assert`` out, so a precondition check there would
+  be no check at all). Re-declaring the same header name on the same status
+  replaces it, which is how a route overrides the framework's automatic
+  ``Location`` prose. Most routes never call it: ``Location`` comes from the
+  status, and the ``sse`` / ``binary_download`` helpers declare their own
+  framework-owned headers (``Cache-Control`` and ``X-Accel-Buffering``;
+  ``Content-Disposition`` and ``Accept-Ranges``) next to the code that sets
+  them. Declared headers carry no ``required`` flag - OpenAPI response headers
+  are optional by definition, which matches headers the gateway sets
+  conditionally.
 - ``gated_on(available, unavailable)`` - the route's backing feature can be
   absent. ``available`` is re-evaluated per request (a manager can appear after
   registration), and when it is false the framework answers with
@@ -458,6 +507,50 @@ Two further ``RouteEntry`` knobs shape the published response set:
   because its own backend is unconfigured, e.g. ``LockHandlers`` without a lock
   manager - are declared with plain ``errors({501})`` until a handler-level
   seam exists.
+
+Every self-check named above (``errors()`` handed a sub-400 status,
+``response_header()`` aimed at an undeclared status, a route with no tag or no
+success schema) reports through ``RouteRegistry::validate_completeness()``, and
+``RESTServer::report_route_metadata_issues()`` calls it once at start-up and
+logs what it finds. That call is what makes "reported" mean something: before
+it existed the issues were collected and discarded outside the unit tests, so
+the guarantee was words only.
+
+The report is logged, never fatal. Every issue it can raise is a defect in the
+*document*, and a gateway that refused to serve traffic because one route is
+missing a summary would trade a documentation bug for an outage. Its job is to
+cover the route set a given configuration actually assembled - which feature
+gates and plugins make impossible to enumerate in a test - while the OpenAPI
+contract suite gates the shape of the document itself.
+
+The report is not merely logged. It emits a summary line unconditionally -
+including for a clean route set, because a line that only appears on failure
+cannot be asserted on - and
+``test_openapi_contract.test.py::test_shipped_route_set_declares_complete_metadata``
+waits for that line with a zero error count, on the fixture that turns every
+optional feature gate on. That is what makes it a gate rather than a diagnostic
+nobody reads.
+
+One consequence worth stating: the request-body check reads the *registration*,
+not the HTTP method - and only the **attachments** body-less ``put<TResponse>``
+is exempt. That overload is the fire-and-forget state-machine kick
+(``/updates/{id}/prepare``, the lifecycle transitions), which genuinely takes no
+payload, and it records that on the entry. The plain body-less ``put`` and the
+body-less ``post`` are both **not** exempt: their callers read the body by hand
+(``PUT /{entity}/data/{data_id}`` parses free-form JSON so plugin-owned entities
+can send shapes ``DataWriteRequest`` does not describe; ``/auth/*`` parses
+form-urlencoded), so a missing ``.request_body(...)`` there is a real gap the
+check must keep reporting.
+
+Three statuses never reach a handler at all: the auth middleware answers 401
+and 403, and the rate limiter answers 429, both ahead of routing. No return
+type can describe them and no ``RouteEntry`` can carry their headers, so they
+are declared once as the shared component responses ``Unauthorized`` (carrying
+``WWW-Authenticate``), ``Forbidden`` and ``RateLimited`` (carrying
+``Retry-After`` and the ``X-RateLimit-*`` trio) in ``OpenApiSpecBuilder``.
+Routes reference them - 401/403 when ``set_auth_enabled(true)``, 429 when
+``set_rate_limit_enabled(true)`` - so the document mentions a middleware status
+exactly when that middleware is live.
 
 Escape Hatches
 --------------
@@ -483,7 +576,11 @@ remain compile-time-checked at their boundary.
   ``provider``, ``content_type``, ``filename``, ``supports_ranges``, and
   ``total_size``; the framework wires ``provider`` into cpp-httplib's
   range-aware content-provider machinery so partial-content fetches work
-  without manual ``Content-Range`` plumbing.
+  without manual ``Content-Range`` plumbing. The helper owns the whole header
+  and status story for these routes: it sends ``Content-Disposition`` when the
+  response names a file and ``Accept-Ranges: bytes`` when the provider is
+  range-capable (cpp-httplib only sets the latter for ``HEAD``), and it
+  declares 200, 206, and those headers - see ``mark_partial_content()`` above.
 - ``reg.multipart_upload<TResponse>(path, handler)`` - registers a
   ``multipart/form-data`` upload. The handler receives ``http::MultipartBody``
   (already parsed by cpp-httplib) and returns

@@ -155,6 +155,9 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   // the registry lazily at request time, so the pointer is valid.
   route_registry_ = std::make_unique<openapi::RouteRegistry>();
   route_registry_->set_auth_enabled(auth_config_.enabled);
+  // Read the same flag the middleware branch above reads, so the document
+  // declares 429 exactly when the limiter is live.
+  route_registry_->set_rate_limit_enabled(rate_limit_config.enabled);
 
   // Taken before the handlers that read it: /health reports how much of the
   // SSE client cap is in use, and a tracker fetched afterwards would reach
@@ -426,6 +429,11 @@ void RESTServer::setup_routes() {
                   ft_json_error(res, created.error().first, created.error().second);
                   return;
                 }
+                // Raw route: the typed registry's automatic 201 `Location`
+                // declaration cannot reach here, so the header is set - and
+                // declared below - by hand. `req.path` already carries the API
+                // prefix, matching the form every other 201 uses.
+                res.set_header("Location", req.path + "/" + created->id);
                 res.status = 201;
                 res.set_content(FaultTriggerEngine::rule_to_json(*created).dump(2), "application/json");
               })
@@ -440,6 +448,10 @@ void RESTServer::setup_routes() {
         .request_body("Fault-trigger rule definition",
                       nlohmann::json{{"type", "object"}, {"additionalProperties", true}})
         .response(201, "Created rule", nlohmann::json{{"type", "object"}})
+        .response_header(
+            201, openapi::ResponseHeader{"Location",
+                                         "Absolute path of the created rule, API prefix included (`/api/v1/...`).",
+                                         nlohmann::json{{"type", "string"}, {"format", "uri-reference"}}})
         // 400/404 come from the registry's automatic response-level
         // GenericError $ref; only 409 needs a manual declaration.
         .response(409, "fault_code already used by another rule",
@@ -1064,8 +1076,8 @@ void RESTServer::setup_routes() {
 
       reg.post<dto::TriggerCreateRequest, http::Created<dto::Trigger>>(
              entity_path + "/triggers",
-             [this](http::TypedRequest req,
-                    dto::TriggerCreateRequest body) -> http::Result<http::Created<dto::Trigger>> {
+             [this](http::TypedRequest req, dto::TriggerCreateRequest body)
+                 -> http::Result<std::pair<http::Created<dto::Trigger>, http::ResponseAttachments>> {
                return trigger_handlers_->post_trigger(req, std::move(body));
              })
           .tag("Triggers")
@@ -1145,8 +1157,8 @@ void RESTServer::setup_routes() {
 
       reg.post<dto::CyclicSubscriptionCreateRequest, http::Created<dto::CyclicSubscription>>(
              entity_path + "/cyclic-subscriptions",
-             [this](http::TypedRequest req,
-                    dto::CyclicSubscriptionCreateRequest body) -> http::Result<http::Created<dto::CyclicSubscription>> {
+             [this](http::TypedRequest req, dto::CyclicSubscriptionCreateRequest body)
+                 -> http::Result<std::pair<http::Created<dto::CyclicSubscription>, http::ResponseAttachments>> {
                return cyclic_sub_handlers_->post_subscription(req, std::move(body));
              })
           .tag("Subscriptions")
@@ -1631,6 +1643,12 @@ void RESTServer::setup_routes() {
       .tag("Faults")
       .summary("Clear all faults globally")
       .description("Clears all faults across the entire system.")
+      // A 204 cannot carry a body, so the "peers were not cleared" caveat this
+      // route ships travels as a header - which makes declaring it the only way
+      // a generated client can see it at all.
+      .response_header(204, openapi::ResponseHeader{"X-Medkit-Local-Only",
+                                                    "`true` when only the local FaultManager was cleared; faults held "
+                                                    "by aggregated peers are untouched and must be cleared per peer."})
       .operation_id("clearAllFaults")
       .query<dto::FaultClearQuery>();
 
@@ -1841,6 +1859,48 @@ void RESTServer::setup_routes() {
 
   // Register all routes with cpp-httplib
   route_registry_->register_all(*srv, API_BASE_PATH);
+
+  report_route_metadata_issues();
+}
+
+void RESTServer::report_route_metadata_issues() const {
+  // The registry's self-checks (`errors()` handed a sub-400 status,
+  // `response_header()` aimed at a status no response declares, a route with no
+  // tag or no success schema) are only worth recording if something reads them.
+  // Until this call existed they were collected and thrown away outside the unit
+  // tests, so the comments promising they would be "surfaced" were promising
+  // nothing on a shipped gateway.
+  //
+  // Logged, never fatal: every issue here is a defect in the *document*, and a
+  // gateway that refused to serve traffic because one route is missing a summary
+  // would trade a documentation bug for an outage.
+  //
+  // The summary line below is emitted unconditionally, including for a clean
+  // route set, and that is deliberate: a log line that only appears on failure
+  // cannot be asserted on, so the check itself would be guarded by nothing.
+  // `test_openapi_contract.test.py::test_shipped_route_set_declares_complete_metadata`
+  // waits for it and requires the error count to be zero, which is what makes
+  // this a gate rather than a diagnostic nobody reads.
+  std::size_t errors = 0;
+  std::size_t warnings = 0;
+  for (const auto & issue : route_registry_->validate_completeness()) {
+    if (issue.severity == openapi::ValidationIssue::Severity::kError) {
+      ++errors;
+      RCLCPP_ERROR(rclcpp::get_logger("rest_server"), "OpenAPI metadata error on %s: %s", issue.route.c_str(),
+                   issue.message.c_str());
+    } else {
+      ++warnings;
+      RCLCPP_WARN(rclcpp::get_logger("rest_server"), "OpenAPI metadata warning on %s: %s", issue.route.c_str(),
+                  issue.message.c_str());
+    }
+  }
+  RCLCPP_INFO(rclcpp::get_logger("rest_server"),
+              "OpenAPI metadata check: %zu error(s), %zu warning(s) across %zu route(s)", errors, warnings,
+              route_registry_->size());
+  if (errors > 0) {
+    RCLCPP_ERROR(rclcpp::get_logger("rest_server"),
+                 "Routes above publish incomplete OpenAPI metadata; generated clients will be wrong for them");
+  }
 }
 
 void RESTServer::start() {

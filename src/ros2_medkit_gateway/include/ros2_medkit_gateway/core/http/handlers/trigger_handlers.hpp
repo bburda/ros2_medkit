@@ -67,9 +67,10 @@ class TriggerHandlers {
 
   /// POST /{entity}/triggers - create trigger.
   ///
-  /// On success returns the new `Trigger` body as 201 Created.
-  http::Result<http::Created<dto::Trigger>> post_trigger(const http::TypedRequest & req,
-                                                         dto::TriggerCreateRequest body);
+  /// On success returns the new `Trigger` body as 201 Created, with the
+  /// `Location` header naming the trigger that was created.
+  http::Result<std::pair<http::Created<dto::Trigger>, http::ResponseAttachments>>
+  post_trigger(const http::TypedRequest & req, dto::TriggerCreateRequest body);
 
   /// GET /{entity}/triggers - list all triggers for entity.
   http::Result<dto::Collection<dto::Trigger>> get_triggers(const http::TypedRequest & req);

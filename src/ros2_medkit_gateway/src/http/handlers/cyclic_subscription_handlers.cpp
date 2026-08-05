@@ -83,7 +83,7 @@ CyclicSubscriptionHandlers::CyclicSubscriptionHandlers(HandlerContext & ctx, Sub
 // ---------------------------------------------------------------------------
 // POST - create subscription
 // ---------------------------------------------------------------------------
-http::Result<http::Created<dto::CyclicSubscription>>
+http::Result<std::pair<http::Created<dto::CyclicSubscription>, http::ResponseAttachments>>
 CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
                                               dto::CyclicSubscriptionCreateRequest body) {
   auto id_result = read_entity_id(req);
@@ -204,7 +204,11 @@ CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
   }
 
   auto sub_dto = subscription_to_dto(*result, *event_source_result);
-  return http::Created<dto::CyclicSubscription>{std::move(sub_dto)};
+  http::ResponseAttachments att;
+  // The subscription is a child of the POST target, and `req.path()` already
+  // carries the API prefix, so this is the same absolute form every `href` uses.
+  att.with_location(req.path() + "/" + sub_dto.id);
+  return std::make_pair(http::Created<dto::CyclicSubscription>{std::move(sub_dto)}, std::move(att));
 }
 
 // ---------------------------------------------------------------------------

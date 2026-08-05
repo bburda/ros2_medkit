@@ -879,3 +879,231 @@ TEST_F(RouteRegistryTest, GateWithSubErrorStatusIsReportedNotPublished) {
   EXPECT_TRUE(reported) << "sub-400 gate status was silently dropped";
   EXPECT_FALSE(registry_.to_openapi_paths()["/bad-gate"]["get"]["responses"].contains("302"));
 }
+
+// =============================================================================
+// Response headers
+// =============================================================================
+
+namespace {
+
+// Seed handler returning `Created<SeedDto>` so the registry derives 201 - the
+// status that carries the automatic `Location` declaration. It must be the
+// attachments form: the non-attachments overloads static_assert against 201/202
+// precisely because they give the handler no way to send the header the
+// document then advertises.
+using SeedCreated = ros2_medkit_gateway::http::Created<RouteRegistryTestSeedDto>;
+using SeedCreatedPair = std::pair<SeedCreated, ros2_medkit_gateway::http::ResponseAttachments>;
+
+Result<SeedCreatedPair> seed_created_handler(TypedRequest req, RouteRegistryTestSeedDto /*body*/) {
+  ros2_medkit_gateway::http::ResponseAttachments att;
+  att.with_location(req.path() + "/seed");
+  return SeedCreatedPair{SeedCreated{RouteRegistryTestSeedDto{}}, std::move(att)};
+}
+
+RouteEntry & seed_created_post(RouteRegistry & reg, const std::string & path) {
+  std::function<Result<SeedCreatedPair>(TypedRequest, RouteRegistryTestSeedDto)> h = &seed_created_handler;
+  return reg.post<RouteRegistryTestSeedDto, SeedCreated>(path, std::move(h));
+}
+
+}  // namespace
+
+// @verifies REQ_INTEROP_002
+TEST_F(RouteRegistryTest, DerivedCreatedResponseDeclaresLocationHeader) {
+  // The 201 comes from `Created<T>`; the `Location` declaration is derived from
+  // that same status, so a route cannot ship one without the other.
+  seed_created_post(registry_, "/items").tag("Test").summary("Create item");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & created = paths["/items"]["post"]["responses"]["201"];
+
+  ASSERT_TRUE(created.contains("headers")) << created.dump();
+  ASSERT_TRUE(created["headers"].contains("Location"));
+  EXPECT_FALSE(created["headers"]["Location"]["description"].get<std::string>().empty());
+  EXPECT_EQ(created["headers"]["Location"]["schema"]["type"].get<std::string>(), "string");
+}
+
+TEST_F(RouteRegistryTest, PlainSuccessResponseDeclaresNoLocationHeader) {
+  // 200 does not identify a newly created resource, so declaring `Location`
+  // there would advertise a header the handler never sets.
+  seed_get(registry_, "/items").tag("Test").summary("List items");
+
+  // Bind the document to a local: `to_openapi_paths()` returns by value, and a
+  // reference into the temporary dangles the moment the statement ends.
+  auto paths = registry_.to_openapi_paths();
+  ASSERT_TRUE(paths["/items"]["get"]["responses"].contains("200"));
+  auto & ok = paths["/items"]["get"]["responses"]["200"];
+  EXPECT_FALSE(ok.contains("headers")) << ok.dump();
+}
+
+TEST_F(RouteRegistryTest, ResponseHeaderReplacesSameNameOnSameStatus) {
+  seed_created_post(registry_, "/items")
+      .tag("Test")
+      .summary("Create item")
+      .response_header(201, ResponseHeader{"Location", "Bespoke prose"});
+
+  auto paths = registry_.to_openapi_paths();
+  auto & headers = paths["/items"]["post"]["responses"]["201"]["headers"];
+  EXPECT_EQ(headers.size(), 1u) << headers.dump();
+  EXPECT_EQ(headers["Location"]["description"].get<std::string>(), "Bespoke prose");
+}
+
+TEST_F(RouteRegistryTest, ResponseHeaderOnUndeclaredStatusIsReportedNotPublished) {
+  // A header aimed at a status no response declares would otherwise mint a
+  // description-less response object and publish a status the handler cannot
+  // return. It is dropped and surfaced by validate_completeness() instead - an
+  // assert would be compiled out of the release build the gateway ships.
+  seed_get(registry_, "/items")
+      .tag("Test")
+      .summary("List items")
+      .response_header(418, ResponseHeader{"X-Teapot", "Never declared"});
+
+  bool reported = false;
+  for (const auto & issue : registry_.validate_completeness()) {
+    if (issue.message.find("418") != std::string::npos) {
+      reported = true;
+      EXPECT_EQ(issue.severity, ValidationIssue::Severity::kError);
+    }
+  }
+  EXPECT_TRUE(reported) << "undeclared-status header was silently dropped";
+  auto paths = registry_.to_openapi_paths();
+  EXPECT_FALSE(paths["/items"]["get"]["responses"].contains("418"));
+}
+
+TEST_F(RouteRegistryTest, BodylessResponseKeepsNoSchemaKeyWhenHeadersAreDeclared) {
+  // A default-constructed nlohmann::json is `null`. Emitting headers must not
+  // drag a `"schema": null` onto a 204 that legitimately has no body.
+  seed_del(registry_, "/items")
+      .tag("Test")
+      .summary("Delete item")
+      .response_header(204, ResponseHeader{"X-Medkit-Local-Only", "Local scope only"});
+
+  auto paths = registry_.to_openapi_paths();
+  auto & no_content = paths["/items"]["delete"]["responses"]["204"];
+  EXPECT_FALSE(no_content.contains("content")) << no_content.dump();
+  ASSERT_TRUE(no_content.contains("headers"));
+  EXPECT_TRUE(no_content["headers"].contains("X-Medkit-Local-Only"));
+}
+
+TEST_F(RouteRegistryTest, MiddlewareStatusesReferenceTheirOwnComponents) {
+  // 401/403/429 never reach a handler, so their headers (WWW-Authenticate,
+  // Retry-After, X-RateLimit-*) can only live on shared components. Pointing
+  // them at GenericError would describe the wrong body and no headers at all.
+  registry_.set_auth_enabled(true);
+  registry_.set_rate_limit_enabled(true);
+  seed_get(registry_, "/items").tag("Test").summary("List items");
+
+  auto paths = registry_.to_openapi_paths();
+  auto & responses = paths["/items"]["get"]["responses"];
+  EXPECT_EQ(responses["401"]["$ref"].get<std::string>(), "#/components/responses/Unauthorized");
+  EXPECT_EQ(responses["403"]["$ref"].get<std::string>(), "#/components/responses/Forbidden");
+  EXPECT_EQ(responses["429"]["$ref"].get<std::string>(), "#/components/responses/RateLimited");
+  EXPECT_EQ(responses["400"]["$ref"].get<std::string>(), "#/components/responses/GenericError");
+}
+
+TEST_F(RouteRegistryTest, RateLimitedStatusAbsentWhenLimiterIsOff) {
+  seed_get(registry_, "/items").tag("Test").summary("List items");
+  auto paths = registry_.to_openapi_paths();
+  ASSERT_TRUE(paths["/items"]["get"]["responses"].contains("200")) << "route missing; absence check would be vacuous";
+  EXPECT_FALSE(paths["/items"]["get"]["responses"].contains("429"));
+}
+
+// =============================================================================
+// Request-body completeness reads the registration, not the HTTP method
+// =============================================================================
+
+namespace {
+
+using SeedAccepted = ros2_medkit_gateway::http::Accepted<ros2_medkit_gateway::http::NoContent>;
+using SeedAcceptedPair = std::pair<SeedAccepted, ros2_medkit_gateway::http::ResponseAttachments>;
+
+Result<ros2_medkit_gateway::http::NoContent> seed_body_less_handler(TypedRequest /*req*/) {
+  return ros2_medkit_gateway::http::NoContent{};
+}
+
+// The payload-free state-machine kick: 202 + Location, no request body at all.
+Result<SeedAcceptedPair> seed_kick_handler(TypedRequest req) {
+  ros2_medkit_gateway::http::ResponseAttachments att;
+  att.with_location(req.path() + "/status");
+  return SeedAcceptedPair{SeedAccepted{ros2_medkit_gateway::http::NoContent{}}, std::move(att)};
+}
+
+/// Plain body-less PUT - the overload whose callers parse a body by hand.
+RouteEntry & seed_body_less_put(RouteRegistry & reg, const std::string & path) {
+  std::function<Result<ros2_medkit_gateway::http::NoContent>(TypedRequest)> h = &seed_body_less_handler;
+  return reg.put<ros2_medkit_gateway::http::NoContent>(path, std::move(h));
+}
+
+/// Attachments body-less PUT - the overload reserved for payload-free routes.
+RouteEntry & seed_kick_put(RouteRegistry & reg, const std::string & path) {
+  std::function<Result<SeedAcceptedPair>(TypedRequest)> h = &seed_kick_handler;
+  return reg.put<SeedAccepted>(path, std::move(h));
+}
+
+RouteEntry & seed_body_less_post(RouteRegistry & reg, const std::string & path) {
+  std::function<Result<ros2_medkit_gateway::http::NoContent>(TypedRequest)> h = &seed_body_less_handler;
+  return reg.post<ros2_medkit_gateway::http::NoContent>(path, std::move(h));
+}
+
+bool has_error_mentioning(const RouteRegistry & reg, const std::string & needle) {
+  for (const auto & issue : reg.validate_completeness()) {
+    if (issue.severity == ValidationIssue::Severity::kError && issue.message.find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+TEST_F(RouteRegistryTest, PayloadFreePutIsNotAskedForARequestBody) {
+  // The attachments body-less PUT is the payload-free state-machine kick
+  // (/updates/{id}/prepare, the lifecycle transitions). Inferring "PUT
+  // therefore a request body" from the method reported 13 shipped routes that
+  // are correct as written, which is how a diagnostic channel gets ignored.
+  seed_kick_put(registry_, "/items/prepare").tag("Test").summary("Prepare");
+
+  EXPECT_FALSE(has_error_mentioning(registry_, "request body"));
+}
+
+TEST_F(RouteRegistryTest, PlainBodyLessPutIsStillAskedForARequestBody) {
+  // The plain body-less PUT is NOT the payload-free shape: its caller reads the
+  // body itself (PUT /{entity}/data/{data_id} parses free-form JSON by hand).
+  // Exempting it would blind the check for PUT to exactly the case kept covered
+  // for POST - a manual-body route that forgets `.request_body(...)`.
+  seed_body_less_put(registry_, "/items/value").tag("Test").summary("Write value");
+
+  EXPECT_TRUE(has_error_mentioning(registry_, "request body"));
+}
+
+TEST_F(RouteRegistryTest, PlainBodyLessPutIsSatisfiedByAManualDeclaration) {
+  // ...and declaring the body by hand, which is what the data route does, is
+  // what clears it. Without this the test above could be satisfied by a check
+  // that reports the route no matter what.
+  seed_body_less_put(registry_, "/items/value")
+      .tag("Test")
+      .summary("Write value")
+      .request_body("Free-form value", json{{"type", "object"}});
+
+  EXPECT_FALSE(has_error_mentioning(registry_, "request body"));
+}
+
+TEST_F(RouteRegistryTest, BodyLessPostIsStillAskedForARequestBody) {
+  // The body-less POST overload means the same thing: the handler parses a
+  // non-JSON body itself (form-urlencoded auth). A missing declaration there is
+  // a real gap in the document, so the check must stay.
+  seed_body_less_post(registry_, "/items/token").tag("Test").summary("Token");
+
+  EXPECT_TRUE(has_error_mentioning(registry_, "request body"));
+}
+
+TEST_F(RouteRegistryTest, TypedPutWithABodyIsStillSatisfiedAutomatically) {
+  // Guard against the exemption leaking to the overload that does parse a body:
+  // it declares its schema from TBody, so it must never be reported either.
+  std::function<Result<RouteRegistryTestSeedDto>(TypedRequest, RouteRegistryTestSeedDto)> h = &seed_post_handler;
+  registry_.put<RouteRegistryTestSeedDto, RouteRegistryTestSeedDto>("/items", std::move(h))
+      .tag("Test")
+      .summary("Replace item");
+
+  EXPECT_FALSE(has_error_mentioning(registry_, "request body"));
+  EXPECT_TRUE(registry_.to_openapi_paths()["/items"]["put"].contains("requestBody"));
+}

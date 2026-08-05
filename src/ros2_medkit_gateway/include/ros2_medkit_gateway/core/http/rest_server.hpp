@@ -95,6 +95,16 @@ class RESTServer {
 
  private:
   void setup_routes();
+
+  /// Log every issue `RouteRegistry::validate_completeness()` finds for the
+  /// route set this configuration assembled, plus an unconditional summary line
+  /// carrying the error and warning counts. Called once, after registration.
+  ///
+  /// Never fatal - an incomplete OpenAPI declaration is a documentation defect,
+  /// not a reason to refuse traffic. The summary is what the integration suite
+  /// asserts on, so the check is gated rather than merely logged.
+  void report_route_metadata_issues() const;
+
   void setup_pre_routing_handler();
   void setup_global_error_handlers();
 

@@ -252,14 +252,118 @@ class TestOpenApiContract(GatewayTestCase):
         self.assertEqual(mislabelled, [], f'mislabelled: {mislabelled}')
 
     def test_no_operation_declares_a_status_it_cannot_return(self):
-        """Multiple 2xx codes only where the handler returns a variant."""
+        """Multiple 2xx codes only where a second one is genuinely reachable.
+
+        Exactly two things make a second 2xx reachable, and each declares
+        itself: a handler returning a ``std::variant``
+        (``x-medkit-alternates``), and a range-capable download where the HTTP
+        layer answers 206 to a ``Range`` request
+        (``x-medkit-partial-content``). They are separate markers on purpose -
+        one marker covering both would wave through a route that declares a
+        status it can never return.
+        """
         offenders = []
         for path, method, op in self.operations():
             codes = {c for c in op.get('responses', {}) if c.startswith('2')}
-            if len(codes) < 2 or op.get('x-medkit-alternates'):
+            if len(codes) < 2:
+                continue
+            if op.get('x-medkit-alternates') or op.get('x-medkit-partial-content'):
                 continue
             offenders.append(f'{op.get("operationId")}: {sorted(codes)}')
         self.assertEqual(offenders, [], f'phantom success: {offenders}')
+
+    def test_partial_content_routes_declare_the_range_response(self):
+        """A route marked partial-content declares 206 with ``Content-Range``.
+
+        The marker is what lets the rule above accept a second 2xx, so it must
+        not be usable as a blanket exemption: whatever carries it has to
+        actually describe the partial response.
+        """
+        marked = []
+        for path, method, op in self.operations():
+            if not op.get('x-medkit-partial-content'):
+                continue
+            marked.append(f'{method.upper()} {path}')
+            partial = op.get('responses', {}).get('206')
+            self.assertIsNotNone(partial, f'{method.upper()} {path}: no 206 declared')
+            self.assertIn(
+                'Content-Range', partial.get('headers', {}),
+                f'{method.upper()} {path}: 206 without Content-Range')
+            full = op.get('responses', {}).get('200')
+            self.assertIsNotNone(full, f'{method.upper()} {path}: no 200 declared')
+            self.assertIn(
+                'Accept-Ranges', full.get('headers', {}),
+                f'{method.upper()} {path}: 200 without Accept-Ranges')
+        self.assertTrue(marked, 'No partial-content routes in the document')
+
+    def test_every_created_or_accepted_declares_location(self):
+        """Every 201/202 publishes the `Location` header the handler sets.
+
+        A 201 that does not name the resource it created, and a 202 that does
+        not name the resource whose status tracks the request, force a
+        generated client to guess the URI it was just handed. The gateway sets
+        `Location` on both; the document has to say so.
+        """
+        missing = []
+        checked = 0
+        for path, method, op in self.operations():
+            for code, resp in op.get('responses', {}).items():
+                if code not in ('201', '202'):
+                    continue
+                checked += 1
+                if 'Location' not in resp.get('headers', {}):
+                    missing.append(f'{op.get("operationId")}: {code}')
+        self.assertGreater(checked, 0, 'No 201/202 responses to check')
+        self.assertEqual(missing, [], f'no Location declared: {missing}')
+
+    def test_created_response_sends_the_location_it_declares(self):
+        """The declared `Location` reaches the wire, in the documented form.
+
+        Declaring the header is only half the contract - this drives a real
+        201 and asserts the header is present and is the absolute, prefixed
+        path form every `href` in the document uses.
+        """
+        op = self.spec()['paths']['/apps/{app_id}/triggers']['post']
+        self.assertIn('Location', op['responses']['201'].get('headers', {}))
+        resp = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/triggers',
+            json={
+                'resource': '/api/v1/apps/temp_sensor/faults',
+                'trigger_condition': {'condition_type': 'OnChange'},
+                'multishot': True,
+            },
+            timeout=10,
+        )
+        self.assertEqual(resp.status_code, 201, resp.text)
+        trigger_id = resp.json()['id']
+        self.addCleanup(
+            requests.delete,
+            f'{self.BASE_URL}/apps/temp_sensor/triggers/{trigger_id}',
+            timeout=10,
+        )
+        self.assertEqual(
+            resp.headers.get('Location'),
+            f'/api/v1/apps/temp_sensor/triggers/{trigger_id}',
+        )
+
+    def test_shipped_route_set_declares_complete_metadata(self, proc_output):
+        """The gateway's own route-metadata check finds nothing on this fixture.
+
+        `RouteRegistry::validate_completeness()` catches what the document
+        contract cannot see from the served JSON alone: `errors()` handed a
+        sub-400 status, `response_header()` aimed at a status no response
+        declares, a route registered without a tag or without a success schema.
+        The gateway runs it at start-up and logs a summary; without this
+        assertion that summary is a line nobody reads, which is the same defect
+        as collecting the issues and discarding them.
+
+        This fixture launches every optional feature gate, so the route set
+        under test is the maximal one - a route added behind any gate is
+        covered here.
+        """
+        # The `check: ` prefix is load-bearing - matching a bare `0 error(s)`
+        # would also match `10 error(s)` and pass on a broken route set.
+        proc_output.assertWaitFor('OpenAPI metadata check: 0 error(s)', timeout=20)
 
     def test_every_ref_resolves(self):
         """No $ref points at a component the document does not define."""
