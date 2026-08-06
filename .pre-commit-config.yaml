@@ -33,10 +33,11 @@ repos:
       - id: flake8
         name: flake8
         additional_dependencies:
-          # The five ament_flake8 declares as exec_depend on Jazzy, so a code
-          # that fails quality.yml also fails here. quotes, builtins and
-          # comprehensions were missing, which is how Q, A and C4 came to run
-          # in CI and nowhere locally.
+          # The five ament_flake8 declares as exec_depend on Jazzy, so code
+          # that fails quality.yml also fails here - though only for the
+          # files a commit touches; quality.yml lints the whole package.
+          # quotes, builtins and comprehensions were missing, which is how Q,
+          # A and C4 came to run in CI and nowhere locally.
           - flake8-builtins
           - flake8-comprehensions
           - flake8-docstrings
