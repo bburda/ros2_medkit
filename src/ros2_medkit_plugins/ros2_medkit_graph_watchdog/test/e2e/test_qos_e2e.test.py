@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""QoS-mismatch e2e: proves GRAPH_QOS_MISMATCH raises and clears through the REAL
-gateway + qos_mismatch_detector + fault_manager stack. This is the acceptance gate
-for its design issue.
+"""QoS-mismatch e2e: proves GRAPH_QOS_MISMATCH raises and clears through the REAL stack.
+
+The real stack is the gateway process, the qos_mismatch_detector, and the fault_manager. This
+is the acceptance gate for its design issue.
 
 Unlike test_qos_mismatch_integration.cpp (which drives the detector directly against
 a fake ReportFault service and a bare rclcpp::Node), this launches the REAL gateway
@@ -58,7 +59,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import (  # noqa: E402
+# I100 as well as E402: `harness` is only importable because of the sys.path line above, so this
+# import cannot be moved up to where the alphabetical order would put it.
+from harness import (  # noqa: E402, I100
     create_watchdog_test_launch,
     poll_cleared,
     poll_entity_faults,
@@ -109,7 +112,8 @@ class TestQosMismatchE2e(unittest.TestCase):
 
         cls._sub_node = Node('qos_e2e_sub')
         reliable_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-        cls._sub = cls._sub_node.create_subscription(String, TOPIC, lambda _msg: None, reliable_qos)
+        cls._sub = cls._sub_node.create_subscription(
+            String, TOPIC, lambda _msg: None, reliable_qos)
 
     @classmethod
     def tearDownClass(cls):

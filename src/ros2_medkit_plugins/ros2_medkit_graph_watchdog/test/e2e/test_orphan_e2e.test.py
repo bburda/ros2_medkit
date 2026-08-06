@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Orphan / topic-name-mismatch e2e: proves GRAPH_ORPHAN raises and clears through the
-REAL gateway + orphan_detector + fault_manager stack. This is the acceptance gate for
-its design issue.
+"""Orphan / topic-name-mismatch e2e: proves GRAPH_ORPHAN raises and clears through the REAL stack.
+
+The real stack is the gateway process, the orphan_detector, and the fault_manager. This is the
+acceptance gate for its design issue.
 
 Unlike test_orphan_integration.cpp (which drives the detector directly against a fake
 ReportFault service and a bare rclcpp::Node), this launches the REAL gateway process with
@@ -53,7 +54,9 @@ from rclpy.qos import QoSProfile
 from sensor_msgs.msg import LaserScan
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import create_watchdog_test_launch, poll_cleared, poll_faults  # noqa: E402
+# I100 as well as E402: `harness` is only importable because of the sys.path line above, so this
+# import cannot be moved up to where the alphabetical order would put it.
+from harness import create_watchdog_test_launch, poll_cleared, poll_faults  # noqa: E402, I100
 
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
 
@@ -106,15 +109,18 @@ def generate_test_description():
 
 
 class TestOrphanE2e(unittest.TestCase):
-    """GRAPH_ORPHAN raises on a real pub-only/sub-only topic-name near-miss pair, clears
-    once the typo publisher is destroyed."""
+    """GRAPH_ORPHAN raises on a real pub-only/sub-only topic-name near-miss pair.
+
+    Clears once the typo publisher is destroyed.
+    """
 
     @classmethod
     def setUpClass(cls):
         rclpy.init()
         cls._pub_node = Node('orphan_e2e_typo_pub')
         cls._pub = cls._pub_node.create_publisher(LaserScan, TYPO_TOPIC, QoSProfile(depth=10))
-        cls._ns_pub = cls._pub_node.create_publisher(LaserScan, NS_TYPO_TOPIC, QoSProfile(depth=10))
+        cls._ns_pub = cls._pub_node.create_publisher(
+            LaserScan, NS_TYPO_TOPIC, QoSProfile(depth=10))
 
         cls._sub_node = Node('orphan_e2e_target_sub')
         cls._sub = cls._sub_node.create_subscription(
