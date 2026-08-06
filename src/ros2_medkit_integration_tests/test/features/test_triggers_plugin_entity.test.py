@@ -24,21 +24,19 @@ must serve the plugin's enumeration route when there is no DataProvider.
 """
 
 import json
+import os
 import threading
 import time
 import unittest
 
+from ament_index_python.packages import get_package_prefix
 import launch_testing
 import launch_testing.actions
 import requests
 
-from ament_index_python.packages import get_package_prefix
-
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, API_BASE_PATH
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
-
-import os
 
 
 def _get_plugin_path():
