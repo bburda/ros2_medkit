@@ -88,6 +88,9 @@ jobs:
       - name: Handlers read query params via typed query<T>() (zero-query-params regression gate)
         run: ./src/ros2_medkit_gateway/scripts/check_handlers_typed_query.sh
 
+      - name: ccache report warns on the right states
+        run: ./scripts/test_ccache_report.sh
+
       - name: Show results
         if: always()
         run: colcon test-result --verbose
