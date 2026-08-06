@@ -139,8 +139,13 @@ if(BUILD_TESTING)
   # Lint the Python that makes up this package. Without this the whole package
   # sits outside `colcon test -L linter`, so the documented lint command passes
   # while none of these files are checked, and the pre-commit hooks are the
-  # first thing to see a problem. The rule set matches those hooks (see .flake8
-  # and .pre-commit-config.yaml) so the two never disagree.
+  # first thing to see a problem.
+  #
+  # Both gates read the same .flake8 (see CONFIG_FILE below) and the hook
+  # installs every plugin ament_flake8 depends on, so nothing this gate rejects
+  # can pass the hook. The hook additionally runs flake8-blind-except and
+  # flake8-class-newline, which ament_flake8 does not depend on - it is a
+  # superset, not a match.
   #
   # Only flake8 for now. ament_pep257 also belongs here, and every other package
   # that ships Python runs it, but this package drifted while it was unchecked:

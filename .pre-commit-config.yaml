@@ -33,11 +33,22 @@ repos:
       - id: flake8
         name: flake8
         additional_dependencies:
-          - flake8-blind-except
-          - flake8-class-newline
+          # The five ament_flake8 declares as exec_depend on Jazzy, so a code
+          # that fails quality.yml also fails here. quotes, builtins and
+          # comprehensions were missing, which is how Q, A and C4 came to run
+          # in CI and nowhere locally.
+          - flake8-builtins
+          - flake8-comprehensions
           - flake8-docstrings
           - flake8-import-order
-        # Config read from .flake8 (matches ament_flake8 defaults)
+          - flake8-quotes
+          # Local-only. ament_flake8 comments both out of its package.xml, so
+          # CI does not run them; keeping them here makes this hook a superset
+          # of CI rather than a match, which is the safe direction.
+          - flake8-blind-except
+          - flake8-class-newline
+        # Config read from .flake8, which is also what ament_flake8 reads (see
+        # the CONFIG_FILE argument in ros2_medkit_integration_tests).
 
   # ── General ────────────────────────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
