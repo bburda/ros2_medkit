@@ -118,14 +118,14 @@ class FakePluginContext : public RosPluginContext {
     return {};
   }
   LockAccessResult check_lock(const std::string &, const std::string &, const std::string &) const override {
-    return {true, "", ""};
+    return {true, "", "", ""};
   }
   tl::expected<LockInfo, LockError> acquire_lock(const std::string &, const std::string &,
                                                  const std::vector<std::string> &, int) override {
-    return tl::make_unexpected(LockError{"not supported", ""});
+    return tl::make_unexpected(LockError{"not supported", "", 409, std::nullopt});
   }
   tl::expected<void, LockError> release_lock(const std::string &, const std::string &) override {
-    return tl::make_unexpected(LockError{"not supported", ""});
+    return tl::make_unexpected(LockError{"not supported", "", 409, std::nullopt});
   }
   IntrospectionInput get_entity_snapshot() const override {
     return {};
