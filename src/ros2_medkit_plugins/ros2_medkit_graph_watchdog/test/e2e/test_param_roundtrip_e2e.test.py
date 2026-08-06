@@ -111,7 +111,9 @@ from rclpy.node import Node
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import create_watchdog_test_launch  # noqa: E402
+# I100 as well as E402: `harness` is only importable because of the sys.path line above, so this
+# import cannot be moved up to where the alphabetical order would put it.
+from harness import create_watchdog_test_launch  # noqa: E402, I100
 
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
 

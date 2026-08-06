@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Config-plumbing e2e: proves NESTED plugin config reaches a live detector
-through the REAL gateway.
+"""Config-plumbing e2e: proves NESTED plugin config reaches a live detector via the REAL gateway.
 
 A C++ unit test cannot prove this - it hand-builds already-nested JSON and
 calls a detector's configure() directly, bypassing the real config-delivery
@@ -64,7 +63,9 @@ import unittest
 import launch_testing
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import (  # noqa: E402
+# I100 as well as E402: `harness` is only importable because of the sys.path line above, so this
+# import cannot be moved up to where the alphabetical order would put it.
+from harness import (  # noqa: E402, I100
     create_watchdog_test_launch,
     poll_faults,
     wait_until_watchdog_armed,
