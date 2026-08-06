@@ -48,7 +48,17 @@ jobs:
                   # job that only runs on push to main. The quota was measured
                   # over the limit (10.54 GB active), so GitHub was evicting
                   # LRU, and the ccache entries the build jobs depend on were
-                  # what it evicted. mode=min keeps the final-stage layers,
-                  # which is what cache-from actually reuses here.
+                  # what it evicted.
+                  #
+                  # This is not free. The Dockerfile is two-stage and mode=min
+                  # exports only the layers of the final image, so builder-stage
+                  # layers are no longer restored at all. What that actually
+                  # costs is smaller than it sounds: the COPY src/ layers sit
+                  # above the rosdep+colcon RUN, so any push touching src/
+                  # already invalidated the build layer under mode=max too. The
+                  # layer genuinely lost across such a push is the build-deps
+                  # apt-get. Accepted: this job is not on the pull request path,
+                  # and the quota it was holding is what every pull request
+                  # needs.
                   cache-to: type=gha,mode=min,scope=${{ matrix.ros_distro }}
                   platforms: linux/amd64

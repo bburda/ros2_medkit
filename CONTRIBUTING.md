@@ -152,7 +152,9 @@ build.
 
 #### CI/CD
 
-All PRs are tested on Ubuntu 24.04 (Jazzy), where build and tests run in a single job, plus Humble and Lyrical. Linters and clang-tidy run in the Quality workflow. Coverage is uploaded to Codecov on push to main. All CI jobs use ccache.
+All PRs are tested on Ubuntu 24.04 (Jazzy), where build and tests run in a single job, plus Humble and Lyrical. Linters and clang-tidy run in the Quality workflow. Coverage is uploaded to Codecov on push to main. ccache is configured in the CI and Quality workflows and in the OPC-UA workflow's colcon jobs. The Pixi workflow and the Docker image builds compile the workspace without it, so a slow build there is expected rather than a cache problem.
+
+Every ccache-backed build step ends with `scripts/ccache_report.sh`, which writes the hit rate, cache size and cleanup count to the job summary. It raises a workflow warning in the two states that make a cache useless: cleanups above zero, meaning the cache evicted objects the same build was still producing and `CCACHE_MAXSIZE` is too small for it, and a hit rate under 50% with no cleanups, meaning the cache was never restored and the key or its `restore-keys` prefix is wrong. It never fails the step - a cold cache is a legitimate state.
 
 ### Pull Request Checklist
 
