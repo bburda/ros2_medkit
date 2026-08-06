@@ -170,6 +170,7 @@ jobs:
               -DENABLE_CLANG_TIDY=OFF \
             --event-handlers console_direct+
           ccache -s
+          ./scripts/ccache_report.sh jazzy-tidy
 
       - name: Merge compile databases
         run: |
@@ -233,10 +234,13 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
-      # Bind-mount the runner's large temp disk. The ASan+UBSan build tree is
-      # ~27 GB; GitHub-hosted runners ship either a 72 GB / (only ~20 GB free,
-      # too small) or a 145 GB / disk, so the job used to pass or fail purely
-      # on which runner it landed. /mnt always has ~60+ GB free.
+      # Bind-mount the runner's large temp disk. The ASan+UBSan build tree
+      # measured ~27 GB before the sanitizer module started passing -g1; the
+      # post -g1 size has not been measured on a real run yet, so treat that
+      # figure as an upper bound. GitHub-hosted runners ship either a 72 GB /
+      # (only ~20 GB free, too small) or a 145 GB / disk, so the job used to
+      # pass or fail purely on which runner it landed. /mnt always has ~60+ GB
+      # free, which keeps that true either way.
       volumes:
         - "/mnt:/mnt"
     # Cold-cache ASan builds are ~33 min; with the test budget a full run is
@@ -286,8 +290,9 @@ jobs:
 
       - name: Redirect heavy build output to /mnt
         run: |
-          # The ASan+UBSan RelWithDebInfo build tree is ~27 GB and does not fit
-          # the container overlay on small (72 GB) GitHub runners. Point the
+          # The ASan+UBSan RelWithDebInfo build tree measured ~27 GB before -g1
+          # and does not fit the container overlay on small (72 GB) GitHub
+          # runners even at a fraction of that size. Point the
           # colcon build base and the compiler's scratch files at the large
           # /mnt temp disk (bind-mounted above). install/ stays on the overlay:
           # with --symlink-install it is only symlinks plus small setup files.
@@ -314,12 +319,14 @@ jobs:
           # RelWithDebInfo (not Debug): Debug's -O0 roughly doubles binary size
           # vs -O1, and ASan/UBSan instrumentation inflates it further. The
           # sanitizer cmake module forces -O1 regardless, so the build type only
-          # affects debug-info size. The build tree lands on /mnt (redirect step
-          # above) so the ~27 GB of instrumented objects + DWARF fit.
+          # affects debug-info size - and the module now also forces -g1, which
+          # is what cut that. The build tree lands on /mnt (redirect step above)
+          # so the instrumented objects + DWARF fit whatever the current size.
           colcon build --symlink-install \
             --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSANITIZER=asan,ubsan \
             --event-handlers console_direct+
           ccache -s
+          ./scripts/ccache_report.sh jazzy-asan
           df -h / /mnt
 
       - name: Extend test timeouts for ASan overhead
@@ -443,6 +450,7 @@ jobs:
             --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSANITIZER=tsan \
             --event-handlers console_direct+
           ccache -s
+          ./scripts/ccache_report.sh jazzy-tsan
           df -h / /mnt
 
       - name: Extend test timeouts for TSan overhead

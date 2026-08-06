@@ -82,6 +82,7 @@ jobs:
             --cmake-args -DCMAKE_BUILD_TYPE=Release \
             --event-handlers console_direct+
           ccache -s
+          ./scripts/ccache_report.sh "${{ matrix.ros_distro }}"
 
       - name: Run unit and integration tests
         # The suite grew past the old 15-minute budget: on lyrical it was already taking
@@ -189,6 +190,7 @@ jobs:
             --cmake-args -DCMAKE_BUILD_TYPE=Release \
             --event-handlers console_direct+
           ccache -s
+          ./scripts/ccache_report.sh jazzy-test
 
       - name: Run unit and integration tests
         env:
@@ -225,6 +227,14 @@ jobs:
     # quality.yml's format-lint job via check_coverage_packages.sh --static-only.
     # What moves to main-only is the runtime half, which needs .gcda files and
     # therefore needs this job's build and test run.
+    #
+    # This was also the only PR job building without -DNDEBUG, so on its own it
+    # would have taken every assert() out of pull request builds - the other
+    # jobs are Release or RelWithDebInfo. ROS2MedkitSanitizers.cmake now passes
+    # -UNDEBUG, which puts the asserts back in the two sanitizer jobs. Those run
+    # ctest -LE linter per package, a superset of the selection here - they do
+    # not skip ros2_medkit_opcua - so the asserts are still exercised against
+    # unit and integration tests on every PR.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     container:
@@ -283,6 +293,7 @@ jobs:
             --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON \
             --event-handlers console_direct+
           ccache -s
+          ./scripts/ccache_report.sh coverage
 
       - name: Run unit and integration tests for coverage
         run: |

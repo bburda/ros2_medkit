@@ -84,13 +84,26 @@ GitHub Copilot code review is used in addition to human review.
 
 ### Continuous Integration [2.iv]
 
-All pull requests must pass CI before merging:
+Every pull request runs the following, and a failure in any of them blocks
+review:
 
-- **Build & Test job:** Full build + unit/integration tests on Ubuntu Noble / ROS 2 Jazzy, Ubuntu Jammy / ROS 2 Humble, and Ubuntu Resolute / ROS 2 Lyrical. Linter tests on Jazzy only
-- **Coverage job:** Debug build with coverage, run on pushes to `main`. Reports are archived as artifacts and uploaded to [Codecov](https://codecov.io/gh/selfpatch/ros2_medkit). Every pull request is gated on the static coverage-scope check in the Quality workflow, which fails if a package compiles production C++ without opting into coverage instrumentation
-- Linting enforced: `clang-format`, `clang-tidy` via `ament_lint_auto`
+- **Build & Test:** build + unit/integration tests on Ubuntu Noble / ROS 2 Jazzy, Ubuntu Jammy / ROS 2 Humble, and Ubuntu Resolute / ROS 2 Lyrical. `ros2_medkit_opcua` is excluded here and covered by its own workflow instead
+- **Quality:** `clang-format` and the other ament linters, the static coverage-scope check, which fails if a package compiles production C++ without opting into coverage instrumentation, and two source gates (`check_no_naked_subscriptions.sh`, `check_handlers_typed_query.sh`). Jazzy only
+- **clang-tidy:** on a pull request this is incremental - it analyses the `.cpp` and `.hpp` files the branch changed, and does not run at all when the branch changes none. The full sweep over the compilation database runs on pushes to `main`
+- **Sanitizers:** the unit and integration suites again under ASan + UBSan and under TSan, on Jazzy. Only packages that include the shared sanitizer module are instrumented; `ros2_medkit_fault_detection`, `ros2_medkit_sovd_service_interface` and the integration-test fixture executables are not
+- **Documentation:** Sphinx build with `-W` plus linkcheck, on any pull request touching `docs/`, `src/` or `scripts/`
+- **OPC-UA plugin:** the OpenPLC-based integration suite, on any pull request touching the plugin, the gateway plugin/provider headers or `ros2_medkit_msgs`
 
-CI configuration: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+Reported on pushes to `main`, not run on pull requests:
+
+- **Coverage:** Debug build with coverage instrumentation. Reports are archived as artifacts and uploaded to [Codecov](https://codecov.io/gh/selfpatch/ros2_medkit)
+
+Merging additionally requires one approving review. Branch rules enforce the
+review requirement and a linear history; the checks above are not configured as
+required status checks, so passing them is a review expectation rather than a
+mechanical block.
+
+CI configuration: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/quality.yml`](.github/workflows/quality.yml)
 
 ### Documentation Policy [2.v]
 
