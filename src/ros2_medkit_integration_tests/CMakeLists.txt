@@ -151,7 +151,11 @@ if(BUILD_TESTING)
   # ament_lint_common is deliberately not used either: it would also apply the
   # C++ style checks to the demo nodes, which is a separate decision.
   find_package(ament_cmake_flake8 REQUIRED)
-  ament_flake8()
+  # Without CONFIG_FILE, ament_flake8 reads the ini bundled inside the
+  # ament_flake8 package and the repository .flake8 never applies here. The two
+  # would then be hand-synced copies that drift in silence. Point it at the
+  # repository file so there is one configuration.
+  ament_flake8(CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.flake8")
 
   # Each integration test gets a unique HTTP port via GATEWAY_TEST_PORT env var,
   # allowing parallel CTest execution without port conflicts.
