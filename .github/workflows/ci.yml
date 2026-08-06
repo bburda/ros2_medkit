@@ -165,9 +165,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /root/.cache/ccache
-          key: ccache-jazzy-${{ github.sha }}
+          # ccache-jazzy-test-, not ccache-jazzy-. The shorter prefix also
+          # matches ccache-jazzy-asan-, -tsan-, -lint- and -tidy-, and
+          # restore-keys takes the most recently created match, so this job kept
+          # restoring whichever other Jazzy job finished last. It was measured
+          # loading the ASan cache: 2 GB of instrumented objects it cannot use,
+          # 10% hits, and then 219 cleanups as its own Release objects fought
+          # for the 500M ceiling on top of them.
+          key: ccache-jazzy-test-${{ github.sha }}
           restore-keys: |
-            ccache-jazzy-
+            ccache-jazzy-test-
 
       - name: Install dependencies
         run: |
