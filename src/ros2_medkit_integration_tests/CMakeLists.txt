@@ -142,14 +142,17 @@ if(BUILD_TESTING)
   # first thing to see a problem.
   #
   # Both gates read the same .flake8 (see CONFIG_FILE below) and the hook
-  # installs every plugin ament_flake8 depends on, so nothing this gate rejects
-  # can pass the hook. The hook additionally runs flake8-blind-except and
-  # flake8-class-newline, which ament_flake8 does not depend on - it is a
-  # superset, not a match.
+  # installs the same plugins ament_flake8 depends on, though CI installs
+  # those from apt while the hook's additional_dependencies are unpinned and
+  # resolve to whatever is current on PyPI - plugin coverage matches, exact
+  # plugin versions are not guaranteed to. The hook additionally runs
+  # flake8-blind-except and flake8-class-newline, which ament_flake8 does not
+  # depend on - it is a superset, not a match.
   #
-  # Only flake8 for now. ament_pep257 also belongs here, and every other package
-  # that ships Python runs it, but this package drifted while it was unchecked:
-  # 563 multi-line docstrings put the summary on the opening line, which the
+  # Only flake8 for now. ament_pep257 also belongs here - every package in
+  # the tree runs it except ros2_medkit_graph_watchdog, which excludes both
+  # flake8 and pep257 - but this package drifted while it was unchecked: 559
+  # multi-line docstrings put the summary on the opening line, which the
   # convention the rest of the tree follows does not. Adding the checker and
   # correcting those docstrings is its own change.
   #
