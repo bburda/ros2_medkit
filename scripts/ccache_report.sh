@@ -22,6 +22,12 @@
 # `ccache -s` and nothing ever read it, so a regression back into it would have
 # been silent - the job just gets slow again.
 #
+# ccache keeps its counters inside the cache directory, and actions/cache
+# restores that directory whole, counters included. Read without preparation
+# they are therefore the running total over every job that has fed this cache
+# entry, not what the build in front of you did. Every build step that calls
+# this runs `ccache -z` first so the numbers below describe that build alone.
+#
 # Usage: scripts/ccache_report.sh <label>
 #
 # Emits a one-line table row to $GITHUB_STEP_SUMMARY when running under Actions,

@@ -70,9 +70,12 @@ jobs:
           CCACHE_SLOPPINESS: pch_defines,time_macros
         run: |
           source /opt/ros/jazzy/setup.bash
+          ccache -z
           colcon build --symlink-install \
             --cmake-args -DCMAKE_BUILD_TYPE=Release \
             --event-handlers console_direct+
+          ccache -s
+          ./scripts/ccache_report.sh jazzy-lint
 
       - name: Run format linters
         run: |
@@ -167,6 +170,7 @@ jobs:
           CCACHE_SLOPPINESS: pch_defines,time_macros
         run: |
           source /opt/ros/jazzy/setup.bash
+          ccache -z
           colcon build --symlink-install \
             --cmake-args -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
@@ -325,6 +329,7 @@ jobs:
           # affects debug-info size - and the module now also forces -g1, which
           # is what cut that. The build tree lands on /mnt (redirect step above)
           # so the instrumented objects + DWARF fit whatever the current size.
+          ccache -z
           colcon build --symlink-install \
             --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSANITIZER=asan,ubsan \
             --event-handlers console_direct+
@@ -449,6 +454,7 @@ jobs:
           TMPDIR: /mnt/tsan/tmp
         run: |
           source /opt/ros/jazzy/setup.bash
+          ccache -z
           colcon build --symlink-install \
             --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSANITIZER=tsan \
             --event-handlers console_direct+
