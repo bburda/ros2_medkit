@@ -76,13 +76,31 @@ else
   hit_rate=0
 fi
 
-if [ "$max_kib" -gt 0 ]; then
+max_size=$(ccache --get-config max_size)
+
+# ccache 4.5, which is what the Humble runner's Ubuntu Jammy image ships, has no
+# max_cache_size_kibibyte in --print-stats. Without a fallback the fill would
+# read 0 there and the eviction warning could never fire on that job at all.
+# Derive it from the configured value instead, which every version prints,
+# accepting both spellings ("500.0M" and "500.0 MB"). ccache counts these in
+# powers of ten, verified against the machine-readable field: 500M reports
+# 488281 KiB and 1.5G reports 1464843.
+if [ "$max_kib" -le 0 ]; then
+  max_kib=$(awk -v s="$max_size" 'BEGIN {
+    if (match(s, /[0-9.]+/)) { n = substr(s, RSTART, RLENGTH) + 0 } else { print 0; exit }
+    unit = toupper(substr(s, RSTART + RLENGTH)); sub(/^ +/, "", unit)
+    if (unit ~ /^T/) { m = 1e12 } else if (unit ~ /^G/) { m = 1e9 }
+    else if (unit ~ /^M/) { m = 1e6 } else if (unit ~ /^K/) { m = 1e3 } else { m = 1 }
+    printf "%d", n * m / 1024
+  }')
+fi
+
+if [ "${max_kib:-0}" -gt 0 ]; then
   fill=$((size_kib * 100 / max_kib))
 else
   fill=0
 fi
 
-max_size=$(ccache --get-config max_size)
 size_gib=$(awk -v k="$size_kib" 'BEGIN { printf "%.2f", k / 1048576 }')
 
 echo "==> ccache ($LABEL): ${hit_rate}% hits (${hits}/${total}), ${size_gib} GiB of ${max_size} (${fill}% full), ${cleanups} cleanups"
@@ -108,7 +126,10 @@ fi
 # the cache was never restored - check the key and its restore-keys prefix - or
 # the branch changed something that invalidated the objects, such as a compiler
 # flag, in which case the next run recovers on its own.
-if [ "$total" -gt 0 ] && [ "$cleanups" -gt 0 ] && [ "$fill" -ge "$FULL_PCT" ]; then
+if [ "$total" -gt 0 ] && [ "$cleanups" -gt 0 ] && [ "$fill" -ge "$FULL_PCT" ] &&
+   [ "$hit_rate" -lt "$HIT_FLOOR" ]; then
+  echo "::warning title=ccache is full of another build's objects::$LABEL is ${fill}% full (${size_gib} GiB of ${max_size}) yet served only ${hit_rate}% of ${total} calls, and ran $cleanups cleanup(s) making room. A cache that is both full and useless was filled by something else: check that this job's restore-keys prefix cannot match another job's cache."
+elif [ "$total" -gt 0 ] && [ "$cleanups" -gt 0 ] && [ "$fill" -ge "$FULL_PCT" ]; then
   echo "::warning title=ccache evicted during the build::$LABEL ran $cleanups cleanup(s) while ${fill}% full (${size_gib} GiB of ${max_size}). The cache is discarding objects this same build produced, so CCACHE_MAXSIZE is too small for it or the Actions cache quota is evicting the entry."
 elif [ "$total" -gt 0 ] && [ "$hit_rate" -lt "$HIT_FLOOR" ]; then
   echo "::warning title=ccache hit rate below ${HIT_FLOOR}%::$LABEL served ${hit_rate}% of ${total} cacheable calls from cache while only ${fill}% full, so the ceiling is not the constraint. Either the cache was not restored - check the key and its restore-keys prefix - or this branch changed a compiler flag and invalidated the objects."
