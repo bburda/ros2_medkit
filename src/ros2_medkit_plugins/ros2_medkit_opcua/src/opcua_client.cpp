@@ -736,12 +736,12 @@ OpcuaClient::AccessLevelInfo OpcuaClient::read_access_level(const opcua::NodeId 
   try {
     opcua::Node node(impl_->client, variable_node);
     const opcua::Bitmask<opcua::AccessLevel> access = node.readAccessLevel();
-    info.access_level = static_cast<uint8_t>(access.get());
+    info.access_level = access.get();
     bool have_user = false;
     opcua::Bitmask<opcua::AccessLevel> user = access;
     try {
       user = node.readUserAccessLevel();
-      info.user_access_level = static_cast<uint8_t>(user.get());
+      info.user_access_level = user.get();
       have_user = true;
     } catch (const opcua::BadStatus &) {
       // Not every server exposes UserAccessLevel; fall back to AccessLevel.

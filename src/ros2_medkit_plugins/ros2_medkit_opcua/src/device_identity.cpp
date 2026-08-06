@@ -27,7 +27,8 @@ std::string slugify(const std::string & in) {
   std::string out;
   out.reserve(in.size());
   bool pending_sep = false;
-  for (unsigned char c : in) {
+  for (char ch : in) {
+    const unsigned char c = static_cast<unsigned char>(ch);
     if (std::isalnum(c)) {
       if (pending_sep && !out.empty()) {
         out += '_';

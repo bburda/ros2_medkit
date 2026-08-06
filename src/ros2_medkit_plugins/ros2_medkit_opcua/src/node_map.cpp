@@ -1092,7 +1092,8 @@ std::string slugify(const std::string & s) {
   std::string out;
   out.reserve(s.size());
   bool last_was_underscore = false;
-  for (unsigned char c : s) {
+  for (char ch : s) {
+    const unsigned char c = static_cast<unsigned char>(ch);
     if (std::isalnum(c) != 0) {
       out += static_cast<char>(std::toupper(c));
       last_was_underscore = false;
@@ -1113,7 +1114,8 @@ std::string slugify(const std::string & s) {
 // distinct conditions never share one.
 std::string short_hash_hex(const std::string & s) {
   uint32_t h = 2166136261u;
-  for (unsigned char c : s) {
+  for (char ch : s) {
+    const unsigned char c = static_cast<unsigned char>(ch);
     h ^= c;
     h *= 16777619u;
   }

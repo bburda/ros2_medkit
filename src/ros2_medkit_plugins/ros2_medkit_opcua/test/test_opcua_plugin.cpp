@@ -137,16 +137,16 @@ class FakePluginContext : public RosPluginContext {
   }
   LockAccessResult check_lock(const std::string & /*entity_id*/, const std::string & /*collection*/,
                               const std::string & /*client_id*/) const override {
-    return {true, "", ""};
+    return {true, "", "", ""};
   }
   tl::expected<LockInfo, LockError> acquire_lock(const std::string & /*entity_id*/, const std::string & /*collection*/,
                                                  const std::vector<std::string> & /*scopes*/,
                                                  int /*expiration_s*/) override {
-    return tl::make_unexpected(LockError{"not supported", ""});
+    return tl::make_unexpected(LockError{"not supported", "", 409, std::nullopt});
   }
   tl::expected<void, LockError> release_lock(const std::string & /*entity_id*/,
                                              const std::string & /*lock_id*/) override {
-    return tl::make_unexpected(LockError{"not supported", ""});
+    return tl::make_unexpected(LockError{"not supported", "", 409, std::nullopt});
   }
   IntrospectionInput get_entity_snapshot() const override {
     return {};
@@ -1089,7 +1089,9 @@ nodes:
         // Sink is ready, so each call pushes into pending_reports_ AND drains it
         // via flush_pending_reports() -> batch.swap(): worker threads race
         // push_back against swap on the shared buffer.
-        plugin.clear_fault("tank", "RACE_" + std::to_string(t) + "_" + std::to_string(i++ & 0x3f));
+        // The result is deliberately dropped: this test races the shared
+        // pending-report buffer, it does not assert on any single clear.
+        static_cast<void>(plugin.clear_fault("tank", "RACE_" + std::to_string(t) + "_" + std::to_string(i++ & 0x3f)));
       }
     });
   }
