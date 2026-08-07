@@ -101,15 +101,14 @@ if(BUILD_TESTING)
 
   find_package(ament_lint_auto REQUIRED)
   # uncrustify/cpplint conflict with project-wide clang-format (120 cols vs 100).
-  # flake8/pep257 are excluded here only. ros2_medkit_integration_tests, which
-  # holds every other launch test, now lints its Python too, so this package
-  # is the last one in the workspace still skipping these checks. copyright,
+  # flake8 now runs here too. Only pep257 stays excluded, deferred together
+  # with the same change in ros2_medkit_integration_tests - see that
+  # package's CMakeLists.txt for the docstring backlog behind it. copyright,
   # lint_cmake and xmllint stay on.
   list(APPEND AMENT_LINT_AUTO_EXCLUDE
     ament_cmake_uncrustify
     ament_cmake_cpplint
     ament_cmake_clang_format
-    ament_cmake_flake8
     ament_cmake_pep257
   )
   ament_lint_auto_find_test_dependencies()

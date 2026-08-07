@@ -84,7 +84,7 @@ RUN bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && \
     apt-get update && \
     rosdep update && \
     rosdep install --from-paths src --ignore-src -r -y \
-      --skip-keys='ament_cmake_clang_format ament_cmake_clang_tidy test_msgs sqlite3 libcpp-httplib-dev rosbag2_storage_mcap' && \
+      --skip-keys='ament_cmake_clang_format ament_cmake_clang_tidy ament_cmake_flake8 test_msgs sqlite3 libcpp-httplib-dev rosbag2_storage_mcap' && \
     rm -rf /var/lib/apt/lists/* && \
     colcon build --cmake-args -DBUILD_TESTING=OFF"
 
