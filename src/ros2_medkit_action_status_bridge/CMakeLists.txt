@@ -89,7 +89,8 @@ if(BUILD_TESTING)
   ros2_medkit_clang_tidy()
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 116 END 119)
+  medkit_init_test_domains(PACKAGE ros2_medkit_action_status_bridge)
+  medkit_add_domain_allocation_test()
 
   ament_add_gtest(test_action_status_bridge test/test_action_status_bridge.cpp)
   target_link_libraries(test_action_status_bridge action_status_bridge_lib)

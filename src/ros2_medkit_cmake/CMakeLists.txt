@@ -31,6 +31,14 @@ install(
   DESTINATION share/${PROJECT_NAME}/cmake
 )
 
+# Installed next to the modules, not in a scripts/ directory of its own, so
+# ROS2MedkitTestDomain.cmake can find it from CMAKE_CURRENT_LIST_DIR under both
+# a plain install and a --symlink-install.
+install(
+  PROGRAMS scripts/check_test_domains.py
+  DESTINATION share/${PROJECT_NAME}/cmake
+)
+
 # Install .clang-tidy config alongside the cmake modules so
 # ROS2MedkitLinting.cmake can find it via CMAKE_CURRENT_LIST_DIR.
 # Conditional: in colcon workspace the file exists at ../../.clang-tidy;
@@ -38,6 +46,16 @@ install(
 set(_CLANG_TIDY_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-tidy")
 if(EXISTS "${_CLANG_TIDY_SRC}")
   install(FILES "${_CLANG_TIDY_SRC}" DESTINATION share/${PROJECT_NAME}/cmake)
+endif()
+
+if(BUILD_TESTING)
+  # Lints scripts/check_test_domains.py. Without this the script sits outside
+  # `colcon test -L linter` even though ROS2MedkitTestDomain.cmake registers it
+  # as a test_dds_domain_allocation command for every package with a pool.
+  find_package(ament_cmake_flake8 REQUIRED)
+  # Without CONFIG_FILE, ament_flake8 reads the ini bundled inside the
+  # ament_flake8 package and the repository .flake8 never applies here.
+  ament_flake8(CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.flake8")
 endif()
 
 ament_package(

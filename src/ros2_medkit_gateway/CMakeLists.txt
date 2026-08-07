@@ -330,7 +330,8 @@ if(BUILD_TESTING)
   )
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 30 END 74)
+  medkit_init_test_domains(PACKAGE ros2_medkit_gateway)
+  medkit_add_domain_allocation_test()
 
   # ─── Core purity check ────────────────────────────────────────────────────
   # Fails the build if any file under include/ros2_medkit_gateway/core/ or
@@ -962,7 +963,8 @@ if(BUILD_TESTING)
   medkit_target_dependencies(test_plugin_abi_conformance ament_index_cpp)
 
   # Log manager tests
-  # Dedicated ROS_DOMAIN_ID to prevent cross-talk with concurrent integration tests
+  # Takes a ROS_DOMAIN_ID from the package pool to prevent cross-talk with concurrent
+  # integration tests
   ament_add_gtest(test_log_manager test/test_log_manager.cpp)
   target_link_libraries(test_log_manager gateway_ros2)
   medkit_set_test_domain(test_log_manager)

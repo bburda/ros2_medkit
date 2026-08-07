@@ -135,6 +135,57 @@ through `add_compile_options`, which CMake places after
 Do not move these into `CMAKE_CXX_FLAGS`, where the build type's flags would
 come last and win instead.
 
+### ROS2MedkitTestDomain
+
+Hands every test that creates a ROS 2 node a `ROS_DOMAIN_ID`, drawn from a per-package pool
+defined in `MEDKIT_DOMAIN_TABLE` in the module itself. The table is the single source of
+truth: a package names itself and gets its pool, so a range cannot drift between the module
+and a `CMakeLists.txt`.
+
+```cmake
+include(ROS2MedkitTestDomain)
+medkit_init_test_domains(PACKAGE ros2_medkit_gateway)
+medkit_add_domain_allocation_test()
+
+ament_add_gtest(test_foo test/test_foo.cpp)
+medkit_set_test_domain(test_foo)
+
+medkit_add_launch_test(test_bar test/test_bar.test.py TIMEOUT 90)
+```
+
+Only domains **1-100 and 215-231** are usable. RTPS gives a domain the UDP slice
+`[7400 + 250 * d, 7400 + 250 * d + 249]`, and the kernel hands out ephemeral ports from
+`net.ipv4.ip_local_port_range` (32768-60999 by default), which covers domains 101-214. If an
+unrelated process is given one of those ports first, the node dies at startup with
+`failed to bind to ANY:<port>: address in use` and every case in the file fails at once.
+Domain 0 stays free because it is the ROS 2 default a developer shell uses, and 232 is
+dropped because its slice runs past 65535.
+
+That leaves fewer domains than the workspace has tests, so pools are reused. Reuse is safe
+because `medkit_set_test_domain` also puts a `medkit_dds_domain_<id>` `RESOURCE_LOCK` on the
+test, and CTest never runs two tests holding one lock at the same time - which matters,
+because `scripts/test.sh` runs `ctest -j $(nproc)`. Cross-package isolation comes from the
+pools being disjoint, since a lock does not reach across CTest runs.
+
+Both properties are appended, so a caller adding its own environment entries or locks must
+use `set_property(TEST ... APPEND PROPERTY ...)`. A plain
+`set_tests_properties(... PROPERTIES ENVIRONMENT ...)` afterwards silently drops the domain.
+
+Two checks keep the scheme honest rather than documented:
+
+- at configure time the module validates the whole table - every domain outside the
+  ephemeral range, every pool disjoint from every other - reading the range from
+  `/proc/sys/net/ipv4/ip_local_port_range` and widening it to at least the Linux default,
+  so a host with a narrow range cannot bless an allocation that breaks on a stock machine;
+- `medkit_add_domain_allocation_test()` registers `test_dds_domain_allocation`, which runs on
+  the machine that *tests*. It reads back the generated CTest properties and fails if a test
+  runs on a domain outside its pool, on a domain inside that machine's live ephemeral range,
+  or without its domain lock.
+
+`medkit_reserve_test_domain(<domain_var> <lock_var>)` is for tests that must build their own
+`ENVIRONMENT` string, and `medkit_secondary_test_domains(<var>)` returns the shared pool for
+tests that hold more than one domain at once.
+
 ## Usage
 
 In your package's `CMakeLists.txt`, before the first target:

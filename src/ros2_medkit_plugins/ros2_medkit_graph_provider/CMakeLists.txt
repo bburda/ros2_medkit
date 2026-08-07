@@ -96,7 +96,8 @@ if(BUILD_TESTING)
   unset(_gw_vendored)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 120 END 129)
+  medkit_init_test_domains(PACKAGE ros2_medkit_graph_provider)
+  medkit_add_domain_allocation_test()
 
   ament_add_gtest(test_graph_provider_plugin
     test/test_graph_provider_plugin.cpp

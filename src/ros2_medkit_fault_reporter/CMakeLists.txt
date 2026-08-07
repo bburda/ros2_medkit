@@ -81,7 +81,8 @@ if(BUILD_TESTING)
   ros2_medkit_clang_tidy()
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 110 END 112)
+  medkit_init_test_domains(PACKAGE ros2_medkit_fault_reporter)
+  medkit_add_domain_allocation_test()
 
   # Unit tests
   ament_add_gtest(test_local_filter test/test_local_filter.cpp)

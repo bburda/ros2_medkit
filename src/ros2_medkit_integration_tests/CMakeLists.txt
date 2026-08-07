@@ -168,22 +168,20 @@ if(BUILD_TESTING)
   # Each integration test gets a unique HTTP port via GATEWAY_TEST_PORT env var,
   # allowing parallel CTest execution without port conflicts.
   # Stride of 10 per test so multi-gateway tests can use get_test_port(offset).
-  # Each test also gets a unique ROS_DOMAIN_ID to prevent DDS cross-contamination
-  # between tests (e.g., stale DDS participants from previous tests leaking into
-  # subsequent test's graph discovery). Multi-gateway tests (e.g. peer aggregation)
-  # use get_test_domain_id(offset) for additional domains in the 230-232 range.
   set(_INTEG_PORT 9100)
 
   include(ROS2MedkitTestDomain)
-  # Primary per-test domain pool 130-219, with 220-229 owned by opcua and
-  # 230-232 reserved for the multi-gateway secondary pool (see
-  # get_test_domain_id below). One domain is consumed per feature + scenario
-  # test. This pool grows by glob, so it is the first to fill; when it does,
-  # reclaim slack from the fixed beacon pools (see ROS2MedkitTestDomain.cmake).
-  # The tests below call add_launch_test directly instead of the
-  # medkit_add_launch_test wrapper because each needs a combined
-  # GATEWAY_TEST_PORT + ROS_DOMAIN_ID environment, assigned inline in the loop.
-  medkit_init_test_domains(START 130 END 219)
+  # This package holds more tests than the safe DDS band has domains, so
+  # medkit_set_test_domain wraps around its pool and two tests can end up on the
+  # same domain. That is safe because the same call also puts the domain's
+  # RESOURCE_LOCK on the test, and CTest never runs two tests holding one lock at
+  # the same time - a stale participant from an earlier test cannot leak into a
+  # later one's graph discovery, because the earlier one has finished.
+  # Multi-gateway tests take their EXTRA domains from the shared secondary pool,
+  # passed down as MEDKIT_SECONDARY_DOMAINS so the numbers live in one place.
+  medkit_init_test_domains(PACKAGE ros2_medkit_integration_tests)
+  medkit_add_domain_allocation_test()
+  medkit_secondary_test_domains(_INTEG_SECONDARY_DOMAINS)
 
   # Feature tests (atomic, independent, 120s timeout)
   file(GLOB FEATURE_TESTS test/features/*.test.py)
@@ -195,9 +193,9 @@ if(BUILD_TESTING)
     )
     set_tests_properties(${test_name} PROPERTIES
       LABELS "integration;feature"
-      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT};ROS_DOMAIN_ID=${_MEDKIT_DOMAIN_COUNTER}"
+      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT};MEDKIT_SECONDARY_DOMAINS=${_INTEG_SECONDARY_DOMAINS}"
     )
-    math(EXPR _MEDKIT_DOMAIN_COUNTER "${_MEDKIT_DOMAIN_COUNTER} + 1")
+    medkit_set_test_domain(${test_name})
     math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
   endforeach()
 
@@ -211,29 +209,26 @@ if(BUILD_TESTING)
     )
     set_tests_properties(${test_name} PROPERTIES
       LABELS "integration;scenario"
-      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT};ROS_DOMAIN_ID=${_MEDKIT_DOMAIN_COUNTER}"
+      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT};MEDKIT_SECONDARY_DOMAINS=${_INTEG_SECONDARY_DOMAINS}"
     )
-    math(EXPR _MEDKIT_DOMAIN_COUNTER "${_MEDKIT_DOMAIN_COUNTER} + 1")
+    medkit_set_test_domain(${test_name})
     math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
   endforeach()
 
-  # Verify domain range not exhausted
-  if(_MEDKIT_DOMAIN_COUNTER GREATER _MEDKIT_DOMAIN_END)
-    message(FATAL_ERROR "Integration test domain range exhausted (${_MEDKIT_DOMAIN_START}-${_MEDKIT_DOMAIN_END})")
-  endif()
-
-  # Serialise multi-gateway tests that share the secondary DDS domain pool
-  # (230-232, see ros2_medkit_test_utils.constants.get_test_domain_id). CTest
-  # will not run two tests holding this resource lock concurrently, so they
-  # cannot collide on those shared domains. Every integration test that
-  # calls get_test_domain_id(offset>0) must be listed here.
-  set_tests_properties(
+  # Serialise multi-gateway tests that share the secondary DDS domain pool (see
+  # ros2_medkit_test_utils.constants.get_test_domain_id). CTest will not run two
+  # tests holding this resource lock concurrently, so they cannot collide on
+  # those shared domains. Every integration test that calls
+  # get_test_domain_id(offset>0) must be listed here. APPEND, because each of
+  # these already carries its own primary domain's lock.
+  foreach(_multi_gateway_test
     test_peer_aggregation
     test_cross_ecu_fanout
     test_daisy_chain_aggregation
-    test_leaf_collision_aggregation
-    PROPERTIES RESOURCE_LOCK medkit_secondary_dds_domains
-  )
+    test_leaf_collision_aggregation)
+    set_property(TEST ${_multi_gateway_test} APPEND PROPERTY
+      RESOURCE_LOCK medkit_secondary_dds_domains)
+  endforeach()
 
   # test_graph_provider_greenwave drives a real greenwave_monitor node,
   # which only publishes /diagnostics at ~1 Hz with the first useful

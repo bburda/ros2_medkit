@@ -92,12 +92,14 @@ install(TARGETS ros2_medkit_graph_watchdog LIBRARY DESTINATION lib/${PROJECT_NAM
 
 if(BUILD_TESTING)
   include(ROS2MedkitTestDomain)
-  # This package owns 75-89. The gtests below take one domain each through the shared macro,
-  # so the allocation table cannot drift from the literals and exhaustion is a configure
-  # error rather than a silent collision. The launch tests cannot use it: it writes
-  # ENVIRONMENT wholesale and they also need GATEWAY_TEST_PORT and the plugin path, so they
-  # keep an explicit assignment and share one domain under a RESOURCE_LOCK.
-  medkit_init_test_domains(START 75 END 89)
+  # The pool comes from the table in ROS2MedkitTestDomain.cmake, so no range literal lives
+  # here to drift. The gtests below take one domain each through medkit_set_test_domain.
+  # The launch tests need GATEWAY_TEST_PORT and the plugin path in the same ENVIRONMENT, so
+  # they reserve one shared domain up front and pass its id and lock by variable - still no
+  # literal, and still one slot rather than seven.
+  medkit_init_test_domains(PACKAGE ros2_medkit_graph_watchdog)
+  medkit_add_domain_allocation_test()
+  medkit_reserve_test_domain(_WATCHDOG_E2E_DOMAIN _WATCHDOG_E2E_LOCK)
 
   find_package(ament_lint_auto REQUIRED)
   # uncrustify/cpplint conflict with project-wide clang-format (120 cols vs 100).
@@ -239,7 +241,11 @@ if(BUILD_TESTING)
     ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs std_msgs sensor_msgs)
   target_link_libraries(test_orphan_integration nlohmann_json::nlohmann_json)
   medkit_set_test_domain(test_orphan_integration)
-  set_tests_properties(test_orphan_integration PROPERTIES TIMEOUT 120 RESOURCE_LOCK graph_watchdog_integration_domain)
+  # APPEND, not set_tests_properties: medkit_set_test_domain already put this test's own
+  # domain lock on it, and a plain PROPERTIES assignment would drop that.
+  set_tests_properties(test_orphan_integration PROPERTIES TIMEOUT 120)
+  set_property(TEST test_orphan_integration APPEND PROPERTY
+    RESOURCE_LOCK graph_watchdog_integration_domain)
 
   ament_add_gtest(test_param_drift_integration
     test/test_param_drift_integration.cpp
@@ -259,8 +265,9 @@ if(BUILD_TESTING)
   # of those costs real seconds that no budget knob can compress away. A timeout the suite can
   # outgrow kills the process before gtest prints which case failed, which is the one thing a
   # timeout must never do to a diagnostic suite.
-  set_tests_properties(test_param_drift_integration PROPERTIES
-    TIMEOUT 300 RESOURCE_LOCK graph_watchdog_integration_domain)
+  set_tests_properties(test_param_drift_integration PROPERTIES TIMEOUT 300)
+  set_property(TEST test_param_drift_integration APPEND PROPERTY
+    RESOURCE_LOCK graph_watchdog_integration_domain)
 
   # === QoS-mismatch e2e (launch_testing) ===
   #
@@ -272,20 +279,24 @@ if(BUILD_TESTING)
   # GRAPH_WATCHDOG_PLUGIN_PATH (see harness.py's graph_watchdog_plugin_path()).
   find_package(launch_testing_ament_cmake REQUIRED)
   set(_WATCHDOG_E2E_SO "$<TARGET_FILE:ros2_medkit_graph_watchdog>")
+  # The part of the environment every e2e launch below shares: the reserved domain and the
+  # plugin under test. Kept in a variable so each ENVIRONMENT line stays readable.
+  set(_WATCHDOG_E2E_ENV
+    "ROS_DOMAIN_ID=${_WATCHDOG_E2E_DOMAIN};GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}")
 
   add_launch_test(test/e2e/test_qos_e2e.test.py TIMEOUT 180)
   set_tests_properties(test_e2e_test_qos_e2e.test.py PROPERTIES
     LABELS "integration;e2e"
     # Shares the e2e domain and its lock rather than consuming another slot.
-    ENVIRONMENT "GATEWAY_TEST_PORT=19120;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
-    RESOURCE_LOCK graph_watchdog_e2e_domain)
+    ENVIRONMENT "GATEWAY_TEST_PORT=19120;${_WATCHDOG_E2E_ENV}"
+    RESOURCE_LOCK ${_WATCHDOG_E2E_LOCK})
 
   add_launch_test(test/e2e/test_orphan_e2e.test.py TIMEOUT 180)
   set_tests_properties(test_e2e_test_orphan_e2e.test.py PROPERTIES
     LABELS "integration;e2e"
     # Shares the e2e domain and its lock rather than consuming another slot.
-    ENVIRONMENT "GATEWAY_TEST_PORT=19130;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
-    RESOURCE_LOCK graph_watchdog_e2e_domain)
+    ENVIRONMENT "GATEWAY_TEST_PORT=19130;${_WATCHDOG_E2E_ENV}"
+    RESOURCE_LOCK ${_WATCHDOG_E2E_LOCK})
 
   # param_drift e2e: the detector's DEFAULT mode. The config-plumbing scenarios below all set
   # baseline: false and none of them asserts a clear, so without this the self-capturing behaviour
@@ -298,8 +309,8 @@ if(BUILD_TESTING)
   add_launch_test(test/e2e/test_param_drift_e2e.test.py TIMEOUT 300)
   set_tests_properties(test_e2e_test_param_drift_e2e.test.py PROPERTIES
     LABELS "integration;e2e"
-    ENVIRONMENT "GATEWAY_TEST_PORT=19170;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
-    RESOURCE_LOCK graph_watchdog_e2e_domain)
+    ENVIRONMENT "GATEWAY_TEST_PORT=19170;${_WATCHDOG_E2E_ENV}"
+    RESOURCE_LOCK ${_WATCHDOG_E2E_LOCK})
 
   # Round-trip cost e2e: what ONE parameter read really costs the node that serves it, counted
   # at a node that answers the parameter services by hand. param_drift's read budget is charged
@@ -316,8 +327,8 @@ if(BUILD_TESTING)
   add_launch_test(test/e2e/test_param_roundtrip_e2e.test.py TIMEOUT 300)
   set_tests_properties(test_e2e_test_param_roundtrip_e2e.test.py PROPERTIES
     LABELS "integration;e2e"
-    ENVIRONMENT "GATEWAY_TEST_PORT=19180;ROS_DOMAIN_ID=89;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
-    RESOURCE_LOCK graph_watchdog_e2e_domain)
+    ENVIRONMENT "GATEWAY_TEST_PORT=19180;${_WATCHDOG_E2E_ENV}"
+    RESOURCE_LOCK ${_WATCHDOG_E2E_LOCK})
 
   # === Config-plumbing e2e (launch_testing) ===
   #
@@ -335,16 +346,16 @@ if(BUILD_TESTING)
     TIMEOUT 180)
   set_tests_properties(test_config_plumbing_e2e_positive PROPERTIES
     LABELS "integration;e2e"
-    ENVIRONMENT "GATEWAY_TEST_PORT=19140;ROS_DOMAIN_ID=89;WATCHDOG_E2E_SCENARIO=positive;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
-    RESOURCE_LOCK graph_watchdog_e2e_domain)
+    ENVIRONMENT "GATEWAY_TEST_PORT=19140;WATCHDOG_E2E_SCENARIO=positive;${_WATCHDOG_E2E_ENV}"
+    RESOURCE_LOCK ${_WATCHDOG_E2E_LOCK})
 
   add_launch_test(test/e2e/test_config_plumbing_e2e.test.py
     TARGET test_config_plumbing_e2e_mode_off
     TIMEOUT 180)
   set_tests_properties(test_config_plumbing_e2e_mode_off PROPERTIES
     LABELS "integration;e2e"
-    ENVIRONMENT "GATEWAY_TEST_PORT=19150;ROS_DOMAIN_ID=89;WATCHDOG_E2E_SCENARIO=mode_off;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
-    RESOURCE_LOCK graph_watchdog_e2e_domain)
+    ENVIRONMENT "GATEWAY_TEST_PORT=19150;WATCHDOG_E2E_SCENARIO=mode_off;${_WATCHDOG_E2E_ENV}"
+    RESOURCE_LOCK ${_WATCHDOG_E2E_LOCK})
 
   # Third launch: `mode: off` written BARE, which the ROS parser types as a YAML 1.1 boolean
   # rather than a string. That is the form operators write, and a string-only reader silently
@@ -355,8 +366,8 @@ if(BUILD_TESTING)
   set_tests_properties(test_config_plumbing_e2e_mode_off_yaml_bool PROPERTIES
     LABELS "integration;e2e"
     ENVIRONMENT
-      "GATEWAY_TEST_PORT=19160;ROS_DOMAIN_ID=89;WATCHDOG_E2E_SCENARIO=mode_off_yaml_bool;GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}"
-    RESOURCE_LOCK graph_watchdog_e2e_domain)
+      "GATEWAY_TEST_PORT=19160;WATCHDOG_E2E_SCENARIO=mode_off_yaml_bool;${_WATCHDOG_E2E_ENV}"
+    RESOURCE_LOCK ${_WATCHDOG_E2E_LOCK})
 
   ros2_medkit_relax_vendor_warnings()
 

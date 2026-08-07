@@ -177,7 +177,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 220 END 229)
+  medkit_init_test_domains(PACKAGE ros2_medkit_opcua)
+  medkit_add_domain_allocation_test()
 
   # Each test connects to a non-existent OPC UA host and waits ~3.8s for the
   # DNS / TCP failure path; with 13 tests in the suite the run requires ~90s.
