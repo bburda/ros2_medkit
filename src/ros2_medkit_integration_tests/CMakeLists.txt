@@ -150,8 +150,8 @@ if(BUILD_TESTING)
   # depend on - it is a superset, not a match.
   #
   # Only flake8 for now. ament_pep257 also belongs here - every package in
-  # the tree runs it except ros2_medkit_graph_watchdog, which excludes both
-  # flake8 and pep257 - but this package drifted while it was unchecked: 559
+  # the tree runs it except ros2_medkit_graph_watchdog, which excludes
+  # pep257 - but this package drifted while it was unchecked: 559
   # multi-line docstrings put the summary on the opening line, which the
   # convention the rest of the tree follows does not. Adding the checker and
   # correcting those docstrings is its own change.
