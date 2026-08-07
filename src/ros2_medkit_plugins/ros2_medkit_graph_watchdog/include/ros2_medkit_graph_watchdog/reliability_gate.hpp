@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -40,6 +41,12 @@ class ReliabilityGate {
   /// Feed a fresh introspection snapshot at `tick`: updates per-entity warmup,
   /// lifecycle tracking, and the global bringup marker.
   void update(const ros2_medkit_gateway::IntrospectionInput & snapshot, uint64_t tick);
+
+  /// Drain the LifecycleWatcher's pending ~/transition_event callbacks (see
+  /// LifecycleWatcher::pump_events). Nothing else runs those subscriptions, so the tick
+  /// thread has to poll this between ticks; it MUST be the same thread that calls
+  /// update().
+  void pump_lifecycle_events(std::chrono::nanoseconds budget);
 
   /// True if `source_id` is allowed to raise a fault: known entities must be armed
   /// and lifecycle-ok; unknown entities fall back to the global warmup window.

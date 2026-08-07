@@ -4,7 +4,10 @@ Gateway plugin that detects silent faults in the ROS 2 graph: failures where eve
 node is up, nothing logs an error, and the robot is still broken.
 
 Detectors read the graph and raise faults through a `ReportFault` service client on the
-gateway node; the faults surface via FaultManager on the gateway `/faults` API.
+gateway node; the faults surface via FaultManager on the gateway `/faults` API. That
+client, like the lifecycle subscriptions below, lives in the plugin's own callback group
+and is driven by the plugin's own executor from the tick thread, never by the gateway's
+ROS executor.
 
 This package carries the plugin skeleton, the central reliability gate that holds raises
 until the graph has quiesced, and three detectors, `qos_mismatch`, `orphan` and
@@ -612,7 +615,10 @@ bringup-quiesce centrally so no individual detector has to reimplement it.
   discovery is briefly re-seeded, so an `active` transition lost during the
   subscription's endpoint-matching window self-heals instead of suppressing the
   node forever. Seeds are bounded per tick so a batch bringup cannot stall the
-  tick loop. Non-managed nodes are never gated.
+  tick loop. Those `~/transition_event` subscriptions are kept out of the
+  gateway's ROS executor (own callback group, own single-threaded executor that
+  the plugin's tick thread drains between ticks), so they are only ever created,
+  run and destroyed on that one thread. Non-managed nodes are never gated.
 - **Clock validity.** `ctx.clock->time_is_valid()` flags a paused or absent
   `/clock` (e.g. a bag pauses or a sim crashes under `use_sim_time`). This is
   **detector-consulted, not centrally enforced**: a time-based detector

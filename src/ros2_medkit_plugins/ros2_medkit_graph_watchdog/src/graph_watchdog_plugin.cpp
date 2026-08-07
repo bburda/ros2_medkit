@@ -21,6 +21,17 @@
 #include <utility>
 #include <vector>
 
+// rclcpp's create_client() does not spell its QoS parameter the same way on every distro
+// this package builds for: Humble takes only rmw_qos_profile_t, Lyrical and Rolling take
+// only rclcpp::QoS, and Jazzy takes both but marks the rmw_qos_profile_t overload
+// deprecated. Humble's rclcpp ships no <rclcpp/version.h> at all, so the absence of that
+// header is what identifies Humble below.
+#if defined(__has_include)
+#if __has_include(<rclcpp/version.h>)
+#include <rclcpp/version.h>
+#endif
+#endif
+
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_graph_watchdog/aggregated_fault.hpp"  // kGraphWatchdogEntityId
 #include "ros2_medkit_graph_watchdog/detector_config.hpp"
@@ -34,6 +45,34 @@ namespace {
 // namespace, not reachable from here) - kept in sync by convention since this is only a
 // fallback used when config carries no explicit "detectors.node_death.miss_grace".
 constexpr int kDefaultNodeDeathMissGrace = 2;
+
+/// How often the tick thread comes back to drain the plugin's private executors while it
+/// waits out the tick interval. Both the lifecycle watcher's ~/transition_event
+/// subscriptions and the fault client are deliberately kept out of every gateway executor
+/// (see lifecycle_watcher.hpp and set_context() below), so this poll is the ONLY thing
+/// that runs them. Draining once per tick instead would delay every transition by up to a
+/// full tick interval (1 s by default) and let a bringup burst overrun the subscription's
+/// KeepLast(10) queue, losing the intermediate transitions the watcher's saw_transition /
+/// errorprocessing logic reads.
+constexpr std::chrono::milliseconds kPrivateDrainInterval{20};
+
+/// Wall-clock cap on a single drain of one private executor. spin_some() never blocks
+/// waiting for work, so this only bounds a pathological burst of already-queued work; it
+/// exists so a flood cannot push the next tick out indefinitely.
+constexpr std::chrono::milliseconds kPrivateDrainBudget{5};
+
+/// create_client() with an explicit callback group, spelled the way each supported distro
+/// wants it (see the <rclcpp/version.h> note above). Jazzy is rclcpp 28, Lyrical 32+;
+/// anything older only offers the rmw_qos_profile_t form, where it is not deprecated.
+template <typename ServiceT>
+typename rclcpp::Client<ServiceT>::SharedPtr create_client_in_group(rclcpp::Node * node, const std::string & name,
+                                                                    const rclcpp::CallbackGroup::SharedPtr & group) {
+#if defined(RCLCPP_VERSION_MAJOR) && RCLCPP_VERSION_MAJOR >= 28
+  return node->create_client<ServiceT>(name, rclcpp::ServicesQoS(), group);
+#else
+  return node->create_client<ServiceT>(name, rmw_qos_profile_services_default, group);
+#endif
+}
 }  // namespace
 
 ros2_medkit_gateway::IntrospectionResult
@@ -172,7 +211,31 @@ void GraphWatchdogPlugin::set_context(ros2_medkit_gateway::PluginContext & conte
   // owns its miss_grace default) has not run yet at this point.
   const int departed_retention_ticks = compute_departed_retention_ticks(config_snapshot);
   gate_ = std::make_unique<ReliabilityGate>(warmup_cycles_, node, &node_mutex_, departed_retention_ticks);
-  fault_client_ = node->create_client<ros2_medkit_msgs::srv::ReportFault>("/fault_manager/report_fault");
+
+  // The fault client gets the same treatment as the lifecycle subscriptions: its own
+  // callback group, automatic executor registration disabled, added only to a private
+  // executor this plugin pumps from the tick thread. rclcpp::AnyExecutable holds a strong
+  // reference to the CLIENT it dispatches just as it does for a subscription, and it is a
+  // local of the executor thread, so a client left in the node's default group can have
+  // its last reference released - and ~Client run, mutating the node's entity registry -
+  // on a gateway executor thread at an arbitrary moment. Creating it under node_mutex_
+  // and never handing it to a gateway executor is what keeps every reference to it on
+  // this plugin's own threads.
+  //
+  // The client is used strictly fire-and-forget (see DetectorContext::raise_fault: it
+  // guards on service_is_ready() and discards the future), so nothing consumes the
+  // responses - but rclcpp keeps per-request state until an executor processes the
+  // response, so the private executor MUST still be drained or pending_requests_ grows for
+  // the life of the process. That drain is wait_for_next_tick()'s second job.
+  {
+    std::lock_guard<std::mutex> node_lock(node_mutex_);
+    fault_client_group_ = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive,
+                                                      /*automatically_add_to_executor_with_node=*/false);
+    fault_executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+    fault_executor_->add_callback_group(fault_client_group_, node->get_node_base_interface());
+    fault_client_ = create_client_in_group<ros2_medkit_msgs::srv::ReportFault>(node, "/fault_manager/report_fault",
+                                                                               fault_client_group_);
+  }
 
   std::set<std::string> seen_ids;
   for (auto & detector : DetectorRegistry::instance().create_all()) {
@@ -265,10 +328,7 @@ void GraphWatchdogPlugin::set_context(ros2_medkit_gateway::PluginContext & conte
 void GraphWatchdogPlugin::run_tick_loop() {
   while (!shutdown_requested_.load()) {
     tick();
-    std::unique_lock<std::mutex> lock(tick_cv_mutex_);
-    tick_cv_.wait_for(lock, std::chrono::milliseconds(tick_interval_ms_), [this] {
-      return shutdown_requested_.load();
-    });
+    wait_for_next_tick();
   }
   // Announce that no more ticks (and so no more rcl reads) will run. The pre-shutdown callback
   // waits on this so the context is not invalidated while a tick is mid-flight.
@@ -277,6 +337,52 @@ void GraphWatchdogPlugin::run_tick_loop() {
     tick_loop_exited_ = true;
   }
   tick_cv_.notify_all();
+}
+
+void GraphWatchdogPlugin::drain_private_executors() {
+  // Each drain is guarded separately: an escape here would unwind out of the thread
+  // function and std::terminate the gateway (the same reason tick() catches the gate
+  // update), and a throw from one executor must not cost the other its drain.
+  try {
+    if (gate_) {
+      gate_->pump_lifecycle_events(kPrivateDrainBudget);
+    }
+  } catch (const std::exception & e) {
+    log_error("graph_watchdog lifecycle pump threw: " + std::string(e.what()));
+  }
+  try {
+    if (fault_executor_) {
+      fault_executor_->spin_some(kPrivateDrainBudget);
+    }
+  } catch (const std::exception & e) {
+    log_error("graph_watchdog fault-response pump threw: " + std::string(e.what()));
+  }
+}
+
+void GraphWatchdogPlugin::wait_for_next_tick() {
+  // The gap between two ticks is not dead time any more. The lifecycle watcher's
+  // ~/transition_event subscriptions and the fault client both sit in callback groups that
+  // no gateway executor collects, so the tick thread - the only thread allowed anywhere
+  // near them - has to run them itself. Poll instead of sleeping the whole interval in one
+  // go: otherwise a transition event sits unread for a full tick, and every fault reported
+  // during a tick keeps its pending-request entry until the next one.
+  //
+  // The condition variable still owns the sleeping, so shutdown latency is unchanged: a
+  // shutdown request wakes the wait immediately and both loop conditions re-test it.
+  const auto next_tick = std::chrono::steady_clock::now() + std::chrono::milliseconds(tick_interval_ms_);
+  while (!shutdown_requested_.load()) {
+    drain_private_executors();
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_tick) {
+      return;
+    }
+    const auto slice = std::min(std::chrono::duration_cast<std::chrono::nanoseconds>(next_tick - now),
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(kPrivateDrainInterval));
+    std::unique_lock<std::mutex> lock(tick_cv_mutex_);
+    tick_cv_.wait_for(lock, slice, [this] {
+      return shutdown_requested_.load();
+    });
+  }
 }
 
 void GraphWatchdogPlugin::tick() {
@@ -359,13 +465,34 @@ void GraphWatchdogPlugin::shutdown() {
   }
   // Fence the get_routes() status handler (the only other member reader) against teardown.
   std::lock_guard<std::mutex> lock(tick_mutex_);
+  // Detectors first: each tick hands them a copy of fault_client_ in a DetectorContext, so
+  // clearing them makes sure no detector-held copy outlives the reset below.
   detectors_.clear();
-  fault_client_.reset();
+  {
+    // Destroy the private executor BEFORE the client, for the same reason
+    // LifecycleWatcher::reset() destroys its own executor before clearing the
+    // subscriptions: while the executor lives it can hold its own strong reference to the
+    // client, so resetting our handle alone would not necessarily release the last one and
+    // ~Client would run at some later, less obvious point. Doing both here, under
+    // node_mutex_, keeps the destruction on this thread and ordered against the entity
+    // creation this plugin does on the same node. The scope matters: gate_->reset() below
+    // takes node_mutex_ itself, and std::mutex is not recursive.
+    std::lock_guard<std::mutex> node_lock(node_mutex_);
+    fault_executor_.reset();
+    fault_client_.reset();
+    fault_client_group_.reset();
+  }
   clock_.reset();
   if (gate_) {
     gate_->reset();
   }
   gate_.reset();
+}
+
+std::size_t GraphWatchdogPlugin::prune_pending_fault_requests_for_test() {
+  // rclcpp guards pending_requests_ with its own mutex, so this is safe to call while the
+  // tick thread is sending.
+  return fault_client_ ? fault_client_->prune_pending_requests() : 0u;
 }
 
 std::vector<GraphWatchdogPlugin::PluginRoute> GraphWatchdogPlugin::get_routes() {

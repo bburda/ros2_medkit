@@ -93,6 +93,29 @@ ros2_medkit_gateway::IntrospectionInput managed_nodes_snapshot(const std::vector
   }
   return in;
 }
+
+constexpr auto kPumpBudget = std::chrono::milliseconds(100);
+
+// Publish `msg` and pump the watcher until `id`'s cached label becomes `label`, or the
+// retry budget runs out. Two reasons this is a retry loop and not a single publish:
+// a volatile publisher only delivers to a subscription that has finished DDS endpoint
+// matching, and the watcher's subscriptions are in a callback group NO node-wide executor
+// collects - pump_events() is the only thing that runs them, exactly as the plugin's tick
+// thread does in production.
+bool publish_until_label(ros2_medkit_graph_watchdog::LifecycleWatcher & w,
+                         const rclcpp::Publisher<lifecycle_msgs::msg::TransitionEvent>::SharedPtr & pub,
+                         const lifecycle_msgs::msg::TransitionEvent & msg, const std::string & id,
+                         const std::string & label) {
+  for (int i = 0; i < 100; ++i) {
+    pub->publish(msg);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    w.pump_events(kPumpBudget);
+    if (w.state_of(id).value_or("") == label) {
+      return true;
+    }
+  }
+  return false;
+}
 }  // namespace
 
 // Exercises the REAL mechanism (not the set_state_for_test shim): update() discovers a
@@ -115,24 +138,10 @@ TEST_F(LifecycleWatcherTest, UpdateSubscribesAndCallbackUpdatesState) {
   ASSERT_TRUE(w.state_of(id).has_value());  // now tracked
   EXPECT_TRUE(w.node_ok(id));               // empty seed -> ungated
 
-  rclcpp::executors::SingleThreadedExecutor exec;
-  exec.add_node(node_);
-  std::thread spin([&exec]() {
-    exec.spin();
-  });
-
-  // Drive an "inactive" transition. Retry because a volatile publisher only delivers to a
-  // subscription that has finished endpoint matching.
+  // Drive an "inactive" transition.
   lifecycle_msgs::msg::TransitionEvent msg;
   msg.goal_state.label = "inactive";
-  bool flipped = false;
-  for (int i = 0; i < 100 && !flipped; ++i) {
-    pub->publish(msg);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    flipped = (w.state_of(id).value_or("") == "inactive");
-  }
-  exec.cancel();
-  spin.join();
+  const bool flipped = publish_until_label(w, pub, msg, id, "inactive");
 
   EXPECT_TRUE(flipped);         // callback wrote the label from the live message
   EXPECT_FALSE(w.node_ok(id));  // known non-active -> gated
@@ -155,25 +164,11 @@ TEST_F(LifecycleWatcherTest, DepartureThroughErrorProcessingIsRecordedAsErrorTer
   w.update(managed_node_snapshot(id), /*tick=*/1);
   ASSERT_TRUE(w.state_of(id).has_value());
 
-  rclcpp::executors::SingleThreadedExecutor exec;
-  exec.add_node(node_);
-  std::thread spin([&exec]() {
-    exec.spin();
-  });
-
   // errorprocessing -> finalized is the ON_ERROR_FAILURE / ON_ERROR_ERROR edge.
   lifecycle_msgs::msg::TransitionEvent msg;
   msg.start_state.label = "errorprocessing";
   msg.goal_state.label = "finalized";
-  bool arrived = false;
-  for (int i = 0; i < 100 && !arrived; ++i) {
-    pub->publish(msg);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    arrived = (w.state_of(id).value_or("") == "finalized");
-  }
-  exec.cancel();
-  spin.join();
-  ASSERT_TRUE(arrived);
+  ASSERT_TRUE(publish_until_label(w, pub, msg, id, "finalized"));
 
   w.update(ros2_medkit_gateway::IntrospectionInput{}, /*tick=*/2);
   const auto departed = w.departed_state_of(id);
@@ -194,30 +189,107 @@ TEST_F(LifecycleWatcherTest, OrdinaryShutdownDepartureIsNotErrorTerminated) {
   w.update(managed_node_snapshot(id), /*tick=*/1);
   ASSERT_TRUE(w.state_of(id).has_value());
 
-  rclcpp::executors::SingleThreadedExecutor exec;
-  exec.add_node(node_);
-  std::thread spin([&exec]() {
-    exec.spin();
-  });
-
   lifecycle_msgs::msg::TransitionEvent msg;
   msg.start_state.label = "shuttingdown";
   msg.goal_state.label = "finalized";
-  bool arrived = false;
-  for (int i = 0; i < 100 && !arrived; ++i) {
-    pub->publish(msg);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    arrived = (w.state_of(id).value_or("") == "finalized");
-  }
-  exec.cancel();
-  spin.join();
-  ASSERT_TRUE(arrived);
+  ASSERT_TRUE(publish_until_label(w, pub, msg, id, "finalized"));
 
   w.update(ros2_medkit_gateway::IntrospectionInput{}, /*tick=*/2);
   const auto departed = w.departed_state_of(id);
   ASSERT_TRUE(departed.has_value());
   EXPECT_TRUE(departed->saw_transition);
   EXPECT_FALSE(departed->error_terminated);
+}
+
+// The structural property the private callback group exists for: an executor that has the
+// gateway node added must never collect these subscriptions. If it did, rclcpp's
+// AnyExecutable (a local of the executor thread, holding a STRONG ref to the subscription
+// it dispatches) would routinely release the last reference on an executor thread, running
+// ~Subscription - which mutates the node's rcl entity registry - concurrently with the
+// tick thread's create_subscription on the same node. No lock in this class can reach an
+// executor thread, so keeping the subscriptions out of every gateway executor is the fix,
+// and this test is what fails if the callback-group wiring is ever dropped.
+TEST_F(LifecycleWatcherTest, NodeWideExecutorNeverRunsTheLifecycleCallbacks) {
+  const std::string id = "/detached_group";
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+  auto pub = node_->create_publisher<lifecycle_msgs::msg::TransitionEvent>(
+      id + "/transition_event", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+
+  w.update(managed_node_snapshot(id), /*tick=*/1);
+  ASSERT_TRUE(w.state_of(id).has_value());
+
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(node_);
+  std::thread spin([&exec]() {
+    exec.spin();
+  });
+
+  // Wait for endpoint matching first: without it, "no callback ran" would prove nothing
+  // (the messages would simply never have reached the subscription).
+  bool matched = false;
+  for (int i = 0; i < 100 && !matched; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    matched = pub->get_subscription_count() > 0;
+  }
+  ASSERT_TRUE(matched) << "the watcher's subscription never matched; the rest is vacuous";
+
+  lifecycle_msgs::msg::TransitionEvent msg;
+  msg.goal_state.label = "inactive";
+  for (int i = 0; i < 5; ++i) {
+    pub->publish(msg);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  EXPECT_EQ(w.state_of(id).value_or("<untracked>"), "")
+      << "an executor spinning the gateway node executed a lifecycle callback: the subscription is back "
+         "in the gateway's executor, where an executor thread can run ~Subscription against a concurrent "
+         "create_subscription";
+
+  exec.cancel();
+  spin.join();
+
+  // The messages WERE delivered - KeepLast(10) is holding them - so the watcher's own
+  // pump must now produce them without a single further publish. That is what separates
+  // "the callbacks are correctly detached" from "delivery is simply broken".
+  bool arrived = false;
+  for (int i = 0; i < 40 && !arrived; ++i) {
+    w.pump_events(kPumpBudget);
+    arrived = (w.state_of(id).value_or("") == "inactive");
+    if (!arrived) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  }
+  EXPECT_TRUE(arrived) << "pump_events() must deliver the events the node-wide executor left queued";
+}
+
+// Steady state is not enough: in production nodes appear mid-run, so a subscription is
+// routinely added to a private executor that has ALREADY been pumped and has a built
+// entity collection. If that addition does not make the executor re-collect, the second
+// node's transitions are silently never delivered while the first node's keep working -
+// a failure mode no single-node test can see.
+TEST_F(LifecycleWatcherTest, NodeDiscoveredAfterTheFirstPumpStillGetsItsEvents) {
+  const std::string first = "/lc_first";
+  const std::string late = "/lc_late";
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+  auto first_pub = node_->create_publisher<lifecycle_msgs::msg::TransitionEvent>(
+      first + "/transition_event", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+
+  w.update(managed_node_snapshot(first), /*tick=*/1);
+  lifecycle_msgs::msg::TransitionEvent inactive;
+  inactive.goal_state.label = "inactive";
+  ASSERT_TRUE(publish_until_label(w, first_pub, inactive, first, "inactive"))
+      << "the first node's events must arrive before this test can say anything about a later one";
+
+  // A second managed node shows up on a later tick, long after the executor was primed.
+  auto late_pub = node_->create_publisher<lifecycle_msgs::msg::TransitionEvent>(
+      late + "/transition_event", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+  w.update(managed_nodes_snapshot({first, late}), /*tick=*/2);
+  ASSERT_TRUE(w.state_of(late).has_value()) << late << " must be tracked after the second update";
+
+  lifecycle_msgs::msg::TransitionEvent active;
+  active.goal_state.label = "active";
+  EXPECT_TRUE(publish_until_label(w, late_pub, active, late, "active"))
+      << "a subscription added to an already-pumped private executor never got collected";
+  EXPECT_EQ(w.state_of(first).value_or(""), "inactive") << "the first node's cached label must survive";
 }
 
 // The self-heal budget must be charged for reads that HAPPENED, not for jobs that were

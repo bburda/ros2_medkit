@@ -15,8 +15,32 @@ Structure
 - **Plugin shell** (``GraphWatchdogPlugin``): loads via the gateway plugin ABI
   (v7). In ``set_context`` it casts the context with ``as_ros_plugin_context``,
   creates one ``rclcpp::Client<ReportFault>`` on the gateway node, and starts a
-  tick wall timer on that node. No child node, no extra executor/thread - the
-  gateway spins its own node.
+  dedicated tick thread. The tick is deliberately NOT a gateway wall timer:
+  detectors do blocking parameter/service reads, and the gateway's small
+  executor is only safe because blocking never runs on an executor thread. No
+  child node.
+
+  Every ROS entity the plugin owns - the fault client here and the
+  ``LifecycleWatcher``'s ``~/transition_event`` subscriptions below - is created
+  in a callback group of its own with
+  ``automatically_add_to_executor_with_node = false``, and added only to a
+  private ``SingleThreadedExecutor`` that the tick thread pumps between ticks.
+  Neither executor is ever spun on a thread of its own. The reason is the same in
+  both cases and is a correctness requirement, not tuning:
+  ``rclcpp::AnyExecutable`` holds a strong reference to the subscription or
+  client it dispatches and is a local of the executor thread, so an entity left
+  in the node's default group can have its last reference released - and its
+  destructor run, mutating the node's rcl entity registry - on a gateway executor
+  thread, concurrently with this plugin creating an entity on the same node. No
+  lock the plugin holds can reach a gateway executor thread, so the fix is to
+  keep the entities out of every gateway executor; that puts creation,
+  destruction and callback execution on the tick thread alone.
+
+  For the fault client the drain is load-bearing for a second reason:
+  ``DetectorContext::raise_fault`` is fire-and-forget (it guards on
+  ``service_is_ready()`` and discards the future), and rclcpp keeps per-request
+  state until an executor processes the response, so an unpumped client would
+  leak one pending entry per raised fault for the life of the process.
 - **Detector pattern**: ``Detector`` + ``DetectorContext``; each detector is one
   self-registering file under ``src/detectors/`` (``REGISTER_DETECTOR``), globbed
   by CMake so parallel authors never edit a shared file. A detector's source
@@ -55,6 +79,15 @@ Reliability core
     state, so a callback in flight during teardown bails instead of touching
     freed memory. Non-managed nodes are never gated - ``node_ok`` returns true
     for them unconditionally.
+
+    Those subscriptions follow the private-callback-group rule described in the
+    plugin shell bullet above: created on the shared gateway node, but in the
+    watcher's own group and pumped only by the watcher's own executor, so they
+    are created, run and destroyed on the tick thread alone. This is also why the
+    tick thread drains in short slices rather than once per tick - a transition
+    would otherwise be delayed by up to a whole tick interval, and a bringup
+    burst could overrun the subscription's queue and lose the intermediate
+    transitions the departure classification reads.
 - **Central enforcement.** ``DetectorContext::raise_fault`` runs every raise
   through ``reliability_allows(gate, source_id)`` before the fault client
   sends anything; a detector raising about a still-warming-up entity or a

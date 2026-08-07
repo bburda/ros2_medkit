@@ -55,6 +55,13 @@ void ReliabilityGate::update(const ros2_medkit_gateway::IntrospectionInput & sna
   last_tick_ = tick;
 }
 
+void ReliabilityGate::pump_lifecycle_events(std::chrono::nanoseconds budget) {
+  // Deliberately NOT under gate_mutex_, for the same reason lifecycle_.update() is not:
+  // this executes subscription callbacks that take the watcher's own state mutex, and
+  // holding gate_mutex_ across them would park the status handler behind them.
+  lifecycle_.pump_events(budget);
+}
+
 bool ReliabilityGate::allows_raise(const std::string & source_id) const {
   if (warmup_.is_known(source_id)) {
     return warmup_.is_armed(source_id, last_tick_) && lifecycle_.node_ok(source_id);

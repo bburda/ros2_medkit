@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -50,6 +51,21 @@ struct DepartedLifecycle {
 /// Tracks managed lifecycle nodes and caches their state label ("active" etc.),
 /// seeded via GetState and kept fresh via ~/transition_event. Non-managed nodes are
 /// never tracked (node_ok returns true for them).
+///
+/// Threading contract - this is what makes the ~/transition_event subscriptions safe to
+/// create and destroy on a live gateway node. The subscriptions are created on the shared
+/// gateway node but placed in a callback group of this watcher's own, created with
+/// `automatically_add_to_executor_with_node = false` and added ONLY to the private
+/// executor below. No gateway executor ever collects them, so no gateway executor thread
+/// can ever hold a reference to one, and `~Subscription` (which mutates the node's rcl
+/// entity registry, the same structure `create_subscription` mutates) can only run on the
+/// thread that owns this watcher.
+///
+/// Concretely, `update()` and `pump_events()` MUST be called from one and the same thread
+/// (the plugin's tick thread), and `reset()`/the destructor MUST NOT run while either is
+/// in flight (the plugin joins its tick thread before tearing the gate down). The const
+/// readers - node_ok(), state_of(), departed_state_of() - are the only members safe to
+/// call from another thread; they take the shared-state mutex and touch no ROS entity.
 class LifecycleWatcher {
  public:
   LifecycleWatcher(rclcpp::Node * gateway_node, std::mutex * node_mutex,
@@ -67,6 +83,15 @@ class LifecycleWatcher {
   /// entries from it.
   void update(const ros2_medkit_gateway::IntrospectionInput & snapshot, std::uint64_t tick);
 
+  /// Execute the ~/transition_event callbacks that are already pending, for at most
+  /// `budget` of wall clock. Nothing else runs these subscriptions (see the class note),
+  /// so the owner has to call this or transition events never land - and calling it once
+  /// per tick would delay every event by up to a full tick interval and let a bringup
+  /// burst overrun the subscription queue. The plugin therefore polls it while it waits
+  /// for the next tick. MUST be called from the same thread as update(); it never blocks
+  /// waiting for work, so `budget` only caps a pathological burst.
+  void pump_events(std::chrono::nanoseconds budget);
+
   bool node_ok(const std::string & app_id) const;  // true if untracked or "active"
   std::optional<std::string> state_of(const std::string & app_id) const;
   /// Last cached lifecycle label of a node that WAS tracked but is no longer present in
@@ -76,7 +101,10 @@ class LifecycleWatcher {
   /// retention. Does NOT return a still-present node's state - node_death only ever
   /// queries fqns already absent from the graph.
   std::optional<DepartedLifecycle> departed_state_of(const std::string & fqn) const;
-  void reset();  // drop all subscriptions (shutdown)
+  /// Shutdown: tear down the private executor and drop every subscription. Callers must
+  /// have stopped update()/pump_events() first (see the class note); the destructor calls
+  /// it too, and it is idempotent.
+  void reset();
 
   void set_state_for_test(const std::string & app_id, const std::string & label);
   /// Test-only: how much of the bounded GetState self-heal budget a tracked node has left.
@@ -112,10 +140,10 @@ class LifecycleWatcher {
   /// Everything the volatile ~/transition_event callback touches lives behind this
   /// shared_ptr. The callback captures a weak_ptr (never a raw `this`): a callback that
   /// races teardown either locked first (keeping this alive for its duration) or finds
-  /// lock() empty and bails, so it never dereferences a destroyed mutex/map. The
-  /// executor holds its own strong ref to an already-dispatched Subscription, so
-  /// dropping the sub from `tracked` does not cancel a callback already in flight - the
-  /// weak_ptr guard is what makes that in-flight callback safe.
+  /// lock() empty and bails, so it never dereferences a destroyed mutex/map. The private
+  /// executor runs those callbacks on the same thread that calls update(), so a callback
+  /// cannot actually be in flight while an entry is erased - the weak_ptr guard is kept
+  /// as the standing defence for the shared state, not as the fix for the entity race.
   struct SharedState {
     std::mutex mutex;
     std::unordered_map<std::string, Tracked> tracked;  // key = App::id
@@ -131,6 +159,13 @@ class LifecycleWatcher {
   std::shared_ptr<ros2_medkit_gateway::Ros2LifecycleStateReader> reader_;
   std::shared_ptr<SharedState> state_;
   int retention_ticks_;
+  /// The lifecycle subscriptions' own callback group, created with automatic executor
+  /// registration DISABLED so no executor the gateway node is added to ever collects
+  /// them - that is what keeps every reference to them on this watcher's own thread.
+  rclcpp::CallbackGroup::SharedPtr lifecycle_group_;
+  /// The only executor that group is ever added to. Declared last so it is torn down
+  /// before the group (and, in a reset()-less path, before `state_`'s subscriptions).
+  std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> lifecycle_executor_;
 };
 
 }  // namespace ros2_medkit_graph_watchdog
