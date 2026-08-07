@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>
 
+#include <lifecycle_msgs/msg/transition_event.hpp>
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
 
@@ -32,6 +33,7 @@
 #include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 #include "ros2_medkit_graph_watchdog/aggregated_fault.hpp"
 #include "ros2_medkit_graph_watchdog/detector_registry.hpp"
+#include "ros2_medkit_graph_watchdog/graph_fault_codes.hpp"
 #include "ros2_medkit_graph_watchdog/graph_watchdog_plugin.hpp"
 
 // The plugin's extern "C" exports (graph_watchdog_plugin_exports.cpp) are compiled
@@ -100,7 +102,22 @@ class ConfigCapturingDetector : public ros2_medkit_graph_watchdog::Detector {
   }
 };
 
+// Raises one fault per tick through the PLUGIN's own fault client, so a test can observe
+// what actually leaves the process and what the client is left holding afterwards. Harmless
+// in every other test in this binary: raise_fault() bails on !service_is_ready() when no
+// ReportFault server exists, which is the case everywhere except the test that starts one.
+class RaisingDetector : public ros2_medkit_graph_watchdog::Detector {
+ public:
+  std::string id() const override {
+    return "raising";
+  }
+  void tick(ros2_medkit_graph_watchdog::DetectorContext & ctx) override {
+    ctx.raise_fault(ros2_medkit_graph_watchdog::graph_fault_codes::kOrphan, 2, "fault client probe", "/watched_app");
+  }
+};
+
 REGISTER_DETECTOR(CountingDetector, "counting")
+REGISTER_DETECTOR(RaisingDetector, "raising")
 REGISTER_DETECTOR(ThrowingDetector, "throwing")
 REGISTER_DETECTOR(OffDetector, "offd")
 REGISTER_DETECTOR(ConfigCapturingDetector, "capturing")
@@ -206,6 +223,31 @@ class FakeContextWithApp : public FakeContext {
     ros2_medkit_gateway::IntrospectionInput input;
     ros2_medkit_gateway::App app;
     app.id = "/watched_app";
+    input.apps.push_back(app);
+    return input;
+  }
+};
+
+// Reports one MANAGED lifecycle node: GetState + ChangeState services, the exact shape
+// LifecycleWatcher keys on. Nothing answers that GetState, so the blocking seed times out
+// to an empty label and a live ~/transition_event is the only thing that can ever set it.
+class FakeContextWithManagedApp : public FakeContext {
+ public:
+  using FakeContext::FakeContext;
+  ros2_medkit_gateway::IntrospectionInput get_entity_snapshot() const override {
+    ros2_medkit_gateway::ServiceInfo get_state;
+    get_state.full_path = "/managed_app/get_state";
+    get_state.type = "lifecycle_msgs/srv/GetState";
+    ros2_medkit_gateway::ServiceInfo change_state;
+    change_state.full_path = "/managed_app/change_state";
+    change_state.type = "lifecycle_msgs/srv/ChangeState";
+
+    ros2_medkit_gateway::App app;
+    app.id = "/managed_app";
+    app.bound_fqn = "/managed_app";
+    app.services = {get_state, change_state};
+
+    ros2_medkit_gateway::IntrospectionInput input;
     input.apps.push_back(app);
     return input;
   }
@@ -454,6 +496,135 @@ TEST_F(GraphWatchdogPluginTest, WatchdogStatusRouteReportsEntityLifecycleAndArme
   EXPECT_EQ(entity["state"], "armed");
   EXPECT_TRUE(entity["armed"].get<bool>());
   EXPECT_TRUE(entity.contains("lifecycle"));  // untracked (non-lifecycle) node -> null, but key present
+
+  EXPECT_NO_THROW(plugin.shutdown());
+  exec.cancel();
+  spin.join();
+}
+
+// The plugin's own fault client, end to end against a REAL ReportFault server. Two
+// separate claims, and the test would be worth little without both:
+//
+//  1. Requests still leave the process now that the client is out of the node's default
+//     callback group. A stub client can only show that a request was constructed; a real
+//     service callback firing is what shows it was actually sent.
+//  2. The responses nobody reads are still drained. raise_fault() is fire-and-forget - it
+//     discards every future - but rclcpp keeps per-request state until an executor
+//     processes the response. Moving the client off the gateway executor without pumping
+//     it would trade the destruction race for a slow leak of one pending entry per raised
+//     fault, for the life of the process.
+//
+// No executor spins the gateway node here, deliberately. The whole point of the fix is
+// that the plugin does not depend on a gateway executor for its own client, and running
+// without one is exactly what makes this test fail if the client ever drifts back into the
+// node's default callback group.
+TEST_F(GraphWatchdogPluginTest, FaultClientDeliversRequestsAndDrainsItsOwnResponses) {
+  auto sink = std::make_shared<rclcpp::Node>("fault_sink");
+  std::mutex received_mutex;
+  int received = 0;
+  auto srv = sink->create_service<ros2_medkit_msgs::srv::ReportFault>(
+      "/fault_manager/report_fault",
+      [&received, &received_mutex](const std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Request>,
+                                   std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Response> resp) {
+        {
+          std::lock_guard<std::mutex> lk(received_mutex);
+          ++received;
+        }
+        resp->accepted = true;
+      });
+
+  // Only the SINK is spun. The plugin drives its own client off its own tick thread.
+  rclcpp::executors::SingleThreadedExecutor sink_exec;
+  sink_exec.add_node(sink);
+  std::thread sink_spin([&sink_exec] {
+    sink_exec.spin();
+  });
+
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  FakeContextWithApp ctx(gateway_node_.get());  // "/watched_app", the id RaisingDetector reports on
+  plugin.configure(nlohmann::json{{"tick_interval_ms", 50}, {"warmup_cycles", 0}});
+  plugin.set_context(ctx);
+
+  // Enough raises that an undrained pending map is unmistakably larger than the handful of
+  // requests that can legitimately be in flight at any instant.
+  constexpr int kWantRequests = 25;
+  int seen = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (seen < kWantRequests && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::lock_guard<std::mutex> lk(received_mutex);
+    seen = received;
+  }
+  EXPECT_GE(seen, kWantRequests) << "the plugin's fault client never reached a real /fault_manager/report_fault "
+                                    "server; requests are not leaving the process";
+
+  // Destructive read, so it happens exactly once and last. With the drain working this is
+  // the number of requests genuinely in flight right now (0 or 1 at a 50 ms cadence);
+  // without it, it is every request ever sent.
+  const std::size_t pending = plugin.prune_pending_fault_requests_for_test();
+  EXPECT_LE(pending, 5u) << "the fault client is holding " << pending << " pending responses after " << seen
+                         << " requests; nothing is draining it, so the client leaks one entry per raised fault";
+
+  EXPECT_NO_THROW(plugin.shutdown());
+  sink_exec.cancel();
+  sink_spin.join();
+}
+
+// The production wiring for lifecycle events, end to end. The watcher's
+// ~/transition_event subscriptions live in a callback group no gateway executor collects,
+// so the plugin's own tick thread - draining them from wait_for_next_tick() - is the ONLY
+// thing that can deliver a transition. A gateway-style executor spins the node throughout
+// this test precisely because it must NOT be the one delivering it. If that drain is ever
+// removed, weakened to once per tick with too coarse a poll, or moved off the tick thread,
+// the cached label stays empty here and every lifecycle-gated suppression silently stops
+// working on a real robot while the unit tests below still pass.
+TEST_F(GraphWatchdogPluginTest, TickThreadDeliversRealTransitionEventsToTheGate) {
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  FakeContextWithManagedApp ctx(gateway_node_.get());
+
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(gateway_node_);
+  std::thread spin([&exec] {
+    exec.spin();
+  });
+
+  auto pub = gateway_node_->create_publisher<lifecycle_msgs::msg::TransitionEvent>(
+      "/managed_app/transition_event", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+
+  plugin.configure(nlohmann::json{{"tick_interval_ms", 200}, {"warmup_cycles", 1}});
+  plugin.set_context(ctx);
+
+  const auto routes = plugin.get_routes();
+  const auto route_it = find_watchdog_route(routes);
+  ASSERT_NE(route_it, routes.end());
+
+  lifecycle_msgs::msg::TransitionEvent msg;
+  msg.start_state.label = "active";
+  msg.goal_state.label = "inactive";
+
+  // Republish while polling: a volatile publisher only reaches a subscription that has
+  // finished DDS endpoint matching, and the subscription is only created on the plugin's
+  // first tick.
+  std::string observed;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (observed != "inactive" && std::chrono::steady_clock::now() < deadline) {
+    pub->publish(msg);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    TestResponseSink sink;
+    ros2_medkit_gateway::PluginRequest req(nullptr);
+    ros2_medkit_gateway::PluginResponse res(&sink);
+    route_it->handler(req, res);
+    if (!sink.body.contains("x-medkit-watchdog")) {
+      continue;
+    }
+    for (const auto & entity : sink.body["x-medkit-watchdog"]["entities"]) {
+      if (entity["id"] == "/managed_app" && entity["lifecycle"].is_string()) {
+        observed = entity["lifecycle"].get<std::string>();
+      }
+    }
+  }
+  EXPECT_EQ(observed, "inactive") << "the tick thread never delivered a live ~/transition_event; nothing else "
+                                     "runs these subscriptions, so the gate is now blind to lifecycle state";
 
   EXPECT_NO_THROW(plugin.shutdown());
   exec.cancel();

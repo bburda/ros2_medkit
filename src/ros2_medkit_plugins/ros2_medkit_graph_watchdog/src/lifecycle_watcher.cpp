@@ -77,6 +77,20 @@ LifecycleWatcher::LifecycleWatcher(rclcpp::Node * gateway_node, std::mutex * nod
   , reader_(std::make_shared<ros2_medkit_gateway::Ros2LifecycleStateReader>(gateway_node))
   , state_(std::make_shared<SharedState>())
   , retention_ticks_(departed_retention_ticks) {
+  // One group for every lifecycle subscription, created once here rather than per node:
+  // create_callback_group() mutates the node's own group registry and is no more
+  // thread-safe than create_subscription(), so it goes under the shared node_mutex_ too.
+  //
+  // `automatically_add_to_executor_with_node = false` is the load-bearing argument. With
+  // it, a gateway executor that has this node added never collects these subscriptions,
+  // so no executor thread ever holds a reference to one and none of them can be destroyed
+  // on an executor thread. Adding the group to a private executor instead keeps creation,
+  // destruction AND callback execution on the single thread that drives this watcher.
+  std::lock_guard<std::mutex> node_lock(*node_mutex_);
+  lifecycle_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive,
+                                                  /*automatically_add_to_executor_with_node=*/false);
+  lifecycle_executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+  lifecycle_executor_->add_callback_group(lifecycle_group_, node_->get_node_base_interface());
 }
 
 LifecycleWatcher::~LifecycleWatcher() {
@@ -117,12 +131,19 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
     current_fqns.emplace(app.id, app.effective_fqn());
   }
 
-  // Drop nodes that are no longer managed. Erasing the entry drops the last strong ref
-  // to a Subscription created on node_, whose ~Subscription mutates node_'s topic
-  // registry and waitset - the same structures create_subscription touches. Take
-  // node_mutex_ then state->mutex here to mirror the creation-side lock order
-  // (node_mutex_ -> state->mutex); the callback only takes state->mutex, so this adds no
-  // inversion.
+  // Drop nodes that are no longer managed. Erasing the entry runs ~Subscription, which
+  // mutates node_'s entity registry and waitset - the same structures create_subscription
+  // mutates. Two things make that safe, and BOTH are needed:
+  //
+  //   1. The subscription is in lifecycle_group_, which no gateway executor collects, so
+  //      the only references to it live on this thread. A subscription in the gateway's
+  //      executor would not have that property: rclcpp::AnyExecutable holds a STRONG ref
+  //      to the subscription it dispatches and is a local of the executor thread, so the
+  //      last reference is routinely released - and ~Subscription routinely runs - on an
+  //      executor thread no lock here can reach.
+  //   2. node_mutex_ then state->mutex, mirroring the creation-side lock order
+  //      (node_mutex_ -> state->mutex), serializes this against the other entity creation
+  //      this plugin does on node_. The callback only takes state->mutex, so no inversion.
   {
     std::lock_guard<std::mutex> node_lock(*node_mutex_);
     std::lock_guard<std::mutex> state_lock(state_->mutex);
@@ -206,6 +227,10 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
     const std::string topic = derive_transition_event_topic(get_state_path);
     const auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
     std::weak_ptr<SharedState> weak_state = state_;
+    // Every lifecycle subscription goes into the watcher's own group, never the node's
+    // default one - see the constructor for why that is what makes teardown safe.
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = lifecycle_group_;
 
     std::lock_guard<std::mutex> node_lock(*node_mutex_);
     std::lock_guard<std::mutex> state_lock(state_->mutex);
@@ -213,7 +238,8 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
       return;
     }
     auto sub = node_->create_subscription<lifecycle_msgs::msg::TransitionEvent>(
-        topic, qos, [weak_state, id](const lifecycle_msgs::msg::TransitionEvent::ConstSharedPtr & msg) {
+        topic, qos,
+        [weak_state, id](const lifecycle_msgs::msg::TransitionEvent::ConstSharedPtr & msg) {
           auto shared = weak_state.lock();
           if (!shared) {
             return;  // watcher torn down; nothing to update
@@ -234,7 +260,8 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
               it->second.error_terminated = true;
             }
           }
-        });
+        },
+        options);
     auto & tracked = state_->tracked[id];
     tracked.sub = std::move(sub);
     tracked.reseeds_remaining = kReseedAttempts;
@@ -274,6 +301,23 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
   }
 }
 
+void LifecycleWatcher::pump_events(std::chrono::nanoseconds budget) {
+  // No lock: this runs the ~/transition_event callbacks, and those take state->mutex
+  // themselves. Holding either mutex across the spin would deadlock the callback, and
+  // holding node_mutex_ would stall every other entity creation for the whole drain.
+  // Single-thread safety comes from the calling contract (same thread as update(); see
+  // the class note), not from a lock.
+  //
+  // spin_some() collects once and returns as soon as the ready work is drained - it never
+  // blocks waiting for new work - so this is a poll, not a spin. It is also the point
+  // where the private executor takes and releases its own transient strong references to
+  // the subscriptions, which is precisely why it must run on the same thread that erases
+  // them.
+  if (lifecycle_executor_) {
+    lifecycle_executor_->spin_some(budget);
+  }
+}
+
 bool LifecycleWatcher::node_ok(const std::string & app_id) const {
   std::lock_guard<std::mutex> lock(state_->mutex);
   const auto it = state_->tracked.find(app_id);
@@ -307,8 +351,22 @@ std::optional<DepartedLifecycle> LifecycleWatcher::departed_state_of(const std::
 
 void LifecycleWatcher::reset() {
   // Symmetric with subscription creation (node_mutex_ then state->mutex): clearing
-  // tracked_ drops the subs, and ~Subscription mutates node_'s topic registry.
+  // tracked drops the subs, and ~Subscription mutates node_'s entity registry.
+  //
+  // Unlike update(), this does NOT run on the tick thread - the plugin calls it from
+  // whoever is tearing the plugin down, after that thread is joined. Destroying the
+  // private executor FIRST is what keeps the destruction single-threaded anyway: while it
+  // is alive it may still hold its own strong reference to a collected subscription, so
+  // clearing `tracked` would not necessarily release the last one, and the release would
+  // then happen at some later, less obvious point. Tearing the executor down here means
+  // every reference is gone by the time `tracked` is cleared.
+  //
+  // node_mutex_ is held across the whole body, which is what excludes a concurrent
+  // create_subscription in update() (it takes the same mutex). The two teardown steps are
+  // each idempotent - a null unique_ptr and an already-empty map - so the second call (the
+  // destructor, after the plugin already called reset() through the gate) does nothing.
   std::lock_guard<std::mutex> node_lock(*node_mutex_);
+  lifecycle_executor_.reset();
   std::lock_guard<std::mutex> state_lock(state_->mutex);
   state_->shutdown_requested = true;
   state_->tracked.clear();

@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -76,9 +77,27 @@ class GraphWatchdogPlugin : public ros2_medkit_gateway::GatewayPlugin,
     return tick_count_.load();
   }
 
+  /// Test-only: how many ReportFault responses the plugin's fault client is still waiting
+  /// on. The client is fire-and-forget (DetectorContext::raise_fault discards the future),
+  /// and rclcpp keeps per-request state until an executor processes the response, so this
+  /// must fall back to 0 between ticks or the plugin leaks one entry per raised fault for
+  /// the life of the process. DESTRUCTIVE: rclcpp exposes no non-mutating count, so this
+  /// clears the pending map as it reads it.
+  std::size_t prune_pending_fault_requests_for_test();
+
  private:
   void load_parameters();
-  void run_tick_loop();  ///< Body of tick_thread_: tick() + interruptible sleep, until shutdown.
+  void run_tick_loop();  ///< Body of tick_thread_: tick() + interruptible wait, until shutdown.
+  /// Run both private executors once, each guarded so a throw from one cannot escape the
+  /// tick thread or cost the other its drain.
+  void drain_private_executors();
+  /// Wait out one tick interval on tick_cv_, in short slices, draining the private
+  /// executors between them: the gate's lifecycle ~/transition_event subscriptions and the
+  /// fault client's responses. Both live in callback groups no gateway executor collects
+  /// (see lifecycle_watcher.hpp and set_context()), so this poll is the only thing that
+  /// runs them - and it deliberately runs on the tick thread, the same thread that creates
+  /// and destroys them.
+  void wait_for_next_tick();
   void tick();
   /// Departed-lifecycle retention horizon (ticks) for the ReliabilityGate's
   /// LifecycleWatcher: prune_ticks + node_death's own miss_grace + 1, where prune_ticks
@@ -105,6 +124,14 @@ class GraphWatchdogPlugin : public ros2_medkit_gateway::GatewayPlugin,
 
   std::unique_ptr<WatchdogClock> clock_;
   std::unique_ptr<ReliabilityGate> gate_;  ///< Incomplete type here is fine: dtor is out-of-line (.cpp).
+  /// The fault client's own callback group, created with automatic executor registration
+  /// DISABLED so no executor the gateway node is added to ever collects the client - that
+  /// is what keeps every reference to it, and therefore ~Client, on this plugin's threads.
+  rclcpp::CallbackGroup::SharedPtr fault_client_group_;
+  /// The only executor that group is ever added to, pumped from the tick thread. It is
+  /// what processes the ReportFault responses nobody reads; without it the client's
+  /// pending-request map would grow without bound.
+  std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> fault_executor_;
   rclcpp::Client<ros2_medkit_msgs::srv::ReportFault>::SharedPtr fault_client_;
 
   // The tick runs on a DEDICATED plugin thread, NOT a gateway wall-timer/executor

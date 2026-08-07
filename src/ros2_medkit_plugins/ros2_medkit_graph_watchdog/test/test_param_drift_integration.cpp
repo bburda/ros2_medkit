@@ -597,6 +597,7 @@ class ParamDriftIntegrationTest : public ::testing::Test {
     exec_.remove_node(gateway_);
     exec_.remove_node(target_);
     exec_.remove_node(sink_);
+    param_clients_.clear();  // safe here: the executor has stopped spinning, nothing else can touch these
     client_.reset();
     srv_.reset();
     sink_.reset();
@@ -637,9 +638,21 @@ class ParamDriftIntegrationTest : public ::testing::Test {
   // read succeeds and captures the baseline BEFORE any set_parameter. Without this, an
   // early negative-cache miss (service not yet discovered) could make the first
   // successful read land after the drift and capture the drifted value as the baseline.
+  //
+  // The client is cached per service name and kept alive in `param_clients_` instead of being
+  // created and dropped on every call. The executor is spinning on `spin_` for the whole test
+  // and holds its own shared_ptr to the client while it is in flight, so the last reference is
+  // often released on an executor thread rather than here. `~Client()` reads the node's
+  // internal rcutils_hash_map, and a throwaway client destroyed while the next `create_client`
+  // call writes that same map is a data race. Caching defers destruction to TearDown(), which
+  // only runs after the executor has stopped spinning.
   bool wait_param_service(const std::string & node_fqn) {
     std::lock_guard<std::mutex> lk(node_mutex_);
-    auto c = gateway_->create_client<rcl_interfaces::srv::GetParameters>(node_fqn + "/get_parameters");
+    const std::string service_name = node_fqn + "/get_parameters";
+    auto & c = param_clients_[service_name];
+    if (!c) {
+      c = gateway_->create_client<rcl_interfaces::srv::GetParameters>(service_name);
+    }
     return c->wait_for_service(5s);
   }
 
@@ -761,6 +774,9 @@ class ParamDriftIntegrationTest : public ::testing::Test {
   std::mutex mtx_, node_mutex_;
   std::vector<ReportFault::Request> received_;
   IntrospectionInput snapshot_;  // owned entity snapshot the detector reads each tick
+  // Clients created by wait_param_service(), cached per service name so none of them are ever
+  // destroyed while exec_ is spinning. Released in TearDown(), after the executor has stopped.
+  std::map<std::string, rclcpp::Client<rcl_interfaces::srv::GetParameters>::SharedPtr> param_clients_;
 };
 
 TEST_F(ParamDriftIntegrationTest, RuntimeSetRaisesThenRestoreClears) {
