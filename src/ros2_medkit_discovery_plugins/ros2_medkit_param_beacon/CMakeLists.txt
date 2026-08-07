@@ -81,7 +81,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gmock REQUIRED)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 100 END 104)
+  medkit_init_test_domains(PACKAGE ros2_medkit_param_beacon)
+  medkit_add_domain_allocation_test()
 
   # Include plugin source in test (plugin is MODULE/dlopen, test instantiates directly)
   # TIMEOUT 180: the 12 test cases each spin a node for ~200-400 ms. Under

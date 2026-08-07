@@ -32,34 +32,52 @@ def get_test_port(offset=0):
     return DEFAULT_PORT + offset
 
 
+def _secondary_domains():
+    """Return the shared secondary DDS domains, as handed down by CMake.
+
+    ``MEDKIT_SECONDARY_DOMAINS`` is set on every integration test from
+    ``MEDKIT_SECONDARY_DOMAIN_RANGE`` in ``ROS2MedkitTestDomain.cmake``,
+    so the numbers are written once. Absent (a test run by hand outside
+    CTest), there is nothing to fall back on that would be safe, so say so.
+    """
+    raw = os.environ.get('MEDKIT_SECONDARY_DOMAINS', '')
+    return [int(part) for part in raw.split(',') if part.strip()]
+
+
 def get_test_domain_id(offset=0):
     """Return a DDS domain ID for this test, optionally with an offset.
 
-    Each integration test gets a unique ``ROS_DOMAIN_ID`` from CMake
-    (stride of 1, range 130-219). For offset 0, returns the assigned
-    domain ID directly.
+    Each integration test gets a ``ROS_DOMAIN_ID`` from its package pool in
+    ``ROS2MedkitTestDomain.cmake``. For offset 0, returns that domain.
 
-    For offset in 1..3 (multi-gateway tests needing extra DDS domains),
-    returns one of the three secondary domains 230, 231, 232 so each
-    offset produces a distinct domain. These three secondaries sit
-    outside the per-package allocation in
-    ``ROS2MedkitTestDomain.cmake`` and are shared across every
-    multi-gateway integration test; CTest serialises those tests via a
-    ``RESOURCE_LOCK`` (see ``CMakeLists.txt``) so two of them never
-    hold the same secondary domain simultaneously.
+    Offsets above 0 are for multi-gateway tests that need a second or third
+    domain at the same time. Those come from the shared secondary pool, which
+    sits outside every package pool and is shared across all such tests; CTest
+    serialises them with a ``RESOURCE_LOCK`` (see ``CMakeLists.txt``) so two of
+    them never hold the same secondary domain at once.
 
-    DDS max domain ID is 232 (UDP port formula: 7400 + 250 * domain_id).
-    Offsets above 3 would exceed that ceiling and are rejected up front.
+    Only domains whose UDP port slice falls outside the kernel ephemeral port
+    range are usable at all - see the header of ``ROS2MedkitTestDomain.cmake``.
+    That is why the secondary pool is small and why the offset is bounded.
     """
     if offset == 0:
         return DEFAULT_DOMAIN_ID
-    if not 1 <= offset <= 3:
-        raise ValueError(
-            f'secondary DDS domain offset {offset} out of range 1..3 '
-            '(only domains 230-232 are available; DDS max is 232). '
-            'Add a new offset only after extending the allocation scheme.'
+    secondary = _secondary_domains()
+    if not secondary:
+        raise RuntimeError(
+            'MEDKIT_SECONDARY_DOMAINS is not set, so no secondary DDS domain can be '
+            'handed out. CTest sets it from the allocation table in '
+            'ROS2MedkitTestDomain.cmake. To run this test by hand, set it yourself to '
+            'the same value, for example MEDKIT_SECONDARY_DOMAINS=229,230,231.'
         )
-    return 229 + offset
+    if not 1 <= offset <= len(secondary):
+        raise ValueError(
+            f'secondary DDS domain offset {offset} out of range 1..{len(secondary)} '
+            f'(the shared secondary pool is {secondary}). Widen '
+            'MEDKIT_SECONDARY_DOMAIN_RANGE in ROS2MedkitTestDomain.cmake before '
+            'adding a new offset - it can only grow into the safe band.'
+        )
+    return secondary[offset - 1]
 
 
 # Gateway startup

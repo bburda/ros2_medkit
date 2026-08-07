@@ -97,7 +97,8 @@ if(BUILD_TESTING)
   ros2_medkit_clang_tidy()
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 90 END 99)
+  medkit_init_test_domains(PACKAGE ros2_medkit_diagnostic_bridge)
+  medkit_add_domain_allocation_test()
 
   # Unit tests
   ament_add_gtest(test_diagnostic_bridge test/test_diagnostic_bridge.cpp)

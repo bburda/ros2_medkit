@@ -14,7 +14,7 @@ and ``include()``.
 Modules
 -------
 
-The package provides four CMake modules installed to the ament index:
+The package provides these CMake modules, installed to the ament index:
 
 1. **ros2_medkit_cmake-extras.cmake** - Ament extras hook
 
@@ -48,8 +48,59 @@ The package provides four CMake modules installed to the ament index:
    - ``medkit_apply_compat_defs(target)`` - Applies compile definitions based on detected versions
    - ``medkit_target_dependencies(target ...)`` - Drop-in replacement for ``ament_target_dependencies`` that also works on Lyrical (where ``ament_target_dependencies`` was removed)
 
+5. **ROS2MedkitTestDomain.cmake** - ``ROS_DOMAIN_ID`` allocation for tests
+
+   - ``MEDKIT_DOMAIN_TABLE`` holds the per-package pools; a package names itself with
+     ``medkit_init_test_domains(PACKAGE <name>)`` rather than repeating a range
+   - ``medkit_set_test_domain(<test>)`` assigns the next domain from the pool and its
+     ``RESOURCE_LOCK``
+   - ``medkit_add_launch_test(<name> <file>)`` registers a launch test and assigns its domain
+     in one call, so a launch test cannot be added without isolation
+   - ``medkit_add_domain_allocation_test()`` registers the runtime guard described below
+
 Design Decisions
 ----------------
+
+Test Domains Avoid the Ephemeral Port Range
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+RTPS gives a DDS domain the UDP slice ``[7400 + 250 * d, 7400 + 250 * d + 249]``, and both
+CycloneDDS and Fast-DDS bind inside it without ``SO_REUSEPORT``. The Linux kernel hands out
+ephemeral ports from ``net.ipv4.ip_local_port_range``, 32768-60999 by default, which maps
+back to domains 101-214. A domain in that band works until an unrelated process on the
+machine is given one of its ports first, and then every node on it fails to start with
+``failed to bind to ANY:<port>: address in use``.
+
+Test domains are therefore drawn only from 1-100 and 215-231. Domain 0 is left to the
+developer shell, and 232 is dropped because its slice runs past 65535.
+
+Pools Are Reused, Under a Lock
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The safe band holds fewer domains than the workspace has tests, so a package's pool wraps
+around and two of its tests can share a domain. Sharing is made harmless rather than
+unlikely: the same call that assigns a domain puts a ``medkit_dds_domain_<id>``
+``RESOURCE_LOCK`` on the test, and CTest will not schedule two tests holding one lock
+concurrently. That is load-bearing because ``scripts/test.sh`` runs ``ctest -j $(nproc)``.
+
+A lock only binds inside one CTest run, and colcon runs a separate CTest per package in
+parallel, so isolation *between* packages comes from the pools being disjoint instead. The
+module checks that rather than trusting it.
+
+The Constraint Is Checked, Not Documented
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Earlier rounds of domain work fixed collisions between our own tests and left the ephemeral
+range unexamined, because nothing checked it. Two checks now do:
+
+- at configure time the module validates the entire table, not just the pool being asked
+  for, so a package that is not currently being built still cannot hold an unsafe or
+  overlapping range. The ephemeral range is read from
+  ``/proc/sys/net/ipv4/ip_local_port_range`` and widened to at least the Linux default, so a
+  host configured with a narrow range cannot accept an allocation that breaks elsewhere;
+- ``test_dds_domain_allocation`` runs on the machine that executes the tests. It reads the
+  generated CTest properties back and fails on a domain outside the pool, a domain inside
+  that machine's live ephemeral range, or a missing domain lock.
 
 Separate Package
 ~~~~~~~~~~~~~~~~

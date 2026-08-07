@@ -113,12 +113,14 @@ if(BUILD_TESTING)
   ros2_medkit_clang_tidy()
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 10 END 29)
+  medkit_init_test_domains(PACKAGE ros2_medkit_fault_manager)
+  medkit_add_domain_allocation_test()
 
   # Unit tests
-  # Each GTest target that instantiates ROS 2 nodes gets a dedicated ROS_DOMAIN_ID
-  # so it cannot interfere with launch_testing integration tests that run concurrently
-  # in the same CTest invocation and launch their own fault_manager_node subprocess.
+  # Each GTest target that instantiates ROS 2 nodes takes a ROS_DOMAIN_ID from this
+  # package's pool so it cannot interfere with launch_testing integration tests that run
+  # concurrently in the same CTest invocation and launch their own fault_manager_node
+  # subprocess.
   ament_add_gtest(test_fault_manager test/test_fault_manager.cpp)
   target_link_libraries(test_fault_manager fault_manager_lib)
   medkit_target_dependencies(test_fault_manager rclcpp ros2_medkit_msgs std_msgs)
