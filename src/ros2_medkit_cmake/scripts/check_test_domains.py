@@ -101,8 +101,13 @@ def test_properties(test):
 
 
 def domain_of(env_entries):
-    """Return the ROS_DOMAIN_ID a test is given, or None."""
-    for entry in env_entries:
+    """Return the ROS_DOMAIN_ID a test is given, or None.
+
+    CTest applies ENVIRONMENT entries in order, so when a test carries more
+    than one ROS_DOMAIN_ID entry (medkit_set_test_domain APPENDs, so a caller
+    can add its own on top), the last one wins. Scan in reverse to match.
+    """
+    for entry in reversed(env_entries):
         name, _, value = entry.partition('=')
         if name == 'ROS_DOMAIN_ID':
             return int(value)

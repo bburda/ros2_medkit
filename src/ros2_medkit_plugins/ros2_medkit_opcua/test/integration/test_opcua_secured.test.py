@@ -52,6 +52,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -66,9 +67,6 @@ PASSWORD = 'secret'
 WRONG_PASSWORD = 'definitely-not-the-password'
 APP_URI_SERVER = 'urn:test:alarms:server'
 APP_URI_CLIENT = 'urn:selfpatch:medkit:opcua-client'
-# 229 is the one free slot in this package's 220-229 range (the gtests take
-# 220-228); 228 would collide with test_opcua_identity's CMake-assigned domain.
-ROS_DOMAIN_ID = '229'
 
 ALARM_CODE = 'PLC_OVERPRESSURE'
 # Source-level catch-all code a non-condition event would be mis-mapped to if the
@@ -241,7 +239,7 @@ def start_gateway(params_file, log_path, env):
     proc = subprocess.Popen(
         ['ros2', 'run', 'ros2_medkit_gateway', 'gateway_node',
          '--ros-args', '--params-file', str(params_file)],
-        stdout=log, stderr=subprocess.STDOUT, env=env,
+        stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True,
     )
     proc._log = log  # keep handle alive for close on teardown
     return proc
@@ -283,15 +281,57 @@ def send_cmd(server, server_log, cmd):
 
 
 def terminate(proc):
-    """Best-effort SIGTERM then SIGKILL of a child process."""
+    """
+    Best-effort SIGTERM then SIGKILL of a child process *group*.
+
+    The node processes are launched through ``ros2 run``, so the direct child
+    is the CLI wrapper and the node itself is a grandchild. Signalling only the
+    wrapper leaves the node reparented to init, still holding the DDS domain
+    CTest assigned this run from the ros2_medkit_opcua pool, so the leaked
+    node then joins a later run's graph. Every process *passed to this
+    function* is started with
+    ``start_new_session=True``, which puts it in its own process group, so the
+    whole group can be signalled.
+
+    That guarantee does not extend to processes this function never sees. A
+    plain ``subprocess.run(['ros2', ...])`` call outside this function is not
+    started with ``start_new_session=True`` and is not tracked here, so if it
+    spawns a ros2cli daemon for itself, the daemon lands in this test script's
+    own process group and terminate() cannot reach it. Such call sites need
+    ``--no-daemon`` (or their own cleanup) instead of relying on this function.
+    """
     if proc is None:
         return
+    if proc.returncode is not None:
+        # Already reaped by an earlier proc.poll() in the readiness loop. The OS can have
+        # recycled this PID since then, so looking up and signalling a process group for it
+        # would risk hitting an unrelated process instead of a no-op - skip both.
+        pgid = None
+    else:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            pgid = None
+
+    def signal_group(sig):
+        if pgid is None:
+            return
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+
+    signal_group(signal.SIGTERM)
     proc.terminate()
     try:
         proc.wait(timeout=8)
     except subprocess.TimeoutExpired:
+        signal_group(signal.SIGKILL)
         proc.kill()
         proc.wait()
+    # The wrapper can exit before the node it spawned does. SIGKILL the group
+    # unconditionally afterwards so nothing outlives this call.
+    signal_group(signal.SIGKILL)
     log = getattr(proc, '_log', None)
     if log is not None:
         log.close()
@@ -304,6 +344,16 @@ def main():
         return 2
     server_bin = Path(sys.argv[1]).resolve()
     gen_certs = Path(sys.argv[2]).resolve()
+
+    # ROS_DOMAIN_ID must come from CTest's ENVIRONMENT property (see
+    # ros2_medkit_opcua's CMakeLists.txt and ROS2MedkitTestDomain.cmake). A
+    # missing value is a wiring bug, not something to paper over with a
+    # literal, so fail loudly instead of guessing a domain.
+    ros_domain_id = os.environ.get('ROS_DOMAIN_ID')
+    if not ros_domain_id:
+        print('ROS_DOMAIN_ID is not set: this test must be launched by CTest, which '
+              'assigns it a domain from the ros2_medkit_opcua pool', file=sys.stderr)
+        return 1
 
     # --- Prerequisite gating (skip 77 unless required) ---------------------
     if shutil.which('openssl') is None:
@@ -325,7 +375,7 @@ def main():
     workdir = Path(tempfile.mkdtemp(prefix='opcua_secured_'))
     certs = workdir / 'certs'
     server_log = workdir / 'server.log'
-    env = dict(os.environ, ROS_DOMAIN_ID=ROS_DOMAIN_ID)
+    env = dict(os.environ, ROS_DOMAIN_ID=ros_domain_id)
 
     server = fault_mgr = gw_good = gw_bad = gw_catch = None
     try:
@@ -352,7 +402,7 @@ def main():
              '--app-uri', APP_URI_SERVER,
              '--username', USERNAME, '--password', PASSWORD],
             stdin=subprocess.PIPE, stdout=slog, stderr=subprocess.STDOUT,
-            text=True,
+            text=True, start_new_session=True,
         )
         if not wait_log(server_log, 'READY ', deadline=20):
             print('secure server did not become READY', file=sys.stderr)
@@ -360,18 +410,44 @@ def main():
             return 1
 
         # --- fault_manager_node --------------------------------------------
+        # storage_type:=memory, as every other integration test does. The
+        # production default is sqlite at /var/lib/ros2_medkit/faults.db, which
+        # only a root process can create. Without this the node aborts on an
+        # uncaught filesystem_error and the run fails much later, at the alarm
+        # assertion, naming the wrong component.
+        fault_mgr_log = workdir / 'fault_manager.log'
         fault_mgr = subprocess.Popen(
-            ['ros2', 'run', 'ros2_medkit_fault_manager', 'fault_manager_node'],
-            stdout=open(workdir / 'fault_manager.log', 'w'),
-            stderr=subprocess.STDOUT, env=env,
+            ['ros2', 'run', 'ros2_medkit_fault_manager', 'fault_manager_node',
+             '--ros-args', '-p', 'storage_type:=memory'],
+            stdout=open(fault_mgr_log, 'w'),
+            stderr=subprocess.STDOUT, env=env, start_new_session=True,
         )
-        # Poll for the service the opcua plugin calls.
+        # Poll for the service the opcua plugin calls. Falling through without
+        # it is not recoverable: every fault assertion below would then fail on
+        # its own deadline and blame the alarm path instead of this node.
+        fault_mgr_ready = False
         for _ in range(40):
-            out = subprocess.run(['ros2', 'service', 'list'], capture_output=True,
+            if fault_mgr.poll() is not None:
+                break
+            out = subprocess.run(['ros2', 'service', 'list', '--no-daemon'], capture_output=True,
                                  text=True, env=env, timeout=15, check=False)
             if '/fault_manager/report_fault' in out.stdout:
+                fault_mgr_ready = True
                 break
             time.sleep(0.5)
+        # The service appearing is not on its own proof the node survived: an orphaned
+        # fault_manager_node left behind by an earlier run of this same test can still be
+        # sitting on this domain and answer for the service. Require both, and re-check
+        # liveness after a settle.
+        if fault_mgr_ready:
+            time.sleep(2)
+        if not fault_mgr_ready or fault_mgr.poll() is not None:
+            reason = ('exited with code %r' % fault_mgr.poll() if fault_mgr.poll() is not None
+                      else 'never offered /fault_manager/report_fault')
+            print(f'FAIL: fault_manager_node {reason}', file=sys.stderr)
+            print('fault_manager log:\n'
+                  + fault_mgr_log.read_text(errors='replace'), file=sys.stderr)
+            return 1
 
         # === POSITIVE: good credentials ====================================
         good_params = workdir / 'gateway_good.yaml'

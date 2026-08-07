@@ -173,10 +173,11 @@ if(BUILD_TESTING)
   include(ROS2MedkitTestDomain)
   # This package holds more tests than the safe DDS band has domains, so
   # medkit_set_test_domain wraps around its pool and two tests can end up on the
-  # same domain. That is safe because the same call also puts the domain's
-  # RESOURCE_LOCK on the test, and CTest never runs two tests holding one lock at
-  # the same time - a stale participant from an earlier test cannot leak into a
-  # later one's graph discovery, because the earlier one has finished.
+  # same domain. The RESOURCE_LOCK that same call puts on the test only stops
+  # CTest from RUNNING two tests on one domain at once; it does nothing about a
+  # process that outlived its test. A run that is killed or crashes can leave
+  # orphaned nodes holding the domain, and those still pollute graph discovery
+  # for whichever later test reuses it.
   # Multi-gateway tests take their EXTRA domains from the shared secondary pool,
   # passed down as MEDKIT_SECONDARY_DOMAINS so the numbers live in one place.
   medkit_init_test_domains(PACKAGE ros2_medkit_integration_tests)
