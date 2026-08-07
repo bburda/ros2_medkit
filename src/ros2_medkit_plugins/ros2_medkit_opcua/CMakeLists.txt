@@ -466,13 +466,23 @@ if(BUILD_TESTING)
               "${CMAKE_CURRENT_SOURCE_DIR}/test/integration/test_opcua_secured.test.py"
               "${CMAKE_BINARY_DIR}/test_alarm_server"
               "${CMAKE_CURRENT_SOURCE_DIR}/test/integration/gen_test_certs.sh")
+    # Reserved explicitly (rather than via medkit_set_test_domain) because this
+    # test sets LABELS, SKIP_RETURN_CODE, and TIMEOUT together with ENVIRONMENT
+    # and RESOURCE_LOCK in the single set_tests_properties() call below. A plain
+    # set_tests_properties(... PROPERTIES ...) call after medkit_set_test_domain
+    # would drop what that macro appended, instead of adding to it.
+    medkit_reserve_test_domain(_OPCUA_SECURED_DOMAIN _OPCUA_SECURED_LOCK)
     # TIMEOUT must exceed the sum of the script's internal wait deadlines so a
     # slow failing run still reaches its own FAIL diagnostics instead of being
-    # killed by CTest.
+    # killed by CTest. ENVIRONMENT and RESOURCE_LOCK must stay in this same
+    # PROPERTIES call - a later separate set_tests_properties(... ENVIRONMENT
+    # ...) would silently replace them instead of appending.
     set_tests_properties(test_opcua_secured PROPERTIES
       LABELS "integration"
       SKIP_RETURN_CODE 77
-      TIMEOUT 420)
+      TIMEOUT 420
+      ENVIRONMENT "ROS_DOMAIN_ID=${_OPCUA_SECURED_DOMAIN}"
+      RESOURCE_LOCK ${_OPCUA_SECURED_LOCK})
 
     # INV2: end-to-end identity test. Boots test_alarm_server as a subprocess and
     # proves connect -> device-info read -> AssetIdentity via both OpcuaClient and
