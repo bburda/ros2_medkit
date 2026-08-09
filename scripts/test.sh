@@ -20,6 +20,11 @@ set -euo pipefail
 #
 # Presets:
 #   unit        - Unit tests only, no linters, no integration (DEFAULT)
+#
+# ctest -L takes a regex, so the label-selecting presets ask for their own
+# label or "gate". The domain gates carry the "gate" label and no other: they
+# must not be labelled "linter", because CI runs with -LE linter and a gate
+# excluded from CI is not a gate.
 #   integ       - Integration tests only
 #   lint        - Linters only (clang-format, copyright, cmake-lint; NO clang-tidy)
 #   tidy        - clang-tidy only (slow; accepts --jobs N, see below)
@@ -39,10 +44,18 @@ set -euo pipefail
 # --jobs N costs roughly N x 1.4 GiB. The value sticks in the CMake cache and is
 # printed on every run.
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PRESET="${1:-unit}"
 shift 2>/dev/null || true
 
 COMMON_ARGS=(--event-handlers console_direct+ --parallel-workers "$(nproc)" --return-code-on-test-failure)
+
+# Drop every result file from earlier runs before starting, so the summary at the
+# end is the tally of THIS run. A separate script because it has a test of its own,
+# scripts/test_drop_stale_results.sh, and because "drop the stale results" is worth
+# being able to ask for on its own. The reasoning lives there.
+"$HERE/drop_stale_results.sh" build
 
 # Run tests, capture exit code so we always show results even on failure.
 set +e
@@ -56,13 +69,13 @@ case "$PRESET" in
   integ)
     echo "==> Running integration tests only"
     colcon test "${COMMON_ARGS[@]}" \
-      --ctest-args -j "$(nproc)" -L integration \
+      --ctest-args -j "$(nproc)" -L "integration|gate" \
       "$@"
     ;;
   lint)
     echo "==> Running linters (excluding clang-tidy)"
     colcon test "${COMMON_ARGS[@]}" \
-      --ctest-args -j "$(nproc)" -L linter -E "clang_tidy" \
+      --ctest-args -j "$(nproc)" -L "linter|gate" -E "clang_tidy" \
       "$@"
     ;;
   tidy)
