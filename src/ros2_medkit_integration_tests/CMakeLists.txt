@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 # Shared cmake modules (multi-distro compat, ccache, linting)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
+include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
 
 # The shared coverage module is deliberately NOT included here: everything this
@@ -160,10 +161,11 @@ if(BUILD_TESTING)
   # C++ style checks to the demo nodes, which is a separate decision.
   find_package(ament_cmake_flake8 REQUIRED)
   # Without CONFIG_FILE, ament_flake8 reads the ini bundled inside the
-  # ament_flake8 package and the repository .flake8 never applies here. The two
+  # ament_flake8 package and the shared .flake8 never applies here. The two
   # would then be hand-synced copies that drift in silence. Point it at the
-  # repository file so there is one configuration.
-  ament_flake8(CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.flake8")
+  # shared file so there is one configuration.
+  medkit_lint_config(.flake8 _flake8_config)
+  ament_flake8(CONFIG_FILE "${_flake8_config}")
 
   # Each integration test gets a unique HTTP port via GATEWAY_TEST_PORT env var,
   # allowing parallel CTest execution without port conflicts.
@@ -171,32 +173,44 @@ if(BUILD_TESTING)
   set(_INTEG_PORT 9100)
 
   include(ROS2MedkitTestDomain)
-  # This package holds more tests than the safe DDS band has domains, so
-  # medkit_set_test_domain wraps around its pool and two tests can end up on the
-  # same domain. The RESOURCE_LOCK that same call puts on the test only stops
-  # CTest from RUNNING two tests on one domain at once; it does nothing about a
-  # process that outlived its test. A run that is killed or crashes can leave
-  # orphaned nodes holding the domain, and those still pollute graph discovery
-  # for whichever later test reuses it.
-  # Multi-gateway tests take their EXTRA domains from the shared secondary pool,
-  # passed down as MEDKIT_SECONDARY_DOMAINS so the numbers live in one place.
-  medkit_init_test_domains(PACKAGE ros2_medkit_integration_tests)
-  medkit_add_domain_allocation_test()
-  medkit_secondary_test_domains(_INTEG_SECONDARY_DOMAINS)
+
+  # The shared test helpers, checked without a gateway. Declared ROS-free: it
+  # manipulates ROS_DOMAIN_ID itself to prove the refusal, so a domain of its
+  # own would be the thing under test rather than a fixture.
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_test_utils_constants test/utils TIMEOUT 60)
+  set_tests_properties(test_test_utils_constants PROPERTIES LABELS "unit")
+  medkit_test_needs_no_domain(test_test_utils_constants)
+
+  # Multi-gateway tests run a second and a third gateway, each on a domain of its
+  # own, and reach them through ros2_medkit_test_utils.constants.get_test_domain_id.
+  # DOMAINS below is one for the test itself plus one per extra gateway; the
+  # extras arrive as MEDKIT_SECONDARY_DOMAINS. The highest offset any of them
+  # asks for is 3, so four domains covers all of them.
+  set(_MULTI_GATEWAY_TESTS
+    test_peer_aggregation
+    test_cross_ecu_fanout
+    test_daisy_chain_aggregation
+    test_leaf_collision_aggregation)
+  set(_MULTI_GATEWAY_DOMAINS 4)
 
   # Feature tests (atomic, independent, 120s timeout)
   file(GLOB FEATURE_TESTS test/features/*.test.py)
   foreach(test_file ${FEATURE_TESTS})
     get_filename_component(test_name ${test_file} NAME_WE)
-    add_launch_test(${test_file}
-      TARGET ${test_name}
+    set(_test_domains 1)
+    if(test_name IN_LIST _MULTI_GATEWAY_TESTS)
+      set(_test_domains ${_MULTI_GATEWAY_DOMAINS})
+    endif()
+    medkit_add_launch_test(${test_name} ${test_file}
       TIMEOUT 120
+      DOMAINS ${_test_domains}
     )
-    set_tests_properties(${test_name} PROPERTIES
-      LABELS "integration;feature"
-      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT};MEDKIT_SECONDARY_DOMAINS=${_INTEG_SECONDARY_DOMAINS}"
-    )
-    medkit_set_test_domain(${test_name})
+    # APPEND: medkit_add_launch_test put this test's domain count in ENVIRONMENT,
+    # and a plain set_tests_properties(... PROPERTIES ENVIRONMENT ...) would drop it.
+    set_tests_properties(${test_name} PROPERTIES LABELS "integration;feature")
+    set_property(TEST ${test_name} APPEND PROPERTY
+      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT}")
     math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
   endforeach()
 
@@ -204,31 +218,18 @@ if(BUILD_TESTING)
   file(GLOB SCENARIO_TESTS test/scenarios/*.test.py)
   foreach(test_file ${SCENARIO_TESTS})
     get_filename_component(test_name ${test_file} NAME_WE)
-    add_launch_test(${test_file}
-      TARGET ${test_name}
+    set(_test_domains 1)
+    if(test_name IN_LIST _MULTI_GATEWAY_TESTS)
+      set(_test_domains ${_MULTI_GATEWAY_DOMAINS})
+    endif()
+    medkit_add_launch_test(${test_name} ${test_file}
       TIMEOUT 300
+      DOMAINS ${_test_domains}
     )
-    set_tests_properties(${test_name} PROPERTIES
-      LABELS "integration;scenario"
-      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT};MEDKIT_SECONDARY_DOMAINS=${_INTEG_SECONDARY_DOMAINS}"
-    )
-    medkit_set_test_domain(${test_name})
+    set_tests_properties(${test_name} PROPERTIES LABELS "integration;scenario")
+    set_property(TEST ${test_name} APPEND PROPERTY
+      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT}")
     math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
-  endforeach()
-
-  # Serialise multi-gateway tests that share the secondary DDS domain pool (see
-  # ros2_medkit_test_utils.constants.get_test_domain_id). CTest will not run two
-  # tests holding this resource lock concurrently, so they cannot collide on
-  # those shared domains. Every integration test that calls
-  # get_test_domain_id(offset>0) must be listed here. APPEND, because each of
-  # these already carries its own primary domain's lock.
-  foreach(_multi_gateway_test
-    test_peer_aggregation
-    test_cross_ecu_fanout
-    test_daisy_chain_aggregation
-    test_leaf_collision_aggregation)
-    set_property(TEST ${_multi_gateway_test} APPEND PROPERTY
-      RESOURCE_LOCK medkit_secondary_dds_domains)
   endforeach()
 
   # test_graph_provider_greenwave drives a real greenwave_monitor node,

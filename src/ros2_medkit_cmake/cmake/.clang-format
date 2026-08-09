@@ -1,0 +1,99 @@
+---
+BasedOnStyle: Google
+Language: Cpp
+
+ColumnLimit: 120
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+MaxEmptyLinesToKeep: 1
+
+Standard: c++17
+
+# Pointers & References - ROS 2 style (spaces around * and &)
+DerivePointerAlignment: false
+PointerAlignment: Middle
+ReferenceAlignment: Middle
+
+# Spaces
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: false
+SpaceAfterCStyleCast: false
+SpaceBeforeAssignmentOperators: true
+
+# Templates
+AlwaysBreakTemplateDeclarations: Yes
+
+# Binary/Ternary operators
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: true
+
+# Constructor initializers (modern syntax - replaces deprecated options)
+BreakConstructorInitializers: BeforeComma
+ConstructorInitializerIndentWidth: 2
+PackConstructorInitializers: NextLine
+
+# Short statements
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortLambdasOnASingleLine: Empty
+
+# Braces
+InsertBraces: true
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+
+# Comments
+AlignTrailingComments: true
+SpacesBeforeTrailingComments: 2
+ReflowComments: true
+
+# Includes - ROS 2 friendly
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+IncludeCategories:
+  - Regex: '^<.*>'
+    Priority: 1
+  - Regex: '^"rclcpp/.*"'
+    Priority: 2
+  - Regex: '^".*"'
+    Priority: 3
+
+# Qualifiers
+QualifierAlignment: Custom
+QualifierOrder: ['static', 'inline', 'constexpr', 'const', 'volatile', 'type']
+
+# Modern C++ options
+InsertNewlineAtEOF: true
+SeparateDefinitionBlocks: Leave
+EmptyLineAfterAccessModifier: Never
+EmptyLineBeforeAccessModifier: LogicalBlock
+
+# Alignment
+AlignAfterOpenBracket: Align
+AlignOperands: Align
+AlignEscapedNewlines: Left
+
+# Penalties (prefer breaking at certain places)
+PenaltyBreakBeforeFirstCallParameter: 19
+PenaltyBreakComment: 300
+PenaltyBreakFirstLessLess: 120
+PenaltyBreakString: 1000
+PenaltyExcessCharacter: 1000000
+PenaltyReturnTypeOnItsOwnLine: 60

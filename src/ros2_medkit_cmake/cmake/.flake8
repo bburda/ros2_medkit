@@ -1,0 +1,11 @@
+[flake8]
+# Match ament_flake8 defaults (ROS 2 Jazzy)
+extend-ignore = B902,C816,D100,D101,D102,D103,D104,D105,D106,D107,D203,D212,D404,I202
+import-order-style = google
+max-line-length = 99
+show-source = true
+statistics = true
+
+per-file-ignores =
+    # Sphinx conf.py requires matplotlib backend setup before stdlib imports
+    docs/conf.py: E402, F401, I100

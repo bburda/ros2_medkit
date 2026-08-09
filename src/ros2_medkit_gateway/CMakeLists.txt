@@ -270,8 +270,8 @@ install(PROGRAMS scripts/get_type_schema.py scripts/generate_dev_certs.sh
 if(BUILD_TESTING)
   # Linting and code quality checks
   find_package(ament_lint_auto REQUIRED)
-  # Use custom clang-format config from repo root
-  set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
+  # Use the shared clang-format config that ships with ros2_medkit_cmake
+  medkit_lint_config(.clang-format ament_cmake_clang_format_CONFIG_FILE)
 
   # Exclude linters that don't work well with vendored dependencies:
   # - uncrustify/cpplint: conflicts with clang-format
@@ -330,8 +330,6 @@ if(BUILD_TESTING)
   )
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(PACKAGE ros2_medkit_gateway)
-  medkit_add_domain_allocation_test()
 
   # ─── Core purity check ────────────────────────────────────────────────────
   # Fails the build if any file under include/ros2_medkit_gateway/core/ or
@@ -370,6 +368,8 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_gateway_core_smoke>
   )
   set_tests_properties(gateway_core_smoke PROPERTIES LABELS "unit")
+  # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
+  medkit_test_needs_no_domain(gateway_core_smoke)
 
   # ─── DataAccessManager routing test (gateway_core only) ────────────────────
   # Mock-transport coverage proving the manager body compiles + links against
@@ -386,6 +386,8 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_data_access_manager_routing>
   )
   set_tests_properties(data_access_manager_routing PROPERTIES LABELS "unit")
+  # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
+  medkit_test_needs_no_domain(data_access_manager_routing)
 
   # ─── OperationManager routing test (gateway_core only) ─────────────────────
   # Mock-transport coverage proving the manager body (service / action call
@@ -403,6 +405,8 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_operation_manager_routing>
   )
   set_tests_properties(operation_manager_routing PROPERTIES LABELS "unit")
+  # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
+  medkit_test_needs_no_domain(operation_manager_routing)
 
   # ─── ConfigurationManager routing test (gateway_core only) ─────────────────
   # Mock-transport coverage proving the manager body (CRUD delegation,
@@ -421,6 +425,8 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_configuration_manager_routing>
   )
   set_tests_properties(configuration_manager_routing PROPERTIES LABELS "unit")
+  # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
+  medkit_test_needs_no_domain(configuration_manager_routing)
 
   # ─── FaultManager routing test (gateway_core only) ─────────────────────────
   # Mock-transport coverage proving the manager body (eight SOVD operations,
@@ -439,6 +445,8 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_fault_manager_routing>
   )
   set_tests_properties(fault_manager_routing PROPERTIES LABELS "unit")
+  # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
+  medkit_test_needs_no_domain(fault_manager_routing)
 
   # ─── LogManager routing test (gateway_core only) ───────────────────────────
   # Mock-source coverage proving the manager body (ring-buffer storage,
@@ -457,6 +465,8 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_log_manager_routing>
   )
   set_tests_properties(log_manager_routing PROPERTIES LABELS "unit")
+  # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
+  medkit_test_needs_no_domain(log_manager_routing)
 
   # ─── TriggerManager routing test (gateway_core only) ───────────────────────
   # Mock-transport coverage proving the manager body (data-trigger subscribe
@@ -476,6 +486,8 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_trigger_manager_routing>
   )
   set_tests_properties(trigger_manager_routing PROPERTIES LABELS "unit")
+  # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
+  medkit_test_needs_no_domain(trigger_manager_routing)
 
   # ─── ServiceActionResolver abstract contract test (gateway_core only) ──────
   # Standalone pin of the ServiceActionResolver interface contract: nullopt
@@ -497,364 +509,338 @@ if(BUILD_TESTING)
     COMMAND $<TARGET_FILE:test_service_action_resolver_contract>
   )
   set_tests_properties(service_action_resolver_contract PROPERTIES LABELS "unit")
+  # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
+  medkit_test_needs_no_domain(service_action_resolver_contract)
 
   # Add GTest
   find_package(ament_cmake_gtest REQUIRED)
   find_package(rclcpp_action REQUIRED)
   find_package(example_interfaces REQUIRED)
 
-  ament_add_gtest(test_gateway_node test/test_gateway_node.cpp)
+  medkit_add_gtest(test_gateway_node test/test_gateway_node.cpp)
   target_link_libraries(test_gateway_node gateway_ros2)
-  medkit_set_test_domain(test_gateway_node)
 
-  ament_add_gtest(test_entity_change_scope test/test_entity_change_scope.cpp)
+  medkit_add_gtest(test_entity_change_scope test/test_entity_change_scope.cpp)
   target_link_libraries(test_entity_change_scope gateway_ros2)
 
-  ament_add_gtest(test_manifest_fragments test/test_manifest_fragments.cpp)
+  medkit_add_gtest(test_manifest_fragments test/test_manifest_fragments.cpp)
   target_link_libraries(test_manifest_fragments gateway_ros2)
 
-  ament_add_gtest(test_plugin_notify_integration test/test_plugin_notify_integration.cpp)
+  medkit_add_gtest(test_plugin_notify_integration test/test_plugin_notify_integration.cpp)
   target_link_libraries(test_plugin_notify_integration gateway_ros2)
-  medkit_set_test_domain(test_plugin_notify_integration)
 
-  ament_add_gtest(test_plugin_context_aggregation test/test_plugin_context_aggregation.cpp)
+  medkit_add_gtest(test_plugin_context_aggregation test/test_plugin_context_aggregation.cpp)
   target_link_libraries(test_plugin_context_aggregation gateway_ros2)
-  medkit_set_test_domain(test_plugin_context_aggregation)
 
-  ament_add_gtest(test_auth_manager test/test_auth_manager.cpp)
+  medkit_add_gtest(test_auth_manager test/test_auth_manager.cpp)
   target_link_libraries(test_auth_manager gateway_ros2)
 
-  ament_add_gtest(test_generic_client_compat test/test_generic_client_compat.cpp)
+  medkit_add_gtest(test_generic_client_compat test/test_generic_client_compat.cpp)
   target_link_libraries(test_generic_client_compat gateway_ros2)
   medkit_target_dependencies(test_generic_client_compat rclcpp std_srvs)
-  medkit_set_test_domain(test_generic_client_compat)
 
-  ament_add_gtest(test_operation_manager test/test_operation_manager.cpp)
+  medkit_add_gtest(test_operation_manager test/test_operation_manager.cpp)
   target_link_libraries(test_operation_manager gateway_ros2)
-  medkit_set_test_domain(test_operation_manager)
 
-  ament_add_gtest(test_configuration_manager test/test_configuration_manager.cpp)
+  medkit_add_gtest(test_configuration_manager test/test_configuration_manager.cpp)
   target_link_libraries(test_configuration_manager gateway_ros2)
-  medkit_set_test_domain(test_configuration_manager)
 
   # Ros2ParameterTransport round-trip timeout coverage (#531): a
   # discoverable-but-unresponsive node's parameter service must not hang the
   # transport forever.
-  ament_add_gtest(test_ros2_parameter_transport test/test_ros2_parameter_transport.cpp)
+  medkit_add_gtest(test_ros2_parameter_transport test/test_ros2_parameter_transport.cpp)
   target_link_libraries(test_ros2_parameter_transport gateway_ros2)
-  medkit_set_test_domain(test_ros2_parameter_transport)
 
   # Separate binary: these tests own the whole rclcpp init/shutdown lifecycle (they
   # destroy a transport AFTER rclcpp::shutdown()), so they cannot share the
   # process-wide context bracket the tests above use.
-  ament_add_gtest(test_ros2_parameter_transport_shutdown test/test_ros2_parameter_transport_shutdown.cpp)
+  medkit_add_gtest(test_ros2_parameter_transport_shutdown test/test_ros2_parameter_transport_shutdown.cpp)
   target_link_libraries(test_ros2_parameter_transport_shutdown gateway_ros2)
-  medkit_set_test_domain(test_ros2_parameter_transport_shutdown)
 
   # BoundedLruCache: pure-C++ header, no ROS - bounds the parameter transport's
-  # per-node caches. No test domain (creates no ROS nodes).
-  ament_add_gtest(test_bounded_lru_cache test/test_bounded_lru_cache.cpp)
+  # per-node caches.
+  medkit_add_gtest(test_bounded_lru_cache test/test_bounded_lru_cache.cpp)
 
   find_package(std_msgs REQUIRED)
 
   # Add DiscoveryManager tests
-  ament_add_gtest(test_discovery_manager test/test_discovery_manager.cpp)
+  medkit_add_gtest(test_discovery_manager test/test_discovery_manager.cpp)
   target_link_libraries(test_discovery_manager gateway_ros2)
   medkit_target_dependencies(test_discovery_manager std_msgs)
-  medkit_set_test_domain(test_discovery_manager)
 
   # Add Ros2RuntimeIntrospection tests
-  ament_add_gtest(test_runtime_discovery test/test_runtime_discovery.cpp)
+  medkit_add_gtest(test_runtime_discovery test/test_runtime_discovery.cpp)
   target_link_libraries(test_runtime_discovery gateway_ros2)
-  medkit_set_test_domain(test_runtime_discovery)
 
   # Add TLS configuration tests
-  ament_add_gtest(test_tls_config test/test_tls_config.cpp)
+  medkit_add_gtest(test_tls_config test/test_tls_config.cpp)
   target_link_libraries(test_tls_config gateway_ros2)
 
   # Add HTTP server thread-pool bound tests (issue #440)
-  ament_add_gtest(test_http_server_thread_pool test/test_http_server_thread_pool.cpp)
+  medkit_add_gtest(test_http_server_thread_pool test/test_http_server_thread_pool.cpp)
   target_link_libraries(test_http_server_thread_pool gateway_ros2)
 
   # Add FaultManager tests
-  ament_add_gtest(test_fault_manager test/test_fault_manager.cpp)
+  medkit_add_gtest(test_fault_manager test/test_fault_manager.cpp)
   target_link_libraries(test_fault_manager gateway_ros2)
   medkit_target_dependencies(test_fault_manager rclcpp ros2_medkit_msgs)
-  medkit_set_test_domain(test_fault_manager)
 
   # Add error info tests
-  ament_add_gtest(test_error_info test/test_error_info.cpp)
+  medkit_add_gtest(test_error_info test/test_error_info.cpp)
   target_link_libraries(test_error_info gateway_ros2)
 
   # Parameter error classification unit tests (pure C++, no rclcpp)
-  ament_add_gtest(test_parameter_error_classification test/test_parameter_error_classification.cpp)
+  medkit_add_gtest(test_parameter_error_classification test/test_parameter_error_classification.cpp)
   target_link_libraries(test_parameter_error_classification gateway_ros2)
 
   # Parameter error precedence tests (multi-node GET aggregation, live GatewayNode)
-  ament_add_gtest(test_parameter_error_precedence test/test_parameter_error_precedence.cpp)
+  medkit_add_gtest(test_parameter_error_precedence test/test_parameter_error_precedence.cpp)
   target_link_libraries(test_parameter_error_precedence gateway_ros2)
   medkit_target_dependencies(test_parameter_error_precedence rclcpp)
-  medkit_set_test_domain(test_parameter_error_precedence)
 
   # Add ROS 2 subscription executor tests
-  ament_add_gtest(test_ros2_subscription_executor test/test_ros2_subscription_executor.cpp)
+  medkit_add_gtest(test_ros2_subscription_executor test/test_ros2_subscription_executor.cpp)
   target_link_libraries(test_ros2_subscription_executor gateway_ros2)
   medkit_target_dependencies(test_ros2_subscription_executor rclcpp std_msgs)
-  medkit_set_test_domain(test_ros2_subscription_executor)
 
   # Add ROS 2 subscription slot tests
-  ament_add_gtest(test_ros2_subscription_slot test/test_ros2_subscription_slot.cpp)
+  medkit_add_gtest(test_ros2_subscription_slot test/test_ros2_subscription_slot.cpp)
   target_link_libraries(test_ros2_subscription_slot gateway_ros2)
   medkit_target_dependencies(test_ros2_subscription_slot rclcpp std_msgs)
-  medkit_set_test_domain(test_ros2_subscription_slot)
 
   # Add TopicDataProvider interface tests (pure C++, no rclcpp init required)
-  ament_add_gtest(test_topic_data_provider_interface test/test_topic_data_provider_interface.cpp)
+  medkit_add_gtest(test_topic_data_provider_interface test/test_topic_data_provider_interface.cpp)
   target_link_libraries(test_topic_data_provider_interface gateway_ros2)
 
   # Add Ros2TopicDataProvider tests (rclcpp required)
-  ament_add_gtest(test_ros2_topic_data_provider test/test_ros2_topic_data_provider.cpp)
+  medkit_add_gtest(test_ros2_topic_data_provider test/test_ros2_topic_data_provider.cpp)
   target_link_libraries(test_ros2_topic_data_provider gateway_ros2)
   medkit_target_dependencies(test_ros2_topic_data_provider rclcpp std_msgs)
-  medkit_set_test_domain(test_ros2_topic_data_provider)
 
   # TriggerTopicSubscriber adapter tests (rclcpp + a real subscription executor)
-  ament_add_gtest(test_trigger_topic_subscriber test/test_trigger_topic_subscriber.cpp)
+  medkit_add_gtest(test_trigger_topic_subscriber test/test_trigger_topic_subscriber.cpp)
   target_link_libraries(test_trigger_topic_subscriber gateway_ros2)
   medkit_target_dependencies(test_trigger_topic_subscriber rclcpp std_msgs)
-  medkit_set_test_domain(test_trigger_topic_subscriber)
 
   # Add Ros2LogSource tests (rclcpp required - publishes to /rosout)
-  ament_add_gtest(test_ros2_log_source test/test_ros2_log_source.cpp)
+  medkit_add_gtest(test_ros2_log_source test/test_ros2_log_source.cpp)
   target_link_libraries(test_ros2_log_source gateway_ros2)
   medkit_target_dependencies(test_ros2_log_source rclcpp rcl_interfaces)
-  medkit_set_test_domain(test_ros2_log_source)
 
   # Add discovery models tests
-  ament_add_gtest(test_discovery_models test/test_discovery_models.cpp)
+  medkit_add_gtest(test_discovery_models test/test_discovery_models.cpp)
   target_link_libraries(test_discovery_models gateway_ros2)
 
   # Add host info provider tests
-  ament_add_gtest(test_host_info_provider test/test_host_info_provider.cpp)
+  medkit_add_gtest(test_host_info_provider test/test_host_info_provider.cpp)
   target_link_libraries(test_host_info_provider gateway_ros2)
 
   # Add discovery handlers tests
-  ament_add_gtest(test_discovery_handlers test/test_discovery_handlers.cpp)
+  medkit_add_gtest(test_discovery_handlers test/test_discovery_handlers.cpp)
   target_link_libraries(test_discovery_handlers gateway_ros2)
-  medkit_set_test_domain(test_discovery_handlers)
 
   # Add manifest parser tests
-  ament_add_gtest(test_manifest_parser test/test_manifest_parser.cpp)
+  medkit_add_gtest(test_manifest_parser test/test_manifest_parser.cpp)
   target_link_libraries(test_manifest_parser gateway_ros2)
 
   # Add manifest validator tests
-  ament_add_gtest(test_manifest_validator test/test_manifest_validator.cpp)
+  medkit_add_gtest(test_manifest_validator test/test_manifest_validator.cpp)
   target_link_libraries(test_manifest_validator gateway_ros2)
 
   # Add manifest manager tests
-  ament_add_gtest(test_manifest_manager test/test_manifest_manager.cpp)
+  medkit_add_gtest(test_manifest_manager test/test_manifest_manager.cpp)
   target_link_libraries(test_manifest_manager gateway_ros2)
 
   # Add runtime linker tests
-  ament_add_gtest(test_runtime_linker test/test_runtime_linker.cpp)
+  medkit_add_gtest(test_runtime_linker test/test_runtime_linker.cpp)
   target_link_libraries(test_runtime_linker gateway_ros2)
 
   # Add merge pipeline tests
-  ament_add_gtest(test_merge_pipeline test/test_merge_pipeline.cpp)
+  medkit_add_gtest(test_merge_pipeline test/test_merge_pipeline.cpp)
   target_link_libraries(test_merge_pipeline gateway_ros2)
 
   # Add asset-identity model + merge tests
-  ament_add_gtest(test_asset_identity test/test_asset_identity.cpp)
+  medkit_add_gtest(test_asset_identity test/test_asset_identity.cpp)
   target_link_libraries(test_asset_identity gateway_ros2)
 
   # Asset inventory: CSV / manifest asset-list parse + merge-by-id
-  ament_add_gtest(test_asset_inventory test/test_asset_inventory.cpp)
+  medkit_add_gtest(test_asset_inventory test/test_asset_inventory.cpp)
   target_link_libraries(test_asset_inventory gateway_ros2)
 
   # Add capability builder tests
-  ament_add_gtest(test_capability_builder test/test_capability_builder.cpp)
+  medkit_add_gtest(test_capability_builder test/test_capability_builder.cpp)
   target_link_libraries(test_capability_builder gateway_ros2)
 
   # Add handler context tests
-  ament_add_gtest(test_handler_context test/test_handler_context.cpp)
+  medkit_add_gtest(test_handler_context test/test_handler_context.cpp)
   target_link_libraries(test_handler_context gateway_ros2)
-  medkit_set_test_domain(test_handler_context)
 
   # FlatHashMap open-addressed container (pure C++17, no ROS node)
-  ament_add_gtest(test_flat_hash_map test/test_flat_hash_map.cpp)
+  medkit_add_gtest(test_flat_hash_map test/test_flat_hash_map.cpp)
   if(TARGET test_flat_hash_map)
     target_link_libraries(test_flat_hash_map gateway_core)
   endif()
 
   # Graph-event refresh debounce decision (pure C++17, no ROS node)
-  ament_add_gtest(test_refresh_debounce test/test_refresh_debounce.cpp)
+  medkit_add_gtest(test_refresh_debounce test/test_refresh_debounce.cpp)
   if(TARGET test_refresh_debounce)
     target_link_libraries(test_refresh_debounce gateway_core)
   endif()
 
   # SlotStore object pool (pure C++17, no ROS node)
-  ament_add_gtest(test_slot_store test/test_slot_store.cpp)
+  medkit_add_gtest(test_slot_store test/test_slot_store.cpp)
   if(TARGET test_slot_store)
     target_link_libraries(test_slot_store gateway_core)
   endif()
 
   # ThreadSafeEntityCache incremental reconcile (pure C++17, no ROS node)
-  ament_add_gtest(test_thread_safe_entity_cache
+  medkit_add_gtest(test_thread_safe_entity_cache
     test/test_thread_safe_entity_cache.cpp)
   if(TARGET test_thread_safe_entity_cache)
     target_link_libraries(test_thread_safe_entity_cache gateway_core)
   endif()
 
   # DTO contract core (pure C++17, no ROS node)
-  ament_add_gtest(test_dto_contract test/test_dto_contract.cpp)
+  medkit_add_gtest(test_dto_contract test/test_dto_contract.cpp)
   target_link_libraries(test_dto_contract gateway_core)
 
   # Lifecycle DTO (pure C++17, no ROS node)
-  ament_add_gtest(test_lifecycle_dto test/test_lifecycle_dto.cpp)
+  medkit_add_gtest(test_lifecycle_dto test/test_lifecycle_dto.cpp)
   target_link_libraries(test_lifecycle_dto gateway_core)
 
   # DTO Collection<T, XMedkit> template + fan-out observability fields
-  ament_add_gtest(test_collection test/test_collection.cpp)
+  medkit_add_gtest(test_collection test/test_collection.cpp)
   target_link_libraries(test_collection gateway_core)
 
   # DTO opaque_object machinery (pure C++17, no ROS node)
-  ament_add_gtest(test_opaque_object test/test_opaque_object.cpp)
+  medkit_add_gtest(test_opaque_object test/test_opaque_object.cpp)
   target_link_libraries(test_opaque_object gateway_core)
 
   # Entity value equality (operator==) - pure C++17, no ROS node
-  ament_add_gtest(test_entity_equality test/test_entity_equality.cpp)
+  medkit_add_gtest(test_entity_equality test/test_entity_equality.cpp)
   target_link_libraries(test_entity_equality gateway_core)
 
   # Typed router foundational types (pure C++17, no ROS node)
-  ament_add_gtest(test_typed_router test/test_typed_router.cpp)
+  medkit_add_gtest(test_typed_router test/test_typed_router.cpp)
   target_link_libraries(test_typed_router gateway_core)
 
   # Framework response-writing primitives (pure C++17, no ROS node)
-  ament_add_gtest(test_primitives test/test_primitives.cpp)
+  medkit_add_gtest(test_primitives test/test_primitives.cpp)
   target_link_libraries(test_primitives gateway_core)
 
   # Add rate limiter tests
-  ament_add_gtest(test_rate_limiter test/test_rate_limiter.cpp)
+  medkit_add_gtest(test_rate_limiter test/test_rate_limiter.cpp)
   target_link_libraries(test_rate_limiter gateway_ros2)
 
   # Add auth config tests
-  ament_add_gtest(test_auth_config test/test_auth_config.cpp)
+  medkit_add_gtest(test_auth_config test/test_auth_config.cpp)
   target_link_libraries(test_auth_config gateway_ros2)
 
   # Add data access manager tests
-  ament_add_gtest(test_data_access_manager test/test_data_access_manager.cpp)
+  medkit_add_gtest(test_data_access_manager test/test_data_access_manager.cpp)
   target_link_libraries(test_data_access_manager gateway_ros2)
   medkit_target_dependencies(test_data_access_manager rclcpp std_msgs)
-  medkit_set_test_domain(test_data_access_manager)
 
   # Add entity resource model tests
-  ament_add_gtest(test_entity_resource_model test/test_entity_resource_model.cpp)
+  medkit_add_gtest(test_entity_resource_model test/test_entity_resource_model.cpp)
   target_link_libraries(test_entity_resource_model gateway_ros2)
 
   # Function/Area resource collection aggregation tests
-  ament_add_gtest(test_function_resource_collections test/test_function_resource_collections.cpp)
+  medkit_add_gtest(test_function_resource_collections test/test_function_resource_collections.cpp)
   target_link_libraries(test_function_resource_collections gateway_ros2)
 
   # Add entity path utils tests
-  ament_add_gtest(test_entity_path_utils test/test_entity_path_utils.cpp)
+  medkit_add_gtest(test_entity_path_utils test/test_entity_path_utils.cpp)
   target_link_libraries(test_entity_path_utils gateway_ros2)
 
   # Add fault handlers tests (SOVD response building)
-  ament_add_gtest(test_fault_handlers test/test_fault_handlers.cpp)
+  medkit_add_gtest(test_fault_handlers test/test_fault_handlers.cpp)
   target_link_libraries(test_fault_handlers gateway_ros2)
 
   # Add bulk data store tests
-  ament_add_gtest(test_bulk_data_store test/test_bulk_data_store.cpp)
+  medkit_add_gtest(test_bulk_data_store test/test_bulk_data_store.cpp)
   target_link_libraries(test_bulk_data_store gateway_ros2)
 
   # Add bulk data handlers tests
-  ament_add_gtest(test_bulkdata_handlers test/test_bulkdata_handlers.cpp)
+  medkit_add_gtest(test_bulkdata_handlers test/test_bulkdata_handlers.cpp)
   target_link_libraries(test_bulkdata_handlers gateway_ros2)
 
   # Add subscription manager tests
-  ament_add_gtest(test_subscription_manager test/test_subscription_manager.cpp)
+  medkit_add_gtest(test_subscription_manager test/test_subscription_manager.cpp)
   target_link_libraries(test_subscription_manager gateway_ros2)
 
   # Add resource sampler registry tests
-  ament_add_gtest(test_resource_sampler_registry test/test_resource_sampler_registry.cpp)
+  medkit_add_gtest(test_resource_sampler_registry test/test_resource_sampler_registry.cpp)
   target_link_libraries(test_resource_sampler_registry gateway_ros2)
 
   # Add transport registry tests
-  ament_add_gtest(test_transport_registry test/test_transport_registry.cpp)
+  medkit_add_gtest(test_transport_registry test/test_transport_registry.cpp)
   target_link_libraries(test_transport_registry gateway_ros2)
 
   # Add cyclic subscription handler tests
-  ament_add_gtest(test_cyclic_subscription_handlers test/test_cyclic_subscription_handlers.cpp)
+  medkit_add_gtest(test_cyclic_subscription_handlers test/test_cyclic_subscription_handlers.cpp)
   target_link_libraries(test_cyclic_subscription_handlers gateway_ros2)
 
   # Add SSE transport provider tests
-  ament_add_gtest(test_sse_transport_provider test/test_sse_transport_provider.cpp)
+  medkit_add_gtest(test_sse_transport_provider test/test_sse_transport_provider.cpp)
   target_link_libraries(test_sse_transport_provider gateway_ros2)
 
   # Add SSE fault handler tests
-  ament_add_gtest(test_sse_fault_handler test/test_sse_fault_handler.cpp)
+  medkit_add_gtest(test_sse_fault_handler test/test_sse_fault_handler.cpp)
   target_link_libraries(test_sse_fault_handler gateway_ros2)
   medkit_target_dependencies(test_sse_fault_handler rclcpp ros2_medkit_msgs)
-  medkit_set_test_domain(test_sse_fault_handler)
 
   # Zero-config entity freeze-frame capture tests
-  ament_add_gtest(test_entity_freeze_frame_capture test/test_entity_freeze_frame_capture.cpp)
+  medkit_add_gtest(test_entity_freeze_frame_capture test/test_entity_freeze_frame_capture.cpp)
   target_link_libraries(test_entity_freeze_frame_capture gateway_ros2)
   medkit_target_dependencies(test_entity_freeze_frame_capture rclcpp ros2_medkit_msgs)
-  medkit_set_test_domain(test_entity_freeze_frame_capture)
 
   # Add update manager tests
-  ament_add_gtest(test_update_manager test/test_update_manager.cpp)
+  medkit_add_gtest(test_update_manager test/test_update_manager.cpp)
   target_link_libraries(test_update_manager gateway_ros2)
 
   # Add script manager tests
-  ament_add_gtest(test_script_manager test/test_script_manager.cpp)
+  medkit_add_gtest(test_script_manager test/test_script_manager.cpp)
   target_link_libraries(test_script_manager gateway_ros2)
 
   # Add default script provider tests
-  ament_add_gtest(test_default_script_provider test/test_default_script_provider.cpp)
+  medkit_add_gtest(test_default_script_provider test/test_default_script_provider.cpp)
   target_link_libraries(test_default_script_provider gateway_ros2)
 
   # Add script handler tests
-  ament_add_gtest(test_script_handlers test/test_script_handlers.cpp)
+  medkit_add_gtest(test_script_handlers test/test_script_handlers.cpp)
   target_link_libraries(test_script_handlers gateway_ros2)
-  medkit_set_test_domain(test_script_handlers)
 
   # Add data handler tests
-  ament_add_gtest(test_data_handlers test/test_data_handlers.cpp)
+  medkit_add_gtest(test_data_handlers test/test_data_handlers.cpp)
   target_link_libraries(test_data_handlers gateway_ros2)
 
   # Add auth handler tests
-  ament_add_gtest(test_auth_handlers test/test_auth_handlers.cpp)
+  medkit_add_gtest(test_auth_handlers test/test_auth_handlers.cpp)
   target_link_libraries(test_auth_handlers gateway_ros2)
 
   # Add health handler tests
-  ament_add_gtest(test_health_handlers test/test_health_handlers.cpp)
+  medkit_add_gtest(test_health_handlers test/test_health_handlers.cpp)
   target_link_libraries(test_health_handlers gateway_ros2)
-  medkit_set_test_domain(test_health_handlers)
 
   # Add lifecycle handler tests
-  ament_add_gtest(test_lifecycle_handlers test/test_lifecycle_handlers.cpp)
+  medkit_add_gtest(test_lifecycle_handlers test/test_lifecycle_handlers.cpp)
   target_link_libraries(test_lifecycle_handlers gateway_ros2)
   medkit_target_dependencies(test_lifecycle_handlers rclcpp)
-  medkit_set_test_domain(test_lifecycle_handlers)
 
   # Lifecycle status helpers (pure C++17, no ROS node)
-  ament_add_gtest(test_lifecycle_status_helpers test/test_lifecycle_status_helpers.cpp)
+  medkit_add_gtest(test_lifecycle_status_helpers test/test_lifecycle_status_helpers.cpp)
   target_link_libraries(test_lifecycle_status_helpers gateway_core)
-  medkit_set_test_domain(test_lifecycle_status_helpers)
 
   # GetState-backed lifecycle state reader (ROS 2 in-process service)
-  ament_add_gtest(test_ros2_lifecycle_state_reader test/test_ros2_lifecycle_state_reader.cpp)
+  medkit_add_gtest(test_ros2_lifecycle_state_reader test/test_ros2_lifecycle_state_reader.cpp)
   target_link_libraries(test_ros2_lifecycle_state_reader gateway_ros2)
   medkit_target_dependencies(test_ros2_lifecycle_state_reader rclcpp lifecycle_msgs)
-  medkit_set_test_domain(test_ros2_lifecycle_state_reader)
 
   # Add operation handler tests
-  ament_add_gtest(test_operation_handlers test/test_operation_handlers.cpp)
+  medkit_add_gtest(test_operation_handlers test/test_operation_handlers.cpp)
   target_link_libraries(test_operation_handlers gateway_ros2)
   medkit_target_dependencies(test_operation_handlers rclcpp rclcpp_action std_srvs example_interfaces)
-  medkit_set_test_domain(test_operation_handlers)
 
   # Demo update backend plugin (.so for integration tests)
   add_library(test_update_backend MODULE
@@ -927,29 +913,28 @@ if(BUILD_TESTING)
   install(TARGETS test_minimal_plugin LIBRARY DESTINATION lib/${PROJECT_NAME})
 
   # Add plugin loader tests
-  ament_add_gtest(test_plugin_loader test/test_plugin_loader.cpp)
+  medkit_add_gtest(test_plugin_loader test/test_plugin_loader.cpp)
   target_link_libraries(test_plugin_loader gateway_ros2)
   medkit_target_dependencies(test_plugin_loader ament_index_cpp)
 
   # Plugin config from YAML tests
-  ament_add_gtest(test_plugin_config test/test_plugin_config.cpp)
+  medkit_add_gtest(test_plugin_config test/test_plugin_config.cpp)
   target_link_libraries(test_plugin_config gateway_ros2)
-  medkit_set_test_domain(test_plugin_config)
 
   # Plugin manager tests
-  ament_add_gtest(test_plugin_manager test/test_plugin_manager.cpp)
+  medkit_add_gtest(test_plugin_manager test/test_plugin_manager.cpp)
   target_link_libraries(test_plugin_manager gateway_ros2)
 
   # Plugin entity routing tests
-  ament_add_gtest(test_plugin_entity_routing test/test_plugin_entity_routing.cpp)
+  medkit_add_gtest(test_plugin_entity_routing test/test_plugin_entity_routing.cpp)
   target_link_libraries(test_plugin_entity_routing gateway_ros2)
 
   # Lifecycle provider routing tests
-  ament_add_gtest(test_lifecycle_provider_routing test/test_lifecycle_provider_routing.cpp)
+  medkit_add_gtest(test_lifecycle_provider_routing test/test_lifecycle_provider_routing.cpp)
   target_link_libraries(test_lifecycle_provider_routing gateway_ros2)
 
   # Plugin HTTP types tests
-  ament_add_gtest(test_plugin_http_types test/test_plugin_http_types.cpp)
+  medkit_add_gtest(test_plugin_http_types test/test_plugin_http_types.cpp)
   target_link_libraries(test_plugin_http_types gateway_ros2)
 
   # Plugin ABI conformance tests
@@ -958,131 +943,125 @@ if(BUILD_TESTING)
   # the production PluginLoader entry point. Locks in the wire-format contract
   # so refactors that would break commercial out-of-tree plugins (UDS, OPC-UA,
   # Uptane OTA, Mender OTA) fail loudly here.
-  ament_add_gtest(test_plugin_abi_conformance test/test_plugin_abi_conformance.cpp)
+  medkit_add_gtest(test_plugin_abi_conformance test/test_plugin_abi_conformance.cpp)
   target_link_libraries(test_plugin_abi_conformance gateway_ros2)
   medkit_target_dependencies(test_plugin_abi_conformance ament_index_cpp)
 
   # Log manager tests
-  # Takes a ROS_DOMAIN_ID from the package pool to prevent cross-talk with concurrent
-  # integration tests
-  ament_add_gtest(test_log_manager test/test_log_manager.cpp)
+  medkit_add_gtest(test_log_manager test/test_log_manager.cpp)
   target_link_libraries(test_log_manager gateway_ros2)
-  medkit_set_test_domain(test_log_manager)
 
   # Log handlers tests
-  ament_add_gtest(test_log_handlers test/test_log_handlers.cpp)
+  medkit_add_gtest(test_log_handlers test/test_log_handlers.cpp)
   target_link_libraries(test_log_handlers gateway_ros2)
 
   # Log scope tests (entity -> log-source resolution shared by handlers and samplers)
-  ament_add_gtest(test_log_scope test/test_log_scope.cpp)
+  medkit_add_gtest(test_log_scope test/test_log_scope.cpp)
   target_link_libraries(test_log_scope gateway_ros2)
 
   # Route descriptions tests (OpenAPI doc builder)
-  ament_add_gtest(test_route_descriptions test/test_route_descriptions.cpp)
+  medkit_add_gtest(test_route_descriptions test/test_route_descriptions.cpp)
   target_link_libraries(test_route_descriptions gateway_ros2)
 
   # Schema builder tests (OpenAPI schema generation)
-  ament_add_gtest(test_schema_builder test/test_schema_builder.cpp)
+  medkit_add_gtest(test_schema_builder test/test_schema_builder.cpp)
   target_link_libraries(test_schema_builder gateway_ros2)
 
   # Path builder tests (OpenAPI path item generation)
-  ament_add_gtest(test_path_builder test/test_path_builder.cpp)
+  medkit_add_gtest(test_path_builder test/test_path_builder.cpp)
   target_link_libraries(test_path_builder gateway_ros2)
 
   # OpenAPI spec builder tests (full document assembly)
-  ament_add_gtest(test_openapi_spec_builder test/test_openapi_spec_builder.cpp)
+  medkit_add_gtest(test_openapi_spec_builder test/test_openapi_spec_builder.cpp)
   target_link_libraries(test_openapi_spec_builder gateway_ros2)
 
   # Path resolver tests (OpenAPI path classification)
-  ament_add_gtest(test_path_resolver test/test_path_resolver.cpp)
+  medkit_add_gtest(test_path_resolver test/test_path_resolver.cpp)
   target_link_libraries(test_path_resolver gateway_ros2)
 
   # Capability generator tests (OpenAPI spec generation engine)
-  ament_add_gtest(test_capability_generator test/test_capability_generator.cpp)
+  medkit_add_gtest(test_capability_generator test/test_capability_generator.cpp)
   target_link_libraries(test_capability_generator gateway_ros2)
-  medkit_set_test_domain(test_capability_generator)
 
   # Route registry tests (OpenAPI route registration and path conversion)
-  ament_add_gtest(test_route_registry test/test_route_registry.cpp)
+  medkit_add_gtest(test_route_registry test/test_route_registry.cpp)
   target_link_libraries(test_route_registry gateway_ros2)
 
   # Typed RouteRegistry overload tests (PR-403 commit 4 typed router wrappers)
-  ament_add_gtest(test_typed_route_registry test/test_typed_route_registry.cpp)
+  medkit_add_gtest(test_typed_route_registry test/test_typed_route_registry.cpp)
   target_link_libraries(test_typed_route_registry gateway_core)
 
   # Docs handlers tests (OpenAPI /docs endpoint handlers)
-  ament_add_gtest(test_docs_handlers test/test_docs_handlers.cpp)
+  medkit_add_gtest(test_docs_handlers test/test_docs_handlers.cpp)
   target_link_libraries(test_docs_handlers gateway_ros2)
-  medkit_set_test_domain(test_docs_handlers)
 
   # Lock manager tests
-  ament_add_gtest(test_lock_manager test/test_lock_manager.cpp)
+  medkit_add_gtest(test_lock_manager test/test_lock_manager.cpp)
   target_link_libraries(test_lock_manager gateway_ros2)
 
   # Lock handlers tests
-  ament_add_gtest(test_lock_handlers test/test_lock_handlers.cpp)
+  medkit_add_gtest(test_lock_handlers test/test_lock_handlers.cpp)
   target_link_libraries(test_lock_handlers gateway_ros2)
-  medkit_set_test_domain(test_lock_handlers)
 
   # Condition evaluator tests (trigger condition interface + built-in evaluators)
-  ament_add_gtest(test_condition_evaluator test/test_condition_evaluator.cpp)
+  medkit_add_gtest(test_condition_evaluator test/test_condition_evaluator.cpp)
   target_link_libraries(test_condition_evaluator gateway_ros2)
 
   # Resource change notifier tests (async notification hub for triggers)
-  ament_add_gtest(test_resource_change_notifier test/test_resource_change_notifier.cpp TIMEOUT 180)
+  medkit_add_gtest(test_resource_change_notifier test/test_resource_change_notifier.cpp TIMEOUT 180)
   target_link_libraries(test_resource_change_notifier gateway_ros2)
 
   # Trigger store tests (SQLite persistence for triggers)
-  ament_add_gtest(test_trigger_store test/test_trigger_store.cpp)
+  medkit_add_gtest(test_trigger_store test/test_trigger_store.cpp)
   target_link_libraries(test_trigger_store gateway_ros2)
 
   # Trigger manager tests (CRUD, condition eval, hierarchy matching)
-  ament_add_gtest(test_trigger_manager test/test_trigger_manager.cpp)
+  medkit_add_gtest(test_trigger_manager test/test_trigger_manager.cpp)
   target_link_libraries(test_trigger_manager gateway_ros2)
 
   # Trigger handler tests (REST endpoints for triggers)
-  ament_add_gtest(test_trigger_handlers test/test_trigger_handlers.cpp)
+  medkit_add_gtest(test_trigger_handlers test/test_trigger_handlers.cpp)
   target_link_libraries(test_trigger_handlers gateway_ros2)
 
   # Fault-trigger (threshold-rule) engine tests (issue #235): CRUD, validation,
   # edge-detection, persistence. Links gateway_core only (ROS-neutral).
-  ament_add_gtest(test_fault_trigger_engine test/test_fault_trigger_engine.cpp)
+  medkit_add_gtest(test_fault_trigger_engine test/test_fault_trigger_engine.cpp)
   target_link_libraries(test_fault_trigger_engine gateway_core)
 
   # Data-point suggestion helpers (issue #584): header-only, ROS-neutral.
-  ament_add_gtest(test_data_point_suggest test/test_data_point_suggest.cpp)
+  medkit_add_gtest(test_data_point_suggest test/test_data_point_suggest.cpp)
   target_link_libraries(test_data_point_suggest gateway_core)
 
   # Peer client tests (aggregation module)
-  ament_add_gtest(test_peer_client test/test_peer_client.cpp)
+  medkit_add_gtest(test_peer_client test/test_peer_client.cpp)
   target_link_libraries(test_peer_client gateway_ros2)
 
   # Entity merger tests (aggregation module)
-  ament_add_gtest(test_entity_merger test/test_entity_merger.cpp)
+  medkit_add_gtest(test_entity_merger test/test_entity_merger.cpp)
   target_link_libraries(test_entity_merger gateway_ros2)
 
   # Fan-out helper tests (shared URL encoding and peer merge utilities)
-  ament_add_gtest(test_fan_out_helpers test/test_fan_out_helpers.cpp)
+  medkit_add_gtest(test_fan_out_helpers test/test_fan_out_helpers.cpp)
   target_link_libraries(test_fan_out_helpers gateway_ros2)
 
   # Aggregation manager tests (aggregation module)
-  ament_add_gtest(test_aggregation_manager test/test_aggregation_manager.cpp)
+  medkit_add_gtest(test_aggregation_manager test/test_aggregation_manager.cpp)
   target_link_libraries(test_aggregation_manager gateway_ros2)
 
   # Aggregation classification tests (hierarchical vs leaf Component routing)
-  ament_add_gtest(test_aggregation_classification test/test_aggregation_classification.cpp)
+  medkit_add_gtest(test_aggregation_classification test/test_aggregation_classification.cpp)
   target_link_libraries(test_aggregation_classification gateway_ros2)
 
   # Stream proxy tests (SSE parsing, aggregation module)
-  ament_add_gtest(test_stream_proxy test/test_stream_proxy.cpp)
+  medkit_add_gtest(test_stream_proxy test/test_stream_proxy.cpp)
   target_link_libraries(test_stream_proxy gateway_ros2)
 
   # mDNS discovery tests (aggregation module)
-  ament_add_gtest(test_mdns_discovery test/test_mdns_discovery.cpp)
+  medkit_add_gtest(test_mdns_discovery test/test_mdns_discovery.cpp)
   target_link_libraries(test_mdns_discovery gateway_ros2)
 
   # Network utility tests (URL parsing, local address collection)
-  ament_add_gtest(test_network_utils test/test_network_utils.cpp)
+  medkit_add_gtest(test_network_utils test/test_network_utils.cpp)
   target_link_libraries(test_network_utils gateway_ros2)
 
   # ─── Allocation-counter proxy gate (gateway_core only) ────────────────────
@@ -1090,8 +1069,10 @@ if(BUILD_TESTING)
   # g_armed). Proves update_all performs ~zero net structural allocations in
   # steady-state churn over a bounded id-set. Must be its OWN executable so
   # the operator new override does not bleed into other test binaries.
-  # No medkit_set_test_domain - this is ROS-free (gateway_core only).
-  ament_add_gtest(test_entity_cache_alloc test/test_entity_cache_alloc.cpp)
+  # gateway_core only, so nothing here creates a ROS entity - but it still goes
+  # through medkit_add_gtest, because "this one does not need a domain" is a
+  # judgement that ages badly the moment a case adds a node.
+  medkit_add_gtest(test_entity_cache_alloc test/test_entity_cache_alloc.cpp)
   target_link_libraries(test_entity_cache_alloc gateway_core)
 
   ros2_medkit_relax_vendor_warnings()

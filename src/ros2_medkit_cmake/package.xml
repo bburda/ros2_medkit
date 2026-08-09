@@ -9,7 +9,15 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
+  <!-- The test-domain wrapper scripts every package runs import these. -->
+  <exec_depend>ament_cmake_test</exec_depend>
+  <exec_depend>domain_coordinator</exec_depend>
+
   <test_depend>ament_cmake_flake8</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>std_msgs</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

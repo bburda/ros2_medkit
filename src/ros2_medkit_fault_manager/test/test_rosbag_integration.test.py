@@ -131,9 +131,9 @@ if __name__ == '__main__':
     script_file.close()
     PUBLISHER_SCRIPT_PATH = script_file.name
 
-    # Inherit the per-test ROS_DOMAIN_ID that CMake injects via
-    # medkit_set_test_domain, so this test is isolated from other packages
-    # running in parallel. ROS_LOCALHOST_ONLY keeps discovery on loopback.
+    # Inherit the ROS_DOMAIN_ID the domain wrapper allocated for this test, so
+    # it is isolated from everything else running in parallel.
+    # ROS_LOCALHOST_ONLY keeps discovery on loopback.
     env = os.environ.copy()
     env['ROS_LOCALHOST_ONLY'] = '1'
 

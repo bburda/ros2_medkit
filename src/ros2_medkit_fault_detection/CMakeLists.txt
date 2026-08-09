@@ -20,6 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCoverage)
+include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
@@ -57,15 +58,23 @@ if(BUILD_TESTING)
   find_package(ament_cmake_clang_format QUIET)
   if(ament_cmake_clang_format_FOUND)
     file(GLOB_RECURSE _format_files "include/*.hpp" "test/*.cpp")
+    medkit_lint_config(.clang-format _clang_format_config)
     ament_clang_format(${_format_files}
-      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
+      CONFIG_FILE "${_clang_format_config}")
   endif()
 
   find_package(ament_cmake_gtest REQUIRED)
+
+  include(ROS2MedkitTestDomain)
   ament_add_gtest(test_fault_detection test/test_fault_detection.cpp)
   target_link_libraries(test_fault_detection ros2_medkit_fault_detection)
 
   ros2_medkit_relax_vendor_warnings()
+  # No ROS middleware on the link line and none loaded at run time (these pass
+  # with RMW_IMPLEMENTATION pointing at a library that does not exist), so there
+  # is no DDS participant to isolate and a wrapper would be cost without cover.
+  medkit_test_needs_no_domain(test_fault_detection)
+
 endif()
 
 ament_package()
