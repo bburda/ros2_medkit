@@ -345,14 +345,15 @@ def main():
     server_bin = Path(sys.argv[1]).resolve()
     gen_certs = Path(sys.argv[2]).resolve()
 
-    # ROS_DOMAIN_ID must come from CTest's ENVIRONMENT property (see
-    # ros2_medkit_opcua's CMakeLists.txt and ROS2MedkitTestDomain.cmake). A
-    # missing value is a wiring bug, not something to paper over with a
-    # literal, so fail loudly instead of guessing a domain.
+    # ROS_DOMAIN_ID comes from the domain wrapper this test is registered behind
+    # (see ros2_medkit_opcua's CMakeLists.txt and ROS2MedkitTestDomain.cmake),
+    # which holds it for as long as this process runs. A missing value is a
+    # wiring bug, not something to paper over with a literal, so fail loudly
+    # instead of guessing a domain.
     ros_domain_id = os.environ.get('ROS_DOMAIN_ID')
     if not ros_domain_id:
         print('ROS_DOMAIN_ID is not set: this test must be launched by CTest, which '
-              'assigns it a domain from the ros2_medkit_opcua pool', file=sys.stderr)
+              'runs it behind medkit_run_with_domain.py', file=sys.stderr)
         return 1
 
     # --- Prerequisite gating (skip 77 unless required) ---------------------

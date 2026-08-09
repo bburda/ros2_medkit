@@ -15,352 +15,327 @@
 # ROS_DOMAIN_ID allocation for tests.
 #
 # ---------------------------------------------------------------------------
-# Why the allocation is not simply 1-232
+# What this does
 # ---------------------------------------------------------------------------
 #
-# RTPS gives every DDS domain a 250-port slice of the UDP space:
+# Every test registered through the macros below runs behind a wrapper that
+# takes a DDS domain when the test starts, holds it through an open socket for
+# exactly as long as the test runs, and gives it back when the test process
+# ends - including when it is killed, because the kernel closes the socket.
 #
-#   slice(d) = [7400 + 250 * d, 7400 + 250 * d + 249]
+# Nothing here decides which domain a test gets, and nothing here has to know
+# how many tests a package has. There is no table to extend, no per-package
+# pool to size and no disjointness to maintain: the socket is the allocation.
 #
-# Cyclone DDS 0.10.5, what both Humble and Jazzy ship, binds the multicast
-# sockets at offsets 0 and 1 unconditionally, on every configuration -
-# ddsi_portmapping.c forces the participant index to 0 for both multicast
-# cases, so the index never enters into it. Those sockets do set both
-# SO_REUSEPORT and SO_REUSEADDR, but a collision there is still fatal:
-# Linux only grants the reuse exemption when every socket that ever held
-# the port opted in, so an ordinary socket already sitting on it blocks
-# the bind regardless. A failed multicast bind aborts domain creation, so
-# this is the failure that actually kills a node:
+# That socket is also why the isolation reaches across packages. colcon runs one
+# ctest per package, in parallel, and a CTest RESOURCE_LOCK only binds inside a
+# single ctest run - which is what used to force every package onto its own
+# range. Two processes contending for the same port do not care which ctest run
+# started them.
 #
-#   ddsi_udp_create_conn: failed to bind to ANY:53150: address in use
-#   rmw_create_node: failed to create domain, error Error
-#
-# 53150 is 7400 + 250 * 183, the multicast base port of domain 183 - the
-# failure above is exactly the case this scheme protects against.
-#
-# The unicast sockets, at offsets 10 + 2p and 11 + 2p for participant
-# index p, depend on Discovery/ParticipantIndex. On Humble,
-# rmw_cyclonedds_cpp emits no <Discovery> element, so the default "none"
-# applies and the single unicast socket gets a kernel-assigned port with
-# no relation to the domain. On Jazzy, rmw_cyclonedds_cpp injects
-# <ParticipantIndex>auto</ParticipantIndex> with MaxAutoParticipantIndex
-# 32, so unicast does land on offsets 10 through 75 - but a collision
-# there is not fatal, it just advances to the next participant index.
-#
-# Fast DDS 3.6.2 (Lyrical) derives every listening port from the formula
-# and never falls back to a kernel-assigned one; its participant id
-# mutates by +2 for up to 100 tries on collision. A failed multicast bind
-# there is only a warning, so discovery degrades instead of the process
-# dying.
-#
-# What keeping a domain's slice out of the ephemeral range buys, then: on
-# every distro it protects offsets 0 and 1, the one collision that is
-# fatal. On Jazzy it additionally covers offsets 10 through 75. On Humble
-# the unicast socket sits outside the scheme entirely and needs no
-# protection, since a kernel-assigned port is free by construction.
-#
-# The protection is deterministic rather than statistical: once a socket
-# with the reuse options holds a port, the kernel will not also hand that
-# port out as an ephemeral one. The race runs one way - the unrelated
-# process has to grab the port before the participant starts, never the
-# other way around.
-#
-# The kernel hands out ephemeral ports from net.ipv4.ip_local_port_range, which
-# defaults to 32768-60999. Any unrelated process - a browser, a package manager,
-# a second test run - can be given a port in that range, and if it is one of
-# ours the whole domain stops working. Mapped back through the formula, the
-# default range covers domains 101 to 214 - domain 101's slice, 32650-32899,
-# already overlaps the range starting at 32768.
-#
-# The usable domains are the ones whose whole slice sits outside that range:
-# 1-100 and 215-231. Domain 0 stays free because it is the ROS 2 default a
-# developer shell uses, and 232 is dropped because its slice runs past 65535.
-#
-# That is 117 domains for more test slots than that, so packages draw from a
-# pool and reuse domains inside it. CTest never runs two tests that share a
-# domain at the same time, because every domain also installs a RESOURCE_LOCK -
-# which matters because scripts/test.sh runs `ctest -j $(nproc)`, so tests
-# inside one package really do run concurrently.
+# The band the wrapper draws from, and the reasoning behind it, live in
+# scripts/medkit_domain.py next to the code that uses them.
 #
 # ---------------------------------------------------------------------------
-# The allocation table
+# Registering a test
 # ---------------------------------------------------------------------------
 #
-# colcon runs one CTest per package, in parallel across packages, and a
-# RESOURCE_LOCK only binds inside a single CTest run. Cross-package isolation
-# therefore comes from the pools being disjoint, which is checked below rather
-# than trusted.
+#   medkit_add_gtest(test_foo test/test_foo.cpp)          # instead of ament_add_gtest
+#   medkit_add_gmock(test_bar test/test_bar.cpp)          # instead of ament_add_gmock
+#   medkit_add_launch_test(test_e2e test/test_e2e.test.py TIMEOUT 120)
+#   medkit_add_pytest_test(test_py test/test_py.py)
+#   medkit_add_wrapped_test(test_script COMMAND "${Python3_EXECUTABLE}" "${_script}")
 #
-# The table is the single source of truth. A package names itself and gets its
-# pool from here, so a range cannot drift between this file and a CMakeLists.txt.
+# All of them take an optional DOMAINS <n> for a test that needs more than one
+# domain at a time. The first is exported as ROS_DOMAIN_ID and the rest as
+# MEDKIT_SECONDARY_DOMAINS, which ros2_medkit_test_utils.constants reads.
 #
-# Pools are sized to the number of tests that hold a domain plus headroom; the
-# two largest pools are deliberately smaller than their test count and rely on
-# reuse. The safe band is fully allocated, so a new package takes its slots from
-# a pool that has headroom.
-set(MEDKIT_DOMAIN_TABLE
-  "ros2_medkit_sovd_service_interface:1-2"
-  "ros2_medkit_param_beacon:3-4"
-  "ros2_medkit_topic_beacon:5-6"
-  "ros2_medkit_graph_provider:7-8"
-  "ros2_medkit_fault_reporter:9-11"
-  "ros2_medkit_log_bridge:12-14"
-  "ros2_medkit_action_status_bridge:15-17"
-  "ros2_medkit_diagnostic_bridge:18-20"
-  "ros2_medkit_fault_manager:21-32"
-  "ros2_medkit_opcua:33-44"
-  "ros2_medkit_graph_watchdog:45-54"
-  "ros2_medkit_gateway:55-79"
-  "ros2_medkit_integration_tests:80-100,215-228"
-)
-
-# Secondary pool for tests that need MORE than one domain at a time (a
-# multi-gateway test runs its second and third gateway on their own domains).
-# Shared by every such test and serialised with a RESOURCE_LOCK, so it does not
-# grow with the number of them. Exported to Python through
-# MEDKIT_SECONDARY_DOMAINS so the test utils do not repeat the numbers.
-set(MEDKIT_SECONDARY_DOMAIN_RANGE "229-231")
-
-set(_MEDKIT_RTPS_PORT_BASE 7400)
-set(_MEDKIT_RTPS_DOMAIN_GAIN 250)
+# A test that creates no ROS entities at all can say so with
+# medkit_test_needs_no_domain(<test>), and test_dds_domain_allocation reports
+# every test that does neither.
 
 # Where this module lives, captured at include time. Inside a macro,
 # CMAKE_CURRENT_LIST_DIR would point at the calling CMakeLists.txt instead.
 set(_MEDKIT_TEST_DOMAIN_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
-# ---------------------------------------------------------------------------
-# Ephemeral port range
-# ---------------------------------------------------------------------------
-#
-# Read from the running kernel, then widened to at least the Linux default. The
-# widening matters: without it, configuring on a host with a narrow range would
-# accept an allocation that breaks on a stock machine, and the check would only
-# fail for whoever happened to run it last.
-set(_MEDKIT_EPHEMERAL_LOW 32768)
-set(_MEDKIT_EPHEMERAL_HIGH 60999)
-set(_MEDKIT_EPHEMERAL_SOURCE "Linux default; kernel range not readable")
-if(EXISTS "/proc/sys/net/ipv4/ip_local_port_range")
-  file(READ "/proc/sys/net/ipv4/ip_local_port_range" _medkit_range_raw)
-  if(_medkit_range_raw MATCHES "([0-9]+)[ \t]+([0-9]+)")
-    set(_medkit_sys_low ${CMAKE_MATCH_1})
-    set(_medkit_sys_high ${CMAKE_MATCH_2})
-    set(_MEDKIT_EPHEMERAL_SOURCE
-      "net.ipv4.ip_local_port_range=${_medkit_sys_low}-${_medkit_sys_high}, widened to the Linux default")
-    if(_medkit_sys_low LESS _MEDKIT_EPHEMERAL_LOW)
-      set(_MEDKIT_EPHEMERAL_LOW ${_medkit_sys_low})
-    endif()
-    if(_medkit_sys_high GREATER _MEDKIT_EPHEMERAL_HIGH)
-      set(_MEDKIT_EPHEMERAL_HIGH ${_medkit_sys_high})
-    endif()
-  endif()
+# The scripts are installed next to the modules, so an installed module finds
+# them beside itself. ros2_medkit_cmake includes this module out of its own
+# source tree, where they are one directory over.
+if(EXISTS "${_MEDKIT_TEST_DOMAIN_MODULE_DIR}/../scripts/medkit_domain.py")
+  get_filename_component(MEDKIT_TEST_DOMAIN_SCRIPT_DIR
+    "${_MEDKIT_TEST_DOMAIN_MODULE_DIR}/../scripts" ABSOLUTE)
+else()
+  set(MEDKIT_TEST_DOMAIN_SCRIPT_DIR "${_MEDKIT_TEST_DOMAIN_MODULE_DIR}")
 endif()
 
-# Expand "1-2,215-228" into a flat list of domain IDs.
-function(_medkit_expand_domain_ranges RANGE_SPEC OUT_VAR)
-  set(_domains "")
-  string(REPLACE "," ";" _ranges "${RANGE_SPEC}")
-  foreach(_range IN LISTS _ranges)
-    if(NOT _range MATCHES "^([0-9]+)-([0-9]+)$")
-      message(FATAL_ERROR
-        "ROS2MedkitTestDomain: malformed domain range '${_range}' in '${RANGE_SPEC}' "
-        "(expected '<start>-<end>')")
-    endif()
-    set(_start ${CMAKE_MATCH_1})
-    set(_end ${CMAKE_MATCH_2})
-    if(_start GREATER _end)
-      message(FATAL_ERROR
-        "ROS2MedkitTestDomain: inverted domain range '${_range}' in '${RANGE_SPEC}'")
-    endif()
-    foreach(_d RANGE ${_start} ${_end})
-      list(APPEND _domains ${_d})
-    endforeach()
-  endforeach()
-  set(${OUT_VAR} "${_domains}" PARENT_SCOPE)
-endfunction()
+# Replaces ament's run_test.py, so the domain is held by the process that
+# already supervises the test command rather than by one added in front of it.
+set(MEDKIT_TEST_DOMAIN_RUNNER "${MEDKIT_TEST_DOMAIN_SCRIPT_DIR}/medkit_domain_runner.py")
+# For tests registered with a plain add_test, which build their own command.
+set(MEDKIT_TEST_DOMAIN_EXEC "${MEDKIT_TEST_DOMAIN_SCRIPT_DIR}/medkit_run_with_domain.py")
+set(_MEDKIT_TEST_DOMAIN_CHECK "${MEDKIT_TEST_DOMAIN_SCRIPT_DIR}/check_test_domains.py")
+# Fixture behind the cross-talk probes; see scripts/domain_crosstalk_peer.py.
+set(MEDKIT_TEST_DOMAIN_CROSSTALK_PEER
+  "${MEDKIT_TEST_DOMAIN_SCRIPT_DIR}/domain_crosstalk_peer.py")
 
-# Fail if any domain in the list would bind a port the kernel can hand to
-# somebody else, or a port outside the legal UDP space.
-function(_medkit_assert_domains_safe OWNER DOMAINS)
-  foreach(_d IN LISTS DOMAINS)
-    if(_d EQUAL 0)
-      message(FATAL_ERROR
-        "ROS2MedkitTestDomain: ${OWNER} claims domain 0, which is the ROS 2 default and "
-        "belongs to whoever is using the machine. Pick another domain.")
-    endif()
-    math(EXPR _slice_low "${_MEDKIT_RTPS_PORT_BASE} + ${_MEDKIT_RTPS_DOMAIN_GAIN} * ${_d}")
-    math(EXPR _slice_high "${_slice_low} + ${_MEDKIT_RTPS_DOMAIN_GAIN} - 1")
-    if(_slice_high GREATER 65535)
-      message(FATAL_ERROR
-        "ROS2MedkitTestDomain: ${OWNER} claims domain ${_d}, whose UDP slice "
-        "${_slice_low}-${_slice_high} runs past 65535. The highest usable domain is 231.")
-    endif()
-    if(NOT (_slice_high LESS _MEDKIT_EPHEMERAL_LOW OR _slice_low GREATER _MEDKIT_EPHEMERAL_HIGH))
-      message(FATAL_ERROR
-        "ROS2MedkitTestDomain: ${OWNER} claims domain ${_d}, whose UDP slice "
-        "${_slice_low}-${_slice_high} overlaps the kernel ephemeral port range "
-        "${_MEDKIT_EPHEMERAL_LOW}-${_MEDKIT_EPHEMERAL_HIGH} (${_MEDKIT_EPHEMERAL_SOURCE}). "
-        "Any process on the machine can be given one of those ports, and the test then dies "
-        "with 'failed to bind to ANY:<port>: address in use'. Use a domain in 1-100 or 215-231.")
-    endif()
-  endforeach()
-endfunction()
-
-# Validate the whole table on every include, not only the pool being asked for.
-# A package that is not currently being built still cannot hold an unsafe or
-# overlapping range without the next build of any other package saying so.
-function(_medkit_validate_domain_table)
-  set(_seen "")
-  set(_all_specs ${MEDKIT_DOMAIN_TABLE} "secondary pool:${MEDKIT_SECONDARY_DOMAIN_RANGE}")
-  foreach(_entry IN LISTS _all_specs)
-    if(NOT _entry MATCHES "^([^:]+):(.+)$")
-      message(FATAL_ERROR "ROS2MedkitTestDomain: malformed table entry '${_entry}'")
-    endif()
-    set(_owner "${CMAKE_MATCH_1}")
-    _medkit_expand_domain_ranges("${CMAKE_MATCH_2}" _domains)
-    _medkit_assert_domains_safe("${_owner}" "${_domains}")
-    foreach(_d IN LISTS _domains)
-      if(_d IN_LIST _seen)
-        message(FATAL_ERROR
-          "ROS2MedkitTestDomain: domain ${_d} is allocated twice; '${_owner}' overlaps an "
-          "earlier entry. Pools must be disjoint - colcon runs packages in parallel and a "
-          "RESOURCE_LOCK does not reach across CTest runs.")
-      endif()
-      list(APPEND _seen ${_d})
-    endforeach()
-  endforeach()
-endfunction()
-
-_medkit_validate_domain_table()
-
-# Initialize the domain pool for a package.
-# Must be called once per CMakeLists.txt, before any other macro here.
-#
-# Usage:
-#   medkit_init_test_domains(PACKAGE ros2_medkit_gateway)
-#
-macro(medkit_init_test_domains)
-  cmake_parse_arguments(_MTID "" "PACKAGE" "" ${ARGN})
-  if(NOT DEFINED _MTID_PACKAGE)
-    message(FATAL_ERROR "medkit_init_test_domains requires a PACKAGE argument")
-  endif()
-  set(_MEDKIT_DOMAIN_POOL "")
-  set(_MTID_MATCHES 0)
-  foreach(_mtid_entry IN LISTS MEDKIT_DOMAIN_TABLE)
-    if(_mtid_entry MATCHES "^${_MTID_PACKAGE}:(.+)$")
-      _medkit_expand_domain_ranges("${CMAKE_MATCH_1}" _MEDKIT_DOMAIN_POOL)
-      math(EXPR _MTID_MATCHES "${_MTID_MATCHES} + 1")
-    endif()
-  endforeach()
-  if(_MTID_MATCHES GREATER 1)
+foreach(_medkit_required_script
+  "${MEDKIT_TEST_DOMAIN_RUNNER}"
+  "${MEDKIT_TEST_DOMAIN_EXEC}"
+  "${_MEDKIT_TEST_DOMAIN_CHECK}")
+  if(NOT EXISTS "${_medkit_required_script}")
     message(FATAL_ERROR
-      "medkit_init_test_domains: '${_MTID_PACKAGE}' appears ${_MTID_MATCHES} times in "
-      "MEDKIT_DOMAIN_TABLE, and only the last entry would be used. Give the package one "
-      "entry with comma-separated ranges instead, e.g. '80-100,215-228'.")
+      "ROS2MedkitTestDomain: ${_medkit_required_script} is missing. Without it a test "
+      "would silently run on the default domain 0 and see every node on the machine.")
   endif()
-  if(NOT _MEDKIT_DOMAIN_POOL)
+endforeach()
+
+# Record how many domains a registered test needs, for the wrapper to read and
+# for test_dds_domain_allocation to check.
+#
+# APPEND, so a caller may add its own environment entries. Use
+# set_property(TEST ... APPEND PROPERTY ENVIRONMENT ...) for those: a plain
+# set_tests_properties(... PROPERTIES ENVIRONMENT ...) after this call replaces
+# the count instead of adding to it, and the domain check says so.
+macro(_medkit_declare_domains TEST_NAME COUNT)
+  if(NOT "${COUNT}" MATCHES "^[1-9][0-9]*$")
     message(FATAL_ERROR
-      "medkit_init_test_domains: no domain pool for '${_MTID_PACKAGE}'. Add one to "
-      "MEDKIT_DOMAIN_TABLE in ROS2MedkitTestDomain.cmake - the safe band is fully "
-      "allocated, so take the slots from a pool that has headroom.")
+      "medkit test domains: DOMAINS must be a positive integer, got '${COUNT}' for "
+      "${TEST_NAME}. A test that needs no domain uses medkit_test_needs_no_domain().")
   endif()
-  set(_MEDKIT_DOMAIN_OWNER ${_MTID_PACKAGE})
-  set(_MEDKIT_DOMAIN_NEXT 0)
-  list(LENGTH _MEDKIT_DOMAIN_POOL _MEDKIT_DOMAIN_POOL_SIZE)
+  set_property(TEST ${TEST_NAME} APPEND PROPERTY ENVIRONMENT "MEDKIT_TEST_DOMAINS=${COUNT}")
 endmacro()
 
-# Take the next domain from the pool, with its lock name.
-#
-# Wraps around when the pool is exhausted, so a package may hold more tests than
-# it has domains. Reuse stays safe only if the caller puts the returned lock on
-# the test: CTest will not schedule two tests holding the same lock at once.
-# Prefer medkit_set_test_domain, which does both.
+# ament_add_gtest with a domain. Same arguments, plus DOMAINS <n>.
 #
 # Usage:
-#   medkit_reserve_test_domain(_my_domain _my_lock)
-#
-macro(medkit_reserve_test_domain DOMAIN_VAR LOCK_VAR)
-  if(NOT DEFINED _MEDKIT_DOMAIN_POOL)
-    message(FATAL_ERROR "medkit_reserve_test_domain called before medkit_init_test_domains")
+#   medkit_add_gtest(test_foo test/test_foo.cpp)
+#   medkit_add_gtest(test_foo test/test_foo.cpp TIMEOUT 180 DOMAINS 2)
+macro(medkit_add_gtest TARGET)
+  cmake_parse_arguments(_MAGT "" "DOMAINS" "" ${ARGN})
+  if(NOT DEFINED _MAGT_DOMAINS)
+    set(_MAGT_DOMAINS 1)
   endif()
-  list(GET _MEDKIT_DOMAIN_POOL ${_MEDKIT_DOMAIN_NEXT} ${DOMAIN_VAR})
-  set(${LOCK_VAR} "medkit_dds_domain_${${DOMAIN_VAR}}")
-  math(EXPR _MEDKIT_DOMAIN_NEXT "(${_MEDKIT_DOMAIN_NEXT} + 1) % ${_MEDKIT_DOMAIN_POOL_SIZE}")
+  ament_add_gtest(${TARGET} ${_MAGT_UNPARSED_ARGUMENTS}
+    RUNNER "${MEDKIT_TEST_DOMAIN_RUNNER}")
+  if(TARGET ${TARGET})
+    _medkit_declare_domains(${TARGET} ${_MAGT_DOMAINS})
+  endif()
 endmacro()
 
-# Assign the next domain from the pool to a test target.
-# The test must already be defined via ament_add_gtest or add_launch_test.
-#
-# Both properties are APPENDed, so a caller may add its own environment entries
-# and its own resource locks. Use set_property(TEST ... APPEND PROPERTY ...) for
-# those: a plain set_tests_properties(... PROPERTIES ENVIRONMENT ...) after this
-# call would drop the domain assignment on the floor. test_dds_domain_allocation
-# catches that at test time.
-#
-# Usage:
-#   ament_add_gtest(test_foo test_foo.cpp)
-#   medkit_set_test_domain(test_foo)
-#
-macro(medkit_set_test_domain TEST_NAME)
-  medkit_reserve_test_domain(_MSTD_DOMAIN _MSTD_LOCK)
-  set_property(TEST ${TEST_NAME} APPEND PROPERTY ENVIRONMENT "ROS_DOMAIN_ID=${_MSTD_DOMAIN}")
-  set_property(TEST ${TEST_NAME} APPEND PROPERTY RESOURCE_LOCK "${_MSTD_LOCK}")
+# ament_add_gmock with a domain. Same arguments, plus DOMAINS <n>.
+macro(medkit_add_gmock TARGET)
+  cmake_parse_arguments(_MAGM "" "DOMAINS" "" ${ARGN})
+  if(NOT DEFINED _MAGM_DOMAINS)
+    set(_MAGM_DOMAINS 1)
+  endif()
+  ament_add_gmock(${TARGET} ${_MAGM_UNPARSED_ARGUMENTS}
+    RUNNER "${MEDKIT_TEST_DOMAIN_RUNNER}")
+  if(TARGET ${TARGET})
+    _medkit_declare_domains(${TARGET} ${_MAGM_DOMAINS})
+  endif()
 endmacro()
 
-# Register a launch_testing test AND assign it a domain in one call.
+# ament_add_pytest_test with a domain. Same arguments, plus DOMAINS <n>.
+macro(medkit_add_pytest_test TEST_NAME TEST_PATH)
+  cmake_parse_arguments(_MAPT "" "DOMAINS" "" ${ARGN})
+  if(NOT DEFINED _MAPT_DOMAINS)
+    set(_MAPT_DOMAINS 1)
+  endif()
+  ament_add_pytest_test(${TEST_NAME} ${TEST_PATH} ${_MAPT_UNPARSED_ARGUMENTS}
+    RUNNER "${MEDKIT_TEST_DOMAIN_RUNNER}")
+  _medkit_declare_domains(${TEST_NAME} ${_MAPT_DOMAINS})
+endmacro()
+
+# Register a launch_testing test AND give it a domain in one call.
 # This is the required way to add a launch test: it makes it impossible to add
-# one without domain isolation (a launch test left on the default domain 0 sees
-# every other node on the machine).
-# Do not call add_launch_test directly.
+# one without isolation, and a launch test left on the default domain 0 sees
+# every other node on the machine. Do not call add_launch_test directly.
+#
+# The domain is exported by the runner, so every process the launch description
+# starts inherits it.
 #
 # Usage:
 #   medkit_add_launch_test(test_integration test/test_integration.test.py)
-#   medkit_add_launch_test(test_integration test/test_integration.test.py TIMEOUT 90)
+#   medkit_add_launch_test(test_multi test/test_multi.test.py TIMEOUT 300 DOMAINS 4)
 macro(medkit_add_launch_test TEST_NAME TEST_FILE)
-  cmake_parse_arguments(_MALT "" "TIMEOUT" "" ${ARGN})
-  if(DEFINED _MALT_TIMEOUT)
-    add_launch_test(${TEST_FILE} TARGET ${TEST_NAME} TIMEOUT ${_MALT_TIMEOUT})
-  else()
-    add_launch_test(${TEST_FILE} TARGET ${TEST_NAME})
+  cmake_parse_arguments(_MALT "" "TIMEOUT;DOMAINS" "" ${ARGN})
+  if(NOT DEFINED _MALT_DOMAINS)
+    set(_MALT_DOMAINS 1)
   endif()
-  medkit_set_test_domain(${TEST_NAME})
+  set(_MALT_EXTRA_ARGS "")
+  if(DEFINED _MALT_TIMEOUT)
+    list(APPEND _MALT_EXTRA_ARGS TIMEOUT ${_MALT_TIMEOUT})
+  endif()
+  # RUNNER is not a parameter add_launch_test knows; it forwards what it does
+  # not recognise to ament_add_test, which does. If a future launch_testing
+  # stopped forwarding it, the test would quietly run on domain 0 - which is
+  # exactly what test_dds_domain_allocation reads the generated command for.
+  add_launch_test(${TEST_FILE}
+    TARGET ${TEST_NAME}
+    ${_MALT_EXTRA_ARGS}
+    ${_MALT_UNPARSED_ARGUMENTS}
+    RUNNER "${MEDKIT_TEST_DOMAIN_RUNNER}")
+  _medkit_declare_domains(${TEST_NAME} ${_MALT_DOMAINS})
 endmacro()
 
-# Comma-separated secondary domains, for tests that hold several domains at
-# once. Pass it through the environment so Python does not repeat the numbers.
+# Register an arbitrary command as a test that holds a domain.
+# For tests that build their own command line and so cannot take an ament test
+# runner. Everything else should use one of the macros above.
 #
 # Usage:
-#   medkit_secondary_test_domains(_secondary)
-#   ... ENVIRONMENT "MEDKIT_SECONDARY_DOMAINS=${_secondary}"
-macro(medkit_secondary_test_domains OUT_VAR)
-  _medkit_expand_domain_ranges("${MEDKIT_SECONDARY_DOMAIN_RANGE}" _MSEC_DOMAINS)
-  string(REPLACE ";" "," ${OUT_VAR} "${_MSEC_DOMAINS}")
+#   medkit_add_wrapped_test(test_script
+#     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test/script.py")
+macro(medkit_add_wrapped_test TEST_NAME)
+  cmake_parse_arguments(_MAWT "" "DOMAINS;WORKING_DIRECTORY" "COMMAND" ${ARGN})
+  if(NOT _MAWT_COMMAND)
+    message(FATAL_ERROR "medkit_add_wrapped_test(${TEST_NAME}) needs a COMMAND")
+  endif()
+  if(NOT DEFINED _MAWT_DOMAINS)
+    set(_MAWT_DOMAINS 1)
+  endif()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(_MAWT_WD_ARGS "")
+  if(DEFINED _MAWT_WORKING_DIRECTORY)
+    set(_MAWT_WD_ARGS WORKING_DIRECTORY "${_MAWT_WORKING_DIRECTORY}")
+  endif()
+  add_test(
+    NAME ${TEST_NAME}
+    COMMAND "${Python3_EXECUTABLE}" "${MEDKIT_TEST_DOMAIN_EXEC}"
+      "--domains" "${_MAWT_DOMAINS}" "--" ${_MAWT_COMMAND}
+    ${_MAWT_WD_ARGS}
+  )
+  _medkit_declare_domains(${TEST_NAME} ${_MAWT_DOMAINS})
+endmacro()
+
+# Declare that a test creates no ROS entities and therefore needs no domain.
+#
+# The only way past test_dds_domain_allocation for a test that does not go
+# through the wrapper. Written at the call site so the claim is greppable and
+# ages with the test, rather than sitting in a list somewhere else.
+#
+# A CTest label rather than an environment entry, because a test's environment
+# is inherited by everything it starts: a test that runs a wrapped command of
+# its own would hand the child its own "needs no domain" declaration.
+#
+# Call it AFTER any set_tests_properties(... LABELS ...) on the same test - that
+# form replaces labels rather than adding to them. Getting the order wrong loses
+# the declaration, and test_dds_domain_allocation then reports the test, which is
+# the safe direction to fail in.
+#
+# Usage:
+#   add_test(NAME core_only COMMAND $<TARGET_FILE:test_core_only>)
+#   set_tests_properties(core_only PROPERTIES LABELS "unit")
+#   medkit_test_needs_no_domain(core_only)
+macro(medkit_test_needs_no_domain TEST_NAME)
+  set_property(TEST ${TEST_NAME} APPEND PROPERTY LABELS "no_ros_domain")
 endmacro()
 
 # Register the per-package guard that re-reads the generated CTest properties on
-# the machine that RUNS the tests. The checks above run at configure time, on the
-# machine that builds them, against the table; this one runs against what was
-# actually generated and against that machine's live kernel range.
+# the machine that RUNS the tests.
 #
-# May be called anywhere after medkit_init_test_domains: it asks ctest for the
-# test list when it runs, by which time every test in the package is registered.
+# Nothing at configure time can see whether a test ended up behind the wrapper:
+# the command is assembled by ament, and a later set_tests_properties can drop
+# the count that goes with it. This reads what was actually generated.
 #
-# Usage:
-#   medkit_add_domain_allocation_test()
-macro(medkit_add_domain_allocation_test)
-  if(NOT DEFINED _MEDKIT_DOMAIN_POOL)
-    message(FATAL_ERROR
-      "medkit_add_domain_allocation_test called before medkit_init_test_domains")
+# NOT called by packages. ros2_medkit_cmake-extras.cmake defers a call to this
+# for every package that does find_package(ros2_medkit_cmake), which is the
+# point: a gate a package has to ask for is a gate the next package will not
+# have. The deferral is what makes it possible to register from the extras hook
+# at all - the hook runs before a package's tests exist, and in several packages
+# before BUILD_TESTING is even defined, so the work has to happen at the end of
+# the directory instead of where the hook fires.
+# Give every wrapped test a wait budget that fits inside its own CTest TIMEOUT.
+#
+# The allocator used to wait a fixed 180s for a domain. ament_add_test defaults
+# to TIMEOUT 60, so on almost every test in the tree CTest killed the process
+# while the allocator was still waiting, and the message explaining that no
+# domain could be had never printed. Deferred to the end of the directory
+# because several call sites raise TIMEOUT with a set_tests_properties AFTER
+# registering the test, and the budget has to be read after that has happened.
+function(_medkit_set_domain_wait_budgets)
+  if(NOT BUILD_TESTING)
+    return()
   endif()
-  string(REPLACE ";" "," _MADAT_POOL "${_MEDKIT_DOMAIN_POOL}")
-  medkit_secondary_test_domains(_MADAT_SECONDARY)
+  get_property(_mswb_tests DIRECTORY PROPERTY TESTS)
+  foreach(_mswb_test IN LISTS _mswb_tests)
+    get_property(_mswb_env TEST ${_mswb_test} PROPERTY ENVIRONMENT)
+    string(FIND "${_mswb_env}" "MEDKIT_TEST_DOMAINS=" _mswb_wrapped)
+    if(_mswb_wrapped LESS 0)
+      continue()
+    endif()
+    string(FIND "${_mswb_env}" "MEDKIT_TEST_DOMAIN_WAIT=" _mswb_explicit)
+    if(NOT _mswb_explicit LESS 0)
+      continue()  # a caller said what it wants; leave it alone
+    endif()
+    get_property(_mswb_timeout TEST ${_mswb_test} PROPERTY TIMEOUT)
+    if(NOT _mswb_timeout)
+      # No TIMEOUT property means CTest's own default of 1500 seconds.
+      set(_mswb_timeout 1500)
+    endif()
+    string(REGEX REPLACE "\\..*$" "" _mswb_timeout "${_mswb_timeout}")
+    # Half the budget: long enough to ride out a busy band, short enough that
+    # the wrapper reports in its own words instead of being killed mid-wait.
+    math(EXPR _mswb_wait "${_mswb_timeout} / 2")
+    if(_mswb_wait LESS 5)
+      set(_mswb_wait 5)
+    endif()
+    set_property(TEST ${_mswb_test} APPEND PROPERTY
+      ENVIRONMENT "MEDKIT_TEST_DOMAIN_WAIT=${_mswb_wait}")
+  endforeach()
+endfunction()
+
+function(_medkit_register_domain_gate)
+  if(NOT BUILD_TESTING)
+    return()
+  endif()
+  get_property(_mrdg_tests DIRECTORY PROPERTY TESTS)
+  if(NOT _mrdg_tests)
+    return()
+  endif()
+  if("test_dds_domain_allocation" IN_LIST _mrdg_tests)
+    return()
+  endif()
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_test(
     NAME test_dds_domain_allocation
-    COMMAND "${Python3_EXECUTABLE}"
-      "${_MEDKIT_TEST_DOMAIN_MODULE_DIR}/check_test_domains.py"
+    COMMAND "${Python3_EXECUTABLE}" "${_MEDKIT_TEST_DOMAIN_CHECK}"
       --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
-      --package "${_MEDKIT_DOMAIN_OWNER}"
-      --pool "${_MADAT_POOL}"
-      --secondary "${_MADAT_SECONDARY}"
+      --package "${PROJECT_NAME}"
   )
+  # Labelled "gate" so a developer preset can select it. Deliberately not
+  # "linter": CI runs with -LE linter, and a gate excluded from CI is not a
+  # gate. scripts/test.sh selects "linter|gate" and "integration|gate", since
+  # ctest -L takes a regex.
+  set_tests_properties(test_dds_domain_allocation PROPERTIES LABELS "gate")
+endfunction()
+
+# Register the workspace-wide sweep, which is the half of the gate that reaches
+# packages the per-package guard cannot.
+#
+# The per-package guard rides on find_package(ros2_medkit_cmake). A package that
+# never finds it - a new one, or an interface-only one - would carry no gate and
+# report nothing, which is the same opt-in hole in a different place. This walks
+# every sibling package build directory in the workspace and applies the same
+# rule to all of them, and additionally reports a package that has tests of its
+# own but no per-package guard, because that is exactly how a package leaves the
+# scheme.
+#
+# Registered once, by ros2_medkit_cmake, which every other package depends on
+# and which colcon therefore builds first.
+macro(medkit_add_domain_coverage_test)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  get_filename_component(_MADCT_WORKSPACE_BUILD "${CMAKE_BINARY_DIR}/.." ABSOLUTE)
+  # The sweep must only judge packages from this repository. An overlay
+  # workspace that source-builds a dependency next to us would otherwise be
+  # told to rewrite a package nobody here maintains. Every package build
+  # directory records its source directory, so the sweep filters on that
+  # against the repository root rather than on a name.
+  get_filename_component(_MADCT_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+  add_test(
+    NAME test_dds_domain_coverage
+    COMMAND "${Python3_EXECUTABLE}" "${_MEDKIT_TEST_DOMAIN_CHECK}"
+      --workspace-build-dir "${_MADCT_WORKSPACE_BUILD}"
+      --repo-root "${_MADCT_REPO_ROOT}"
+  )
+  set_tests_properties(test_dds_domain_coverage PROPERTIES LABELS "gate")
 endmacro()

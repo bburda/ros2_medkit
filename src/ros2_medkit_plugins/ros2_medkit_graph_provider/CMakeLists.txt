@@ -24,6 +24,7 @@ include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
 include(ROS2MedkitCoverage)
+include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
@@ -81,8 +82,9 @@ if(BUILD_TESTING)
     file(GLOB_RECURSE _format_files
       "include/*.hpp" "src/*.cpp" "test/*.cpp"
     )
+    medkit_lint_config(.clang-format _clang_format_config)
     ament_clang_format(${_format_files}
-      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+      CONFIG_FILE "${_clang_format_config}")
   endif()
 
   find_package(ament_cmake_gtest REQUIRED)
@@ -96,10 +98,8 @@ if(BUILD_TESTING)
   unset(_gw_vendored)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(PACKAGE ros2_medkit_graph_provider)
-  medkit_add_domain_allocation_test()
 
-  ament_add_gtest(test_graph_provider_plugin
+  medkit_add_gtest(test_graph_provider_plugin
     test/test_graph_provider_plugin.cpp
     src/graph_provider_plugin.cpp
   )
@@ -117,7 +117,6 @@ if(BUILD_TESTING)
     cpp_httplib_target
     OpenSSL::SSL OpenSSL::Crypto
   )
-  medkit_set_test_domain(test_graph_provider_plugin)
   ros2_medkit_relax_vendor_warnings()
 endif()
 

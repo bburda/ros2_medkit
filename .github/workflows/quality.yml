@@ -94,6 +94,9 @@ jobs:
       - name: ccache report warns on the right states
         run: ./scripts/test_ccache_report.sh
 
+      - name: Stale result sweep removes everything colcon would count
+        run: ./scripts/test_drop_stale_results.sh
+
       - name: Show results
         if: always()
         run: colcon test-result --verbose
@@ -151,9 +154,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /root/.ctcache
-          key: ctcache-jazzy-${{ hashFiles('.clang-tidy') }}-${{ github.sha }}
+          key: ctcache-jazzy-${{ hashFiles('src/ros2_medkit_cmake/cmake/.clang-tidy') }}-${{ github.sha }}
           restore-keys: |
-            ctcache-jazzy-${{ hashFiles('.clang-tidy') }}-
+            ctcache-jazzy-${{ hashFiles('src/ros2_medkit_cmake/cmake/.clang-tidy') }}-
 
       - name: Install dependencies
         run: |

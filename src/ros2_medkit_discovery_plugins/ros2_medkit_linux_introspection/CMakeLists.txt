@@ -68,6 +68,8 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   find_package(ament_cmake_gtest REQUIRED)
 
+  include(ROS2MedkitTestDomain)
+
   ament_lint_auto_find_test_dependencies()
 
   ament_add_gtest(test_proc_reader test/test_proc_reader.cpp)
@@ -94,6 +96,16 @@ if(BUILD_TESTING)
   target_include_directories(test_systemd_plugin PRIVATE ${ros2_medkit_gateway_INCLUDE_DIRS})
   medkit_target_dependencies(test_systemd_plugin nlohmann_json)
   ros2_medkit_relax_vendor_warnings()
+  # No ROS middleware on the link line and none loaded at run time (these pass
+  # with RMW_IMPLEMENTATION pointing at a library that does not exist), so there
+  # is no DDS participant to isolate and a wrapper would be cost without cover.
+  medkit_test_needs_no_domain(test_proc_reader)
+  medkit_test_needs_no_domain(test_cgroup_reader)
+  medkit_test_needs_no_domain(test_pid_cache)
+  medkit_test_needs_no_domain(test_procfs_plugin)
+  medkit_test_needs_no_domain(test_container_plugin)
+  medkit_test_needs_no_domain(test_systemd_plugin)
+
 endif()
 
 ament_package()

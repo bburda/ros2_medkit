@@ -27,9 +27,8 @@ the wire this surfaces as:
   not both.
 
 Three gateways, three distinct DDS domains, aggregation is the only channel
-between them. Serialised against ``test_daisy_chain_aggregation`` and
-``test_peer_aggregation`` via ``RESOURCE_LOCK medkit_secondary_dds_domains``
-in CMakeLists.txt.
+between them. All three domains are allocated to this test alone, by the
+``DOMAINS`` count on its registration in CMakeLists.txt.
 """
 
 import os

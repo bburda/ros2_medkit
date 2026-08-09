@@ -24,6 +24,7 @@ include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
 include(ROS2MedkitCoverage)
+include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
@@ -170,21 +171,20 @@ if(BUILD_TESTING)
     file(GLOB_RECURSE _format_files
       "include/*.hpp" "src/*.cpp" "test/*.cpp"
     )
+    medkit_lint_config(.clang-format _clang_format_config)
     ament_clang_format(${_format_files}
-      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+      CONFIG_FILE "${_clang_format_config}")
   endif()
 
   find_package(ament_cmake_gtest REQUIRED)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(PACKAGE ros2_medkit_opcua)
-  medkit_add_domain_allocation_test()
 
   # Each test connects to a non-existent OPC UA host and waits ~3.8s for the
   # DNS / TCP failure path; with 13 tests in the suite the run requires ~90s.
   # The default ament_add_gtest timeout (60s) is too tight, causing the runner
   # to abort mid-suite and emit "missing_result" under heavy parallelism.
-  ament_add_gtest(test_opcua_plugin
+  medkit_add_gtest(test_opcua_plugin
     test/test_opcua_plugin.cpp
     src/opcua_plugin.cpp
     src/opcua_client.cpp
@@ -212,9 +212,8 @@ if(BUILD_TESTING)
     yaml-cpp::yaml-cpp
     OpenSSL::SSL OpenSSL::Crypto
   )
-  medkit_set_test_domain(test_opcua_plugin)
 
-  ament_add_gtest(test_node_map
+  medkit_add_gtest(test_node_map
     test/test_node_map.cpp
     src/node_map.cpp
   )
@@ -231,9 +230,8 @@ if(BUILD_TESTING)
     nlohmann_json::nlohmann_json
     yaml-cpp::yaml-cpp
   )
-  medkit_set_test_domain(test_node_map)
 
-  ament_add_gtest(test_opcua_client
+  medkit_add_gtest(test_opcua_client
     test/test_opcua_client.cpp
     src/opcua_client.cpp
   )
@@ -252,12 +250,11 @@ if(BUILD_TESTING)
     open62541pp::open62541pp
     nlohmann_json::nlohmann_json
   )
-  medkit_set_test_domain(test_opcua_client)
 
   # Zero-config native A&C (auto_alarms): pure-function coverage of the
   # subscription-source precedence rule (effective_alarm_sources) and the
   # system-message filter (is_condition_event) - no live server needed.
-  ament_add_gtest(test_opcua_poller
+  medkit_add_gtest(test_opcua_poller
     test/test_opcua_poller.cpp
     src/opcua_poller.cpp
     src/opcua_client.cpp
@@ -276,22 +273,20 @@ if(BUILD_TESTING)
     nlohmann_json::nlohmann_json
     yaml-cpp::yaml-cpp
   )
-  medkit_set_test_domain(test_opcua_poller)
 
   # Issue #386: pure-function state machine tests. Header-only target -
   # no opcua dependency at link time so it runs fast and is sanitizer
   # clean independent of the open62541pp build flavour.
-  ament_add_gtest(test_alarm_state_machine
+  medkit_add_gtest(test_alarm_state_machine
     test/test_alarm_state_machine.cpp
   )
   target_include_directories(test_alarm_state_machine PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  medkit_set_test_domain(test_alarm_state_machine)
 
   # INV2: device-info -> AssetIdentity mapping + identity trust-gate tests.
   # No server; opcua_client.cpp is link-only (requires_secure_channel).
-  ament_add_gtest(test_device_identity
+  medkit_add_gtest(test_device_identity
     test/test_device_identity.cpp
     src/device_identity.cpp
     src/opcua_client.cpp
@@ -307,13 +302,12 @@ if(BUILD_TESTING)
     open62541pp::open62541pp
     nlohmann_json::nlohmann_json
   )
-  medkit_set_test_domain(test_device_identity)
 
   # Read-only PLC/OPC-UA network discovery: CIDR expansion, config parse +
   # validation, dedup / URL-preference / classification, and auto-endpoint
   # selection. Links only the pure orchestrator (network_discovery.cpp) with
   # injected fake scan/identify - no network, no open62541, no I/O source.
-  ament_add_gtest(test_network_discovery
+  medkit_add_gtest(test_network_discovery
     test/test_network_discovery.cpp
     src/network_discovery.cpp
   )
@@ -323,7 +317,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_network_discovery
     nlohmann_json::nlohmann_json
   )
-  medkit_set_test_domain(test_network_discovery)
 
   # auto_browse: recursive address-space walker tests, against an injected
   # fake AutoBrowseSource - no network, no server. node_map.cpp is link-only
@@ -333,7 +326,7 @@ if(BUILD_TESTING)
   # that uses it (Itanium ABI key-function rule) and needs OpcuaClient's
   # symbols to resolve, even though the tests exercise AutoBrowser only
   # through the injected fake and never construct an OpcuaClientBrowseSource.
-  ament_add_gtest(test_address_space_browser
+  medkit_add_gtest(test_address_space_browser
     test/test_address_space_browser.cpp
     src/address_space_browser.cpp
     src/node_map.cpp
@@ -352,7 +345,6 @@ if(BUILD_TESTING)
     nlohmann_json::nlohmann_json
     yaml-cpp::yaml-cpp
   )
-  medkit_set_test_domain(test_address_space_browser)
 
   # ---- test_alarm_server fixture ------------------------------------------
   # Standalone OPC-UA server emitting AlarmConditionType events for
@@ -445,6 +437,9 @@ if(BUILD_TESTING)
       LABELS "integration"
       SKIP_RETURN_CODE 77
       TIMEOUT 60)
+    # OPC UA over TCP end to end, with no ROS node anywhere in it. AFTER the
+    # LABELS assignment above, which would otherwise replace the declaration.
+    medkit_test_needs_no_domain(test_alarm_server_smoke)
 
     # ---- Secured A&C integration test (issue #477) ------------------------
     # Drives the gateway's apply_security_config() success path against the
@@ -461,33 +456,26 @@ if(BUILD_TESTING)
       test/integration/gen_test_certs.sh
       test/integration/test_opcua_secured.test.py
       DESTINATION lib/${PROJECT_NAME})
-    add_test(NAME test_opcua_secured
+    # This one boots a real gateway and fault manager, so it needs a domain, and
+    # it builds its own command line - hence the generic wrapper rather than an
+    # ament test runner.
+    medkit_add_wrapped_test(test_opcua_secured
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/test/integration/test_opcua_secured.test.py"
               "${CMAKE_BINARY_DIR}/test_alarm_server"
               "${CMAKE_CURRENT_SOURCE_DIR}/test/integration/gen_test_certs.sh")
-    # Reserved explicitly (rather than via medkit_set_test_domain) because this
-    # test sets LABELS, SKIP_RETURN_CODE, and TIMEOUT together with ENVIRONMENT
-    # and RESOURCE_LOCK in the single set_tests_properties() call below. A plain
-    # set_tests_properties(... PROPERTIES ...) call after medkit_set_test_domain
-    # would drop what that macro appended, instead of adding to it.
-    medkit_reserve_test_domain(_OPCUA_SECURED_DOMAIN _OPCUA_SECURED_LOCK)
     # TIMEOUT must exceed the sum of the script's internal wait deadlines so a
     # slow failing run still reaches its own FAIL diagnostics instead of being
-    # killed by CTest. ENVIRONMENT and RESOURCE_LOCK must stay in this same
-    # PROPERTIES call - a later separate set_tests_properties(... ENVIRONMENT
-    # ...) would silently replace them instead of appending.
+    # killed by CTest.
     set_tests_properties(test_opcua_secured PROPERTIES
       LABELS "integration"
       SKIP_RETURN_CODE 77
-      TIMEOUT 420
-      ENVIRONMENT "ROS_DOMAIN_ID=${_OPCUA_SECURED_DOMAIN}"
-      RESOURCE_LOCK ${_OPCUA_SECURED_LOCK})
+      TIMEOUT 420)
 
     # INV2: end-to-end identity test. Boots test_alarm_server as a subprocess and
     # proves connect -> device-info read -> AssetIdentity via both OpcuaClient and
     # OpcuaPlugin::introspect(). GTEST_SKIP when the fixture binary is missing.
-    ament_add_gtest(test_opcua_identity
+    medkit_add_gtest(test_opcua_identity
       test/test_opcua_identity.cpp
       src/opcua_plugin.cpp
       src/opcua_client.cpp
@@ -518,7 +506,6 @@ if(BUILD_TESTING)
       yaml-cpp::yaml-cpp
       OpenSSL::SSL OpenSSL::Crypto
     )
-    medkit_set_test_domain(test_opcua_identity)
   endif()
 
   ros2_medkit_relax_vendor_warnings()

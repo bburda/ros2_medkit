@@ -19,9 +19,49 @@ include_guard(GLOBAL)
 # (alongside include(ROS2MedkitCcache) - CMAKE_MODULE_PATH is already set).
 #
 # Provides:
+#   function medkit_lint_config(<file name> <output variable>)
 #   option ENABLE_CLANG_TIDY (default OFF)
 #   cache var ROS2_MEDKIT_CLANG_TIDY_JOBS (default: host core count)
 #   function ros2_medkit_clang_tidy([HEADER_FILTER <regex>] [TIMEOUT <seconds>] [JOBS <n>])
+
+# The shared lint configurations - .clang-format, .clang-tidy, .flake8 - are
+# files of this package, kept next to the cmake modules and installed next to
+# them, so the same relative lookup works from a source tree, from a plain
+# install, and from a --symlink-install. The repository root paths that editors,
+# pre-commit and scripts/clang-tidy-diff.sh use are symlinks to these files, so
+# there is one copy of each and nothing to keep in sync.
+#
+# What this replaces is a path out of the package into the repository root,
+# "${CMAKE_CURRENT_SOURCE_DIR}/../../.flake8". That resolves in a workspace
+# checkout and nowhere else. A binary package is built from an export of one
+# package directory with nothing above it, so the linter was handed a path that
+# does not exist and failed on every such build. Because bloom's debian/rules
+# runs the test step as `dh_auto_test || true`, the failure could not stop the
+# build and nobody had to see it.
+#
+# Captured at include time: inside a function CMAKE_CURRENT_LIST_DIR resolves to
+# the caller's list file, not to this one.
+set(_ROS2_MEDKIT_LINT_CONFIG_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
+# Resolve a shared lint configuration by file name to an absolute path.
+#
+#   medkit_lint_config(.clang-format _config)
+#   ament_clang_format(CONFIG_FILE "${_config}")
+#
+# Aborts the configure step when the file is missing. Falling back to "run the
+# linter without a config" or to "skip the linter" would turn a build that says
+# it is wrong into a build that lints against the wrong rules or does not lint
+# at all, which is the failure worth having least.
+function(medkit_lint_config _name _output_var)
+  set(_path "${_ROS2_MEDKIT_LINT_CONFIG_DIR}/${_name}")
+  if(NOT EXISTS "${_path}")
+    message(FATAL_ERROR
+      "ros2_medkit_cmake: shared lint config '${_name}' not found at '${_path}'. "
+      "These configs ship with ros2_medkit_cmake alongside its cmake modules; "
+      "an install or package of ros2_medkit_cmake that lacks them is incomplete.")
+  endif()
+  set(${_output_var} "${_path}" PARENT_SCOPE)
+endfunction()
 
 option(ENABLE_CLANG_TIDY "Register clang-tidy as a CTest target" OFF)
 
@@ -67,9 +107,6 @@ endif()
 set(ROS2_MEDKIT_CLANG_TIDY_JOBS "${_ros2_medkit_clang_tidy_jobs}"
     CACHE STRING "Number of clang-tidy processes per package (default: min(host cores, 2))")
 
-# Capture at include-time: inside a function CMAKE_CURRENT_LIST_DIR resolves to the caller.
-set(_ROS2_MEDKIT_CLANG_TIDY_CONFIG "${CMAKE_CURRENT_LIST_DIR}/.clang-tidy")
-
 function(ros2_medkit_clang_tidy)
   if(NOT ENABLE_CLANG_TIDY)
     return()
@@ -79,7 +116,8 @@ function(ros2_medkit_clang_tidy)
 
   find_package(ament_cmake_clang_tidy REQUIRED)
 
-  set(_args "${CMAKE_CURRENT_BINARY_DIR}" CONFIG_FILE "${_ROS2_MEDKIT_CLANG_TIDY_CONFIG}")
+  medkit_lint_config(.clang-tidy _clang_tidy_config)
+  set(_args "${CMAKE_CURRENT_BINARY_DIR}" CONFIG_FILE "${_clang_tidy_config}")
 
   if(ARG_HEADER_FILTER)
     list(APPEND _args HEADER_FILTER "${ARG_HEADER_FILTER}")

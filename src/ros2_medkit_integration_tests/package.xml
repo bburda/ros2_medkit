@@ -25,6 +25,8 @@
   <depend>diagnostic_msgs</depend>
 
   <!-- Test dependencies (Python integration tests) -->
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
   <test_depend>launch_testing_ament_cmake</test_depend>
   <test_depend>launch_testing</test_depend>
   <test_depend>launch_ros</test_depend>

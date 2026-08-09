@@ -106,65 +106,58 @@ if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
   find_package(std_msgs REQUIRED)
 
-  set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
+  medkit_lint_config(.clang-format ament_cmake_clang_format_CONFIG_FILE)
   list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify ament_cmake_cpplint ament_cmake_clang_tidy)
   ament_lint_auto_find_test_dependencies()
 
   ros2_medkit_clang_tidy()
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(PACKAGE ros2_medkit_fault_manager)
-  medkit_add_domain_allocation_test()
 
   # Unit tests
   # Each GTest target that instantiates ROS 2 nodes takes a ROS_DOMAIN_ID from this
   # package's pool so it cannot interfere with launch_testing integration tests that run
   # concurrently in the same CTest invocation and launch their own fault_manager_node
   # subprocess.
-  ament_add_gtest(test_fault_manager test/test_fault_manager.cpp)
+  medkit_add_gtest(test_fault_manager test/test_fault_manager.cpp)
   target_link_libraries(test_fault_manager fault_manager_lib)
   medkit_target_dependencies(test_fault_manager rclcpp ros2_medkit_msgs std_msgs)
-  medkit_set_test_domain(test_fault_manager)
 
   # SQLite storage tests
-  ament_add_gtest(test_sqlite_storage test/test_sqlite_storage.cpp)
+  medkit_add_gtest(test_sqlite_storage test/test_sqlite_storage.cpp)
   target_link_libraries(test_sqlite_storage fault_manager_lib)
   medkit_target_dependencies(test_sqlite_storage rclcpp ros2_medkit_msgs)
-  medkit_set_test_domain(test_sqlite_storage)
 
   # Fault audit log tests (hash chain, verify, rotation, reopen)
-  ament_add_gtest(test_fault_audit_log test/test_fault_audit_log.cpp)
+  medkit_add_gtest(test_fault_audit_log test/test_fault_audit_log.cpp)
   target_link_libraries(test_fault_audit_log fault_manager_lib)
 
   # Snapshot capture tests
-  ament_add_gtest(test_snapshot_capture test/test_snapshot_capture.cpp)
+  medkit_add_gtest(test_snapshot_capture test/test_snapshot_capture.cpp)
   target_link_libraries(test_snapshot_capture fault_manager_lib)
   medkit_target_dependencies(test_snapshot_capture rclcpp ros2_medkit_msgs std_msgs)
-  medkit_set_test_domain(test_snapshot_capture)
 
   # Rosbag capture tests
-  ament_add_gtest(test_rosbag_capture test/test_rosbag_capture.cpp)
+  medkit_add_gtest(test_rosbag_capture test/test_rosbag_capture.cpp)
   target_link_libraries(test_rosbag_capture fault_manager_lib)
   medkit_target_dependencies(test_rosbag_capture rclcpp ros2_medkit_msgs std_msgs)
-  medkit_set_test_domain(test_rosbag_capture)
 
   # Correlation config parser tests
-  ament_add_gtest(test_correlation_config_parser test/test_correlation_config_parser.cpp)
+  medkit_add_gtest(test_correlation_config_parser test/test_correlation_config_parser.cpp)
   target_link_libraries(test_correlation_config_parser fault_manager_lib)
 
   # Pattern matcher tests
-  ament_add_gtest(test_pattern_matcher test/test_pattern_matcher.cpp)
+  medkit_add_gtest(test_pattern_matcher test/test_pattern_matcher.cpp)
   target_link_libraries(test_pattern_matcher fault_manager_lib)
 
   # Correlation engine tests
-  ament_add_gtest(test_correlation_engine test/test_correlation_engine.cpp)
+  medkit_add_gtest(test_correlation_engine test/test_correlation_engine.cpp)
   target_link_libraries(test_correlation_engine fault_manager_lib)
 
   # Entity threshold resolver tests
-  ament_add_gtest(test_entity_thresholds test/test_entity_thresholds.cpp)
+  medkit_add_gtest(test_entity_thresholds test/test_entity_thresholds.cpp)
   target_link_libraries(test_entity_thresholds fault_manager_lib)
   medkit_target_dependencies(test_entity_thresholds rclcpp ros2_medkit_msgs)
-  medkit_set_test_domain(test_entity_thresholds)
 
   # Integration tests
   install(DIRECTORY test
@@ -183,8 +176,8 @@ if(BUILD_TESTING)
   medkit_add_launch_test(test_rosbag_entity_scope test/test_rosbag_entity_scope.test.py TIMEOUT 120)
   set_tests_properties(test_rosbag_entity_scope PROPERTIES LABELS "integration")
 
-  # CaptureThreadPool unit tests (no ROS node, no domain id needed)
-  ament_add_gtest(test_capture_thread_pool test/test_capture_thread_pool.cpp)
+  # CaptureThreadPool unit tests
+  medkit_add_gtest(test_capture_thread_pool test/test_capture_thread_pool.cpp)
   target_link_libraries(test_capture_thread_pool fault_manager_lib)
   medkit_target_dependencies(test_capture_thread_pool rclcpp)
 

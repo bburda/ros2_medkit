@@ -26,6 +26,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitCoverage)
+include(ROS2MedkitLinting)
 
 find_package(ament_cmake REQUIRED)
 find_package(ros2_medkit_gateway REQUIRED)
@@ -82,17 +83,16 @@ if(BUILD_TESTING)
     file(GLOB_RECURSE _format_files
       "src/*.hpp" "src/*.cpp" "test/*.cpp"
     )
+    medkit_lint_config(.clang-format _clang_format_config)
     ament_clang_format(${_format_files}
-      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+      CONFIG_FILE "${_clang_format_config}")
   endif()
 
   find_package(ament_cmake_gtest REQUIRED)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(PACKAGE ros2_medkit_sovd_service_interface)
-  medkit_add_domain_allocation_test()
 
-  ament_add_gtest(test_sovd_service_interface
+  medkit_add_gtest(test_sovd_service_interface
     test/test_sovd_service_interface.cpp
     src/sovd_service_interface.cpp
   )
@@ -107,7 +107,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_sovd_service_interface
     nlohmann_json::nlohmann_json
   )
-  medkit_set_test_domain(test_sovd_service_interface)
 endif()
 
 ament_package()

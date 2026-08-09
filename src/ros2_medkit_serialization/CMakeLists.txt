@@ -107,6 +107,8 @@ install(DIRECTORY include/
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+
+  include(ROS2MedkitTestDomain)
   find_package(ament_lint_auto REQUIRED)
   find_package(std_msgs REQUIRED)
   find_package(std_srvs REQUIRED)
@@ -130,7 +132,7 @@ if(BUILD_TESTING)
   # build-and-test runners without breaking the build.
   find_package(ament_cmake_clang_format QUIET)
   if(ament_cmake_clang_format_FOUND)
-    set(_clang_format_config "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
+    medkit_lint_config(.clang-format _clang_format_config)
     ament_clang_format(
       CONFIG_FILE "${_clang_format_config}"
       "include/ros2_medkit_serialization/json_serializer.hpp"
@@ -161,7 +163,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_type_cache ${PROJECT_NAME})
   medkit_target_dependencies(test_type_cache std_msgs std_srvs)
 
-  ament_add_gtest(test_json_serializer test/test_json_serializer.cpp)
+  medkit_add_gtest(test_json_serializer test/test_json_serializer.cpp)
   target_link_libraries(test_json_serializer ${PROJECT_NAME})
   medkit_target_dependencies(test_json_serializer std_msgs std_srvs geometry_msgs sensor_msgs test_msgs)
 
@@ -169,11 +171,17 @@ if(BUILD_TESTING)
   target_link_libraries(test_service_action_types ${PROJECT_NAME})
   medkit_target_dependencies(test_service_action_types std_srvs)
 
-  ament_add_gtest(test_type_introspection test/test_type_introspection.cpp)
+  medkit_add_gtest(test_type_introspection test/test_type_introspection.cpp)
   target_link_libraries(test_type_introspection ${PROJECT_NAME})
   medkit_target_dependencies(test_type_introspection std_msgs std_srvs test_msgs)
 
   ros2_medkit_relax_vendor_warnings()
+  # No ROS middleware on the link line and none loaded at run time (these pass
+  # with RMW_IMPLEMENTATION pointing at a library that does not exist), so there
+  # is no DDS participant to isolate and a wrapper would be cost without cover.
+  medkit_test_needs_no_domain(test_type_cache)
+  medkit_test_needs_no_domain(test_service_action_types)
+
 endif()
 
 ament_package()

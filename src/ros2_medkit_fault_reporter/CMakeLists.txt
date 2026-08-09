@@ -74,25 +74,22 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(launch_testing_ament_cmake REQUIRED)
 
-  set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
+  medkit_lint_config(.clang-format ament_cmake_clang_format_CONFIG_FILE)
   list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify ament_cmake_cpplint ament_cmake_clang_tidy)
   ament_lint_auto_find_test_dependencies()
 
   ros2_medkit_clang_tidy()
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(PACKAGE ros2_medkit_fault_reporter)
-  medkit_add_domain_allocation_test()
 
   # Unit tests
-  ament_add_gtest(test_local_filter test/test_local_filter.cpp)
+  medkit_add_gtest(test_local_filter test/test_local_filter.cpp)
   target_link_libraries(test_local_filter fault_reporter_lib)
   medkit_target_dependencies(test_local_filter rclcpp rclcpp_lifecycle ros2_medkit_msgs)
 
-  ament_add_gtest(test_fault_reporter_construction test/test_fault_reporter_construction.cpp)
+  medkit_add_gtest(test_fault_reporter_construction test/test_fault_reporter_construction.cpp)
   target_link_libraries(test_fault_reporter_construction fault_reporter_lib)
   medkit_target_dependencies(test_fault_reporter_construction rclcpp rclcpp_lifecycle ros2_medkit_msgs)
-  medkit_set_test_domain(test_fault_reporter_construction)
 
   # Integration tests
   install(DIRECTORY test
@@ -100,6 +97,15 @@ if(BUILD_TESTING)
   )
 
   medkit_add_launch_test(test_integration test/test_integration.test.py TIMEOUT 60)
+
+  # A launch test and its children on one domain. It lives here rather than in
+  # ros2_medkit_cmake because that package is declared NONE, and on Humble
+  # launch_testing_ament_cmake reaches the deprecated FindPythonLibs, which
+  # cannot find libpython without a language enabled. This package compiles and
+  # already runs a launch test on every distro.
+  medkit_add_launch_test(test_domain_launch test/test_domain_launch.test.py TIMEOUT 300)
+  set_tests_properties(test_domain_launch PROPERTIES LABELS "integration")
+
   ros2_medkit_relax_vendor_warnings()
 endif()
 

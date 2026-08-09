@@ -82,6 +82,13 @@ Use `scripts/test.sh` for testing (preferred over raw colcon commands):
 ./scripts/test.sh <test_name>  # Single test by CTest name regex
 ```
 
+Every run starts by dropping the result files of the previous one, so the summary it prints
+is the tally of the run you just started and not of everything tested since the last clean.
+`colcon test-result` counts any XML under `build/` whose root element is `<testsuite>` or
+`<testsuites>`, whatever it is called, so the sweep asks colcon itself which files those are
+rather than matching a name. Run it on its own with `./scripts/drop_stale_results.sh` if you
+invoke `colcon test` directly.
+
 #### Pre-commit and Pre-push Hooks
 
 ```bash
