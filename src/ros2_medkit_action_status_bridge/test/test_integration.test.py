@@ -102,6 +102,23 @@ def _status_array(status, goal_byte):
     return gsa
 
 
+def _stamped_array(goals):
+    """Build an array from (goal_byte, status, stamp_seconds) triples.
+
+    Preemption is read off goal_info.stamp order, so anything exercising it has
+    to stamp; _status_array above leaves the stamp at 0, which is the deliberate
+    "no ordering information, never suppress" case the other tests rely on.
+    """
+    gsa = GoalStatusArray()
+    for goal_byte, status, sec in goals:
+        gs = GoalStatus()
+        gs.goal_info.goal_id = UUID(uuid=[goal_byte] * 16)
+        gs.goal_info.stamp.sec = int(sec)
+        gs.status = int(status)
+        gsa.status_list.append(gs)
+    return gsa
+
+
 class TestActionStatusBridgeIntegration(unittest.TestCase):
     """End-to-end action-status -> fault discovery and raise/heal."""
 
@@ -171,6 +188,30 @@ class TestActionStatusBridgeIntegration(unittest.TestCase):
                 return True
             rclpy.spin_once(self.node, timeout_sec=0.1)
         return False
+
+    def test_00_preempted_goal_raises_nothing(self):
+        """A goal aborted because a newer one displaced it is not a fault.
+
+        The two arrays are the shape measured on a live nav2 bt_navigator: the
+        displacing goal's status is published first (both live), then the old
+        goal is aborted while the new one is still executing. Runs before
+        test_01 deliberately - it has to prove the tree is EMPTY, and test_01's
+        fault never heals until test_02.
+        """
+        self.assertTrue(self.wait_for_bridge_watching(),
+                        'bridge did not subscribe to the status topic in time')
+        self.status_pub.publish(_stamped_array([
+            (10, GoalStatus.STATUS_EXECUTING, 10),
+            (11, GoalStatus.STATUS_EXECUTING, 20),
+        ]))
+        self.status_pub.publish(_stamped_array([
+            (10, GoalStatus.STATUS_ABORTED, 10),
+            (11, GoalStatus.STATUS_EXECUTING, 20),
+        ]))
+        # Same generous window the positive case is allowed, so this is not a
+        # race that passes by being quick.
+        fault = self.wait_for_fault(ABORTED_CODE, timeout=15.0)
+        self.assertIsNone(fault, f'a preemption raised {ABORTED_CODE}')
 
     def test_01_aborted_goal_raises_fault(self):
         """An ABORTED goal on a discovered status topic raises a fault."""

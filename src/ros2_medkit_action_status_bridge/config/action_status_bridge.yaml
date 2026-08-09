@@ -5,6 +5,12 @@ action_status_bridge:
     # Treat a CANCELED goal as a fault (emits a _CANCELED code). Off by default
     # (cancel is usually an intentional operator/client action, not a failure).
     canceled_is_fault: false
+    # Treat an ABORTED goal that a newer, still-live goal displaced as a fault.
+    # Off by default: a preempted goal is aborted by its server with no status
+    # of its own (action_msgs/GoalStatus has no PREEMPTED), so canceled_is_fault
+    # above never sees one, and on a system that re-plans every preemption would
+    # otherwise raise. Turn on to count every ABORTED whatever displaced it.
+    preempted_is_fault: false
     # On a non-failing terminal state, send PASSED to heal the action's fault.
     heal_on_succeeded: true
     # How often to rescan the graph for new (and vanished) action status topics.

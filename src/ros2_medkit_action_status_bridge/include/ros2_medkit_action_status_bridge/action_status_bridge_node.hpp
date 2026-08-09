@@ -42,13 +42,26 @@ namespace ros2_medkit_action_status_bridge {
 /// this bridge delivers the generic terminal status.
 ///
 /// Status mapping (action_msgs/msg/GoalStatus):
-///   - ABORTED (6)  -> fault (severity configurable, default ERROR)
+///   - ABORTED (6)  -> fault (severity configurable, default ERROR), UNLESS the
+///                     goal was preempted - see `goal_was_preempted`
 ///   - CANCELED (5) -> fault only if canceled_is_fault (usually intentional)
 ///   - SUCCEEDED (4)-> PASSED (heals the per-action fault code) if enabled
 ///
 /// Fault state is per-ACTION, not per-goal: every message is scanned for the net
 /// state of the whole GoalStatusArray and a fault is raised/healed only on the
 /// action-level transition. See `derive_state`.
+///
+/// PREEMPTION IS NOT A FAILURE, AND ABORTED IS THE ONLY STATUS IT EVER WEARS.
+/// A server that terminates a running goal because a newer one displaced it has
+/// no separate status to say so: `action_msgs/GoalStatus` has no PREEMPTED, and
+/// the canonical single-goal server (`nav2_util::SimpleActionServer::
+/// accept_pending_goal`) calls `current_handle_->abort()` on the goal it is
+/// dropping. So CANCELED never fires for a preemption and `canceled_is_fault`
+/// cannot suppress one. The one witness that survives on the status topic is the
+/// ARRAY the abort is published in: the displacing goal is accepted (and, for a
+/// server returning ACCEPT_AND_EXECUTE, already EXECUTING) and its status is
+/// published BEFORE the old goal is aborted, so the array carrying the abort
+/// also carries its live successor. `goal_was_preempted` reads exactly that.
 class ActionStatusBridgeNode : public rclcpp::Node {
  public:
   explicit ActionStatusBridgeNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
@@ -88,10 +101,48 @@ class ActionStatusBridgeNode : public rclcpp::Node {
   /// Lowercase hex of a 16-byte goal UUID, for dedup keys and short display.
   static std::string uuid_to_hex(const std::array<uint8_t, 16> & uuid);
 
-  /// Scan a whole GoalStatusArray and return the action-level net state.
-  /// `canceled_is_fault` decides whether CANCELED counts as failing. Order of
-  /// the goals in the array does not affect the result (any failing goal wins).
-  static ActionState derive_state(const action_msgs::msg::GoalStatusArray & msg, bool canceled_is_fault);
+  /// Why one goal in an array counts (or does not count) towards the action's
+  /// failure. Recorded per goal id the FIRST time that goal is seen terminal.
+  enum class GoalVerdict { kNotFailing, kFailingAborted, kFailingCanceled };
+
+  /// Per-action memory of the goals whose terminal status has already been
+  /// judged, keyed by goal-id hex. It exists because the preemption test reads
+  /// the array a goal terminated IN, and that array keeps changing afterwards:
+  /// a GENUINE abort acquires a newer active successor as soon as the client
+  /// retries (measured live at ~1 s), and re-judging it then would read the
+  /// retry as a preemption and heal the fault the abort had just raised. A
+  /// verdict is therefore taken once, at the terminal transition, and only
+  /// forgotten when the goal ages out of the array.
+  using GoalLedger = std::map<std::string, GoalVerdict>;
+
+  /// True when the ABORTED goal at `index` was displaced by a newer goal rather
+  /// than failing on its own: the goal with the smallest goal_info.stamp
+  /// strictly greater than this one's exists in the SAME array and is still
+  /// active (ACCEPTED / EXECUTING / CANCELING).
+  ///
+  /// The IMMEDIATE successor is the test, not "any newer active goal", so that a
+  /// cold start against the latched array reads correctly: a snapshot holding
+  /// several old genuine aborts plus one goal executing now would classify all
+  /// of them as preempted under the looser test, whereas each of those aborts is
+  /// in fact followed by another TERMINAL goal and only the last one is followed
+  /// by the live one.
+  static bool goal_was_preempted(const action_msgs::msg::GoalStatusArray & msg, size_t index);
+
+  /// Scan a whole GoalStatusArray and return the action-level net state, judging
+  /// each goal's terminal status once and remembering the verdict in `ledger`
+  /// (which is also pruned to the goals still present in this array, so an
+  /// aged-out failure stops counting exactly as it did before). Order of the
+  /// goals in the array does not affect the result (any failing goal wins).
+  /// `canceled_is_fault` decides whether CANCELED counts as failing;
+  /// `preempted_is_fault` true restores the pre-preemption-aware behaviour in
+  /// which every ABORTED counts.
+  static ActionState derive_state(const action_msgs::msg::GoalStatusArray & msg, bool canceled_is_fault,
+                                  bool preempted_is_fault, GoalLedger & ledger);
+
+  /// True when every failing goal recorded in `ledger` failed by CANCELED, so
+  /// the emitted fault code's suffix matches the description. ABORTED dominates
+  /// if both occur; false when nothing is failing.
+  static bool failure_is_cancel(const GoalLedger & ledger);
 
   /// Update the desired per-action state from a message and reconcile it,
   /// acting on the transition only. Returns the state that was reported on
@@ -187,6 +238,9 @@ class ActionStatusBridgeNode : public rclcpp::Node {
   // so reconcile_pending() retries it on the next rescan instead of dropping it.
   std::map<std::string, DesiredState> desired_state_;
   std::map<std::string, ActionState> last_reported_state_;
+  // Per-action goal verdict memory (see GoalLedger). Same key space and same
+  // lock as the two maps above, and dropped with them in prune_vanished().
+  std::map<std::string, GoalLedger> goal_ledgers_;
   std::mutex state_mutex_;
 
   // Bounded dedup of logged (goal_id:status) keys (LOG suppression only).
@@ -198,6 +252,7 @@ class ActionStatusBridgeNode : public rclcpp::Node {
   // Configuration
   uint8_t aborted_severity_;
   bool canceled_is_fault_;
+  bool preempted_is_fault_;
   bool heal_on_succeeded_;
   double rescan_period_sec_;
   double retry_period_sec_;

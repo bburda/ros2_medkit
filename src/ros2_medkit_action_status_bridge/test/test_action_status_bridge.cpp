@@ -17,6 +17,8 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "action_msgs/msg/goal_status.hpp"
@@ -46,6 +48,29 @@ GoalStatusArray make_array(const std::vector<std::pair<uint8_t, int8_t>> & goals
 
 GoalStatusArray one_goal(uint8_t goal_byte, int8_t status) {
   return make_array({{goal_byte, status}});
+}
+
+// Build a STAMPED array from (goal_byte, status, stamp_seconds) triples. The
+// preemption test orders goals by goal_info.stamp, so anything exercising it
+// must stamp; make_array() above leaves every stamp at 0, which is the
+// deliberate "no ordering information, never suppress" case.
+GoalStatusArray make_stamped(const std::vector<std::tuple<uint8_t, int8_t, int32_t>> & goals) {
+  GoalStatusArray arr;
+  for (const auto & [goal_byte, status, sec] : goals) {
+    GoalStatus gs;
+    gs.goal_info.goal_id.uuid[0] = goal_byte;
+    gs.goal_info.stamp.sec = sec;
+    gs.status = status;
+    arr.status_list.push_back(gs);
+  }
+  return arr;
+}
+
+// derive_state against a throwaway ledger: the "no memory of earlier arrays"
+// reading, which is what the pure array-level tests below are about.
+State derive_fresh(const GoalStatusArray & msg, bool canceled_is_fault, bool preempted_is_fault = true) {
+  ActionStatusBridgeNode::GoalLedger ledger;
+  return ActionStatusBridgeNode::derive_state(msg, canceled_is_fault, preempted_is_fault, ledger);
 }
 
 }  // namespace
@@ -153,30 +178,91 @@ TEST_F(ActionStatusBridgeTest, NodeCreation) {
 // --- derive_state: net state from a whole array ---
 
 TEST_F(ActionStatusBridgeTest, DeriveState_AbortedIsFailed) {
-  EXPECT_EQ(ActionStatusBridgeNode::derive_state(one_goal(1, GoalStatus::STATUS_ABORTED), false), State::kFailed);
+  EXPECT_EQ(derive_fresh(one_goal(1, GoalStatus::STATUS_ABORTED), false), State::kFailed);
 }
 
 TEST_F(ActionStatusBridgeTest, DeriveState_SucceededIsHealthy) {
-  EXPECT_EQ(ActionStatusBridgeNode::derive_state(one_goal(1, GoalStatus::STATUS_SUCCEEDED), false), State::kHealthy);
+  EXPECT_EQ(derive_fresh(one_goal(1, GoalStatus::STATUS_SUCCEEDED), false), State::kHealthy);
 }
 
 TEST_F(ActionStatusBridgeTest, DeriveState_NoTerminalIsUnknown) {
-  EXPECT_EQ(ActionStatusBridgeNode::derive_state(one_goal(1, GoalStatus::STATUS_EXECUTING), false), State::kUnknown);
-  EXPECT_EQ(ActionStatusBridgeNode::derive_state(GoalStatusArray{}, false), State::kUnknown);
+  EXPECT_EQ(derive_fresh(one_goal(1, GoalStatus::STATUS_EXECUTING), false), State::kUnknown);
+  EXPECT_EQ(derive_fresh(GoalStatusArray{}, false), State::kUnknown);
 }
 
 TEST_F(ActionStatusBridgeTest, DeriveState_CanceledRespectsFlag) {
   const auto arr = one_goal(1, GoalStatus::STATUS_CANCELED);
-  EXPECT_EQ(ActionStatusBridgeNode::derive_state(arr, false), State::kHealthy);
-  EXPECT_EQ(ActionStatusBridgeNode::derive_state(arr, true), State::kFailed);
+  EXPECT_EQ(derive_fresh(arr, false), State::kHealthy);
+  EXPECT_EQ(derive_fresh(arr, true), State::kFailed);
 }
 
 TEST_F(ActionStatusBridgeTest, DeriveState_OrderIndependent) {
   // ABORTED before and after SUCCEEDED must both yield FAILED.
   const auto a = make_array({{1, GoalStatus::STATUS_ABORTED}, {2, GoalStatus::STATUS_SUCCEEDED}});
   const auto b = make_array({{2, GoalStatus::STATUS_SUCCEEDED}, {1, GoalStatus::STATUS_ABORTED}});
-  EXPECT_EQ(ActionStatusBridgeNode::derive_state(a, false), State::kFailed);
-  EXPECT_EQ(ActionStatusBridgeNode::derive_state(b, false), State::kFailed);
+  EXPECT_EQ(derive_fresh(a, false), State::kFailed);
+  EXPECT_EQ(derive_fresh(b, false), State::kFailed);
+}
+
+// --- preemption: an ABORTED goal displaced by a newer live one ---
+//
+// The shapes below are the ones measured on a live nav2 bt_navigator (see the
+// README): the displacing goal's status is published BEFORE the abort, so the
+// array carrying the abort also carries its successor, EXECUTING.
+
+TEST_F(ActionStatusBridgeTest, GoalWasPreempted_NewerLiveSuccessor) {
+  const auto arr = make_stamped({{1, GoalStatus::STATUS_ABORTED, 10}, {2, GoalStatus::STATUS_EXECUTING, 20}});
+  EXPECT_TRUE(ActionStatusBridgeNode::goal_was_preempted(arr, 0));
+  // The live goal itself is not aborted, so it is never "preempted".
+  EXPECT_FALSE(ActionStatusBridgeNode::goal_was_preempted(arr, 1));
+}
+
+TEST_F(ActionStatusBridgeTest, GoalWasPreempted_NoSuccessorIsGenuine) {
+  // The abort is the newest thing in the array: nothing displaced it.
+  const auto arr = make_stamped({{1, GoalStatus::STATUS_SUCCEEDED, 10}, {2, GoalStatus::STATUS_ABORTED, 20}});
+  EXPECT_FALSE(ActionStatusBridgeNode::goal_was_preempted(arr, 1));
+}
+
+TEST_F(ActionStatusBridgeTest, GoalWasPreempted_TerminalSuccessorIsGenuine) {
+  // The retry that followed a genuine abort has itself finished: that is the
+  // history of a failure, not a preemption.
+  const auto arr = make_stamped({{1, GoalStatus::STATUS_ABORTED, 10}, {2, GoalStatus::STATUS_SUCCEEDED, 20}});
+  EXPECT_FALSE(ActionStatusBridgeNode::goal_was_preempted(arr, 0));
+}
+
+TEST_F(ActionStatusBridgeTest, GoalWasPreempted_OnlyTheIMMEDIATESuccessorCounts) {
+  // A cold start against the latched array: two old genuine aborts and one goal
+  // running now. Each old abort is followed by another TERMINAL goal, so only
+  // the last one is a candidate at all - and it is followed by the live goal.
+  const auto arr = make_stamped({{1, GoalStatus::STATUS_ABORTED, 10},
+                                 {2, GoalStatus::STATUS_ABORTED, 20},
+                                 {3, GoalStatus::STATUS_EXECUTING, 30}});
+  EXPECT_FALSE(ActionStatusBridgeNode::goal_was_preempted(arr, 0));
+  EXPECT_TRUE(ActionStatusBridgeNode::goal_was_preempted(arr, 1));
+}
+
+TEST_F(ActionStatusBridgeTest, GoalWasPreempted_UnstampedNeverSuppresses) {
+  // No stamps means no ordering information; the conservative reading is that
+  // nothing displaced anything, so a genuine abort is never lost.
+  const auto arr = make_array({{1, GoalStatus::STATUS_ABORTED}, {2, GoalStatus::STATUS_EXECUTING}});
+  EXPECT_FALSE(ActionStatusBridgeNode::goal_was_preempted(arr, 0));
+}
+
+TEST_F(ActionStatusBridgeTest, DeriveState_PreemptedAbortIsNotFailed) {
+  const auto arr = make_stamped({{1, GoalStatus::STATUS_ABORTED, 10}, {2, GoalStatus::STATUS_EXECUTING, 20}});
+  EXPECT_EQ(derive_fresh(arr, false, /*preempted_is_fault=*/false), State::kUnknown);
+  // ... and the flag restores the old behaviour verbatim.
+  EXPECT_EQ(derive_fresh(arr, false, /*preempted_is_fault=*/true), State::kFailed);
+}
+
+TEST_F(ActionStatusBridgeTest, DeriveState_PreemptedAbortIsNotAHealEither) {
+  // A suppressed abort must not stand in for a success: it is evidence about
+  // nothing, and licensing a heal off it would clear a real fault.
+  ActionStatusBridgeNode::GoalLedger ledger;
+  const auto failed = make_stamped({{1, GoalStatus::STATUS_ABORTED, 10}});
+  EXPECT_EQ(ActionStatusBridgeNode::derive_state(failed, false, false, ledger), State::kFailed);
+  const auto preempted = make_stamped({{2, GoalStatus::STATUS_ABORTED, 20}, {3, GoalStatus::STATUS_EXECUTING, 30}});
+  EXPECT_EQ(ActionStatusBridgeNode::derive_state(preempted, false, false, ledger), State::kUnknown);
 }
 
 // --- apply_message: transitions only (nullptr reporter = decision-only seam) ---
@@ -240,6 +326,70 @@ TEST_F(ActionStatusBridgeTest, Apply_Flapping_OnlyNetStateChangesTransition) {
 }
 
 // --- canceled-as-fault semantics ---
+
+TEST_F(ActionStatusBridgeTest, Apply_PreemptionRaisesNothing) {
+  auto node = std::make_shared<ActionStatusBridgeNode>();
+  ActionStatusBridgeTestAccess access(node.get());
+  // The two arrays a live bt_navigator publishes around a preemption: the new
+  // goal appears alongside the running one, then the running one is aborted.
+  EXPECT_EQ(node->apply_message(
+                "/nav", make_stamped({{1, GoalStatus::STATUS_EXECUTING, 10}, {2, GoalStatus::STATUS_EXECUTING, 20}}),
+                nullptr),
+            State::kUnknown);
+  EXPECT_EQ(
+      node->apply_message(
+          "/nav", make_stamped({{1, GoalStatus::STATUS_ABORTED, 10}, {2, GoalStatus::STATUS_EXECUTING, 20}}), nullptr),
+      State::kUnknown);
+  EXPECT_FALSE(access.reported_failed("/nav"));
+  EXPECT_FALSE(access.pending_failed("/nav"));
+}
+
+TEST_F(ActionStatusBridgeTest, Apply_GenuineAbortRaises_AndTheRetryDoesNotHealIt) {
+  // The measured live sequence a stateless preemption test would get wrong: a
+  // goal aborts alone (genuine), and ~1 s later the client's retry appears in
+  // the SAME array, which now looks exactly like a preemption. The verdict was
+  // taken at the abort and must not be revised.
+  auto node = std::make_shared<ActionStatusBridgeNode>();
+  ActionStatusBridgeTestAccess access(node.get());
+  EXPECT_EQ(
+      node->apply_message(
+          "/nav", make_stamped({{1, GoalStatus::STATUS_SUCCEEDED, 10}, {2, GoalStatus::STATUS_ABORTED, 20}}), nullptr),
+      State::kFailed);
+  EXPECT_EQ(node->apply_message("/nav",
+                                make_stamped({{1, GoalStatus::STATUS_SUCCEEDED, 10},
+                                              {2, GoalStatus::STATUS_ABORTED, 20},
+                                              {3, GoalStatus::STATUS_EXECUTING, 30}}),
+                                nullptr),
+            State::kUnknown);
+  EXPECT_TRUE(access.reported_failed("/nav"));
+  // It heals only when the failing goal ages out of the array, exactly as before.
+  EXPECT_EQ(node->apply_message("/nav", make_stamped({{3, GoalStatus::STATUS_SUCCEEDED, 30}}), nullptr),
+            State::kHealthy);
+}
+
+TEST_F(ActionStatusBridgeTest, Apply_PreemptedIsFaultTrueRestoresEveryAbort) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("preempted_is_fault", true)});
+  auto node = std::make_shared<ActionStatusBridgeNode>(options);
+  EXPECT_EQ(
+      node->apply_message(
+          "/nav", make_stamped({{1, GoalStatus::STATUS_ABORTED, 10}, {2, GoalStatus::STATUS_EXECUTING, 20}}), nullptr),
+      State::kFailed);
+}
+
+TEST_F(ActionStatusBridgeTest, Apply_PreemptionThenGenuineAbortStillRaises) {
+  // The proof that the suppression is narrow: the same action, preempted first
+  // and then genuinely failing, still names the failure.
+  auto node = std::make_shared<ActionStatusBridgeNode>();
+  EXPECT_EQ(
+      node->apply_message(
+          "/nav", make_stamped({{1, GoalStatus::STATUS_ABORTED, 10}, {2, GoalStatus::STATUS_EXECUTING, 20}}), nullptr),
+      State::kUnknown);
+  EXPECT_EQ(
+      node->apply_message(
+          "/nav", make_stamped({{1, GoalStatus::STATUS_ABORTED, 10}, {2, GoalStatus::STATUS_ABORTED, 20}}), nullptr),
+      State::kFailed);
+}
 
 TEST_F(ActionStatusBridgeTest, Apply_CanceledNotFaultByDefault) {
   auto node = std::make_shared<ActionStatusBridgeNode>();

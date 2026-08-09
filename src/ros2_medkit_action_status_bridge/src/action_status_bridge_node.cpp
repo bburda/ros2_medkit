@@ -54,23 +54,116 @@ void strip_trailing_underscore(std::string & s) {
   }
 }
 
-// True when the failing state is caused solely by CANCELED goals (no ABORTED),
-// so the emitted code matches the description. ABORTED dominates if both occur.
-bool describe_failure_is_cancel(const action_msgs::msg::GoalStatusArray & msg, bool canceled_is_fault) {
+// A goal that has reached a final state. Anything else (ACCEPTED, EXECUTING,
+// CANCELING) is still live and can therefore be the goal that displaced another.
+bool is_terminal_status(int8_t status) {
   using GoalStatus = action_msgs::msg::GoalStatus;
+  return status == GoalStatus::STATUS_SUCCEEDED || status == GoalStatus::STATUS_CANCELED ||
+         status == GoalStatus::STATUS_ABORTED;
+}
+
+// goal_info.stamp in nanoseconds. The action SERVER stamps this at acceptance
+// (rcl_action_accept_new_goal), so within one action it orders goals by the
+// order that server took them - which is what "displaced by a newer goal" means.
+int64_t stamp_ns(const action_msgs::msg::GoalStatus & gs) {
+  return static_cast<int64_t>(gs.goal_info.stamp.sec) * 1000000000LL + static_cast<int64_t>(gs.goal_info.stamp.nanosec);
+}
+
+}  // namespace
+
+bool ActionStatusBridgeNode::goal_was_preempted(const action_msgs::msg::GoalStatusArray & msg, size_t index) {
+  using GoalStatus = action_msgs::msg::GoalStatus;
+  if (index >= msg.status_list.size() || msg.status_list[index].status != GoalStatus::STATUS_ABORTED) {
+    return false;
+  }
+  const int64_t self_stamp = stamp_ns(msg.status_list[index]);
+
+  // The immediate successor by stamp: the smallest stamp strictly greater than
+  // this goal's. A tie is NOT a successor - unstamped arrays (the unit tests,
+  // and any server that does not stamp) must fall through to "not preempted",
+  // which is the conservative direction.
+  const action_msgs::msg::GoalStatus * successor = nullptr;
+  int64_t successor_stamp = 0;
+  for (size_t i = 0; i < msg.status_list.size(); ++i) {
+    if (i == index) {
+      continue;
+    }
+    const int64_t s = stamp_ns(msg.status_list[i]);
+    if (s <= self_stamp) {
+      continue;
+    }
+    if (successor == nullptr || s < successor_stamp) {
+      successor = &msg.status_list[i];
+      successor_stamp = s;
+    }
+  }
+  return successor != nullptr && !is_terminal_status(successor->status);
+}
+
+ActionStatusBridgeNode::ActionState ActionStatusBridgeNode::derive_state(const action_msgs::msg::GoalStatusArray & msg,
+                                                                         bool canceled_is_fault,
+                                                                         bool preempted_is_fault, GoalLedger & ledger) {
+  using GoalStatus = action_msgs::msg::GoalStatus;
+
+  GoalLedger next;
+  bool any_terminal = false;
+  for (size_t i = 0; i < msg.status_list.size(); ++i) {
+    const auto & gs = msg.status_list[i];
+    std::array<uint8_t, 16> uuid{};
+    std::copy(gs.goal_info.goal_id.uuid.begin(), gs.goal_info.goal_id.uuid.end(), uuid.begin());
+    const std::string key = uuid_to_hex(uuid);
+
+    if (!is_terminal_status(gs.status)) {
+      continue;  // still live: contributes nothing and carries no verdict
+    }
+
+    // A verdict already taken for this goal is never revised - see GoalLedger.
+    // Carrying it into `next` is also what prunes: a goal absent from this
+    // array simply does not make it across.
+    const auto seen = ledger.find(key);
+    if (seen != ledger.end()) {
+      next.emplace(key, seen->second);
+    } else if (gs.status == GoalStatus::STATUS_ABORTED) {
+      const bool suppressed = !preempted_is_fault && goal_was_preempted(msg, i);
+      next.emplace(key, suppressed ? GoalVerdict::kNotFailing : GoalVerdict::kFailingAborted);
+    } else if (gs.status == GoalStatus::STATUS_CANCELED && canceled_is_fault) {
+      next.emplace(key, GoalVerdict::kFailingCanceled);
+    } else {
+      next.emplace(key, GoalVerdict::kNotFailing);
+    }
+
+    // SUCCEEDED, or CANCELED when it is not a fault, is a non-failing terminal
+    // and is what licenses a heal. A SUPPRESSED (preempted) abort deliberately
+    // does not: a preemption is evidence about nothing, and letting it stand in
+    // for a success would heal a real fault raised moments earlier.
+    if (gs.status == GoalStatus::STATUS_SUCCEEDED || gs.status == GoalStatus::STATUS_CANCELED) {
+      any_terminal = true;
+    }
+  }
+
+  ledger = std::move(next);
+  for (const auto & [key, verdict] : ledger) {
+    (void)key;
+    if (verdict != GoalVerdict::kNotFailing) {
+      return ActionState::kFailed;  // any failing goal fails the action (order-independent)
+    }
+  }
+  return any_terminal ? ActionState::kHealthy : ActionState::kUnknown;
+}
+
+bool ActionStatusBridgeNode::failure_is_cancel(const GoalLedger & ledger) {
   bool saw_canceled = false;
-  for (const auto & gs : msg.status_list) {
-    if (gs.status == GoalStatus::STATUS_ABORTED) {
+  for (const auto & [key, verdict] : ledger) {
+    (void)key;
+    if (verdict == GoalVerdict::kFailingAborted) {
       return false;
     }
-    if (gs.status == GoalStatus::STATUS_CANCELED && canceled_is_fault) {
+    if (verdict == GoalVerdict::kFailingCanceled) {
       saw_canceled = true;
     }
   }
   return saw_canceled;
 }
-
-}  // namespace
 
 ActionStatusBridgeNode::ActionStatusBridgeNode(const rclcpp::NodeOptions & options)
   : Node("action_status_bridge", options) {
@@ -88,9 +181,11 @@ ActionStatusBridgeNode::ActionStatusBridgeNode(const rclcpp::NodeOptions & optio
     rescan_actions();
   });
 
-  RCLCPP_INFO(get_logger(), "ActionStatusBridge started (prefix=%s, aborted_severity=%u, rescan=%.1fs, retry=%.0fms)",
-              code_prefix_.c_str(), static_cast<unsigned>(aborted_severity_), rescan_period_sec_,
-              retry_period_sec_ * 1000.0);
+  RCLCPP_INFO(get_logger(),
+              "ActionStatusBridge started (prefix=%s, aborted_severity=%u, canceled_is_fault=%s, "
+              "preempted_is_fault=%s, rescan=%.1fs, retry=%.0fms)",
+              code_prefix_.c_str(), static_cast<unsigned>(aborted_severity_), canceled_is_fault_ ? "true" : "false",
+              preempted_is_fault_ ? "true" : "false", rescan_period_sec_, retry_period_sec_ * 1000.0);
 }
 
 ActionStatusBridgeNode::~ActionStatusBridgeNode() {
@@ -116,6 +211,12 @@ void ActionStatusBridgeNode::load_parameters() {
   }
 
   canceled_is_fault_ = declare_parameter<bool>("canceled_is_fault", false);
+  // A preempted goal is terminated by its server as ABORTED with no status of
+  // its own (see this class's header), so it is suppressed by default: on a
+  // fleet that re-plans, preemptions are routine and a fault per preemption
+  // buries the failures the tree exists to name. Set true to count every
+  // ABORTED, whatever displaced it.
+  preempted_is_fault_ = declare_parameter<bool>("preempted_is_fault", false);
   heal_on_succeeded_ = declare_parameter<bool>("heal_on_succeeded", true);
   rescan_period_sec_ = declare_parameter<double>("rescan_period_sec", 2.0);
   if (rescan_period_sec_ <= 0.0) {
@@ -262,49 +363,32 @@ void ActionStatusBridgeNode::prune_vanished(const std::map<std::string, std::str
       std::lock_guard<std::mutex> lock(state_mutex_);
       last_reported_state_.erase(action_name);
       desired_state_.erase(action_name);
+      goal_ledgers_.erase(action_name);
     }
     RCLCPP_INFO(get_logger(), "Action '%s' vanished; dropped (topic %s)", action_name.c_str(), topic.c_str());
     it = subs_.erase(it);
   }
 }
 
-ActionStatusBridgeNode::ActionState ActionStatusBridgeNode::derive_state(const action_msgs::msg::GoalStatusArray & msg,
-                                                                         bool canceled_is_fault) {
-  using GoalStatus = action_msgs::msg::GoalStatus;
-
-  bool any_terminal = false;
-  for (const auto & gs : msg.status_list) {
-    const bool failing =
-        gs.status == GoalStatus::STATUS_ABORTED || (gs.status == GoalStatus::STATUS_CANCELED && canceled_is_fault);
-    if (failing) {
-      return ActionState::kFailed;  // any failing goal fails the action (order-independent)
-    }
-    // SUCCEEDED, or CANCELED when it is not a fault, is a non-failing terminal.
-    if (gs.status == GoalStatus::STATUS_SUCCEEDED || gs.status == GoalStatus::STATUS_CANCELED) {
-      any_terminal = true;
-    }
-  }
-  return any_terminal ? ActionState::kHealthy : ActionState::kUnknown;
-}
-
 ActionStatusBridgeNode::ActionState
 ActionStatusBridgeNode::apply_message(const std::string & action_name, const action_msgs::msg::GoalStatusArray & msg,
                                       ros2_medkit_fault_reporter::FaultReporter * reporter) {
-  const ActionState net = derive_state(msg, canceled_is_fault_);
-  if (net == ActionState::kUnknown) {
-    return ActionState::kUnknown;  // no terminal verdict in this message
-  }
-
   // Record the latest observed action-level state as the desired state, then
   // reconcile it against what the FaultManager was last told. A SUCCEEDED while
   // healing is disabled leaves the desired state untouched, so a prior failure
-  // stays failed (the no-heal contract).
+  // stays failed (the no-heal contract). The derivation itself now carries
+  // per-action memory (GoalLedger), so it runs under state_mutex_ with the maps
+  // it belongs to.
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    const ActionState net = derive_state(msg, canceled_is_fault_, preempted_is_fault_, goal_ledgers_[action_name]);
+    if (net == ActionState::kUnknown) {
+      return ActionState::kUnknown;  // no terminal verdict in this message
+    }
     auto & desired = desired_state_[action_name];
     if (net == ActionState::kFailed) {
       desired.net = ActionState::kFailed;
-      desired.canceled = describe_failure_is_cancel(msg, canceled_is_fault_);
+      desired.canceled = failure_is_cancel(goal_ledgers_[action_name]);
     } else if (heal_on_succeeded_) {  // net == kHealthy
       desired.net = ActionState::kHealthy;
     }
@@ -435,7 +519,8 @@ void ActionStatusBridgeNode::status_callback(const std::string & action_name,
   using GoalStatus = action_msgs::msg::GoalStatus;
 
   // Per-goal dedup is LOG-only here; it must not gate the state transition.
-  for (const auto & gs : msg->status_list) {
+  for (size_t i = 0; i < msg->status_list.size(); ++i) {
+    const auto & gs = msg->status_list[i];
     if (gs.status != GoalStatus::STATUS_ABORTED && gs.status != GoalStatus::STATUS_CANCELED &&
         gs.status != GoalStatus::STATUS_SUCCEEDED) {
       continue;
@@ -444,10 +529,21 @@ void ActionStatusBridgeNode::status_callback(const std::string & action_name,
     std::copy(gs.goal_info.goal_id.uuid.begin(), gs.goal_info.goal_id.uuid.end(), uuid.begin());
     const std::string uuid_hex = uuid_to_hex(uuid);
     const std::string key = uuid_hex + ":" + std::to_string(static_cast<int>(gs.status));
-    if (mark_logged(key)) {
-      RCLCPP_DEBUG(get_logger(), "Action %s goal %s status %d", action_name.c_str(), uuid_hex.substr(0, 8).c_str(),
-                   static_cast<int>(gs.status));
+    if (!mark_logged(key)) {
+      continue;
     }
+    // A suppressed preemption is INFO, not DEBUG: it is the one case where the
+    // bridge deliberately says nothing to the FaultManager about an ABORTED
+    // goal, so the decision has to be visible somewhere. Logged only on the
+    // first sight of that goal's abort - the same dedup key everything else
+    // here uses - so a fleet that re-plans does not flood the log.
+    if (!preempted_is_fault_ && gs.status == GoalStatus::STATUS_ABORTED && goal_was_preempted(*msg, i)) {
+      RCLCPP_INFO(get_logger(), "Action %s goal %s aborted by preemption (a newer goal was live); not a fault",
+                  action_name.c_str(), uuid_hex.substr(0, 8).c_str());
+      continue;
+    }
+    RCLCPP_DEBUG(get_logger(), "Action %s goal %s status %d", action_name.c_str(), uuid_hex.substr(0, 8).c_str(),
+                 static_cast<int>(gs.status));
   }
 
   // Single-threaded rclcpp::spin (see main.cpp): status callbacks and the rescan

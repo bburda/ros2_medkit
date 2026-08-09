@@ -24,7 +24,8 @@ generically, by observing the goal-status topic.
   topics (re-scanned on a timer to catch actions that appear later, to drop
   actions that vanish, e.g. a Nav2 lifecycle deactivate or a one-shot node, and
   to retry any fault whose delivery to the FaultManager was deferred).
-- `ABORTED (6)` -> fault (`SEVERITY_ERROR` by default).
+- `ABORTED (6)` -> fault (`SEVERITY_ERROR` by default), unless the goal was
+  **preempted** - see [Preemption is not a failure](#preemption-is-not-a-failure).
 - `CANCELED (5)` -> fault only if `canceled_is_fault` (off by default; cancel is
   usually intentional). When enabled it emits a `_CANCELED` code.
 - `SUCCEEDED (4)` -> `PASSED` to heal the action's fault code (if enabled).
@@ -39,8 +40,10 @@ generically, by observing the goal-status topic.
 The fault is a property of the **action**, not of an individual goal. On every
 status message the whole `GoalStatusArray` is scanned for the net state:
 
-- if **any** goal is `ABORTED` (or `CANCELED` when `canceled_is_fault`), the
-  action is **failed** (order of goals in the array does not matter);
+- if **any** goal is `ABORTED` (unless it was preempted - see
+  [Preemption is not a failure](#preemption-is-not-a-failure)) or `CANCELED`
+  when `canceled_is_fault`, the action is **failed** (order of goals in the
+  array does not matter);
 - otherwise, if the array has terminal goals and none are failing, the action is
   **healthy**.
 
@@ -59,6 +62,53 @@ client connects - the transition stays pending and is retried, rather than the
 high-severity fault being silently dropped. (The latched status is delivered to
 a subscription only once, so without this retry the dropped report would never
 recover.) See [Delivery latency and freeze-frame](#delivery-latency-and-freeze-frame).
+
+## Preemption is not a failure
+
+A server that terminates a running goal because a newer one displaced it has no
+status of its own to say so: `action_msgs/GoalStatus` has no `PREEMPTED`, and
+the canonical single-goal server
+(`nav2_util::SimpleActionServer::accept_pending_goal`) calls
+`current_handle_->abort()` on the goal it drops. So a preemption arrives as a
+plain `ABORTED` and `canceled_is_fault` cannot suppress it - on a fleet that
+re-plans, that means one fault per preemption, burying the failures the tree
+exists to name.
+
+The witness that survives is the **array the abort is published in**. The
+displacing goal is accepted (and, for a server returning
+`ACCEPT_AND_EXECUTE`, already `EXECUTING`) and its status is published *before*
+the old goal is aborted, so the array carrying the abort also carries its live
+successor. Measured against a live nav2 `bt_navigator`, three forced
+preemptions: the abort was published 5 ms / 2 ms / 1 ms after the displacing
+goal first appeared, and in all three the aborted goal's immediate successor by
+`goal_info.stamp` was `EXECUTING` in the same array. A genuine give-up in the
+same capture had **no** successor at all in the array carrying its abort; the
+client's retry appeared ~1 s later, in a later message.
+
+So, with `preempted_is_fault` false (the default): an `ABORTED` goal is
+suppressed when the goal with the smallest `goal_info.stamp` strictly greater
+than its own is present in the SAME array and is still active
+(`ACCEPTED`/`EXECUTING`/`CANCELING`).
+
+Three details that are load-bearing:
+
+- **The verdict is taken once**, at the message where the goal is first seen
+  terminal, and remembered until the goal ages out of the array. A genuine abort
+  acquires a newer active successor as soon as the client retries; re-judging it
+  then would read the retry as a preemption and heal the fault that abort had
+  just raised.
+- **Only the IMMEDIATE successor counts**, not "any newer active goal". On a
+  cold start the latched array can hold several old genuine aborts plus one goal
+  running now; under the looser test all of them would read as preempted,
+  whereas each is in fact followed by another *terminal* goal.
+- **A suppressed abort is not a heal either.** It contributes nothing: it does
+  not fail the action and it does not count as the non-failing terminal that
+  licenses a heal.
+
+The narrow cost, stated rather than hidden: a goal that genuinely fails at the
+same instant a newer goal is accepted is read as preempted and its fault is
+delayed to the next attempt. Set `preempted_is_fault: true` to count every
+`ABORTED` whatever displaced it.
 
 ## Scope: the terminal verdict, not the reason
 
@@ -124,6 +174,7 @@ ros2 launch ros2_medkit_action_status_bridge action_status_bridge.launch.py
 |-------|---------|---------|
 | `aborted_severity` | `2` (ERROR) | severity of an aborted goal |
 | `canceled_is_fault` | `false` | treat CANCELED as a fault |
+| `preempted_is_fault` | `false` | treat an ABORTED goal that a newer live goal displaced as a fault |
 | `heal_on_succeeded` | `true` | send PASSED on a successful goal |
 | `rescan_period_sec` | `2.0` | how often to look for new actions |
 | `retry_period_sec` | `0.05` | fast retry cadence for reports deferred while the FaultManager service is undiscovered (armed only while pending) |
@@ -149,6 +200,15 @@ the default), with a warning.
   cycle. There is no per-code rate throttle in this bridge; lower noise via the
   FaultReporter local filter if needed.
 - **No per-code throttle**: every action-level transition is forwarded.
+- **Preemption detection needs stamps**: it orders goals by `goal_info.stamp`,
+  which the action *server* fills in at acceptance (`rcl_action_accept_new_goal`).
+  An array with no stamps carries no ordering information, so nothing is ever
+  suppressed - the conservative direction, but it means a non-conforming server
+  gets the old behaviour.
+- **A missed intermediate message weakens it**: if the displacing goal has
+  already terminated by the time the abort is observed, the abort reads as
+  genuine. That is a false positive, i.e. the pre-existing behaviour, not a lost
+  fault.
 - **CANCELED heal semantics**: with `canceled_is_fault`, a canceled action heals
   on the next non-failing terminal (a later SUCCEEDED), or when the canceled goal
   ages out of the action server's retained status array and a non-failed terminal
