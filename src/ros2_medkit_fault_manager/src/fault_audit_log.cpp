@@ -61,6 +61,8 @@ class Stmt {
 
   Stmt(const Stmt &) = delete;
   Stmt & operator=(const Stmt &) = delete;
+  Stmt(Stmt &&) = delete;
+  Stmt & operator=(Stmt &&) = delete;
 
   void bind_text(int index, const std::string & value) {
     if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {

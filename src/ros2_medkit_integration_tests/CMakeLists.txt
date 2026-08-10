@@ -232,6 +232,14 @@ if(BUILD_TESTING)
     math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
   endforeach()
 
+  # test_rosbag_boundary_download drives three real rosbag recordings end to end
+  # (the demo node's own fault, then a burst across the post-fault window
+  # boundary), each with its own post-roll and finalize. Its polling deadlines
+  # add up past the 120s the feature glob assigns, so give it its own budget
+  # rather than have a slow runner kill it with no test name in the output.
+  set_tests_properties(test_rosbag_boundary_download PROPERTIES TIMEOUT 180)
+
+
   # test_graph_provider_greenwave drives a real greenwave_monitor node,
   # which only publishes /diagnostics at ~1 Hz with the first useful
   # reading a few seconds in, plus an 8s launch-ordering delay so

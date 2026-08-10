@@ -137,8 +137,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_snapshot_capture fault_manager_lib)
   medkit_target_dependencies(test_snapshot_capture rclcpp ros2_medkit_msgs std_msgs)
 
-  # Rosbag capture tests
-  medkit_add_gtest(test_rosbag_capture test/test_rosbag_capture.cpp)
+  # Rosbag capture tests. The suite drives real post-roll windows (multi-second
+  # buffer fills and timer waits), so it needs more than the 60s default.
+  medkit_add_gtest(test_rosbag_capture test/test_rosbag_capture.cpp TIMEOUT 180)
   target_link_libraries(test_rosbag_capture fault_manager_lib)
   medkit_target_dependencies(test_rosbag_capture rclcpp ros2_medkit_msgs std_msgs)
 
@@ -175,6 +176,11 @@ if(BUILD_TESTING)
 
   medkit_add_launch_test(test_rosbag_entity_scope test/test_rosbag_entity_scope.test.py TIMEOUT 120)
   set_tests_properties(test_rosbag_entity_scope PROPERTIES LABELS "integration")
+
+  # Parametrized over both storage formats (sqlite3 + mcap), so the launch
+  # runs twice inside one ctest invocation.
+  medkit_add_launch_test(test_rosbag_boundary test/test_rosbag_boundary.test.py TIMEOUT 240)
+  set_tests_properties(test_rosbag_boundary PROPERTIES LABELS "integration")
 
   # CaptureThreadPool unit tests
   medkit_add_gtest(test_capture_thread_pool test/test_capture_thread_pool.cpp)
