@@ -17,6 +17,14 @@
 # Designed for pre-commit which passes staged filenames.
 # Requires: merged compile_commands.json (run ./scripts/merge-compile-commands.sh after build).
 #
+# On the pre-push stage pre-commit passes everything that differs between the local
+# branch and the REMOTE branch. After a rebase the remote tip is the pre-rebase one,
+# so every file the base branch moved in the meantime arrives here looking changed -
+# on a branch rebased over a few dozen commits that is most of the repository, in
+# packages the author never touched and may not even have built. The list is
+# therefore narrowed to what this branch really changes, which is what the hook is
+# for. Files given explicitly on the command line are always honoured.
+#
 # Usage (standalone):
 #   ./scripts/clang-tidy-diff.sh src/ros2_medkit_gateway/src/config.cpp
 #
@@ -36,7 +44,23 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLANG_TIDY_CONFIG=".clang-tidy"
 ERRORS=0
 
+# Files this branch changes, against the point it forked from the base branch. Empty
+# when the base ref is unavailable (a fresh clone, a detached checkout, a fork with a
+# different remote name), and the filter below is then skipped rather than silencing
+# the hook.
+BRANCH_FILES=""
+if BASE_REF="$(git merge-base origin/main HEAD 2>/dev/null)"; then
+  BRANCH_FILES="$(git diff --name-only "$BASE_REF" HEAD 2>/dev/null || true)"
+fi
+
 for file in "$@"; do
+  # Not ours: a file the base branch changed, handed over by the pre-push stage
+  # because the remote tip predates a rebase. Its package may not even be built here,
+  # and clang-tidy without a compile database reports the whole file as errors.
+  if [ -n "$BRANCH_FILES" ] && ! printf '%s\n' "$BRANCH_FILES" | grep -Fxq "$file"; then
+    continue
+  fi
+
   # Only process C++ source files (.cpp). Headers are checked transitively
   # through their including .cpp files. CI runs full clang-tidy on all files.
   case "$file" in
