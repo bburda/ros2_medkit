@@ -520,21 +520,25 @@ so the three cases are:
 
    * - When the fault confirms
      - What it gets
-   * - No recording open
+   * - No recording open, buffer holding history
      - A **full bag**: the buffered pre-fault history plus the post-fault window.
    * - Inside an open window
      - **Attached** to the in-flight recording - the same bag, with its own
        metadata entry. Up to 32 faults attach on top of the first.
-   * - Right after a window closed
+   * - No recording open, buffer empty
      - A **post-fault-only bag**: its own recording holding just its
-       ``duration_after_sec`` window.
+       ``duration_after_sec`` window. Usually because a window has just closed;
+       also at startup, before anything has been published on a captured topic.
 
-The third case is not an edge case, it is the normal shape of a burst. Nothing is
-buffered while a window is open (messages go straight into the open bag), and the
-flush that opened that bag had already emptied the buffer, so the next fault to
-confirm genuinely has no pre-fault history available. It still gets a black box
+What decides between the first and the third case is simply whether anything is in
+the buffer. The third case is not an edge case, it is the normal shape of a burst:
+nothing is buffered while a window is open (messages go straight into the open bag),
+and the flush that opened that bag had already emptied the buffer, so the next fault
+to confirm genuinely has no pre-fault history available. It still gets a black box
 covering how the system behaved *after* it failed, which is what the second fault
-of a burst is usually investigated for. The log names the cause:
+of a burst is usually investigated for. A fault that confirms before any captured
+topic has published - right after startup, or under ``lazy_start`` - lands in the
+same case for the same reason. The log names the cause:
 
 .. code-block:: text
 

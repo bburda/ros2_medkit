@@ -1028,14 +1028,11 @@ bool SqliteFaultStorage::delete_rosbag_file(const std::string & fault_code) {
     }
   }
 
-  // Try to delete the actual file/directory, unless a sibling fault still
-  // points at it. Checked before the DELETE so the exclusion is explicit.
-  if (!file_path.empty() && !path_shared_with_other_fault(file_path, fault_code)) {
-    std::error_code ec;
-    std::filesystem::remove_all(file_path, ec);
-    // Ignore errors - file may already be deleted
-  }
-
+  // Row first, file after, exactly as delete_rosbag_files() does it. The step()
+  // below throws on a busy, full or unwritable database; with the unlink already
+  // done, that would leave a surviving row pointing at a bag that is gone -
+  // unreadable for good, and still charged against the storage quota, which sums
+  // rows. This way the worst case is an orphaned directory instead.
   SqliteStatement delete_stmt(db_, "DELETE FROM rosbag_files WHERE fault_code = ?");
   delete_stmt.bind_text(1, fault_code);
 
@@ -1043,7 +1040,17 @@ bool SqliteFaultStorage::delete_rosbag_file(const std::string & fault_code) {
     throw std::runtime_error(std::string("Failed to delete rosbag file record: ") + sqlite3_errmsg(db_));
   }
 
-  return sqlite3_changes(db_) > 0;
+  const bool deleted = sqlite3_changes(db_) > 0;
+
+  // Unlink only once no fault references the bag any more. This row is already
+  // gone, so path_referenced() sees exactly the siblings of a shared recording.
+  if (!file_path.empty() && !path_referenced(file_path)) {
+    std::error_code ec;
+    std::filesystem::remove_all(file_path, ec);
+    // Ignore errors - file may already be deleted
+  }
+
+  return deleted;
 }
 
 size_t SqliteFaultStorage::delete_rosbag_files(const std::vector<std::string> & fault_codes) {

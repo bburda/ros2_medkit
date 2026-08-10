@@ -15,7 +15,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <deque>
 #include <functional>
 #include <map>
@@ -136,6 +135,23 @@ class RosbagCapture {
   /// Static + public so the quota arithmetic is testable without a live recording.
   static std::vector<std::string> evict_bags_over_quota(FaultStorage * storage, size_t max_bytes);
 
+  /// Buffered history a flush may claim, in nanoseconds: the age of the oldest message
+  /// it wrote, bounded by how long the capture has been running.
+  ///
+  /// The age is a wall-clock difference, because message timestamps are wall-clock, and
+  /// it is applied to a monotonic origin. A clock step between buffering a message and
+  /// flushing it therefore lands in the figure in full. No recording can hold more
+  /// history than the capture has been alive, so that is the bound; it also keeps the
+  /// derived origin above zero, which span_sec_since() reserves for "never started" and
+  /// reports as a duration of 0.
+  ///
+  /// Static + public for the same reason as the quota arithmetic above: a wall-clock
+  /// step cannot be produced through this class's own API, and in ordinary operation the
+  /// oldest buffered message is always younger than the capture, so the bound never
+  /// engages and nothing driving the capture can exercise it.
+  static int64_t bounded_history_ns(int64_t now_wall_ns, int64_t oldest_msg_wall_ns, int64_t now_steady_ns,
+                                    int64_t capture_started_steady_ns);
+
  private:
   /// Outcome of a ring-buffer flush. "Nothing was buffered" and "the bag could not
   /// be written" used to share one empty-string return, but they call for opposite
@@ -215,18 +231,46 @@ class RosbagCapture {
   /// Enforce storage limits by deleting oldest bags
   void enforce_storage_limits();
 
+  /// Make @p rows durable for the finished bag at @p bag_path, or discard the bag.
+  ///
+  /// Both finalisation paths end here, so a bag that cannot be looked up never
+  /// survives on disk: retrieval is keyed by fault code and the quota enumerates
+  /// rows, so a directory with no row is unreachable, uncounted, and can never be
+  /// evicted to make room.
+  ///
+  /// The discard covers a failure of the store and nothing else. Quota enforcement
+  /// runs afterwards under its own handler: by then the rows are committed, so a
+  /// failing eviction says nothing about this bag, and removing the directory there
+  /// would strand the rows just written - unreadable for good, and still charged
+  /// against max_total_storage_mb.
+  ///
+  /// Never throws. One caller is reached from ~RosbagCapture via stop(), where an
+  /// escaping exception would terminate; the other runs on the capture pool, which
+  /// would swallow it into a log with the bag already orphaned.
+  ///
+  /// @return True when the rows are durable.
+  bool store_rows_or_discard_bag(const std::vector<RosbagFileInfo> & rows, const std::string & bag_path);
+
   /// Start the post-fault window: re-arm the timer, creating it the first time.
   ///
   /// The timer is created once and re-armed, never replaced per recording. A timer
-  /// per recording had the confirming capture-pool worker creating one while the
-  /// executor thread destroyed the previous one, which mutates rcl's clock
-  /// jump-callback list from two threads - and the two coincide exactly in the
+  /// per recording had the confirming capture-pool worker creating one - a node
+  /// mutation, which is why the call sits under node_ops_mutex_ - while the executor
+  /// thread destroyed the previous one, and the two coincide exactly in the
   /// burst-at-the-boundary case this class exists to serve. The destruction side is
-  /// not ours to serialise: the executor holds the last reference in
-  /// `AnyExecutable::timer` and drops it after the callback returns, outside any
-  /// mutex we could take. Re-arming removes the second party instead of trying to
-  /// lock it. Caller must hold post_fault_timer_mutex_.
-  void arm_post_fault_timer(std::chrono::nanoseconds period);
+  /// not ours to serialise: `AnyExecutable::timer` is a strong reference, so the
+  /// executor holds the last one and runs the destructor after the callback returns,
+  /// outside any mutex we could take. Re-arming removes the second party instead of
+  /// trying to lock it, and costs one allocation for the life of the capture.
+  ///
+  /// The window is always config_.duration_after_sec, so the period is fixed when
+  /// the timer is built and reset() restarts that same period. It is not a parameter
+  /// here: rclcpp offers no way to re-arm at a different one, and taking it would
+  /// promise a per-recording window the body cannot deliver. duration_after_sec is
+  /// read once at construction and never changes for the life of the node.
+  ///
+  /// Caller must hold post_fault_timer_mutex_.
+  void arm_post_fault_timer();
 
   /// Timer callback for post-fault recording
   void post_fault_timer_callback();
@@ -334,6 +378,14 @@ class RosbagCapture {
   /// confirmation racing the finalise cannot have its own start time attributed to
   /// the bag being closed.
   std::atomic<int64_t> recording_started_at_ns_{0};
+
+  /// When start() ran, on the monotonic clock. Bounds the buffered history a flush
+  /// may claim: that history is measured on the wall clock (message timestamps are),
+  /// so an NTP step or a VM resync between buffering a message and flushing it lands
+  /// straight in the figure. No recording can hold more history than this capture has
+  /// been running, and the cap also keeps the derived monotonic origin above zero,
+  /// which span_sec_since() reserves for "never started".
+  std::atomic<int64_t> capture_started_at_ns_{0};
 
   /// Active writer for current bag (kept open during post-fault recording)
   std::unique_ptr<rosbag2_cpp::Writer> active_writer_;
