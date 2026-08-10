@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -752,4 +753,142 @@ TEST_F(CancelOutcomesFixtureTest, ExecutionEvictedBetweenChecksMapsTo404NotFound
   ASSERT_TRUE(failure.has_value());
   EXPECT_EQ(failure->http_status, 404) << failure->error_code << ": " << failure->message;
   EXPECT_STREQ(failure->error_code, "resource-not-found");
+}
+
+// ---------------------------------------------------------------------------
+// One mapper serves both entry points, so every sentence it builds has to name
+// the operation the CLIENT asked for. A stop answered with "the action server
+// did not answer the cancel request" describes a request the client never
+// issued, and the operator cannot tell whether the gateway understood them.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Stands in for the two transport outcomes this fixture genuinely cannot
+/// produce: the cancel service vanishing mid-flight (kServiceUnavailable,
+/// covered end to end by test_action_cancel_unavailable.test.py) and a
+/// malformed CancelGoal answer (kTransportError). Everything the phantom
+/// service CAN drive - timeouts and rejections - is driven through the real
+/// handlers instead, so the tests also pin which verb each route passes.
+ros2_medkit_gateway::ActionCancelResult make_transport_result(ros2_medkit_gateway::CancelOutcome outcome,
+                                                              const std::string & error_message) {
+  ros2_medkit_gateway::ActionCancelResult result;
+  result.success = false;
+  result.return_code = 0;
+  result.outcome = outcome;
+  result.error_message = error_message;
+  return result;
+}
+
+/// Case-insensitive substring search - the leak this pins is a whole word
+/// ("cancel"), which appears capitalised at the start of a sentence.
+bool contains_ci(const std::string & haystack, const std::string & needle) {
+  auto lower = [](const std::string & s) {
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return out;
+  };
+  return lower(haystack).find(lower(needle)) != std::string::npos;
+}
+
+}  // namespace
+
+TEST_F(CancelOutcomesFixtureTest, StopTimeoutMessageAttributesTheStopNotACancelRequest) {
+  // Driven through PUT-stop against the blocking phantom service, so this also
+  // pins that `update_execution` is the route that passes the "Stop" verb.
+  inject_goal();
+  auto typed = make_execution_request();
+  dto::ExecutionUpdateRequest body;
+  body.capability = "stop";
+
+  auto result = handlers_->update_execution(typed, body);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 504);
+  EXPECT_EQ(result.error().message.rfind("Stop ", 0), 0u)
+      << "the message must open on the client's verb: " << result.error().message;
+  EXPECT_FALSE(contains_ci(result.error().message, "cancel request"))
+      << "a stop request is not a cancel request the client issued: " << result.error().message;
+}
+
+TEST_F(CancelOutcomesFixtureTest, StopTimeoutOnATerminalGoalSaysNothingLeftToStop) {
+  inject_goal(ActionGoalStatus::SUCCEEDED);
+  auto typed = make_execution_request();
+  dto::ExecutionUpdateRequest body;
+  body.capability = "stop";
+
+  auto result = handlers_->update_execution(typed, body);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_NE(result.error().message.find("nothing left to stop"), std::string::npos) << result.error().message;
+  EXPECT_EQ(result.error().message.find("nothing left to cancel"), std::string::npos) << result.error().message;
+}
+
+TEST_F(CancelOutcomesFixtureTest, CancelTimeoutOnATerminalGoalStillSaysNothingLeftToCancel) {
+  // The symmetric half. This one passes at HEAD too - deriving the noun from
+  // the verb must not have moved the leak to the other route, and only a
+  // regression here would turn it red.
+  inject_goal(ActionGoalStatus::SUCCEEDED);
+  auto typed = make_execution_request();
+
+  auto result = handlers_->cancel_execution(typed);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_NE(result.error().message.find("nothing left to cancel"), std::string::npos) << result.error().message;
+}
+
+TEST_F(CancelOutcomesFixtureTest, StopRefusedWithAnUndefinedReturnCodeStillNamesTheStop) {
+  // CancelGoal defines 0-3. A server answering anything else lands in the
+  // mapper's default arm, which forwards the transport's diagnostic - and that
+  // diagnostic is worded around the action's cancel. The raw code has to
+  // survive, because it is the only thing identifying what the server said.
+  fixture_node_->set_mode(PhantomCancelFixtureNode::CancelMode::kRejectImmediately);
+  fixture_node_->set_reject_return_code(7);
+  inject_goal();
+  auto typed = make_execution_request();
+  dto::ExecutionUpdateRequest body;
+  body.capability = "stop";
+
+  auto result = handlers_->update_execution(typed, body);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 400);
+  EXPECT_EQ(result.error().code, "x-medkit-ros2-action-rejected");
+  EXPECT_EQ(result.error().message.rfind("Stop failed: ", 0), 0u)
+      << "an undefined return code must still name the operation the client issued: " << result.error().message;
+  EXPECT_NE(result.error().message.find("return_code 7"), std::string::npos)
+      << "the raw code is the only identification of what the server answered: " << result.error().message;
+  EXPECT_EQ(result.error().params["return_code"], 7);
+}
+
+TEST_F(CancelOutcomesFixtureTest, UnavailableAndTransportErrorAttributeTheVerbTheClientUsed) {
+  auto * operation_mgr = gateway_node_->get_operation_manager();
+
+  struct Case {
+    ros2_medkit_gateway::CancelOutcome outcome;
+    const char * transport_message;
+    int expected_status;
+  };
+  // The transport's own diagnostic names the ROS 2 entity that failed and must
+  // survive - it is the only thing that tells an operator WHICH service is
+  // gone - but it cannot be the whole message on a stop request.
+  const std::array<Case, 2> cases{
+      Case{ros2_medkit_gateway::CancelOutcome::kServiceUnavailable, "Cancel service not available", 503},
+      Case{ros2_medkit_gateway::CancelOutcome::kTransportError, "Cancel returned null response", 500}};
+
+  for (const auto & c : cases) {
+    for (const char * verb : {"Cancel", "Stop"}) {
+      auto result = make_transport_result(c.outcome, c.transport_message);
+      auto failure = ros2_medkit_gateway::handlers::detail::map_cancel_result(result, *operation_mgr, kGoalIdHex, verb);
+
+      ASSERT_TRUE(failure.has_value()) << verb;
+      EXPECT_EQ(failure->http_status, c.expected_status) << verb << ": " << failure->message;
+      EXPECT_EQ(failure->message.rfind(std::string(verb) + " failed: ", 0), 0u)
+          << "the message must open on the client's verb: " << failure->message;
+      EXPECT_NE(failure->message.find(c.transport_message), std::string::npos)
+          << "the transport diagnostic must survive: " << failure->message;
+    }
+  }
 }

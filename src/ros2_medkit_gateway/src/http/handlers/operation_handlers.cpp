@@ -14,6 +14,7 @@
 
 #include "ros2_medkit_gateway/core/http/handlers/operation_handlers.hpp"
 
+#include <cctype>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -230,8 +231,28 @@ namespace detail {
 ///   the action server, so an availability code would misdirect the operator.
 ///
 /// @param verb "Cancel" or "Stop" - keeps each entry point's message wording.
+///   Every sentence this function builds is worded from `verb`: the same
+///   mapping serves both routes, and a stop request answered with "the action
+///   server did not answer the cancel request" names an operation the client
+///   never issued. Where the underlying ROS 2 mechanism has to be named - a
+///   stop IS carried out as an action cancel - it is named as the cause, after
+///   the verb the client used, never in place of it.
 std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result, OperationManager & operation_mgr,
                                                const std::string & execution_id, const char * verb) {
+  // Derived rather than passed as a second parameter, so no call site can hand
+  // in a verb and a noun that disagree.
+  std::string lower_verb(verb);
+  if (!lower_verb.empty()) {
+    lower_verb[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(lower_verb[0])));
+  }
+  // "<Verb> failed: <cause>" - keeps the transport's diagnostic, which names
+  // the ROS 2 entity that failed, while the sentence still opens on what the
+  // client asked for. `fallback` is defensive: every producer of these outcomes
+  // sets `error_message`, so it stands in only for a future one that forgets.
+  auto attributed = [&result, verb](const char * fallback) {
+    return std::string(verb) + " failed: " + (result.error_message.empty() ? fallback : result.error_message);
+  };
+
   switch (result.outcome) {
     case CancelOutcome::kOk:
       return std::nullopt;
@@ -241,8 +262,7 @@ std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result
           (tracked->status == ActionGoalStatus::CANCELING || tracked->status == ActionGoalStatus::CANCELED)) {
         return std::nullopt;
       }
-      std::string message =
-          std::string(verb) + " outcome unknown: the action server did not answer the cancel request in time. ";
+      std::string message = std::string(verb) + " outcome unknown: the action server did not answer in time. ";
       // CANCELED already reconciled above, so a terminal status here means
       // the goal finished on its own. Telling the client to watch for
       // progress would describe something that cannot happen - say what the
@@ -252,7 +272,7 @@ std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result
       if (tracked.has_value() &&
           (tracked->status == ActionGoalStatus::SUCCEEDED || tracked->status == ActionGoalStatus::ABORTED)) {
         message += "The execution status resource already reports the goal as " +
-                   sovd_status_from_ros2(tracked->status) + ", so there is nothing left to cancel.";
+                   sovd_status_from_ros2(tracked->status) + ", so there is nothing left to " + lower_verb + ".";
       } else {
         // `status` alone cannot express the answer the client is asking for -
         // it renders CANCELED and ABORTED identically as "failed" - so name
@@ -263,10 +283,10 @@ std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result
     }
     case CancelOutcome::kServiceUnavailable:
       return CancelFailure{503, ERR_X_MEDKIT_ROS2_ACTION_UNAVAILABLE,
-                           result.error_message.empty() ? "Cancel service not available" : result.error_message};
+                           attributed("the action server's cancel service is not available")};
     case CancelOutcome::kTransportError:
       return CancelFailure{500, ERR_X_MEDKIT_ROS2_ACTION_UNAVAILABLE,
-                           result.error_message.empty() ? std::string(verb) + " failed" : result.error_message};
+                           attributed("the cancel request could not be completed")};
     case CancelOutcome::kNotTracked:
       return CancelFailure{404, ERR_RESOURCE_NOT_FOUND, "Execution not found"};
     case CancelOutcome::kErrorResponse:
@@ -284,7 +304,11 @@ std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result
       message = "Execution already terminated";
       break;
     default:
-      message = result.error_message.empty() ? std::string(verb) + " failed" : result.error_message;
+      // A code CancelGoal does not define. The transport's diagnostic quotes
+      // the raw code and is the only thing that identifies it, so it is kept
+      // as the cause - but it is worded around the action's own cancel, and on
+      // the stop route that is not the operation the client issued.
+      message = attributed("the action server refused it with a return code the protocol does not define");
   }
   return CancelFailure{400, ERR_X_MEDKIT_ROS2_ACTION_REJECTED, std::move(message)};
 }
