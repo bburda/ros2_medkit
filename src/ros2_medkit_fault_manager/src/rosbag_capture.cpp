@@ -282,6 +282,11 @@ void RosbagCapture::on_fault_prefailed(const std::string & fault_code) {
   }
 }
 
+bool RosbagCapture::is_current_recording_primary(const std::string & fault_code) const {
+  std::lock_guard<std::mutex> lock(post_fault_timer_mutex_);
+  return recording_post_fault_.load() && fault_code == current_fault_code_;
+}
+
 bool RosbagCapture::attach_to_active_recording(const std::string & fault_code,
                                                const std::set<std::string> & entity_topics) {
   std::lock_guard<std::mutex> lock(post_fault_timer_mutex_);
@@ -297,6 +302,11 @@ bool RosbagCapture::attach_to_active_recording(const std::string & fault_code,
   if (attached_fault_codes_.size() >= kMaxAttachedFaults) {
     RCLCPP_WARN(node_->get_logger(), "Post-fault recording already covers %zu faults, not attaching '%s'",
                 attached_fault_codes_.size(), fault_code.c_str());
+    // Widened anyway. What the cap withholds is the lookup key, not the data - and in
+    // entity mode returning here withheld the data too, because the recording never
+    // learned this fault's topics and should_capture_topic() then dropped every one of
+    // its messages. The bag is the burst's black box either way.
+    widen_capture_filter_for(fault_code, entity_topics);
     return true;
   }
   if (attached_fault_codes_.insert(fault_code).second) {
@@ -347,7 +357,7 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
   // guard stays true, messages keep entering the bag, and the recording overruns
   // duration_after_sec by however long the store stalls.
   std::set<std::string> entity_topics;
-  if (config_.topics == "entity") {
+  if (config_.topics == "entity" && !is_current_recording_primary(fault_code)) {
     entity_topics = compute_entity_topics(fault_code);
   }
 
@@ -1369,14 +1379,34 @@ void RosbagCapture::finalize_post_fault_recording() {
 
   // One recording, one row per fault it covers: the correlated faults that
   // confirmed inside this window each need their own lookup key to serve it.
-  // A fault cleared during the post-roll was dropped from the recording state
-  // (auto-cleanup) and gets no row.
+  //
+  // A fault cleared meanwhile gets none. on_fault_cleared() drops the code from the
+  // recording state, but only when the guard was already published at the moment the
+  // clear arrived - a fault cleared while its own recording was still being opened
+  // slips past that, and its row would then survive with nothing left to remove it,
+  // keeping the bag referenced for good. The store knows the current answer, so ask
+  // it rather than trust a flag captured earlier. Only under auto_cleanup: without
+  // it, a cleared fault is meant to keep its black box.
+  const auto wants_a_row = [this](const std::string & code) {
+    if (!config_.auto_cleanup) {
+      return true;
+    }
+    const auto fault = storage_->get_fault(code);
+    // Absent is not cleared. A caller driving the capture directly, or a fault the
+    // store never saw, must keep its row - only a fault the store still holds AND
+    // reports as cleared loses one.
+    return !fault.has_value() || fault->status != ros2_medkit_msgs::msg::Fault::STATUS_CLEARED;
+  };
+
   std::vector<RosbagFileInfo> rows;
-  if (!fault_code.empty()) {
+  if (!fault_code.empty() && wants_a_row(fault_code)) {
     info.fault_code = fault_code;
     rows.push_back(info);
   }
   for (const auto & code : attached) {
+    if (!wants_a_row(code)) {
+      continue;
+    }
     info.fault_code = code;
     rows.push_back(info);
   }

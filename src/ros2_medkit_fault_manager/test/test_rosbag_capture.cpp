@@ -727,6 +727,30 @@ class RosbagQuotaSweepFailingStorage : public InMemoryFaultStorage {
   size_t sweep_attempts = 0;
 };
 
+/// Storage that throws something that is not a std::exception. The interface promises
+/// nothing about what a backend throws, and the finalise is reached from ~RosbagCapture
+/// through stop(), where an escape terminates the process.
+class RosbagNonStandardThrowStorage : public InMemoryFaultStorage {
+ public:
+  void store_rosbag_files(const std::vector<ros2_medkit_fault_manager::RosbagFileInfo> & /*infos*/) override {
+    ++store_attempts;
+    throw 42;  // NOLINT(hicpp-exception-baseclass) - deliberately not a std::exception
+  }
+
+  size_t store_attempts = 0;
+};
+
+/// Storage counting fault lookups, which is what resolving an entity scope costs.
+class RosbagFaultLookupCountingStorage : public InMemoryFaultStorage {
+ public:
+  std::optional<ros2_medkit_msgs::msg::Fault> get_fault(const std::string & fault_code) const override {
+    ++lookups;
+    return InMemoryFaultStorage::get_fault(fault_code);
+  }
+
+  mutable size_t lookups = 0;
+};
+
 /// Storage whose metadata write is slow, standing in for a busy database or a loaded
 /// disk. The finalise reaches it after it has released post_fault_timer_mutex_, so it
 /// widens - deterministically, and without a hook in production code - the window in
@@ -1983,4 +2007,166 @@ TEST_F(RosbagCaptureIntegrationTest, ConfirmedWithoutPrefailed) {
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, AFaultClearedWhileItsBagWasOpeningGetsNoRow) {
+  // on_fault_cleared() drops the code from the recording state only when the guard is
+  // already published. A clear that arrives while the recording is still being opened
+  // misses that window, and the row it leaves behind has nothing left to remove it -
+  // auto-cleanup has already run. The clear is applied straight to the store here,
+  // which is that race without having to hit it.
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_after_sec = 0.4;
+  rosbag_config.auto_cleanup = true;
+  auto snapshot_config = create_snapshot_config();
+
+  rclcpp::Clock clock;
+  storage_->report_fault_event("CLEARED_WHILE_OPENING", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                               ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "cleared while opening", "/test_source",
+                               clock.now(), ros2_medkit_fault_manager::DebounceConfig{});
+
+  RosbagCapture capture(node_.get(), storage_.get(), rosbag_config, snapshot_config);
+  capture.start();
+  capture.on_fault_confirmed("CLEARED_WHILE_OPENING");
+  storage_->clear_fault("CLEARED_WHILE_OPENING");
+  spin_for(std::chrono::milliseconds(1500));
+
+  EXPECT_FALSE(storage_->get_rosbag_file("CLEARED_WHILE_OPENING").has_value())
+      << "a fault cleared before its recording finalised kept a row nothing will ever remove";
+  EXPECT_EQ(count_bag_dirs(), 0u) << "the bag nobody references any more was left on disk";
+
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, AFaultPastTheAttachmentCapStillGetsItsTopicsRecorded) {
+  // The cap withholds the lookup key, not the data - that is what the comment on it and
+  // the configuration docs both say. In entity mode it withheld the data too: returning
+  // before the scope was widened left the recording ignorant of the over-cap fault's
+  // topics, and should_capture_topic() then dropped every message it published.
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.topics = "entity";
+  rosbag_config.duration_sec = 2.0;
+  rosbag_config.duration_after_sec = 3.0;
+  auto snapshot_config = create_snapshot_config();
+
+  auto node_primary = std::make_shared<rclcpp::Node>("cap_primary_source");
+  auto node_late = std::make_shared<rclcpp::Node>("cap_late_source");
+  auto pub_primary = node_primary->create_publisher<std_msgs::msg::String>("/cap_primary", 10);
+  auto pub_late = node_late->create_publisher<std_msgs::msg::String>("/cap_late", 10);
+
+  rclcpp::Clock clock;
+  const ros2_medkit_fault_manager::DebounceConfig debounce{};
+  storage_->report_fault_event("CAP_PRIMARY", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                               ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "cap primary", "/cap_primary_source",
+                               clock.now(), debounce);
+  storage_->report_fault_event("CAP_LATE", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                               ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "cap late", "/cap_late_source",
+                               clock.now(), debounce);
+
+  RosbagCapture capture(node_.get(), storage_.get(), rosbag_config, snapshot_config);
+  capture.start();
+
+  std_msgs::msg::String msg;
+  msg.data = "payload";
+  for (int i = 0; i < 20; ++i) {
+    pub_primary->publish(msg);
+    pub_late->publish(msg);
+    spin_for(std::chrono::milliseconds(50));
+  }
+
+  capture.on_fault_confirmed("CAP_PRIMARY");
+  // Fill the attachment set past its cap, then confirm the one whose topics matter.
+  // The fillers report the PRIMARY node as their source on purpose: a fault whose
+  // scope cannot be resolved widens the recording to every topic, which would let the
+  // late fault's topic into the bag for a reason that has nothing to do with the cap.
+  for (int i = 0; i < 40; ++i) {
+    const std::string filler = "CAP_FILLER_" + std::string(i < 10 ? "0" : "") + std::to_string(i);
+    storage_->report_fault_event(filler, ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                                 ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "cap filler", "/cap_primary_source",
+                                 clock.now(), debounce);
+    capture.on_fault_confirmed(filler);
+  }
+  capture.on_fault_confirmed("CAP_LATE");
+  for (int i = 0; i < 30; ++i) {
+    pub_primary->publish(msg);
+    pub_late->publish(msg);
+    spin_for(std::chrono::milliseconds(50));
+  }
+
+  ASSERT_TRUE(wait_for_row("CAP_PRIMARY", std::chrono::milliseconds(12000)));
+  auto row = storage_->get_rosbag_file("CAP_PRIMARY");
+  ASSERT_TRUE(row.has_value());
+  EXPECT_FALSE(storage_->get_rosbag_file("CAP_LATE").has_value()) << "the cap is supposed to withhold the lookup key";
+  EXPECT_TRUE(bag_has_topic(row->file_path, "/cap_primary")) << "the recording lost the topics it was opened for";
+  EXPECT_TRUE(bag_has_topic(row->file_path, "/cap_late"))
+      << "an over-cap fault's topics never reached the bag, so the burst's black box is missing its data";
+
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, AnUnusualExceptionFromTheStoreDoesNotEscape) {
+  // The helper documents "never throws" because it is reached from ~RosbagCapture via
+  // stop(), and a destructor is implicitly noexcept. Catching std::exception only made
+  // that a claim rather than a fact: the storage interface says nothing about what a
+  // backend throws.
+  RosbagNonStandardThrowStorage odd_storage;
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_after_sec = 0.0;
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture capture(node_.get(), &odd_storage, rosbag_config, snapshot_config);
+
+  capture.start();
+  fill_buffer("/odd_throw_probe");
+  EXPECT_NO_THROW(capture.on_fault_confirmed("ODD_THROW"));
+  ASSERT_GT(odd_storage.store_attempts, 0u) << "the store was never reached, so nothing was caught";
+
+  EXPECT_FALSE(odd_storage.get_rosbag_file("ODD_THROW").has_value());
+  EXPECT_EQ(count_bag_dirs(), 0u) << "the bag survived a failed store";
+
+  EXPECT_NO_THROW(capture.stop());
+}
+
+TEST_F(RosbagCaptureIntegrationTest, ReconfirmingTheRecordingsOwnFaultResolvesNoScope) {
+  // A level-triggered reporter re-confirms the same fault for as long as it is failing.
+  // Each of those repeats reaches a fault already owning the running recording and can
+  // do nothing with an entity scope, so resolving one - a fault-store read plus a graph
+  // enumeration per topic - is pure cost on a hot path.
+  auto counting_storage = std::make_unique<RosbagFaultLookupCountingStorage>();
+  auto * storage_ptr = counting_storage.get();
+
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.topics = "entity";
+  rosbag_config.duration_after_sec = 2.0;
+  auto snapshot_config = create_snapshot_config();
+
+  auto source = std::make_shared<rclcpp::Node>("reconfirm_source");
+  auto pub = source->create_publisher<std_msgs::msg::String>("/reconfirm_probe", 10);
+
+  rclcpp::Clock clock;
+  storage_ptr->report_fault_event("RECONFIRMED", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                                  ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "reconfirmed", "/reconfirm_source",
+                                  clock.now(), ros2_medkit_fault_manager::DebounceConfig{});
+
+  RosbagCapture capture(node_.get(), storage_ptr, rosbag_config, snapshot_config);
+  capture.start();
+
+  std_msgs::msg::String msg;
+  msg.data = "payload";
+  for (int i = 0; i < 20; ++i) {
+    pub->publish(msg);
+    spin_for(std::chrono::milliseconds(50));
+  }
+
+  capture.on_fault_confirmed("RECONFIRMED");
+  const size_t after_first = storage_ptr->lookups;
+
+  constexpr int kRepeats = 20;
+  for (int i = 0; i < kRepeats; ++i) {
+    capture.on_fault_confirmed("RECONFIRMED");
+  }
+
+  EXPECT_LT(storage_ptr->lookups - after_first, static_cast<size_t>(kRepeats))
+      << "every repeat resolved an entity scope it cannot use";
+
+  capture.stop();
 }
