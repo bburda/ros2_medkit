@@ -306,23 +306,27 @@ class GenericServiceClient : public rclcpp::ClientBase {
   }
 
   /// Send a request asynchronously. Returns a FutureAndRequestId.
+  ///
+  /// The pending-request mutex is held ACROSS `rcl_send_request`, not just
+  /// around the insertion. The caller is an HTTP thread while `handle_response`
+  /// runs on an executor thread, so a reply to a fast service can arrive before
+  /// this function reaches the insertion. `handle_response` would then find no
+  /// entry, drop the reply, and the caller's future would only end on timeout.
+  /// Sending under the lock makes the reply callback wait for the entry that
+  /// names it. This is what `rclcpp::Client::async_send_request_impl` does with
+  /// its own pending map, and the reason is the same.
   /// @param request Pointer to the deserialized request message (void*)
   FutureAndRequestId async_send_request(const Request request) {
     Promise promise;
     auto future = promise.get_future();
 
-    // Send the request via rcl
     int64_t sequence_number;
+    std::lock_guard<std::mutex> lock(pending_requests_mutex_);
     rcl_ret_t ret = rcl_send_request(get_client_handle().get(), request, &sequence_number);
     if (ret != RCL_RET_OK) {
       rclcpp::exceptions::throw_from_rcl_error(ret, "Failed to send request");
     }
-
-    // Store promise for later fulfillment when handle_response is called
-    {
-      std::lock_guard<std::mutex> lock(pending_requests_mutex_);
-      pending_requests_.emplace(sequence_number, std::move(promise));
-    }
+    pending_requests_.emplace(sequence_number, std::move(promise));
 
     return FutureAndRequestId(std::move(future), sequence_number);
   }
