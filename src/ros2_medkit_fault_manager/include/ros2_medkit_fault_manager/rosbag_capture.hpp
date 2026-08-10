@@ -288,6 +288,12 @@ class RosbagCapture {
   /// Attach @p fault_code to the in-flight post-fault recording, if there is one.
   /// Returns true when the fault was handled (attached, already recording, or the
   /// attachment cap was hit) and the caller must not open a second bag.
+  /// Whether @p fault_code is the fault the running recording was opened for.
+  /// Cheap, and checked before the entity scope is resolved: a level-triggered
+  /// reporter re-confirming the same fault would otherwise pay for a fault-store read
+  /// and a full graph enumeration on every repeat, none of which it can use.
+  bool is_current_recording_primary(const std::string & fault_code) const;
+
   bool attach_to_active_recording(const std::string & fault_code, const std::set<std::string> & entity_topics);
 
   /// Try to subscribe to a single topic
@@ -366,7 +372,7 @@ class RosbagCapture {
   /// start time, the writer - must happen inside one post_fault_timer_mutex_
   /// critical section, or a confirmation racing a finalise ends up owning half of
   /// the previous recording's state.
-  std::mutex post_fault_timer_mutex_;
+  mutable std::mutex post_fault_timer_mutex_;
   rclcpp::TimerBase::SharedPtr post_fault_timer_;
   std::atomic<bool> recording_post_fault_{false};
 
