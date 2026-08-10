@@ -448,14 +448,23 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
         print('Multiple faults have separate rosbag files')
 
     def test_06_rosbag_contains_recorded_duration(self):
-        """Test that rosbag duration approximately matches configuration."""
+        """
+        Test that a full-buffer recording reports ~the configured window.
+
+        ``duration_sec`` is the recording's real span, not the configured
+        ``duration_sec + duration_after_sec``. The two only coincide when the
+        ring buffer actually held a full pre-fault window at confirmation, so
+        this test waits for that many messages (25 at the publisher's 10 Hz =
+        2.5s > the 2.0s buffer) instead of the 5-message default, which only
+        guarantees ~0.5s of history and would legitimately report ~1.4s.
+        """
         fault_code = 'DURATION_TEST'
 
-        # Report fault - buffer should have ~duration_sec worth of messages
+        # Report fault only once the buffer holds a FULL pre-fault window.
         # Same refill race as test_01/test_02: the previous test's post-fault window
         # diverts messages away from the ring buffer, so reporting straight after it
         # closes finds the buffer empty and no bag is created.
-        self.assertTrue(self._wait_for_buffered_data(),
+        self.assertTrue(self._wait_for_buffered_data(count=25),
                         'ring buffer never refilled after the previous post-fault window')
         response = self._report_fault(fault_code, 'Duration test fault')
         self.assertTrue(response.accepted)
@@ -465,7 +474,7 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
 
         self.assertTrue(rosbag_response.success)
 
-        # Duration should be approximately duration_sec + duration_after_sec
+        # With a full buffer the real span is ~duration_sec + duration_after_sec.
         # Allow some tolerance for timing
         expected_min = 1.5  # At least some data
         expected_max = 4.0  # Upper bound with tolerance

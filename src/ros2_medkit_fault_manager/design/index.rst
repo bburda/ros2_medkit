@@ -244,3 +244,111 @@ means heal on a single PASSED event); the node validates the
 merged per-entity config at startup, logs a warning, and falls back to safe defaults if not. When
 healing is disabled, any HEALED row left by a previous (healing-enabled) run is reclassified to
 CLEARED once at startup so it does not behave inconsistently under the latch.
+
+Rosbag Black-Box Recording
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``RosbagCapture`` is a single-writer black box: one ring buffer, one open bag writer and
+one post-fault window per fault manager. Everything below follows from that.
+
+Subscriptions feed a ``std::deque`` of serialised messages, pruned to ``duration_sec`` of
+history and to ``max_buffer_mb`` of RAM. Pruning is driven by message arrival, not by a
+timer, so a topic that stops publishing keeps its last window buffered rather than
+silently losing the final messages before it died.
+
+On confirmation the whole buffer is moved out in one step and written to a new bag. If
+``duration_after_sec > 0`` the writer stays open and the state machine enters the
+post-fault window: ``recording_post_fault_`` is set, a one-shot timer is armed, and from
+that point incoming messages bypass the buffer and are written straight to the open bag.
+When the timer fires (or ``stop()`` runs first), the recording is finalised: the writer
+closes and one metadata row is stored per fault the recording covers.
+
+.. plantuml::
+
+   @startuml
+   skinparam backgroundColor transparent
+   state "Buffering" as BUF
+   state "Post-fault window" as POST
+   state "Finalising" as FIN
+
+   [*] --> BUF : start()
+   BUF --> POST : confirm, buffer non-empty\n(flush + keep writer open)
+   BUF --> POST : confirm, buffer EMPTY\n(post-fault-only bag)
+   BUF --> BUF : confirm, duration_after_sec == 0\n(flush, close, store row)
+   POST --> POST : confirm inside the window\n(attach, share the bag)
+   POST --> FIN : timer expires / stop()
+   FIN --> BUF : rows stored, writer closed
+   @enduml
+
+The window boundary
+"""""""""""""""""""
+
+The interesting transition is the second one. Right after a window finalises the buffer
+is empty *by construction*: the flush that opened the recording drained it, and every
+message published during the window went into that bag instead of back into the buffer.
+A fault confirming in that gap - typically the next fault of the same burst - therefore
+has no pre-fault history to write.
+
+Before, ``flush_to_bag()`` returned an empty path and the confirmation was abandoned with
+a warning: no bag, no metadata row, no retry, and every later retrieval for that fault
+failed permanently. Now the empty buffer is distinguished from a write failure, and it
+opens a recording anyway - a post-fault-only bag. Because it is the ordinary post-roll
+state machine, attachment, entity scoping, auto-cleanup and quota accounting all behave
+as for any other recording.
+
+Two states stay deliberately empty-handed:
+
+- ``duration_after_sec == 0``: there is no window to record into and no history to write,
+  so the fault gets no bag.
+- an I/O failure (unwritable ``storage_path``, unusable storage backend): no post-roll is
+  opened on top of it, so no row is ever stored for a bag that does not exist.
+
+``flush_to_bag()`` reports ``kOk`` / ``kEmptyBuffer`` / ``kIoError`` rather than one
+overloaded empty-string return, and the writer-open block lives in ``open_bag_writer()``
+so it can run without any buffered messages.
+
+Handing a recording over
+""""""""""""""""""""""""
+
+Confirmations run on the capture pool and the post-fault timer runs on the executor. The
+node-level rosbag mutex serialises confirmations against each other but not against the
+timer, so ``post_fault_timer_mutex_`` is the only thing ordering the two - and clearing
+the recording guard is precisely the signal that lets the next confirmation open a bag of
+its own. Everything that belongs to the recording therefore changes hands inside one
+critical section: the guard, the start time and the writer. Releasing the guard first and
+reaching for ``writer_mutex_`` afterwards leaves a gap in which the incoming confirmation
+installs its writer and the outgoing finalise then destroys it, after which the new
+recording writes through a null pointer - every message dropped - and still stores a row
+for the empty bag it produced. The writer is only *closed* outside the locks, once it is
+exclusively the finalise's own, because flushing a bag is real I/O.
+
+The resulting order is ``node rosbag mutex -> post_fault_timer_mutex_ ->
+{capture_topics_mutex_, writer_mutex_}``, with ``buffer_mutex_`` never held across another
+lock. Paths that take the capture-topics or writer locks on their own release each before
+taking the next, so no reverse edge exists and the order is acyclic.
+
+Honest durations
+""""""""""""""""
+
+``RosbagFileInfo::duration_sec`` is the wall-clock span the recording was open, tracked
+from the timestamp of its oldest written message (or from the moment the writer opened,
+for a post-fault-only bag). Both storage paths used to hardcode the configured windows,
+which made a post-fault-only bag and a bag flushed from a half-filled buffer both claim a
+full pre-fault window.
+
+It is a recording span, not a content span. A post-fault-only window during which nothing
+was published still reports its window: that statement is more useful to an operator than
+a zero indistinguishable from a broken artifact, and it is the only definition every path
+can produce without timestamping each message inside the post-roll write path, which runs
+under ``writer_mutex_`` in the hot path. Because the buffer is pruned only on arrival, the
+span can also legitimately exceed ``duration_sec + duration_after_sec``.
+
+If the metadata row cannot be stored, the bag is discarded rather than kept: retrieval is
+keyed by fault code and quota accounting enumerates rows, so a bag with no row would
+occupy disk that nothing can find and nothing can evict.
+
+Known interval: between the empty-buffer flush and the moment the recording guard is
+published, the writer is being created - directory creation plus a storage-backend open.
+Messages arriving in that interval take the buffering path rather than the new bag, so a
+post-fault-only recording can miss its first few milliseconds. They are not lost; they
+stay in the ring buffer and serve the next fault as pre-history.

@@ -270,7 +270,10 @@ Capture continuous rosbag recordings around fault events.
        still running attaches to the in-flight recording and shares its bag,
        with one metadata entry per fault. At most 32 faults attach on top of
        the first; any beyond that are recorded in the bag's data but get no
-       per-fault entry (logged as a warning).
+       per-fault entry (logged as a warning). A fault confirming just *after*
+       the window closes gets a post-fault-only bag of its own - see
+       :ref:`rosbag-recording-lifecycle` below. Setting this to ``0`` disables
+       the post-fault window entirely, and with it post-fault-only recordings.
    * - ``rosbag.topics``
      - ``entity``
      - Topic selection mode: ``entity`` (default; write only the faulting node's
@@ -304,6 +307,63 @@ Capture continuous rosbag recordings around fault events.
      - ``true``
      - Delete a fault's bag when the fault is cleared. A recording shared by a
        burst survives until the last fault referencing it clears.
+
+.. _rosbag-recording-lifecycle:
+
+Recording Lifecycle and the Window Boundary
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Only one recording is open at a time: there is one ring buffer, one bag writer and
+one post-fault window per fault manager. That single-writer design decides what a
+fault gets depending on *when* it confirms relative to the previous fault's
+``duration_after_sec`` window.
+
+**While no recording is open.** Messages accumulate in the ring buffer. A
+confirmation flushes the whole buffer into a new bag and, if
+``duration_after_sec > 0``, keeps that bag open for the post-fault window. The
+result is a full bag: pre-fault history plus post-fault response.
+
+**Inside an open window.** The confirming fault attaches to the in-flight
+recording and shares its bag, getting its own metadata entry (see
+``duration_after_sec`` above). Nothing is buffered while a window is open -
+incoming messages are written straight to the open bag.
+
+**Right after a window closes.** The ring buffer is empty *by construction*: the
+flush that opened the recording moved the whole buffer out, and everything
+published during the window went into that bag rather than back into the buffer.
+A fault confirming in this moment - typically the second fault of a burst - has no
+pre-fault history to write. It gets a **post-fault-only bag**: a recording of its
+own containing just its ``duration_after_sec`` window. It is a normal recording in
+every other respect, so a further fault of the burst attaches to it as usual. The
+fault manager logs the cause:
+
+.. code-block:: text
+
+   No pre-fault data buffered for fault 'BRAKE_PRESSURE_LOW' - recording post-fault window only
+
+With ``duration_after_sec: 0`` there is no window to record into and no history to
+write, so such a fault gets no bag at all (also logged). If the bag cannot be
+written (unwritable ``storage_path``, missing storage backend), no recording is
+opened and no metadata entry is stored - a failed capture never leaves a row
+pointing at a bag that is not there.
+
+A post-fault-only bag on a quiet or heavily filtered system can contain zero
+messages. It still finalises normally on both ``sqlite3`` and ``mcap``, is listed
+by the bulk-data endpoints and can be downloaded; only its payload is empty.
+
+**What ``duration_sec`` on a stored bag means.** The value returned by
+``~/get_rosbag`` and the gateway's bulk-data listing is the span the recording was
+open, not the configured windows. It is a *recording* span, not a *content* span:
+the zero-message bag above still reports its window rather than ``0.0``, because
+"the black box covered these seconds and nothing was published" is the useful
+statement and a bare zero would be indistinguishable from a broken artifact. A
+post-fault-only bag therefore reports roughly ``duration_after_sec``, and a bag
+flushed from a buffer that never filled reports the history it holds plus its
+window. The span can also *exceed* ``duration_sec + duration_after_sec``:
+the ring buffer is pruned only when a message arrives, so a topic that goes quiet
+keeps its last window buffered until the next confirmation flushes it. That is
+deliberate - a black box should keep the final messages of a topic that stopped
+publishing - and the reported duration says so honestly.
 
 .. seealso::
 

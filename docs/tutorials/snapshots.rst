@@ -430,7 +430,8 @@ Rosbag Configuration Options
        in-flight recording and shares its bag, with one metadata entry per
        fault. At most 32 faults attach on top of the first; any beyond that
        are recorded in the bag's data but get no per-fault entry (logged as
-       a warning).
+       a warning). A fault confirming just *after* the window closes gets a
+       post-fault-only bag - see `Bursts and the Window Boundary`_ below.
    * - ``snapshots.rosbag.topics``
      - ``"entity"``
      - Topic selection mode:
@@ -504,6 +505,72 @@ Rosbag Configuration Options
        deleted when this limit is exceeded. A recording shared by a burst of
        faults counts once towards the total, and eviction removes a whole
        burst's bag at a time.
+
+Bursts and the Window Boundary
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Faults rarely arrive alone. One root cause produces a burst, and where each fault
+of that burst lands relative to the previous ``duration_after_sec`` window decides
+what it gets. There is only ever one recording open (one ring buffer, one writer),
+so the three cases are:
+
+.. list-table::
+   :widths: 30 70
+   :header-rows: 1
+
+   * - When the fault confirms
+     - What it gets
+   * - No recording open
+     - A **full bag**: the buffered pre-fault history plus the post-fault window.
+   * - Inside an open window
+     - **Attached** to the in-flight recording - the same bag, with its own
+       metadata entry. Up to 32 faults attach on top of the first.
+   * - Right after a window closed
+     - A **post-fault-only bag**: its own recording holding just its
+       ``duration_after_sec`` window.
+
+The third case is not an edge case, it is the normal shape of a burst. Nothing is
+buffered while a window is open (messages go straight into the open bag), and the
+flush that opened that bag had already emptied the buffer, so the next fault to
+confirm genuinely has no pre-fault history available. It still gets a black box
+covering how the system behaved *after* it failed, which is what the second fault
+of a burst is usually investigated for. The log names the cause:
+
+.. code-block:: text
+
+   No pre-fault data buffered for fault 'BRAKE_PRESSURE_LOW' - recording post-fault window only
+
+Two consequences worth knowing:
+
+- **With** ``duration_after_sec: 0`` **there is no window**, so a fault landing on
+  an empty buffer gets no bag at all - there is neither history to write nor a
+  window to record into. If bursts matter to you, keep a non-zero post-fault
+  window.
+- **A post-fault-only bag may contain zero messages** if nothing publishes during
+  the window (a quiet system, or a narrow ``topics`` filter). It still finalises
+  and downloads normally on both storage formats; only the payload is empty.
+
+The stored ``duration_sec`` is the span the recording was open, not the configured
+windows, so the two kinds of bag are easy to tell apart:
+
+.. code-block:: bash
+
+   ros2 service call /fault_manager/get_rosbag ros2_medkit_msgs/srv/GetRosbag \
+     "{fault_code: 'BRAKE_PRESSURE_LOW'}"
+   # duration_sec ~= duration_after_sec -> post-fault-only bag
+   # anything longer                    -> the recording also holds pre-fault history
+
+Note the second rule has no upper bound, deliberately. The span can exceed
+``duration_sec + duration_after_sec``: the ring buffer is pruned only when a
+message arrives, so a topic that stops publishing keeps its last window buffered
+until the next confirmation flushes it. That is intentional - the final messages
+before a topic died are exactly what a black box is for - and the reported
+duration reflects it.
+
+It is a *recording* span and not a *content* span: a post-fault-only bag whose
+window stayed quiet still reports its window rather than zero, because the useful
+statement is "the black box covered these seconds and nothing was published"
+rather than a bare ``0.0`` that would be indistinguishable from a broken artifact.
 
 Understanding lazy_start Mode
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
