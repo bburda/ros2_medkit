@@ -18,6 +18,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -613,6 +614,80 @@ TEST_F(RosbagCaptureTest, TheDerivedOriginStaysPositiveOnALowUptimeMachine) {
   EXPECT_GT(now_steady - history, 0) << "the recording's origin is non-positive, so its duration reports as zero";
 }
 
+TEST_F(RosbagCaptureTest, ABatchStoreUnlinksASharedReplacedBagExactlyOnce) {
+  // The in-memory backend now publishes a batch in one step rather than row by row,
+  // because the caller reads a throw as "nothing was stored" and removes the
+  // recording. The replaced-bag rule has to survive that rewrite: two faults of one
+  // burst can share the bag being replaced, and whether it is still referenced has
+  // to be judged on the finished batch. Judged row by row beforehand, each row sees
+  // its sibling still pointing at the old bag and neither unlinks it.
+  using ros2_medkit_fault_manager::RosbagFileInfo;
+
+  const auto old_bag = temp_dir_ / "shared_old_bag";
+  const auto new_bag = temp_dir_ / "shared_new_bag";
+  std::filesystem::create_directories(old_bag);
+  std::filesystem::create_directories(new_bag);
+
+  RosbagFileInfo shared;
+  shared.file_path = old_bag.string();
+  shared.format = "mcap";
+  shared.duration_sec = 1.0;
+  shared.size_bytes = 10;
+  shared.created_at_ns = 1000;
+  shared.fault_code = "SHARED_A";
+  storage_->store_rosbag_file(shared);
+  shared.fault_code = "SHARED_B";
+  storage_->store_rosbag_file(shared);
+  ASSERT_TRUE(std::filesystem::exists(old_bag));
+
+  RosbagFileInfo moved = shared;
+  moved.file_path = new_bag.string();
+  moved.created_at_ns = 2000;
+  std::vector<RosbagFileInfo> rows;
+  rows.reserve(2);
+  moved.fault_code = "SHARED_A";
+  rows.push_back(moved);
+  moved.fault_code = "SHARED_B";
+  rows.push_back(moved);
+  storage_->store_rosbag_files(rows);
+
+  EXPECT_FALSE(std::filesystem::exists(old_bag)) << "the replaced bag leaked: nothing references it any more";
+  EXPECT_TRUE(std::filesystem::exists(new_bag)) << "the bag the batch points at was removed";
+  auto row_a = storage_->get_rosbag_file("SHARED_A");
+  auto row_b = storage_->get_rosbag_file("SHARED_B");
+  ASSERT_TRUE(row_a.has_value());
+  ASSERT_TRUE(row_b.has_value());
+  EXPECT_EQ(row_a->file_path, new_bag.string());
+  EXPECT_EQ(row_b->file_path, new_bag.string());
+}
+
+TEST_F(RosbagCaptureTest, TheHistoryBoundHoldsForClockValuesFarApart) {
+  // A public entry point taking two clocks it does not control. The pair below would
+  // overflow a signed subtraction, which is undefined - the result has to stay inside
+  // the bound rather than becoming whatever the compiler makes of it.
+  const int64_t started = 1'000'000'000;
+  const int64_t now_steady = started + 5'000'000'000;
+
+  EXPECT_EQ(RosbagCapture::bounded_history_ns(std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::min(),
+                                              now_steady, started),
+            5'000'000'000);
+  EXPECT_EQ(RosbagCapture::bounded_history_ns(std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max(),
+                                              now_steady, started),
+            0);
+  // An uptime that would itself overflow must not turn into a negative upper bound.
+  EXPECT_GE(RosbagCapture::bounded_history_ns(5'000'000'000, 0, std::numeric_limits<int64_t>::max(),
+                                              std::numeric_limits<int64_t>::min()),
+            0);
+}
+
+TEST_F(RosbagCaptureTest, NoStartTimeYieldsNoClaimedHistory) {
+  // capture_started_at_ns_ is zero until start() runs. Unreachable through the class,
+  // because a message cannot be buffered before then, but the static says nothing
+  // about its callers, so the answer has to be the conservative one.
+  const int64_t now_steady = 5'000'000'000;
+  EXPECT_EQ(RosbagCapture::bounded_history_ns(9'000'000'000, 1'000'000'000, now_steady, 0), now_steady);
+}
+
 // Integration tests (simplified without actual message publishing)
 
 /// Storage whose rosbag metadata writes fail, the way a full, read-only or busy
@@ -621,14 +696,20 @@ TEST_F(RosbagCaptureTest, TheDerivedOriginStaysPositiveOnALowUptimeMachine) {
 class RosbagMetadataFailingStorage : public InMemoryFaultStorage {
  public:
   void store_rosbag_files(const std::vector<ros2_medkit_fault_manager::RosbagFileInfo> & /*infos*/) override {
+    ++store_attempts;
     throw std::runtime_error("metadata store unavailable");
   }
 
   // Both entry points, or the double silently stops failing for whichever call the
   // code under test happens to use - the immediate path used the single-row one.
   void store_rosbag_file(const ros2_medkit_fault_manager::RosbagFileInfo & /*info*/) override {
+    ++store_attempts;
     throw std::runtime_error("metadata store unavailable");
   }
+
+  // "No row and no directory" is equally true of a capture that never opened a bag,
+  // so every test using this double has to prove the store was actually reached.
+  size_t store_attempts = 0;
 };
 
 /// Storage whose metadata writes SUCCEED and whose quota sweep then fails, the way
@@ -1504,12 +1585,17 @@ TEST_F(RosbagCaptureIntegrationTest, ABoundaryRecordingKeepsItsScopeWhileTheOldF
   EXPECT_FALSE(bag_has_topic(row_b->file_path, "/scope_race_a"))
       << "the finalise of the previous recording cleared B's entity filter, and B recorded everything";
 
-  // The storage double sits inside the finalise, 400 ms of it, so this pins the
-  // measurement to before the metadata write: a duration that swallowed the store
-  // would come out near 0.9s for a 0.5s window. It does NOT cover the bag close and
-  // the size walk, which are also finalisation work and were also being charged to
-  // the recording - those cost tens of milliseconds on a bag this size, far below
-  // any tolerance a test can assert without becoming a timing flake.
+  // Read this for what it is. The storage double delays store_rosbag_files() by
+  // 400 ms, and the measurement has always been taken before that call - so this
+  // does NOT discriminate the change that moved it, and the commit that added it
+  // would pass with that change reverted. What it does pin is that the measurement
+  // never DRIFTS past the metadata write, which is a plausible future regression.
+  //
+  // The part that change really moved - the bag close and the directory size walk -
+  // has no falsifying test. Both cost tens of milliseconds on a bag this size, and
+  // reaching a margin a test could assert without becoming a timing flake would need
+  // a bag of about a hundred megabytes or a directory of tens of thousands of files.
+  // That is stated rather than papered over.
   EXPECT_LT(row_b->duration_sec, rosbag_config.duration_after_sec + 0.3)
       << "duration_sec includes finalisation work rather than the span the recording was open";
 
@@ -1637,6 +1723,8 @@ TEST_F(RosbagCaptureIntegrationTest, MetadataStoreFailureDiscardsTheBagInsteadOf
   capture.on_fault_confirmed("STORE_FAILS");  // empty buffer -> post-fault-only
   spin_for(std::chrono::milliseconds(1200));  // past the window, finalise ran
 
+  ASSERT_GT(failing_storage.store_attempts, 0u)
+      << "the recording never reached the metadata store, so no row and no directory prove nothing";
   EXPECT_FALSE(failing_storage.get_rosbag_file("STORE_FAILS").has_value());
   EXPECT_EQ(count_bag_dirs(), 0u) << "a bag that no row can reference must not be left on disk";
 
@@ -1698,6 +1786,9 @@ TEST_F(RosbagCaptureIntegrationTest, AFailingStoreLeavesNoBagOnTheImmediatePath)
   EXPECT_NO_THROW(capture.on_fault_confirmed("IMMEDIATE_STORE_FAILS"));
   spin_for(std::chrono::milliseconds(200));
 
+  ASSERT_GT(failing_storage.store_attempts, 0u)
+      << "fill_buffer() buffered nothing, so the confirmation returned before opening a bag and the "
+         "assertions below hold for the wrong reason";
   EXPECT_FALSE(failing_storage.get_rosbag_file("IMMEDIATE_STORE_FAILS").has_value());
   EXPECT_EQ(count_bag_dirs(), 0u) << "a bag that no row can reference must not be left on disk";
 

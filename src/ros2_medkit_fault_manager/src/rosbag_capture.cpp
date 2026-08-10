@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <rosbag2_cpp/writer.hpp>
 #include <rosbag2_storage/storage_options.hpp>
@@ -281,7 +282,8 @@ void RosbagCapture::on_fault_prefailed(const std::string & fault_code) {
   }
 }
 
-bool RosbagCapture::attach_to_active_recording(const std::string & fault_code) {
+bool RosbagCapture::attach_to_active_recording(const std::string & fault_code,
+                                               const std::set<std::string> & entity_topics) {
   std::lock_guard<std::mutex> lock(post_fault_timer_mutex_);
   if (!recording_post_fault_.load()) {
     return false;
@@ -300,29 +302,28 @@ bool RosbagCapture::attach_to_active_recording(const std::string & fault_code) {
   if (attached_fault_codes_.insert(fault_code).second) {
     RCLCPP_INFO(node_->get_logger(), "Fault '%s' confirmed during post-fault recording, attaching it to bag for '%s'",
                 fault_code.c_str(), current_fault_code_.empty() ? "<cleared primary>" : current_fault_code_.c_str());
-    widen_capture_filter_for(fault_code);
+    widen_capture_filter_for(fault_code, entity_topics);
   }
   return true;
 }
 
-void RosbagCapture::widen_capture_filter_for(const std::string & fault_code) {
+void RosbagCapture::widen_capture_filter_for(const std::string & fault_code, const std::set<std::string> & topics) {
   // Entity mode scoped the in-flight writes to the first fault's topics; an
   // attached fault needs its own topics in the bag from the attach onwards, or
   // its row would serve a recording with none of its data. Union them in, and
   // degrade to writing everything when its scope cannot be resolved.
+  //
+  // The topics arrive resolved. Resolving them here would mean reading the fault
+  // store and enumerating the ROS graph while the caller holds
+  // post_fault_timer_mutex_, which the finalise of the very window being attached to
+  // must also take - a stalled store would then extend that window by however long
+  // it stalls, and the recording would keep taking messages past duration_after_sec.
   if (config_.topics != "entity") {
     return;
   }
-  {
-    std::lock_guard<std::mutex> lock(capture_topics_mutex_);
-    if (active_capture_topics_.empty()) {
-      return;  // already writing everything
-    }
-  }
-  auto topics = compute_entity_topics(fault_code);
   std::lock_guard<std::mutex> lock(capture_topics_mutex_);
   if (active_capture_topics_.empty()) {
-    return;
+    return;  // already writing everything
   }
   if (topics.empty()) {
     RCLCPP_WARN(node_->get_logger(),
@@ -339,11 +340,22 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
     return;
   }
 
+  // Resolved before any lock is taken, and once for both users below. It reads the
+  // fault store - whose busy timeout is five seconds - and enumerates the ROS graph
+  // per topic. Done while holding post_fault_timer_mutex_, as the attach path used
+  // to, that work blocks the finalise of the very window being attached to: the
+  // guard stays true, messages keep entering the bag, and the recording overruns
+  // duration_after_sec by however long the store stalls.
+  std::set<std::string> entity_topics;
+  if (config_.topics == "entity") {
+    entity_topics = compute_entity_topics(fault_code);
+  }
+
   // Faults arrive in bursts from one root cause, so a confirmation landing inside
   // an in-flight post-roll is exactly the correlated fault whose black box matters
   // most. It shares the recording window, so attach it to the running bag instead
   // of leaving it with no recording at all.
-  if (attach_to_active_recording(fault_code)) {
+  if (attach_to_active_recording(fault_code, entity_topics)) {
     return;
   }
 
@@ -351,7 +363,7 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
 
   // In "entity" mode, narrow the broadly-buffered messages to the faulting node's
   // topics. Sets the filter used by flush_to_bag() and the post-fault write path.
-  resolve_entity_topics(fault_code);
+  resolve_entity_topics(fault_code, std::move(entity_topics));
 
   // Flush buffer to bag
   auto flush = flush_to_bag(fault_code);
@@ -411,15 +423,21 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
     RCLCPP_DEBUG(node_->get_logger(), "Recording %.1fs more after fault confirmation", config_.duration_after_sec);
   } else {
     // No post-fault recording, close writer and finalize immediately
+    std::unique_ptr<rosbag2_cpp::Writer> closing_writer;
+    double recording_span_sec = 0.0;
     {
       std::lock_guard<std::mutex> wlock(writer_mutex_);
-      active_writer_.reset();
+      // Taken out rather than reset here, and measured before it is closed. Dropping
+      // the last reference runs ~Writer, which flushes the bag and writes
+      // metadata.yaml, and unique_ptr::reset() only returns once that is done - so
+      // resetting first would charge the close to the recording, which is exactly
+      // what the finalise path is careful not to do.
+      closing_writer = std::move(active_writer_);
       created_topics_.clear();
+      recording_span_sec = span_sec_since(recording_started_at_ns_.exchange(0));
     }
-    // Measured the instant the writer is gone, before the size walk below: past
-    // this point nothing can be added to the bag, so anything the finalisation
-    // spends is the fault manager's time, not the recording's.
-    const double recording_span_sec = span_sec_since(recording_started_at_ns_.exchange(0));
+    // Outside the lock, and before the size is measured: metadata.yaml has to exist.
+    closing_writer.reset();
 
     size_t bag_size = calculate_bag_size(bag_path);
 
@@ -879,21 +897,20 @@ std::set<std::string> RosbagCapture::compute_entity_topics(const std::string & f
   return topics;
 }
 
-void RosbagCapture::resolve_entity_topics(const std::string & fault_code) {
-  std::set<std::string> topics;
-
-  if (config_.topics == "entity") {
-    topics = compute_entity_topics(fault_code);
-
-    if (!topics.empty()) {
-      RCLCPP_INFO(node_->get_logger(), "Entity scope for fault '%s': %zu topic(s) from the faulting node(s) + /tf",
-                  fault_code.c_str(), topics.size());
-    } else {
-      RCLCPP_WARN(node_->get_logger(),
-                  "Entity scope unresolved for fault '%s' (source not a live node, or no buffered topics); "
-                  "writing the full buffer",
-                  fault_code.c_str());
-    }
+void RosbagCapture::resolve_entity_topics(const std::string & fault_code, std::set<std::string> topics) {
+  // The topics arrive resolved, for the same reason widen_capture_filter_for() takes
+  // them resolved: computing them reads the fault store and walks the ROS graph, and
+  // the caller does that once, before it touches any lock.
+  if (config_.topics != "entity") {
+    topics.clear();
+  } else if (!topics.empty()) {
+    RCLCPP_INFO(node_->get_logger(), "Entity scope for fault '%s': %zu topic(s) from the faulting node(s) + /tf",
+                fault_code.c_str(), topics.size());
+  } else {
+    RCLCPP_WARN(node_->get_logger(),
+                "Entity scope unresolved for fault '%s' (source not a live node, or no buffered topics); "
+                "writing the full buffer",
+                fault_code.c_str());
   }
 
   std::lock_guard<std::mutex> lock(capture_topics_mutex_);
@@ -1152,8 +1169,25 @@ std::vector<std::string> RosbagCapture::evict_bags_over_quota(FaultStorage * sto
 
 int64_t RosbagCapture::bounded_history_ns(int64_t now_wall_ns, int64_t oldest_msg_wall_ns, int64_t now_steady_ns,
                                           int64_t capture_started_steady_ns) {
-  const int64_t uptime_ns = std::max<int64_t>(0, now_steady_ns - capture_started_steady_ns);
-  return std::clamp<int64_t>(now_wall_ns - oldest_msg_wall_ns, 0, uptime_ns);
+  // Saturating, not wrapping. Signed overflow is undefined, and this is a public
+  // entry point whose arguments are two clocks nothing here controls, so a pair far
+  // enough apart has to be handled rather than assumed away. Wrapping would be
+  // defined but wrong in the direction that matters: the largest possible forward
+  // step would come out as -1 and be read as no history at all, when the whole point
+  // of the bound is to treat it as more history than the capture can have had.
+  const auto difference = [](int64_t lhs, int64_t rhs) -> int64_t {
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+    constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+    if (rhs < 0 && lhs > kMax + rhs) {
+      return kMax;
+    }
+    if (rhs > 0 && lhs < kMin + rhs) {
+      return kMin;
+    }
+    return lhs - rhs;
+  };
+  const int64_t uptime_ns = std::max<int64_t>(0, difference(now_steady_ns, capture_started_steady_ns));
+  return std::clamp<int64_t>(difference(now_wall_ns, oldest_msg_wall_ns), 0, uptime_ns);
 }
 
 void RosbagCapture::enforce_storage_limits() {
@@ -1163,18 +1197,42 @@ void RosbagCapture::enforce_storage_limits() {
 }
 
 bool RosbagCapture::store_rows_or_discard_bag(const std::vector<RosbagFileInfo> & rows, const std::string & bag_path) {
+  // Reported rather than logged inside the handler, because a handler cannot throw
+  // here and building the message is the one part that could.
+  const char * store_error = nullptr;
+  std::string store_error_text;
   try {
     storage_->store_rosbag_files(rows);
   } catch (const std::exception & e) {
+    store_error_text = e.what();
+    store_error = store_error_text.c_str();
+  } catch (...) {
+    // The storage interface promises nothing about what a backend throws, and this
+    // function is called from a path that reaches ~RosbagCapture through stop().
+    // An escape there terminates the process during shutdown.
+    store_error_text = "unknown exception";
+    store_error = store_error_text.c_str();
+  }
+
+  if (store_error != nullptr) {
     // Without a row nothing can ever reach this bag: retrieval is keyed by fault
     // code, and quota accounting enumerates rows, so a kept directory would sit
     // on disk unreachable and uncounted, and the next full storage would not even
     // be able to evict it.
     std::error_code ec;
     std::filesystem::remove_all(bag_path, ec);
-    RCLCPP_WARN(node_->get_logger(),
-                "Failed to store rosbag metadata for '%s' (%s); discarded the bag, nothing could reference it",
-                bag_path.c_str(), e.what());
+    if (ec) {
+      // Say so rather than claim a discard that did not happen: what is left is the
+      // unreachable, uncounted directory the discard exists to prevent.
+      RCLCPP_WARN(node_->get_logger(),
+                  "Failed to store rosbag metadata for '%s' (%s), and the bag could not be removed either (%s); "
+                  "it is now unreachable and uncounted on disk",
+                  bag_path.c_str(), store_error, ec.message().c_str());
+    } else {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Failed to store rosbag metadata for '%s' (%s); discarded the bag, nothing could reference it",
+                  bag_path.c_str(), store_error);
+    }
     return false;
   }
 
@@ -1189,6 +1247,9 @@ bool RosbagCapture::store_rows_or_discard_bag(const std::vector<RosbagFileInfo> 
   } catch (const std::exception & e) {
     RCLCPP_WARN(node_->get_logger(), "Failed to enforce the rosbag storage limit after storing '%s': %s",
                 bag_path.c_str(), e.what());
+  } catch (...) {
+    RCLCPP_WARN(node_->get_logger(), "Failed to enforce the rosbag storage limit after storing '%s': unknown exception",
+                bag_path.c_str());
   }
   return true;
 }
@@ -1249,37 +1310,42 @@ void RosbagCapture::finalize_post_fault_recording() {
     // otherwise overwrite the start time before this bag's row is built.
     started_at_ns = recording_started_at_ns_.exchange(0);
     {
+      // The writer has to change hands under that same lock. Clearing the guard is
+      // precisely what invites a boundary confirmation in, and it opens ITS writer
+      // into active_writer_; if this finalise were still to reach for writer_mutex_
+      // afterwards it would destroy that writer, leaving the new recording to write
+      // through a null pointer - every message silently dropped - and still store a
+      // row for the empty bag it produced. Which is #574 again, now as a race and
+      // with a row that lies about it.
+      std::lock_guard<std::mutex> wlock(writer_mutex_);
+      closing_writer = std::move(active_writer_);
+      created_topics_.clear();
+      // Measured here, with the writer already out of reach of message_callback, and
+      // not further down: closing the bag flushes it and writes metadata.yaml, and
+      // the size walk recurses the directory. Both are the fault manager's own time
+      // on whatever the storage happens to be, and neither adds a message to the
+      // bag. Charging them to the recording would inflate a stored duration_sec
+      // without bound on slow storage.
+      recording_span_sec = span_sec_since(started_at_ns);
+    }
+    {
       // The entity filter belongs to the recording being handed over, so it is
       // dropped here rather than at the end of this function. Cleared after the
-      // lock, it would land on the NEXT recording: a boundary confirmation resolves
-      // its own scope the moment the guard drops, and this finalise still has the
-      // bag close, the size walk and the metadata write ahead of it. An empty filter
-      // means "write everything" (see should_capture_topic), so that recording would
-      // quietly become a whole-graph capture - in "entity", which is the default mode.
-      // Taken and released before writer_mutex_ below: message_callback consults the
-      // filter and releases it before it takes writer_mutex_, and nothing nests the
-      // two the other way round.
+      // lock it would land on the NEXT recording, which resolves its own scope the
+      // moment the guard drops, and an empty filter means "write everything" - the
+      // boundary bag would quietly become a whole-graph capture, in "entity", which
+      // is the default mode.
+      //
+      // AFTER the writer has been taken, not before. A callback that already read
+      // the guard as true is between should_capture_topic() and writer_mutex_; if
+      // the filter emptied while it sat there, it would take the empty set for
+      // "write everything" and append an out-of-scope topic to the bag now being
+      // closed. Past this point active_writer_ is null, so such a callback writes
+      // nowhere. No new recording can install its own filter in between either -
+      // post_fault_timer_mutex_ is still held, and a confirmation has to pass it.
       std::lock_guard<std::mutex> tlock(capture_topics_mutex_);
       active_capture_topics_.clear();
     }
-    // The writer has to change hands under that same lock, for the same reason.
-    // Clearing the guard is precisely what invites a boundary confirmation in, and
-    // it opens ITS writer into active_writer_; if this finalise were still to reach
-    // for writer_mutex_ afterwards it would destroy that writer, leaving the new
-    // recording to write through a null pointer - every message silently dropped -
-    // and still store a row for the empty bag it produced. Which is #574 again,
-    // now as a race and with a row that lies about it.
-    std::lock_guard<std::mutex> wlock(writer_mutex_);
-    closing_writer = std::move(active_writer_);
-    created_topics_.clear();
-    // Measured here, with the writer already out of reach of message_callback, and
-    // not further down: closing the bag flushes it and writes metadata.yaml, and the
-    // size walk recurses the directory. Both are the fault manager's own time on
-    // whatever the storage happens to be, and neither adds a message to the bag.
-    // Charging them to the recording would inflate a stored duration_sec without
-    // bound on slow storage - and duration_sec ~= duration_after_sec is what tells
-    // an operator a bag holds no pre-fault history.
-    recording_span_sec = span_sec_since(started_at_ns);
   }
 
   // Close outside both locks. Flushing the bag and writing metadata.yaml is real

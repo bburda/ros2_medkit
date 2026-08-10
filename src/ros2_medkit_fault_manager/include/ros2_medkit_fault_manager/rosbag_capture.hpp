@@ -55,13 +55,17 @@ struct BufferedMessage {
 /// - on_fault_cleared() deletes bag file if auto_cleanup enabled
 ///
 /// Only one recording is open at a time (one ring buffer, one writer, one post-roll
-/// state machine). That makes the ring buffer empty by construction right after a
-/// post-fault window closes: the flush that opened it moved the whole deque out, and
+/// state machine). Right after a post-fault window closes the ring buffer holds nothing
+/// of the capture's own making: the flush that opened it moved the whole deque out, and
 /// everything published during the window went straight to that bag instead of the
 /// buffer. A fault confirming in that moment - typically the second fault of a burst -
 /// therefore has no pre-fault history to write, and gets a post-fault-only recording
 /// instead of nothing (a bag holding just its own duration_after_sec window). With
 /// duration_after_sec == 0 no window exists and such a fault gets no bag.
+///
+/// How often that state is reached depends on the topic mode: the broad ones also
+/// capture /fault_manager/events, and reporting a fault publishes there, so the next
+/// fault usually finds that one message. See design/index.rst.
 class RosbagCapture {
  public:
   /// Probe a rosbag2 storage backend. Returns std::nullopt when the backend is
@@ -193,12 +197,12 @@ class RosbagCapture {
 
   /// In "entity" mode, compute the set of topics to write for a confirmed fault
   /// (the faulting source node's pub/sub topics + /tf). Empty set = write all.
-  void resolve_entity_topics(const std::string & fault_code);
+  void resolve_entity_topics(const std::string & fault_code, std::set<std::string> topics);
 
   /// In "entity" mode, union an attached fault's entity topics into the active
   /// capture filter so its data reaches the shared bag from the attach onwards
   /// (empty resolution widens to all topics). Caller holds post_fault_timer_mutex_.
-  void widen_capture_filter_for(const std::string & fault_code);
+  void widen_capture_filter_for(const std::string & fault_code, const std::set<std::string> & topics);
 
   /// Whether a topic should be written to the bag given the active entity filter
   bool should_capture_topic(const std::string & topic) const;
@@ -284,7 +288,7 @@ class RosbagCapture {
   /// Attach @p fault_code to the in-flight post-fault recording, if there is one.
   /// Returns true when the fault was handled (attached, already recording, or the
   /// attachment cap was hit) and the caller must not open a second bag.
-  bool attach_to_active_recording(const std::string & fault_code);
+  bool attach_to_active_recording(const std::string & fault_code, const std::set<std::string> & entity_topics);
 
   /// Try to subscribe to a single topic
   /// @param topic The topic to subscribe to

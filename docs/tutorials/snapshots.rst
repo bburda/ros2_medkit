@@ -531,10 +531,17 @@ so the three cases are:
        also at startup, before anything has been published on a captured topic.
 
 What decides between the first and the third case is simply whether anything is in
-the buffer. The third case is not an edge case, it is the normal shape of a burst:
-nothing is buffered while a window is open (messages go straight into the open bag),
-and the flush that opened that bag had already emptied the buffer, so the next fault
-to confirm genuinely has no pre-fault history available. It still gets a black box
+the buffer. Nothing is buffered while a window is open (messages go straight into the
+open bag), and the flush that opened that bag had already emptied the buffer, so the
+next fault to confirm can genuinely have no pre-fault history available.
+
+How often that happens depends on ``topics``. The broad modes - ``all``, ``auto`` and
+``entity``, which is the default - capture everything on the graph, including
+``/fault_manager/events``; reporting a fault publishes an event there, so the act of
+reporting refills the buffer and the next fault usually finds history after all. With
+a narrowed capture (``explicit``, a topic list, ``config``, or a broad mode listing
+``/fault_manager/events`` in ``exclude_topics``) the empty buffer is the normal shape
+of a burst. It still gets a black box
 covering how the system behaved *after* it failed, which is what the second fault
 of a burst is usually investigated for. A fault that confirms before any captured
 topic has published - right after startup, or under ``lazy_start`` - lands in the
@@ -564,9 +571,14 @@ windows, so the two kinds of bag are easy to tell apart:
    # duration_sec ~= duration_after_sec -> post-fault-only bag
    # anything longer                    -> the recording also holds pre-fault history
 
+The rule is a hint, not a test. A full bag flushed from a buffer holding only the
+last few milliseconds reports about as much as a post-fault-only one, so the two
+overlap; read it together with the bag's contents rather than on its own.
+
 Note the second rule has no upper bound, deliberately. The span can exceed
-``duration_sec + duration_after_sec``: the ring buffer is pruned only when a
-message arrives, so a topic that stops publishing keeps its last window buffered
+``duration_sec + duration_after_sec``: pruning is driven by message arrival rather
+than by a timer, so when every captured topic stops publishing nothing prunes and the
+buffer keeps its last window
 until the next confirmation flushes it. That is intentional - the final messages
 before a topic died are exactly what a black box is for - and the reported
 duration reflects it.
