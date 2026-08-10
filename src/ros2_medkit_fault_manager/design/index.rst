@@ -283,11 +283,19 @@ closes and one metadata row is stored per fault the recording covers.
 The window boundary
 """""""""""""""""""
 
-The interesting transition is the second one. Right after a window finalises the buffer
-is empty *by construction*: the flush that opened the recording drained it, and every
-message published during the window went into that bag instead of back into the buffer.
-A fault confirming in that gap - typically the next fault of the same burst - therefore
-has no pre-fault history to write.
+The interesting transition is the second one. The branch is on the buffer, not on window
+history: a confirmation that finds nothing buffered opens a post-fault-only recording,
+whatever emptied the buffer.
+
+Right after a window finalises the buffer is empty *by construction*: the flush that
+opened the recording drained it, and every message published during the window went into
+that bag instead of back into the buffer. A fault confirming in that gap - typically the
+next fault of the same burst - therefore has no pre-fault history to write. That is the
+case this exists for, and the common one.
+
+It is not the only one. A fault confirming before anything has been published on a
+captured topic - at startup, or with ``lazy_start`` - finds the same empty buffer and gets
+the same post-fault-only bag, with no window having closed beforehand.
 
 Before, ``flush_to_bag()`` returned an empty path and the confirmation was abandoned with
 a warning: no bag, no metadata row, no retry, and every later retrieval for that fault
@@ -330,11 +338,25 @@ taking the next, so no reverse edge exists and the order is acyclic.
 Honest durations
 """"""""""""""""
 
-``RosbagFileInfo::duration_sec`` is the wall-clock span the recording was open, tracked
-from the timestamp of its oldest written message (or from the moment the writer opened,
-for a post-fault-only bag). Both storage paths used to hardcode the configured windows,
-which made a post-fault-only bag and a bag flushed from a half-filled buffer both claim a
-full pre-fault window.
+``RosbagFileInfo::duration_sec`` is the span the recording was open, tracked from the
+timestamp of its oldest written message (or from the moment the writer opened, for a
+post-fault-only bag). Both storage paths used to hardcode the configured windows, which
+made a post-fault-only bag and a bag flushed from a half-filled buffer both claim a full
+pre-fault window.
+
+The span is measured on the **monotonic** clock, not the wall clock that timestamps
+messages: a wall clock that steps backwards mid-window turns an elapsed time negative,
+and the duration is then reported as zero. Message ages necessarily start out as wall-clock
+differences, so a flush converts the history it found into a monotonic origin once and
+measures forward from there. That conversion is capped at how long the capture has been
+running - no bag can hold more history than that - because a clock step between buffering a
+message and flushing it would otherwise land in the figure in full.
+
+Measurement stops when the writer leaves ``message_callback``'s reach, inside the handover
+critical section. Closing the bag flushes it and writes ``metadata.yaml``, and the size
+walk recurses the directory; both scale with the bag and the storage, and neither adds a
+message. Charging them to the recording would inflate a stored ``duration_sec`` without
+bound on slow storage.
 
 It is a recording span, not a content span. A post-fault-only window during which nothing
 was published still reports its window: that statement is more useful to an operator than

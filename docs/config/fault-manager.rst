@@ -318,8 +318,8 @@ one post-fault window per fault manager. That single-writer design decides what 
 fault gets depending on *when* it confirms relative to the previous fault's
 ``duration_after_sec`` window.
 
-**While no recording is open.** Messages accumulate in the ring buffer. A
-confirmation flushes the whole buffer into a new bag and, if
+**While no recording is open, with history buffered.** Messages accumulate in the
+ring buffer. A confirmation flushes the whole buffer into a new bag and, if
 ``duration_after_sec > 0``, keeps that bag open for the post-fault window. The
 result is a full bag: pre-fault history plus post-fault response.
 
@@ -328,14 +328,18 @@ recording and shares its bag, getting its own metadata entry (see
 ``duration_after_sec`` above). Nothing is buffered while a window is open -
 incoming messages are written straight to the open bag.
 
-**Right after a window closes.** The ring buffer is empty *by construction*: the
-flush that opened the recording moved the whole buffer out, and everything
-published during the window went into that bag rather than back into the buffer.
-A fault confirming in this moment - typically the second fault of a burst - has no
-pre-fault history to write. It gets a **post-fault-only bag**: a recording of its
+**While no recording is open, with the buffer empty.** A fault confirming here has
+no pre-fault history to write. It gets a **post-fault-only bag**: a recording of its
 own containing just its ``duration_after_sec`` window. It is a normal recording in
-every other respect, so a further fault of the burst attaches to it as usual. The
-fault manager logs the cause:
+every other respect, so a further fault of the burst attaches to it as usual.
+
+The usual way to reach it is right after a window closes. The ring buffer is empty
+*by construction* there: the flush that opened the recording moved the whole buffer
+out, and everything published during the window went into that bag rather than back
+into the buffer. The fault confirming in that moment is typically the second fault
+of a burst. A fault confirming before any captured topic has published - just after
+startup, or with ``lazy_start`` - finds the same empty buffer and gets the same bag.
+Either way the fault manager logs the cause:
 
 .. code-block:: text
 
@@ -344,8 +348,15 @@ fault manager logs the cause:
 With ``duration_after_sec: 0`` there is no window to record into and no history to
 write, so such a fault gets no bag at all (also logged). If the bag cannot be
 written (unwritable ``storage_path``, missing storage backend), no recording is
-opened and no metadata entry is stored - a failed capture never leaves a row
-pointing at a bag that is not there.
+opened and no metadata entry is stored.
+
+A capture never leaves a row pointing at a bag that is not there, and never leaves a
+bag that no row points at. If the metadata cannot be stored, the recording is
+discarded with it: nothing could reach that bag anyway, since retrieval is keyed by
+fault code and the quota is computed from rows, so it would sit on disk unreachable
+and uncounted. If the quota sweep that follows fails instead, the bag and its rows
+both stay - the sweep is about the whole store, not about this recording, and it
+runs again on the next capture.
 
 A post-fault-only bag on a quiet or heavily filtered system can contain zero
 messages. It still finalises normally on both ``sqlite3`` and ``mcap``, is listed

@@ -18,6 +18,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <random>
 #include <set>
@@ -1200,6 +1201,48 @@ TEST_F(SqliteFaultStorageTest, ListRosbagsForEntityFiltersCorrectly) {
   // Get rosbags for unknown entity
   auto unknown_rosbags = storage_->list_rosbags_for_entity("/unknown/entity");
   EXPECT_TRUE(unknown_rosbags.empty());
+}
+
+TEST_F(SqliteFaultStorageTest, AFailingRowDeleteKeepsTheBagOnDisk) {
+  using ros2_medkit_fault_manager::RosbagFileInfo;
+
+  // delete_rosbag_file() has to survive a DELETE that throws - a busy, full or
+  // read-only database - without having already unlinked the bag. A surviving row
+  // whose directory is gone fails every later retrieval and keeps its bytes charged
+  // against the quota, which sums rows. The batch sibling states this invariant in
+  // its own comment; this pins it for the single-row path too.
+  const auto bag_dir = std::filesystem::temp_directory_path() / "test_failing_delete_bag";
+  std::filesystem::create_directories(bag_dir);
+  { std::ofstream(bag_dir / "payload.mcap") << "data"; }
+
+  RosbagFileInfo info;
+  info.fault_code = "DELETE_FAILS";
+  info.file_path = bag_dir.string();
+  info.format = "mcap";
+  info.duration_sec = 1.0;
+  info.size_bytes = 4;
+  info.created_at_ns = 1000;
+  storage_->store_rosbag_file(info);
+
+  // Make the DELETE, and only the DELETE, fail. A dropped or renamed table would
+  // take the preceding SELECT with it, and the unlink under test comes after that.
+  sqlite3 * raw = nullptr;
+  ASSERT_EQ(sqlite3_open(temp_db_path_.string().c_str(), &raw), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(raw,
+                         "CREATE TRIGGER block_rosbag_delete BEFORE DELETE ON rosbag_files "
+                         "BEGIN SELECT RAISE(ABORT, 'delete blocked'); END;",
+                         nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  sqlite3_close(raw);
+
+  EXPECT_THROW(storage_->delete_rosbag_file("DELETE_FAILS"), std::runtime_error);
+
+  EXPECT_TRUE(storage_->get_rosbag_file("DELETE_FAILS").has_value()) << "the DELETE failed, so its row must remain";
+  EXPECT_TRUE(std::filesystem::exists(bag_dir))
+      << "the bag was unlinked before its row was deleted, so the surviving row now points at nothing";
+
+  std::error_code ec;
+  std::filesystem::remove_all(bag_dir, ec);
 }
 
 // @verifies REQ_INTEROP_073

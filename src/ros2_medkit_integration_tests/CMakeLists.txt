@@ -239,7 +239,6 @@ if(BUILD_TESTING)
   # rather than have a slow runner kill it with no test name in the output.
   set_tests_properties(test_rosbag_boundary_download PROPERTIES TIMEOUT 180)
 
-
   # test_graph_provider_greenwave drives a real greenwave_monitor node,
   # which only publishes /diagnostics at ~1 Hz with the first useful
   # reading a few seconds in, plus an 8s launch-ordering delay so
