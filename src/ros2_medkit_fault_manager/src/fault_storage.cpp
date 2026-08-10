@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <set>
 
 namespace ros2_medkit_fault_manager {
 
@@ -399,6 +400,46 @@ void InMemoryFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
   }
 
   rosbag_files_[info.fault_code] = info;
+}
+
+void InMemoryFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> & infos) {
+  if (infos.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Built beside the live map and swapped in, because swap cannot throw. The caller
+  // reads a throw here as "no row was written" and removes the recording, so a batch
+  // that stored half a burst and then threw would leave those rows naming a bag that
+  // is gone. Copying costs one allocation per stored recording, not per message.
+  auto updated = rosbag_files_;
+
+  std::set<std::string> replaced;
+  for (const auto & info : infos) {
+    auto it = updated.find(info.fault_code);
+    if (it != updated.end() && it->second.file_path != info.file_path) {
+      replaced.insert(it->second.file_path);
+    }
+    updated[info.fault_code] = info;
+  }
+  rosbag_files_.swap(updated);
+
+  // Unlinked only once every row is in, the way the SQLite backend unlinks after its
+  // COMMIT: a throw above must leave the old rows pointing at bags that still exist.
+  // Sharing is decided on the finished batch, not on the state before it - two faults
+  // of one burst can have shared the bag being replaced, and checking row by row
+  // beforehand would find it still referenced by the sibling and leak it.
+  for (const auto & path : replaced) {
+    const bool still_referenced = std::any_of(rosbag_files_.begin(), rosbag_files_.end(), [&path](const auto & e) {
+      return e.second.file_path == path;
+    });
+    if (still_referenced) {
+      continue;
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+    // Ignore errors - file may already be deleted
+  }
 }
 
 std::optional<RosbagFileInfo> InMemoryFaultStorage::get_rosbag_file(const std::string & fault_code) const {

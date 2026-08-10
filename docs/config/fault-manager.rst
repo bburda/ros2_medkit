@@ -333,17 +333,25 @@ no pre-fault history to write. It gets a **post-fault-only bag**: a recording of
 own containing just its ``duration_after_sec`` window. It is a normal recording in
 every other respect, so a further fault of the burst attaches to it as usual.
 
-The usual way to reach it is right after a window closes. The ring buffer is empty
-*by construction* there: the flush that opened the recording moved the whole buffer
-out, and everything published during the window went into that bag rather than back
-into the buffer. The fault confirming in that moment is typically the second fault
-of a burst. A fault confirming before any captured topic has published - just after
-startup, or with ``lazy_start`` - finds the same empty buffer and gets the same bag.
-Either way the fault manager logs the cause:
+The usual way to reach it is right after a window closes. The flush that opened the
+previous recording moved the whole buffer out, and everything published during its
+window went into that bag rather than back into the buffer, so the fault confirming
+in that moment - typically the second fault of a burst - has nothing to write. A
+fault confirming before any captured topic has published, just after startup or with
+``lazy_start``, finds the same empty buffer and gets the same bag. Either way the
+fault manager logs the cause:
 
 .. code-block:: text
 
    No pre-fault data buffered for fault 'BRAKE_PRESSURE_LOW' - recording post-fault window only
+
+**How often this case actually arises depends on** ``topics``. The broad modes -
+``all``, ``auto`` and ``entity``, which is the default - subscribe to everything on
+the graph, and that includes ``/fault_manager/events``. Reporting a fault publishes
+an event there, so the buffer is refilled by the act of reporting and the next fault
+of the burst usually finds history rather than an empty buffer. The empty-buffer case
+belongs mainly to a narrowed capture: ``explicit``, a topic list, ``config``, or a
+broad mode with ``/fault_manager/events`` in ``exclude_topics``.
 
 With ``duration_after_sec: 0`` there is no window to record into and no history to
 write, so such a fault gets no bag at all (also logged). If the bag cannot be
@@ -370,11 +378,13 @@ the zero-message bag above still reports its window rather than ``0.0``, because
 statement and a bare zero would be indistinguishable from a broken artifact. A
 post-fault-only bag therefore reports roughly ``duration_after_sec``, and a bag
 flushed from a buffer that never filled reports the history it holds plus its
-window. The span can also *exceed* ``duration_sec + duration_after_sec``:
-the ring buffer is pruned only when a message arrives, so a topic that goes quiet
-keeps its last window buffered until the next confirmation flushes it. That is
-deliberate - a black box should keep the final messages of a topic that stopped
-publishing - and the reported duration says so honestly.
+window. The span can also *exceed* ``duration_sec + duration_after_sec``, because pruning is
+driven by message arrival rather than by a timer: when **every** captured topic goes
+quiet nothing prunes, and the buffer keeps its last window until the next
+confirmation flushes it. That is deliberate - a black box should keep the final
+messages before everything stopped. Note the condition: a single captured topic that
+goes quiet while others keep publishing is pruned like anything else, because each
+arrival prunes the whole buffer by age.
 
 .. seealso::
 

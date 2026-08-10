@@ -253,8 +253,9 @@ one post-fault window per fault manager. Everything below follows from that.
 
 Subscriptions feed a ``std::deque`` of serialised messages, pruned to ``duration_sec`` of
 history and to ``max_buffer_mb`` of RAM. Pruning is driven by message arrival, not by a
-timer, so a topic that stops publishing keeps its last window buffered rather than
-silently losing the final messages before it died.
+timer, and each arrival prunes the whole deque by age - so a single topic going quiet is
+pruned like anything else, while a system where *everything* goes quiet keeps its last
+window buffered rather than silently losing the final messages before it died.
 
 On confirmation the whole buffer is moved out in one step and written to a new bag. If
 ``duration_after_sec > 0`` the writer stays open and the state machine enters the
@@ -287,11 +288,19 @@ The interesting transition is the second one. The branch is on the buffer, not o
 history: a confirmation that finds nothing buffered opens a post-fault-only recording,
 whatever emptied the buffer.
 
-Right after a window finalises the buffer is empty *by construction*: the flush that
-opened the recording drained it, and every message published during the window went into
-that bag instead of back into the buffer. A fault confirming in that gap - typically the
-next fault of the same burst - therefore has no pre-fault history to write. That is the
-case this exists for, and the common one.
+Right after a window finalises the buffer is empty as far as the capture's own message
+flow goes: the flush that opened the recording drained it, and every message published
+during the window went into that bag instead of back into the buffer. A fault confirming
+in that gap - typically the next fault of the same burst - therefore has no pre-fault
+history to write.
+
+Two things qualify "empty". A message arriving between the drain and the guard being
+published is still buffered, and more importantly the broad topic modes (``all``,
+``auto``, ``entity``) subscribe to ``/fault_manager/events``: reporting a fault publishes
+an event there, so on a real fault manager the act of reporting refills the buffer, and
+the boundary case belongs mainly to a narrowed capture - ``explicit``, a topic list,
+``config``, or a broad mode excluding that topic. ``test_rosbag_boundary_scope.test.py``
+excludes it for exactly this reason, and says so.
 
 It is not the only one. A fault confirming before anything has been published on a
 captured topic - at startup, or with ``lazy_start`` - finds the same empty buffer and gets

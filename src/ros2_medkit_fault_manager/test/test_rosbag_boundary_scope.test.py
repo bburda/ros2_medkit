@@ -65,6 +65,16 @@ TOPIC_B = '/scope/b_telemetry'
 TOPIC_BYSTANDER = '/scope/bystander_telemetry'
 
 
+def post_only_log_line(fault_code):
+    """
+    Return the log line the fault manager emits on the boundary path.
+
+    It carries the fault code because ``assertWaitFor`` scans everything received
+    so far: a code-less pattern would also match a line an earlier fault logged.
+    """
+    return f"fault '{fault_code}' - recording post-fault window only"
+
+
 def get_coverage_env():
     """Get environment variables for gcov coverage data collection."""
     try:
@@ -106,6 +116,13 @@ def generate_test_description():
             'snapshots.rosbag.duration_after_sec': DURATION_AFTER_SEC,
             # The default, and the whole point of this file.
             'snapshots.rosbag.topics': 'entity',
+            # Without this the boundary is unreachable in any broad topic mode on a
+            # real node. Broad discovery subscribes to /fault_manager/events, the
+            # fault manager's own event stream, so reporting a fault immediately
+            # buffers one - and the next fault finds history rather than the empty
+            # buffer the boundary path is defined by. The first version of this test
+            # ran straight into it and still passed every content assertion.
+            'snapshots.rosbag.exclude_topics': ['/fault_manager/events'],
             'snapshots.rosbag.format': STORAGE_FORMAT,
             'snapshots.rosbag.storage_path': storage_path,
             'snapshots.rosbag.max_bag_size_mb': 10,
@@ -229,7 +246,10 @@ class TestRosbagBoundaryScope(unittest.TestCase):
         while time.time() < deadline:
             if response is not None and response.success:
                 return response
-            self._publish_once()
+            # Deliberately silent. Publishing here would refill the ring buffer while
+            # the test waits for the previous recording to finalise, and the fault
+            # reported next would take the ordinary flush path instead of the
+            # boundary one - with every content assertion below still passing.
             time.sleep(0.3)
             response = self._get_rosbag(fault_code)
         return response
@@ -253,7 +273,7 @@ class TestRosbagBoundaryScope(unittest.TestCase):
     # Tests
     # ------------------------------------------------------------------
 
-    def test_01_boundary_recording_is_scoped_and_widens_on_attach(self):
+    def test_01_boundary_recording_is_scoped_and_widens_on_attach(self, proc_output):
         """
         A boundary recording is scoped, and widens when a fault attaches.
 
@@ -262,6 +282,12 @@ class TestRosbagBoundaryScope(unittest.TestCase):
         # Fill the buffer, then flush it with a fault from node A. Everything
         # published during A's window goes into A's bag rather than the buffer.
         self._publish_for(DURATION_SEC + 1.0)
+        # Go quiet before confirming, so anything still in flight is in the ring
+        # buffer when A's flush drains it. A message that lands after the drain but
+        # before the post-roll guard is published stays buffered for the next fault,
+        # and B would then find history and take the ordinary path - which is exactly
+        # what this test did until the log assertion below was added.
+        time.sleep(1.0)
         self._report_fault('SCOPE_PRIMARY', SOURCE_A)
 
         primary = self._wait_for_rosbag('SCOPE_PRIMARY')
@@ -271,7 +297,12 @@ class TestRosbagBoundaryScope(unittest.TestCase):
         # The buffer is empty by construction now: this is the boundary, and B
         # is the fault that has to resolve a scope of its own.
         self._report_fault('SCOPE_BOUNDARY', SOURCE_B)
-        time.sleep(1.0)
+        # The claim this file makes is about a recording opened on an empty buffer.
+        # Without this the test would still pass on an ordinary buffered flush, and
+        # would have stopped being a boundary test without anyone noticing.
+        proc_output.assertWaitFor(
+            expected_output=post_only_log_line('SCOPE_BOUNDARY'), timeout=10.0,
+        )
         self._publish_for(1.0)
 
         # Inside B's window, so this one attaches and widens the scope to A too.

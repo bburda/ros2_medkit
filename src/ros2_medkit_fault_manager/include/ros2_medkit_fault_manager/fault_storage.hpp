@@ -221,9 +221,18 @@ class FaultStorage {
   /// @param info The rosbag file info to store (replaces any existing entry for fault_code)
   virtual void store_rosbag_file(const RosbagFileInfo & info) = 0;
 
-  /// Store one row per fault of a burst that shares a recording. Backends with
-  /// real transactions (SQLite) commit all rows atomically, so a crash mid-store
-  /// never leaves part of the burst without its lookup key. Default: plain loop.
+  /// Store one row per fault of a burst that shares a recording.
+  ///
+  /// Implementations MUST be all-or-nothing. The caller treats a throw as "no row
+  /// was written" and discards the recording, so a batch that stored some rows and
+  /// then threw would leave those rows naming a bag that has just been removed:
+  /// unreadable for good, and still charged against the storage quota, which sums
+  /// rows. Both in-tree backends satisfy this - SQLite through a transaction, the
+  /// in-memory one by publishing the whole batch at once.
+  ///
+  /// The default below does NOT satisfy it and exists only so a backend that cannot
+  /// fail per row keeps compiling. Override it in anything that can.
+  ///
   /// @param infos The rows to store (typically all pointing at one file_path)
   virtual void store_rosbag_files(const std::vector<RosbagFileInfo> & infos) {
     for (const auto & info : infos) {
@@ -328,6 +337,9 @@ class InMemoryFaultStorage : public FaultStorage {
   std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const override;
 
   void store_rosbag_file(const RosbagFileInfo & info) override;
+  /// All-or-nothing, as the base class requires: the batch is built beside the live
+  /// map and swapped in, so a throw leaves the store exactly as it was.
+  void store_rosbag_files(const std::vector<RosbagFileInfo> & infos) override;
   std::optional<RosbagFileInfo> get_rosbag_file(const std::string & fault_code) const override;
   bool delete_rosbag_file(const std::string & fault_code) override;
   size_t get_total_rosbag_storage_bytes() const override;
