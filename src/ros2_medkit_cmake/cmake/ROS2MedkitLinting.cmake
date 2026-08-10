@@ -19,10 +19,23 @@ include_guard(GLOBAL)
 # (alongside include(ROS2MedkitCcache) - CMAKE_MODULE_PATH is already set).
 #
 # Provides:
+#   CMAKE_EXPORT_COMPILE_COMMANDS ON
 #   function medkit_lint_config(<file name> <output variable>)
 #   option ENABLE_CLANG_TIDY (default OFF)
 #   cache var ROS2_MEDKIT_CLANG_TIDY_JOBS (default: host core count)
 #   function ros2_medkit_clang_tidy([HEADER_FILTER <regex>] [TIMEOUT <seconds>] [JOBS <n>])
+
+# Every package that lints needs a compile database, because that is where
+# clang-tidy reads a file's include paths and flags from. Setting it per package
+# meant a new package started life invisible to the analysis: scripts/
+# clang-tidy-diff.sh merges the per-package databases, and a file absent from
+# the merged database is analysed with no flags at all. It then fails to find
+# its own headers, and the pre-push hook reports that parse error instead of
+# the checks it was meant to run. Eight of the packages set this and the rest
+# did not, so most of the workspace was never really analysed. Setting it here
+# means including this module is what makes a package lintable, with nothing
+# else to remember.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # The shared lint configurations - .clang-format, .clang-tidy, .flake8 - are
 # files of this package, kept next to the cmake modules and installed next to
