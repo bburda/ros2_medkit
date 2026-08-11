@@ -22,7 +22,7 @@ another, and nothing in between said so. The symptom of a wrong value (a slow
 or jittery gateway) shows up far from the cause (one line in a YAML file), so
 the warning is the only thing that connects them.
 
-Two gateways launch with deliberately mis-set values and the test reads their
+Four gateways launch with deliberately mis-set values and the test reads their
 own process output:
 
 - ``gateway_node`` (the default port) sets every clamped parameter BELOW its
@@ -31,6 +31,13 @@ own process output:
   ``/health`` before any test runs, so a floor value that killed the gateway
   would fail the file rather than pass quietly.
 - ``gw_ceiling`` sets them ABOVE their documented ceiling.
+- ``gw_in_range`` sets every one of them to a legal value and must report
+  nothing at all. Without it, a site that lost its "did the clamp actually
+  fire" guard would warn at every boot of a correctly configured gateway, and
+  no other assertion in this file would notice.
+- ``gw_rejected`` carries the parameters that are REFUSED rather than clamped
+  (half a port number is not a port), including three values above INT_MAX
+  that used to wrap back into the legal band and be accepted in silence.
 
 COVERAGE LIMIT, stated so nobody reads more into a green run than it has:
 ``PARAMS_FLOOR_ONLY`` lists three parameters whose above-ceiling case is NOT
@@ -38,11 +45,11 @@ exercised - ``server.executor_threads`` (256), ``server.http_thread_pool_size``
 (1024) and ``entity_cache.capacity`` (1,000,000). Clamping means the gateway
 then RUNS at the ceiling, and that is not free. Measured, not estimated: one
 gateway launched past all three ceilings serves ``/health`` correctly and warns
-for each parameter, at **1299 threads and 1486 MB RSS**. Paying that (times a
-runner already hosting the two gateways below, and again under a sanitizer) buys
-one log line per parameter from the same four-line compare-and-warn the floor
-case already drives, and that the other 11 parameters already drive in the
-ceiling direction. Their below-floor case IS exercised, on the floor gateway.
+for each parameter, at **1299 threads and 1486 MB RSS**. Paying that (on a
+runner already hosting the three other gateways, and again under a sanitizer)
+buys one log line per parameter from the same four-line compare-and-warn that
+the floor case already drives, that the in-range case pins the guard of, and
+that the other 14 parameters already drive in the ceiling direction.
 """
 
 import unittest
@@ -89,6 +96,59 @@ CLAMPED_PARAMS = [
     ('data_provider.max_parallel_samples', 1, 256, 0, 512),
     ('data_provider.idle_safety_net_sec', 0, 86400, -1, 172800),
     ('data_provider.idle_sweep_tick_sec', 0, 3600, -1, 7200),
+    # aggregation.* - gateway_node.cpp, only read when aggregation is enabled
+    ('aggregation.max_discovered_peers', 1, 1000, 0, 2000),
+]
+
+# In-range values, one per clamped parameter. A gateway launched with these must
+# report NO clamp at all. Without this, no gateway in the file ever leaves most
+# of these parameters in range, and a site that dropped its `if (used !=
+# requested)` guard would warn on every boot of a correctly configured gateway
+# while every other assertion here stayed green.
+IN_RANGE_PARAMS = {
+    'server.executor_threads': 2,
+    'server.http_thread_pool_size': 6,
+    'server.keep_alive_timeout_sec': 2,
+    'sse.max_clients': 2,
+    'service_call_timeout_sec': 10,
+    'logs.buffer_size': 200,
+    'entity_cache.capacity': 256,
+    'subscription_executor.max_queue_depth': 256,
+    'subscription_executor.watchdog_threshold_ms': 5000,
+    'subscription_executor.watchdog_tick_ms': 1000,
+    'subscription_executor.graph_poll_tick_ms': 100,
+    'data_provider.max_pool_size': 256,
+    'data_provider.cold_wait_cap': 4,
+    'data_provider.max_parallel_samples': 8,
+    'data_provider.idle_safety_net_sec': 900,
+    'data_provider.idle_sweep_tick_sec': 60,
+    'aggregation.max_discovered_peers': 50,
+}
+
+# Parameters whose out-of-range value is REFUSED and replaced by the documented
+# default instead of being clamped. Clamping makes no sense for them: half a
+# port number is not a port. The warning still has to name the refused value.
+#
+#   (parameter, refused_value, expected log fragment)
+#
+# The first three carry a value above INT_MAX on purpose. Each of these was read
+# into an int BEFORE its range check, so the value wrapped back into the legal
+# band and was accepted in silence: port 4294976296 narrows to 9000.
+REJECTED_PARAMS = [
+    ('server.port', 4294976296,
+     'Invalid port 4294976296. Must be between 1024-65535. Using default 8080.'),
+    ('refresh_interval_ms', 4294967396,
+     'Invalid backstop refresh interval 4294967396ms'),
+    ('sse.max_duration_sec', 4294967300,
+     'sse.max_duration_sec 4294967300 must be > 0'),
+    ('discovery.refresh_debounce_ms', 70000,
+     'Invalid discovery.refresh_debounce_ms 70000ms'),
+    ('topic_sample_timeout_sec', 60.0,
+     'topic_sample_timeout_sec 60.00 is outside 0.1-30.0'),
+    ('bulk_data.max_upload_size', -1,
+     'bulk_data.max_upload_size -1 is negative'),
+    ('sse.max_subscriptions', -1,
+     'sse.max_subscriptions -1 must be >= 1'),
 ]
 
 # The three whose above-ceiling case is skipped (see the module docstring).
@@ -122,25 +182,56 @@ STARTUP_COMPLETE = 'TopicDataProvider attached'
 
 
 def generate_test_description():
+    # aggregation.max_discovered_peers is only read when aggregation is on. With
+    # no peers and mDNS off it does nothing else, so it is a cheap way to reach
+    # that parameter.
+    aggregation_on = {'aggregation.enabled': True}
+
     # Floor gateway on the default port: GatewayTestCase polls /health here, so
     # this gateway also proves the clamped-to-floor values still serve requests.
-    gateway_node = create_gateway_node(extra_params=dict(FLOOR_PARAMS))
+    gateway_node = create_gateway_node(
+        extra_params={**FLOOR_PARAMS, **aggregation_on},
+    )
 
     gw_ceiling = create_gateway_node(
         port=get_test_port(1),
         name='gateway_clamp_ceiling',
-        extra_params=dict(CEILING_PARAMS),
+        extra_params={**CEILING_PARAMS, **aggregation_on},
+    )
+
+    gw_in_range = create_gateway_node(
+        port=get_test_port(2),
+        name='gateway_clamp_in_range',
+        extra_params={**IN_RANGE_PARAMS, **aggregation_on},
+    )
+
+    # The refused values include server.port itself, so this gateway falls back
+    # to the default 8080 rather than the port it was given. Nothing here talks
+    # to it over HTTP; only its startup log is read. If 8080 is already taken the
+    # gateway logs that it could not start serving and keeps running, so the
+    # assertions and the exit code hold either way.
+    gw_rejected = create_gateway_node(
+        port=get_test_port(3),
+        name='gateway_param_rejected',
+        extra_params={
+            **{name: value for name, value, _fragment in REJECTED_PARAMS},
+            **aggregation_on,
+        },
     )
 
     return (
         LaunchDescription([
             gateway_node,
             gw_ceiling,
+            gw_in_range,
+            gw_rejected,
             launch_testing.actions.ReadyToTest(),
         ]),
         {
             'gateway_node': gateway_node,
             'gw_ceiling': gw_ceiling,
+            'gw_in_range': gw_in_range,
+            'gw_rejected': gw_rejected,
         },
     )
 
@@ -175,21 +266,34 @@ class TestStartupParamClampWarnings(GatewayTestCase):
             with self.subTest(parameter=parameter, direction='ceiling'):
                 self.assertIn(expected_warning(parameter, above, ceiling), reported)
 
-    def test_in_range_values_stay_quiet(self, proc_output, gw_ceiling):
-        """An in-range parameter is not reported as clamped.
+    def test_in_range_values_stay_quiet(self, proc_output, gw_in_range):
+        """A gateway configured entirely in range reports no clamp at all.
 
-        A "warn on every read" regression would satisfy both tests above while
-        burying the real misconfigurations in noise. The ceiling gateway leaves
-        the floor-only parameters at their defaults, so their names must not
-        appear in a clamp line at all.
+        A "warn on every read" regression - one site losing its
+        `if (effective != requested)` guard - would satisfy the floor and
+        ceiling tests while making a correctly configured gateway shout at
+        every boot. Only an in-range observation catches it, and every one of
+        the parameters needs its own, because a dropped guard at one site says
+        nothing about the others.
         """
-        reported = _clamp_lines(proc_output, gw_ceiling)
-        for parameter in sorted(PARAMS_FLOOR_ONLY):
+        reported = _clamp_lines(proc_output, gw_in_range)
+        self.assertEqual(
+            reported, [],
+            f'a gateway with every parameter in range still reported: {reported}',
+        )
+
+    def test_rejected_values_name_the_refused_value(self, proc_output, gw_rejected):
+        """A refused value is named in the log, not just replaced.
+
+        These parameters fall back to their documented default instead of being
+        clamped. Three of them are set above INT_MAX here: each used to be
+        narrowed to int before its range check, so the value wrapped back into
+        the legal band and was taken as valid without a word.
+        """
+        text = _output_text(proc_output, gw_rejected)
+        for parameter, _value, fragment in REJECTED_PARAMS:
             with self.subTest(parameter=parameter):
-                self.assertFalse(
-                    [line for line in reported if line.startswith(f'{parameter} ')],
-                    f'{parameter} was left at its default but still reported a clamp',
-                )
+                self.assertIn(fragment, text)
 
     def test_repeated_reads_warn_once_per_parameter(self, proc_output, gateway_node):
         """A parameter read twice at startup is reported once, not twice.
@@ -211,8 +315,8 @@ class TestStartupParamClampWarnings(GatewayTestCase):
                 )
 
 
-def _clamp_lines(proc_output, process):
-    """Return every 'X clamped to Y' fragment this process logged during startup.
+def _output_text(proc_output, process):
+    """Return this process's whole startup output as one string.
 
     Waits for STARTUP_COMPLETE first, so the buffer is whole before it is read.
     Every check in this file scans rather than waits per parameter: waiting
@@ -223,16 +327,22 @@ def _clamp_lines(proc_output, process):
     proc_output.assertWaitFor(
         STARTUP_COMPLETE, process=process, timeout=WARNING_TIMEOUT * get_time_scale(),
     )
+    return '\n'.join(
+        output.text.decode(errors='replace') for output in proc_output[process]
+    )
+
+
+def _clamp_lines(proc_output, process):
+    """Return every 'X clamped to Y' fragment this process logged during startup."""
     lines = []
-    for output in proc_output[process]:
-        for line in output.text.decode(errors='replace').splitlines():
-            marker = line.find(' clamped to ')
-            if marker == -1:
-                continue
-            # Strip the rclcpp prefix ("[WARN] [stamp] [logger]: ") so the
-            # fragment starts at the parameter name.
-            start = line.rfind(': ', 0, marker)
-            lines.append(line[start + 2:] if start != -1 else line)
+    for line in _output_text(proc_output, process).splitlines():
+        marker = line.find(' clamped to ')
+        if marker == -1:
+            continue
+        # Strip the rclcpp prefix ("[WARN] [stamp] [logger]: ") so the
+        # fragment starts at the parameter name.
+        start = line.rfind(': ', 0, marker)
+        lines.append(line[start + 2:] if start != -1 else line)
     return lines
 
 
@@ -240,10 +350,10 @@ def _clamp_lines(proc_output, process):
 class TestShutdown(unittest.TestCase):
 
     def test_exit_codes(self, proc_info):
-        """Both gateways exit cleanly.
+        """Every gateway exits cleanly.
 
-        A clamped value must leave a working gateway behind. An exit code here
-        would mean the coercion turned a typo into a crash.
+        A coerced or refused value must leave a working gateway behind. An exit
+        code here would mean a mis-set parameter turned a typo into a crash.
         """
         for info in proc_info:
             self.assertIn(

@@ -321,8 +321,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
 
   // Get parameter values
   server_host_ = get_parameter("server.host").as_string();
-  server_port_ = static_cast<int>(get_parameter("server.port").as_int());
-  refresh_interval_ms_ = static_cast<int>(get_parameter("refresh_interval_ms").as_int());
+  // Port and backstop interval are read as int64 and validated below, before
+  // they are narrowed to int. Narrowing first would wrap a value above INT_MAX
+  // back into the valid band and let it through in silence: 4294976296 narrows
+  // to 9000, a legal port nobody asked for.
+  const int64_t server_port_raw = get_parameter("server.port").as_int();
+  const int64_t refresh_interval_raw = get_parameter("refresh_interval_ms").as_int();
   // Read as int64 and validate BEFORE narrowing to int: a value above INT_MAX
   // would otherwise wrap into the valid range and silently bypass the range
   // check (e.g. 4294967296 -> 0, disabling debounce). 0 disables debouncing
@@ -350,9 +354,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
                      .build();
 
   // Validate port range
-  if (server_port_ < 1024 || server_port_ > 65535) {
-    RCLCPP_ERROR(get_logger(), "Invalid port %d. Must be between 1024-65535. Using default 8080.", server_port_);
+  if (server_port_raw < 1024 || server_port_raw > 65535) {
+    RCLCPP_ERROR(get_logger(), "Invalid port %" PRId64 ". Must be between 1024-65535. Using default 8080.",
+                 server_port_raw);
     server_port_ = 8080;
+  } else {
+    server_port_ = static_cast<int>(server_port_raw);
   }
 
   // Validate host
@@ -370,11 +377,13 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // graph events polled every 100 ms; this value only governs the
   // safety-backstop timer that periodically forces a refresh in case a
   // graph event is missed.
-  if (refresh_interval_ms_ < 100 || refresh_interval_ms_ > 60000) {
+  if (refresh_interval_raw < 100 || refresh_interval_raw > 60000) {
     RCLCPP_WARN(get_logger(),
-                "Invalid backstop refresh interval %dms. Must be between 100-60000ms. Using default 30000ms.",
-                refresh_interval_ms_);
+                "Invalid backstop refresh interval %" PRId64 "ms. Must be between 100-60000ms. Using default 30000ms.",
+                refresh_interval_raw);
     refresh_interval_ms_ = 30000;
+  } else {
+    refresh_interval_ms_ = static_cast<int>(refresh_interval_raw);
   }
 
   // Log configuration
@@ -593,7 +602,18 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     throw std::runtime_error("Discovery initialization failed");
   }
 
-  const auto topic_sample_timeout_sec = get_parameter("topic_sample_timeout_sec").as_double();
+  // Validated here, at the read, rather than in the two consumers. Both
+  // Ros2TopicTransport and DataAccessManager fall back to 1.0 on their own, but
+  // DataAccessManager lives in the ROS-neutral core and cannot log, so a value
+  // rejected there disappeared without a trace. Their fallbacks stay as
+  // contract guards; this is the one place that reports.
+  const auto raw_topic_sample_timeout_sec = get_parameter("topic_sample_timeout_sec").as_double();
+  auto topic_sample_timeout_sec = raw_topic_sample_timeout_sec;
+  if (topic_sample_timeout_sec < 0.1 || topic_sample_timeout_sec > 30.0) {
+    RCLCPP_WARN(get_logger(), "topic_sample_timeout_sec %.2f is outside 0.1-30.0. Using default 1.0.",
+                raw_topic_sample_timeout_sec);
+    topic_sample_timeout_sec = 1.0;
+  }
   topic_transport_ = std::make_shared<ros2::Ros2TopicTransport>(this, topic_sample_timeout_sec);
   data_access_mgr_ = std::make_unique<DataAccessManager>(topic_transport_, topic_sample_timeout_sec);
   // Shared callback groups for blocking-RPC response dispatch and action
@@ -637,7 +657,23 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
 
   // Initialize bulk data store
   auto bd_storage_dir = get_parameter("bulk_data.storage_dir").as_string();
-  auto bd_max_upload = static_cast<size_t>(get_parameter("bulk_data.max_upload_size").as_int());
+  // A negative value would wrap to a huge size_t and be handed to
+  // set_payload_max_length as an effectively unlimited cap. 0 already means
+  // unlimited by documented design, so a negative cannot be folded into it
+  // without turning a typo into that same silent "no limit". Reject it and say
+  // which value was refused.
+  const int64_t bd_max_upload_raw = get_parameter("bulk_data.max_upload_size").as_int();
+  size_t bd_max_upload = 0;
+  if (bd_max_upload_raw < 0) {
+    RCLCPP_WARN(get_logger(),
+                "bulk_data.max_upload_size %" PRId64
+                " is negative. Must be >= 0 (0 = unlimited). "
+                "Using default 104857600.",
+                bd_max_upload_raw);
+    bd_max_upload = 104857600;
+  } else {
+    bd_max_upload = static_cast<size_t>(bd_max_upload_raw);
+  }
   auto bd_categories = get_parameter("bulk_data.categories").as_string_array();
   bd_categories.erase(std::remove_if(bd_categories.begin(), bd_categories.end(),
                                      [](const auto & item) {
@@ -650,7 +686,18 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
               bd_max_upload, bd_categories.size());
 
   // Initialize subscription manager for cyclic subscriptions
-  auto max_subscriptions = static_cast<size_t>(get_parameter("sse.max_subscriptions").as_int());
+  // Same wrap hazard as bulk_data.max_upload_size: a negative here becomes a
+  // huge size_t, and the documented "HTTP 503 when this limit is reached" then
+  // never fires. There is no documented ceiling for this knob, so only the
+  // nonsensical low end is refused.
+  const int64_t max_subscriptions_raw = get_parameter("sse.max_subscriptions").as_int();
+  size_t max_subscriptions = 100;
+  if (max_subscriptions_raw < 1) {
+    RCLCPP_WARN(get_logger(), "sse.max_subscriptions %" PRId64 " must be >= 1. Using default 100.",
+                max_subscriptions_raw);
+  } else {
+    max_subscriptions = static_cast<size_t>(max_subscriptions_raw);
+  }
   subscription_mgr_ = std::make_unique<SubscriptionManager>(max_subscriptions);
   RCLCPP_INFO(get_logger(), "Subscription manager: max_subscriptions=%zu", max_subscriptions);
 
@@ -1078,7 +1125,15 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
                    agg_config.peer_scheme.c_str());
       agg_config.peer_scheme = "http";
     }
-    agg_config.max_discovered_peers = static_cast<size_t>(get_parameter("aggregation.max_discovered_peers").as_int());
+    // Documented range 1-1000. Unchecked, a negative wraps to a huge size_t and
+    // the cap that exists to stop rogue mDNS announcements stops existing.
+    const int64_t max_peers_raw = get_parameter("aggregation.max_discovered_peers").as_int();
+    const int64_t max_peers_used = std::clamp<int64_t>(max_peers_raw, 1, 1000);
+    if (max_peers_used != max_peers_raw) {
+      RCLCPP_WARN(get_logger(), "aggregation.max_discovered_peers %" PRId64 " clamped to %" PRId64, max_peers_raw,
+                  max_peers_used);
+    }
+    agg_config.max_discovered_peers = static_cast<size_t>(max_peers_used);
 
     // Parse static peers from parallel arrays
     auto peer_urls = get_parameter("aggregation.peer_urls").as_string_array();

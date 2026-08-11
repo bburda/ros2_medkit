@@ -16,6 +16,7 @@
 
 #include <cinttypes>
 #include <exception>
+#include <limits>
 #include <rclcpp/rclcpp.hpp>
 #include <stdexcept>
 #include <type_traits>
@@ -166,10 +167,17 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   sse_client_tracker_ = node_->get_sse_client_tracker();
   sse_fault_handler_ = std::make_unique<handlers::SSEFaultHandler>(*handler_ctx_, sse_client_tracker_);
   bulkdata_handlers_ = std::make_unique<handlers::BulkDataHandlers>(*handler_ctx_);
-  auto max_duration_sec = static_cast<int>(node_->get_parameter("sse.max_duration_sec").as_int());
-  if (max_duration_sec <= 0) {
-    RCLCPP_WARN(node_->get_logger(), "sse.max_duration_sec must be > 0, using default 3600");
-    max_duration_sec = 3600;
+  // Validated as int64 before narrowing: narrowing first wraps a value above
+  // INT_MAX into a small positive one that passes the check, so 4294967300
+  // would silently cap every subscription at 4 seconds. The warning names the
+  // requested value, otherwise the operator cannot tell which value was refused.
+  const int64_t max_duration_raw = node_->get_parameter("sse.max_duration_sec").as_int();
+  int max_duration_sec = 3600;
+  if (max_duration_raw < 1 || max_duration_raw > std::numeric_limits<int>::max()) {
+    RCLCPP_WARN(node_->get_logger(), "sse.max_duration_sec %" PRId64 " must be > 0. Using default 3600.",
+                max_duration_raw);
+  } else {
+    max_duration_sec = static_cast<int>(max_duration_raw);
   }
   cyclic_sub_handlers_ = std::make_unique<handlers::CyclicSubscriptionHandlers>(
       *handler_ctx_, *node_->get_subscription_manager(), *node_->get_sampler_registry(),
