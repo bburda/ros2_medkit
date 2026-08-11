@@ -14,6 +14,7 @@
 
 #include "ros2_medkit_gateway/core/http/rest_server.hpp"
 
+#include <cinttypes>
 #include <exception>
 #include <rclcpp/rclcpp.hpp>
 #include <stdexcept>
@@ -94,10 +95,20 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   // timeout in [1, 3600]s: with a small pool, the cpp-httplib default (5s) lets
   // a burst of short-lived client connections pin every worker, so we shorten it
   // (default 2s) to recover workers quickly while retaining reuse.
-  const auto http_thread_pool_size =
-      clamp_thread_count(node_->get_parameter("server.http_thread_pool_size").as_int(), 1, 1024);
-  const auto keep_alive_timeout_sec =
-      clamp_keep_alive_timeout(node_->get_parameter("server.keep_alive_timeout_sec").as_int(), 1, 3600);
+  // Both clamps report when they fire: the pool that ends up serving requests
+  // must be traceable to the config file that asked for it.
+  const auto requested_pool_size = node_->get_parameter("server.http_thread_pool_size").as_int();
+  const auto http_thread_pool_size = clamp_thread_count(requested_pool_size, 1, 1024);
+  if (static_cast<int64_t>(http_thread_pool_size) != requested_pool_size) {
+    RCLCPP_WARN(rclcpp::get_logger("rest_server"), "server.http_thread_pool_size %" PRId64 " clamped to %zu",
+                requested_pool_size, http_thread_pool_size);
+  }
+  const auto requested_keep_alive = node_->get_parameter("server.keep_alive_timeout_sec").as_int();
+  const auto keep_alive_timeout_sec = clamp_keep_alive_timeout(requested_keep_alive, 1, 3600);
+  if (static_cast<int64_t>(keep_alive_timeout_sec) != requested_keep_alive) {
+    RCLCPP_WARN(rclcpp::get_logger("rest_server"), "server.keep_alive_timeout_sec %" PRId64 " clamped to %ld",
+                requested_keep_alive, static_cast<long>(keep_alive_timeout_sec));
+  }
   http_server_ = std::make_unique<HttpServerManager>(tls_config_, http_thread_pool_size, keep_alive_timeout_sec);
   RCLCPP_INFO(rclcpp::get_logger("rest_server"),
               "HTTP request thread pool bounded to %zu workers (each active SSE stream holds one), "

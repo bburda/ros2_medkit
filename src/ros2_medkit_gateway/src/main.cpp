@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -33,31 +34,93 @@ namespace {
 // because a runaway value here (e.g. queue_depth=1e9) can starve the gateway
 // process for memory. Defaults mirror the Config{} constructors so the stock
 // deployment behaviour is unchanged.
+//
+// Every clamp that fires is logged. A silent coercion leaves the config file
+// and the running process disagreeing with nothing in between to show it, and
+// the symptom of a wrong value (a slow or jittery gateway) shows up far from
+// the cause. The message shape matches the sibling clamps in gateway_node.cpp
+// so every coerced parameter reads the same way in a log.
 ros2_medkit_gateway::ros2_common::Ros2SubscriptionExecutor::Config declare_executor_config(rclcpp::Node & node) {
   ros2_medkit_gateway::ros2_common::Ros2SubscriptionExecutor::Config cfg;
+
   const auto queue_depth = node.declare_parameter<int64_t>("subscription_executor.max_queue_depth", 256);
-  cfg.max_queue_depth = static_cast<std::size_t>(std::clamp<int64_t>(queue_depth, 16, 4096));
+  const auto queue_depth_used = std::clamp<int64_t>(queue_depth, 16, 4096);
+  if (queue_depth_used != queue_depth) {
+    RCLCPP_WARN(node.get_logger(), "subscription_executor.max_queue_depth %" PRId64 " clamped to %" PRId64, queue_depth,
+                queue_depth_used);
+  }
+  cfg.max_queue_depth = static_cast<std::size_t>(queue_depth_used);
+
   const auto watchdog_ms = node.declare_parameter<int64_t>("subscription_executor.watchdog_threshold_ms", 5000);
-  cfg.watchdog_threshold = std::chrono::milliseconds{std::clamp<int64_t>(watchdog_ms, 100, 60000)};
+  const auto watchdog_ms_used = std::clamp<int64_t>(watchdog_ms, 100, 60000);
+  if (watchdog_ms_used != watchdog_ms) {
+    RCLCPP_WARN(node.get_logger(), "subscription_executor.watchdog_threshold_ms %" PRId64 " clamped to %" PRId64,
+                watchdog_ms, watchdog_ms_used);
+  }
+  cfg.watchdog_threshold = std::chrono::milliseconds{watchdog_ms_used};
+
   const auto watchdog_tick = node.declare_parameter<int64_t>("subscription_executor.watchdog_tick_ms", 1000);
-  cfg.watchdog_tick = std::chrono::milliseconds{std::clamp<int64_t>(watchdog_tick, 10, 10000)};
+  const auto watchdog_tick_used = std::clamp<int64_t>(watchdog_tick, 10, 10000);
+  if (watchdog_tick_used != watchdog_tick) {
+    RCLCPP_WARN(node.get_logger(), "subscription_executor.watchdog_tick_ms %" PRId64 " clamped to %" PRId64,
+                watchdog_tick, watchdog_tick_used);
+  }
+  cfg.watchdog_tick = std::chrono::milliseconds{watchdog_tick_used};
+
   const auto graph_tick = node.declare_parameter<int64_t>("subscription_executor.graph_poll_tick_ms", 100);
-  cfg.graph_poll_tick = std::chrono::milliseconds{std::clamp<int64_t>(graph_tick, 10, 10000)};
+  const auto graph_tick_used = std::clamp<int64_t>(graph_tick, 10, 10000);
+  if (graph_tick_used != graph_tick) {
+    RCLCPP_WARN(node.get_logger(), "subscription_executor.graph_poll_tick_ms %" PRId64 " clamped to %" PRId64,
+                graph_tick, graph_tick_used);
+  }
+  cfg.graph_poll_tick = std::chrono::milliseconds{graph_tick_used};
+
   return cfg;
 }
 
 ros2_medkit_gateway::Ros2TopicDataProvider::Config declare_data_provider_config(rclcpp::Node & node) {
   ros2_medkit_gateway::Ros2TopicDataProvider::Config cfg;
+
   const auto pool_size = node.declare_parameter<int64_t>("data_provider.max_pool_size", 256);
-  cfg.max_pool_size = static_cast<std::size_t>(std::clamp<int64_t>(pool_size, 1, 4096));
+  const auto pool_size_used = std::clamp<int64_t>(pool_size, 1, 4096);
+  if (pool_size_used != pool_size) {
+    RCLCPP_WARN(node.get_logger(), "data_provider.max_pool_size %" PRId64 " clamped to %" PRId64, pool_size,
+                pool_size_used);
+  }
+  cfg.max_pool_size = static_cast<std::size_t>(pool_size_used);
+
   const auto cold_cap = node.declare_parameter<int64_t>("data_provider.cold_wait_cap", 4);
-  cfg.cold_wait_cap = static_cast<std::size_t>(std::clamp<int64_t>(cold_cap, 0, 1024));
+  const auto cold_cap_used = std::clamp<int64_t>(cold_cap, 0, 1024);
+  if (cold_cap_used != cold_cap) {
+    RCLCPP_WARN(node.get_logger(), "data_provider.cold_wait_cap %" PRId64 " clamped to %" PRId64, cold_cap,
+                cold_cap_used);
+  }
+  cfg.cold_wait_cap = static_cast<std::size_t>(cold_cap_used);
+
   const auto max_parallel = node.declare_parameter<int64_t>("data_provider.max_parallel_samples", 8);
-  cfg.max_parallel_samples = static_cast<std::size_t>(std::clamp<int64_t>(max_parallel, 1, 256));
+  const auto max_parallel_used = std::clamp<int64_t>(max_parallel, 1, 256);
+  if (max_parallel_used != max_parallel) {
+    RCLCPP_WARN(node.get_logger(), "data_provider.max_parallel_samples %" PRId64 " clamped to %" PRId64, max_parallel,
+                max_parallel_used);
+  }
+  cfg.max_parallel_samples = static_cast<std::size_t>(max_parallel_used);
+
   const auto idle_safety_s = node.declare_parameter<int64_t>("data_provider.idle_safety_net_sec", 15 * 60);
-  cfg.idle_safety_net = std::chrono::seconds{std::clamp<int64_t>(idle_safety_s, 0, 24 * 3600)};
+  const auto idle_safety_s_used = std::clamp<int64_t>(idle_safety_s, 0, 24 * 3600);
+  if (idle_safety_s_used != idle_safety_s) {
+    RCLCPP_WARN(node.get_logger(), "data_provider.idle_safety_net_sec %" PRId64 " clamped to %" PRId64, idle_safety_s,
+                idle_safety_s_used);
+  }
+  cfg.idle_safety_net = std::chrono::seconds{idle_safety_s_used};
+
   const auto idle_sweep_s = node.declare_parameter<int64_t>("data_provider.idle_sweep_tick_sec", 60);
-  cfg.idle_sweep_tick = std::chrono::seconds{std::clamp<int64_t>(idle_sweep_s, 0, 3600)};
+  const auto idle_sweep_s_used = std::clamp<int64_t>(idle_sweep_s, 0, 3600);
+  if (idle_sweep_s_used != idle_sweep_s) {
+    RCLCPP_WARN(node.get_logger(), "data_provider.idle_sweep_tick_sec %" PRId64 " clamped to %" PRId64, idle_sweep_s,
+                idle_sweep_s_used);
+  }
+  cfg.idle_sweep_tick = std::chrono::seconds{idle_sweep_s_used};
+
   return cfg;
 }
 
@@ -93,8 +156,12 @@ int main(int argc, char ** argv) {
     // uses its own private executor. The Ros2SubscriptionExecutor built below
     // owns its own internal single-threaded executor (spun from its worker
     // thread); the subscription node is intentionally not added here.
-    const auto executor_threads =
-        ros2_medkit_gateway::clamp_thread_count(node->get_parameter("server.executor_threads").as_int(), 1, 256);
+    const auto requested_executor_threads = node->get_parameter("server.executor_threads").as_int();
+    const auto executor_threads = ros2_medkit_gateway::clamp_thread_count(requested_executor_threads, 1, 256);
+    if (static_cast<int64_t>(executor_threads) != requested_executor_threads) {
+      RCLCPP_WARN(node->get_logger(), "server.executor_threads %" PRId64 " clamped to %zu", requested_executor_threads,
+                  executor_threads);
+    }
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), executor_threads);
     executor.add_node(node);
     RCLCPP_INFO(node->get_logger(), "Main executor bounded to %zu threads", executor_threads);
@@ -117,6 +184,12 @@ int main(int argc, char ** argv) {
     // run a smaller pool. Values are clamped the same way their consumers clamp
     // them, so the comparison reflects effective sizes. cold_wait_cap is read
     // from dp_cfg (already clamped above).
+    //
+    // Both re-reads below use the silent clamp on purpose. Each of these two
+    // parameters is already reported by the site that owns it -
+    // http_thread_pool_size by RESTServer, sse.max_clients by GatewayNode - and
+    // logging the same coercion a second time here would train operators to
+    // skim past the warning that matters.
     {
       const auto http_pool = ros2_medkit_gateway::clamp_thread_count(
           node->get_parameter("server.http_thread_pool_size").as_int(), 1, 1024);

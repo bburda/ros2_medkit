@@ -658,7 +658,11 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // Clamp like the pool knobs (issue #440): read raw, a negative value would wrap
   // to a huge size_t. Bounded to [1, 1024]; main.cpp warns at startup if this
   // exceeds the HTTP pool budget (pool < sse.max_clients + cold_wait_cap).
-  auto max_sse_clients = clamp_thread_count(get_parameter("sse.max_clients").as_int(), 1, 1024);
+  auto requested_sse_clients = get_parameter("sse.max_clients").as_int();
+  auto max_sse_clients = clamp_thread_count(requested_sse_clients, 1, 1024);
+  if (static_cast<int64_t>(max_sse_clients) != requested_sse_clients) {
+    RCLCPP_WARN(get_logger(), "sse.max_clients %" PRId64 " clamped to %zu", requested_sse_clients, max_sse_clients);
+  }
   sse_client_tracker_ = std::make_shared<SSEClientTracker>(max_sse_clients);
 
   // Initialize resource sampler and transport registries

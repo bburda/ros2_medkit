@@ -13,6 +13,25 @@ The gateway can be configured via:
 2. **Launch files**: ``parameters=[{'server.port': 9000}]``
 3. **YAML file**: See ``src/ros2_medkit_gateway/config/gateway_params.yaml``
 
+Out-of-range values
+-------------------
+
+Where a parameter below documents a valid range, that range is enforced when the
+value is read at startup. An out-of-range value neither aborts startup nor takes
+effect: it is coerced to the nearest endpoint of the range, and the gateway logs
+a warning naming both the requested and the effective value.
+
+.. code-block:: text
+
+   [WARN] [ros2_medkit_gateway]: server.http_thread_pool_size 0 clamped to 1
+
+The coercion exists so a typo cannot break request serving - a pool of ``0``
+would queue every request forever. The warning exists because the config file
+and the running process would otherwise disagree with nothing to show it, and
+the symptom of a mis-set value (a slow or jittery gateway) surfaces far from the
+cause. If the gateway behaves as though a parameter were different from what
+your YAML says, its startup log names the parameter.
+
 Network Settings
 ----------------
 
@@ -349,7 +368,9 @@ size instead of scaling with the host CPU count, so the gateway's thread
 footprint is the same on a 4-core SBC and a 64-core server. A third knob,
 ``keep_alive_timeout_sec``, bounds how long the HTTP pool keeps a worker parked
 on an idle keep-alive connection. Every value is clamped to a working minimum on
-read, so a mis-set parameter can never break request serving.
+read, so a mis-set parameter can never break request serving - and the clamp is
+reported, so it cannot quietly change what the gateway runs (see
+`Out-of-range values`_).
 
 .. list-table::
    :header-rows: 1
