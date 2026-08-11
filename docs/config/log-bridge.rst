@@ -18,8 +18,11 @@ it through the same ``ReportFault`` path any node would use.
 
 Two things bound the volume. Messages at ``WARN`` pass through each node's
 ``FaultReporter`` local filter, which debounces on a threshold and a window;
-``ERROR`` and ``FATAL`` bypass that filter. On top of that, the bridge itself
-holds a per-node cooldown so one node in a loop cannot flood the fault store.
+``ERROR`` and ``FATAL`` bypass that filter, so the bridge applies its own
+cooldown to those two levels instead. That cooldown is keyed by the generated
+fault code together with the severity, not by the node: a repeat of the same
+message is suppressed, while a different message from the same node is not, and
+an ERROR is never suppressed by an earlier WARN of the same text.
 
 Parameters
 ----------
@@ -49,11 +52,13 @@ Parameters
      - Topic the bridge subscribes to.
    * - ``severity_floor``
      - ``30`` (WARN)
-     - Lowest rcutils log level that becomes a fault: 10 DEBUG, 20 INFO,
-       30 WARN, 40 ERROR, 50 FATAL. Raise it to ``40`` on chatty or constrained
-       targets to cut volume. Out of range is clamped to ``[0, 50]`` with a
-       warning, because the value is narrowed to a byte and would otherwise wrap
-       into "let everything through".
+     - Lowest rcutils log level that becomes a fault. Useful values are ``30``
+       WARN, ``40`` ERROR and ``50`` FATAL: DEBUG and INFO never become faults
+       whatever this is set to, so ``0``, ``10`` and ``20`` all behave like
+       ``30``. Raise it to ``40`` on chatty or constrained targets to cut
+       volume. Out of range is clamped to ``[0, 50]`` with a warning, because
+       the value is narrowed to a byte and would otherwise wrap into "let
+       everything through".
    * - ``code_prefix``
      - ``LOG``
      - Prefix of every generated fault code. Normalized to upper snake case and
@@ -68,12 +73,15 @@ Parameters
      - When non-empty, only these nodes are considered.
    * - ``max_tracked_nodes``
      - ``512``
-     - How many distinct nodes the bridge keeps cooldown state for. Bounds
-       memory when node names are generated. Clamped to at least ``1``.
+     - How many distinct source nodes the bridge tracks. Bounds memory when node
+       names are generated. Clamped to at least ``1``.
    * - ``report_cooldown_sec``
      - ``5.0``
-     - Minimum gap between two reports for the same node. A negative value is
-       treated as ``0``.
+     - Minimum gap between two reports carrying the same generated fault code at
+       the same severity. Applies to ``ERROR`` and ``FATAL`` only, because
+       ``WARN`` is already debounced by the reporter-side local filter and
+       cooling it here would starve that filter's threshold counting. ``0`` or a
+       negative value disables it.
    * - ``exclude_medkit_stack``
      - ``true``
      - Ignore logs from medkit's own nodes, so the diagnostics stack does not

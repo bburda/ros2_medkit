@@ -18,6 +18,7 @@
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -610,7 +611,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // contract guards; this is the one place that reports.
   const auto raw_topic_sample_timeout_sec = get_parameter("topic_sample_timeout_sec").as_double();
   auto topic_sample_timeout_sec = raw_topic_sample_timeout_sec;
-  if (topic_sample_timeout_sec < 0.1 || topic_sample_timeout_sec > 30.0) {
+  // isfinite first, and the range as a positive test. Do NOT rewrite this as
+  // "below 0.1 or above 30.0": every comparison against NaN is false, so that
+  // form hands NaN to both consumers as a sampling timeout.
+  const bool timeout_in_range =
+      std::isfinite(topic_sample_timeout_sec) && topic_sample_timeout_sec >= 0.1 && topic_sample_timeout_sec <= 30.0;
+  if (!timeout_in_range) {
     RCLCPP_WARN(get_logger(), "topic_sample_timeout_sec %.2f is outside 0.1-30.0. Using default 1.0.",
                 raw_topic_sample_timeout_sec);
     topic_sample_timeout_sec = 1.0;

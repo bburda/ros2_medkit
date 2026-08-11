@@ -18,8 +18,10 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <vector>
 
 #include "action_msgs/msg/goal_status.hpp"
@@ -105,11 +107,14 @@ ActionStatusBridgeNode::~ActionStatusBridgeNode() {
 }
 
 void ActionStatusBridgeNode::load_parameters() {
-  const int aborted_severity =
-      static_cast<int>(declare_parameter<int>("aborted_severity", ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR));
+  // Read as int64 and checked before narrowing. A ROS parameter is an int64, so
+  // declaring this as int narrowed first and a value above INT_MAX wrapped back
+  // into [0,3] and was accepted in silence: 4294967298 becomes 2.
+  const int64_t aborted_severity =
+      declare_parameter<int64_t>("aborted_severity", ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR);
   if (aborted_severity < ros2_medkit_msgs::msg::Fault::SEVERITY_INFO ||
       aborted_severity > ros2_medkit_msgs::msg::Fault::SEVERITY_CRITICAL) {
-    RCLCPP_WARN(get_logger(), "aborted_severity %d out of range [0,3]; clamping to ERROR", aborted_severity);
+    RCLCPP_WARN(get_logger(), "aborted_severity %" PRId64 " out of range [0,3]; clamping to ERROR", aborted_severity);
     aborted_severity_ = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
   } else {
     aborted_severity_ = static_cast<uint8_t>(aborted_severity);
@@ -143,9 +148,10 @@ void ActionStatusBridgeNode::load_parameters() {
   include_only_actions_ =
       declare_parameter<std::vector<std::string>>("include_only_actions", std::vector<std::string>{});
 
-  const int dedup_capacity = static_cast<int>(declare_parameter<int>("dedup_capacity", 4096));
-  if (dedup_capacity <= 0) {
-    RCLCPP_WARN(get_logger(), "dedup_capacity %d not positive; using 4096", dedup_capacity);
+  // Same reason as aborted_severity: checked as int64, narrowed afterwards.
+  const int64_t dedup_capacity = declare_parameter<int64_t>("dedup_capacity", 4096);
+  if (dedup_capacity <= 0 || dedup_capacity > std::numeric_limits<int>::max()) {
+    RCLCPP_WARN(get_logger(), "dedup_capacity %" PRId64 " out of range; using 4096", dedup_capacity);
     logged_capacity_ = 4096;
   } else {
     logged_capacity_ = static_cast<size_t>(dedup_capacity);
