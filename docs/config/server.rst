@@ -25,8 +25,8 @@ range and the gateway logs both values. This applies to the thread and pool knob
 (``server.executor_threads``, ``server.http_thread_pool_size``,
 ``server.keep_alive_timeout_sec``, ``sse.max_clients``,
 ``service_call_timeout_sec``, ``logs.buffer_size``, ``entity_cache.capacity``,
-``aggregation.max_discovered_peers``) and to the ``subscription_executor.*`` and
-``data_provider.*`` knobs:
+``aggregation.max_discovered_peers``, ``fault_triggers.poll_interval_ms``) and to
+the ``subscription_executor.*`` and ``data_provider.*`` knobs:
 
 .. code-block:: text
 
@@ -154,11 +154,13 @@ Cross-Origin Resource Sharing (CORS) settings for browser-based clients.
      - Description
    * - ``cors.allowed_origins``
      - list
-     - ``[""]``
-     - List of allowed origins. Use ``["*"]`` for all (not recommended).
+     - ``[]``
+     - List of allowed origins. Use ``["*"]`` for all (not recommended). CORS is
+       off while this is empty, so the shipped ``gateway_params.yaml`` value of
+       ``[""]`` also leaves it off: empty strings are stripped before the check.
    * - ``cors.allowed_methods``
      - list
-     - ``["GET", "PUT", "OPTIONS"]``
+     - ``["GET", "PUT", "POST", "DELETE", "OPTIONS"]``
      - Allowed HTTP methods.
    * - ``cors.allowed_headers``
      - list
@@ -203,8 +205,11 @@ Data Access Settings
        topics are processed in follow-up chunks. Range: 1-256.
    * - ``topic_sample_timeout_sec``
      - float
-     - ``2.0``
+     - ``1.0``
      - Timeout for sampling topics with active publishers. Range: 0.1-30.0.
+       The declared default is ``1.0``, which is what a bare ``ros2 run`` uses.
+       ``gateway_params.yaml`` sets ``2.0``, so a launch that loads it gets that
+       instead.
    * - ``parameter_service_timeout_sec``
      - float
      - ``2.0``
@@ -660,6 +665,36 @@ Configure condition-based push notifications for resource changes.
      - ``1000``
      - Maximum number of concurrent triggers across all entities. Returns
        HTTP 503 when this limit is reached.
+
+Fault-trigger rules
+^^^^^^^^^^^^^^^^^^^
+
+A separate engine evaluates threshold rules over plugin-provided data values and
+raises faults from them, without a rule file. It only starts when at least one
+plugin is loaded; with no plugins these parameters do nothing.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 8 14 46
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``fault_triggers.enabled``
+     - bool
+     - ``true``
+     - Master switch for the rule engine.
+   * - ``fault_triggers.poll_interval_ms``
+     - int
+     - ``1000``
+     - How often the rules are evaluated. Floored at ``50`` ms so the loop
+       cannot busy-spin; a lower value is clamped with a warning.
+   * - ``fault_triggers.storage.path``
+     - string
+     - ``""``
+     - SQLite file the rules are persisted in. Empty keeps them in memory, so
+       they are lost on restart.
    * - ``triggers.on_restart_behavior``
      - string
      - ``"reset"``
@@ -913,8 +948,10 @@ Complete Example
            enabled: false
 
        refresh_interval_ms: 5000
-       max_parallel_topic_samples: 30
        topic_sample_timeout_sec: 3.0
+
+       data_provider:
+         max_parallel_samples: 30
 
        cors:
          allowed_origins: ["http://localhost:5173", "https://dashboard.example.com"]

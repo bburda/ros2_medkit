@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <string>
@@ -1873,10 +1874,15 @@ void GatewayNode::init_fault_trigger_engine() {
     return;
   }
   const std::string storage_path = get_parameter("fault_triggers.storage.path").as_string();
-  int poll_ms = static_cast<int>(get_parameter("fault_triggers.poll_interval_ms").as_int());
-  if (poll_ms < 50) {
-    poll_ms = 50;  // floor: never busy-spin the evaluation loop
+  // Floor so the evaluation loop can never busy-spin. Read as int64 and checked
+  // before narrowing, or a value above INT_MAX would wrap past the floor.
+  const int64_t poll_ms_raw = get_parameter("fault_triggers.poll_interval_ms").as_int();
+  const int64_t poll_ms_used = std::clamp<int64_t>(poll_ms_raw, 50, std::numeric_limits<int>::max());
+  if (poll_ms_used != poll_ms_raw) {
+    RCLCPP_WARN(get_logger(), "fault_triggers.poll_interval_ms %" PRId64 " clamped to %" PRId64, poll_ms_raw,
+                poll_ms_used);
   }
+  const int poll_ms = static_cast<int>(poll_ms_used);
 
   // Value fetch: same in-process x-plc-data route the freeze-frame capture uses,
   // so a rule always sees exactly the value the /data endpoint would serve.

@@ -140,7 +140,8 @@ for peer communication.
    * - ``aggregation.max_discovered_peers``
      - int
      - ``50``
-     - Maximum number of peers that can be added via mDNS discovery. Prevents
+     - Maximum number of peers that can be added via mDNS discovery. Range:
+       1-1000, clamped with a warning. Prevents
        unbounded growth of the peer list from rogue mDNS announcements on the
        local network. Static peers (configured via ``peer_urls``/``peer_names``)
        do not count against this limit. When the limit is reached, additional

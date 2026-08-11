@@ -49,11 +49,13 @@ for each parameter, at **1299 threads and 1486 MB RSS**. Paying that (on a
 runner already hosting the three other gateways, and again under a sanitizer)
 buys one log line per parameter from the same four-line compare-and-warn that
 the floor case already drives, that the in-range case pins the guard of, and
-that the other 14 parameters already drive in the ceiling direction.
+that the other 15 parameters already drive in the ceiling direction.
 """
 
+import os
 import unittest
 
+from ament_index_python.packages import get_package_prefix
 from launch import LaunchDescription
 import launch_testing
 import launch_testing.actions
@@ -98,6 +100,10 @@ CLAMPED_PARAMS = [
     ('data_provider.idle_sweep_tick_sec', 0, 3600, -1, 7200),
     # aggregation.* - gateway_node.cpp, only read when aggregation is enabled
     ('aggregation.max_discovered_peers', 1, 1000, 0, 2000),
+    # fault_triggers.* - gateway_node.cpp, only read once a plugin is loaded.
+    # The ceiling is INT_MAX because the value is narrowed to int for the timer;
+    # it is a type boundary, not a tuning choice.
+    ('fault_triggers.poll_interval_ms', 50, 2147483647, 0, 4294967296),
 ]
 
 # In-range values, one per clamped parameter. A gateway launched with these must
@@ -123,6 +129,7 @@ IN_RANGE_PARAMS = {
     'data_provider.idle_safety_net_sec': 900,
     'data_provider.idle_sweep_tick_sec': 60,
     'aggregation.max_discovered_peers': 50,
+    'fault_triggers.poll_interval_ms': 1000,
 }
 
 # Parameters whose out-of-range value is REFUSED and replaced by the documented
@@ -182,27 +189,37 @@ STARTUP_COMPLETE = 'TopicDataProvider attached'
 
 
 def generate_test_description():
-    # aggregation.max_discovered_peers is only read when aggregation is on. With
-    # no peers and mDNS off it does nothing else, so it is a cheap way to reach
-    # that parameter.
-    aggregation_on = {'aggregation.enabled': True}
+    # Two parameters in the table are only read when something else is on:
+    # aggregation.max_discovered_peers needs aggregation, and the
+    # fault_triggers.* group needs at least one loaded plugin. With no peers,
+    # mDNS off and the plugin idle, neither does anything beyond making its
+    # parameter reachable.
+    plugin_path = os.path.join(
+        get_package_prefix('ros2_medkit_gateway'),
+        'lib', 'ros2_medkit_gateway', 'libtest_gateway_plugin.so',
+    )
+    reachable = {
+        'aggregation.enabled': True,
+        'plugins': ['test_plugin'],
+        'plugins.test_plugin.path': plugin_path,
+    }
 
     # Floor gateway on the default port: GatewayTestCase polls /health here, so
     # this gateway also proves the clamped-to-floor values still serve requests.
     gateway_node = create_gateway_node(
-        extra_params={**FLOOR_PARAMS, **aggregation_on},
+        extra_params={**FLOOR_PARAMS, **reachable},
     )
 
     gw_ceiling = create_gateway_node(
         port=get_test_port(1),
         name='gateway_clamp_ceiling',
-        extra_params={**CEILING_PARAMS, **aggregation_on},
+        extra_params={**CEILING_PARAMS, **reachable},
     )
 
     gw_in_range = create_gateway_node(
         port=get_test_port(2),
         name='gateway_clamp_in_range',
-        extra_params={**IN_RANGE_PARAMS, **aggregation_on},
+        extra_params={**IN_RANGE_PARAMS, **reachable},
     )
 
     # The refused values include server.port itself, so this gateway falls back
@@ -215,7 +232,7 @@ def generate_test_description():
         name='gateway_param_rejected',
         extra_params={
             **{name: value for name, value, _fragment in REJECTED_PARAMS},
-            **aggregation_on,
+            **reachable,
         },
     )
 
@@ -327,7 +344,14 @@ def _output_text(proc_output, process):
     proc_output.assertWaitFor(
         STARTUP_COMPLETE, process=process, timeout=WARNING_TIMEOUT * get_time_scale(),
     )
-    return '\n'.join(
+    # Concatenated with NO separator on purpose. proc_output yields raw stream
+    # chunks, not lines: a chunk boundary can fall in the middle of a log line,
+    # and joining with '\n' then splices a newline into the message so a
+    # substring match on it fails while the line is plainly there in the log.
+    # That is not hypothetical - it is how this file first failed under a
+    # sanitizer, where the timing moved the boundary. The stream carries its own
+    # newlines, so plain concatenation reconstructs it.
+    return ''.join(
         output.text.decode(errors='replace') for output in proc_output[process]
     )
 
