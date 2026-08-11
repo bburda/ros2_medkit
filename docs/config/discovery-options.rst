@@ -132,6 +132,31 @@ This is useful when running beacon plugins as the sole enrichment source
 When a layer is disabled, its entities are not discovered and its merge
 contributions are skipped. Plugins always run regardless of these flags.
 
+Manifest Loading
+^^^^^^^^^^^^^^^^
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 8 14 44
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``discovery.manifest_strict_validation``
+     - bool
+     - ``true``
+     - Reject a manifest that fails validation instead of loading the parts of
+       it that happen to parse. Turn it off only to bring up a manifest that is
+       still being written.
+   * - ``discovery.manifest.fragments_dir``
+     - string
+     - ``""``
+     - Directory of manifest fragment YAML files. Every load and reload of the
+       manifest scans it and merges the apps, components and functions it finds
+       on top of the base manifest, so a fleet can ship one base file plus
+       per-robot fragments. Empty disables fragment loading.
+
 Field Groups
 ^^^^^^^^^^^^
 
