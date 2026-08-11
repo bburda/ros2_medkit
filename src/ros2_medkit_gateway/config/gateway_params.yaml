@@ -7,11 +7,17 @@
 #   - This YAML file
 #
 # Ranges: where a parameter below documents a valid range, that range is
-# enforced when the value is read. An out-of-range value does not abort startup
-# and does not silently take effect either - it is coerced to the nearest
-# endpoint and the gateway logs a warning naming both the requested and the
-# effective value, e.g.
-#   [WARN] server.http_thread_pool_size 0 clamped to 1
+# enforced when the value is read, and an out-of-range value is never accepted
+# in silence. What happens next differs by parameter:
+#   - most are coerced to the nearest endpoint, and the gateway logs both
+#     values:   [WARN] server.http_thread_pool_size 0 clamped to 1
+#   - server.port, refresh_interval_ms, discovery.refresh_debounce_ms,
+#     topic_sample_timeout_sec, bulk_data.max_upload_size, sse.max_subscriptions
+#     and sse.max_duration_sec are refused and the documented default is used
+#     instead; the warning names the value that was refused
+#   - parameter_service_timeout_sec and parameter_service_negative_cache_sec are
+#     declared with a floating-point range descriptor, so rclcpp rejects the
+#     value and the gateway does not start at all
 # So if the gateway behaves as though a parameter were different from what this
 # file says, its startup log will name the parameter.
 

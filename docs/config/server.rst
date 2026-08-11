@@ -16,21 +16,52 @@ The gateway can be configured via:
 Out-of-range values
 -------------------
 
-Where a parameter below documents a valid range, that range is enforced when the
-value is read at startup. An out-of-range value neither aborts startup nor takes
-effect: it is coerced to the nearest endpoint of the range, and the gateway logs
-a warning naming both the requested and the effective value.
+Where a parameter documents a valid range, that range is enforced when the value
+is read at startup, and an out-of-range value is never accepted in silence. What
+happens next differs by parameter, in one of three ways.
+
+**Clamped to the nearest endpoint.** The value is moved to the closest end of the
+range and the gateway logs both values. This applies to the thread and pool knobs
+(``server.executor_threads``, ``server.http_thread_pool_size``,
+``server.keep_alive_timeout_sec``, ``sse.max_clients``,
+``service_call_timeout_sec``, ``logs.buffer_size``, ``entity_cache.capacity``,
+``aggregation.max_discovered_peers``) and to the ``subscription_executor.*`` and
+``data_provider.*`` knobs:
 
 .. code-block:: text
 
-   [WARN] [ros2_medkit_gateway]: server.http_thread_pool_size 0 clamped to 1
+   [WARN] [rest_server]: server.http_thread_pool_size 0 clamped to 1
 
-The coercion exists so a typo cannot break request serving - a pool of ``0``
-would queue every request forever. The warning exists because the config file
-and the running process would otherwise disagree with nothing to show it, and
-the symptom of a mis-set value (a slow or jittery gateway) surfaces far from the
-cause. If the gateway behaves as though a parameter were different from what
-your YAML says, its startup log names the parameter.
+**Rejected, and the documented default is used instead.** Clamping makes no sense
+for these, so the value is refused and the default takes its place. The warning
+names the value that was refused. This applies to ``server.port``,
+``refresh_interval_ms``, ``discovery.refresh_debounce_ms``,
+``topic_sample_timeout_sec``, ``bulk_data.max_upload_size``,
+``sse.max_subscriptions`` and ``sse.max_duration_sec``:
+
+.. code-block:: text
+
+   [ERROR] [ros2_medkit_gateway]: Invalid port 70000. Must be between 1024-65535. Using default 8080.
+
+**Refused at startup.** ``parameter_service_timeout_sec`` and
+``parameter_service_negative_cache_sec`` are declared with a floating-point range
+descriptor, so rclcpp itself rejects the value and the gateway does not start:
+
+.. code-block:: text
+
+   [ros2_medkit_gateway] Fatal exception in main: parameter
+   'parameter_service_timeout_sec' could not be set: Parameter
+   {parameter_service_timeout_sec} doesn't comply with floating point range.
+
+In every case the point is the same. The config file and the running process must
+not disagree with nothing to show it, because the symptom of a mis-set value (a
+slow or jittery gateway, a limit that never fires) surfaces far from the cause.
+If the gateway behaves as though a parameter were different from what your YAML
+says, its startup log names the parameter.
+
+Note the logger name in the message. Most of these come from
+``ros2_medkit_gateway``, but the HTTP pool and keep-alive lines come from
+``rest_server``.
 
 Network Settings
 ----------------
@@ -165,10 +196,11 @@ Data Access Settings
      - Type
      - Default
      - Description
-   * - ``max_parallel_topic_samples``
+   * - ``data_provider.max_parallel_samples``
      - int
-     - ``20``
-     - Max concurrent topic samples. Higher values use more resources. Range: 1-50.
+     - ``8``
+     - Max concurrent topic samples. Higher values use more resources. Excess
+       topics are processed in follow-up chunks. Range: 1-256.
    * - ``topic_sample_timeout_sec``
      - float
      - ``2.0``
@@ -230,9 +262,69 @@ Data Access Settings
 .. note::
 
    The defaults listed above match the recommended gateway configuration in
-   ``src/ros2_medkit_gateway/config/gateway_params.yaml``. If these parameters are
-   not provided at all, the ``DataAccessManager`` fallback defaults are
-   ``max_parallel_topic_samples = 10`` and ``topic_sample_timeout_sec = 1.0``.
+   ``src/ros2_medkit_gateway/config/gateway_params.yaml``. If
+   ``topic_sample_timeout_sec`` is out of range, ``DataAccessManager`` and the
+   topic transport both fall back to ``1.0``.
+
+Subscription Pool and Executor
+------------------------------
+
+The topic data provider keeps a pool of live subscriptions, and all subscription
+create and destroy calls are funnelled through one serial worker. These knobs
+bound both. Every value is clamped to its range on read, with a warning (see
+`Out-of-range values`_).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 8 10 44
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``data_provider.max_pool_size``
+     - int
+     - ``256``
+     - Live per-topic subscriptions the pool keeps. At the cap, sampling a new
+       topic evicts the least recently used entry. Range: 1-4096.
+   * - ``data_provider.cold_wait_cap``
+     - int
+     - ``4``
+     - Concurrent HTTP workers allowed to block waiting for the first message on
+       a freshly subscribed topic. Further callers get 503 and back off instead
+       of saturating the request pool. Range: 0-1024.
+   * - ``data_provider.idle_safety_net_sec``
+     - int
+     - ``900``
+     - A pool entry unsampled for this long is evicted, releasing its
+       subscription. ``0`` disables idle eviction. Range: 0-86400.
+   * - ``data_provider.idle_sweep_tick_sec``
+     - int
+     - ``60``
+     - How often the idle sweep runs. ``0`` disables idle eviction.
+       Range: 0-3600.
+   * - ``subscription_executor.max_queue_depth``
+     - int
+     - ``256``
+     - Tasks queued on the serial worker before new posts are rejected with
+       backpressure. Bounds peak memory when handler threads create
+       subscriptions faster than the worker services them. Range: 16-4096.
+   * - ``subscription_executor.watchdog_threshold_ms``
+     - int
+     - ``5000``
+     - A worker task running longer than this marks the executor degraded
+       (``x-medkit-subscription-executor.degraded`` on ``/health``). The flag
+       clears when the task completes. Range: 100-60000.
+   * - ``subscription_executor.watchdog_tick_ms``
+     - int
+     - ``1000``
+     - How often the watchdog checks. Finer tick detects degradation sooner at
+       the cost of more wakeups. Range: 10-10000.
+   * - ``subscription_executor.graph_poll_tick_ms``
+     - int
+     - ``100``
+     - How often graph events are polled (publisher appear or disappear, type
+       changes). Range: 10-10000.
 
 Fault Manager Integration
 -------------------------

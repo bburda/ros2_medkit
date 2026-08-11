@@ -237,14 +237,15 @@ Possible causes:
 
 1. **Many topics** - Response time scales with topic count
 2. **Slow publishers** - 3-second timeout per topic by default
-3. **Low parallelism** - Increase ``max_parallel_topic_samples``
+3. **Low parallelism** - Increase ``data_provider.max_parallel_samples``
 
 Optimize with:
 
 .. code-block:: yaml
 
-   max_parallel_topic_samples: 20  # Increase from default 10
-   topic_sample_timeout_sec: 0.5   # Decrease from default 1.0
+   data_provider:
+     max_parallel_samples: 32      # Increase from default 8
+   topic_sample_timeout_sec: 0.5   # Decrease from default 2.0
 
 **High CPU usage**
 
