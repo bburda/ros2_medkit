@@ -5,6 +5,15 @@
 #   - Command line: --ros-args -p server.port:=9000
 #   - Launch files: parameters=[...]
 #   - This YAML file
+#
+# Ranges: where a parameter below documents a valid range, that range is
+# enforced when the value is read. An out-of-range value does not abort startup
+# and does not silently take effect either - it is coerced to the nearest
+# endpoint and the gateway logs a warning naming both the requested and the
+# effective value, e.g.
+#   [WARN] server.http_thread_pool_size 0 clamped to 1
+# So if the gateway behaves as though a parameter were different from what this
+# file says, its startup log will name the parameter.
 
 ros2_medkit_gateway:
   ros__parameters:
