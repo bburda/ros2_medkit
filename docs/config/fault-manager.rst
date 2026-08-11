@@ -299,8 +299,9 @@ Capture continuous rosbag recordings around fault events.
        it.
    * - ``rosbag.storage_path``
      - ``""``
-     - Directory the bag files are written to. Empty writes beside the snapshot
-       storage.
+     - Directory the bag files are written to. Empty falls back to the system
+       temporary directory, which on most systems is cleared on reboot - set
+       this if the bags have to survive one.
    * - ``rosbag.qos_match``
      - ``true``
      - Subscribe with each topic's publisher-offered QoS for faithful capture

@@ -25,8 +25,8 @@ range and the gateway logs both values. This applies to the thread and pool knob
 (``server.executor_threads``, ``server.http_thread_pool_size``,
 ``server.keep_alive_timeout_sec``, ``sse.max_clients``,
 ``service_call_timeout_sec``, ``logs.buffer_size``, ``entity_cache.capacity``,
-``aggregation.max_discovered_peers``, ``fault_triggers.poll_interval_ms``) and to
-the ``subscription_executor.*`` and ``data_provider.*`` knobs:
+``aggregation.max_discovered_peers``) and to the ``subscription_executor.*`` and
+``data_provider.*`` knobs:
 
 .. code-block:: text
 
@@ -689,7 +689,9 @@ plugin is loaded; with no plugins these parameters do nothing.
      - int
      - ``1000``
      - How often the rules are evaluated. Floored at ``50`` ms so the loop
-       cannot busy-spin; a lower value is clamped with a warning.
+       cannot busy-spin; a lower value is clamped with a warning. Read only when
+       the engine actually starts, so with no plugin loaded a mis-set value is
+       neither applied nor reported - it does nothing either way.
    * - ``fault_triggers.storage.path``
      - string
      - ``""``

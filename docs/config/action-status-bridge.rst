@@ -48,7 +48,8 @@ Parameters
    * - ``aborted_severity``
      - ``2`` (ERROR)
      - Severity reported when a goal aborts: 0 INFO, 1 WARN, 2 ERROR,
-       3 CRITICAL. Out of range is refused with a warning and ERROR is used.
+       3 CRITICAL. Out of range is refused with a warning naming the value, and
+       ERROR is used.
    * - ``canceled_is_fault``
      - ``false``
      - Report a fault when a goal is canceled. Off by default, because a cancel
@@ -81,8 +82,8 @@ Parameters
    * - ``dedup_capacity``
      - ``4096``
      - How many goal IDs are remembered to avoid reporting the same terminal
-       outcome twice. A non-positive value is refused with a warning and
-       ``4096`` is used.
+       outcome twice. A non-positive value, or one past what the counter can
+       hold, is refused with a warning naming the value, and ``4096`` is used.
 
 The bridge also declares ``fault_reporter.local_filtering.enabled`` (default
 ``false``) on its own node. See :doc:`fault-manager` for what the reporter-side

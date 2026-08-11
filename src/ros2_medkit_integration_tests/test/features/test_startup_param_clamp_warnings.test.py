@@ -47,9 +47,18 @@ then RUNS at the ceiling, and that is not free. Measured, not estimated: one
 gateway launched past all three ceilings serves ``/health`` correctly and warns
 for each parameter, at **1299 threads and 1486 MB RSS**. Paying that (on a
 runner already hosting the three other gateways, and again under a sanitizer)
-buys one log line per parameter from the same four-line compare-and-warn that
-the floor case already drives, that the in-range case pins the guard of, and
-that the other 15 parameters already drive in the ceiling direction.
+buys the same four-line compare-and-warn that the floor case already drives,
+that the in-range case pins the guard of, and that the other 15 parameters
+already drive in the ceiling direction.
+
+Be precise about what that costs, because it is more than a log line: for those
+three, and only those three, the CEILING CONSTANT ITSELF is unpinned. Widening
+``server.http_thread_pool_size`` from 1024 to 8, or ``server.executor_threads``
+from 256 to 4096, leaves every test in this file green while the config docs go
+on advertising the old range. The floor row still warns and the in-range value
+is still silent under either bound. The table comment below says a range that
+moves in code without moving here gets caught - that holds for the 15 rows with
+a ceiling value, not for these three.
 """
 
 import os
@@ -73,10 +82,10 @@ from ros2_medkit_test_utils.launch_helpers import create_gateway_node
 #
 #   (parameter, floor, ceiling, below_floor_value, above_ceiling_value)
 #
-# Ranges are the ones in docs/config: keep this table and the docs in step, a
-# range that moves in code without moving here is exactly the regression this
-# file is meant to catch. ``above_ceiling_value`` is None for the parameters in
-# the coverage limit described in the module docstring.
+# Ranges are the ones in docs/config: keep this table and the docs in step. A
+# range that moves in code without moving here is caught for every row that has
+# an ``above_ceiling_value``; for the three rows where it is None only the floor
+# is pinned, which the module docstring spells out.
 CLAMPED_PARAMS = [
     # server.* - main.cpp and http/rest_server.cpp
     ('server.executor_threads', 1, 256, 0, None),
@@ -180,12 +189,19 @@ def expected_warning(parameter, requested, effective):
 # the time /health answers. The timeout only covers a slow runner's startup.
 WARNING_TIMEOUT = 20
 
-# Logged by GatewayNode::set_topic_data_provider, which main.cpp calls after the
-# last clamped parameter has been read (node constructor -> RESTServer -> the
-# executor and data-provider configs). The two tests that SCAN the output buffer
-# rather than wait for one line need this: without it they would read a buffer
-# that is still filling and pass on an empty one.
-STARTUP_COMPLETE = 'TopicDataProvider attached'
+# Logged by GatewayNode::init_fault_trigger_engine, the LAST thing main.cpp does
+# before it starts spinning, and after every clamped parameter has been read
+# (node constructor -> RESTServer -> executor and data-provider configs ->
+# fault-trigger engine). Every check here scans the output buffer, so the anchor
+# has to sit after the last assertion target or a scan can read a buffer that is
+# still filling and pass on what is missing from it.
+#
+# 'TopicDataProvider attached' is NOT good enough and was the first choice:
+# main.cpp emits it at line 212 but reads fault_triggers.poll_interval_ms at
+# line 228, with a synchronous subscription creation in between. Every gateway
+# in this file loads a plugin, so the engine always starts and the line always
+# comes.
+STARTUP_COMPLETE = 'fault-trigger engine active'
 
 
 def generate_test_description():
