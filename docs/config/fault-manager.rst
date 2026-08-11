@@ -144,8 +144,9 @@ threshold overrides:
    thresholds resolved from that event's ``source_id``. This means the debounce
    behavior follows the reporting entity, not the fault.
 
-   ``auto_confirm_after_sec`` and ``critical_immediate_confirm`` are global-only and
-   cannot be overridden per-entity.
+   ``auto_confirm_after_sec`` is global-only and cannot be overridden per-entity.
+   Critical faults skip debounce and confirm on their first occurrence; that is
+   built in, not a parameter, so it can be neither disabled nor set per entity.
 
 Snapshot Configuration
 ----------------------
@@ -285,6 +286,21 @@ Capture continuous rosbag recordings around fault events.
      - In broad modes (``all``/``entity``), auto-exclude high-bandwidth sensor
        topics (image/points/depth/compressed) to bound memory. Excluded topics are
        dropped silently; ``include_topics`` re-adds any you need.
+   * - ``rosbag.include_topics``
+     - ``[]``
+     - Topics to record on top of whatever the selection mode picked. This is
+       how a topic dropped by ``exclude_sensor_topics`` is brought back.
+   * - ``rosbag.exclude_topics``
+     - ``[]``
+     - Topics to drop from whatever the selection mode picked.
+   * - ``rosbag.format``
+     - ``sqlite3``
+     - Storage format handed to rosbag2. Use ``mcap`` where the reader expects
+       it.
+   * - ``rosbag.storage_path``
+     - ``""``
+     - Directory the bag files are written to. Empty writes beside the snapshot
+       storage.
    * - ``rosbag.qos_match``
      - ``true``
      - Subscribe with each topic's publisher-offered QoS for faithful capture
@@ -389,6 +405,57 @@ arrival prunes the whole buffer by age.
 .. seealso::
 
    :doc:`/tutorials/snapshots` for detailed snapshot configuration examples.
+
+Audit Log
+---------
+
+An append-only, hash-chained record of fault state transitions, for deployments
+that have to show afterwards what the fault state was and when it changed. Off
+by default: with it off there is no table, no file and no write cost.
+
+.. code-block:: yaml
+
+   fault_manager:
+     ros__parameters:
+       audit_log:
+         enabled: false
+         transitions: "all"
+         retention_max_records: 0
+         fail_closed: false
+         database_path: ""
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 14 52
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``audit_log.enabled``
+     - ``false``
+     - Turn the audit log on.
+   * - ``audit_log.transitions``
+     - ``"all"``
+     - Which transitions are recorded: ``all`` (occurred, confirmed, cleared) or
+       ``confirmed_only``. Any other value falls back to ``all`` with a warning.
+   * - ``audit_log.retention_max_records``
+     - ``0``
+     - Seal and prune the oldest segment once the log passes this many records.
+       ``0`` disables rotation, and a negative value is refused with a warning
+       and treated as ``0``.
+   * - ``audit_log.fail_closed``
+     - ``false``
+     - Re-raise a failed audit append as a hard error instead of carrying on.
+       Note what this does and does not do: it does NOT roll back the fault
+       state change that triggered the transition, because that change has
+       already committed to the separate fault-store database and the two
+       databases cannot be made atomic. It signals a broken audit chain so an
+       operator has to act. Off by default so the audit can never block fault
+       processing.
+   * - ``audit_log.database_path``
+     - ``""``
+     - Where the audit database lives. Empty puts it beside the fault database,
+       or in memory when the fault store is itself in memory or not SQLite.
 
 Correlation Configuration
 -------------------------

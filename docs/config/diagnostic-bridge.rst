@@ -48,6 +48,7 @@ Parameters
      ros__parameters:
        diagnostics_topic: "/diagnostics"   # Topic to subscribe to
        auto_generate_codes: true           # Auto-generate fault codes from names
+       keyvalue_codes: ["fault_code"]      # Take the code from these key-value keys
 
 .. list-table::
    :header-rows: 1
@@ -63,6 +64,13 @@ Parameters
      - ``true``
      - Automatically generate fault codes from diagnostic names when no explicit
        mapping exists.
+   * - ``keyvalue_codes``
+     - ``[]``
+     - Keys to look for inside the ``DiagnosticStatus`` key-value pairs. The
+       first key in this list that the message carries supplies the fault code
+       as its value, so a publisher can name its own code instead of relying on
+       a mapping. Checked after ``name_to_code`` and before auto-generation.
+       Empty strings in the list are ignored.
 
 Custom Fault Code Mappings
 --------------------------
