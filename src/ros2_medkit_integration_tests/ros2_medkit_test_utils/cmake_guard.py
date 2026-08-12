@@ -16,7 +16,7 @@
 Real-`cmake`-configure checks for `medkit_add_launch_test`'s system-package guard.
 
 Shared by every package that proves, for itself, that a system-package
-configure (`CMAKE_INSTALL_PREFIX=/opt/ros/$ROS_DISTRO`,
+configure (`CMAKE_INSTALL_PREFIX=/opt/ros/<distro>`,
 `CMAKE_INSTALL_LOCALSTATEDIR=/var` - what bloom's `debian/rules` passes)
 suppresses exactly its own launch tests without failing the configure. A
 regex sweep over `CMakeLists.txt` text was tried first and evaded three

@@ -165,11 +165,21 @@ endmacro()
 # place our packages are exercised against a minimal dependency closure, and it
 # is where the missing rosbag2 sqlite3 storage plugin was found.
 #
-# Fires only in a system package build. Two independent signals, because either
-# one alone has a false positive that costs a developer their launch tests:
+# Fires only in a system package build. Two independent signals, both read
+# from CMake variables rather than the environment - an earlier version of
+# this guard also required ENV{ROS_DISTRO} to be defined, and that guard
+# never fired in the one job it exists for: the ROS build farm's binarydeb
+# chroot has no ROS_DISTRO in its environment at all. That export lives only
+# in the ros_environment package (no package.xml in this repository declares
+# it, and it is not part of the farm's chroot install) or in a ros:<distro>
+# Docker image's own ENV, neither of which the build farm's chroot carries.
+# Either signal alone also has a false positive that costs a developer their
+# launch tests:
 #
-#   * the install prefix is the ROS distribution root, which is what bloom's
-#     debian/rules passes (-DCMAKE_INSTALL_PREFIX=/opt/ros/humble), and
+#   * the install prefix matches /opt/ros/<anything> - not a specific distro
+#     name, since nothing in a bare CMake configure names the right one on
+#     its own - which is what bloom's debian/rules passes
+#     (-DCMAKE_INSTALL_PREFIX=/opt/ros/humble), and
 #   * CMAKE_INSTALL_LOCALSTATEDIR is the absolute path "/var", which debhelper's
 #     cmake buildsystem always passes (-DCMAKE_INSTALL_LOCALSTATEDIR=/var) and
 #     colcon never does.
@@ -182,19 +192,28 @@ endmacro()
 # today, so this is hardening against a real GNUInstallDirs default rather
 # than a fix for an observed failure.
 #
-# The prefix alone would also catch `colcon build --install-base /opt/ros/jazzy`,
-# whose test step runs after its install step and whose launch tests work fine.
-# If this ever stops matching the build farm the guard simply does not fire and we
-# are back to a noisy log, which is the safe direction to be wrong in.
+# The prefix alone would also catch `colcon build --install-base /opt/ros/jazzy`
+# (or any other distro name), whose test step runs after its install step and
+# whose launch tests work fine - colcon never passes
+# CMAKE_INSTALL_LOCALSTATEDIR, so the function returns TRUE before the prefix
+# is even inspected. If this ever stops matching the build farm the guard
+# simply does not fire and we are back to a noisy log, which is the safe
+# direction to be wrong in.
 function(_medkit_launch_tests_can_register _output_var)
   set(${_output_var} TRUE PARENT_SCOPE)
-  if(NOT DEFINED ENV{ROS_DISTRO} OR NOT DEFINED CMAKE_INSTALL_LOCALSTATEDIR)
+  if(NOT DEFINED CMAKE_INSTALL_LOCALSTATEDIR)
     return()
   endif()
-  # Exact comparison, so normalise a trailing slash first on both sides.
-  string(REGEX REPLACE "/+$" "" _malt_prefix "${CMAKE_INSTALL_PREFIX}")
+  # CMAKE_INSTALL_PREFIX needs no normalisation of its own: CMake strips a
+  # trailing slash from it before project code ever sees it - confirmed on
+  # CMake 3.22, 3.28 and 4.4 - so a trailing slash cannot change the outcome
+  # of the MATCHES below however the caller spells the prefix.
+  # CMAKE_INSTALL_LOCALSTATEDIR is an ordinary cache variable nothing else
+  # normalises, so its trailing slash is still stripped explicitly before the
+  # exact comparison.
+  set(_malt_prefix "${CMAKE_INSTALL_PREFIX}")
   string(REGEX REPLACE "/+$" "" _malt_localstatedir "${CMAKE_INSTALL_LOCALSTATEDIR}")
-  if(_malt_prefix STREQUAL "/opt/ros/$ENV{ROS_DISTRO}" AND _malt_localstatedir STREQUAL "/var")
+  if(_malt_prefix MATCHES "^/opt/ros/[^/]+$" AND _malt_localstatedir STREQUAL "/var")
     set(${_output_var} FALSE PARENT_SCOPE)
   endif()
 endfunction()

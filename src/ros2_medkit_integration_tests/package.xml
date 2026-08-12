@@ -50,9 +50,8 @@
        already declared above; these four were resolving only by luck,
        through ros2_medkit_gateway's own exec_depend chain.
 
-       ros2_medkit_graph_watchdog is the seventh package that test file
-       configures and is deliberately NOT declared here: it already
-       test_depends on this package (its e2e harness imports
+       ros2_medkit_graph_watchdog is deliberately NOT declared here: it
+       already test_depends on this package (its e2e harness imports
        ros2_medkit_test_utils, installed as part of this package), and
        colcon graph, scoped to just these two packages, confirms adding the
        reverse edge makes the pair topologically unorderable - not a
@@ -61,8 +60,12 @@
        (ros2_medkit_gateway, rcl_interfaces, lifecycle_msgs, tf2_msgs,
        geometry_msgs, nlohmann_json) are already satisfied through
        ros2_medkit_gateway above and the base ROS install, which is why its
-       configure resolves anyway; test_launch_test_guard_system_build.py's
-       own resolvability probe reports it by name rather than assuming so. -->
+       configure resolves anyway - not that this file's own
+       test_launch_test_guard_system_build.py exercises it: that file covers
+       only the six packages listed above, and ros2_medkit_graph_watchdog
+       proves the same property about itself in its own copy of that test
+       instead, at
+       src/ros2_medkit_plugins/ros2_medkit_graph_watchdog/test/test_launch_test_guard_system_build.py. -->
   <test_depend>ros2_medkit_action_status_bridge</test_depend>
   <test_depend>ros2_medkit_diagnostic_bridge</test_depend>
   <test_depend>ros2_medkit_fault_reporter</test_depend>
