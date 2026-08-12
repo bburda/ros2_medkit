@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cinttypes>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -85,11 +86,26 @@ void LogBridgeNode::load_parameters() {
   exclude_nodes_ = declare_parameter<std::vector<std::string>>("exclude_nodes", std::vector<std::string>{});
   include_only_nodes_ = declare_parameter<std::vector<std::string>>("include_only_nodes", std::vector<std::string>{});
   const int64_t max_tracked_nodes = declare_parameter<int64_t>("max_tracked_nodes", INT64_C(512));
-  max_tracked_nodes_ = static_cast<int>(
-      std::clamp(max_tracked_nodes, INT64_C(1), static_cast<int64_t>(std::numeric_limits<int>::max())));
-  report_cooldown_sec_ = declare_parameter<double>("report_cooldown_sec", 5.0);
-  if (report_cooldown_sec_ < 0.0) {
-    report_cooldown_sec_ = 0.0;
+  const int64_t max_tracked_nodes_used =
+      std::clamp(max_tracked_nodes, INT64_C(1), static_cast<int64_t>(std::numeric_limits<int>::max()));
+  if (max_tracked_nodes_used != max_tracked_nodes) {
+    RCLCPP_WARN(get_logger(), "max_tracked_nodes %" PRId64 " clamped to %" PRId64, max_tracked_nodes,
+                max_tracked_nodes_used);
+  }
+  max_tracked_nodes_ = static_cast<int>(max_tracked_nodes_used);
+
+  // isfinite plus a positive range test. Do NOT rewrite this as "negative ->
+  // 0.0": every comparison against NaN is false, so that form lets NaN past
+  // here AND past the "<= 0.0 disables the cooldown" check below it, into
+  // Duration::from_seconds, where converting NaN to nanoseconds is undefined
+  // and the resulting window silences either everything or nothing.
+  const double report_cooldown_raw = declare_parameter<double>("report_cooldown_sec", 5.0);
+  if (std::isfinite(report_cooldown_raw) && report_cooldown_raw >= 0.0) {
+    report_cooldown_sec_ = report_cooldown_raw;
+  } else {
+    RCLCPP_WARN(get_logger(), "report_cooldown_sec %.2f must be finite and >= 0. Using default 5.0.",
+                report_cooldown_raw);
+    report_cooldown_sec_ = 5.0;
   }
   exclude_medkit_stack_ = declare_parameter<bool>("exclude_medkit_stack", true);
 }
