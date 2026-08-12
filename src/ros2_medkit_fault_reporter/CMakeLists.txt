@@ -103,8 +103,8 @@ if(BUILD_TESTING)
   # launch_testing_ament_cmake reaches the deprecated FindPythonLibs, which
   # cannot find libpython without a language enabled. This package compiles and
   # already runs a launch test on every distro.
-  medkit_add_launch_test(test_domain_launch test/test_domain_launch.test.py TIMEOUT 300)
-  set_tests_properties(test_domain_launch PROPERTIES LABELS "integration")
+  medkit_add_launch_test(test_domain_launch test/test_domain_launch.test.py TIMEOUT 300
+    LABELS "integration")
 
   ros2_medkit_relax_vendor_warnings()
 endif()

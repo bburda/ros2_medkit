@@ -113,11 +113,10 @@ if(BUILD_TESTING)
   # so the launch test ran in the unit phase together with all other unit tests
   # in one colcon invocation. Under that load the node could miss the launch
   # SIGINT shutdown window and get killed with SIGTERM, failing the
-  # post-shutdown exit-code check. Override the label to "integration" via
-  # set_tests_properties (the repo convention) so it runs only in the
-  # integration phase.
-  medkit_add_launch_test(test_integration test/test_integration.test.py TIMEOUT 60)
-  set_tests_properties(test_integration PROPERTIES LABELS "integration")
+  # post-shutdown exit-code check. LABELS overrides it to "integration" (the
+  # repo convention) so it runs only in the integration phase.
+  medkit_add_launch_test(test_integration test/test_integration.test.py TIMEOUT 60
+    LABELS "integration")
   ros2_medkit_relax_vendor_warnings()
 endif()
 

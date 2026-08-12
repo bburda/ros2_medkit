@@ -42,6 +42,32 @@
   <test_depend>ros2_medkit_graph_provider</test_depend>
   <test_depend>greenwave_monitor</test_depend>
 
+  <!-- Configured for real, not linked against, by
+       test/test_launch_test_guard_system_build.py, which is what actually
+       needs these declared: a package used at test time must be a
+       test_depend even when nothing here #includes or find_package()s it at
+       build time. ros2_medkit_gateway and ros2_medkit_fault_manager are
+       already declared above; these four were resolving only by luck,
+       through ros2_medkit_gateway's own exec_depend chain.
+
+       ros2_medkit_graph_watchdog is the seventh package that test file
+       configures and is deliberately NOT declared here: it already
+       test_depends on this package (its e2e harness imports
+       ros2_medkit_test_utils, installed as part of this package), and
+       colcon graph, scoped to just these two packages, confirms adding the
+       reverse edge makes the pair topologically unorderable - not a
+       theoretical concern, colcon build refuses to proceed. Its own
+       find_package() dependencies
+       (ros2_medkit_gateway, rcl_interfaces, lifecycle_msgs, tf2_msgs,
+       geometry_msgs, nlohmann_json) are already satisfied through
+       ros2_medkit_gateway above and the base ROS install, which is why its
+       configure resolves anyway; test_launch_test_guard_system_build.py's
+       own resolvability probe reports it by name rather than assuming so. -->
+  <test_depend>ros2_medkit_action_status_bridge</test_depend>
+  <test_depend>ros2_medkit_diagnostic_bridge</test_depend>
+  <test_depend>ros2_medkit_fault_reporter</test_depend>
+  <test_depend>ros2_medkit_log_bridge</test_depend>
+
   <export>
     <build_type>ament_cmake</build_type>
   </export>

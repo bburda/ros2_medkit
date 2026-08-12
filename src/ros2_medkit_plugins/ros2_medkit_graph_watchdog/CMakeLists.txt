@@ -269,18 +269,14 @@ if(BUILD_TESTING)
   set(_WATCHDOG_E2E_ENV "GRAPH_WATCHDOG_PLUGIN_PATH=${_WATCHDOG_E2E_SO}")
 
   medkit_add_launch_test(test_e2e_test_qos_e2e.test.py test/e2e/test_qos_e2e.test.py
-    TIMEOUT 180)
-  set_tests_properties(test_e2e_test_qos_e2e.test.py PROPERTIES LABELS "integration;e2e")
-  # APPEND: medkit_add_launch_test put this test's domain count in ENVIRONMENT and a plain
-  # PROPERTIES assignment would drop it, leaving the test on the default domain.
-  set_property(TEST test_e2e_test_qos_e2e.test.py APPEND PROPERTY
-    ENVIRONMENT "GATEWAY_TEST_PORT=19120;${_WATCHDOG_E2E_ENV}")
+    TIMEOUT 180
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19120" "${_WATCHDOG_E2E_ENV}")
 
   medkit_add_launch_test(test_e2e_test_orphan_e2e.test.py test/e2e/test_orphan_e2e.test.py
-    TIMEOUT 180)
-  set_tests_properties(test_e2e_test_orphan_e2e.test.py PROPERTIES LABELS "integration;e2e")
-  set_property(TEST test_e2e_test_orphan_e2e.test.py APPEND PROPERTY
-    ENVIRONMENT "GATEWAY_TEST_PORT=19130;${_WATCHDOG_E2E_ENV}")
+    TIMEOUT 180
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19130" "${_WATCHDOG_E2E_ENV}")
 
   # param_drift e2e: the detector's DEFAULT mode. The config-plumbing scenarios below all set
   # baseline: false and none of them asserts a clear, so without this the self-capturing behaviour
@@ -291,10 +287,9 @@ if(BUILD_TESTING)
   # before any of the messages those deadlines exist to print reaches the log, which turns every
   # one of them into "timed out".
   medkit_add_launch_test(test_e2e_test_param_drift_e2e.test.py
-    test/e2e/test_param_drift_e2e.test.py TIMEOUT 300)
-  set_tests_properties(test_e2e_test_param_drift_e2e.test.py PROPERTIES LABELS "integration;e2e")
-  set_property(TEST test_e2e_test_param_drift_e2e.test.py APPEND PROPERTY
-    ENVIRONMENT "GATEWAY_TEST_PORT=19170;${_WATCHDOG_E2E_ENV}")
+    test/e2e/test_param_drift_e2e.test.py TIMEOUT 300
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19170" "${_WATCHDOG_E2E_ENV}")
 
   # Round-trip cost e2e: what ONE parameter read really costs the node that serves it, counted
   # at a node that answers the parameter services by hand. param_drift's read budget is charged
@@ -309,11 +304,9 @@ if(BUILD_TESTING)
   # than the internal budgets kills the process before any of those diagnostics print, so the
   # failure reads as "test timed out" and says nothing about round trips.
   medkit_add_launch_test(test_e2e_test_param_roundtrip_e2e.test.py
-    test/e2e/test_param_roundtrip_e2e.test.py TIMEOUT 300)
-  set_tests_properties(test_e2e_test_param_roundtrip_e2e.test.py PROPERTIES
-    LABELS "integration;e2e")
-  set_property(TEST test_e2e_test_param_roundtrip_e2e.test.py APPEND PROPERTY
-    ENVIRONMENT "GATEWAY_TEST_PORT=19180;${_WATCHDOG_E2E_ENV}")
+    test/e2e/test_param_roundtrip_e2e.test.py TIMEOUT 300
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19180" "${_WATCHDOG_E2E_ENV}")
 
   # === Config-plumbing e2e (launch_testing) ===
   #
@@ -327,27 +320,36 @@ if(BUILD_TESTING)
   # gateway launches rather than separate test methods in one. WATCHDOG_E2E_SCENARIO selects
   # which launch and which assertions run in each process.
   medkit_add_launch_test(test_config_plumbing_e2e_positive
-    test/e2e/test_config_plumbing_e2e.test.py TIMEOUT 180)
-  set_tests_properties(test_config_plumbing_e2e_positive PROPERTIES LABELS "integration;e2e")
-  set_property(TEST test_config_plumbing_e2e_positive APPEND PROPERTY
-    ENVIRONMENT "GATEWAY_TEST_PORT=19140;WATCHDOG_E2E_SCENARIO=positive;${_WATCHDOG_E2E_ENV}")
+    test/e2e/test_config_plumbing_e2e.test.py TIMEOUT 180
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19140" "WATCHDOG_E2E_SCENARIO=positive" "${_WATCHDOG_E2E_ENV}")
 
   medkit_add_launch_test(test_config_plumbing_e2e_mode_off
-    test/e2e/test_config_plumbing_e2e.test.py TIMEOUT 180)
-  set_tests_properties(test_config_plumbing_e2e_mode_off PROPERTIES LABELS "integration;e2e")
-  set_property(TEST test_config_plumbing_e2e_mode_off APPEND PROPERTY
-    ENVIRONMENT "GATEWAY_TEST_PORT=19150;WATCHDOG_E2E_SCENARIO=mode_off;${_WATCHDOG_E2E_ENV}")
+    test/e2e/test_config_plumbing_e2e.test.py TIMEOUT 180
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19150" "WATCHDOG_E2E_SCENARIO=mode_off" "${_WATCHDOG_E2E_ENV}")
 
   # Third launch: `mode: off` written BARE, which the ROS parser types as a YAML 1.1 boolean
   # rather than a string. That is the form operators write, and a string-only reader silently
   # keeps the detector raising.
   medkit_add_launch_test(test_config_plumbing_e2e_mode_off_yaml_bool
-    test/e2e/test_config_plumbing_e2e.test.py TIMEOUT 180)
-  set_tests_properties(test_config_plumbing_e2e_mode_off_yaml_bool PROPERTIES
-    LABELS "integration;e2e")
-  set_property(TEST test_config_plumbing_e2e_mode_off_yaml_bool APPEND PROPERTY
-    ENVIRONMENT
-      "GATEWAY_TEST_PORT=19160;WATCHDOG_E2E_SCENARIO=mode_off_yaml_bool;${_WATCHDOG_E2E_ENV}")
+    test/e2e/test_config_plumbing_e2e.test.py TIMEOUT 180
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19160" "WATCHDOG_E2E_SCENARIO=mode_off_yaml_bool" "${_WATCHDOG_E2E_ENV}")
+
+  # Real-cmake-configure proof of the launch-test guard for this package -
+  # this package's own half of the pair described in
+  # ros2_medkit_integration_tests/test/test_launch_test_guard_system_build.py's
+  # module docstring. Registers unconditionally: it configures only this
+  # package's own source directory, present in every build context including
+  # the ROS build farm's binarydeb chroot, unlike the sibling test's need for
+  # a repository root above it. ROS-free: it spawns its own cmake
+  # subprocesses rather than creating ROS entities.
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_launch_test_guard_system_build
+    test/test_launch_test_guard_system_build.py TIMEOUT 180)
+  set_tests_properties(test_launch_test_guard_system_build PROPERTIES LABELS "integration")
+  medkit_test_needs_no_domain(test_launch_test_guard_system_build)
 
   ros2_medkit_relax_vendor_warnings()
 

@@ -12,7 +12,7 @@ build acceleration, and centralized linting configuration across all packages.
 | `ROS2MedkitCoverage.cmake` | gcov/lcov instrumentation behind `-DENABLE_COVERAGE=ON` |
 | `ROS2MedkitLinting.cmake` | Shared lint configs via `medkit_lint_config()`, plus the opt-in clang-tidy gate (CI runs `run-clang-tidy` instead) |
 | `ROS2MedkitSanitizers.cmake` | ASan / TSan / UBSan behind `-DSANITIZER=asan,ubsan` |
-| `ROS2MedkitTestDomain.cmake` | Per-package `ROS_DOMAIN_ID` allocation for test isolation |
+| `ROS2MedkitTestDomain.cmake` | Per-test `ROS_DOMAIN_ID` allocation for test isolation - an OS-level socket lock taken at test start and released when the process ends, not a per-package table |
 | `ROS2MedkitWarnings.cmake` | Shared warning flags and vendored-code relaxations |
 
 ### ROS2MedkitCompat
@@ -196,6 +196,103 @@ For a test that builds its own command line and so cannot take an ament test run
 `medkit_add_wrapped_test(<name> [DOMAINS <n>] COMMAND <cmd...>)`, which puts
 `medkit_run_with_domain.py` in front of the command instead.
 
+#### A launch test's properties belong to the call that registers it
+
+`medkit_add_launch_test(<name> <file> [TIMEOUT n] [DOMAINS n] [LABELS "a;b"] [ENV "K=V" ...]
+[ARGS "foo:=bar" ...])` is the only supported way to give a launch test a label or an
+environment variable:
+
+```cmake
+medkit_add_launch_test(test_multi test/test_multi.test.py TIMEOUT 300 DOMAINS 4
+  LABELS "integration" ENV "FOO=bar" "BAZ=qux" ARGS "foo:=bar")
+```
+
+Setting them afterwards - `set_tests_properties(test_multi PROPERTIES LABELS
+...)` or `set_property(TEST test_multi APPEND PROPERTY ENVIRONMENT ...)` - is
+not supported, and not merely discouraged: see the next section for why the
+build can register no launch test at all, and a property call that names a
+test CMake never registered is a hard configure error, not a no-op. `ENV` is
+applied after the domain the macro already set for the test, by appending, so
+a caller's own environment can never overwrite `MEDKIT_TEST_DOMAINS` - an
+`ENV` entry that sets the literal key `MEDKIT_TEST_DOMAINS=` fails the
+configure with `FATAL_ERROR` naming `DOMAINS` as the way to set it, rather
+than silently landing behind the macro's own entry and winning at run time
+the way a plain `set_tests_properties(... PROPERTIES ENVIRONMENT ...)` used
+to. This is a literal string match, not a generator-expression evaluation:
+it does not chase down a value spelled to avoid the literal key (e.g.
+`ENV "$<1:MEDKIT_TEST_DOMAINS=99>"`), which nobody writes by accident and
+which a blanket rejection of `$<` would also catch legitimate uses of.
+`LABELS` overrides `add_launch_test()`'s own default of `"launch_test"`, the same
+override callers used to apply by hand. `ARGS` forwards extra launch
+arguments straight to `add_launch_test()`, same as it always did - it has its
+own keyword rather than falling through as an unrecognised argument, because
+`LABELS` being multi-value (to survive `ENV`'s/`LABELS`'s own semicolon-split
+values, see the `.cmake` comment) would otherwise absorb an `ARGS` that had
+no keyword of its own instead of erroring on it.
+
+This does not reach `medkit_add_gtest`, `medkit_add_gmock`,
+`medkit_add_pytest_test` or `medkit_add_wrapped_test`: those are always
+registered, so `MEDKIT_TEST_DOMAINS` is appended to their `ENVIRONMENT` and a
+caller adding entries of its own still uses
+`set_property(TEST ... APPEND PROPERTY ENVIRONMENT ...)` afterwards, same as
+before. A plain `set_tests_properties(... PROPERTIES ENVIRONMENT ...)` drops
+the domain there too, and the check below says so.
+
+#### Launch tests are not registered in a system package build
+
+`medkit_add_launch_test()` registers nothing when two conditions both hold -
+the install prefix is the ROS distribution root, AND
+`CMAKE_INSTALL_LOCALSTATEDIR` is the absolute path `/var` - and prints why
+once per directory instead:
+
+```
+ros2_medkit: launch tests are not registered in this build. Installing into
+/opt/ros/humble is a system package build, whose test step runs before the
+install step, so a launch test cannot resolve this package through the ament
+index. gtests and pytest tests still run.
+```
+
+A launch test resolves the executables and the Python helper package of the
+package under test through the ament index, which only an installed prefix
+carries. Installing straight into the ROS distribution root is what a system
+package build does - the ROS build farm's binarydeb job - and that job runs
+its test step *before* the install step, so the package it is testing is not
+yet on `AMENT_PREFIX_PATH`. Every launch test then fails on resolution rather
+than on anything the test set out to check. Humble is the only distro whose
+binarydeb job still runs package tests at all; every distro from Iron onward
+disabled that step (`ros2/ros_buildfarm_config` PR 298). Because bloom runs it
+as `dh_auto_test || true`, the failures cannot stop the build, so what used to
+reach the build farm's log was every launch test failing for a reason that
+said nothing about the package.
+
+The install prefix alone is not a safe signal: `colcon build --install-base
+/opt/ros/<distro>` also installs straight into the distribution root, but its
+test step runs *after* its own install step, so its launch tests work fine.
+`CMAKE_INSTALL_LOCALSTATEDIR` is the second signal that tells the two apart -
+debhelper's `cmake` buildsystem always passes it
+(`-DCMAKE_INSTALL_LOCALSTATEDIR=/var`), and no `colcon build` ever does. The
+check is on the *value*, not merely `DEFINED`: a package that
+`include(GNUInstallDirs)`s defines `CMAKE_INSTALL_LOCALSTATEDIR` itself, to
+the relative `var` (no leading slash), which is a different value from what
+debhelper passes - `DEFINED` alone cannot tell those apart, so the guard
+requires the absolute `/var`. No in-tree package includes `GNUInstallDirs`
+today, so this is hardening against a real default rather than a fix for an
+observed failure. Both comparisons (the prefix and `CMAKE_INSTALL_LOCALSTATEDIR`)
+are exact (`STREQUAL`), so a trailing slash is stripped from each before
+comparing rather than trusted to match bloom's spelling.
+
+The "once per directory" of the printed message is a macro-scoped CMake
+variable, not a `CACHE` entry: a package that calls `medkit_add_launch_test`
+many times in one `CMakeLists.txt` sees the explanation once, and a different
+`CMakeLists.txt` in the same build - a different package, or a second
+`add_subdirectory()` - prints its own.
+
+gtests and pytest tests are untouched on purpose. That chroot is the only
+place our packages are exercised against a minimal dependency closure, and it
+is where the missing rosbag2 sqlite3 storage plugin was found - taking that
+coverage away along with the launch tests would trade one blind spot for
+another.
+
 Only domains **1-100 and 215-231** are drawn from. RTPS gives a domain the UDP slice
 `[7400 + 250 * d, 7400 + 250 * d + 249]`, and the kernel hands out ephemeral ports from
 `net.ipv4.ip_local_port_range` (32768-60999 by default), which covers domains 101-214. If an
@@ -237,7 +334,13 @@ part of what the other needs is a deadlock that only ends when both wait budgets
 `MEDKIT_TEST_DOMAINS` is appended to the test's `ENVIRONMENT`, so a caller adding its own
 entries must use `set_property(TEST ... APPEND PROPERTY ENVIRONMENT ...)`. A plain
 `set_tests_properties(... PROPERTIES ENVIRONMENT ...)` afterwards drops it, and the check
-below says so.
+below says so. This is the general rule for `medkit_add_gtest`, `medkit_add_gmock`,
+`medkit_add_pytest_test` and `medkit_add_wrapped_test` - all four are always registered, so a
+call naming the test afterwards is safe, just easy to get wrong in the APPEND direction.
+**A launch test is the one exception**: it is not always registered (see "Launch tests are not
+registered in a system package build" above), so a `set_tests_properties` or `set_property`
+call naming it afterwards is not a subtler bug to get right, it is unsupported - use
+`medkit_add_launch_test`'s own `LABELS` and `ENV` parameters instead.
 
 The failure this scheme has to guard against is silent: a test registered with plain
 `ament_add_gtest` or `add_launch_test` does not fail, it runs on domain 0 and sees every node
