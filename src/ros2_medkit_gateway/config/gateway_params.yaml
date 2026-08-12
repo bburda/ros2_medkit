@@ -11,13 +11,14 @@
 # in silence. What happens next differs by parameter:
 #   - most are coerced to the nearest endpoint, and the gateway logs both
 #     values:   [WARN] [rest_server]: server.http_thread_pool_size 0 clamped to 1
-#   - server.port, refresh_interval_ms, discovery.refresh_debounce_ms,
-#     topic_sample_timeout_sec, bulk_data.max_upload_size, sse.max_subscriptions
-#     and sse.max_duration_sec are refused and the documented default is used
-#     instead; the warning names the value that was refused
-#   - parameter_service_timeout_sec and parameter_service_negative_cache_sec are
-#     declared with a floating-point range descriptor, so rclcpp rejects the
-#     value and the gateway does not start at all
+#   - some are refused instead, because clamping them makes no sense (half a
+#     port number is not a port); the documented default is used and the
+#     warning names the value that was refused
+#   - a couple are declared with a floating-point range descriptor, so rclcpp
+#     itself rejects the value and the gateway does not start at all
+# Which parameter falls in which group is listed once, in the "Out-of-range
+# values" section of docs/config/server.rst. It is deliberately not repeated
+# here: the same list in two files is the kind that quietly drifts apart.
 # So if the gateway behaves as though a parameter were different from what this
 # file says, its startup log will name the parameter.
 

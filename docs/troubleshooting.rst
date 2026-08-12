@@ -236,7 +236,8 @@ Performance Issues
 Possible causes:
 
 1. **Many topics** - Response time scales with topic count
-2. **Slow publishers** - 3-second timeout per topic by default
+2. **Slow publishers** - the per-topic timeout applies (declared default 1.0 s,
+   2.0 s with the shipped ``gateway_params.yaml``)
 3. **Low parallelism** - Increase ``data_provider.max_parallel_samples``
 
 Optimize with:
