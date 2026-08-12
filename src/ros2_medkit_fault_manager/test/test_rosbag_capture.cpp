@@ -119,9 +119,27 @@ TEST_F(RosbagCaptureTest, ConstructorWithDisabledRosbag) {
 }
 
 // @verifies REQ_INTEROP_088
+TEST_F(RosbagCaptureTest, DefaultFormatIsMcap) {
+  // mcap is what Foxglove and Lichtblick open without conversion, and what
+  // rosbag2 itself defaults to since Iron. A silent drift back to sqlite3 would
+  // hand operators a black box their viewer cannot read.
+  RosbagConfig defaults;
+  EXPECT_EQ(defaults.format, "mcap");
+}
+
+// @verifies REQ_INTEROP_088
 TEST_F(RosbagCaptureTest, ConstructorFallsBackOnUnknownFormat) {
-  // An unknown/unavailable format must NOT terminate the node; it degrades to
-  // sqlite3 (always shipped with rosbag2) and capture stays enabled.
+  // An unknown format string must NOT terminate the node. It normalises to
+  // "sqlite3" first, then goes through the same real probe as an explicit
+  // sqlite3 configuration would, so this test uses the real probe on
+  // purpose - unlike the crash-safety tests below, which inject a double.
+  // That means the resolved format is not fixed: on a host with only mcap
+  // installed and not sqlite3 (the buildfarm chroot before
+  // rosbag2_storage_default_plugins lands as a real dependency), resolution
+  // falls back to mcap instead, which is the fallback being symmetric doing
+  // exactly its job, not a failure. The contract this test is actually about
+  // is that capture stays enabled and resolves to one of the two real
+  // backends, not "invalid_format" - not which one that happens to be here.
   auto rosbag_config = create_rosbag_config();
   rosbag_config.format = "invalid_format";
   auto snapshot_config = create_snapshot_config();
@@ -129,7 +147,8 @@ TEST_F(RosbagCaptureTest, ConstructorFallsBackOnUnknownFormat) {
   EXPECT_NO_THROW(rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config));
   ASSERT_NE(rb, nullptr);
   EXPECT_TRUE(rb->is_enabled());
-  EXPECT_EQ(rb->config().format, "sqlite3");
+  EXPECT_TRUE(rb->config().format == "sqlite3" || rb->config().format == "mcap")
+      << "resolved format was '" << rb->config().format << "', neither a real backend";
 }
 
 // The crash-safety branches below force the storage probe via an injected double,
@@ -157,6 +176,29 @@ TEST_F(RosbagCaptureTest, ConfiguredFormatUnavailableFallsBackToSqlite3) {
 }
 
 // @verifies REQ_INTEROP_088
+TEST_F(RosbagCaptureTest, ConfiguredSqlite3UnavailableFallsBackToMcap) {
+  // The symmetric case of the fallback above: a known format (sqlite3) whose
+  // plugin is unavailable degrades to mcap and capture stays enabled. Neither
+  // backend is privileged - whichever is configured falls back to the other,
+  // not always to sqlite3.
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.format = "sqlite3";
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture::StorageProbeFn probe = [](const std::string & f) -> std::optional<std::string> {
+    if (f == "sqlite3") {
+      return std::string("simulated: sqlite3 plugin not found");
+    }
+    return std::nullopt;  // mcap usable
+  };
+  std::shared_ptr<RosbagCapture> rb;
+  EXPECT_NO_THROW(
+      rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config, probe));
+  ASSERT_NE(rb, nullptr);
+  EXPECT_TRUE(rb->is_enabled());
+  EXPECT_EQ(rb->config().format, "mcap");
+}
+
+// @verifies REQ_INTEROP_088
 TEST_F(RosbagCaptureTest, NoUsableBackendDisablesCaptureWithoutCrashing) {
   // When neither the configured format nor sqlite3 is usable, capture self-disables
   // and the node keeps running (no throw out of the constructor).
@@ -175,8 +217,10 @@ TEST_F(RosbagCaptureTest, NoUsableBackendDisablesCaptureWithoutCrashing) {
 
 // @verifies REQ_INTEROP_088
 TEST_F(RosbagCaptureTest, Sqlite3BaselineUnavailableDisablesCapture) {
-  // When the always-shipped sqlite3 baseline itself fails to load, capture
-  // self-disables rather than crashing the node.
+  // When sqlite3 is configured and neither it nor its mcap fallback loads,
+  // capture self-disables rather than crashing the node - the symmetric case
+  // of NoUsableBackendDisablesCaptureWithoutCrashing above, starting from
+  // sqlite3 instead of mcap.
   auto rosbag_config = create_rosbag_config();
   rosbag_config.format = "sqlite3";
   auto snapshot_config = create_snapshot_config();

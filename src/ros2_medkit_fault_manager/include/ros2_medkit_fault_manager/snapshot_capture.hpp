@@ -64,9 +64,13 @@ struct RosbagConfig {
   /// If false (default), ring buffer runs continuously from startup
   bool lazy_start{false};
 
-  /// Storage format: "sqlite3" (default, always shipped with rosbag2) or "mcap"
-  /// (opt-in; needs rosbag2_storage_mcap, falls back to sqlite3 if unavailable).
-  std::string format{"sqlite3"};
+  /// Storage format: "mcap" (default; what Foxglove and Lichtblick open directly)
+  /// or "sqlite3" (also what an unknown format string lands on). Neither is
+  /// privileged over the other: whichever is configured, an unavailable plugin
+  /// falls back automatically to the other one, and capture disables itself
+  /// only if neither loads. Both plugins are runtime dependencies of this
+  /// package.
+  std::string format{"mcap"};
 
   /// Path to store bag files (empty = system temp directory)
   std::string storage_path;

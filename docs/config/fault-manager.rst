@@ -244,7 +244,7 @@ Capture continuous rosbag recordings around fault events.
            exclude_topics: []              # Topics to exclude
            exclude_sensor_topics: true     # Auto-exclude image/points/depth/compressed in broad modes
            lazy_start: false               # Start recording on first fault
-           format: "sqlite3"               # Storage format
+           format: "mcap"                  # Storage format (default: mcap)
            qos_match: true                 # Match each topic's publisher QoS
            storage_path: ""                # Custom storage path
            max_buffer_mb: 256              # Ring-buffer RAM cap
@@ -306,6 +306,14 @@ Capture continuous rosbag recordings around fault events.
      - ``true``
      - Subscribe with each topic's publisher-offered QoS for faithful capture
        instead of forcing best-effort.
+   * - ``rosbag.format``
+     - ``mcap``
+     - Bag storage format: ``mcap`` (default; opens directly in Foxglove and
+       Lichtblick) or ``sqlite3`` (also what an unknown format string lands
+       on). Neither is privileged: whichever is configured, an unavailable
+       plugin falls back automatically to the other one, and capture disables
+       itself only if neither loads. Both plugins are runtime dependencies of
+       ``ros2_medkit_fault_manager``.
    * - ``rosbag.max_buffer_mb``
      - ``256``
      - Ring-buffer RAM cap; oldest buffered messages drop past it.
@@ -384,7 +392,7 @@ both stay - the sweep is about the whole store, not about this recording, and it
 runs again on the next capture.
 
 A post-fault-only bag on a quiet or heavily filtered system can contain zero
-messages. It still finalises normally on both ``sqlite3`` and ``mcap``, is listed
+messages. It still finalises normally on both ``mcap`` and ``sqlite3``, is listed
 by the bulk-data endpoints and can be downloaded; only its payload is empty.
 
 **What ``duration_sec`` on a stored bag means.** The value returned by

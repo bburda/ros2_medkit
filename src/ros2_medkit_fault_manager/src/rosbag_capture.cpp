@@ -39,10 +39,13 @@ namespace {
 
 /// Actionable install hint for an unavailable storage backend.
 std::string storage_plugin_hint(const std::string & format) {
+  const char * distro = std::getenv("ROS_DISTRO");
+  const std::string d = (distro && *distro) ? distro : "$ROS_DISTRO";
   if (format == "mcap") {
-    const char * distro = std::getenv("ROS_DISTRO");
-    const std::string d = (distro && *distro) ? distro : "$ROS_DISTRO";
     return "install ros-" + d + "-rosbag2-storage-mcap";
+  }
+  if (format == "sqlite3") {
+    return "install ros-" + d + "-rosbag2-storage-default-plugins";
   }
   return "check the rosbag2 storage plugin installation";
 }
@@ -163,9 +166,12 @@ RosbagCapture::RosbagCapture(rclcpp::Node * node, FaultStorage * storage, const 
 
   // Resolve a usable storage backend without ever terminating the FaultManager:
   // an unavailable plugin (e.g. rosbag2_storage_mcap not installed) must degrade,
-  // not crash. Unknown formats and a missing plugin fall back to sqlite3 (always
-  // shipped with rosbag2); if no backend works, disable capture and keep running
-  // (freeze-frame snapshots are independent of rosbag).
+  // not crash. An unknown format string falls back to sqlite3. Neither backend is
+  // privileged over the other: both mcap and sqlite3 are declared runtime
+  // dependencies of this package, so whichever format is CONFIGURED, if its
+  // plugin fails to load, resolution falls back to the OTHER one; if neither
+  // backend works, disable capture and keep running (freeze-frame snapshots are
+  // independent of rosbag).
   if (config_.format != "sqlite3" && config_.format != "mcap") {
     RCLCPP_WARN(node_->get_logger(), "Unknown rosbag storage format '%s'; using 'sqlite3'", config_.format.c_str());
     config_.format = "sqlite3";
@@ -173,31 +179,25 @@ RosbagCapture::RosbagCapture(rclcpp::Node * node, FaultStorage * storage, const 
 
   if (auto probe_err = storage_probe_(config_.format)) {
     const std::string reason = truncate_reason(*probe_err);
-    if (config_.format == "sqlite3") {
-      // The always-shipped baseline failed: an environment-level problem (broken
-      // rosbag2 base install / disk / permissions), not a missing optional plugin.
+    const std::string other_format = (config_.format == "sqlite3") ? "mcap" : "sqlite3";
+    if (auto other_err = storage_probe_(other_format)) {
       RCLCPP_WARN(node_->get_logger(),
-                  "sqlite3 rosbag storage is unavailable (%s); the rosbag2 base install may be broken. "
-                  "Black-box rosbag capture disabled (freeze-frame snapshots still work)",
-                  reason.c_str());
+                  "No usable rosbag storage backend: '%s' (%s) and '%s' (%s) both failed to load; install "
+                  "rosbag2_storage_mcap and rosbag2_storage_default_plugins. Black-box rosbag capture disabled "
+                  "(freeze-frame snapshots still work)",
+                  config_.format.c_str(), reason.c_str(), other_format.c_str(), truncate_reason(*other_err).c_str());
       config_.enabled = false;
       return;
     }
-    if (auto sqlite_err = storage_probe_("sqlite3")) {
-      RCLCPP_WARN(node_->get_logger(),
-                  "No usable rosbag storage backend: '%s' (%s) and sqlite3 (%s) both failed to load; black-box "
-                  "rosbag capture disabled (freeze-frame snapshots still work)",
-                  config_.format.c_str(), reason.c_str(), truncate_reason(*sqlite_err).c_str());
-      config_.enabled = false;
-      return;
-    }
-    // Explicitly-configured (non-default) format unavailable: name the fix so an
-    // operator who chose e.g. mcap for Foxglove is not silently downgraded.
+    // The configured format is unavailable, whether it is the default (mcap) or
+    // an explicit choice (including sqlite3): name the fix so an operator
+    // relying on it - Foxglove/Lichtblick via mcap, or legacy tooling via
+    // sqlite3 - is not silently downgraded without knowing what to install.
     RCLCPP_WARN(node_->get_logger(),
-                "Rosbag storage format '%s' is unavailable (%s); %s. Falling back to 'sqlite3' for black-box "
-                "capture (sqlite3 bags are not directly Foxglove-readable)",
-                config_.format.c_str(), reason.c_str(), storage_plugin_hint(config_.format).c_str());
-    config_.format = "sqlite3";
+                "Rosbag storage format '%s' is unavailable (%s); %s. Falling back to '%s' for black-box capture",
+                config_.format.c_str(), reason.c_str(), storage_plugin_hint(config_.format).c_str(),
+                other_format.c_str());
+    config_.format = other_format;
   }
 
   RCLCPP_INFO(node_->get_logger(), "RosbagCapture initialized (duration=%.1fs, after=%.1fs, lazy_start=%s, format=%s)",

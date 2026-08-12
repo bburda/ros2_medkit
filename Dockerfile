@@ -80,6 +80,17 @@ COPY src/ros2_medkit_plugins/ ${COLCON_WS}/src/ros2_medkit_plugins/
 # test_depend and which rosdep tries to install even with BUILD_TESTING=OFF).
 # This was previously masked by Docker layer cache hits on CI; cold builds
 # always failed.
+#
+# rosbag2_storage_mcap stays skip-keyed here even though fault_manager now
+# exec_depends on it: this stage compiles with -DBUILD_TESTING=OFF against
+# rosbag2_cpp/rosbag2_storage (the plugin interface, already resolvable
+# without it) and never runs a bag, so it never needs the plugin itself, only
+# its interface. The key exists because the plugin package was not available
+# via rosdep on every distro this Dockerfile targets when it was added
+# (ce702f61); that constraint is about apt package availability per distro,
+# not about whether fault_manager declares the dependency, so becoming an
+# exec_depend does not remove the reason to skip it here. It is installed for
+# real in the runtime stage below, which is where it is actually loaded.
 RUN bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && \
     apt-get update && \
     rosdep update && \
@@ -104,10 +115,23 @@ ENV COLCON_WS=/home/medkit/ws
 # CycloneDDS RMW is bundled so the gateway can attach to a stack running
 # CycloneDDS (e.g. Autoware) without rebuilding. FastDDS stays the default;
 # switch with RMW_IMPLEMENTATION=rmw_cyclonedds_cpp at runtime.
+# rosbag2-storage-mcap and rosbag2-storage-default-plugins are the actual
+# rosbag2 storage plugins fault_manager loads at runtime through
+# rosbag2_storage's plugin interface: the former is always the mcap plugin,
+# the latter is the sqlite3 plugin itself on humble but, on jazzy (this
+# stage's default) and lyrical, a metapackage that pulls in both sqlite3 and
+# mcap - so it is not a clean sqlite3-only counterpart to the first package on
+# every distro this image targets, just the name that guarantees sqlite3 is
+# present. libsqlite3-0 alone is the C library, not a rosbag2 plugin, and this
+# stage never gets /opt/ros from the builder - only the colcon workspace
+# install/ - so without these two the image would advertise mcap-by-default
+# and silently have no working black-box storage backend at all.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-${ROS_DISTRO}-yaml-cpp-vendor \
     ros-${ROS_DISTRO}-example-interfaces \
     ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
+    ros-${ROS_DISTRO}-rosbag2-storage-mcap \
+    ros-${ROS_DISTRO}-rosbag2-storage-default-plugins \
     libsqlite3-0 \
     libsystemd0 \
     libssl3 \

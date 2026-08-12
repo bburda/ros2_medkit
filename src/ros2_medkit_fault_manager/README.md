@@ -109,7 +109,24 @@ patterns:
     - /cmd_vel
 ```
 
+### Rosbag Capture
+
+Black-box rosbag capture (`snapshots.rosbag.*`) writes bags in `mcap` format by
+default, which Foxglove and Lichtblick open directly with no conversion step.
+`sqlite3` remains available through `snapshots.rosbag.format` and is also what an
+unknown format string lands on. Neither backend is privileged over the other:
+whichever is configured, if its plugin is unavailable at startup the FaultManager
+logs a warning naming the missing package and falls back to the other one
+automatically, disabling capture only if neither loads. Both `rosbag2_storage_mcap`
+and `rosbag2_storage_default_plugins` (the sqlite3 plugin) are runtime dependencies
+of this package, so a normal install pulls in both backends. See
+`docs/config/fault-manager.rst` and `docs/tutorials/snapshots.rst` for the full
+parameter list and recording lifecycle.
+
 ### Storage Backends
+
+This is the persisted fault store (`storage_type`), separate from the rosbag storage
+format used by black-box capture (`snapshots.rosbag.format`, see Rosbag Capture above).
 
 **SQLite (default)**: Faults are persisted to disk and survive node restarts. Uses WAL mode for optimal performance.
 

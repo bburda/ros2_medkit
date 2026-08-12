@@ -1114,7 +1114,7 @@ SnapshotConfig FaultManagerNode::create_snapshot_config() {
     config.rosbag.qos_match = declare_parameter<bool>("snapshots.rosbag.qos_match", true);
 
     config.rosbag.lazy_start = declare_parameter<bool>("snapshots.rosbag.lazy_start", false);
-    config.rosbag.format = declare_parameter<std::string>("snapshots.rosbag.format", "sqlite3");
+    config.rosbag.format = declare_parameter<std::string>("snapshots.rosbag.format", "mcap");
     config.rosbag.storage_path = declare_parameter<std::string>("snapshots.rosbag.storage_path", "");
 
     int64_t max_bag_size = declare_parameter<int64_t>("snapshots.rosbag.max_bag_size_mb", 50);
