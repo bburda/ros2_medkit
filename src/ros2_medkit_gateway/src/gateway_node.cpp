@@ -654,12 +654,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
 
   // Parameter-service tuning parameters were declared at construction-time
   // alongside the rest of the gateway parameters; resolve them here.
-  // The FloatingPointRange descriptors on these two do NOT cover NaN: rclcpp's
-  // range check compares with < and >, and every comparison against NaN is
-  // false, so NaN is accepted as in-range and the gateway starts with it.
-  // Verified against a running gateway, which reported "timeout=nans". It then
-  // reaches a duration_cast and a try_lock_for, where it is undefined. Checked
-  // here with isfinite, which is the part rclcpp cannot do for us.
+  // The FloatingPointRange descriptors on these two do not cover NaN the same
+  // way everywhere: the range check compares with < and >, both false for NaN,
+  // so Jazzy accepts NaN as in-range (verified on a running gateway, which
+  // reported "timeout=nans") while Lyrical refuses it before main gets this
+  // far. Where it gets through it reaches a duration_cast and a try_lock_for,
+  // where it is undefined. isfinite here is what closes that distro gap.
   auto resolve_finite = [this](const char * name, double fallback) {
     const double value = get_parameter(name).as_double();
     if (std::isfinite(value)) {
