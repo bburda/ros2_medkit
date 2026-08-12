@@ -187,7 +187,7 @@ TEST_F(LogHandlersTest, GetLogsReturnsBadRequestWhenMatchesMissing) {
 }
 ```
 
-**ROS_DOMAIN_ID isolation**: GTest targets creating `rclcpp::Node` need unique domain IDs. Current: 62-66 (fault_manager), 99 (gateway). Next available: 67.
+**ROS_DOMAIN_ID isolation**: GTest, gmock, pytest and launch tests that create `rclcpp::Node` get a domain automatically when registered through `medkit_add_gtest()` / `medkit_add_gmock()` / `medkit_add_pytest_test()` / `medkit_add_launch_test()` in `ROS2MedkitTestDomain.cmake` - a wrapper takes a free domain from a shared band at test start and holds it for exactly as long as the test runs. There is no hand-maintained ID table to update. A test that creates no ROS node calls `medkit_test_needs_no_domain()` instead.
 
 ### Integration Tests (Python launch_testing)
 
@@ -285,7 +285,7 @@ Every code change must include corresponding tests. A feature without tests is n
 
 **General test rules:**
 - **Flag** any use of `GTEST_SKIP()`, `@pytest.mark.skip`, `unittest.skip`, or equivalent - tests must not be skipped, fix the code or the test instead.
-- **Flag** GTest files that create `rclcpp::Node` without setting a unique `ROS_DOMAIN_ID` in CMakeLists.txt `set_tests_properties()`. Current IDs: 62-66, 99. Next available: 67.
+- **Flag** GTest/launch test files that create `rclcpp::Node` without registering through `medkit_add_gtest()` / `medkit_add_gmock()` / `medkit_add_launch_test()` in `ROS2MedkitTestDomain.cmake`, which allocate a `ROS_DOMAIN_ID` automatically - there is no hand-maintained ID table to update, and for a launch test a manual `set_tests_properties()` afterward fails the configure outright when the guard in that macro has not registered the test.
 - **Flag** integration tests that select `/parameter_events` or `/rosout` topics - these are ROS 2 system topics without continuous data flow.
 - **Flag** test files for SOVD-spec endpoints that are missing `// @verifies REQ_XXX` traceability tags.
 
@@ -314,7 +314,7 @@ Every code change must include corresponding tests. A feature without tests is n
 | `find_package(yaml-cpp REQUIRED)` | Use `medkit_find_yaml_cpp()` |
 | `res.set_header("Content-Type", ...)` + `set_chunked_content_provider(...)` | Remove `set_header` - provider sets Content-Type |
 | `GTEST_SKIP()` or `@pytest.mark.skip` | Fix the test or the code, never skip |
-| `set_tests_properties(... ENVIRONMENT "ROS_DOMAIN_ID=99")` reusing existing ID | Assign next available ID (67) |
+| `set_tests_properties(... ENVIRONMENT "ROS_DOMAIN_ID=99")` by hand | Use `medkit_add_gtest()` / `medkit_add_gmock()` / `medkit_add_launch_test()`, which allocate the domain |
 | New endpoint route for `/apps/` only | Add matching route for `/components/` (dual-path) |
 | Error string literal like `"not-found"` | Use constant `ERR_ENTITY_NOT_FOUND` from `error_codes.hpp` |
 | `res.status = 404; res.set_content(...)` manually | Use `HandlerContext::send_error(res, 404, ERR_ENTITY_NOT_FOUND, msg)` |

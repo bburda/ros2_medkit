@@ -115,6 +115,10 @@ if(BUILD_TESTING)
   set_tests_properties(test_lint_config PROPERTIES LABELS "unit")
   medkit_test_needs_no_domain(test_lint_config)
 
+  ament_add_pytest_test(test_launch_test_guard test/test_launch_test_guard.py TIMEOUT 300)
+  set_tests_properties(test_launch_test_guard PROPERTIES LABELS "unit")
+  medkit_test_needs_no_domain(test_launch_test_guard)
+
   set_property(TEST test_domain_band APPEND PROPERTY RESOURCE_LOCK medkit_domain_band)
   set_property(TEST test_domain_wrapper APPEND PROPERTY RESOURCE_LOCK medkit_domain_band)
 

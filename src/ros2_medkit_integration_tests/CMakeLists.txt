@@ -182,6 +182,34 @@ if(BUILD_TESTING)
   set_tests_properties(test_test_utils_constants PROPERTIES LABELS "unit")
   medkit_test_needs_no_domain(test_test_utils_constants)
 
+  # Configures every launch-test-registering package this file can reach for
+  # real, twice each (ordinary workspace conditions and system-package
+  # conditions), and compares what each run actually registered. Lives here
+  # rather than in ros2_medkit_cmake because that package cannot depend on
+  # the packages it is shared by; this package's own dependency chain (via
+  # ros2_medkit_gateway) already reaches all six. ros2_medkit_graph_watchdog
+  # calls medkit_add_launch_test too but is covered by its own copy of this
+  # test instead - see the module docstring. ROS-free for the same reason as
+  # the fixture above - it spawns its own cmake subprocesses rather than
+  # creating ROS entities.
+  #
+  # Registered only when this package can reach a repository root above
+  # itself - reusing _medkit_launch_tests_can_register()'s own detection of a
+  # system-package build (ROS2MedkitTestDomain.cmake), because the two
+  # conditions are the same fact: the ROS build farm's binarydeb chroot
+  # builds this package alone, with no sibling packages beside it, which is
+  # exactly when this test's own repository_root fixture would find nothing.
+  # A test that can prove nothing about its own subject must not run to
+  # report a pass on that account; every other test in this file registers
+  # unconditionally.
+  _medkit_launch_tests_can_register(_malt_system_build_test_can_register)
+  if(_malt_system_build_test_can_register)
+    ament_add_pytest_test(test_launch_test_guard_system_build
+      test/test_launch_test_guard_system_build.py TIMEOUT 900)
+    set_tests_properties(test_launch_test_guard_system_build PROPERTIES LABELS "integration")
+    medkit_test_needs_no_domain(test_launch_test_guard_system_build)
+  endif()
+
   # Multi-gateway tests run a second and a third gateway, each on a domain of its
   # own, and reach them through ros2_medkit_test_utils.constants.get_test_domain_id.
   # DOMAINS below is one for the test itself plus one per extra gateway; the
@@ -199,7 +227,34 @@ if(BUILD_TESTING)
     test_startup_param_clamp_warnings)
   set(_MULTI_GATEWAY_DOMAINS 4)
 
-  # Feature tests (atomic, independent, 120s timeout)
+  # Tests whose polling budgets do not fit the glob's default timeout. Keyed by
+  # test name; anything not listed takes the default for its glob.
+  #
+  # test_rosbag_boundary_download drives three real rosbag recordings end to end
+  # (the demo node's own fault, then a burst across the post-fault window
+  # boundary), each with its own post-roll and finalize. Its polling deadlines
+  # add up past the 120s the feature glob assigns, so it gets its own budget
+  # rather than have a slow runner kill it with no test name in the output.
+  #
+  # test_graph_provider_greenwave drives a real greenwave_monitor node, which
+  # only publishes /diagnostics at ~1 Hz with the first useful reading a few
+  # seconds in, plus an 8s launch-ordering delay so greenwave starts strictly
+  # after the demo nodes it monitors are already publishing (see the test's
+  # module docstring). The default 120s feature timeout does not leave enough
+  # headroom for that startup delay plus the 30-90s polling budgets its cases
+  # need, so it is widened to match the scenario-test timeout.
+  #
+  # test_graph_provider_stale and test_graph_provider_sse also drive a real
+  # greenwave_monitor node through the same 10s launch-ordering delay plus
+  # warmup as test_graph_provider_greenwave above, and their staleness/SSE
+  # polling budgets are similarly generous - both widened to match.
+  set(_MEDKIT_TEST_TIMEOUT_OVERRIDES
+    test_rosbag_boundary_download 180
+    test_graph_provider_greenwave 300
+    test_graph_provider_stale 300
+    test_graph_provider_sse 300)
+
+  # Feature tests (atomic, independent, 120s timeout unless overridden above)
   file(GLOB FEATURE_TESTS test/features/*.test.py)
   foreach(test_file ${FEATURE_TESTS})
     get_filename_component(test_name ${test_file} NAME_WE)
@@ -207,19 +262,22 @@ if(BUILD_TESTING)
     if(test_name IN_LIST _MULTI_GATEWAY_TESTS)
       set(_test_domains ${_MULTI_GATEWAY_DOMAINS})
     endif()
+    set(_test_timeout 120)
+    list(FIND _MEDKIT_TEST_TIMEOUT_OVERRIDES ${test_name} _test_timeout_idx)
+    if(NOT _test_timeout_idx EQUAL -1)
+      math(EXPR _test_timeout_value_idx "${_test_timeout_idx} + 1")
+      list(GET _MEDKIT_TEST_TIMEOUT_OVERRIDES ${_test_timeout_value_idx} _test_timeout)
+    endif()
     medkit_add_launch_test(${test_name} ${test_file}
-      TIMEOUT 120
+      TIMEOUT ${_test_timeout}
       DOMAINS ${_test_domains}
+      LABELS "integration;feature"
+      ENV "GATEWAY_TEST_PORT=${_INTEG_PORT}"
     )
-    # APPEND: medkit_add_launch_test put this test's domain count in ENVIRONMENT,
-    # and a plain set_tests_properties(... PROPERTIES ENVIRONMENT ...) would drop it.
-    set_tests_properties(${test_name} PROPERTIES LABELS "integration;feature")
-    set_property(TEST ${test_name} APPEND PROPERTY
-      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT}")
     math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
   endforeach()
 
-  # Scenario tests (E2E stories, 300s timeout)
+  # Scenario tests (E2E stories, 300s timeout unless overridden above)
   file(GLOB SCENARIO_TESTS test/scenarios/*.test.py)
   foreach(test_file ${SCENARIO_TESTS})
     get_filename_component(test_name ${test_file} NAME_WE)
@@ -227,39 +285,20 @@ if(BUILD_TESTING)
     if(test_name IN_LIST _MULTI_GATEWAY_TESTS)
       set(_test_domains ${_MULTI_GATEWAY_DOMAINS})
     endif()
+    set(_test_timeout 300)
+    list(FIND _MEDKIT_TEST_TIMEOUT_OVERRIDES ${test_name} _test_timeout_idx)
+    if(NOT _test_timeout_idx EQUAL -1)
+      math(EXPR _test_timeout_value_idx "${_test_timeout_idx} + 1")
+      list(GET _MEDKIT_TEST_TIMEOUT_OVERRIDES ${_test_timeout_value_idx} _test_timeout)
+    endif()
     medkit_add_launch_test(${test_name} ${test_file}
-      TIMEOUT 300
+      TIMEOUT ${_test_timeout}
       DOMAINS ${_test_domains}
+      LABELS "integration;scenario"
+      ENV "GATEWAY_TEST_PORT=${_INTEG_PORT}"
     )
-    set_tests_properties(${test_name} PROPERTIES LABELS "integration;scenario")
-    set_property(TEST ${test_name} APPEND PROPERTY
-      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT}")
     math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
   endforeach()
-
-  # test_rosbag_boundary_download drives three real rosbag recordings end to end
-  # (the demo node's own fault, then a burst across the post-fault window
-  # boundary), each with its own post-roll and finalize. Its polling deadlines
-  # add up past the 120s the feature glob assigns, so give it its own budget
-  # rather than have a slow runner kill it with no test name in the output.
-  set_tests_properties(test_rosbag_boundary_download PROPERTIES TIMEOUT 180)
-
-  # test_graph_provider_greenwave drives a real greenwave_monitor node,
-  # which only publishes /diagnostics at ~1 Hz with the first useful
-  # reading a few seconds in, plus an 8s launch-ordering delay so
-  # greenwave starts strictly after the demo nodes it monitors are already
-  # publishing (see the test's module docstring). The default 120s feature
-  # timeout does not leave enough headroom for that startup delay plus the
-  # 30-90s polling budgets its cases need, so widen it to match the
-  # scenario-test timeout.
-  set_tests_properties(test_graph_provider_greenwave PROPERTIES TIMEOUT 300)
-
-  # test_graph_provider_stale and test_graph_provider_sse also drive a real
-  # greenwave_monitor node through the same 10s launch-ordering delay plus
-  # warmup as test_graph_provider_greenwave above, and their staleness/SSE
-  # polling budgets are similarly generous - widen both to match.
-  set_tests_properties(test_graph_provider_stale PROPERTIES TIMEOUT 300)
-  set_tests_properties(test_graph_provider_sse PROPERTIES TIMEOUT 300)
 endif()
 
 ament_package()

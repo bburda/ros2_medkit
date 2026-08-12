@@ -146,6 +146,59 @@ macro(medkit_add_pytest_test TEST_NAME TEST_PATH)
   _medkit_declare_domains(${TEST_NAME} ${_MAPT_DOMAINS})
 endmacro()
 
+# A launch test resolves the executables and the Python helper package of the
+# package under test through the ament index, which only an installed prefix
+# carries. A system package build - the ROS build farm's binarydeb job - runs
+# `make test` before the install step, so the package is not on
+# AMENT_PREFIX_PATH and every launch test dies on resolution:
+#
+#   launch_test.py: error: "package 'ros2_medkit_fault_manager' not found,
+#                           searching: ['/opt/ros/humble']"
+#
+# Humble is the only distro that still runs package tests in that job; every
+# distro from Iron onward disables them (ros2/ros_buildfarm_config PR 298).
+# Because bloom runs the step as `dh_auto_test || true` the failures cannot stop
+# the build, so what they produce is a published log full of failures that say
+# nothing about the package.
+#
+# gtests and pytest tests are deliberately left alone. That chroot is the only
+# place our packages are exercised against a minimal dependency closure, and it
+# is where the missing rosbag2 sqlite3 storage plugin was found.
+#
+# Fires only in a system package build. Two independent signals, because either
+# one alone has a false positive that costs a developer their launch tests:
+#
+#   * the install prefix is the ROS distribution root, which is what bloom's
+#     debian/rules passes (-DCMAKE_INSTALL_PREFIX=/opt/ros/humble), and
+#   * CMAKE_INSTALL_LOCALSTATEDIR is the absolute path "/var", which debhelper's
+#     cmake buildsystem always passes (-DCMAKE_INSTALL_LOCALSTATEDIR=/var) and
+#     colcon never does.
+#
+# The second signal checks the value, not merely DEFINED: a package that
+# include(GNUInstallDirs)s defines CMAKE_INSTALL_LOCALSTATEDIR itself, to the
+# relative "var" (no leading slash), which is a different value from what
+# debhelper passes on the command line. DEFINED alone cannot tell those apart,
+# so this must be false there too - no in-tree package includes GNUInstallDirs
+# today, so this is hardening against a real GNUInstallDirs default rather
+# than a fix for an observed failure.
+#
+# The prefix alone would also catch `colcon build --install-base /opt/ros/jazzy`,
+# whose test step runs after its install step and whose launch tests work fine.
+# If this ever stops matching the build farm the guard simply does not fire and we
+# are back to a noisy log, which is the safe direction to be wrong in.
+function(_medkit_launch_tests_can_register _output_var)
+  set(${_output_var} TRUE PARENT_SCOPE)
+  if(NOT DEFINED ENV{ROS_DISTRO} OR NOT DEFINED CMAKE_INSTALL_LOCALSTATEDIR)
+    return()
+  endif()
+  # Exact comparison, so normalise a trailing slash first on both sides.
+  string(REGEX REPLACE "/+$" "" _malt_prefix "${CMAKE_INSTALL_PREFIX}")
+  string(REGEX REPLACE "/+$" "" _malt_localstatedir "${CMAKE_INSTALL_LOCALSTATEDIR}")
+  if(_malt_prefix STREQUAL "/opt/ros/$ENV{ROS_DISTRO}" AND _malt_localstatedir STREQUAL "/var")
+    set(${_output_var} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+
 # Register a launch_testing test AND give it a domain in one call.
 # This is the required way to add a launch test: it makes it impossible to add
 # one without isolation, and a launch test left on the default domain 0 sees
@@ -154,28 +207,132 @@ endmacro()
 # The domain is exported by the runner, so every process the launch description
 # starts inherits it.
 #
+# LABELS and ENV are the only supported way to give a launch test properties.
+# Passing them here rather than with a set_tests_properties(<name> ...) or a
+# set_property(TEST <name> ...) afterwards is required, not stylistic: a system
+# package build (see _medkit_launch_tests_can_register() above) registers no
+# launch test at all, and set_tests_properties on a test name that was never
+# registered is a hard CMake configure error, not a no-op. ENV is multi-value
+# and always APPENDs after the domain the macro already set, so a caller's
+# environment can never overwrite MEDKIT_TEST_DOMAINS - an ENV entry that sets
+# it with the literal key "MEDKIT_TEST_DOMAINS=" hits a FATAL_ERROR instead of
+# a silently-lost domain, which used to be what a plain
+# set_tests_properties(... PROPERTIES ENVIRONMENT ...) did.
+#
+# ARGS forwards extra launch arguments (e.g. "foo:=bar") straight to
+# add_launch_test(), same as it always did.
+#
+# Not registered at all in a system package build - see
+# _medkit_launch_tests_can_register() above.
+#
 # Usage:
 #   medkit_add_launch_test(test_integration test/test_integration.test.py)
-#   medkit_add_launch_test(test_multi test/test_multi.test.py TIMEOUT 300 DOMAINS 4)
+#   medkit_add_launch_test(test_multi test/test_multi.test.py TIMEOUT 300 DOMAINS 4
+#     LABELS "integration" ENV "FOO=bar" "BAZ=qux" ARGS "foo:=bar")
 macro(medkit_add_launch_test TEST_NAME TEST_FILE)
-  cmake_parse_arguments(_MALT "" "TIMEOUT;DOMAINS" "" ${ARGN})
-  if(NOT DEFINED _MALT_DOMAINS)
-    set(_MALT_DOMAINS 1)
+  _medkit_launch_tests_can_register(_MALT_CAN_REGISTER)
+  if(NOT _MALT_CAN_REGISTER)
+    # Printed once per directory: this flag is a macro-scoped variable, not a
+    # CACHE entry, so a package that calls medkit_add_launch_test many times in
+    # one CMakeLists.txt prints the explanation once, while a different
+    # CMakeLists.txt in the same build prints its own. It is directory-scoped,
+    # not project-scoped: a package built as several add_subdirectory()
+    # directories would print once per directory that registers a launch test.
+    if(NOT _MEDKIT_LAUNCH_TESTS_SKIPPED_REPORTED)
+      message(STATUS
+        "ros2_medkit: launch tests are not registered in this build. Installing into "
+        "${CMAKE_INSTALL_PREFIX} is a system package build, whose test step runs before "
+        "the install step, so a launch test cannot resolve this package through the "
+        "ament index. gtests and pytest tests still run.")
+      set(_MEDKIT_LAUNCH_TESTS_SKIPPED_REPORTED TRUE)
+    endif()
+  else()
+    # LABELS and ARGS are deliberately multi-value, not single-value: ${ARGN}
+    # above is an unquoted expansion, and CMake word-splits any argument that
+    # contains an embedded semicolon at that point - LABELS "integration;e2e"
+    # arrives here as two separate words, "integration" and "e2e", before
+    # parsing ever sees a keyword. A single-value LABELS would take only the
+    # first and leave the second as an unparsed argument that add_launch_test
+    # then rejects; a single-value ARGS has the same failure mode with a
+    # worse consequence - the overflow word would silently join whatever
+    # keyword came next instead of erroring, which is exactly how ARGS used
+    # to be able to leak into LABELS before ARGS got its own keyword below.
+    # "${_MALT_LABELS}" further down re-joins the collected words with ';' on
+    # the way back out, which is exactly the list ctest expects.
+    cmake_parse_arguments(_MALT "" "TIMEOUT;DOMAINS" "ENV;LABELS;ARGS" ${ARGN})
+    if(NOT DEFINED _MALT_DOMAINS)
+      set(_MALT_DOMAINS 1)
+    endif()
+    # A caller cannot set MEDKIT_TEST_DOMAINS through ENV with the literal key:
+    # it would land as a second, later entry in the ENVIRONMENT list behind
+    # the one _medkit_declare_domains sets below, and the later entry wins at
+    # run time - silently handing the test a domain count nothing allocated
+    # for it. DOMAINS <n> is the only supported way to set it.
+    #
+    # This is a literal string match against the "MEDKIT_TEST_DOMAINS=" prefix,
+    # not a CMake generator-expression evaluation: ENV "$<1:MEDKIT_TEST_DOMAINS=99>"
+    # would not match this MATCHES test and would still collide at run time,
+    # the same way it would if this check did not exist at all. Nobody writes
+    # that by accident, and rejecting every value containing "$<" would also
+    # block a caller from legitimately putting a generator expression in some
+    # other ENV entry, so this check only promises to catch the plain spelling.
+    foreach(_malt_env_name IN LISTS _MALT_ENV)
+      if(_malt_env_name MATCHES "^MEDKIT_TEST_DOMAINS=")
+        message(FATAL_ERROR
+          "medkit_add_launch_test(${TEST_NAME}): ENV must not set MEDKIT_TEST_DOMAINS "
+          "literally ('${_malt_env_name}') - that collides with the domain count the macro "
+          "sets for the test from DOMAINS <n>. Use DOMAINS instead of setting this directly.")
+      endif()
+    endforeach()
+    set(_MALT_EXTRA_ARGS "")
+    if(DEFINED _MALT_TIMEOUT)
+      list(APPEND _MALT_EXTRA_ARGS TIMEOUT ${_MALT_TIMEOUT})
+    endif()
+    # ARGS is a real add_launch_test() parameter (extra launch arguments, e.g.
+    # "foo:=bar"), forwarded explicitly rather than left to fall through
+    # _MALT_UNPARSED_ARGUMENTS, because LABELS being multi-value (above) means
+    # an ARGS keyword with no keyword of its own would otherwise be swallowed
+    # as more LABELS values instead of erroring. No in-tree caller uses ARGS
+    # today, so this line has no coverage from real call sites - only from the
+    # probe in test_launch_test_guard.py. Appended LAST into _MALT_EXTRA_ARGS,
+    # not before RUNNER below: ARGS is a multi-value keyword inside
+    # add_launch_test()'s own parser, which does not know RUNNER as a keyword
+    # at all, so anything placed after an open ARGS span - including RUNNER
+    # and its value - gets silently absorbed as more ARGS values instead of
+    # staying unparsed. That is exactly what happened here while writing this:
+    # RUNNER used to trail the call, ARGS's introduction swallowed it, and
+    # every launch test with ARGS would have quietly run unwrapped on domain 0.
+    if(DEFINED _MALT_ARGS)
+      list(APPEND _MALT_EXTRA_ARGS ARGS ${_MALT_ARGS})
+    endif()
+    # RUNNER is not a parameter add_launch_test knows; it forwards what it does
+    # not recognise to ament_add_test, which does. If a future launch_testing
+    # stopped forwarding it, the test would quietly run on domain 0 - which is
+    # exactly what test_dds_domain_allocation reads the generated command for.
+    # Placed right after TARGET, before TIMEOUT/ARGS: at this point no
+    # multi-value keyword of add_launch_test()'s own parser is open yet, so
+    # RUNNER and its value land in its UNPARSED_ARGUMENTS untouched, for the
+    # reason explained above ARGS.
+    add_launch_test(${TEST_FILE}
+      TARGET ${TEST_NAME}
+      RUNNER "${MEDKIT_TEST_DOMAIN_RUNNER}"
+      ${_MALT_UNPARSED_ARGUMENTS}
+      ${_MALT_EXTRA_ARGS})
+    _medkit_declare_domains(${TEST_NAME} ${_MALT_DOMAINS})
+    # add_launch_test() already defaulted LABELS to "launch_test"; this
+    # overrides it when the caller asked for something else, same as the
+    # set_tests_properties() callers used to do by hand - do not reorder this
+    # ahead of add_launch_test().
+    if(DEFINED _MALT_LABELS)
+      set_tests_properties(${TEST_NAME} PROPERTIES LABELS "${_MALT_LABELS}")
+    endif()
+    # APPEND, never a plain set: _medkit_declare_domains put MEDKIT_TEST_DOMAINS in
+    # ENVIRONMENT, and a plain set_tests_properties(... ENVIRONMENT ...) would drop
+    # it and leave the test on domain 0, seeing every node on the machine.
+    foreach(_malt_env IN LISTS _MALT_ENV)
+      set_property(TEST ${TEST_NAME} APPEND PROPERTY ENVIRONMENT "${_malt_env}")
+    endforeach()
   endif()
-  set(_MALT_EXTRA_ARGS "")
-  if(DEFINED _MALT_TIMEOUT)
-    list(APPEND _MALT_EXTRA_ARGS TIMEOUT ${_MALT_TIMEOUT})
-  endif()
-  # RUNNER is not a parameter add_launch_test knows; it forwards what it does
-  # not recognise to ament_add_test, which does. If a future launch_testing
-  # stopped forwarding it, the test would quietly run on domain 0 - which is
-  # exactly what test_dds_domain_allocation reads the generated command for.
-  add_launch_test(${TEST_FILE}
-    TARGET ${TEST_NAME}
-    ${_MALT_EXTRA_ARGS}
-    ${_MALT_UNPARSED_ARGUMENTS}
-    RUNNER "${MEDKIT_TEST_DOMAIN_RUNNER}")
-  _medkit_declare_domains(${TEST_NAME} ${_MALT_DOMAINS})
 endmacro()
 
 # Register an arbitrary command as a test that holds a domain.

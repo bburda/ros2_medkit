@@ -44,6 +44,12 @@
   <test_depend>ros2_medkit_integration_tests</test_depend>
   <test_depend>ament_index_python</test_depend>
 
+  <!-- test_launch_test_guard_system_build.py: real cmake configures of this
+       package, via ros2_medkit_test_utils.cmake_guard (installed by
+       ros2_medkit_integration_tests above). -->
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
   <export>
     <build_type>ament_cmake</build_type>
   </export>
