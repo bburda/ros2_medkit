@@ -67,17 +67,62 @@ def generate_test_description():
         sigkill_timeout='15',
     )
 
+    # A second bridge carrying two values the node used to swallow: a
+    # max_tracked_nodes below its own floor, and a NaN cooldown. NaN is the
+    # dangerous one - the old check was "negative -> 0.0", and every comparison
+    # against NaN is false, so it passed through into the duration the cooldown
+    # window is built from. Only this node's startup log is read.
+    bad_params_bridge_node = launch_ros.actions.Node(
+        package='ros2_medkit_log_bridge',
+        executable='log_bridge_node',
+        name='log_bridge_bad_params',
+        output='screen',
+        parameters=[{
+            'max_tracked_nodes': 0,
+            'report_cooldown_sec': float('nan'),
+            # Keep it out of the fault path; this node exists for its log only.
+            'include_only_nodes': ['__none__'],
+        }],
+        sigterm_timeout='30',
+        sigkill_timeout='15',
+    )
+
     return (
         LaunchDescription([
             fault_manager_node,
             log_bridge_node,
+            bad_params_bridge_node,
             launch_testing.actions.ReadyToTest(),
         ]),
         {
             'fault_manager_node': fault_manager_node,
             'log_bridge_node': log_bridge_node,
+            'bad_params_bridge_node': bad_params_bridge_node,
         },
     )
+
+
+class TestLogBridgeParameterRefusal(unittest.TestCase):
+    """A coerced parameter is reported, and NaN never reaches the window."""
+
+    def test_out_of_range_parameters_are_reported(self, proc_output, bad_params_bridge_node):
+        """
+        Both parameters name the value that was actually supplied.
+
+        max_tracked_nodes was clamped in silence, so a config asking for 0 ran
+        at 1 with nothing to show it. report_cooldown_sec was worse: the check
+        read "negative -> 0.0", which is false for NaN, so NaN passed both that
+        test and the "<= 0 disables the cooldown" test and reached
+        Duration::from_seconds, where converting it is undefined.
+        """
+        for fragment in (
+            'max_tracked_nodes 0 clamped to 1',
+            'report_cooldown_sec nan must be finite and >= 0',
+        ):
+            with self.subTest(fragment=fragment):
+                proc_output.assertWaitFor(
+                    fragment, process=bad_params_bridge_node, timeout=30,
+                )
 
 
 class TestLogBridgeIntegration(unittest.TestCase):

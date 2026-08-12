@@ -74,14 +74,17 @@ Parameters
    * - ``max_tracked_nodes``
      - ``512``
      - How many distinct source nodes the bridge tracks. Bounds memory when node
-       names are generated. Clamped to at least ``1``.
+       names are generated. Range: 1 to 2147483647 (the value becomes an
+       ``int``); either end is clamped with a warning.
    * - ``report_cooldown_sec``
      - ``5.0``
      - Minimum gap between two reports carrying the same generated fault code at
        the same severity. Applies to ``ERROR`` and ``FATAL`` only, because
        ``WARN`` is already debounced by the reporter-side local filter and
-       cooling it here would starve that filter's threshold counting. ``0`` or a
-       negative value disables it.
+       cooling it here would starve that filter's threshold counting. ``0``
+       disables the cooldown. Must be finite and not negative; anything else is
+       refused with a warning and ``5.0`` is used, because a non-finite value
+       would otherwise reach the duration the window is built from.
    * - ``exclude_medkit_stack``
      - ``true``
      - Ignore logs from medkit's own nodes, so the diagnostics stack does not
