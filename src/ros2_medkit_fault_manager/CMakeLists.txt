@@ -114,6 +114,14 @@ if(BUILD_TESTING)
 
   include(ROS2MedkitTestDomain)
 
+  # Manifest test: the storage plugins declared as exec/test dependencies.
+  # Creates no ROS node, so it needs no domain.
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_rosbag_storage_dependency test/test_rosbag_storage_dependency.py
+    TIMEOUT 60)
+  set_tests_properties(test_rosbag_storage_dependency PROPERTIES LABELS "unit")
+  medkit_test_needs_no_domain(test_rosbag_storage_dependency)
+
   # Unit tests
   # Each GTest target that instantiates ROS 2 nodes takes a ROS_DOMAIN_ID from this
   # package's pool so it cannot interfere with launch_testing integration tests that run
@@ -169,6 +177,11 @@ if(BUILD_TESTING)
     LABELS "integration")
 
   medkit_add_launch_test(test_rosbag_integration test/test_rosbag_integration.test.py TIMEOUT 90
+    LABELS "integration")
+
+  # Launches without snapshots.rosbag.format, so the parameter default (mcap)
+  # is what is under test rather than an operator's explicit choice.
+  medkit_add_launch_test(test_rosbag_default_format test/test_rosbag_default_format.test.py TIMEOUT 90
     LABELS "integration")
 
   medkit_add_launch_test(test_entity_thresholds_integration test/test_entity_thresholds_integration.test.py

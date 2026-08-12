@@ -195,6 +195,8 @@ Linter tests are enforced in CI on every pull request.
 | `diagnostic_msgs` | Level 1 |
 | `rosbag2_cpp` | Level 3 |
 | `rosbag2_storage` | Level 3 |
+| `rosbag2_storage_mcap` | Level 3 |
+| `rosbag2_storage_default_plugins` | Level 3 |
 
 ### Optional Direct Runtime Non-ROS Dependencies [5.ii]
 

@@ -1044,7 +1044,7 @@ Rosbag capture is configured via FaultManager parameters. See `config/snapshots.
 | `snapshots.rosbag.topics` | string | `"entity"` | Topic selection: `"entity"` (default; faulting node's topics + `/tf`), `"config"`, `"all"`, or `"explicit"` |
 | `snapshots.rosbag.exclude_sensor_topics` | bool | `true` | Auto-exclude image/points/depth/compressed in broad modes (`include_topics` re-adds) |
 | `snapshots.rosbag.qos_match` | bool | `true` | Match each topic's publisher QoS for faithful capture |
-| `snapshots.rosbag.format` | string | `"sqlite3"` | Bag format: `"sqlite3"` or `"mcap"` |
+| `snapshots.rosbag.format` | string | `"mcap"` | Bag format: `"mcap"` (default; opens directly in Foxglove and Lichtblick) or `"sqlite3"`. Neither is privileged - an unavailable plugin falls back automatically to the other one |
 | `snapshots.rosbag.auto_cleanup` | bool | `true` | Delete bag when fault is cleared |
 | `snapshots.rosbag.max_buffer_mb` | int | `256` | Ring-buffer RAM cap (oldest messages drop past it) |
 | `snapshots.rosbag.max_bag_size_mb` | int | `50` | Max size per bag file |

@@ -25,18 +25,29 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 
+  <!-- Black-box storage backends. rosbag2_storage is only the plugin interface and
+       libsqlite3-dev is the C library the fault database uses; neither provides a
+       rosbag storage plugin. Without these, RosbagCapture logs a warning and
+       disables itself, so an installed package loses black-box capture.
+       mcap is the default the bags are written in. rosbag2_storage_default_plugins
+       covers the sqlite3 fallback: on humble that name is the sqlite3 plugin, on
+       jazzy and lyrical a metapackage carrying sqlite3 and mcap. -->
+  <exec_depend>rosbag2_storage_mcap</exec_depend>
+  <exec_depend>rosbag2_storage_default_plugins</exec_depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
-  <!-- mcap is an opt-in storage backend (sqlite3 is the always-shipped default with
-       a runtime fallback); only the rosbag integration test needs the plugin present -->
-  <test_depend>rosbag2_storage_mcap</test_depend>
   <test_depend>ament_cmake_clang_format</test_depend>
   <test_depend>ament_cmake_clang_tidy</test_depend>
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>launch_ros</test_depend>
   <test_depend>launch_testing_ament_cmake</test_depend>
   <test_depend>launch_testing_ros</test_depend>
+  <test_depend>python3-pytest</test_depend>
   <test_depend>rosbag2_py</test_depend>
+  <test_depend>rosbag2_storage_mcap</test_depend>
+  <test_depend>rosbag2_storage_default_plugins</test_depend>
   <test_depend>sensor_msgs</test_depend>
   <test_depend>std_msgs</test_depend>
 

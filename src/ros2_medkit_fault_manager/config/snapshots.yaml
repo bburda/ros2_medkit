@@ -130,13 +130,18 @@ rosbag:
   # When false, ring buffer runs continuously from node startup
   lazy_start: false
 
-  # Bag file format (default: "sqlite3")
+  # Bag file format (default: "mcap")
   # Options:
-  #   "sqlite3" - Default; always shipped with rosbag2, zero extra setup
-  #   "mcap"    - Opt-in; efficient and Foxglove-readable, needs rosbag2_storage_mcap
-  # If the selected plugin is not installed, capture automatically falls back to
-  # sqlite3, and disables itself only if no backend is usable (never crashes).
-  format: "sqlite3"
+  #   "mcap"    - Default; opens directly in Foxglove and Lichtblick
+  #   "sqlite3" - Also what an unknown format string lands on
+  # Neither backend is privileged over the other: whichever is configured, if
+  # its plugin is unavailable at startup the FaultManager logs a warning
+  # naming the missing package and falls back to the other one automatically,
+  # disabling capture only if neither loads (never crashes). Both
+  # rosbag2_storage_mcap and rosbag2_storage_default_plugins (the sqlite3
+  # plugin) are runtime dependencies of this package, so a normal install
+  # pulls in both backends.
+  format: "mcap"
 
   # Storage path for bag files (default: "" = system temp directory)
   # Empty string uses /tmp/rosbag_snapshots/

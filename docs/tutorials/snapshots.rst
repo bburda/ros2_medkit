@@ -478,9 +478,13 @@ Rosbag Configuration Options
      - In-memory ring-buffer cap; oldest buffered messages drop once exceeded, so a
        broad subscribe set cannot grow memory without bound.
    * - ``snapshots.rosbag.format``
-     - ``"sqlite3"``
-     - Bag storage format: ``"sqlite3"`` (default, widely compatible) or
-       ``"mcap"`` (more efficient compression, requires plugin).
+     - ``"mcap"``
+     - Bag storage format: ``"mcap"`` (default; opens directly in Foxglove and
+       Lichtblick) or ``"sqlite3"`` (also what an unknown format string lands
+       on). Neither is privileged: whichever is configured, an unavailable
+       plugin falls back automatically to the other one, and capture disables
+       itself only if neither loads. Both plugins are runtime dependencies of
+       the package.
    * - ``snapshots.rosbag.storage_path``
      - ``""``
      - Directory for bag files. Empty string uses system temp directory
@@ -671,22 +675,19 @@ Saves resources but may miss context if fault confirms before buffer fills.
 
 .. note::
 
-   The ``"mcap"`` format requires ``rosbag2_storage_mcap`` to be installed.
-   ``"sqlite3"`` (the default) is always shipped with rosbag2 and needs no extra
-   package.
+   ``"mcap"`` (the default) opens directly in Foxglove and Lichtblick with no
+   conversion step. ``"sqlite3"`` is also what an unknown format string lands
+   on. Both ``rosbag2_storage_mcap`` and ``rosbag2_storage_default_plugins``
+   (which carries the sqlite3 plugin) are runtime dependencies of the package,
+   so both are installed alongside it, and neither is privileged over the
+   other.
 
    You do not have to switch formats manually: if a configured backend's plugin
-   is unavailable at startup, the FaultManager logs a warning naming the missing
-   package and automatically falls back to ``"sqlite3"`` for black-box capture.
-   If no storage backend is usable at all, rosbag capture self-disables (the node
-   keeps running and freeze-frame snapshots are unaffected) instead of crashing.
-
-   To use mcap (e.g. for Foxglove), install the plugin:
-
-   .. code-block:: bash
-
-      # Install MCAP support (optional)
-      sudo apt install ros-${ROS_DISTRO}-rosbag2-storage-mcap
+   is somehow still unavailable at startup, the FaultManager logs a warning
+   naming the missing package and automatically falls back to the other
+   backend for black-box capture. If neither storage backend is usable at all,
+   rosbag capture self-disables (the node keeps running and freeze-frame
+   snapshots are unaffected) instead of crashing.
 
 Downloading Rosbag Files
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -758,7 +759,6 @@ For production use with conservative resource usage:
      duration_after_sec: 0.5
      topics: "config"           # Use same topics as JSON snapshots
      lazy_start: true           # Save resources until fault detected
-     format: "sqlite3"
      max_bag_size_mb: 25
      max_total_storage_mb: 200
      auto_cleanup: true
@@ -781,7 +781,6 @@ For development with maximum context:
      duration_after_sec: 2.0    # 2 seconds after
      topics: "config"
      lazy_start: false          # Always recording
-     format: "sqlite3"
      storage_path: "/var/log/ros2_medkit/rosbags"
      max_bag_size_mb: 100
      max_total_storage_mb: 1000
