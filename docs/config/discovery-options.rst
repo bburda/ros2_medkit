@@ -146,9 +146,12 @@ Manifest Loading
    * - ``discovery.manifest_strict_validation``
      - bool
      - ``true``
-     - Reject a manifest that fails validation instead of loading the parts of
-       it that happen to parse. Turn it off only to bring up a manifest that is
-       still being written.
+     - Treat manifest validation WARNINGS as fatal. Validation errors (broken
+       references, circular dependencies, duplicate bindings) always abort the
+       load whatever this is set to, and a manifest is only ever applied whole,
+       so turning this off never loads a partly-valid manifest - it only lets
+       warnings through. Turn it off to bring up a manifest that is still being
+       written.
    * - ``discovery.manifest.fragments_dir``
      - string
      - ``""``

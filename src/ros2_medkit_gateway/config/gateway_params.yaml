@@ -10,7 +10,7 @@
 # enforced when the value is read, and an out-of-range value is never accepted
 # in silence. What happens next differs by parameter:
 #   - most are coerced to the nearest endpoint, and the gateway logs both
-#     values:   [WARN] server.http_thread_pool_size 0 clamped to 1
+#     values:   [WARN] [rest_server]: server.http_thread_pool_size 0 clamped to 1
 #   - server.port, refresh_interval_ms, discovery.refresh_debounce_ms,
 #     topic_sample_timeout_sec, bulk_data.max_upload_size, sse.max_subscriptions
 #     and sse.max_duration_sec are refused and the documented default is used
