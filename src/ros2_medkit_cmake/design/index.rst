@@ -70,18 +70,32 @@ new packages reintroducing the escape.
    - ``medkit_apply_compat_defs(target)`` - Applies compile definitions based on detected versions
    - ``medkit_target_dependencies(target ...)`` - Drop-in replacement for ``ament_target_dependencies`` that also works on Lyrical (where ``ament_target_dependencies`` was removed)
 
-5. **ROS2MedkitTestDomain.cmake** - ``ROS_DOMAIN_ID`` allocation for tests
+5. **ROS2MedkitTestDomain.cmake** - ``ROS_DOMAIN_ID`` allocation for tests, and the
+   system-package launch-test guard
 
-   - ``medkit_add_gtest()``, ``medkit_add_gmock()``, ``medkit_add_pytest_test()`` and
-     ``medkit_add_launch_test()`` register a test behind the domain wrapper, so a test
-     cannot be added without isolation
-   - ``medkit_add_wrapped_test(<name> COMMAND <cmd...>)`` does the same for a test that
-     builds its own command line
+   - ``medkit_add_gtest()``, ``medkit_add_gmock()`` and ``medkit_add_pytest_test()``
+     register a test behind the domain wrapper unconditionally, so a test cannot be
+     added without isolation
+   - ``medkit_add_launch_test()`` does the same, but conditionally:
+     ``_medkit_launch_tests_can_register()`` registers nothing at all when the configure
+     looks like the ROS build farm's binarydeb job - the install prefix matches
+     ``/opt/ros/<anything>`` AND ``CMAKE_INSTALL_LOCALSTATEDIR`` is the absolute path
+     ``/var``, both read from CMake variables, never from the environment. That job runs
+     its test step before its own install step, so a launch test cannot resolve the
+     package under test through the ament index and fails on that alone, on every launch
+     test, for every package, on Humble (the only distro whose binarydeb job still runs
+     package tests at all). gtests and pytest tests need no installed prefix and are
+     unaffected. See "The One Case That Cannot Live Here, Reconciled With the Guard"
+     below.
+   - ``medkit_add_wrapped_test(<name> COMMAND <cmd...>)`` does the same as the
+     unconditional three, for a test that builds its own command line
    - ``DOMAINS <n>`` on any of them for a test that holds several domains at once; the
      extras arrive as ``MEDKIT_SECONDARY_DOMAINS``
    - ``medkit_test_needs_no_domain(<test>)`` declares a test ROS-free
-   - the runtime guard described below registers itself in every package; no package
-     calls anything to get it
+   - the domain-allocation runtime guard described below (``test_dds_domain_allocation``)
+     registers itself in every package; no package calls anything to get it - a separate
+     mechanism from the launch-test guard above, which acts at configure time instead of
+     at test run time
    - the wrapper scripts themselves live in ``scripts/``: ``medkit_domain.py`` (the band
      and the allocator), ``medkit_domain_runner.py`` (ament test runner replacement),
      ``medkit_run_with_domain.py`` (generic command wrapper)
@@ -235,15 +249,33 @@ earlier shape registered them as two CTest tests and needed ``ctest -j`` to run 
 side; CTest cannot be asked for that, so the pair passed under a parallel run and failed
 under a serial one. Concurrency a test depends on is the test's to arrange.
 
-The one case that cannot live here is the launch test, which proves a launch test's children
-join its domain. ``launch_testing_ament_cmake`` reaches the deprecated ``FindPythonLibs``
-through ``python_cmake_module`` on Humble, and this project is declared ``NONE``: with no
-language enabled CMake leaves ``CMAKE_LIBRARY_ARCHITECTURE`` and ``CMAKE_SIZEOF_VOID_P``
-empty, so ``find_library`` never searches the multiarch directory and libpython is not found
-however the development headers are installed. Since every package depends on this one, a
-configure failure here stops the whole workspace, so that test lives in
-``ros2_medkit_fault_reporter``, which compiles and already runs a launch test on every
-distro. Keep test-only ``find_package`` calls out of this package.
+The One Case That Cannot Live Here, Reconciled With the Guard
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The one case that cannot live here is a real launch test of this package's own, which would
+prove a launch test's children join its domain. ``launch_testing_ament_cmake`` reaches the
+deprecated ``FindPythonLibs`` through ``python_cmake_module`` on Humble, and this project is
+declared ``NONE``: with no language enabled CMake leaves ``CMAKE_LIBRARY_ARCHITECTURE`` and
+``CMAKE_SIZEOF_VOID_P`` empty, so ``find_library`` never searches the multiarch directory and
+libpython is not found however the development headers are installed. Since every package
+depends on this one, a configure failure here stops the whole workspace, so that test lives
+in ``ros2_medkit_fault_reporter``, which compiles and already runs a launch test on every
+distro. Keep a real launch test of this package's own - one that would make ``project(
+ros2_medkit_cmake NONE)`` itself resolve ``launch_testing_ament_cmake`` - out of this package.
+
+That does not rule out ``find_package(launch_testing_ament_cmake)`` appearing here at all.
+``test/test_launch_test_guard.py`` proves the guard described above against a real ``cmake``
+configure by writing a throwaway ``CMakeLists.txt`` per case and running a separate ``cmake
+-S ... -B ...`` subprocess against it - every probe that needs it declares its own
+``project(... C)`` or ``project(... CXX)``, never ``NONE``, so the hazard above does not
+apply: it is the throwaway subprocess's own language that ``find_package`` and
+``find_library`` see, not this package's. ``ros2_medkit_cmake/CMakeLists.txt`` itself is
+still ``project(ros2_medkit_cmake NONE)`` and still never calls
+``find_package(launch_testing_ament_cmake)``; the package declares it a ``test_depend`` in
+``package.xml`` so the probes that do call it resolve on their own merits rather than by
+happening to ride in on some other package's dependency chain. What stays out of this package
+is a real launch test of its own; a subprocess that configures one, with a language of its
+own, is a different thing and always was.
 
 Separate Package
 ~~~~~~~~~~~~~~~~
