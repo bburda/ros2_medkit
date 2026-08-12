@@ -340,6 +340,53 @@ def poll_entity_faults(port, entity_path, code, timeout=30.0, interval=0.5):
     return None
 
 
+def poll_fault_describing(port, code, needles, timeout=60.0, interval=0.5):
+    """Poll the GLOBAL ``GET /faults`` until `code` is present AND names every needle.
+
+    :func:`poll_faults` returns the moment the code appears, which is not the
+    same thing as the fault being complete. An aggregating detector raises as
+    soon as its FIRST subject crosses the persistence gate and then rewrites the
+    description on later ticks as more subjects cross it. A test that wants two
+    subjects named has to wait for the second one, or it reads whichever
+    description happened to be current and fails on a slower runner.
+
+    Note the description is capped (``kMaxDescriptionChars``), so this can also
+    time out because the text was truncated rather than because a subject was
+    missing. The returned description lets the caller say which.
+
+    Parameters
+    ----------
+    port : int
+        Gateway HTTP port.
+    code : str
+        The ``fault_code`` to look for.
+    needles : iterable of str
+        Substrings that must all appear in the fault description.
+    timeout : float
+        Maximum time to wait in seconds.
+    interval : float
+        Sleep between retries in seconds.
+
+    Returns
+    -------
+    tuple of (bool, str)
+        ``(True, description)`` once every needle is present, otherwise
+        ``(False, last_description)`` on timeout - empty if the code never
+        appeared at all.
+
+    """
+    deadline = time.monotonic() + timeout
+    last_description = ''
+    while time.monotonic() < deadline:
+        fault = poll_faults(port, code, timeout=interval, interval=interval)
+        if fault is not None:
+            last_description = fault.get('description', '')
+            if all(needle in last_description for needle in needles):
+                return True, last_description
+        time.sleep(interval)
+    return False, last_description
+
+
 def poll_cleared(port, code, timeout=30.0, interval=0.5):
     """Poll the GLOBAL ``GET /faults`` endpoint until `code` is absent.
 
