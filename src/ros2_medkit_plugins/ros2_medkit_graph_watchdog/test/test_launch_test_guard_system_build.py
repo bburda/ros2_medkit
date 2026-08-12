@@ -88,7 +88,7 @@ def test_guard_does_not_break_a_real_configure(tmp_path):
         PACKAGE_ROOT, guarded_build, SYSTEM_INSTALL_PREFIX, localstatedir='/var'
     )
     assert_guard_suppressed_launch_tests(
-        'ros2_medkit_graph_watchdog', baseline_tests, guarded, guarded_build
+        'ros2_medkit_graph_watchdog', baseline_tests, guarded, guarded_build, baseline_build
     )
 
 

@@ -232,11 +232,12 @@ endfunction()
 # package build (see _medkit_launch_tests_can_register() above) registers no
 # launch test at all, and set_tests_properties on a test name that was never
 # registered is a hard CMake configure error, not a no-op. ENV is multi-value
-# and always APPENDs after the domain the macro already set, so a caller's
-# environment can never overwrite MEDKIT_TEST_DOMAINS - an ENV entry that sets
-# it with the literal key "MEDKIT_TEST_DOMAINS=" hits a FATAL_ERROR instead of
-# a silently-lost domain, which used to be what a plain
-# set_tests_properties(... PROPERTIES ENVIRONMENT ...) did.
+# and always APPENDs after the domain the macro already set, so a caller
+# spelling the literal key "MEDKIT_TEST_DOMAINS=" cannot overwrite it - that
+# hits a FATAL_ERROR instead of a silently-lost domain, which used to be what
+# a plain set_tests_properties(... PROPERTIES ENVIRONMENT ...) did. This is a
+# literal-string check, not a generator-expression evaluation - see the check
+# itself, further down, for the value it deliberately does not chase down.
 #
 # ARGS forwards extra launch arguments (e.g. "foo:=bar") straight to
 # add_launch_test(), same as it always did.
@@ -279,6 +280,23 @@ macro(medkit_add_launch_test TEST_NAME TEST_FILE)
     # "${_MALT_LABELS}" further down re-joins the collected words with ';' on
     # the way back out, which is exactly the list ctest expects.
     cmake_parse_arguments(_MALT "" "TIMEOUT;DOMAINS" "ENV;LABELS;ARGS" ${ARGN})
+    # cmake_parse_arguments records, rather than errors on, a keyword given
+    # with no value before the next token - which includes a value that
+    # happens to spell another recognised keyword's name, e.g.
+    # LABELS "ENV" DOMAINS 2: parsing sees ENV as a new keyword opening,
+    # not as a LABELS value, so LABELS silently ends up empty instead of
+    # containing "ENV" and nothing says so unless this is checked. Left
+    # unchecked, that is a caller's value silently misrouted or dropped,
+    # not merely an unhelpful error - worse than the CMake default of no
+    # error at all.
+    if(_MALT_KEYWORDS_MISSING_VALUES)
+      message(FATAL_ERROR
+        "medkit_add_launch_test(${TEST_NAME}): ${_MALT_KEYWORDS_MISSING_VALUES} given with no "
+        "value. If a value passed to a preceding keyword happens to spell one of TIMEOUT, "
+        "DOMAINS, ENV, LABELS or ARGS, cmake_parse_arguments starts a new keyword there "
+        "instead of taking it as a value - check the call for a value that collides with "
+        "one of those names.")
+    endif()
     if(NOT DEFINED _MALT_DOMAINS)
       set(_MALT_DOMAINS 1)
     endif()

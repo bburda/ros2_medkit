@@ -186,6 +186,24 @@ medkit_add_launch_test(probe_launch_test probe_launch.test.py TIMEOUT 10
   ENV "MEDKIT_TEST_DOMAINS=99")
 """
 
+# "ENV" here is meant as a plain LABELS value, but cmake_parse_arguments
+# cannot tell a value from a keyword by position, only by spelling: "ENV" is
+# itself one of this macro's recognised keywords, so it closes the open
+# LABELS collection - with nothing in it - and opens a new, equally empty
+# ENV collection instead. Both keywords land in _MALT_KEYWORDS_MISSING_VALUES,
+# and without checking that, the caller's intended value simply disappears -
+# no error, nothing in the generated CTestTestfile.cmake to say why LABELS
+# came out empty.
+KEYWORD_SHAPED_VALUE_PROBE = """cmake_minimum_required(VERSION 3.14)
+project(medkit_launch_guard_keyword_shaped_value_probe C)
+find_package(ament_cmake REQUIRED)
+find_package(launch_testing_ament_cmake REQUIRED)
+include("{module}")
+enable_testing()
+medkit_add_launch_test(probe_launch_test probe_launch.test.py
+  LABELS "ENV")
+"""
+
 
 def configure_probe(
     tmp_path, template, install_prefix, extra_files, *, localstatedir=None, ros_distro='jazzy'
@@ -461,6 +479,74 @@ def test_launch_test_is_registered_with_a_non_distribution_prefix_and_localstate
     assert 'probe_launch_test' in registered_tests(build), result.stdout
 
 
+def test_launch_test_is_registered_with_a_ros_shaped_prefix_outside_opt(tmp_path):
+    """
+    A prefix shaped like a ROS distribution root under a different tree does not suppress.
+
+    ``/usr/ros/humble`` has the same ``<top>/ros/<name>`` shape bloom's own
+    ``/opt/ros/<distro>`` does, just rooted at ``/usr`` instead of ``/opt`` -
+    nowhere a build farm installs, and no colcon workspace either. A guard
+    broadened to ``^/(opt|usr)/ros/[^/]+$``, on the reasoning that a distro
+    root might live under either, would wrongly suppress this. The regex has
+    to name ``/opt`` specifically; nothing about "looks like a ROS prefix"
+    is the signal on its own.
+    """
+    result, build = configure_probe(
+        tmp_path,
+        LAUNCH_PROBE,
+        '/usr/ros/humble',
+        {'probe_launch.test.py': '# empty launch test file\n'},
+        localstatedir='/var',
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'probe_launch_test' in registered_tests(build), result.stdout
+
+
+def test_launch_test_is_registered_with_a_localstatedir_that_only_starts_with_var(tmp_path):
+    """
+    CMAKE_INSTALL_LOCALSTATEDIR has to equal "/var" exactly, not merely start with it.
+
+    ``/var/lib`` is a real, plausible absolute path a caller might pass - it
+    is not ``/var`` and must not suppress. A guard loosened from
+    ``STREQUAL "/var"`` to ``MATCHES "^/var"`` would wrongly suppress this,
+    because the string "/var" is a prefix of "/var/lib".
+    """
+    result, build = configure_probe(
+        tmp_path,
+        LAUNCH_PROBE,
+        '/opt/ros/jazzy',
+        {'probe_launch.test.py': '# empty launch test file\n'},
+        localstatedir='/var/lib',
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'probe_launch_test' in registered_tests(build), result.stdout
+
+
+def test_launch_test_is_registered_with_a_localstatedir_that_merely_shares_the_var_prefix(
+    tmp_path,
+):
+    """
+    CMAKE_INSTALL_LOCALSTATEDIR "/variable" must not suppress either.
+
+    A second, distinct way the same ``MATCHES "^/var"`` loosening goes
+    wrong: "/variable" shares the four characters "/var" with no path
+    separator after them at all, which a start-anchored-only regex still
+    matches. This case and ``/var/lib`` above are not redundant: a mutation
+    narrowed to ``^/var/`` (requiring a trailing slash) would still wrongly
+    suppress ``/var/lib`` while correctly rejecting this one, so both
+    shapes have to be pinned separately for either mistake to be caught.
+    """
+    result, build = configure_probe(
+        tmp_path,
+        LAUNCH_PROBE,
+        '/opt/ros/jazzy',
+        {'probe_launch.test.py': '# empty launch test file\n'},
+        localstatedir='/variable',
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'probe_launch_test' in registered_tests(build), result.stdout
+
+
 def test_launch_test_is_not_registered_on_humble(tmp_path):
     """
     The guard's prefix match is a wildcard, not hard-coded to one distro.
@@ -554,9 +640,13 @@ def test_env_cannot_set_medkit_test_domains_directly(tmp_path):
 
     Without this, a caller writing ENV "MEDKIT_TEST_DOMAINS=99" would append a
     second, later ENVIRONMENT entry that wins over the one the macro sets from
-    DOMAINS at run time - the comment above the ENV foreach promises the
-    domain can never be overwritten, and this is what makes that true instead
-    of merely documented.
+    DOMAINS at run time - the comment above the ENV foreach promises a caller
+    cannot overwrite it by spelling the literal key, and this is what makes
+    that true instead of merely documented. It is not a promise about every
+    input: a value spelled to avoid the literal key (a generator expression
+    such as "$<1:MEDKIT_TEST_DOMAINS=99>") still collides at run time, same
+    as if this check did not exist at all - the check only ever promised the
+    plain spelling, and nothing here tests the generator-expression form.
     """
     result, build = configure_probe(
         tmp_path,
@@ -570,6 +660,38 @@ def test_env_cannot_set_medkit_test_domains_directly(tmp_path):
     )
     assert 'MEDKIT_TEST_DOMAINS' in result.stderr, result.stderr
     assert 'DOMAINS' in result.stderr, result.stderr
+    assert not (build / 'CTestTestfile.cmake').is_file(), (
+        'a failed configure left a CTestTestfile.cmake behind'
+    )
+
+
+def test_a_value_that_spells_a_keyword_fails_the_configure_instead_of_vanishing(tmp_path):
+    """
+    A LABELS value that spells another keyword's name fails loudly instead of disappearing.
+
+    `LABELS "ENV"` looks like it should set the label to the literal string
+    "ENV", but cmake_parse_arguments cannot distinguish a value from a
+    keyword by position, only by spelling - "ENV" is itself one of this
+    macro's own recognised keywords, so it closes the open LABELS collection
+    (with nothing in it) and opens a new, equally empty ENV collection
+    instead. Both end up in _MALT_KEYWORDS_MISSING_VALUES. Left unchecked,
+    this would register the launch test with neither the caller's intended
+    LABELS override nor any ENV entry - the value silently vanishes, no
+    error, nothing in the generated CTestTestfile.cmake to say why LABELS
+    came out empty (or missing entirely, since add_launch_test's own default
+    of "launch_test" would apply instead).
+    """
+    result, build = configure_probe(
+        tmp_path,
+        KEYWORD_SHAPED_VALUE_PROBE,
+        tmp_path / 'install',
+        {'probe_launch.test.py': '# empty launch test file\n'},
+    )
+    assert result.returncode != 0, (
+        'configuring succeeded with a LABELS value that spells another keyword name, so the '
+        f'value silently vanished instead of failing the configure:\n{result.stdout}'
+    )
+    assert 'given with no value' in result.stderr, result.stderr
     assert not (build / 'CTestTestfile.cmake').is_file(), (
         'a failed configure left a CTestTestfile.cmake behind'
     )
