@@ -213,15 +213,18 @@ not supported, and not merely discouraged: see the next section for why the
 build can register no launch test at all, and a property call that names a
 test CMake never registered is a hard configure error, not a no-op. `ENV` is
 applied after the domain the macro already set for the test, by appending, so
-a caller's own environment can never overwrite `MEDKIT_TEST_DOMAINS` - an
-`ENV` entry that sets the literal key `MEDKIT_TEST_DOMAINS=` fails the
-configure with `FATAL_ERROR` naming `DOMAINS` as the way to set it, rather
-than silently landing behind the macro's own entry and winning at run time
-the way a plain `set_tests_properties(... PROPERTIES ENVIRONMENT ...)` used
-to. This is a literal string match, not a generator-expression evaluation:
-it does not chase down a value spelled to avoid the literal key (e.g.
-`ENV "$<1:MEDKIT_TEST_DOMAINS=99>"`), which nobody writes by accident and
-which a blanket rejection of `$<` would also catch legitimate uses of.
+a caller spelling the literal key `MEDKIT_TEST_DOMAINS=` cannot overwrite it -
+an `ENV` entry that does fails the configure with `FATAL_ERROR` naming
+`DOMAINS` as the way to set it, rather than silently landing behind the
+macro's own entry and winning at run time the way a plain
+`set_tests_properties(... PROPERTIES ENVIRONMENT ...)` used to. This is a
+literal string match, not a generator-expression evaluation, so the promise
+covers only that plain spelling: it does not chase down a value spelled to
+avoid the literal key (e.g. `ENV "$<1:MEDKIT_TEST_DOMAINS=99>"`), which still
+collides at run time exactly as if this check did not exist. Nobody writes
+that by accident, and a blanket rejection of `$<` would also catch legitimate
+uses of it in some other `ENV` entry, so this check only promises to catch
+the plain spelling.
 `LABELS` overrides `add_launch_test()`'s own default of `"launch_test"`, the same
 override callers used to apply by hand. `ARGS` forwards extra launch
 arguments straight to `add_launch_test()`, same as it always did - it has its

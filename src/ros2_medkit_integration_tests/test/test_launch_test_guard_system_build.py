@@ -70,6 +70,8 @@ where its own dependencies are already declared and guaranteed rather than
 ridden on someone else's. The invariant - for every package that registers
 launch tests, a guarded configure succeeds and suppresses exactly its launch
 tests - is therefore split across two packages, not weakened for either one.
+One package has a documented, unrelated exception to "exactly its launch
+tests": see ALSO_SUPPRESSED_BY_PACKAGE below.
 
 Confirmed empirically, not assumed: see the `resolvable_packages` fixture
 below, which baseline-configures every candidate once, and
@@ -117,6 +119,21 @@ LAUNCH_TEST_PACKAGES = {
     'ros2_medkit_fault_reporter': 'src/ros2_medkit_fault_reporter',
     'ros2_medkit_log_bridge': 'src/ros2_medkit_log_bridge',
     'ros2_medkit_integration_tests': 'src/ros2_medkit_integration_tests',
+}
+
+# ros2_medkit_integration_tests' own test_launch_test_guard_system_build (this
+# file, once installed and configured as part of that package for real) gates
+# its OWN registration on _medkit_launch_tests_can_register() too - see the
+# comment above its ament_add_pytest_test() call in that package's
+# CMakeLists.txt: it cannot prove anything about a system-package build's own
+# repository root while running inside one, so it declines to register there
+# rather than report a pass on nothing. That makes it disappear from a guarded
+# configure of ros2_medkit_integration_tests for a reason that has nothing to
+# do with being a launch test - cmake_guard.assert_guard_suppressed_launch_tests
+# needs to be told about it explicitly, via also_suppressed, or it reads as the
+# guard swallowing something it should not have.
+ALSO_SUPPRESSED_BY_PACKAGE = {
+    'ros2_medkit_integration_tests': {'test_launch_test_guard_system_build'},
 }
 
 # All six configure under colcon test's own dependency-derived environment
@@ -222,7 +239,10 @@ def test_guard_does_not_break_a_real_configure(
 
     guarded_build = tmp_path / 'guarded_build'
     guarded = configure(source_dir, guarded_build, SYSTEM_INSTALL_PREFIX, localstatedir='/var')
-    assert_guard_suppressed_launch_tests(name, baseline_tests, guarded, guarded_build)
+    assert_guard_suppressed_launch_tests(
+        name, baseline_tests, guarded, guarded_build, baseline_build,
+        also_suppressed=ALSO_SUPPRESSED_BY_PACKAGE.get(name, ()),
+    )
 
 
 def test_all_launch_test_packages_resolve(resolvable_packages):
