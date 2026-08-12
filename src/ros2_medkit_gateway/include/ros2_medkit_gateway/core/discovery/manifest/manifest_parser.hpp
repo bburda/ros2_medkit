@@ -67,7 +67,7 @@ class ManifestParser {
    * fragment MAY declare `manifest_version` but is not required to - when
    * omitted, a synthetic `"1.0"` value is injected so the shared
    * `parse_string` pipeline still sees a well-formed manifest. Forbidden
-   * top-level fields (`areas`, `metadata`, `discovery`, `scripts`,
+   * top-level fields (`areas`, `metadata`, `config`, `discovery`, `scripts`,
    * `capabilities`, `lock_overrides`) are still parsed into the returned
    * `Manifest` so the caller (`ManifestManager::apply_fragments`) can
    * detect and reject them with a specific validation error.
@@ -93,7 +93,25 @@ class ManifestParser {
   AssetIdentity parse_identity(const YAML::Node & node) const;
   App parse_app(const YAML::Node & node) const;
   Function parse_function(const YAML::Node & node) const;
-  ManifestConfig parse_config(const YAML::Node & node) const;
+  /// Validate the YAML kind of the discovery-configuration block (`config:`,
+  /// or the deprecated `discovery:` alias), then parse it. A null block means
+  /// "absent". A non-map block is reported under R015, which is a VALIDATION
+  /// notice: under the shipped `manifest_strict_validation: true` that rejects
+  /// the whole manifest, and only with strict validation off does the block
+  /// get ignored and the defaults apply. Either way parse_config() only ever
+  /// sees a map.
+  ManifestConfig parse_config_block(const YAML::Node & node, const std::string & key,
+                                    std::vector<ManifestParseNotice> & notices) const;
+  /// Parse the settings inside an already-validated block. Values that are
+  /// recognised but wrong - an unrecognised `unmanifested_nodes` (R014), or a
+  /// setting of the wrong YAML kind (R015) - are appended to @p notices so the
+  /// caller can put them through `discovery.manifest_strict_validation`.
+  ManifestConfig parse_config(const YAML::Node & node, std::vector<ManifestParseNotice> & notices) const;
+  /// Read one boolean discovery setting, leaving *target* alone when the key
+  /// is absent or null and reporting R015 when it is present but not a
+  /// boolean. Never throws: `.as<bool>()` would abort the whole manifest load.
+  void read_bool_setting(const YAML::Node & node, const std::string & key, bool & target,
+                         std::vector<ManifestParseNotice> & notices) const;
   ManifestMetadata parse_metadata(const YAML::Node & node) const;
   ManifestLockConfig parse_lock_config(const YAML::Node & node) const;
   ScriptEntryConfig parse_script_entry(const YAML::Node & node) const;

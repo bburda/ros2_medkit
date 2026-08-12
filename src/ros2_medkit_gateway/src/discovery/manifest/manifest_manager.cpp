@@ -66,6 +66,7 @@ bool ManifestManager::load_manifest(const std::string & file_path, bool strict) 
     for (auto & warn : merge_errors.warnings) {
       validation_result_.warnings.push_back(std::move(warn));
     }
+    merge_parse_notices(loaded, file_path);
 
     // Always fail on ERRORs (broken references, circular deps, duplicate bindings)
     // These indicate a fundamentally broken manifest that would cause runtime issues
@@ -87,6 +88,7 @@ bool ManifestManager::load_manifest(const std::string & file_path, bool strict) 
     }
 
     manifest_ = std::move(loaded);
+    cached_config_.store(manifest_->config);
     build_lookup_maps();
 
     auto msg = "Manifest loaded successfully: " + std::to_string(manifest_->areas.size()) + " areas, " +
@@ -114,6 +116,7 @@ bool ManifestManager::load_manifest_from_string(const std::string & yaml_content
   try {
     Manifest loaded = parser_.parse_string(yaml_content);
     validation_result_ = validator_.validate(loaded);
+    merge_parse_notices(loaded, "<string>");
 
     // Always fail on ERRORs (broken references, circular deps, duplicate bindings)
     if (validation_result_.has_errors()) {
@@ -134,6 +137,7 @@ bool ManifestManager::load_manifest_from_string(const std::string & yaml_content
     }
 
     manifest_ = std::move(loaded);
+    cached_config_.store(manifest_->config);
     build_lookup_maps();
     return true;
 
@@ -141,6 +145,24 @@ bool ManifestManager::load_manifest_from_string(const std::string & yaml_content
     log_error("Failed to parse manifest: " + std::string(e.what()));
     validation_result_.add_error("LOAD", e.what(), "<string>");
     return false;
+  }
+}
+
+void ManifestManager::merge_parse_notices(const Manifest & loaded, const std::string & source_path) {
+  for (const auto & notice : loaded.log_notices) {
+    // Log-only notices describe the manifest FILE, not this particular load,
+    // so they are emitted once per distinct message rather than once per load.
+    // A plugin that calls notify_entities_changed re-reads the manifest, and
+    // without this a deprecated key would reprint its notice on every refresh
+    // for the life of the process. Validation notices below are rebuilt each
+    // time on purpose: they are the current validation state, which callers
+    // read back through get_validation_result().
+    if (logged_notices_.insert(notice).second) {
+      log_warn(notice);
+    }
+  }
+  for (const auto & notice : loaded.validation_notices) {
+    validation_result_.add_warning(notice.rule_id, notice.message, source_path);
   }
 }
 
@@ -159,6 +181,10 @@ bool ManifestManager::reload_manifest() {
     old_manifest = std::move(manifest_);
     old_strict_mode = strict_mode_;
     manifest_.reset();
+    // cached_config_ deliberately keeps the OLD value across the reload
+    // window. The pipeline is still running the old policy until the reload
+    // completes, so reporting it is accurate; blanking it to defaults would
+    // make /health briefly describe a configuration nothing is using.
   }
 
   std::string path_to_reload = manifest_path_;
@@ -167,6 +193,7 @@ bool ManifestManager::reload_manifest() {
     // Restore old manifest on failure
     std::lock_guard<std::mutex> lock(mutex_);
     manifest_ = std::move(old_manifest);
+    cached_config_.store(manifest_ ? manifest_->config : ManifestConfig{});
     log_warn("Manifest reload failed, keeping previous version");
     return false;
   }
@@ -179,6 +206,7 @@ void ManifestManager::unload_manifest() {
   std::lock_guard<std::mutex> lock(mutex_);
 
   manifest_.reset();
+  cached_config_.store(ManifestConfig{});
   manifest_path_.clear();
   validation_result_ = ValidationResult{};
   area_index_.clear();
@@ -213,11 +241,9 @@ std::optional<ManifestMetadata> ManifestManager::get_metadata() const {
 }
 
 ManifestConfig ManifestManager::get_config() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (manifest_) {
-    return manifest_->config;
-  }
-  return ManifestConfig{};
+  // Deliberately lock-free: see cached_config_. Taking mutex_ here would put
+  // the liveness path behind a full manifest load.
+  return cached_config_.load();
 }
 
 std::unordered_map<std::string, ManifestLockConfig> ManifestManager::get_lock_overrides() const {
@@ -688,8 +714,12 @@ bool ManifestManager::apply_fragments(Manifest & base) {
     // be detected by the struct checks. manifest_version is auto-injected by
     // parse_fragment_file when the fragment omits it, so we do not inspect it
     // here - fragments are free to declare or omit it.
+    // Both spellings of the discovery-configuration block are forbidden: a
+    // fragment that could declare configuration under either one would have it
+    // silently dropped by the merge below, which is the same class of bug one
+    // level down.
     static constexpr const char * kForbiddenKeys[] = {
-        "areas", "metadata", "scripts", "capabilities", "lock_overrides", "discovery",
+        "areas", "metadata", "scripts", "capabilities", "lock_overrides", "config", "discovery",
     };
     static constexpr const char * kAllowedKeys[] = {
         "apps",

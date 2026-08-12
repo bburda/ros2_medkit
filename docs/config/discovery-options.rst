@@ -178,7 +178,10 @@ Field Groups
    * - ``status``
      - is_online, bound_fqn
    * - ``metadata``
-     - source, ros_binding, external, x-medkit extensions, custom metadata fields
+     - ros_binding, external, x-medkit extensions, custom metadata fields.
+       **Not** ``source``: an entity's provenance decides whether the orphan
+       filter may delete it, so it is never negotiated between layers and
+       setting ``layers.manifest.metadata`` does not move it.
 
 Merge Policies
 ^^^^^^^^^^^^^^
@@ -290,31 +293,47 @@ Health Endpoint
 ^^^^^^^^^^^^^^^
 
 ``GET /api/v1/health`` includes a ``discovery`` section in hybrid mode with
-pipeline stats, linking results, and merge warnings:
+pipeline stats and linking results. The ``warnings`` array and
+``warning_schema_version`` are unconditional - they are served in every mode,
+and an empty array means the gateway has no anomaly to report (see
+:doc:`/api/warning_codes`). ``discovery.linking`` is the conditional part: it
+appears only when a manifest is loaded, and ``unmanifested_policy`` carries the
+configured :ref:`unmanifested_nodes <manifest-unmanifested-nodes>` value so a
+client can evaluate ``orphan_count > 0 && unmanifested_policy == "error"``
+without parsing prose.
 
 .. code-block:: json
 
    {
      "status": "healthy",
+     "warnings": [],
+     "warning_schema_version": 2,
      "discovery": {
        "mode": "hybrid",
        "strategy": "hybrid",
        "pipeline": {
-         "layers": ["manifest", "runtime", "plugin"],
-         "total_entities": 6,
-         "enriched_count": 5,
+         "layers": ["manifest", "runtime"],
+         "total_entities": 9,
+         "enriched_count": 1,
          "conflict_count": 0,
          "conflicts": [],
          "id_collisions": 0,
          "filtered_by_gap_fill": 0
        },
        "linking": {
-         "linked_count": 5,
-         "orphan_count": 1,
-         "binding_conflicts": 0
+         "linked_count": 2,
+         "orphan_count": 5,
+         "binding_conflicts": 0,
+         "unmanifested_policy": "warn"
        }
      }
    }
+
+The response also carries the ``x-medkit-data-provider``,
+``x-medkit-entity-cache`` and ``x-medkit-subscription-executor`` statistics
+objects, omitted here. ``layers`` lists one entry per active layer, and a
+discovery plugin contributes under its own registered name (for example
+``"opcua"``) rather than a literal ``"plugin"``.
 
 Configuration Example
 ---------------------

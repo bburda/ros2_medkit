@@ -262,7 +262,12 @@ if(BUILD_TESTING)
   unset(_MEDKIT_TEST_TIMEOUT_OVERRIDES_SEEN)
 
   # Feature tests (atomic, independent, 120s timeout unless overridden above)
-  file(GLOB FEATURE_TESTS test/features/*.test.py)
+  # CONFIGURE_DEPENDS is load-bearing, not tidiness: a glob is expanded at
+  # configure time, so without it a test file added after the build tree was
+  # configured is never registered. The suite then reports a clean pass while
+  # silently not running it, and the absence of a whole test file looks
+  # exactly like success.
+  file(GLOB FEATURE_TESTS CONFIGURE_DEPENDS test/features/*.test.py)
   foreach(test_file ${FEATURE_TESTS})
     get_filename_component(test_name ${test_file} NAME_WE)
     set(_test_domains 1)
@@ -286,7 +291,12 @@ if(BUILD_TESTING)
   endforeach()
 
   # Scenario tests (E2E stories, 300s timeout unless overridden above)
-  file(GLOB SCENARIO_TESTS test/scenarios/*.test.py)
+  # CONFIGURE_DEPENDS is load-bearing, not tidiness: a glob is expanded at
+  # configure time, so without it a test file added after the build tree was
+  # configured is never registered. The suite then reports a clean pass while
+  # silently not running it, and the absence of a whole test file looks
+  # exactly like success.
+  file(GLOB SCENARIO_TESTS CONFIGURE_DEPENDS test/scenarios/*.test.py)
   foreach(test_file ${SCENARIO_TESTS})
     get_filename_component(test_name ${test_file} NAME_WE)
     set(_test_domains 1)

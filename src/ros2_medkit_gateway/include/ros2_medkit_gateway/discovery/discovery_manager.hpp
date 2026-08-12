@@ -15,6 +15,7 @@
 #pragma once
 
 #include "ros2_medkit_gateway/core/discovery/discovery_enums.hpp"
+#include "ros2_medkit_gateway/core/discovery/layers/manifest_layer.hpp"
 #include "ros2_medkit_gateway/core/discovery/merge_types.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/app.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/area.hpp"
@@ -365,6 +366,28 @@ class DiscoveryManager : public ServiceActionResolver {
    */
   discovery::ManifestManager * get_manifest_manager();
 
+  /**
+   * @brief Get the discovery configuration the manifest asked for
+   *
+   * Answers in every mode. There is no manifest manager in runtime_only, and
+   * a hybrid manifest that fails to load resets it, so this returns a
+   * default-constructed ManifestConfig in those cases - the same values the
+   * pipeline itself runs with.
+   */
+  discovery::ManifestConfig get_manifest_config() const;
+
+  /**
+   * @brief Re-read the manifest configuration into the running pipeline
+   *
+   * Call after a successful manifest reload. `/health` reads the config live
+   * from the ManifestManager, but the pipeline captured it when it was built,
+   * so without this the served `unmanifested_policy` and the policy the
+   * orphan filter actually runs drift apart. Keeps the existing layers - in
+   * particular plugin layers added at runtime - and only refreshes the config
+   * and the manifest layer's policies.
+   */
+  void refresh_manifest_config();
+
   // =========================================================================
   // Status
   // =========================================================================
@@ -430,6 +453,11 @@ class DiscoveryManager : public ServiceActionResolver {
    */
   template <typename LayerT>
   void apply_layer_policy_overrides(const std::string & layer_name, LayerT & layer);
+
+  /// Apply the manifest layer's two policy sources in their required order:
+  /// the `allow_manifest_override` blanket demotion first, then the per-group
+  /// gateway parameters, so an explicit parameter keeps beating the flag.
+  void apply_manifest_layer_policies(discovery::ManifestLayer & manifest_layer);
 
   rclcpp::Node * node_;
   DiscoveryConfig config_;

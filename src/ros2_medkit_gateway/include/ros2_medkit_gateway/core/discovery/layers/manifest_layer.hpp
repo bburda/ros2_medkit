@@ -40,6 +40,10 @@ class ManifestLayer : public DiscoveryLayer {
 
   void set_policy(FieldGroup group, MergePolicy policy);
 
+  /// Restore the shipped policies. Needed on reload: a manifest that turns
+  /// allow_manifest_override back on must undo the previous demotion.
+  void reset_policies_to_defaults();
+
  private:
   ManifestManager * manifest_manager_;
   std::unordered_map<FieldGroup, MergePolicy> policies_;

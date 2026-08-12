@@ -48,9 +48,21 @@ ERRORS=0
 # when the base ref is unavailable (a fresh clone, a detached checkout, a fork with a
 # different remote name), and the filter below is then skipped rather than silencing
 # the hook.
+#
+# "What this branch changes" has to include work that is not committed yet, or the
+# pre-commit stage - the one this script was written for, which passes STAGED
+# filenames - matches nothing and the script exits 0 having analysed no files at all.
+# A silent pass is indistinguishable from a clean one, so the three sources are
+# unioned: committed branch diff, staged, and working tree.
 BRANCH_FILES=""
 if BASE_REF="$(git merge-base origin/main HEAD 2>/dev/null)"; then
-  BRANCH_FILES="$(git diff --name-only "$BASE_REF" HEAD 2>/dev/null || true)"
+  BRANCH_FILES="$(
+    {
+      git diff --name-only "$BASE_REF" HEAD 2>/dev/null || true   # committed on this branch
+      git diff --name-only --cached 2>/dev/null || true           # staged, not yet committed
+      git diff --name-only 2>/dev/null || true                    # modified in the working tree
+    } | sort -u
+  )"
 fi
 
 for file in "$@"; do

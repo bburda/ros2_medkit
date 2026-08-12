@@ -13,7 +13,9 @@ metadata:
   description: "Demo vehicle system for integration testing"
 
 config:
-  # Fail on orphan nodes during testing to catch manifest mismatches
+  # Log a warning per undeclared node during testing to catch manifest
+  # mismatches. Use `error` to additionally have them reported on
+  # GET /api/v1/health - no policy value stops the gateway.
   unmanifested_nodes: warn
   inherit_runtime_resources: true
 

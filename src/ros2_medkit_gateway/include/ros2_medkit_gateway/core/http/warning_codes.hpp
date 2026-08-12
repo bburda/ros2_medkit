@@ -34,11 +34,29 @@ namespace ros2_medkit_gateway {
 /// ``parentComponentId`` pointing at the colliding ID on the owning peer).
 inline constexpr const char * WARN_LEAF_ID_COLLISION = "leaf_id_collision";
 
+/// One or more running ROS nodes are not declared in the manifest while
+/// unmanifested_nodes is set to "error". The gateway keeps serving; the node
+/// fully-qualified names are listed in ``ros_node_fqns`` and ``entity_ids`` is
+/// empty, because a node FQN is not an addressable SOVD entity id. Resolve by
+/// declaring them in the manifest, or by relaxing the policy to "warn" or
+/// "ignore".
+inline constexpr const char * WARN_UNMANIFESTED_NODES = "unmanifested_nodes";
+
 /// Schema version for the ``warnings`` array on ``GET /health``. Clients can
 /// key on this integer to detect supported warning codes without
 /// string-matching on individual codes. Increment whenever a code is added,
 /// removed, or the shape of an individual warning object changes. Keep in
 /// sync with docs/api/warning_codes.rst.
-inline constexpr int kWarningSchemaVersion = 1;
+///
+/// Version 2 added ``unmanifested_nodes`` and the ``ros_node_fqns`` field,
+/// and made the array unconditional: it used to be emitted only when
+/// aggregation was active, which left every non-aggregating gateway unable to
+/// report anything at all.
+///
+/// Invariant across all codes: ``entity_ids`` carries addressable SOVD entity
+/// ids only, ``ros_node_fqns`` carries ROS node names, ``peer_names`` carries
+/// aggregation peers, and all three are always present - empty when a code has
+/// nothing to say in one of them.
+inline constexpr int kWarningSchemaVersion = 2;
 
 }  // namespace ros2_medkit_gateway
