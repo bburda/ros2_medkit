@@ -654,8 +654,22 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
 
   // Parameter-service tuning parameters were declared at construction-time
   // alongside the rest of the gateway parameters; resolve them here.
-  const double parameter_service_timeout_sec = get_parameter("parameter_service_timeout_sec").as_double();
-  const double parameter_service_negative_cache_sec = get_parameter("parameter_service_negative_cache_sec").as_double();
+  // The FloatingPointRange descriptors on these two do NOT cover NaN: rclcpp's
+  // range check compares with < and >, and every comparison against NaN is
+  // false, so NaN is accepted as in-range and the gateway starts with it.
+  // Verified against a running gateway, which reported "timeout=nans". It then
+  // reaches a duration_cast and a try_lock_for, where it is undefined. Checked
+  // here with isfinite, which is the part rclcpp cannot do for us.
+  auto resolve_finite = [this](const char * name, double fallback) {
+    const double value = get_parameter(name).as_double();
+    if (std::isfinite(value)) {
+      return value;
+    }
+    RCLCPP_WARN(get_logger(), "%s is not a finite number. Using default %.1f.", name, fallback);
+    return fallback;
+  };
+  const double parameter_service_timeout_sec = resolve_finite("parameter_service_timeout_sec", 2.0);
+  const double parameter_service_negative_cache_sec = resolve_finite("parameter_service_negative_cache_sec", 60.0);
   parameter_transport_ = std::make_shared<ros2::Ros2ParameterTransport>(this, parameter_service_timeout_sec,
                                                                         parameter_service_negative_cache_sec);
   config_mgr_ = std::make_unique<ConfigurationManager>(parameter_transport_);
@@ -994,7 +1008,18 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     }
 
     TriggerConfig trigger_config;
-    trigger_config.max_triggers = static_cast<int>(get_parameter("triggers.max_triggers").as_int());
+    // The cap is stored as int here and compared against a size_t in
+    // TriggerManager, so a negative would become a huge unsigned bound and the
+    // documented "HTTP 503 when this limit is reached" would never fire - the
+    // trigger list would grow without one. Checked as int64 before narrowing.
+    const int64_t max_triggers_raw = get_parameter("triggers.max_triggers").as_int();
+    if (max_triggers_raw < 1 || max_triggers_raw > std::numeric_limits<int>::max()) {
+      RCLCPP_WARN(get_logger(), "triggers.max_triggers %" PRId64 " out of range. Using default 1000.",
+                  max_triggers_raw);
+      trigger_config.max_triggers = 1000;
+    } else {
+      trigger_config.max_triggers = static_cast<int>(max_triggers_raw);
+    }
     trigger_config.on_restart_behavior = get_parameter("triggers.on_restart_behavior").as_string();
 
     // Subscribe to data topics for data triggers. The adapter is created

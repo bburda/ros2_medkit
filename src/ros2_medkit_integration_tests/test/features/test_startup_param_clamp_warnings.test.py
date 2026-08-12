@@ -156,15 +156,41 @@ REJECTED_PARAMS = [
     ('refresh_interval_ms', 4294967396,
      'Invalid backstop refresh interval 4294967396ms'),
     ('sse.max_duration_sec', 4294967300,
-     'sse.max_duration_sec 4294967300 must be > 0'),
+     'sse.max_duration_sec 4294967300 must be in [1, 2147483647]'),
     ('discovery.refresh_debounce_ms', 70000,
      'Invalid discovery.refresh_debounce_ms 70000ms'),
-    ('topic_sample_timeout_sec', 60.0,
-     'topic_sample_timeout_sec 60.00 is outside 0.1-30.0'),
     ('bulk_data.max_upload_size', -1,
      'bulk_data.max_upload_size -1 is negative'),
     ('sse.max_subscriptions', -1,
      'sse.max_subscriptions -1 must be >= 1'),
+    ('triggers.max_triggers', -1,
+     'triggers.max_triggers -1 out of range. Using default 1000.'),
+    # Two float checks that a "below or above the range" test would not catch,
+    # because every comparison against NaN is false. NaN does survive the launch
+    # path: launch_ros hands the parameter through as a double, verified against
+    # a running gateway. Both sites are written as isfinite plus a positive
+    # range test for this reason.
+    ('topic_sample_timeout_sec', float('nan'),
+     'topic_sample_timeout_sec nan is outside 0.1-30.0'),
+    ('fault_manager.service_timeout_sec', float('nan'),
+     'fault_manager.service_timeout_sec nan must be finite and > 0'),
+    # This one carries a FloatingPointRange descriptor, so rclcpp refuses an
+    # ordinary out-of-range value before the gateway ever sees it. NaN is the
+    # exception: the descriptor compares with < and >, both false for NaN, so it
+    # is accepted as in-range and the gateway has to catch it at the read.
+    ('parameter_service_timeout_sec', float('nan'),
+     'parameter_service_timeout_sec is not a finite number'),
+]
+
+# Ordinary out-of-range values for the same two floats. They cannot ride on the
+# gateway above - one parameter takes one value - and they are worth keeping
+# separate anyway: NaN pins the isfinite guard, these pin the range itself, and
+# a mutation that dropped either would leave the other green.
+FLOOR_EXTRA_REJECTED = [
+    ('topic_sample_timeout_sec', 60.0,
+     'topic_sample_timeout_sec 60.00 is outside 0.1-30.0'),
+    ('fault_manager.service_timeout_sec', -1.0,
+     'fault_manager.service_timeout_sec -1.00 must be finite and > 0'),
 ]
 
 # The three whose above-ceiling case is skipped (see the module docstring).
@@ -223,7 +249,11 @@ def generate_test_description():
     # Floor gateway on the default port: GatewayTestCase polls /health here, so
     # this gateway also proves the clamped-to-floor values still serve requests.
     gateway_node = create_gateway_node(
-        extra_params={**FLOOR_PARAMS, **reachable},
+        extra_params={
+            **FLOOR_PARAMS,
+            **{name: value for name, value, _fragment in FLOOR_EXTRA_REJECTED},
+            **reachable,
+        },
     )
 
     gw_ceiling = create_gateway_node(
@@ -285,6 +315,11 @@ class TestStartupParamClampWarnings(GatewayTestCase):
         for parameter, floor, _ceiling, below, _above in CLAMPED_PARAMS:
             with self.subTest(parameter=parameter, direction='floor'):
                 self.assertIn(expected_warning(parameter, below, floor), reported)
+
+        text = _output_text(proc_output, gateway_node)
+        for parameter, _value, fragment in FLOOR_EXTRA_REJECTED:
+            with self.subTest(parameter=parameter, direction='out-of-range'):
+                self.assertIn(fragment, text)
 
     def test_above_ceiling_values_are_reported(self, proc_output, gw_ceiling):
         """Every parameter set above its ceiling names both values in the log.

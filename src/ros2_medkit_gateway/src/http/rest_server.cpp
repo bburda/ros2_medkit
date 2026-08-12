@@ -107,14 +107,14 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   const auto requested_keep_alive = node_->get_parameter("server.keep_alive_timeout_sec").as_int();
   const auto keep_alive_timeout_sec = clamp_keep_alive_timeout(requested_keep_alive, 1, 3600);
   if (static_cast<int64_t>(keep_alive_timeout_sec) != requested_keep_alive) {
-    RCLCPP_WARN(rclcpp::get_logger("rest_server"), "server.keep_alive_timeout_sec %" PRId64 " clamped to %ld",
-                requested_keep_alive, static_cast<long>(keep_alive_timeout_sec));
+    RCLCPP_WARN(rclcpp::get_logger("rest_server"), "server.keep_alive_timeout_sec %" PRId64 " clamped to %" PRId64,
+                requested_keep_alive, static_cast<int64_t>(keep_alive_timeout_sec));
   }
   http_server_ = std::make_unique<HttpServerManager>(tls_config_, http_thread_pool_size, keep_alive_timeout_sec);
   RCLCPP_INFO(rclcpp::get_logger("rest_server"),
               "HTTP request thread pool bounded to %zu workers (each active SSE stream holds one), "
-              "keep-alive timeout %lds",
-              http_thread_pool_size, static_cast<long>(keep_alive_timeout_sec));
+              "keep-alive timeout %" PRId64 "s",
+              http_thread_pool_size, static_cast<int64_t>(keep_alive_timeout_sec));
 
   // Set maximum payload size for uploads (cpp-httplib default is 8MB)
   auto * srv = http_server_->get_server();
@@ -174,8 +174,8 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   const int64_t max_duration_raw = node_->get_parameter("sse.max_duration_sec").as_int();
   int max_duration_sec = 3600;
   if (max_duration_raw < 1 || max_duration_raw > std::numeric_limits<int>::max()) {
-    RCLCPP_WARN(node_->get_logger(), "sse.max_duration_sec %" PRId64 " must be > 0. Using default 3600.",
-                max_duration_raw);
+    RCLCPP_WARN(rclcpp::get_logger("rest_server"),
+                "sse.max_duration_sec %" PRId64 " must be in [1, 2147483647]. Using default 3600.", max_duration_raw);
   } else {
     max_duration_sec = static_cast<int>(max_duration_raw);
   }

@@ -36,8 +36,9 @@ range and the gateway logs both values. This applies to the thread and pool knob
 for these, so the value is refused and the default takes its place. The warning
 names the value that was refused. This applies to ``server.port``,
 ``refresh_interval_ms``, ``discovery.refresh_debounce_ms``,
-``topic_sample_timeout_sec``, ``bulk_data.max_upload_size``,
-``sse.max_subscriptions`` and ``sse.max_duration_sec``:
+``topic_sample_timeout_sec``, ``fault_manager.service_timeout_sec``,
+``bulk_data.max_upload_size``, ``sse.max_subscriptions``,
+``sse.max_duration_sec`` and ``triggers.max_triggers``:
 
 .. code-block:: text
 
@@ -45,13 +46,19 @@ names the value that was refused. This applies to ``server.port``,
 
 **Refused at startup.** ``parameter_service_timeout_sec`` and
 ``parameter_service_negative_cache_sec`` are declared with a floating-point range
-descriptor, so rclcpp itself rejects the value and the gateway does not start:
+descriptor, so rclcpp itself rejects an out-of-range value and the gateway does
+not start:
 
 .. code-block:: text
 
    [ros2_medkit_gateway] Fatal exception in main: parameter
    'parameter_service_timeout_sec' could not be set: Parameter
    {parameter_service_timeout_sec} doesn't comply with floating point range.
+
+One value gets past that descriptor: ``.nan``. The range check compares with
+``<`` and ``>``, and every comparison against NaN is false, so rclcpp reads it as
+in-range. The gateway catches it when it reads the value, warns, and uses the
+default instead.
 
 In every case the point is the same. The config file and the running process must
 not disagree with nothing to show it, because the symptom of a mis-set value (a
@@ -352,7 +359,12 @@ Configure how the gateway connects to the fault manager services and event topic
    * - ``fault_manager.service_timeout_sec``
      - float
      - ``5.0``
-     - Timeout for fault manager service calls such as ``list_faults`` and ``get_snapshots``.
+     - Timeout for fault manager service calls such as ``list_faults`` and
+       ``get_snapshots``. Must be finite and greater than ``0``; anything else
+       is refused with a warning and ``5.0`` is used. Zero or negative would
+       make every fault call report "service not available" instead of waiting,
+       and a non-finite value would make it wait forever, holding an HTTP worker
+       for the life of the process.
    * - ``entity_freeze_frame.enabled``
      - bool
      - ``true``
@@ -664,7 +676,20 @@ Configure condition-based push notifications for resource changes.
      - int
      - ``1000``
      - Maximum number of concurrent triggers across all entities. Returns
-       HTTP 503 when this limit is reached.
+       HTTP 503 when this limit is reached. A value below ``1`` or past what an
+       ``int`` holds is refused with a warning and ``1000`` is used, because the
+       cap is compared as an unsigned count and a negative would remove it.
+   * - ``triggers.on_restart_behavior``
+     - string
+     - ``"reset"``
+     - Behavior on gateway restart for persistent triggers. ``"reset"`` clears
+       all triggers on restart. ``"restore"`` reloads persistent triggers from
+       the storage database.
+   * - ``triggers.storage.path``
+     - string
+     - ``""``
+     - Path to SQLite database for persistent trigger storage. When empty
+       (default), triggers are stored in-memory only and lost on restart.
 
 Fault-trigger rules
 ^^^^^^^^^^^^^^^^^^^
@@ -697,17 +722,6 @@ plugin is loaded; with no plugins these parameters do nothing.
      - ``""``
      - SQLite file the rules are persisted in. Empty keeps them in memory, so
        they are lost on restart.
-   * - ``triggers.on_restart_behavior``
-     - string
-     - ``"reset"``
-     - Behavior on gateway restart for persistent triggers. ``"reset"`` clears
-       all triggers on restart. ``"restore"`` reloads persistent triggers from
-       the storage database.
-   * - ``triggers.storage.path``
-     - string
-     - ``""``
-     - Path to SQLite database for persistent trigger storage. When empty
-       (default), triggers are stored in-memory only and lost on restart.
 
 Example:
 

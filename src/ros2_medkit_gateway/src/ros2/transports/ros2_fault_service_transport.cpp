@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <builtin_interfaces/msg/time.hpp>
 #include <chrono>
+#include <cmath>
 #include <string>
 
 #include "ros2_medkit_gateway/fault_manager_paths.hpp"
@@ -77,6 +78,20 @@ Ros2FaultServiceTransport::Ros2FaultServiceTransport(rclcpp::Node * node) : node
   // Pick up configurable timeout. GatewayNode declares this parameter up front,
   // but unit tests may construct the transport with a plain rclcpp::Node.
   if (!node_->get_parameter("fault_manager.service_timeout_sec", service_timeout_sec_)) {
+    service_timeout_sec_ = 5.0;
+  }
+  // isfinite first, and the range as a positive test. Do NOT rewrite this as
+  // "not positive or too large": every comparison against NaN is false, so that
+  // form lets NaN reach wait_for_service, where the duration_cast to
+  // nanoseconds is undefined and the result is treated as "wait forever" - one
+  // fault RPC then pins an HTTP worker for the life of the process. A
+  // non-positive value is the quiet version of the same problem: every fault
+  // RPC returns "service not available" with nothing in the log.
+  const bool timeout_usable = std::isfinite(service_timeout_sec_) && service_timeout_sec_ > 0.0;
+  if (!timeout_usable) {
+    RCLCPP_WARN(node_->get_logger(),
+                "fault_manager.service_timeout_sec %.2f must be finite and > 0. Using default 5.0.",
+                service_timeout_sec_);
     service_timeout_sec_ = 5.0;
   }
   fault_manager_base_path_ = build_fault_manager_base_path(node_);
