@@ -174,12 +174,14 @@ REJECTED_PARAMS = [
      'topic_sample_timeout_sec nan is outside 0.1-30.0'),
     ('fault_manager.service_timeout_sec', float('nan'),
      'fault_manager.service_timeout_sec nan must be finite and > 0'),
-    # This one carries a FloatingPointRange descriptor, so rclcpp refuses an
-    # ordinary out-of-range value before the gateway ever sees it. NaN is the
-    # exception: the descriptor compares with < and >, both false for NaN, so it
-    # is accepted as in-range and the gateway has to catch it at the read.
-    ('parameter_service_timeout_sec', float('nan'),
-     'parameter_service_timeout_sec is not a finite number'),
+    # parameter_service_timeout_sec deliberately has NO row here. It carries a
+    # FloatingPointRange descriptor, and what rclcpp does with NaN against that
+    # descriptor differs by distro: Jazzy accepts it as in-range (verified on a
+    # running gateway, which logged "timeout=nans") while Lyrical refuses it and
+    # the process exits 1 before reaching our check. Asserting either outcome
+    # pins rclcpp's behaviour rather than ours. The gateway's own isfinite check
+    # stays, because it is the only thing standing between NaN and a duration
+    # cast on the distros that let it through.
 ]
 
 # Ordinary out-of-range values for the same two floats. They cannot ride on the

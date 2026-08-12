@@ -55,10 +55,13 @@ not start:
    'parameter_service_timeout_sec' could not be set: Parameter
    {parameter_service_timeout_sec} doesn't comply with floating point range.
 
-One value gets past that descriptor: ``.nan``. The range check compares with
-``<`` and ``>``, and every comparison against NaN is false, so rclcpp reads it as
-in-range. The gateway catches it when it reads the value, warns, and uses the
-default instead.
+``.nan`` is the one value whose handling depends on the ROS 2 distribution. The
+range check compares with ``<`` and ``>``, and every comparison against NaN is
+false, so on Jazzy rclcpp reads NaN as in-range and the gateway starts; on
+Lyrical it is refused like any other bad value and the gateway does not start.
+Where it does get through, the gateway catches it when it reads the value, warns
+and uses the default, so a NaN never reaches the code that would treat it as a
+duration.
 
 In every case the point is the same. The config file and the running process must
 not disagree with nothing to show it, because the symptom of a mis-set value (a
