@@ -121,6 +121,16 @@ def generate_test_description():
     )
 
 
+def _pair_phrase(pub_topic, sub_topic):
+    """Return the exact wording the detector uses to name one orphaned pair.
+
+    Asserting the two topic names separately would also pass if a regression
+    paired either of them with something else, or reported them in two
+    unrelated findings. This pins the association.
+    """
+    return f"publisher-only '{pub_topic}' and subscriber-only '{sub_topic}'"
+
+
 class TestOrphanE2e(unittest.TestCase):
     """GRAPH_ORPHAN raises on a real pub-only/sub-only topic-name near-miss pair.
 
@@ -161,7 +171,7 @@ class TestOrphanE2e(unittest.TestCase):
         # for the code returns whichever description was current, so this asks
         # for the pair by name instead. The same applies to test_01a below.
         found, description = poll_fault_describing(
-            PORT, FAULT_CODE, (TYPO_TOPIC, TARGET_TOPIC), timeout=60.0)
+            PORT, FAULT_CODE, (_pair_phrase(TYPO_TOPIC, TARGET_TOPIC),), timeout=60.0)
         self.assertTrue(
             found,
             f'{FAULT_CODE} never named the pub-only {TYPO_TOPIC} / sub-only '
@@ -170,7 +180,7 @@ class TestOrphanE2e(unittest.TestCase):
 
     def test_01a_namespace_typo_pair_is_reported_too(self):
         found, description = poll_fault_describing(
-            PORT, FAULT_CODE, (NS_TYPO_TOPIC,), timeout=60.0)
+            PORT, FAULT_CODE, (_pair_phrase(NS_TYPO_TOPIC, NS_TARGET_TOPIC),), timeout=60.0)
         self.assertTrue(
             found,
             f'{NS_TYPO_TOPIC} / {NS_TARGET_TOPIC} differ only in the namespace, so they are '

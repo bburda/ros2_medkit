@@ -25,8 +25,8 @@ range and the gateway logs both values. This applies to the thread and pool knob
 (``server.executor_threads``, ``server.http_thread_pool_size``,
 ``server.keep_alive_timeout_sec``, ``sse.max_clients``,
 ``service_call_timeout_sec``, ``logs.buffer_size``, ``entity_cache.capacity``,
-``aggregation.max_discovered_peers``) and to the ``subscription_executor.*`` and
-``data_provider.*`` knobs:
+``aggregation.max_discovered_peers``, ``fault_triggers.poll_interval_ms``) and to
+the ``subscription_executor.*`` and ``data_provider.*`` knobs:
 
 .. code-block:: text
 
@@ -70,8 +70,9 @@ If the gateway behaves as though a parameter were different from what your YAML
 says, its startup log names the parameter.
 
 Note the logger name in the message. Most of these come from
-``ros2_medkit_gateway``, but the HTTP pool and keep-alive lines come from
-``rest_server``.
+``ros2_medkit_gateway``; the three that the REST server reads for itself -
+``server.http_thread_pool_size``, ``server.keep_alive_timeout_sec`` and
+``sse.max_duration_sec`` - come from ``rest_server``.
 
 Network Settings
 ----------------
@@ -276,8 +277,10 @@ Data Access Settings
 
 .. note::
 
-   The defaults listed above match the recommended gateway configuration in
-   ``src/ros2_medkit_gateway/config/gateway_params.yaml``. If
+   The defaults listed above are the ones the code declares. Where the shipped
+   ``src/ros2_medkit_gateway/config/gateway_params.yaml`` sets a different value
+   the row says so - ``topic_sample_timeout_sec`` is the one that differs today.
+   If
    ``topic_sample_timeout_sec`` is out of range, ``DataAccessManager`` and the
    topic transport both fall back to ``1.0``.
 
@@ -592,7 +595,7 @@ configuration.
    * - ``bulk_data.max_upload_size``
      - int
      - ``104857600``
-     - Maximum upload file size in bytes (default: 100 MB). Set to 0 for unlimited.
+     - Maximum upload file size in bytes (default: 100 MB). Set to ``0`` for unlimited. A negative value is refused with a warning and the default is used: it would otherwise wrap to a huge unsigned size, which is the same "no limit" a typo should never buy silently.
    * - ``bulk_data.categories``
      - string[]
      - ``[]``
@@ -636,15 +639,15 @@ Configure limits for SSE-based streaming (fault events and cyclic subscriptions)
    * - ``sse.max_clients``
      - int
      - ``2``
-     - Maximum number of concurrent SSE connections (fault stream, cyclic subscription streams, and trigger event streams combined). Each connection pins one ``server.http_thread_pool_size`` worker for its lifetime, so this defaults at or below that pool; raise both together for more concurrent streams.
+     - Maximum number of concurrent SSE connections (fault stream, cyclic subscription streams, and trigger event streams combined). Each connection pins one ``server.http_thread_pool_size`` worker for its lifetime, so this defaults at or below that pool; raise both together for more concurrent streams. Range: 1-1024, clamped with a warning.
    * - ``sse.max_subscriptions``
      - int
      - ``100``
-     - Maximum number of active cyclic subscriptions across all entities. Returns HTTP 503 when this limit is reached.
+     - Maximum number of active cyclic subscriptions across all entities. Returns HTTP 503 when this limit is reached. Must be at least ``1``; anything lower is refused with a warning and ``100`` is used, because the cap is compared as an unsigned count and a negative would remove it.
    * - ``sse.max_duration_sec``
      - int
      - ``3600``
-     - Maximum allowed subscription duration in seconds. Requests exceeding this are rejected with HTTP 400.
+     - Maximum allowed subscription duration in seconds. Requests exceeding this are rejected with HTTP 400. Range: 1 to 2147483647 (the value becomes an ``int``); outside it the value is refused with a warning and ``3600`` is used.
 
 Example:
 
@@ -694,6 +697,19 @@ Configure condition-based push notifications for resource changes.
      - Path to SQLite database for persistent trigger storage. When empty
        (default), triggers are stored in-memory only and lost on restart.
 
+Example:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       triggers:
+         enabled: true
+         max_triggers: 1000
+         on_restart_behavior: "restore"
+         storage:
+           path: "/var/lib/ros2_medkit/triggers.db"
+
 Fault-trigger rules
 ^^^^^^^^^^^^^^^^^^^
 
@@ -716,28 +732,17 @@ plugin is loaded; with no plugins these parameters do nothing.
    * - ``fault_triggers.poll_interval_ms``
      - int
      - ``1000``
-     - How often the rules are evaluated. Floored at ``50`` ms so the loop
-       cannot busy-spin; a lower value is clamped with a warning. Read only when
-       the engine actually starts, so with no plugin loaded a mis-set value is
-       neither applied nor reported - it does nothing either way.
+     - How often the rules are evaluated. Range: 50 to 2147483647 ms. The floor
+       stops the loop busy-spinning; the ceiling is what an ``int`` holds, since
+       the value becomes a timer period. Either end is clamped with a warning.
+       Read only when the engine actually starts, so with no plugin loaded a
+       mis-set value is neither applied nor reported - it does nothing either
+       way.
    * - ``fault_triggers.storage.path``
      - string
      - ``""``
      - SQLite file the rules are persisted in. Empty keeps them in memory, so
        they are lost on restart.
-
-Example:
-
-.. code-block:: yaml
-
-   ros2_medkit_gateway:
-     ros__parameters:
-       triggers:
-         enabled: true
-         max_triggers: 1000
-         on_restart_behavior: "restore"
-         storage:
-           path: "/var/lib/ros2_medkit/triggers.db"
 
 Rate Limiting
 -------------

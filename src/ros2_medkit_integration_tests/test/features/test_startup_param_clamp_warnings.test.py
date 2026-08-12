@@ -71,6 +71,7 @@ import launch_testing.actions
 
 from ros2_medkit_test_utils.constants import (
     ALLOWED_EXIT_CODES,
+    get_test_domain_id,
     get_test_port,
     get_time_scale,
 )
@@ -163,8 +164,11 @@ REJECTED_PARAMS = [
      'bulk_data.max_upload_size -1 is negative'),
     ('sse.max_subscriptions', -1,
      'sse.max_subscriptions -1 must be >= 1'),
-    ('triggers.max_triggers', -1,
-     'triggers.max_triggers -1 out of range. Using default 1000.'),
+    # Above INT_MAX on purpose: read as int this narrows to 0, which trips the
+    # same < 1 branch and logs "0", so a negative alone would not notice the
+    # read-before-narrowing order being reverted.
+    ('triggers.max_triggers', 4294967296,
+     'triggers.max_triggers 4294967296 out of range. Using default 1000.'),
     # Two float checks that a "below or above the range" test would not catch,
     # because every comparison against NaN is false. NaN does survive the launch
     # path: launch_ros hands the parameter through as a double, verified against
@@ -172,8 +176,12 @@ REJECTED_PARAMS = [
     # range test for this reason.
     ('topic_sample_timeout_sec', float('nan'),
      'topic_sample_timeout_sec nan is outside 0.1-30.0'),
-    ('fault_manager.service_timeout_sec', float('nan'),
-     'fault_manager.service_timeout_sec nan must be finite and > 0'),
+    # +inf, not NaN: the check is isfinite && > 0, and NaN already fails "> 0"
+    # on its own. Infinity is the only value that passes the comparison and is
+    # caught solely by isfinite - and the one that would reach wait_for_service
+    # and pin an HTTP worker for the life of the process.
+    ('fault_manager.service_timeout_sec', float('inf'),
+     'fault_manager.service_timeout_sec inf must be finite and > 0'),
     # parameter_service_timeout_sec deliberately has NO row here. It carries a
     # FloatingPointRange descriptor, and what rclcpp does with NaN against that
     # descriptor differs by distro: Jazzy accepts it as in-range (verified on a
@@ -189,10 +197,20 @@ REJECTED_PARAMS = [
 # separate anyway: NaN pins the isfinite guard, these pin the range itself, and
 # a mutation that dropped either would leave the other green.
 FLOOR_EXTRA_REJECTED = [
-    ('topic_sample_timeout_sec', 60.0,
-     'topic_sample_timeout_sec 60.00 is outside 0.1-30.0'),
+    ('topic_sample_timeout_sec', 0.05,
+     'topic_sample_timeout_sec 0.05 is outside 0.1-30.0'),
     ('fault_manager.service_timeout_sec', -1.0,
      'fault_manager.service_timeout_sec -1.00 must be finite and > 0'),
+    ('triggers.max_triggers', -1,
+     'triggers.max_triggers -1 out of range. Using default 1000.'),
+]
+
+# The upper end of the same float range. Split across gateways because one
+# parameter takes one value per process, and both ends have to be pinned: with
+# only 60.0, deleting the ">= 0.1" term from the check is a green mutation.
+CEILING_EXTRA_REJECTED = [
+    ('topic_sample_timeout_sec', 60.0,
+     'topic_sample_timeout_sec 60.00 is outside 0.1-30.0'),
 ]
 
 # The three whose above-ceiling case is skipped (see the module docstring).
@@ -213,8 +231,11 @@ def expected_warning(parameter, requested, effective):
     return f'{parameter} {requested} clamped to {effective}'
 
 
-# Warnings are emitted during construction, so they are already in the buffer by
-# the time /health answers. The timeout only covers a slow runner's startup.
+# Do NOT read this as "the warnings are there once /health answers".
+# start_rest_server() runs inside the GatewayNode constructor, so /health goes
+# live before main.cpp reads server.executor_threads, the subscription_executor
+# and data_provider groups, and fault_triggers - eleven of the eighteen clamp
+# warnings come after that. STARTUP_COMPLETE below is what actually bounds them.
 WARNING_TIMEOUT = 20
 
 # Logged by GatewayNode::init_fault_trigger_engine, the LAST thing main.cpp does
@@ -242,6 +263,14 @@ def generate_test_description():
         get_package_prefix('ros2_medkit_gateway'),
         'lib', 'ros2_medkit_gateway', 'libtest_gateway_plugin.so',
     )
+    # One DDS domain per gateway. Nothing here is a peer of anything else, and
+    # four gateways on one domain means each one runs its discovery over the
+    # other three's nodes for no reason - and four sets of participants expire
+    # on that domain at teardown, which the next test to lease it inherits.
+
+    def _domain(offset):
+        return {'ROS_DOMAIN_ID': str(get_test_domain_id(offset))}
+
     reachable = {
         'aggregation.enabled': True,
         'plugins': ['test_plugin'],
@@ -251,6 +280,7 @@ def generate_test_description():
     # Floor gateway on the default port: GatewayTestCase polls /health here, so
     # this gateway also proves the clamped-to-floor values still serve requests.
     gateway_node = create_gateway_node(
+        extra_env=_domain(0),
         extra_params={
             **FLOOR_PARAMS,
             **{name: value for name, value, _fragment in FLOOR_EXTRA_REJECTED},
@@ -261,12 +291,18 @@ def generate_test_description():
     gw_ceiling = create_gateway_node(
         port=get_test_port(1),
         name='gateway_clamp_ceiling',
-        extra_params={**CEILING_PARAMS, **reachable},
+        extra_env=_domain(1),
+        extra_params={
+            **CEILING_PARAMS,
+            **{name: value for name, value, _fragment in CEILING_EXTRA_REJECTED},
+            **reachable,
+        },
     )
 
     gw_in_range = create_gateway_node(
         port=get_test_port(2),
         name='gateway_clamp_in_range',
+        extra_env=_domain(2),
         extra_params={**IN_RANGE_PARAMS, **reachable},
     )
 
@@ -278,6 +314,7 @@ def generate_test_description():
     gw_rejected = create_gateway_node(
         port=get_test_port(3),
         name='gateway_param_rejected',
+        extra_env=_domain(3),
         extra_params={
             **{name: value for name, value, _fragment in REJECTED_PARAMS},
             **reachable,
@@ -336,6 +373,11 @@ class TestStartupParamClampWarnings(GatewayTestCase):
             with self.subTest(parameter=parameter, direction='ceiling'):
                 self.assertIn(expected_warning(parameter, above, ceiling), reported)
 
+        text = _output_text(proc_output, gw_ceiling)
+        for parameter, _value, fragment in CEILING_EXTRA_REJECTED:
+            with self.subTest(parameter=parameter, direction='out-of-range'):
+                self.assertIn(fragment, text)
+
     def test_in_range_values_stay_quiet(self, proc_output, gw_in_range):
         """A gateway configured entirely in range reports no clamp at all.
 
@@ -351,6 +393,38 @@ class TestStartupParamClampWarnings(GatewayTestCase):
             reported, [],
             f'a gateway with every parameter in range still reported: {reported}',
         )
+
+    def test_ceiling_coverage_is_not_dropped_by_accident(self):
+        """Only the three documented parameters may skip the ceiling direction.
+
+        The ceiling loop skips any row whose above-value is None. Without this,
+        setting one more row to None removes its ceiling coverage silently - no
+        failure, no skip marker, nothing in the output to notice.
+        """
+        self.assertEqual(
+            PARAMS_FLOOR_ONLY,
+            {'server.executor_threads', 'server.http_thread_pool_size',
+             'entity_cache.capacity'},
+            'the set of parameters exempt from the ceiling direction changed; '
+            'the module docstring explains why exactly these three are exempt',
+        )
+
+    def test_refused_values_take_the_documented_default(self, proc_output, gw_rejected):
+        """The value the gateway ends up using is the documented default.
+
+        Every other assertion here reads a warning. A warning is a claim: the
+        site could name the default in its message and then assign something
+        else, and nothing would notice. These three parameters log what they
+        actually installed, so they can be checked rather than believed.
+        """
+        text = _output_text(proc_output, gw_rejected)
+        for fragment in (
+            'Subscription manager: max_subscriptions=100',
+            'max_upload=104857600B',
+            'Trigger subsystem: enabled (max=1000',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, text)
 
     def test_rejected_values_name_the_refused_value(self, proc_output, gw_rejected):
         """A refused value is named in the log, not just replaced.

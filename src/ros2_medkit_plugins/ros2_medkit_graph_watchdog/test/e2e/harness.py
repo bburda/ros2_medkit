@@ -379,10 +379,21 @@ def poll_fault_describing(port, code, needles, timeout=60.0, interval=0.5):
     last_description = ''
     while time.monotonic() < deadline:
         fault = poll_faults(port, code, timeout=interval, interval=interval)
-        if fault is not None:
-            last_description = fault.get('description', '')
-            if all(needle in last_description for needle in needles):
-                return True, last_description
+        if fault is None:
+            # Nothing to see. poll_faults already slept `interval` before
+            # giving up, so sleeping again here would halve the sampling rate.
+            # Drop what we saw earlier too: the fault cleared or never
+            # appeared, and a timeout must not report a stale description.
+            last_description = ''
+            continue
+        last_description = fault.get('description', '')
+        if all(needle in last_description for needle in needles):
+            return True, last_description
+        # Present but incomplete - the case this helper exists for. poll_faults
+        # returns the moment it matches the code, BEFORE its own sleep, so this
+        # branch has to pace itself or it becomes a bare retry loop hammering
+        # GET /faults for the whole timeout, against the gateway whose detector
+        # we are waiting on.
         time.sleep(interval)
     return False, last_description
 

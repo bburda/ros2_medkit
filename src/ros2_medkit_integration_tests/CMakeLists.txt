@@ -187,11 +187,16 @@ if(BUILD_TESTING)
   # DOMAINS below is one for the test itself plus one per extra gateway; the
   # extras arrive as MEDKIT_SECONDARY_DOMAINS. The highest offset any of them
   # asks for is 3, so four domains covers all of them.
+  # test_startup_param_clamp_warnings is not an aggregation test, but it does
+  # launch four gateways. They have no reason to see each other, and sharing one
+  # domain makes each of them discover the other three's nodes and leaves four
+  # sets of participants dying on that domain at teardown.
   set(_MULTI_GATEWAY_TESTS
     test_peer_aggregation
     test_cross_ecu_fanout
     test_daisy_chain_aggregation
-    test_leaf_collision_aggregation)
+    test_leaf_collision_aggregation
+    test_startup_param_clamp_warnings)
   set(_MULTI_GATEWAY_DOMAINS 4)
 
   # Feature tests (atomic, independent, 120s timeout)
