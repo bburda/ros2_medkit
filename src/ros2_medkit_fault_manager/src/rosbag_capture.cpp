@@ -19,10 +19,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <rosbag2_cpp/writer.hpp>
 #include <rosbag2_storage/storage_options.hpp>
@@ -81,6 +85,68 @@ double span_sec_since(int64_t started_at_steady_ns) {
   }
   const double span = static_cast<double>(steady_now_ns() - started_at_steady_ns) / 1e9;
   return span > 0.0 ? span : 0.0;
+}
+
+/// Serialises everything that reaches rosbag2's storage-plugin loader: a Writer's
+/// construction, its open(), and its destruction. Nothing else belongs under it.
+///
+/// The racing state is PROCESS-GLOBAL, not per capture, which is why this is not a member.
+/// class_loader keeps ONE registry of loaded libraries keyed by library path
+/// (class_loader::impl::getLoadedLibraryVector()), so every Writer of a given format shares
+/// one rcutils_shared_library_t handle regardless of which object, thread or RosbagCapture
+/// instance opened it. Let one Writer's destructor unload that library while another loads
+/// it and both run dlclose on the same handle: the winner closes it and zeroes the struct,
+/// the loser's dlclose fails with "shared object not open" and then calls the now-null
+/// allocator.deallocate. The fault lands in rcutils_unload_shared_library with RIP=0.
+///
+/// Measured standalone, outside this package, with threads doing nothing but open()/close()
+/// on one format: 4 threads x 200 iterations crashed in 20 of 20 runs on mcap and failed in
+/// 20 of 20 on sqlite3 - 15 of those ended in SIGSEGV and 2 more in an uncaught
+/// class_loader::LibraryUnloadException reaching std::terminate (SIGABRT, not a segfault);
+/// the remaining 3 finished all 200 iterations without a fatal end, but still logged a caught
+/// plugin-load exception along the way, as did 13 of the 17 that crashed - 16 of the 20
+/// sqlite3 runs logged at least one such exception in total. Neither backend's bug. The same
+/// loops with this lock held over construction, open() and destruction ran 0 failures in
+/// 112000 operations per backend.
+///
+/// open() has to be INSIDE the lock, not just the constructor and the destructor: the
+/// constructor touches no loader, open() is what loads the plugin. Measured the same way, a
+/// lock around construction and destruction only still leaked 2 failures in 32000
+/// operations.
+///
+/// What it costs is what a concurrent open_bag_writer() waits behind, measured on one
+/// workstation single-threaded: a close is ~0.37 ms for a bag with no messages (200
+/// samples) and ~1.1 ms for a 256 MB one split at the default 50 MB per file (12 samples),
+/// on top of a ~1.0-1.4 ms open. Closing flushes to the page cache and writes
+/// metadata.yaml without fsync, which is why the size barely moves the figure; slow or
+/// synchronous storage will cost more.
+///
+/// Deliberately never destroyed. A function-local static std::mutex would be destroyed
+/// during static destruction, and a thread closing a bag at exit would then lock a destroyed
+/// mutex, which reopens the exact window this exists to close. One leaked mutex for the life
+/// of the process is the price.
+///
+/// Process-wide as far as this translation unit reaches: rosbag_capture.cpp is compiled once
+/// into fault_manager_lib, so every RosbagCapture in the process shares this mutex. It
+/// cannot cover a Writer opened by code outside this package.
+std::mutex & plugin_mutex() {
+  static std::mutex * m = new std::mutex;
+  return *m;
+}
+
+/// Destroy a writer already taken out of active_writer_, under the plugin lock.
+///
+/// Every destruction site in this file goes through here and all of them have the same
+/// shape: move the writer out of the member under writer_mutex_, RELEASE writer_mutex_,
+/// then call this. Destroying it while writer_mutex_ is still held would order
+/// writer_mutex_ before plugin_mutex(), and open_bag_writer() takes them the other way
+/// round, which is a deadlock cycle.
+void destroy_writer_under_plugin_lock(std::unique_ptr<rosbag2_cpp::Writer> & writer) {
+  if (!writer) {
+    return;
+  }
+  std::lock_guard<std::mutex> plock(plugin_mutex());
+  writer.reset();
 }
 
 /// Bound the probe reason so a verbose pluginlib error does not flood the log.
@@ -212,6 +278,21 @@ RosbagCapture::RosbagCapture(rclcpp::Node * node, FaultStorage * storage, const 
 
 RosbagCapture::~RosbagCapture() {
   stop();
+
+  // Whatever stop() did not close is closed here, explicitly, rather than left to
+  // implicit member destruction - which would run ~Writer under no lock at all and
+  // is the one destruction site in this class that cannot be found by looking for
+  // a reset(). It is reachable: stop() returns early when the capture was never
+  // started or is already stopped, and a confirmation that read running_ as true
+  // just before stop() cleared it can still install a writer after
+  // finalize_post_fault_recording() has been and gone. Normally a no-op.
+  std::unique_ptr<rosbag2_cpp::Writer> closing_writer;
+  {
+    std::lock_guard<std::mutex> wlock(writer_mutex_);
+    closing_writer = std::move(active_writer_);
+    created_topics_.clear();
+  }
+  destroy_writer_under_plugin_lock(closing_writer);
 }
 
 void RosbagCapture::start() {
@@ -437,17 +518,29 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
     double recording_span_sec = 0.0;
     {
       std::lock_guard<std::mutex> wlock(writer_mutex_);
-      // Taken out rather than reset here, and measured before it is closed. Dropping
-      // the last reference runs ~Writer, which flushes the bag and writes
-      // metadata.yaml, and unique_ptr::reset() only returns once that is done - so
-      // resetting first would charge the close to the recording, which is exactly
-      // what the finalise path is careful not to do.
+      // Measured before the close below, not after: dropping the last
+      // reference runs ~Writer, which flushes the bag and writes
+      // metadata.yaml, and that only returns once the I/O is done - so
+      // measuring after would charge the close to the recording, which is
+      // exactly what the finalise path is careful not to do.
       closing_writer = std::move(active_writer_);
       created_topics_.clear();
       recording_span_sec = span_sec_since(recording_started_at_ns_.exchange(0));
     }
-    // Outside the lock, and before the size is measured: metadata.yaml has to exist.
-    closing_writer.reset();
+    // Closed outside writer_mutex_ and under plugin_mutex() instead. Both halves
+    // of that matter. Keeping the close off writer_mutex_ was the original
+    // author's call and the reason still holds: flush + the metadata.yaml write
+    // are real I/O, and writer_mutex_ is what message_callback takes for every
+    // post-fault message, so a close held under it stalls the capture's own write
+    // path. What running the close unsynchronized cost instead was safety:
+    // ~Writer can unload the storage plugin's shared library while another Writer
+    // for the same format is loading it, anywhere in the process. plugin_mutex()
+    // orders exactly those two against each other and nothing else - see its
+    // definition for the crash and the measurements. The cost is paid by a
+    // concurrent open_bag_writer(), which now waits behind this close.
+    destroy_writer_under_plugin_lock(closing_writer);
+    // The size is measured after the close: metadata.yaml exists only once the
+    // writer is gone, and nothing here still needs either lock.
 
     size_t bag_size = calculate_bag_size(bag_path);
 
@@ -954,11 +1047,19 @@ std::string RosbagCapture::get_topic_type(const std::string & topic) const {
 }
 
 void RosbagCapture::discard_active_writer(const std::string & bag_path) {
+  // Same two-step shape as every other destruction site: out of the member under
+  // writer_mutex_, then destroyed under plugin_mutex() with writer_mutex_ already
+  // released. Resetting in place under writer_mutex_ - which is how this read
+  // before - would take writer_mutex_ then plugin_mutex(), the reverse of
+  // open_bag_writer(), and close a deadlock cycle.
+  std::unique_ptr<rosbag2_cpp::Writer> closing_writer;
   {
     std::lock_guard<std::mutex> wlock(writer_mutex_);
-    active_writer_.reset();
+    closing_writer = std::move(active_writer_);
     created_topics_.clear();
   }
+  destroy_writer_under_plugin_lock(closing_writer);
+
   std::error_code ec;
   std::filesystem::remove_all(bag_path, ec);
 }
@@ -973,21 +1074,39 @@ std::optional<std::string> RosbagCapture::open_bag_writer(const std::string & fa
       std::filesystem::create_directories(bag_dir.parent_path());
     }
 
-    // Create writer and store as member for post-fault recording
-    std::lock_guard<std::mutex> wlock(writer_mutex_);
-    active_writer_ = std::make_unique<rosbag2_cpp::Writer>();
-    created_topics_.clear();
-
     rosbag2_storage::StorageOptions storage_options;
     storage_options.uri = bag_path;
     storage_options.storage_id = config_.format;
     storage_options.max_bagfile_size = config_.max_bag_size_mb * 1024 * 1024;
 
-    active_writer_->open(storage_options);
+    // Construct AND open under plugin_mutex(): open() is the call that loads the
+    // storage plugin, so a close running concurrently anywhere in the process is
+    // what has to be excluded. The constructor is in the same critical section
+    // because a Writer that fails to open is destroyed on the way out of this
+    // scope - the local is declared after the guard, so unwinding destroys it
+    // first and the failed writer's destructor is still covered.
+    std::lock_guard<std::mutex> plock(plugin_mutex());
+    auto writer = std::make_unique<rosbag2_cpp::Writer>();
+    writer->open(storage_options);
+
+    // Published into the member only once it is open, under writer_mutex_ and
+    // nested inside plugin_mutex(). This is the one place the two are held
+    // together, and this is the direction every other path must agree with:
+    // plugin_mutex() -> writer_mutex_, never the reverse. Taking writer_mutex_
+    // here rather than around open() also keeps message_callback off the open
+    // I/O it used to wait behind.
+    std::lock_guard<std::mutex> wlock(writer_mutex_);
+    active_writer_ = std::move(writer);
+    created_topics_.clear();
     return bag_path;
 
   } catch (const std::exception & e) {
     RCLCPP_ERROR(node_->get_logger(), "Failed to open bag file '%s': %s", bag_path.c_str(), e.what());
+    // Both guards above are gone by the time this runs (unwinding destroyed
+    // them), so discard_active_writer() is free to take them again in its own
+    // order. active_writer_ is untouched by a failed open - the writer only
+    // reaches the member once open() has returned - so this is here for the
+    // partial directory on disk.
     discard_active_writer(bag_path);
     return std::nullopt;
   }
@@ -1358,11 +1477,22 @@ void RosbagCapture::finalize_post_fault_recording() {
     }
   }
 
-  // Close outside both locks. Flushing the bag and writing metadata.yaml is real
-  // I/O, and the writer is exclusively ours now, so nothing is gained by holding
-  // the post-roll state or the write path hostage while it finishes. It must,
-  // however, close BEFORE the size is measured below.
-  closing_writer.reset();
+  // Closed outside all three of post_fault_timer_mutex_, capture_topics_mutex_ and
+  // writer_mutex_: flushing the bag and writing metadata.yaml is real I/O, and the
+  // writer is exclusively ours now (taken out above), so nothing is gained by
+  // holding the post-roll state or the write path hostage while it finishes. That
+  // reasoning was the original author's and it still holds - writer_mutex_ in
+  // particular is taken by message_callback for every post-fault message, and a
+  // close charged to it stalls the next recording's write path, not just its open.
+  //
+  // What it does NOT buy is safety, which is what plugin_mutex() is for: ~Writer
+  // can unload the storage plugin's shared library while another Writer for the
+  // same format is loading it, anywhere in the process, and that double unload
+  // segfaults in rcutils_unload_shared_library. The close is therefore charged to
+  // the plugin lock and to nothing else, and a concurrent open_bag_writer() waits
+  // behind it. It must also close BEFORE the size is measured below: metadata.yaml
+  // is written by the destructor.
+  destroy_writer_under_plugin_lock(closing_writer);
 
   // Calculate final size and store metadata
   size_t bag_size = calculate_bag_size(bag_path);
@@ -1430,19 +1560,39 @@ std::optional<std::string> RosbagCapture::default_storage_probe(const std::strin
   // Probe the plugin by opening a throwaway bag. Returns the failure reason (never
   // throws) when the plugin is missing or unusable, so the caller can fall back or
   // self-disable instead of crashing.
-  const std::string test_path =
-      std::filesystem::temp_directory_path().string() + "/.rosbag_format_test_" + std::to_string(getpid());
+  // Unique per CALL, not per process. Two captures being constructed at the same
+  // time - a second FaultManagerNode, or one created while another records - each
+  // probe both backends, and a path keyed only by pid put them in the same
+  // directory: one probe's remove_all() below then deletes the bag the other is
+  // still writing. rosbag2 writes metadata.yaml from ~Writer, so that lands as an
+  // exception escaping a destructor rather than as a probe failure this function
+  // could report. plugin_mutex() serialises the open and the close, but the
+  // remove_all() is deliberately outside it, so the paths have to differ.
+  static std::atomic<uint64_t> probe_seq{0};
+  const std::string test_path = std::filesystem::temp_directory_path().string() + "/.rosbag_format_test_" +
+                                std::to_string(getpid()) + "_" +
+                                std::to_string(probe_seq.fetch_add(1, std::memory_order_relaxed));
 
   std::optional<std::string> error;
-  try {
-    rosbag2_cpp::Writer writer;
-    rosbag2_storage::StorageOptions opts;
-    opts.uri = test_path;
-    opts.storage_id = format;
-    writer.open(opts);
-  } catch (const std::exception & e) {
-    // Keep the reason (plugin missing vs. I/O / permission) for the caller's log.
-    error = e.what();
+  {
+    // The probe loads and unloads a storage plugin exactly like a real recording
+    // does, so it takes the same lock. It ran unsynchronized before, which left the
+    // whole hazard open on the one path most likely to hit it: a fault manager
+    // constructed while another one is recording probes both formats back to back,
+    // and construction is precisely when a second capture appears in the process.
+    // The guard is outside the try so the throwaway writer, declared inside, is
+    // destroyed under it on the failure path too.
+    std::lock_guard<std::mutex> plock(plugin_mutex());
+    try {
+      rosbag2_cpp::Writer writer;
+      rosbag2_storage::StorageOptions opts;
+      opts.uri = test_path;
+      opts.storage_id = format;
+      writer.open(opts);
+    } catch (const std::exception & e) {
+      // Keep the reason (plugin missing vs. I/O / permission) for the caller's log.
+      error = e.what();
+    }
   }
 
   std::error_code ec;

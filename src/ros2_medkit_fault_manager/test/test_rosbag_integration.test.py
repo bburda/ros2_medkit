@@ -28,7 +28,7 @@ import launch_testing.markers
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from ros2_medkit_msgs.msg import Fault
+from ros2_medkit_msgs.msg import Fault, FaultEvent
 from ros2_medkit_msgs.srv import ClearFault, GetRosbag, ReportFault
 from sensor_msgs.msg import Temperature
 
@@ -284,11 +284,18 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
         Wait until the rosbag ring buffer holds fresh data before a confirmation.
 
         A previous fault's post-fault recording window diverts incoming messages
-        away from the ring buffer, so right after it closes the buffer can be
-        empty and flush_to_bag creates no bag. There is no service to read the
-        buffer, so subscribe to the same source the fault manager records and
-        wait until ``count`` messages arrive - by then the co-subscribed fault
-        manager has buffered a comparable amount. Adaptive, unlike a fixed sleep.
+        away from the ring buffer - message_callback() writes straight to the open
+        bag and returns before it ever touches the buffer - so right after the
+        window closes the buffer can be empty and flush_to_bag creates no bag.
+        There is no service to read the buffer, so this counts messages on the same
+        source the fault manager records instead, as a proxy. Counting alone is not
+        a safe proxy: a confirmation landing mid-count reopens that same diversion,
+        so ``count`` messages arriving at this node can still correspond to
+        near-zero buffered history on the fault manager's side. The broad topic
+        modes already subscribe to ``/fault_manager/events``, so this does too, and
+        resets the count on every ``EVENT_CONFIRMED`` - guaranteeing the streak of
+        messages this function finally returns on arrived with no post-fault window
+        newly opened partway through it.
         """
         received = 0
 
@@ -296,19 +303,34 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
             nonlocal received
             received += 1
 
+        def _on_event(msg):
+            nonlocal received
+            if msg.event_type == FaultEvent.EVENT_CONFIRMED:
+                received = 0
+
         # Match the publisher's BEST_EFFORT sensor QoS, else no messages arrive.
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
+        # Matches the fault manager's own reliable, depth-100 events publisher.
+        events_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=100,
+        )
         sub = self.node.create_subscription(Temperature, '/test/temperature', _cb, qos)
+        events_sub = self.node.create_subscription(
+            FaultEvent, '/fault_manager/events', _on_event, events_qos
+        )
         try:
             deadline = time.time() + timeout
             while received < count and time.time() < deadline:
                 rclpy.spin_once(self.node, timeout_sec=0.1)
         finally:
             self.node.destroy_subscription(sub)
+            self.node.destroy_subscription(events_sub)
         return received >= count
 
     def test_01_rosbag_created_on_fault_confirmation(self):

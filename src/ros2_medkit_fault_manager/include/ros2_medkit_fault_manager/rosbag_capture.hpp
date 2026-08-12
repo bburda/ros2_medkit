@@ -365,13 +365,18 @@ class RosbagCapture {
   ///   node rosbag mutex -> post_fault_timer_mutex_ -> capture_topics_mutex_
   ///   node rosbag mutex -> post_fault_timer_mutex_ -> writer_mutex_
   ///   node rosbag mutex -> post_fault_timer_mutex_ -> node_ops_mutex_
+  ///   plugin_mutex() (file-scope, in rosbag_capture.cpp) -> writer_mutex_
   /// buffer_mutex_ is never held across another lock. The paths that take
   /// capture_topics_mutex_ or writer_mutex_ on their own (the flush loop, the
   /// post-roll write path) release each before taking the next, so they add no
-  /// reverse edge. Everything that hands the RECORDING over - the guard, the
-  /// start time, the writer - must happen inside one post_fault_timer_mutex_
-  /// critical section, or a confirmation racing a finalise ends up owning half of
-  /// the previous recording's state.
+  /// reverse edge. plugin_mutex() is taken either alone, to close a writer already
+  /// moved out of active_writer_, or as the OUTER of the pair in open_bag_writer();
+  /// no path takes it while holding any lock of this class, and the finalise paths
+  /// close their writer only after post_fault_timer_mutex_, capture_topics_mutex_
+  /// and writer_mutex_ are all released. Everything that hands the RECORDING over -
+  /// the guard, the start time, the writer - must happen inside one
+  /// post_fault_timer_mutex_ critical section, or a confirmation racing a finalise
+  /// ends up owning half of the previous recording's state.
   mutable std::mutex post_fault_timer_mutex_;
   rclcpp::TimerBase::SharedPtr post_fault_timer_;
   std::atomic<bool> recording_post_fault_{false};
@@ -399,6 +404,28 @@ class RosbagCapture {
 
   /// Active writer for current bag (kept open during post-fault recording)
   std::unique_ptr<rosbag2_cpp::Writer> active_writer_;
+  /// Guards DATA ACCESS to active_writer_ and created_topics_, and nothing else.
+  /// Held only for a pointer handover or for one create_topic()/write() call, so
+  /// the two paths that take it in the hot path - message_callback() during a
+  /// post-roll and the flush loop - never wait behind bag I/O.
+  ///
+  /// It deliberately does NOT cover a Writer's construction, its open() or its
+  /// destruction. Those reach rosbag2's storage-plugin loader, whose racing state
+  /// is process-global rather than per capture, so an instance member cannot
+  /// exclude the thread that matters. They are serialised by plugin_mutex() in
+  /// rosbag_capture.cpp instead; see its definition for the crash, the reason it is
+  /// leaked, and the measurements.
+  ///
+  /// Order with respect to that lock: plugin_mutex() -> writer_mutex_. Only
+  /// open_bag_writer() holds both, and it takes them in that order. Every
+  /// destruction site for a writer that was active_writer_ therefore has one
+  /// shape - move the writer out of active_writer_ under writer_mutex_, RELEASE
+  /// writer_mutex_, then destroy it under plugin_mutex() - because closing in
+  /// place under writer_mutex_ would add the reverse edge and deadlock against a
+  /// concurrent open. default_storage_probe()'s writer is a separate case: it is
+  /// local, never becomes active_writer_, and so is constructed, opened and
+  /// destroyed under plugin_mutex() alone, without writer_mutex_ ever entering
+  /// the picture.
   std::mutex writer_mutex_;
   std::set<std::string> created_topics_;
 
