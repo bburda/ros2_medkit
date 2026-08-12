@@ -231,7 +231,14 @@ def configure_probe(
     # CMAKE_PREFIX_PATH to resolve find_package(ament_cmake) and
     # find_package(launch_testing_ament_cmake) at all. Only ROS_DISTRO itself is
     # touched, so every probe imitates a chosen distro - or its absence -
-    # regardless of who runs it.
+    # regardless of who runs it. Those two stay present even in the ROS build
+    # farm's binarydeb chroot: the farm's test step runs
+    # `if [ -f "/opt/ros/humble/setup.sh" ]; then . "/opt/ros/humble/setup.sh";
+    # fi && dh_auto_test`, and sourcing setup.sh is what sets both - the same
+    # reason ROS_DISTRO is the one thing missing there: that export comes from
+    # the ros_environment package specifically, which the chroot does not
+    # install, not from setup.sh itself. A probe never needs to fake either
+    # path for that reason.
     env = dict(os.environ)
     if ros_distro is None:
         env.pop('ROS_DISTRO', None)

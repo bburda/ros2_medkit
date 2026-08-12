@@ -63,7 +63,7 @@ def registered_test_names(build_dir):
 
 def assert_guard_suppressed_launch_tests(name, baseline_tests, guarded, guarded_build_dir):
     """
-    Assert a system-package configure suppressed exactly the launch tests.
+    Assert a system-package configure suppressed something without failing.
 
     *baseline_tests* is the set of test names an ordinary workspace-style
     configure of the same package registered. *guarded* is the completed
@@ -75,11 +75,22 @@ def assert_guard_suppressed_launch_tests(name, baseline_tests, guarded, guarded_
     `set_tests_properties` / `set_property(TEST ...)` call naming a launch
     test the guard did not register makes CMake fail the configure outright.
     Comparing the two real `CTestTestfile.cmake` outputs - not a name pattern
-    - is what proves the guard suppressed exactly the launch tests and
-    nothing else: whatever the baseline registered that the guarded run did
-    not is, by definition, what the guard removed, and it must be non-empty
-    (the guard fired) while what remains registered must also be non-empty
-    (it did not remove everything).
+    - is what this checks: the configure did not fail, the guard's own
+    "launch tests are not registered" message printed, something the
+    baseline registered is gone from the guarded run (the guard fired on at
+    least one test), what remains is a subset of the baseline (nothing new
+    appeared), and something remains at all (it did not remove everything).
+
+    It does NOT prove the removed set is exactly the launch tests and
+    nothing else, or that the surviving set specifically includes gtests and
+    pytest tests as opposed to some other kind - a guard that also swallowed
+    a package's gtests would still pass every one of these assertions for a
+    package whose pytest coverage alone kept the surviving set non-empty.
+    That narrower claim, that a gtest and a pytest test each individually
+    survive the guard, is proven in isolation by
+    `test_gtest_is_still_registered_in_a_system_build` and
+    `test_other_test_kinds_are_still_registered_in_a_system_build` in
+    `ros2_medkit_cmake/test/test_launch_test_guard.py`, not by this function.
     """
     assert guarded.returncode == 0, (
         f'{name}: configure failed under system-package conditions even though the same '
