@@ -336,13 +336,67 @@ critical section: the guard, the start time and the writer. Releasing the guard 
 reaching for ``writer_mutex_`` afterwards leaves a gap in which the incoming confirmation
 installs its writer and the outgoing finalise then destroys it, after which the new
 recording writes through a null pointer - every message dropped - and still stores a row
-for the empty bag it produced. The writer is only *closed* outside the locks, once it is
-exclusively the finalise's own, because flushing a bag is real I/O.
+for the empty bag it produced. The writer is *closed* only after all three of
+``post_fault_timer_mutex_``, ``capture_topics_mutex_`` and ``writer_mutex_`` are released,
+once it is exclusively the finalise's own, because flushing a bag is real I/O. It is not
+closed unsynchronised, though. It is closed under a different lock, and that lock exists
+for a reason that has nothing to do with this class's state.
+
+Closing a bag, and the lock that is not the data lock
+"""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+``~Writer`` can unload the storage plugin's shared library and ``open()`` loads it, and the
+state both touch is **process-global**: ``class_loader`` keeps one registry of loaded
+libraries keyed by library path, so every writer of a given format shares one
+``rcutils_shared_library_t`` no matter which thread, which ``RosbagCapture`` or which
+``FaultManagerNode`` created it. A close racing an open puts two threads into ``dlclose``
+on the same handle. The winner closes it and zeroes the struct; the loser's ``dlclose``
+reports "shared object not open" and then calls the now-null ``allocator.deallocate``,
+and the process dies in ``rcutils_unload_shared_library`` with the instruction pointer at
+zero. Reproduced outside this package with threads doing nothing but open/close loops on
+one format: four threads x 200 iterations failed in 20 of 20 runs on ``mcap`` and in 20 of
+20 on ``sqlite3``, so it belongs to neither backend and to no single instance.
+
+An instance member cannot serialise process-global state, so the lock is a file-scope
+``plugin_mutex()`` in ``rosbag_capture.cpp``, held across a writer's construction, its
+``open()`` and its destruction, on every path that has one: both finalise paths,
+``discard_active_writer()``, the destructor, and the storage-backend probe that every
+capture runs while it is being constructed. ``open()`` is inside the lock deliberately -
+the constructor reaches no loader, the open is what loads the plugin, and a lock around
+construction and destruction alone still let failures through. The mutex is leaked on
+purpose (a ``new std::mutex`` that is never deleted): a static mutex destroyed during
+static destruction, while another thread is closing a bag, reopens the very window it
+exists to close. With it, the same loops ran 0 failures in 112000 operations on each
+backend.
+
+It is deliberately **not** ``writer_mutex_``. That lock is taken by ``message_callback()``
+for every message of a post-roll and by the flush loop for every buffered message, so
+charging a close to it would stall the capture's own write path for the length of a flush
+plus a ``metadata.yaml`` write. Keeping the close off the data lock was the original
+design's call, and the cost it avoided is real; what it left unpaid was safety. Measured on
+one workstation, single-threaded: a close costs about 0.37 ms for a bag with no messages
+(200 samples) and about 1.1 ms for one holding 256 MB, the ring buffer's default RAM cap,
+split at the default 50 MB per file (12 samples). A recording opening at that moment waits
+behind that. The figure is small because closing flushes to the page cache and writes
+``metadata.yaml``; it does not ``fsync``, so slow or synchronous storage will cost more.
 
 The resulting order is ``node rosbag mutex -> post_fault_timer_mutex_ ->
-{capture_topics_mutex_, writer_mutex_}``, with ``buffer_mutex_`` never held across another
-lock. Paths that take the capture-topics or writer locks on their own release each before
-taking the next, so no reverse edge exists and the order is acyclic.
+{capture_topics_mutex_, writer_mutex_}`` plus ``plugin_mutex() -> writer_mutex_``, with
+``buffer_mutex_`` never held across another lock. ``plugin_mutex()`` is taken in three
+shapes: alone, to destroy a writer already moved out of ``active_writer_``; alone, across a
+probe writer's construction, ``open()`` and destruction in ``default_storage_probe()``,
+which never touches ``active_writer_`` at all; or as the outer of the pair in
+``open_bag_writer()``. No path takes it while holding a lock of this class. That is what
+fixes the shape every destruction site shares - move the writer out of ``active_writer_``
+under ``writer_mutex_``, release ``writer_mutex_``, then destroy under ``plugin_mutex()``.
+Resetting in place under ``writer_mutex_`` would add the reverse edge and deadlock against
+a concurrent ``open_bag_writer()``. That cycle is reachable precisely because the close sits
+outside ``post_fault_timer_mutex_``: a confirmation running at the same time is not held at
+the attach check, so it can be inside ``open_bag_writer()`` holding the plugin lock while
+the finalise holds ``writer_mutex_`` and asks for it. Moving the close back inside
+``post_fault_timer_mutex_`` would remove the cycle and reintroduce the stall the design
+declines to pay for. Paths that take the capture-topics or writer locks on their own release
+each before taking the next, so no other reverse edge exists and the order is acyclic.
 
 Honest durations
 """"""""""""""""

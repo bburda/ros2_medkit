@@ -16,6 +16,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -39,6 +41,45 @@ using ros2_medkit_fault_manager::InMemoryFaultStorage;
 using ros2_medkit_fault_manager::RosbagCapture;
 using ros2_medkit_fault_manager::RosbagConfig;
 using ros2_medkit_fault_manager::SnapshotConfig;
+
+namespace {
+
+/// Multiplier for the wall-clock window and throughput thresholds
+/// ConcurrentCapturesInOneProcessSurviveEachOthersPluginTraffic asserts. The
+/// sanitizer CI jobs run this suite too, and an ASan/TSan-instrumented open/
+/// close/dlclose cycle does materially less work per wall-clock second, so a
+/// window or a throughput floor that is tight unsanitized can go unmet under
+/// instrumentation for a reason that has nothing to do with the plugin-loader
+/// race the test exists to catch. Mirrors test_cancel_outcomes.cpp's reader in
+/// ros2_medkit_gateway (same variable, same jobs, same semantics): the
+/// sanitizer jobs export MEDKIT_TEST_TIME_SCALE with the same factor they
+/// apply to every ctest TIMEOUT; unset / unparseable / below 1 means no
+/// scaling, so the normal job keeps the tight window and thresholds.
+double test_time_scale() {
+  const char * raw = std::getenv("MEDKIT_TEST_TIME_SCALE");
+  if (raw == nullptr) {
+    return 1.0;
+  }
+  try {
+    const double scale = std::stod(raw);
+    return scale >= 1.0 ? scale : 1.0;
+  } catch (const std::exception &) {
+    return 1.0;
+  }
+}
+
+/// Scale a wall-clock budget by test_time_scale().
+std::chrono::milliseconds scaled(std::chrono::milliseconds base) {
+  return std::chrono::milliseconds{static_cast<std::int64_t>(static_cast<double>(base.count()) * test_time_scale())};
+}
+
+/// Scale a throughput floor by test_time_scale(), so a longer scaled window still
+/// demands proportionally as much work, not just a longer wait for the same count.
+int scaled(int base) {
+  return static_cast<int>(static_cast<double>(base) * test_time_scale());
+}
+
+}  // namespace
 
 class RosbagCaptureTest : public ::testing::Test {
  protected:
@@ -2211,6 +2252,119 @@ TEST_F(RosbagCaptureIntegrationTest, ReconfirmingTheRecordingsOwnFaultResolvesNo
 
   EXPECT_LT(storage_ptr->lookups - after_first, static_cast<size_t>(kRepeats))
       << "every repeat resolved an entity scope it cannot use";
+
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, ConcurrentCapturesInOneProcessSurviveEachOthersPluginTraffic) {
+  // The storage-plugin loader's state is PROCESS-GLOBAL: class_loader keys one
+  // registry of loaded libraries by library path, so every writer of a format shares
+  // one shared-library handle no matter which capture opened it. A lock that is an
+  // instance member cannot order two captures against each other, and the failure is
+  // a double dlclose - the winner zeroes the handle, the loser calls a null
+  // deallocate and the process dies inside rcutils_unload_shared_library.
+  //
+  // Three threads therefore run at once, in the production shape. Two construct and
+  // destroy captures, whose constructors probe a backend by opening and closing a
+  // throwaway bag. One stands in for the capture pool and confirms faults, which
+  // OPENS bags. This thread spins, so it is the executor: the post-fault timer fires
+  // here and CLOSES them. Every pairing of an open against a close is crossed, across
+  // instance boundaries, which is the part no single-instance test reaches.
+  //
+  // Two claims are falsifiable here, and both were checked by mutation.
+  //
+  // Make the plugin lock per-thread rather than process-wide: this segfaults, 3 runs
+  // of 3.
+  //
+  // Close the finalise's writer under writer_mutex_ instead, so that lock is held
+  // across the plugin lock while open_bag_writer() takes them the other way round:
+  // this deadlocks, not crashes, on the first run. The confirming thread holds the
+  // plugin lock waiting for writer_mutex_ while the finalise holds writer_mutex_
+  // waiting for the plugin lock. A bare SIGTERM does not end it, because rclcpp's
+  // handler runs into the same deadlock - but ctest is not fooled by that: it reaps
+  // the hung process at this test's own TIMEOUT and reports the failure by name,
+  // which is what CI actually shows for this variant, not an indefinitely hung run.
+  //
+  // Both halves need the confirmations to come off THIS thread; one thread cannot
+  // deadlock against itself. The cycle also needs the close to sit where the design
+  // puts it, OUTSIDE post_fault_timer_mutex_: a close moved back inside that lock
+  // cannot deadlock, because a confirmation blocks on post_fault_timer_mutex_ in
+  // attach_to_active_recording() before it ever reaches the plugin lock - it just
+  // stalls every confirmation for the length of a bag close, which is the cost the
+  // design declines to pay. That variant passes, 3 runs of 3, so it is not what this
+  // test pins.
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_sec = 2.0;
+  // Short windows on purpose: the post-fault timer then fires often, so this thread
+  // is closing bags for most of the run rather than a handful of times.
+  rosbag_config.duration_after_sec = 0.1;
+  auto snapshot_config = create_snapshot_config();
+
+  // lazy_start, so the probing captures never create subscriptions on the shared
+  // node. Concurrent create_generic_subscription() on ONE node is a different race
+  // (the rcutils_hash_map one, serialised per instance by node_ops_mutex_), and
+  // letting it fire here would make a crash unattributable.
+  auto probe_config = create_rosbag_config();
+  probe_config.lazy_start = true;
+
+  RosbagCapture capture(node_.get(), storage_.get(), rosbag_config, snapshot_config);
+  auto pub = node_->create_publisher<std_msgs::msg::String>("/plugin_race_probe", 10);
+  capture.start();
+  publish_for(pub, std::chrono::milliseconds(600));
+
+  std::atomic<bool> stop_racers{false};
+  std::atomic<int> probes_done{0};
+  auto probe_loop = [&]() {
+    while (!stop_racers.load()) {
+      RosbagCapture probe(node_.get(), storage_.get(), probe_config, snapshot_config);
+      probes_done.fetch_add(1);
+    }
+  };
+  std::thread racer_a(probe_loop);
+  std::thread racer_b(probe_loop);
+
+  // The capture pool's stand-in. Each confirmation either opens a bag or attaches to
+  // the window this thread's timer is about to close; only this thread ever confirms,
+  // which is the contract the production caller keeps via the node rosbag mutex.
+  std::atomic<int> confirms_done{0};
+  std::thread confirmer([&]() {
+    int n = 0;
+    while (!stop_racers.load()) {
+      capture.on_fault_confirmed("PLUGIN_RACE_" + std::to_string(n++));
+      confirms_done.fetch_add(1);
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  });
+
+  // This thread is the executor for the whole run: spinning is what fires the
+  // post-fault timer, so every recording the confirmer opens is closed here.
+  // Scaled by test_time_scale(): an instrumented open/close/dlclose cycle does
+  // less work per wall-clock second, so the window has to grow to still cross
+  // the same amount of traffic under a sanitizer job.
+  publish_for(pub, scaled(std::chrono::milliseconds(5000)));
+
+  stop_racers.store(true);
+  racer_a.join();
+  racer_b.join();
+  confirmer.join();
+
+  // A crash or a hang is the real assertion; these say the run did the work it
+  // claims. Traffic that never got going would leave the opens and closes uncrossed
+  // and prove nothing, and rows are what say the recordings really finalised while
+  // the loader was under load. Thresholds scaled the same way as the window above,
+  // so a longer scaled window still demands proportionally as much work rather than
+  // just a longer wait for the same absolute count.
+  EXPECT_GT(probes_done.load(), scaled(50)) << "the probing threads barely ran, so no open/close traffic was crossed";
+  EXPECT_GT(confirms_done.load(), scaled(50))
+      << "the confirming thread barely ran, so few bags were opened off-executor";
+  size_t rows = 0;
+  for (int i = 0; i < confirms_done.load(); ++i) {
+    if (storage_->get_rosbag_file("PLUGIN_RACE_" + std::to_string(i)).has_value()) {
+      ++rows;
+    }
+  }
+  EXPECT_GT(rows, static_cast<size_t>(scaled(10)))
+      << "recordings did not finalise while the plugin loader was under load";
 
   capture.stop();
 }
