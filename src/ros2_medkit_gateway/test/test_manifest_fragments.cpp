@@ -255,6 +255,33 @@ apps:
   EXPECT_TRUE(found) << "expected FRAGMENT_FORBIDDEN_FIELD error naming 'discovery'";
 }
 
+TEST_F(FragmentsFixture, FragmentConfigBlockIsRejected) {
+  // `config:` is the canonical spelling of the same block, so a fragment must
+  // not be able to smuggle discovery configuration in under it either.
+  write_fragment("bad.yaml", R"(
+config:
+  unmanifested_nodes: error
+apps:
+  - id: helloApp
+    name: Hello
+    is_located_on: ecu-primary
+    ros_binding:
+      node_name: helloApp
+)");
+  ManifestManager mgr;
+  mgr.set_fragments_dir(fragments_dir.string());
+  EXPECT_FALSE(mgr.load_manifest(base_path.string(), /*strict=*/false));
+  auto vr = mgr.get_validation_result();
+  bool found = false;
+  for (const auto & err : vr.errors) {
+    if (err.rule_id == "FRAGMENT_FORBIDDEN_FIELD" && err.message.find("config") != std::string::npos) {
+      found = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found) << "expected FRAGMENT_FORBIDDEN_FIELD error naming 'config'";
+}
+
 TEST_F(FragmentsFixture, DuplicateIdsAcrossFragmentsFailValidation) {
   write_fragment("a.yaml", R"(
 apps:

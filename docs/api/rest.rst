@@ -59,11 +59,12 @@ Server Capabilities
    in config, which wires up an ``AggregationManager``). It does NOT
    require peers to be present - a gateway with aggregation enabled but
    zero peers still reports ``true`` and still emits the
-   aggregation-only response fields (``peers``, which may be an empty
-   array, and ``warnings`` on ``/health``; ``x-medkit.contributors`` on
-   entities, which will contain only ``"local"`` until a peer
-   contributes). Clients can feature-detect those fields using this
-   flag instead of probing for field presence.
+   aggregation-only response fields (``peers`` on ``/health``, which may
+   be an empty array; ``x-medkit.contributors`` on entities, which will
+   contain only ``"local"`` until a peer contributes). Clients can
+   feature-detect those fields using this flag instead of probing for
+   field presence. ``warnings`` is **not** one of them: it is served on
+   every ``/health`` response regardless of this flag.
 
 ``GET /api/v1/version-info``
    Get gateway version and status information.
@@ -88,20 +89,45 @@ Server Capabilities
 ``GET /api/v1/health``
    Health check endpoint. Returns HTTP 200 if gateway is operational.
 
-   When aggregation is enabled (``capabilities.aggregation == true`` in
-   the root response), the body includes additional x-medkit extension
-   fields:
+   The body always includes these x-medkit extension fields:
 
-   - ``peers`` - array of peer status objects (URL, name, reachability,
-     last-seen timestamp) for every configured or discovered peer.
-   - ``warnings`` - array of structured operator-actionable aggregation
-     warnings (always present when aggregation is active; empty when
-     there are no active anomalies). Each warning carries ``code``,
-     ``message``, ``entity_ids``, and ``peer_names``. See
-     :doc:`warning_codes` for the stable list of codes.
+   - ``warnings`` - array of structured operator-actionable warnings,
+     empty when there are no active anomalies. Each warning carries
+     ``code``, ``message``, ``entity_ids``, ``ros_node_fqns`` and
+     ``peer_names``. The three identifier arrays are always present, and a
+     code with nothing to say in one of them sends it empty.
+     ``entity_ids`` holds addressable SOVD entity ids only - never ROS node
+     names, which go in ``ros_node_fqns``. See :doc:`warning_codes` for the
+     stable list of codes and what each one fills in.
    - ``warning_schema_version`` - integer contract version for the
      ``warnings`` array. Clients key on this instead of string-matching
      codes. See :doc:`warning_codes` ``Schema versioning``.
+
+   .. note::
+
+      The OpenAPI component for a warning object is named ``HealthWarning``.
+      It was ``HealthAggregationWarning`` in earlier releases, renamed when
+      warnings stopped being aggregation-specific. The wire shape of the
+      object did not change, so ``warning_schema_version`` does not move for
+      the rename - but a client regenerated from the OpenAPI document will
+      see the generated type change name.
+
+   When aggregation is enabled (``capabilities.aggregation == true`` in
+   the root response), the body additionally includes:
+
+   - ``peers`` - array of peer status objects for every configured or
+     discovered peer. Each carries ``name``, ``url`` and ``status``
+     (``"online"`` or ``"offline"``).
+
+   The ``discovery`` object carries a ``linking`` sub-object describing
+   how manifest apps were bound to runtime ROS nodes: ``linked_count``,
+   ``orphan_count``, ``binding_conflicts``, ``unmanifested_policy`` (the
+   configured ``config.unmanifested_nodes`` value) and, when the linker
+   produced any, ``warnings`` (an array of strings). It appears only when
+   a linker ran, which means hybrid mode **with the runtime layer
+   enabled**: ``runtime_only`` and ``manifest_only`` run no linker, and
+   neither does a hybrid gateway configured with
+   ``discovery.runtime.enabled: false``.
 
    The body also always includes two subscription-pool vendor-extension
    sections, populated from atomic reads so ``/health`` never blocks even
@@ -136,27 +162,70 @@ Server Capabilities
       authenticating reverse proxy or restrict the peer-name field to
       admin-gated callers at the ingress.
 
-   **Example Response (aggregation enabled, one leaf collision):**
+   **Example Response.** A hybrid gateway with one declared app, six
+   undeclared ROS nodes and ``unmanifested_nodes: error``, captured from a
+   running gateway. The three ``x-medkit-*`` statistics objects are omitted
+   here for length; ``peers`` appears only when aggregation is enabled.
 
    .. code-block:: json
 
       {
         "status": "healthy",
-        "timestamp": 1776185189048036615,
+        "timestamp": 1786538411000000000,
+        "warning_schema_version": 2,
+        "warnings": [
+          {
+            "code": "unmanifested_nodes",
+            "message": "6 running ROS node(s) are not declared in the manifest while unmanifested_nodes is set to 'error' (listed in ros_node_fqns). The gateway keeps serving. Declare them in the manifest, or relax the policy to 'warn' or 'ignore'.",
+            "entity_ids": [],
+            "ros_node_fqns": [
+              "/powertrain/engine/rpm_sensor",
+              "/ros2_medkit_gateway",
+              "/_param_client_node",
+              "/ros2_medkit_gateway_fault_clients",
+              "/ros2_medkit_gateway_lifecycle_state_reader",
+              "/ros2_medkit_gateway_sub"
+            ],
+            "peer_names": []
+          }
+        ],
         "discovery": {
           "mode": "hybrid",
-          "strategy": "hybrid_discovery"
-        },
+          "strategy": "hybrid",
+          "pipeline": {
+            "layers": ["manifest", "runtime"],
+            "total_entities": 9,
+            "enriched_count": 0,
+            "conflict_count": 0,
+            "conflicts": [],
+            "id_collisions": 0,
+            "filtered_by_gap_fill": 0
+          },
+          "linking": {
+            "linked_count": 1,
+            "orphan_count": 6,
+            "binding_conflicts": 0,
+            "unmanifested_policy": "error"
+          }
+        }
+      }
+
+   With aggregation enabled the body additionally carries ``peers``, and a
+   Component announced by more than one peer adds a second warning:
+
+   .. code-block:: json
+
+      {
         "peers": [
-          {"name": "peer_b", "url": "http://peer-b:8080", "healthy": true},
-          {"name": "peer_c", "url": "http://peer-c:8080", "healthy": true}
+          {"name": "peer_b", "url": "http://peer-b:8080", "status": "online"},
+          {"name": "peer_c", "url": "http://peer-c:8080", "status": "online"}
         ],
-        "warning_schema_version": 1,
         "warnings": [
           {
             "code": "leaf_id_collision",
             "message": "Component 'ecu-x' is announced by multiple peers (peer_b, peer_c); routing falls back to last-writer-wins which is non-deterministic. Resolve by renaming the Component on one side or by modelling it as a hierarchical parent (declare a child Component with parentComponentId='ecu-x' on the owning peer).",
             "entity_ids": ["ecu-x"],
+            "ros_node_fqns": [],
             "peer_names": ["peer_b", "peer_c"]
           }
         ]

@@ -94,6 +94,46 @@ void merge_scalar(std::string & target, const std::string & source, MergeWinner 
   }
 }
 
+// Protection has two independent grounds, and an entity needs only one:
+//   1. the OWNING LAYER declares its entities protected (a plugin layer), or
+//   2. the entity carries a source tag the whitelist recognises.
+// (1) exists because (2) alone required every provider to pick a string from a
+// list it could not see; a provider that stamped its own tag lost its entities
+// to the orphan sweep. (2) stays because manifest and inventory entities are
+// identified that way and `source` is public API we do not get to redefine.
+bool is_protected_entity(const std::string & id, const std::string & source,
+                         const std::unordered_set<std::string> & protected_ids) {
+  return protected_ids.count(id) > 0 || is_protected_source(source);
+}
+
+// Merge an entity's `source` tag. Deliberately NOT merge_scalar: `source` is
+// provenance, not content. It records which layer declared the entity, and
+// is_protected_source() keys the orphan filter and the linked-app dedup on it -
+// so it decides whether the entity may be DELETED. A value that governs a
+// deletion must not be reassignable by a formatting policy: with the manifest
+// layer's METADATA policy demoted below the runtime layer's, merge_scalar would
+// take its SOURCE branch and rewrite "manifest" to "heuristic", after which the
+// filters remove the entity. So the resolution is ignored on purpose and this
+// is a pure gap fill - an entity that arrives without provenance still inherits
+// one, and an entity that has provenance keeps it under every layer policy.
+//
+// INVARIANT this relies on: provenance is first-writer-wins, so the layer that
+// declares an entity FIRST owns its `source` for the whole run. Two properties
+// of the callers make that safe, and both must hold:
+//   1. Layer order. merge_entities() seeds the merged entity from the first
+//      layer that contributed it, and DiscoveryManager adds the manifest layer
+//      before the runtime layer and appends plugin layers after both
+//      (discovery_manager.cpp). A plugin therefore cannot take `source` away
+//      from a manifest entity and make it deletable.
+//   2. No carry-over. execute() builds a fresh MergeResult per run, so a
+//      provenance filled in one pass never persists into the next.
+// If either ever changes, this function is the thing that breaks.
+void fill_provenance(std::string & target, const std::string & candidate) {
+  if (target.empty()) {
+    target = candidate;
+  }
+}
+
 void merge_bool(bool & target, bool source, MergeWinner winner) {
   switch (winner) {
     case MergeWinner::SOURCE:
@@ -218,7 +258,8 @@ void apply_field_group_merge(Entity & target, const Entity & source, FieldGroup 
         merge_scalar(target.parent_area_id, source.parent_area_id, res.scalar);
         break;
       case FieldGroup::METADATA:
-        merge_scalar(target.source, source.source, res.scalar);
+        // Provenance is exempt from the policy - see fill_provenance().
+        fill_provenance(target.source, source.source);
         break;
       case FieldGroup::LIVE_DATA:
       case FieldGroup::STATUS:
@@ -261,7 +302,8 @@ void apply_field_group_merge(Entity & target, const Entity & source, FieldGroup 
             res.collection);
         break;
       case FieldGroup::METADATA:
-        merge_scalar(target.source, source.source, res.scalar);
+        // Provenance is exempt from the policy - see fill_provenance().
+        fill_provenance(target.source, source.source);
         merge_scalar(target.variant, source.variant, res.scalar);
         merge_external(target.external, source.external, res.scalar);
         break;
@@ -301,7 +343,8 @@ void apply_field_group_merge(Entity & target, const Entity & source, FieldGroup 
         merge_optional(target.bound_fqn, source.bound_fqn, res.scalar);
         break;
       case FieldGroup::METADATA:
-        merge_scalar(target.source, source.source, res.scalar);
+        // Provenance is exempt from the policy - see fill_provenance().
+        fill_provenance(target.source, source.source);
         merge_optional(target.ros_binding, source.ros_binding, res.scalar);
         merge_external(target.external, source.external, res.scalar);
         break;
@@ -319,7 +362,8 @@ void apply_field_group_merge(Entity & target, const Entity & source, FieldGroup 
         merge_collection(target.depends_on, source.depends_on, res.collection);
         break;
       case FieldGroup::METADATA:
-        merge_scalar(target.source, source.source, res.scalar);
+        // Provenance is exempt from the policy - see fill_provenance().
+        fill_provenance(target.source, source.source);
         break;
       case FieldGroup::LIVE_DATA:
       case FieldGroup::STATUS:
@@ -344,6 +388,15 @@ void MergePipeline::add_layer(std::unique_ptr<DiscoveryLayer> layer) {
 void MergePipeline::set_linker(std::unique_ptr<RuntimeLinker> linker, const ManifestConfig & config) {
   linker_ = std::move(linker);
   manifest_config_ = config;
+}
+
+DiscoveryLayer * MergePipeline::find_layer(const std::string & name) {
+  for (auto & layer : layers_) {
+    if (layer->name() == name) {
+      return layer.get();
+    }
+  }
+  return nullptr;
 }
 
 template <typename Entity>
@@ -377,6 +430,21 @@ std::vector<Entity> MergePipeline::merge_entities(std::vector<std::pair<size_t, 
     Entity merged = std::move(entries[0].entity);
     size_t owner_layer_idx = entries[0].layer_idx;
     report.entity_source[id] = layers_[owner_layer_idx]->name();
+
+    // Record protection here, where the OWNING LAYER INDEX is in hand. The
+    // report keeps the layer's name for humans, but the filters must not key
+    // on a name: names are not guaranteed unique, and re-deriving the layer
+    // from its name would put the delete decision back on a string chosen
+    // elsewhere, which is the bug this replaces.
+    //
+    // Deliberately the owning layer only. A plugin that merely ENRICHES an
+    // entity another layer declared does not protect it - a beacon shadow
+    // contribution must not make a runtime app undeletable. If you are here
+    // because a plugin-enriched entity got swept, that is the intended
+    // behaviour, not a bug to fix.
+    if (layers_[owner_layer_idx]->owns_protected_entities()) {
+      protected_entity_ids_.insert(id);
+    }
 
     // Seed asset-identity provenance with the base entity's canonical source tag so
     // subsequent identity merges can compare authority per field.
@@ -423,6 +491,8 @@ std::vector<Entity> MergePipeline::merge_entities(std::vector<std::pair<size_t, 
 
 MergeResult MergePipeline::execute() {
   MergeReport report;
+  // Rebuilt per run: protection follows what the layers contribute THIS pass.
+  protected_entity_ids_.clear();
   for (const auto & layer : layers_) {
     report.layers.push_back(layer->name());
   }
@@ -436,6 +506,10 @@ MergeResult MergePipeline::execute() {
   // RuntimeLinker needs runtime-only apps (nodes as Apps, not merged with
   // manifest apps). Manifest apps lack bound_fqn until linked.
   std::vector<App> runtime_apps;
+
+  // The manifest's apps exactly as declared, before any merging. Needed to
+  // honour inherit_runtime_resources=false: see the restore below.
+  std::vector<App> manifest_declared_apps;
 
   for (size_t i = 0; i < layers_.size(); ++i) {
     // Build discovery context from entities collected so far (for plugin layers)
@@ -473,6 +547,9 @@ MergeResult MergePipeline::execute() {
     // the linker needs all runtime apps to bind manifest apps to live nodes.
     if (layers_[i]->provides_runtime_apps()) {
       runtime_apps = layers_[i]->get_linking_apps();
+    }
+    if (layers_[i]->name() == "manifest") {
+      manifest_declared_apps = output.apps;
     }
 
     if (!output.areas.empty()) {
@@ -516,9 +593,38 @@ MergeResult MergePipeline::execute() {
   check_ids(result.apps, "App");
   check_ids(result.functions, "Function");
 
+  // inherit_runtime_resources=false must mean the app exposes only what the
+  // manifest declares. Gating RuntimeLinker::enrich_app is not enough to
+  // deliver that: merge_entities<App>() has already run, and its LIVE_DATA
+  // field group unions the runtime layer's topics, services and actions into
+  // any app the two layers contribute under the same id - which is exactly
+  // what a manifest app named after the node it binds to looks like. So the
+  // flag would silently do nothing in the most natural configuration.
+  //
+  // Restore the declared collections here, after the merge and before
+  // linking. The manifest layer is the authority on what it declared, so this
+  // reads from its own untouched output rather than trying to unpick which
+  // entries the merge contributed.
+  if (!manifest_config_.inherit_runtime_resources && !manifest_declared_apps.empty()) {
+    std::unordered_map<std::string, const App *> declared;
+    declared.reserve(manifest_declared_apps.size());
+    for (const auto & app : manifest_declared_apps) {
+      declared.emplace(app.id, &app);
+    }
+    for (auto & app : result.apps) {
+      auto it = declared.find(app.id);
+      if (it == declared.end()) {
+        continue;  // not a manifest app; the flag says nothing about it
+      }
+      app.topics = it->second->topics;
+      app.services = it->second->services;
+      app.actions = it->second->actions;
+    }
+  }
+
   // Post-merge linking: bind manifest apps to runtime nodes (Apps, not Components)
   if (linker_) {
-    auto linking = linker_->link(result.apps, runtime_apps, manifest_config_);
+    auto linking = linker_->link(result.apps, runtime_apps, manifest_config_, protected_entity_ids_);
 
     // Replace apps with linked versions (have is_online, bound_fqn set)
     result.apps = std::move(linking.linked_apps);
@@ -593,7 +699,7 @@ MergeResult MergePipeline::execute() {
 
     auto app_it = std::remove_if(result.apps.begin(), result.apps.end(), [&](const App & app) {
       // Whitelist: manifest and plugin sources are always preserved
-      if (is_protected_source(app.source)) {
+      if (is_protected_entity(app.id, app.source, protected_entity_ids_)) {
         return false;
       }
       // Suppress non-protected apps whose ID matches a linked manifest app (dedup)
@@ -622,7 +728,7 @@ MergeResult MergePipeline::execute() {
 
     // Remove non-protected components whose namespace is covered by manifest or orphan suppression
     auto comp_it = std::remove_if(result.components.begin(), result.components.end(), [&](const Component & comp) {
-      if (is_protected_source(comp.source)) {
+      if (is_protected_entity(comp.id, comp.source, protected_entity_ids_)) {
         return false;
       }
       if (manifest_comp_ns.count(comp.namespace_path) > 0 || linked_namespaces.count(comp.namespace_path) > 0) {
@@ -638,7 +744,7 @@ MergeResult MergePipeline::execute() {
 
     // Remove non-protected areas whose namespace is covered
     auto area_it = std::remove_if(result.areas.begin(), result.areas.end(), [&](const Area & area) {
-      if (is_protected_source(area.source)) {
+      if (is_protected_entity(area.id, area.source, protected_entity_ids_)) {
         return false;
       }
       if (manifest_area_ns.count(area.namespace_path) > 0 || linked_namespaces.count(area.namespace_path) > 0) {

@@ -31,6 +31,49 @@
 namespace ros2_medkit_gateway {
 namespace discovery {
 
+namespace {
+// A top-level block counts as present only when it carries a value. yaml-cpp
+// reports a key with no value as defined-but-null, and treating that as
+// present makes an empty `config:` outrank a populated `discovery:`.
+bool is_present_block(const YAML::Node & node) {
+  return static_cast<bool>(node) && !node.IsNull();
+}
+
+}  // namespace
+
+namespace {
+
+/// Every top-level key `parse_string` reads, plus the deprecated `discovery`
+/// alias. Deliberately next to the parsing code: a new section cannot be added
+/// to `parse_string` without extending this list, and anything outside it is
+/// reported as ignored instead of being dropped in silence.
+constexpr const char * kKnownTopLevelKeys[] = {
+    "manifest_version", "metadata", "config",    "discovery", "areas",        "components",
+    "assets",           "apps",     "functions", "scripts",   "capabilities",
+};
+
+bool is_known_top_level_key(const std::string & key) {
+  for (const char * known : kKnownTopLevelKeys) {
+    if (key == known) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string known_top_level_keys_csv() {
+  std::string joined;
+  for (const char * known : kKnownTopLevelKeys) {
+    if (!joined.empty()) {
+      joined += ", ";
+    }
+    joined += known;
+  }
+  return joined;
+}
+
+}  // namespace
+
 Manifest ManifestParser::parse_file(const std::string & file_path) const {
   std::ifstream file(file_path);
   if (!file.is_open()) {
@@ -122,9 +165,42 @@ Manifest ManifestParser::parse_string(const std::string & yaml_content) const {
     manifest.metadata = parse_metadata(root["metadata"]);
   }
 
-  // Parse discovery config
-  if (root["discovery"]) {
-    manifest.config = parse_config(root["discovery"]);
+  // Parse discovery config. `config:` is the documented, canonical key.
+  // `discovery:` is the key the parser originally read and is kept working as
+  // a deprecated alias; when both are present, `config:` wins.
+  // "Present" must mean the same thing here as it does in parse_config_block,
+  // which treats a null value as absent. A bare `config:` with nothing under
+  // it used to win the precedence test and then parse to nothing, so a
+  // populated `discovery:` below it was skipped, the settings silently did not
+  // apply, and the operator was told "'config:' is used" - which reads as
+  // confirmation that it did.
+  const bool has_config = is_present_block(root["config"]);
+  const bool has_discovery_alias = is_present_block(root["discovery"]);
+  // R014/R015 are ADVISORY for this release: collected here and emitted as log
+  // notices rather than validation warnings. Reason: this branch is what makes
+  // the block read at all, so a manifest carrying `unmanifested_nodes: Warn` or
+  // `inherit_runtime_resources: 0` loaded fine before the upgrade and would be
+  // REFUSED after it, under the shipped `manifest_strict_validation: true` -
+  // taking hybrid discovery down to runtime_only for a file the operator never
+  // touched. They become validation warnings in the next release; a wrong
+  // value already falls back to the documented default either way.
+  std::vector<ManifestParseNotice> config_notices;
+  if (has_config) {
+    manifest.config = parse_config_block(root["config"], "config", config_notices);
+    if (has_discovery_alias) {
+      manifest.log_notices.emplace_back(
+          "Manifest declares both 'config:' and the deprecated 'discovery:' top-level keys; 'config:' is used and "
+          "'discovery:' is ignored.");
+    }
+  } else if (has_discovery_alias) {
+    manifest.config = parse_config_block(root["discovery"], "discovery", config_notices);
+    manifest.log_notices.emplace_back(
+        "Manifest uses the deprecated top-level 'discovery:' key for discovery configuration; rename it to 'config:'. "
+        "The alias still works and will be removed in a future release.");
+  }
+  for (const auto & notice : config_notices) {
+    manifest.log_notices.emplace_back("[" + notice.rule_id + "] " + notice.message +
+                                      " (advisory in this release; becomes a validation warning in the next one)");
   }
 
   // Parse areas (with recursive subareas)
@@ -189,6 +265,24 @@ Manifest ManifestParser::parse_string(const std::string & yaml_content) const {
     }
   }
 
+  // Anything the parser did not read is ignored - say so. A silently ignored
+  // top-level key is how a whole configuration block can go missing without a
+  // single line of output. Non-scalar keys are skipped, as the fragment path
+  // does, because they cannot be rendered into a message.
+  if (root.IsMap()) {
+    for (const auto & it : root) {
+      if (!it.first.IsScalar()) {
+        continue;
+      }
+      std::string key = it.first.as<std::string>();
+      if (is_known_top_level_key(key)) {
+        continue;
+      }
+      manifest.log_notices.emplace_back("Manifest has unknown top-level key '" + key +
+                                        "' - it is ignored. Known keys: " + known_top_level_keys_csv() + ".");
+    }
+  }
+
   return manifest;
 }
 
@@ -201,18 +295,110 @@ ManifestMetadata ManifestParser::parse_metadata(const YAML::Node & node) const {
   return meta;
 }
 
-ManifestConfig ManifestParser::parse_config(const YAML::Node & node) const {
+// Gate the discovery-configuration block on its YAML kind before indexing it.
+// parse_config() addresses the node by field name, and a node that is not a
+// map cannot be addressed that way: yaml-cpp THROWS on a scalar (which would
+// abandon the whole manifest, losing every entity in it over one bad key) and
+// silently yields nothing on a sequence (which would drop the operator's
+// configuration without a word). A key that carries no value at all is YAML
+// null and means "absent": it loads in silence, here and for every setting
+// inside the block (see read_bool_setting and parse_config).
+//
+// R015 is a VALIDATION notice, so what happens next depends on the strictness
+// dial: with the shipped default `manifest_strict_validation: true` the
+// manifest is rejected and hybrid mode degrades to runtime_only; with strict
+// validation off the manifest loads, the defaults apply and the notice is
+// logged. "The defaults apply" is only the non-strict half of the story.
+ManifestConfig ManifestParser::parse_config_block(const YAML::Node & node, const std::string & key,
+                                                  std::vector<ManifestParseNotice> & notices) const {
+  if (node.IsMap()) {
+    return parse_config(node, notices);
+  }
+  if (node.IsNull()) {
+    return ManifestConfig{};  // present but empty == absent
+  }
+
+  const char * kind = node.IsSequence() ? "sequence" : "scalar";
+  notices.push_back({"R015", "Manifest key '" + key + "' must be a mapping of discovery settings, but is a " +
+                                 std::string(kind) + "; the block is ignored and the defaults apply."});
+  return ManifestConfig{};
+}
+
+namespace {
+
+// Describe a node's YAML kind for an operator-facing message.
+const char * yaml_kind_name(const YAML::Node & node) {
+  if (node.IsSequence()) {
+    return "sequence";
+  }
+  if (node.IsMap()) {
+    return "mapping";
+  }
+  return "scalar";
+}
+
+// True when a settings key is present and carries an actual value. A key with
+// no value at all parses as YAML null, which means "not set" and must load in
+// silence - writing `unmanifested_nodes:` and nothing else is not an error.
+bool has_value(const YAML::Node & node, const std::string & key) {
+  return static_cast<bool>(node[key]) && !node[key].IsNull();
+}
+
+}  // namespace
+
+// Read one boolean setting. Same guard the block itself gets, one level down:
+// `.as<bool>()` THROWS on anything it cannot convert - including a key left
+// empty - and that exception would escape the whole manifest load, so a single
+// mistyped flag would cost every entity in the file. Wrong kind or wrong text
+// is reported under R015 and the default stands.
+void ManifestParser::read_bool_setting(const YAML::Node & node, const std::string & key, bool & target,
+                                       std::vector<ManifestParseNotice> & notices) const {
+  if (!has_value(node, key)) {
+    return;
+  }
+  const YAML::Node value = node[key];
+  if (value.IsScalar()) {
+    bool parsed = false;
+    if (YAML::convert<bool>::decode(value, parsed)) {
+      target = parsed;
+      return;
+    }
+    notices.push_back({"R015", "Manifest setting '" + key + "' must be a boolean, but is '" + value.as<std::string>() +
+                                   "'; the default (" + (target ? "true" : "false") + ") applies."});
+    return;
+  }
+  notices.push_back({"R015", "Manifest setting '" + key + "' must be a boolean, but is a " + yaml_kind_name(value) +
+                                 "; the default (" + (target ? "true" : "false") + ") applies."});
+}
+
+ManifestConfig ManifestParser::parse_config(const YAML::Node & node, std::vector<ManifestParseNotice> & notices) const {
   ManifestConfig config;
 
-  std::string policy = get_string(node, "unmanifested_nodes", "warn");
-  config.unmanifested_nodes = ManifestConfig::parse_policy(policy);
+  // A key with no value means "not set", which is the struct default and not a
+  // wrong value. Only a key that carries something is parsed - otherwise
+  // get_string() renders YAML null as the literal text "null" and the operator
+  // is told their empty key is an unknown policy.
+  if (has_value(node, "unmanifested_nodes")) {
+    const YAML::Node policy_node = node["unmanifested_nodes"];
+    if (!policy_node.IsScalar()) {
+      notices.push_back({"R015", "Manifest setting 'unmanifested_nodes' must be a string, but is a " +
+                                     std::string(yaml_kind_name(policy_node)) + "; the default ('warn') applies."});
+    } else if (const std::string policy = policy_node.as<std::string>(); !policy.empty()) {
+      config.unmanifested_nodes = ManifestConfig::parse_policy(policy);
+      // parse_policy is total - every unrecognised string maps to WARN - so at
+      // this call site a typo is indistinguishable from a deliberate "warn".
+      // Detect it by round-tripping the parsed value rather than by keeping a
+      // second copy of the valid-value list here.
+      if (ManifestConfig::policy_to_string(config.unmanifested_nodes) != policy) {
+        notices.push_back({"R014", "Unknown unmanifested_nodes value '" + policy +
+                                       "'; falling back to 'warn'. Valid values: ignore, warn, error, "
+                                       "include_as_orphan (lower-case)."});
+      }
+    }
+  }
 
-  if (node["inherit_runtime_resources"]) {
-    config.inherit_runtime_resources = node["inherit_runtime_resources"].as<bool>();
-  }
-  if (node["allow_manifest_override"]) {
-    config.allow_manifest_override = node["allow_manifest_override"].as<bool>();
-  }
+  read_bool_setting(node, "inherit_runtime_resources", config.inherit_runtime_resources, notices);
+  read_bool_setting(node, "allow_manifest_override", config.allow_manifest_override, notices);
 
   return config;
 }

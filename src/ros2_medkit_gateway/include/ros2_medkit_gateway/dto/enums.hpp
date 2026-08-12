@@ -65,5 +65,14 @@ inline constexpr std::string_view kExecutionCapabilityValues[] = {"stop", "execu
 /// Lifecycle status (LifecycleStatusResponse.status).
 inline constexpr std::string_view kLifecycleStatusValues[] = {"ready", "notReady"};
 
+/// Stable warning codes on GET /health. Keep in sync with
+/// core/http/warning_codes.hpp, which is the canonical list.
+inline constexpr std::string_view kHealthWarningCodeValues[] = {"leaf_id_collision", "unmanifested_nodes"};
+
+/// Values of the manifest's `unmanifested_nodes` setting, as reported by
+/// GET /health under discovery.linking. Lower-case; keep in sync with
+/// ManifestConfig::policy_to_string.
+inline constexpr std::string_view kUnmanifestedPolicyValues[] = {"ignore", "warn", "error", "include_as_orphan"};
+
 }  // namespace dto
 }  // namespace ros2_medkit_gateway

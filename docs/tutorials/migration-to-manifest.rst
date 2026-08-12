@@ -297,6 +297,15 @@ Combine all sections into a complete manifest:
 
 Save as ``system_manifest.yaml`` in your config directory.
 
+.. note::
+
+   The discovery-configuration block is spelled ``config:``. Older manifests
+   written against the gateway source rather than this documentation may spell
+   it ``discovery:``; that key still works as a deprecated alias and the
+   gateway logs a warning naming it, but it will be removed in a future
+   release - rename it to ``config:``. A manifest that declares both keys uses
+   ``config:`` and ignores ``discovery:``.
+
 Step 7: Test in Hybrid Mode
 ---------------------------
 
@@ -343,7 +352,18 @@ Based on testing results:
 **Orphan nodes appearing:**
 
 - Add app entries for missing nodes
-- Or set ``config.unmanifested_nodes: ignore`` to hide them
+- Or set ``config.unmanifested_nodes: ignore`` to hide them. Note how wide
+  that setting reaches: it drops every app that did not come from the
+  manifest, the asset inventory or a discovery plugin, so nodes you have not
+  declared yet disappear from the entity tree along with the ones you meant to
+  hide. "From a plugin" means the plugin's layer *declared* the entity - a
+  plugin that only adds detail to an app another layer discovered does not
+  shield it, whatever ``x-medkit.source`` ends up saying.
+  While you are still filling the manifest in, ``warn`` keeps them visible.
+- ``config.unmanifested_nodes: error`` does not stop the gateway. It logs at
+  error level and lists the orphan nodes on ``GET /api/v1/health`` under the
+  ``unmanifested_nodes`` warning code, which is the form to use if you want CI
+  or a monitor to fail on an incomplete manifest.
 
 **Missing data/operations:**
 

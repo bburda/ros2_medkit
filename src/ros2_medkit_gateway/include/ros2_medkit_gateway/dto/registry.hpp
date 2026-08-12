@@ -82,8 +82,8 @@ using AllDtos =
                // Auth domain DTOs
                AuthCredentials, AuthTokenResponse, AuthRevokeRequest, AuthRevokeResponse,
                // Health / Root domain DTOs
-               HealthDiscoveryLinking, HealthDiscovery, HealthAggregationWarning, Health, VersionInfoVendor,
-               VersionInfoEntry, XMedkitVersionInfo, VersionInfo, RootCapabilities, RootAuth, RootTls, RootOverview,
+               HealthDiscoveryLinking, HealthDiscovery, HealthWarning, Health, VersionInfoVendor, VersionInfoEntry,
+               XMedkitVersionInfo, VersionInfo, RootCapabilities, RootAuth, RootTls, RootOverview,
                // Lifecycle domain DTOs
                LifecycleStatusResponse>;
 

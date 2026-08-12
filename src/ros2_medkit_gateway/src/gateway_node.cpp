@@ -2145,6 +2145,12 @@ void GatewayNode::handle_entity_change_notification(const EntityChangeScope & sc
           RCLCPP_WARN(get_logger(),
                       "notify_entities_changed: manifest reload failed (see validation errors); "
                       "continuing refresh against the previously loaded manifest");
+        } else {
+          // The reloaded manifest may carry a different discovery
+          // configuration. /health reads it live, so without this the served
+          // unmanifested_policy would describe a policy the orphan filter is
+          // not running.
+          discovery_mgr_->refresh_manifest_config();
         }
       }
     }

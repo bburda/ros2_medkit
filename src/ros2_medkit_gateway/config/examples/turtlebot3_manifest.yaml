@@ -3,7 +3,7 @@
 # This manifest describes a TurtleBot3 robot running the Nav2 navigation stack.
 #
 # Use this manifest as a template for your own robot systems.
-# See documentation: https://ros2-medkit.readthedocs.io/tutorials/manifest-discovery.html
+# See documentation: https://selfpatch.github.io/ros2_medkit/tutorials/manifest-discovery.html
 
 manifest_version: "1.0"
 
@@ -13,8 +13,10 @@ metadata:
   description: "TurtleBot3 robot with Nav2 navigation stack for autonomous navigation"
 
 config:
-  # Policy for ROS nodes not declared in manifest
-  # Options: ignore, warn, error, include_as_orphan
+  # Policy for ROS nodes not declared in manifest.
+  # Options: ignore (hide them), warn (log a warning), error (log an error and
+  # report them on GET /api/v1/health), include_as_orphan (log at info level).
+  # None of them stops the gateway; only `ignore` changes the entity tree.
   unmanifested_nodes: warn
 
   # Copy topics/services from runtime nodes to manifest apps

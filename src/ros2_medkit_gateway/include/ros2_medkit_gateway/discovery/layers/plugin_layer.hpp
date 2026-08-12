@@ -38,6 +38,13 @@ class PluginLayer : public DiscoveryLayer {
   std::string name() const override {
     return name_;
   }
+
+  /// A plugin declares entities the operator deliberately added; they are not
+  /// runtime noise and the orphan sweep must not remove them, whatever
+  /// `source` tag the provider chose to stamp on them.
+  bool owns_protected_entities() const override {
+    return true;
+  }
   LayerOutput discover() override;
   MergePolicy policy_for(FieldGroup group) const override;
   void set_discovery_context(const IntrospectionInput & context) override;

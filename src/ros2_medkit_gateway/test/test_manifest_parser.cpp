@@ -21,14 +21,44 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
+#include <cstddef>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include "ros2_medkit_gateway/core/discovery/manifest/manifest_parser.hpp"
 
 using ros2_medkit_gateway::Component;
 using ros2_medkit_gateway::discovery::ManifestConfig;
 using ros2_medkit_gateway::discovery::ManifestParser;
+
+namespace {
+
+// R014 and R015 are ADVISORY this release: emitted on the log-only channel so
+// the strictness dial cannot turn a manifest that loaded before the upgrade
+// into a load failure after it. Returns the message with the rule-id prefix
+// and advisory suffix stripped, so assertions stay about the message itself.
+std::optional<std::string> find_notice(const ros2_medkit_gateway::discovery::Manifest & manifest,
+                                       const std::string & rule_id) {
+  const std::string prefix = "[" + rule_id + "] ";
+  const std::string suffix = " (advisory in this release; becomes a validation warning in the next one)";
+  for (const auto & notice : manifest.log_notices) {
+    if (notice.rfind(prefix, 0) != 0) {
+      continue;
+    }
+    std::string message = notice.substr(prefix.size());
+    if (message.size() >= suffix.size() &&
+        message.compare(message.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      message.erase(message.size() - suffix.size());
+    }
+    return message;
+  }
+  return std::nullopt;
+}
+
+}  // namespace
 
 // =============================================================================
 // Valid Manifest Parsing Tests
@@ -68,10 +98,10 @@ metadata:
   EXPECT_EQ(manifest.metadata.created_at, "2025-01-15");
 }
 
-TEST_F(ManifestParserTest, ParseDiscoveryConfig) {
+TEST_F(ManifestParserTest, ParseConfigBlock) {
   const std::string yaml = R"(
 manifest_version: "1.0"
-discovery:
+config:
   unmanifested_nodes: "ignore"
   inherit_runtime_resources: false
   allow_manifest_override: true
@@ -82,18 +112,21 @@ discovery:
   EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::IGNORE);
   EXPECT_FALSE(manifest.config.inherit_runtime_resources);
   EXPECT_TRUE(manifest.config.allow_manifest_override);
+  EXPECT_TRUE(manifest.log_notices.empty()) << "canonical key must not produce a notice";
+  EXPECT_TRUE(manifest.validation_notices.empty());
 }
 
-TEST_F(ManifestParserTest, ParseDiscoveryConfigDefaultPolicy) {
+TEST_F(ManifestParserTest, ParseConfigBlockDefaultPolicy) {
   const std::string yaml = R"(
 manifest_version: "1.0"
-discovery:
+config:
   unmanifested_nodes: "warn"
 )";
 
   auto manifest = parser_.parse_string(yaml);
 
   EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+  EXPECT_TRUE(manifest.validation_notices.empty());
 }
 
 TEST_F(ManifestParserTest, ParseAreas) {
@@ -359,7 +392,7 @@ manifest_version: "1.0"
 metadata:
   name: "Robot System"
   version: "1.0.0"
-discovery:
+config:
   unmanifested_nodes: "include_as_orphan"
 areas:
   - id: "navigation"
@@ -384,6 +417,283 @@ functions:
   EXPECT_EQ(manifest.components.size(), 2);
   EXPECT_EQ(manifest.apps.size(), 1);
   EXPECT_EQ(manifest.functions.size(), 1);
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::INCLUDE_AS_ORPHAN);
+}
+
+// =============================================================================
+// Top-level `config:` key, deprecated `discovery:` alias, parse notices
+// =============================================================================
+
+namespace {
+
+constexpr const char * kDeprecatedDiscoveryNotice =
+    "Manifest uses the deprecated top-level 'discovery:' key for discovery configuration; rename it to 'config:'. "
+    "The alias still works and will be removed in a future release.";
+
+constexpr const char * kBothKeysNotice =
+    "Manifest declares both 'config:' and the deprecated 'discovery:' top-level keys; 'config:' is used and "
+    "'discovery:' is ignored.";
+
+std::string unknown_key_notice(const std::string & key) {
+  return "Manifest has unknown top-level key '" + key +
+         "' - it is ignored. Known keys: manifest_version, metadata, config, discovery, areas, components, assets, "
+         "apps, functions, scripts, capabilities.";
+}
+
+/// Count how many notices contain `needle`. Substring rather than equality so
+/// a caller can look for one key inside a set of notices.
+size_t count_containing(const std::vector<std::string> & notices, const std::string & needle) {
+  size_t n = 0;
+  for (const auto & notice : notices) {
+    if (notice.find(needle) != std::string::npos) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_F(ManifestParserTest, DeprecatedDiscoveryKeyStillAppliesItsValuesAndIsNoticed) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+discovery:
+  unmanifested_nodes: "ignore"
+  inherit_runtime_resources: false
+  allow_manifest_override: false
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::IGNORE);
+  EXPECT_FALSE(manifest.config.inherit_runtime_resources);
+  EXPECT_FALSE(manifest.config.allow_manifest_override);
+  ASSERT_EQ(manifest.log_notices.size(), 1u);
+  EXPECT_EQ(manifest.log_notices[0], kDeprecatedDiscoveryNotice);
+  // A deprecation must never reach the validator: strict validation is on by
+  // default and would turn it into a load failure.
+  EXPECT_TRUE(manifest.validation_notices.empty());
+}
+
+TEST_F(ManifestParserTest, ConfigKeyWinsWhenBothBlocksArePresent) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+config:
+  unmanifested_nodes: "ignore"
+  inherit_runtime_resources: true
+discovery:
+  unmanifested_nodes: "error"
+  inherit_runtime_resources: false
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::IGNORE);
+  EXPECT_TRUE(manifest.config.inherit_runtime_resources);
+  ASSERT_EQ(manifest.log_notices.size(), 1u);
+  EXPECT_EQ(manifest.log_notices[0], kBothKeysNotice);
+}
+
+TEST_F(ManifestParserTest, DeprecatedDiscoveryKeyAlsoReportsAnUnknownPolicyValue) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+discovery:
+  unmanifested_nodes: "quiet"
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  // Advisory this release, so it lands on the log-only channel. The alias adds
+  // its own deprecation notice there too, hence "at least one".
+  EXPECT_TRUE(manifest.validation_notices.empty());
+  EXPECT_TRUE(find_notice(manifest, "R014").has_value())
+      << "the alias must report a bad policy value just as `config:` does";
+}
+
+TEST_F(ManifestParserTest, UnknownTopLevelKeyIsNoticedAndTheManifestStillLoads) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+configuration:
+  unmanifested_nodes: "ignore"
+apps:
+  - id: "nav2"
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  EXPECT_TRUE(manifest.is_loaded());
+  EXPECT_EQ(manifest.apps.size(), 1u);
+  // The typo'd block is ignored, so the defaults stand.
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+  ASSERT_EQ(manifest.log_notices.size(), 1u);
+  EXPECT_EQ(manifest.log_notices[0], unknown_key_notice("configuration"));
+}
+
+TEST_F(ManifestParserTest, EveryUnknownTopLevelKeyGetsItsOwnNotice) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+configuration: {}
+app:
+  - id: "nav2"
+area: []
+lock_overrides: {}
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  EXPECT_EQ(manifest.log_notices.size(), 4u) << "expected one notice per unknown key, got: " << [&] {
+    std::string joined;
+    for (const auto & notice : manifest.log_notices) {
+      joined += "\n  " + notice;
+    }
+    return joined;
+  }();
+  EXPECT_EQ(count_containing(manifest.log_notices, "'configuration'"), 1u);
+  EXPECT_EQ(count_containing(manifest.log_notices, "'app'"), 1u);
+  EXPECT_EQ(count_containing(manifest.log_notices, "'area'"), 1u);
+  EXPECT_EQ(count_containing(manifest.log_notices, "'lock_overrides'"), 1u);
+}
+
+TEST_F(ManifestParserTest, EveryKnownTopLevelKeyIsAccepted) {
+  // Every section parse_string reads, in one document. If a section is ever
+  // added to the parser without being added to the known-key set, this test
+  // starts reporting it as unknown.
+  const std::string yaml = R"(
+manifest_version: "1.0"
+metadata:
+  name: "Everything"
+config:
+  unmanifested_nodes: "warn"
+discovery:
+  unmanifested_nodes: "warn"
+areas:
+  - id: "navigation"
+components:
+  - id: "nav_server"
+    area: "navigation"
+assets:
+  - id: "cabinet-1"
+apps:
+  - id: "nav2"
+    is_located_on: "nav_server"
+functions:
+  - id: "path_planning"
+scripts:
+  - id: "diag"
+    path: "/opt/diag.sh"
+    format: "bash"
+capabilities:
+  nav2:
+    data: true
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  // Only the both-keys collision notice; nothing reported as unknown.
+  EXPECT_EQ(count_containing(manifest.log_notices, "unknown top-level key"), 0u);
+}
+
+TEST_F(ManifestParserTest, AllUnmanifestedNodePoliciesParseFromConfigBlock) {
+  const struct {
+    const char * text;
+    ManifestConfig::UnmanifestedNodePolicy expected;
+  } cases[] = {
+      {"ignore", ManifestConfig::UnmanifestedNodePolicy::IGNORE},
+      {"warn", ManifestConfig::UnmanifestedNodePolicy::WARN},
+      {"error", ManifestConfig::UnmanifestedNodePolicy::ERROR},
+      {"include_as_orphan", ManifestConfig::UnmanifestedNodePolicy::INCLUDE_AS_ORPHAN},
+  };
+
+  for (const auto & tc : cases) {
+    const std::string yaml =
+        std::string("manifest_version: \"1.0\"\nconfig:\n  unmanifested_nodes: \"") + tc.text + "\"\n";
+    auto manifest = parser_.parse_string(yaml);
+    EXPECT_EQ(manifest.config.unmanifested_nodes, tc.expected) << "value: " << tc.text;
+    EXPECT_TRUE(manifest.validation_notices.empty()) << "value: " << tc.text;
+    EXPECT_TRUE(manifest.log_notices.empty()) << "value: " << tc.text;
+  }
+}
+
+TEST_F(ManifestParserTest, UnknownPolicyValueProducesAnR014Notice) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+config:
+  unmanifested_nodes: "IGNORE"
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  // Falls back to the default policy...
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+  // ...and says so. ADVISORY for this release: it must NOT reach
+  // validation_notices, because the strictness dial defaults to true and would
+  // refuse a manifest that loaded fine before this branch made the block read.
+  EXPECT_TRUE(manifest.validation_notices.empty()) << "R014 must not be able to fail the load in this release";
+  const auto notice = find_notice(manifest, "R014");
+  ASSERT_TRUE(notice.has_value());
+  // The value list says "lower-case" because that is the trap this very case
+  // is: 'IGNORE' is a real policy word in the wrong case.
+  EXPECT_EQ(*notice,
+            "Unknown unmanifested_nodes value 'IGNORE'; falling back to 'warn'. "
+            "Valid values: ignore, warn, error, include_as_orphan (lower-case).");
+}
+
+TEST_F(ManifestParserTest, AbsentConfigBlockUsesDefaults) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+apps:
+  - id: "nav2"
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+  EXPECT_TRUE(manifest.config.inherit_runtime_resources);
+  EXPECT_TRUE(manifest.config.allow_manifest_override);
+  EXPECT_TRUE(manifest.log_notices.empty());
+  EXPECT_TRUE(manifest.validation_notices.empty());
+}
+
+TEST_F(ManifestParserTest, EmptyConfigBlockUsesDefaults) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+config: {}
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+  EXPECT_TRUE(manifest.config.inherit_runtime_resources);
+  EXPECT_TRUE(manifest.config.allow_manifest_override);
+  EXPECT_TRUE(manifest.validation_notices.empty());
+}
+
+TEST_F(ManifestParserTest, EmptyPolicyStringUsesTheDefaultWithoutANotice) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+config:
+  unmanifested_nodes: ""
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+  EXPECT_TRUE(manifest.validation_notices.empty()) << "an omitted value is not a wrong value";
+}
+
+TEST_F(ManifestParserTest, BothBooleanFlagsSweepBothValues) {
+  for (bool inherit : {false, true}) {
+    for (bool allow_override : {false, true}) {
+      const std::string yaml = std::string("manifest_version: \"1.0\"\nconfig:\n  inherit_runtime_resources: ") +
+                               (inherit ? "true" : "false") +
+                               "\n  allow_manifest_override: " + (allow_override ? "true" : "false") + "\n";
+      auto manifest = parser_.parse_string(yaml);
+      EXPECT_EQ(manifest.config.inherit_runtime_resources, inherit)
+          << "inherit=" << inherit << " allow_override=" << allow_override;
+      EXPECT_EQ(manifest.config.allow_manifest_override, allow_override)
+          << "inherit=" << inherit << " allow_override=" << allow_override;
+    }
+  }
 }
 
 // =============================================================================
@@ -640,6 +950,290 @@ TEST(ManifestConfigTest, PolicyToString) {
   EXPECT_EQ(ManifestConfig::policy_to_string(ManifestConfig::UnmanifestedNodePolicy::ERROR), "error");
   EXPECT_EQ(ManifestConfig::policy_to_string(ManifestConfig::UnmanifestedNodePolicy::INCLUDE_AS_ORPHAN),
             "include_as_orphan");
+}
+
+// =============================================================================
+// Malformed discovery-configuration block
+//
+// The block is addressed by key and then indexed by field. A key that is
+// present but not a map cannot be indexed: yaml-cpp throws on a scalar, and
+// silently yields nothing on a sequence. Neither may reach the field parser.
+// Both spellings of the key are guarded, because both are read.
+// =============================================================================
+
+namespace {
+
+// A manifest whose only variable is the value of the discovery-config block.
+std::string manifest_with_config_block(const std::string & key, const std::string & value) {
+  return "manifest_version: \"1.0\"\n" + key + ":" + value +
+         "\ncomponents:\n"
+         "  - id: mc-ecu\n"
+         "    name: \"Malformed Config ECU\"\n";
+}
+
+}  // namespace
+
+// A key with no value is "absent", not "malformed". This must keep working:
+// it loads on the merge base and it loads here.
+TEST_F(ManifestParserTest, NullConfigBlockIsTreatedAsAbsent) {
+  for (const std::string & key : {std::string("config"), std::string("discovery")}) {
+    auto manifest = parser_.parse_string(manifest_with_config_block(key, ""));
+
+    EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN) << key;
+    EXPECT_TRUE(manifest.config.inherit_runtime_resources) << key;
+    EXPECT_TRUE(manifest.config.allow_manifest_override) << key;
+    EXPECT_FALSE(find_notice(manifest, "R015").has_value()) << key << ": a null block is absent, not malformed";
+    ASSERT_EQ(manifest.components.size(), 1u) << key;
+  }
+}
+
+TEST_F(ManifestParserTest, EmptyMapConfigBlockIsTreatedAsAbsent) {
+  for (const std::string & key : {std::string("config"), std::string("discovery")}) {
+    auto manifest = parser_.parse_string(manifest_with_config_block(key, " {}"));
+
+    EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN) << key;
+    EXPECT_FALSE(find_notice(manifest, "R015").has_value()) << key;
+    ASSERT_EQ(manifest.components.size(), 1u) << key;
+  }
+}
+
+// The regression: a scalar value made parse_config throw out of the whole
+// load, so the manifest was lost entirely rather than the block reported.
+TEST_F(ManifestParserTest, ScalarConfigBlockIsReportedAndDoesNotAbortTheLoad) {
+  for (const std::string & key : {std::string("config"), std::string("discovery")}) {
+    ros2_medkit_gateway::discovery::Manifest manifest;
+    ASSERT_NO_THROW(manifest = parser_.parse_string(manifest_with_config_block(key, " \"\"")))
+        << key << ": a malformed block must not throw the manifest away";
+
+    const auto notice = find_notice(manifest, "R015");
+    ASSERT_TRUE(notice.has_value()) << key << ": a malformed block must be reported, not ignored";
+    EXPECT_EQ(*notice, "Manifest key '" + key +
+                           "' must be a mapping of discovery settings, but is a scalar; "
+                           "the block is ignored and the defaults apply.");
+
+    // The rest of the manifest still loads, and the settings fall back.
+    ASSERT_EQ(manifest.components.size(), 1u) << key;
+    EXPECT_EQ(manifest.components[0].id, "mc-ecu") << key;
+    EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN) << key;
+  }
+}
+
+// A sequence never threw - it was indexed, yielded nothing and was silently
+// dropped. Silent-drop of a configuration block is the bug class this branch
+// exists to close, so it is reported too.
+TEST_F(ManifestParserTest, SequenceConfigBlockIsReportedRatherThanSilentlyIgnored) {
+  for (const std::string & key : {std::string("config"), std::string("discovery")}) {
+    ros2_medkit_gateway::discovery::Manifest manifest;
+    ASSERT_NO_THROW(manifest =
+                        parser_.parse_string(manifest_with_config_block(key, "\n  - unmanifested_nodes: ignore")));
+
+    const auto notice = find_notice(manifest, "R015");
+    ASSERT_TRUE(notice.has_value()) << key << ": a sequence must not be dropped without a word";
+    EXPECT_EQ(*notice, "Manifest key '" + key +
+                           "' must be a mapping of discovery settings, but is a sequence; "
+                           "the block is ignored and the defaults apply.");
+    EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN) << key;
+  }
+}
+
+// A malformed canonical key must not silently promote the deprecated alias:
+// `config:` present means `config:` is the block, well-formed or not.
+TEST_F(ManifestParserTest, MalformedConfigDoesNotFallThroughToTheAlias) {
+  const std::string yaml =
+      "manifest_version: \"1.0\"\n"
+      "config: \"\"\n"
+      "discovery:\n"
+      "  unmanifested_nodes: ignore\n";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  ASSERT_TRUE(find_notice(manifest, "R015").has_value());
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN)
+      << "the alias must not quietly supply the configuration the canonical key failed to";
+}
+
+// =============================================================================
+// Malformed VALUES inside the discovery-configuration block
+//
+// The block guard above only proves the block is a mapping. Each setting
+// inside it is read by kind too: `.as<bool>()` throws on anything it cannot
+// convert, and a key left empty renders as the literal string "null" if it is
+// read as text. Either would cost the whole manifest, or accuse the operator
+// of a typo they did not make.
+// =============================================================================
+
+namespace {
+
+std::string manifest_with_setting(const std::string & key, const std::string & value) {
+  return "manifest_version: \"1.0\"\nconfig:\n  " + key + ":" + value +
+         "\ncomponents:\n"
+         "  - id: mc-ecu\n"
+         "    name: \"Malformed Config ECU\"\n";
+}
+
+}  // namespace
+
+// A key with no value is "not set". This is the case the block-level comment
+// promised and the one all three settings used to get wrong.
+TEST_F(ManifestParserTest, NullSettingValuesAreTreatedAsNotSet) {
+  for (const std::string & key : {std::string("unmanifested_nodes"), std::string("inherit_runtime_resources"),
+                                  std::string("allow_manifest_override")}) {
+    ros2_medkit_gateway::discovery::Manifest manifest;
+    ASSERT_NO_THROW(manifest = parser_.parse_string(manifest_with_setting(key, "")))
+        << key << ": an empty value must not throw the manifest away";
+
+    EXPECT_TRUE(manifest.validation_notices.empty())
+        << key << ": an empty value is 'not set', not a wrong value; got "
+        << (manifest.validation_notices.empty() ? std::string{} : manifest.validation_notices[0].message);
+    EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN) << key;
+    EXPECT_TRUE(manifest.config.inherit_runtime_resources) << key;
+    EXPECT_TRUE(manifest.config.allow_manifest_override) << key;
+    ASSERT_EQ(manifest.components.size(), 1u) << key;
+  }
+}
+
+TEST_F(ManifestParserTest, WellFormedSettingValuesStillParse) {
+  auto manifest = parser_.parse_string(
+      "manifest_version: \"1.0\"\n"
+      "config:\n"
+      "  unmanifested_nodes: ignore\n"
+      "  inherit_runtime_resources: false\n"
+      "  allow_manifest_override: false\n");
+
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::IGNORE);
+  EXPECT_FALSE(manifest.config.inherit_runtime_resources);
+  EXPECT_FALSE(manifest.config.allow_manifest_override);
+  EXPECT_TRUE(manifest.validation_notices.empty());
+}
+
+TEST_F(ManifestParserTest, NonBooleanSettingValuesAreReportedAndDefaulted) {
+  struct Case {
+    std::string value;
+    std::string expected_kind;
+  };
+  const std::vector<Case> cases = {
+      {" \"yes-please\"", "'yes-please'"},
+      {"\n    - true", "a sequence"},
+      {"\n    enabled: true", "a mapping"},
+  };
+
+  for (const std::string & key : {std::string("inherit_runtime_resources"), std::string("allow_manifest_override")}) {
+    for (const auto & tc : cases) {
+      ros2_medkit_gateway::discovery::Manifest manifest;
+      ASSERT_NO_THROW(manifest = parser_.parse_string(manifest_with_setting(key, tc.value)))
+          << key << " / " << tc.value;
+
+      const auto notice = find_notice(manifest, "R015");
+      ASSERT_TRUE(notice.has_value()) << key << " / " << tc.value << ": must be reported, not thrown or ignored";
+      EXPECT_EQ(*notice, "Manifest setting '" + key + "' must be a boolean, but is " + tc.expected_kind +
+                             "; the default (true) applies.");
+
+      // The default stands and the rest of the manifest survives.
+      EXPECT_TRUE(manifest.config.inherit_runtime_resources) << key;
+      EXPECT_TRUE(manifest.config.allow_manifest_override) << key;
+      ASSERT_EQ(manifest.components.size(), 1u) << key;
+    }
+  }
+}
+
+TEST_F(ManifestParserTest, NonScalarPolicyValueIsReportedAndDefaulted) {
+  for (const std::string & value : {std::string("\n    - ignore"), std::string("\n    mode: ignore")}) {
+    ros2_medkit_gateway::discovery::Manifest manifest;
+    ASSERT_NO_THROW(manifest = parser_.parse_string(manifest_with_setting("unmanifested_nodes", value)));
+
+    const auto notice = find_notice(manifest, "R015");
+    ASSERT_TRUE(notice.has_value()) << value;
+    EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+    // A wrong KIND is R015, not R014: R014 is for a scalar that is not one of
+    // the known policy words.
+    EXPECT_FALSE(find_notice(manifest, "R014").has_value()) << value;
+  }
+}
+
+// The policy words are lower-case. Documented, and pinned here because under
+// the shipped strict default this rejects the whole manifest.
+TEST_F(ManifestParserTest, PolicyValueIsCaseSensitive) {
+  auto manifest = parser_.parse_string(manifest_with_setting("unmanifested_nodes", " Warn"));
+
+  const auto notice = find_notice(manifest, "R014");
+  ASSERT_TRUE(notice.has_value()) << "'Warn' is not 'warn'";
+  EXPECT_EQ(manifest.config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+}
+
+// =============================================================================
+// Precedence between `config:` and the deprecated `discovery:` alias
+//
+// Both keys are read, so "which one is present" has to mean the same thing to
+// the precedence test as it does to the block parser. It did not: a bare
+// `config:` with no value counted as present, won, then parsed to nothing -
+// so a populated `discovery:` under it was skipped in silence while the log
+// said "'config:' is used", which reads as confirmation it applied.
+// =============================================================================
+
+namespace {
+
+std::string manifest_with_blocks(const std::string & config_block, const std::string & alias_block) {
+  return "manifest_version: \"1.0\"\n" + config_block + alias_block +
+         "components:\n"
+         "  - id: prec-ecu\n"
+         "    name: \"Precedence ECU\"\n";
+}
+
+// The four shapes the canonical key can take.
+const std::string kConfigAbsent;
+const std::string kConfigNull = "config:\n";
+const std::string kConfigEmptyMap = "config: {}\n";
+const std::string kConfigPopulated = "config:\n  unmanifested_nodes: ignore\n";
+
+const std::string kAliasAbsent;
+const std::string kAliasPopulated = "discovery:\n  unmanifested_nodes: error\n";
+
+bool has_collision_notice(const ros2_medkit_gateway::discovery::Manifest & manifest) {
+  for (const auto & notice : manifest.log_notices) {
+    if (notice.find("declares both") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+TEST_F(ManifestParserTest, ConfigAliasPrecedenceSweepsAllCombinations) {
+  using Policy = ManifestConfig::UnmanifestedNodePolicy;
+  struct Case {
+    std::string name;
+    std::string config_block;
+    std::string alias_block;
+    Policy expected;
+    bool expect_collision_notice;
+  };
+
+  const std::vector<Case> cases = {
+      // No canonical key: the alias applies, or nothing does.
+      {"absent/absent", kConfigAbsent, kAliasAbsent, Policy::WARN, false},
+      {"absent/alias", kConfigAbsent, kAliasPopulated, Policy::ERROR, false},
+      // A null canonical key is NOT a configuration. It must not shadow the
+      // alias, and it must not claim a collision.
+      {"null/absent", kConfigNull, kAliasAbsent, Policy::WARN, false},
+      {"null/alias", kConfigNull, kAliasPopulated, Policy::ERROR, false},
+      // An empty MAP is a real (if empty) configuration block: it wins, and
+      // the defaults apply.
+      {"emptymap/absent", kConfigEmptyMap, kAliasAbsent, Policy::WARN, false},
+      {"emptymap/alias", kConfigEmptyMap, kAliasPopulated, Policy::WARN, true},
+      // A populated canonical key wins outright.
+      {"populated/absent", kConfigPopulated, kAliasAbsent, Policy::IGNORE, false},
+      {"populated/alias", kConfigPopulated, kAliasPopulated, Policy::IGNORE, true},
+  };
+
+  for (const auto & tc : cases) {
+    auto manifest = parser_.parse_string(manifest_with_blocks(tc.config_block, tc.alias_block));
+
+    EXPECT_EQ(manifest.config.unmanifested_nodes, tc.expected) << tc.name;
+    EXPECT_EQ(has_collision_notice(manifest), tc.expect_collision_notice)
+        << tc.name << ": the collision notice must fire only when `config:` really carries a block";
+    ASSERT_EQ(manifest.components.size(), 1u) << tc.name;
+  }
 }
 
 // =============================================================================

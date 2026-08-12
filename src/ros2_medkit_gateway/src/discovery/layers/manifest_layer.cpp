@@ -18,6 +18,10 @@ namespace ros2_medkit_gateway {
 namespace discovery {
 
 ManifestLayer::ManifestLayer(ManifestManager * manifest_manager) : manifest_manager_(manifest_manager) {
+  reset_policies_to_defaults();
+}
+
+void ManifestLayer::reset_policies_to_defaults() {
   policies_ = {{FieldGroup::IDENTITY, MergePolicy::AUTHORITATIVE},
                {FieldGroup::HIERARCHY, MergePolicy::AUTHORITATIVE},
                {FieldGroup::LIVE_DATA, MergePolicy::ENRICHMENT},

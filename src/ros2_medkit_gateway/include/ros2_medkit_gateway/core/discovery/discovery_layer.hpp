@@ -65,6 +65,24 @@ class DiscoveryLayer {
 
   /// Whether this layer provides runtime apps for post-merge linking.
   /// Only RuntimeLayer (or test doubles) should return true.
+  /// True when entities this layer OWNS must survive orphan suppression.
+  ///
+  /// Protection used to be decided by matching `entity.source` against a list
+  /// of known strings. That string is chosen by whoever produced the entity -
+  /// a plugin provider may set anything, or nothing - so a provider that
+  /// picked an unlisted tag (`beacon`, say) had its entities deleted. The
+  /// decision belongs to the layer, which the pipeline knows for certain,
+  /// rather than to a value the layer's data happens to carry.
+  ///
+  /// Declared here rather than answered with dynamic_cast to match how the
+  /// pipeline already asks a layer what it is (see provides_runtime_apps).
+  /// DiscoveryLayer is gateway-internal - plugins implement
+  /// IntrospectionProvider, never this - so adding to it does not touch the
+  /// plugin ABI.
+  virtual bool owns_protected_entities() const {
+    return false;
+  }
+
   virtual bool provides_runtime_apps() const {
     return false;
   }

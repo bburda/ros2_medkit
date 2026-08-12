@@ -11,7 +11,11 @@ metadata:
   description: "Fleet of mobile robots with central coordinator"
 
 config:
-  # Include orphan nodes (useful for discovering new robots)
+  # Keep undeclared nodes visible, so a robot that joins the fleet before its
+  # manifest entry does still shows up. This is the same entity tree the
+  # default `warn` produces - the two policies differ only in logging, where
+  # `include_as_orphan` reports one aggregate line instead of one line per
+  # node. Nothing is tagged `source: "orphan"`.
   unmanifested_nodes: include_as_orphan
   inherit_runtime_resources: true
 

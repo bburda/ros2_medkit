@@ -15,6 +15,7 @@
 #include "ros2_medkit_gateway/discovery/manifest/runtime_linker.hpp"
 
 #include "ros2_medkit_gateway/core/discovery/merge_types.hpp"
+#include "ros2_medkit_gateway/core/http/warning_codes.hpp"
 
 #include <algorithm>
 
@@ -71,7 +72,8 @@ RuntimeLinker::RuntimeLinker(rclcpp::Node * node) : node_(node) {
 }
 
 LinkingResult RuntimeLinker::link(const std::vector<App> & manifest_apps, const std::vector<App> & runtime_apps,
-                                  const ManifestConfig & config) {
+                                  const ManifestConfig & config,
+                                  const std::unordered_set<std::string> & protected_ids) {
   LinkingResult result;
 
   // Track which runtime nodes have been matched
@@ -157,7 +159,12 @@ LinkingResult RuntimeLinker::link(const std::vector<App> & manifest_apps, const 
       const auto & match_fqn = match.bound_fqn.value();
       linked_app.bound_fqn = match_fqn;
       linked_app.is_online = true;
-      enrich_app(linked_app, match);
+      // inherit_runtime_resources=false keeps the manifest's declaration of
+      // what the app exposes: the binding still says which node it is, but the
+      // node's live topics, services and actions are not copied onto it.
+      if (config.inherit_runtime_resources) {
+        enrich_app(linked_app, match);
+      }
 
       result.app_to_node[manifest_app.id] = match_fqn;
       result.node_to_app[match_fqn] = manifest_app.id;
@@ -192,7 +199,11 @@ LinkingResult RuntimeLinker::link(const std::vector<App> & manifest_apps, const 
   }
 
   auto it = std::remove_if(result.linked_apps.begin(), result.linked_apps.end(), [&](const App & app) {
-    if (is_protected_source(app.source)) {
+    // Same two grounds the pipeline's orphan sweep uses, from the same set:
+    // the owning layer declares its entities protected, or the source tag is
+    // one the whitelist knows. Keying on the tag alone deleted entities from
+    // any provider that stamped a tag the whitelist had never heard of.
+    if (protected_ids.count(app.id) > 0 || is_protected_source(app.source)) {
       return false;
     }
     if (!app.bound_fqn.has_value()) {
@@ -219,11 +230,15 @@ LinkingResult RuntimeLinker::link(const std::vector<App> & manifest_apps, const 
         break;
 
       case ManifestConfig::UnmanifestedNodePolicy::ERROR:
-        log_error("Orphan nodes detected with 'error' policy. Discovery will fail.");
+        log_error("Orphan nodes detected with 'error' policy: " + std::to_string(result.orphan_nodes.size()) +
+                  " node(s) are not declared in the manifest. The gateway keeps serving; they are reported on "
+                  "GET /health as a '" +
+                  std::string(WARN_UNMANIFESTED_NODES) + "' warning.");
         break;
 
       case ManifestConfig::UnmanifestedNodePolicy::INCLUDE_AS_ORPHAN:
-        log_info("Including " + std::to_string(result.orphan_nodes.size()) + " orphan nodes with source='orphan'");
+        log_info("Including " + std::to_string(result.orphan_nodes.size()) +
+                 " orphan node(s), same as the 'warn' policy but logged at info level");
         break;
     }
   }

@@ -109,6 +109,50 @@ void DiscoveryManager::apply_layer_policy_overrides(const std::string & layer_na
   }
 }
 
+// The manifest layer's policies come from two sources that must be applied in
+// this order, at boot AND after every reload. Shared so the two paths cannot
+// drift: a reload that applied them in the other order would silently invert
+// R11a's precedence and let the blanket flag beat an explicit deployment
+// parameter.
+void DiscoveryManager::apply_manifest_layer_policies(discovery::ManifestLayer & manifest_layer) {
+  // allow_manifest_override=false is sugar over the layer policies: it demotes
+  // every field group of the manifest layer to FALLBACK, so the manifest only
+  // fills gaps the other layers leave. Applied BEFORE the per-group parameter
+  // overrides, so a deployment that explicitly pins
+  // discovery.merge_pipeline.layers.manifest.<group> still wins - only
+  // non-empty parameter values reach layer_policies at all, so this falls out
+  // of the existing last-writer-wins ordering.
+  if (!get_manifest_config().allow_manifest_override) {
+    for (auto fg : {discovery::FieldGroup::IDENTITY, discovery::FieldGroup::HIERARCHY, discovery::FieldGroup::LIVE_DATA,
+                    discovery::FieldGroup::STATUS, discovery::FieldGroup::METADATA}) {
+      manifest_layer.set_policy(fg, discovery::MergePolicy::FALLBACK);
+    }
+    RCLCPP_INFO(node_->get_logger(),
+                "Layer 'manifest': allow_manifest_override=false, every field group demoted to fallback");
+  } else {
+    // A reload can flip the flag back on, so restore the shipped defaults
+    // rather than leaving the previous demotion in place.
+    manifest_layer.reset_policies_to_defaults();
+  }
+  apply_layer_policy_overrides("manifest", manifest_layer);
+}
+
+void DiscoveryManager::refresh_manifest_config() {
+  if (!pipeline_) {
+    return;
+  }
+  // /health reads the config live from the ManifestManager while the pipeline
+  // captured it once at construction. After a reload the two disagree, and the
+  // documented monitor recipe then reports a policy the orphan filter is not
+  // actually running. Push the new config in and re-apply the layer policies
+  // it drives. NOT a pipeline rebuild: plugin layers added at runtime through
+  // add_plugin_layer would be lost.
+  pipeline_->set_manifest_config(get_manifest_config());
+  if (auto * layer = pipeline_->find_layer("manifest")) {
+    apply_manifest_layer_policies(*static_cast<discovery::ManifestLayer *>(layer));
+  }
+}
+
 void DiscoveryManager::build_pipeline() {
   // Configure runtime introspection (always-on adapter, used by all modes for
   // service/action queries even when the merge pipeline is bypassed).
@@ -130,7 +174,22 @@ void DiscoveryManager::build_pipeline() {
 
       if (config_.manifest_enabled) {
         auto manifest_layer = std::make_unique<discovery::ManifestLayer>(manifest_manager_.get());
-        apply_layer_policy_overrides("manifest", *manifest_layer);
+        // allow_manifest_override=false is sugar over the layer policies: it
+        // demotes every field group of the manifest layer to FALLBACK, so the
+        // manifest only fills gaps the other layers leave. Applied BEFORE the
+        // per-group parameter overrides, so a deployment that explicitly pins
+        // discovery.merge_pipeline.layers.manifest.<group> still wins - only
+        // non-empty parameter values reach layer_policies at all, so this falls
+        // out of the existing last-writer-wins ordering.
+        apply_manifest_layer_policies(*manifest_layer);
+        // LAYER ORDER IS PART OF THE CONTRACT, not a convenience. MergePipeline
+        // seeds each merged entity from the FIRST layer that declares it and
+        // fills provenance first-writer-wins (see fill_provenance() in
+        // merge_pipeline.cpp), so whichever layer is added first owns
+        // `source` - and `source` is what the orphan filter keys deletion on.
+        // The manifest must therefore be added before the runtime layer, and
+        // plugin layers are appended after both (add_plugin_layer). Reordering
+        // these calls would silently make manifest entities deletable.
         pipeline->add_layer(std::move(manifest_layer));
       } else {
         RCLCPP_INFO(node_->get_logger(), "Manifest layer disabled in hybrid mode");
@@ -154,8 +213,7 @@ void DiscoveryManager::build_pipeline() {
 
       // RuntimeLinker only makes sense when runtime is enabled.
       if (config_.runtime_enabled) {
-        auto manifest_config = manifest_manager_ ? manifest_manager_->get_config() : discovery::ManifestConfig{};
-        pipeline->set_linker(std::make_unique<discovery::RuntimeLinker>(node_), manifest_config);
+        pipeline->set_linker(std::make_unique<discovery::RuntimeLinker>(node_), get_manifest_config());
       }
 
       pipeline_ = std::move(pipeline);
@@ -418,6 +476,10 @@ void DiscoveryManager::add_plugin_layer(const std::string & plugin_name, Introsp
     RCLCPP_WARN(node_->get_logger(), "Cannot add plugin layer '%s': not in hybrid mode", plugin_name.c_str());
     return;
   }
+  // Appended AFTER the manifest and runtime layers, and that is load-bearing:
+  // provenance is first-writer-wins, so a plugin can never take `source` away
+  // from a manifest entity it also describes. See the note at the manifest
+  // add_layer() call above.
   pipeline_->add_layer(std::make_unique<discovery::PluginLayer>(plugin_name, provider));
   RCLCPP_INFO(node_->get_logger(), "Added plugin layer '%s' to merge pipeline", plugin_name.c_str());
 }
@@ -440,6 +502,10 @@ void DiscoveryManager::refresh_pipeline() {
 
 discovery::ManifestManager * DiscoveryManager::get_manifest_manager() {
   return manifest_manager_.get();
+}
+
+discovery::ManifestConfig DiscoveryManager::get_manifest_config() const {
+  return manifest_manager_ ? manifest_manager_->get_config() : discovery::ManifestConfig{};
 }
 
 std::string DiscoveryManager::get_strategy_name() const {

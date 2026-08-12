@@ -30,12 +30,19 @@ using namespace ros2_medkit_gateway;
 // Concrete test layer for unit testing
 class TestLayer : public DiscoveryLayer {
  public:
-  TestLayer(std::string name, LayerOutput output, std::unordered_map<FieldGroup, MergePolicy> policies = {})
-    : name_(std::move(name)), output_(std::move(output)), policies_(std::move(policies)) {
+  TestLayer(std::string name, LayerOutput output, std::unordered_map<FieldGroup, MergePolicy> policies = {},
+            bool owns_protected = false)
+    : name_(std::move(name))
+    , output_(std::move(output))
+    , policies_(std::move(policies))
+    , owns_protected_(owns_protected) {
   }
 
   std::string name() const override {
     return name_;
+  }
+  bool owns_protected_entities() const override {
+    return owns_protected_;
   }
   bool provides_runtime_apps() const override {
     return name_ == "runtime";
@@ -59,6 +66,7 @@ class TestLayer : public DiscoveryLayer {
   std::string name_;
   LayerOutput output_;
   std::unordered_map<FieldGroup, MergePolicy> policies_;
+  bool owns_protected_{false};
 };
 
 // @verifies REQ_INTEROP_003
@@ -2296,4 +2304,532 @@ TEST_F(MergePipelineTest, IgnorePolicyFiltersHeuristicAppsWithoutBoundFqn) {
   ASSERT_EQ(result.apps.size(), 1u);
   EXPECT_EQ(result.apps[0].id, "nav_app");
   EXPECT_EQ(result.apps[0].source, "manifest");
+}
+
+// =============================================================================
+// Provenance (`source`) is not policy-driven content
+//
+// `is_protected_source(source)` decides whether the orphan/dedup filters may
+// delete an entity, so no field-group policy may reassign it. These cases pin
+// that at all four merge sites (Area, Component, App, Function) by demoting the
+// manifest layer's METADATA policy below the runtime layer's - which is what
+// `discovery.merge_pipeline.layers.manifest.metadata: fallback` and the
+// manifest's `allow_manifest_override: false` both do.
+// =============================================================================
+
+namespace {
+
+// The shipped manifest-layer policies (manifest_layer.cpp).
+std::unordered_map<FieldGroup, MergePolicy> manifest_policies(MergePolicy metadata) {
+  return {{FieldGroup::IDENTITY, MergePolicy::AUTHORITATIVE},
+          {FieldGroup::HIERARCHY, MergePolicy::AUTHORITATIVE},
+          {FieldGroup::LIVE_DATA, MergePolicy::ENRICHMENT},
+          {FieldGroup::STATUS, MergePolicy::FALLBACK},
+          {FieldGroup::METADATA, metadata}};
+}
+
+// The shipped runtime-layer policies (runtime_layer.cpp).
+std::unordered_map<FieldGroup, MergePolicy> runtime_policies() {
+  return {{FieldGroup::IDENTITY, MergePolicy::FALLBACK},
+          {FieldGroup::HIERARCHY, MergePolicy::FALLBACK},
+          {FieldGroup::LIVE_DATA, MergePolicy::AUTHORITATIVE},
+          {FieldGroup::STATUS, MergePolicy::AUTHORITATIVE},
+          {FieldGroup::METADATA, MergePolicy::ENRICHMENT}};
+}
+
+}  // namespace
+
+// --- Site 1: Area ---
+
+TEST_F(MergePipelineTest, AreaProvenanceSurvivesManifestMetadataDemotion) {
+  Area manifest_area = make_area("powertrain");
+  manifest_area.source = "manifest";
+
+  Area runtime_area = make_area("powertrain");
+  runtime_area.source = "heuristic";
+
+  LayerOutput manifest_out;
+  manifest_out.areas.push_back(manifest_area);
+  LayerOutput runtime_out;
+  runtime_out.areas.push_back(runtime_area);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::FALLBACK)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  auto result = pipeline_.execute();
+  ASSERT_EQ(result.areas.size(), 1u);
+  EXPECT_EQ(result.areas[0].source, "manifest") << "a METADATA policy must not be able to rewrite an Area's provenance";
+}
+
+// --- Site 2: Component ---
+
+TEST_F(MergePipelineTest, ComponentProvenanceSurvivesManifestMetadataDemotion) {
+  Component manifest_comp = make_component("engine", "powertrain", "/powertrain");
+  manifest_comp.source = "manifest";
+
+  Component runtime_comp = make_component("engine", "powertrain", "/powertrain");
+  runtime_comp.source = "synthetic";
+
+  LayerOutput manifest_out;
+  manifest_out.components.push_back(manifest_comp);
+  LayerOutput runtime_out;
+  runtime_out.components.push_back(runtime_comp);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::FALLBACK)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  auto result = pipeline_.execute();
+  ASSERT_EQ(result.components.size(), 1u);
+  EXPECT_EQ(result.components[0].source, "manifest")
+      << "a METADATA policy must not be able to rewrite a Component's provenance";
+}
+
+// --- Site 3: App ---
+
+TEST_F(MergePipelineTest, AppProvenanceSurvivesManifestMetadataDemotion) {
+  App manifest_app = make_app("temp_sensor", "engine");
+  manifest_app.source = "manifest";
+
+  App runtime_app = make_app("temp_sensor", "engine");
+  runtime_app.source = "heuristic";
+  runtime_app.is_online = true;
+  runtime_app.bound_fqn = "/powertrain/engine/temp_sensor";
+
+  LayerOutput manifest_out;
+  manifest_out.apps.push_back(manifest_app);
+  LayerOutput runtime_out;
+  runtime_out.apps.push_back(runtime_app);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::FALLBACK)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  auto result = pipeline_.execute();
+  ASSERT_EQ(result.apps.size(), 1u);
+  EXPECT_EQ(result.apps[0].source, "manifest") << "a METADATA policy must not be able to rewrite an App's provenance";
+}
+
+// --- Site 4: Function ---
+
+TEST_F(MergePipelineTest, FunctionProvenanceSurvivesManifestMetadataDemotion) {
+  Function manifest_fn = make_function("braking");
+  manifest_fn.source = "manifest";
+
+  Function runtime_fn = make_function("braking");
+  runtime_fn.source = "heuristic";
+
+  LayerOutput manifest_out;
+  manifest_out.functions.push_back(manifest_fn);
+  LayerOutput runtime_out;
+  runtime_out.functions.push_back(runtime_fn);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::FALLBACK)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  auto result = pipeline_.execute();
+  ASSERT_EQ(result.functions.size(), 1u);
+  EXPECT_EQ(result.functions[0].source, "manifest")
+      << "a METADATA policy must not be able to rewrite a Function's provenance";
+}
+
+// --- The consequence the provenance rewrite had: the entity was deleted ---
+
+namespace {
+
+// Builds the exact shape that reproduces the defect on a live gateway: a
+// manifest app whose `id` equals the name of the node it binds to, so both
+// layers contribute an entity under the same id and the merge runs.
+void seed_self_named_manifest_app(MergePipeline & pipeline, MergePolicy manifest_metadata) {
+  App manifest_app = make_app("temp_sensor", "engine");
+  manifest_app.source = "manifest";
+  App::RosBinding binding;
+  binding.node_name = "temp_sensor";
+  binding.namespace_pattern = "/powertrain/engine";
+  binding.topic_namespace = "";
+  manifest_app.ros_binding = binding;
+
+  App runtime_app = make_app("temp_sensor", "engine");
+  runtime_app.source = "heuristic";
+  runtime_app.is_online = true;
+  runtime_app.bound_fqn = "/powertrain/engine/temp_sensor";
+
+  LayerOutput manifest_out;
+  manifest_out.apps.push_back(manifest_app);
+  LayerOutput runtime_out;
+  runtime_out.apps.push_back(runtime_app);
+
+  pipeline.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(manifest_metadata)));
+  pipeline.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+  pipeline.set_linker(std::make_unique<RuntimeLinker>(nullptr), ManifestConfig{});
+}
+
+}  // namespace
+
+TEST_F(MergePipelineTest, SelfNamedManifestAppSurvivesTheOrphanFilterUnderMetadataDemotion) {
+  seed_self_named_manifest_app(pipeline_, MergePolicy::FALLBACK);
+
+  auto result = pipeline_.execute();
+
+  ASSERT_EQ(result.apps.size(), 1u) << "the linked manifest app must not be deduplicated against itself; "
+                                       "losing its 'manifest' provenance is what let the filter delete it";
+  EXPECT_EQ(result.apps[0].id, "temp_sensor");
+  EXPECT_EQ(result.apps[0].source, "manifest");
+  EXPECT_TRUE(result.apps[0].is_online);
+  ASSERT_TRUE(result.apps[0].bound_fqn.has_value());
+  EXPECT_EQ(*result.apps[0].bound_fqn, "/powertrain/engine/temp_sensor");
+}
+
+// There are TWO filters keyed on is_protected_source, and they run in
+// different translation units: RuntimeLinker::link drops unprotected apps whose
+// bound_fqn is already linked, and only afterwards does MergePipeline run its
+// own id-based dedup. The case above cannot say which of the two deleted the
+// app. This one isolates the linker leg.
+//
+// The runtime app reports is_online=false, and STATUS resolves to the runtime
+// layer, so the merge alone can only produce is_online=false. The single place
+// that can turn it true is RuntimeLinker::link, and that assignment happens
+// BEFORE the linker's own suppression pass. So a final is_online==true proves
+// the app was linked AND survived the linker's filter - not just the pipeline's.
+TEST_F(MergePipelineTest, SelfNamedManifestAppSurvivesTheLinkersOwnFilterUnderMetadataDemotion) {
+  App manifest_app = make_app("temp_sensor", "engine");
+  manifest_app.source = "manifest";
+  manifest_app.is_online = false;
+  App::RosBinding binding;
+  binding.node_name = "temp_sensor";
+  binding.namespace_pattern = "/powertrain/engine";
+  binding.topic_namespace = "";
+  manifest_app.ros_binding = binding;
+
+  App runtime_app = make_app("temp_sensor", "engine");
+  runtime_app.source = "heuristic";
+  runtime_app.is_online = false;  // the merge cannot make this true
+  runtime_app.bound_fqn = "/powertrain/engine/temp_sensor";
+
+  LayerOutput manifest_out;
+  manifest_out.apps.push_back(manifest_app);
+  LayerOutput runtime_out;
+  runtime_out.apps.push_back(runtime_app);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::FALLBACK)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+  pipeline_.set_linker(std::make_unique<RuntimeLinker>(nullptr), ManifestConfig{});
+
+  auto result = pipeline_.execute();
+
+  // Direct measurement of the linker leg: LinkingResult is snapshotted at the
+  // END of RuntimeLinker::link, after its own suppression pass, so this counts
+  // what survived THAT filter specifically - before MergePipeline's dedup has
+  // had any chance to run.
+  ASSERT_EQ(result.linking_result.linked_apps.size(), 1u)
+      << "the app was removed inside RuntimeLinker::link, not by the pipeline";
+  EXPECT_EQ(result.linking_result.linked_apps[0].source, "manifest");
+  EXPECT_EQ(result.linking_result.app_to_node.count("temp_sensor"), 1u);
+
+  // ... and it also survives the pipeline's own id-based dedup afterwards.
+  ASSERT_EQ(result.apps.size(), 1u);
+  EXPECT_EQ(result.apps[0].source, "manifest");
+  EXPECT_TRUE(result.apps[0].is_online) << "only RuntimeLinker::link sets is_online here, so a false value means "
+                                           "the app never came back out of the linker's suppression pass";
+}
+
+// Control: the identical fixture under the shipped default METADATA policy.
+// Pins that the difference above is the policy and not the fixture, and that
+// this slice changed nothing in the default configuration.
+TEST_F(MergePipelineTest, SelfNamedManifestAppSurvivesUnderDefaultMetadataPolicy) {
+  seed_self_named_manifest_app(pipeline_, MergePolicy::AUTHORITATIVE);
+
+  auto result = pipeline_.execute();
+
+  ASSERT_EQ(result.apps.size(), 1u);
+  EXPECT_EQ(result.apps[0].id, "temp_sensor");
+  EXPECT_EQ(result.apps[0].source, "manifest");
+}
+
+// --- Protection follows the OWNING LAYER, not the `source` string ---
+//
+// A plugin provider chooses its own `source` tag. The whitelist could never
+// know them all: a provider that stamped "beacon" (or anything else unlisted)
+// had its entities swept by unmanifested_nodes=ignore. The owning layer is
+// what the pipeline knows for certain, so that is what protection reads.
+
+TEST_F(MergePipelineTest, PluginOwnedEntityWithUnlistedSourceSurvivesIgnorePolicy) {
+  App manifest_app = make_app("nav_app", "compute_unit");
+  manifest_app.source = "manifest";
+  App::RosBinding binding;
+  binding.node_name = "nav_controller";
+  binding.namespace_pattern = "/navigation";
+  binding.topic_namespace = "";
+  manifest_app.ros_binding = binding;
+
+  App runtime_orphan;
+  runtime_orphan.id = "_param_client_node";
+  runtime_orphan.name = "_param_client_node";
+  runtime_orphan.source = "heuristic";
+  runtime_orphan.is_online = true;
+  runtime_orphan.bound_fqn = "/_param_client_node";
+
+  // The entity under test: contributed by a plugin layer, carrying a tag the
+  // source whitelist does not list.
+  App plugin_app = make_app("beacon_temp", "compute_unit");
+  plugin_app.source = "beacon";
+
+  LayerOutput manifest_out;
+  manifest_out.apps.push_back(manifest_app);
+  LayerOutput runtime_out;
+  runtime_out.apps.push_back(runtime_orphan);
+  LayerOutput plugin_out;
+  plugin_out.apps.push_back(plugin_app);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>(
+      "manifest", manifest_out,
+      std::unordered_map<FieldGroup, MergePolicy>{{FieldGroup::IDENTITY, MergePolicy::AUTHORITATIVE}}));
+  pipeline_.add_layer(std::make_unique<TestLayer>(
+      "runtime", runtime_out,
+      std::unordered_map<FieldGroup, MergePolicy>{{FieldGroup::STATUS, MergePolicy::AUTHORITATIVE}}));
+  pipeline_.add_layer(std::make_unique<TestLayer>("some_plugin", plugin_out,
+                                                  std::unordered_map<FieldGroup, MergePolicy>{},
+                                                  /*owns_protected=*/true));
+
+  ManifestConfig config;
+  config.unmanifested_nodes = ManifestConfig::UnmanifestedNodePolicy::IGNORE;
+  pipeline_.set_linker(std::make_unique<RuntimeLinker>(nullptr), config);
+
+  auto result = pipeline_.execute();
+
+  std::set<std::string> ids;
+  for (const auto & a : result.apps) {
+    ids.insert(a.id);
+  }
+  EXPECT_TRUE(ids.count("beacon_temp"))
+      << "a plugin-owned app must survive `ignore` whatever source tag it carries; got: " << result.apps.size()
+      << " apps";
+  EXPECT_TRUE(ids.count("nav_app")) << "the manifest app must still survive";
+  EXPECT_FALSE(ids.count("_param_client_node")) << "a genuine runtime orphan must still be swept";
+
+  // Protection did NOT come from the string - the tag is untouched, because
+  // `source` is public API and feeds identity provenance.
+  for (const auto & a : result.apps) {
+    if (a.id == "beacon_temp") {
+      EXPECT_EQ(a.source, "beacon") << "the fix must not rewrite the provider's source tag";
+    }
+  }
+}
+
+// The limitation, pinned so nobody "fixes" it: enrichment does not protect.
+TEST_F(MergePipelineTest, PluginEnrichmentDoesNotProtectAnotherLayersEntity) {
+  App runtime_orphan;
+  runtime_orphan.id = "shadowed_node";
+  runtime_orphan.name = "shadowed_node";
+  runtime_orphan.source = "heuristic";
+  runtime_orphan.is_online = true;
+  runtime_orphan.bound_fqn = "/shadowed_node";
+
+  // Same id, contributed by the plugin layer - but the runtime layer is added
+  // first, so the runtime layer OWNS it and the plugin only enriches.
+  App plugin_shadow = make_app("shadowed_node", "");
+  plugin_shadow.source = "beacon";
+
+  LayerOutput runtime_out;
+  runtime_out.apps.push_back(runtime_orphan);
+  LayerOutput plugin_out;
+  plugin_out.apps.push_back(plugin_shadow);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>(
+      "runtime", runtime_out,
+      std::unordered_map<FieldGroup, MergePolicy>{{FieldGroup::STATUS, MergePolicy::AUTHORITATIVE}}));
+  pipeline_.add_layer(std::make_unique<TestLayer>("some_plugin", plugin_out,
+                                                  std::unordered_map<FieldGroup, MergePolicy>{},
+                                                  /*owns_protected=*/true));
+
+  ManifestConfig config;
+  config.unmanifested_nodes = ManifestConfig::UnmanifestedNodePolicy::IGNORE;
+  pipeline_.set_linker(std::make_unique<RuntimeLinker>(nullptr), config);
+
+  auto result = pipeline_.execute();
+
+  for (const auto & a : result.apps) {
+    EXPECT_NE(a.id, "shadowed_node") << "a plugin that only enriches a runtime app must not make it undeletable";
+  }
+}
+
+// --- inherit_runtime_resources gates the MERGE, not only enrich_app ---
+//
+// merge_entities<App>() runs before RuntimeLinker::link(), and its LIVE_DATA
+// group unions the runtime layer's topics and services into any app both
+// layers contribute under the same id. Gating only enrich_app would leave the
+// flag inert for exactly the app someone names after its own node.
+
+namespace {
+
+// A manifest app and a runtime app under the SAME id, each carrying its own
+// live data, so the LIVE_DATA merge has something to union.
+void seed_same_id_app_with_resources(MergePipeline & pipeline, bool inherit_runtime_resources) {
+  App manifest_app = make_app("temp_sensor", "engine");
+  manifest_app.source = "manifest";
+  App::RosBinding binding;
+  binding.node_name = "temp_sensor";
+  binding.namespace_pattern = "/powertrain/engine";
+  binding.topic_namespace = "";
+  manifest_app.ros_binding = binding;
+  manifest_app.topics.publishes = {"/declared/topic"};
+
+  App runtime_app = make_app("temp_sensor", "engine");
+  runtime_app.source = "heuristic";
+  runtime_app.is_online = true;
+  runtime_app.bound_fqn = "/powertrain/engine/temp_sensor";
+  runtime_app.topics.publishes = {"/powertrain/engine/temperature"};
+  ServiceInfo svc;
+  svc.full_path = "/powertrain/engine/calibrate";
+  runtime_app.services.push_back(svc);
+
+  LayerOutput manifest_out;
+  manifest_out.apps.push_back(manifest_app);
+  LayerOutput runtime_out;
+  runtime_out.apps.push_back(runtime_app);
+
+  pipeline.add_layer(
+      std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::AUTHORITATIVE)));
+  pipeline.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  ManifestConfig config;
+  config.inherit_runtime_resources = inherit_runtime_resources;
+  pipeline.set_linker(std::make_unique<RuntimeLinker>(nullptr), config);
+}
+
+}  // namespace
+
+TEST_F(MergePipelineTest, InheritFalseKeepsSameNamedAppToItsDeclaredResources) {
+  seed_same_id_app_with_resources(pipeline_, /*inherit_runtime_resources=*/false);
+
+  auto result = pipeline_.execute();
+
+  ASSERT_EQ(result.apps.size(), 1u);
+  const auto & app = result.apps[0];
+  EXPECT_EQ(app.source, "manifest");
+  EXPECT_EQ(app.topics.publishes, std::vector<std::string>{"/declared/topic"})
+      << "the merge must not slip runtime topics past inherit_runtime_resources=false";
+  EXPECT_TRUE(app.services.empty()) << "nor runtime services";
+  // The binding itself is unaffected: the app is still online and still names
+  // the node. Only the resource copy is gated.
+  EXPECT_TRUE(app.is_online);
+  ASSERT_TRUE(app.bound_fqn.has_value());
+  EXPECT_EQ(*app.bound_fqn, "/powertrain/engine/temp_sensor");
+}
+
+TEST_F(MergePipelineTest, InheritTrueStillGivesSameNamedAppTheRuntimeResources) {
+  seed_same_id_app_with_resources(pipeline_, /*inherit_runtime_resources=*/true);
+
+  auto result = pipeline_.execute();
+
+  ASSERT_EQ(result.apps.size(), 1u);
+  const auto & app = result.apps[0];
+  EXPECT_NE(std::find(app.topics.publishes.begin(), app.topics.publishes.end(), "/powertrain/engine/temperature"),
+            app.topics.publishes.end())
+      << "with the flag on, the runtime topic must still arrive";
+  EXPECT_FALSE(app.services.empty()) << "and the runtime service too";
+}
+
+// --- The exemption is `source` alone, not the whole METADATA group ---
+
+TEST_F(MergePipelineTest, MetadataDemotionStillHandsComponentVariantToTheLowerLayer) {
+  Component manifest_comp = make_component("engine", "powertrain", "/powertrain");
+  manifest_comp.source = "manifest";
+  manifest_comp.variant = "declared-variant";
+
+  Component runtime_comp = make_component("engine", "powertrain", "/powertrain");
+  runtime_comp.source = "synthetic";
+  runtime_comp.variant = "observed-variant";
+
+  LayerOutput manifest_out;
+  manifest_out.components.push_back(manifest_comp);
+  LayerOutput runtime_out;
+  runtime_out.components.push_back(runtime_comp);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::FALLBACK)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  auto result = pipeline_.execute();
+  ASSERT_EQ(result.components.size(), 1u);
+  EXPECT_EQ(result.components[0].variant, "observed-variant")
+      << "only `source` is exempt from the METADATA policy; ordinary metadata still follows it";
+  EXPECT_EQ(result.components[0].source, "manifest");
+}
+
+TEST_F(MergePipelineTest, MetadataDemotionStillHandsAppMetadataToTheLowerLayer) {
+  App manifest_app = make_app("temp_sensor", "engine");
+  manifest_app.source = "manifest";
+  manifest_app.external = false;
+
+  App runtime_app = make_app("temp_sensor", "engine");
+  runtime_app.source = "heuristic";
+  runtime_app.external = true;
+  App::RosBinding runtime_binding;
+  runtime_binding.node_name = "temp_sensor";
+  runtime_binding.namespace_pattern = "/powertrain/engine";
+  runtime_binding.topic_namespace = "";
+  runtime_app.ros_binding = runtime_binding;
+
+  LayerOutput manifest_out;
+  manifest_out.apps.push_back(manifest_app);
+  LayerOutput runtime_out;
+  runtime_out.apps.push_back(runtime_app);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::FALLBACK)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  auto result = pipeline_.execute();
+  ASSERT_EQ(result.apps.size(), 1u);
+  ASSERT_TRUE(result.apps[0].external.has_value());
+  EXPECT_TRUE(*result.apps[0].external) << "the lower layer still wins ordinary METADATA under FALLBACK";
+  ASSERT_TRUE(result.apps[0].ros_binding.has_value());
+  EXPECT_EQ(result.apps[0].ros_binding->node_name, "temp_sensor");
+  EXPECT_EQ(result.apps[0].source, "manifest");
+}
+
+// --- Provenance is still gap-filled when the target has none ---
+//
+// A layer may contribute an entity with no `source` at all (plugin stubs do).
+// The gap fill must stay resolution-independent: it has to work under the
+// TARGET branch (manifest AUTHORITATIVE) as well as the SOURCE branch
+// (manifest FALLBACK), because otherwise an entity would reach the orphan
+// filter with an empty provenance string.
+
+TEST_F(MergePipelineTest, EmptyProvenanceIsGapFilledUnderAuthoritativeMetadata) {
+  App target_app = make_app("temp_sensor", "engine");
+  target_app.source.clear();
+
+  App runtime_app = make_app("temp_sensor", "engine");
+  runtime_app.source = "heuristic";
+
+  LayerOutput manifest_out;
+  manifest_out.apps.push_back(target_app);
+  LayerOutput runtime_out;
+  runtime_out.apps.push_back(runtime_app);
+
+  pipeline_.add_layer(
+      std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::AUTHORITATIVE)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  auto result = pipeline_.execute();
+  ASSERT_EQ(result.apps.size(), 1u);
+  EXPECT_EQ(result.apps[0].source, "heuristic") << "an entity with no provenance must still inherit one";
+}
+
+TEST_F(MergePipelineTest, EmptyProvenanceIsGapFilledUnderFallbackMetadata) {
+  Function target_fn = make_function("braking");
+  target_fn.source.clear();
+
+  Function runtime_fn = make_function("braking");
+  runtime_fn.source = "heuristic";
+
+  LayerOutput manifest_out;
+  manifest_out.functions.push_back(target_fn);
+  LayerOutput runtime_out;
+  runtime_out.functions.push_back(runtime_fn);
+
+  pipeline_.add_layer(std::make_unique<TestLayer>("manifest", manifest_out, manifest_policies(MergePolicy::FALLBACK)));
+  pipeline_.add_layer(std::make_unique<TestLayer>("runtime", runtime_out, runtime_policies()));
+
+  auto result = pipeline_.execute();
+  ASSERT_EQ(result.functions.size(), 1u);
+  EXPECT_EQ(result.functions[0].source, "heuristic");
 }

@@ -22,6 +22,7 @@ A manifest file has the following top-level structure:
      description: string
 
    config:                # Optional - discovery behavior settings
+                          # (deprecated alias for this key: "discovery:")
      unmanifested_nodes: string
      inherit_runtime_resources: boolean
      allow_manifest_override: boolean
@@ -32,6 +33,17 @@ A manifest file has the following top-level structure:
    apps: []               # Optional - app definitions
    functions: []          # Optional - function definitions
    scripts: []             # Optional - pre-defined script entries
+
+.. note::
+
+   **Unknown top-level keys are ignored, and the gateway says so.** Any
+   top-level key outside the set the parser reads
+   (``manifest_version``, ``metadata``, ``config``, ``discovery``, ``areas``,
+   ``components``, ``assets``, ``apps``, ``functions``, ``scripts``,
+   ``capabilities``) is skipped, and the gateway logs a warning naming the key
+   and listing the ones it does know. If a whole block of your manifest seems
+   to have no effect, that log line is the first place to look - a misspelled
+   or misplaced top-level key is the usual cause.
 
 manifest_version (Required)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -76,6 +88,26 @@ config (Optional)
 
 Discovery behavior configuration.
 
+Every setting in this block describes how the manifest is combined with what
+runtime discovery finds, so none of them does anything in ``manifest_only``
+(which parses the block and then runs without the merge pipeline that reads
+it) or in ``runtime_only`` (which has no manifest at all).
+
+Within ``hybrid`` mode they differ in what else they need.
+``unmanifested_nodes`` and ``inherit_runtime_resources`` are applied by the
+runtime linker, which only exists when the runtime layer is enabled.
+``allow_manifest_override`` is applied to the manifest layer's own policies,
+so it takes effect whenever the manifest layer is built - though with no
+runtime layer to merge against there is nothing for it to change.
+
+.. note::
+
+   ``config:`` is the canonical top-level key. ``discovery:`` is accepted as a
+   **deprecated alias** for the same block: it is read, the gateway logs a
+   deprecation warning naming it, and it will be removed in a future release.
+   A manifest that declares both keys uses ``config:`` and ignores
+   ``discovery:``; both facts are logged.
+
 .. list-table::
    :header-rows: 1
    :widths: 25 15 60
@@ -85,20 +117,187 @@ Discovery behavior configuration.
      - Description
    * - ``unmanifested_nodes``
      - string
-     - Policy for ROS nodes not in manifest
+     - Policy for running ROS nodes that the manifest does not declare
+       (default: ``warn``)
    * - ``inherit_runtime_resources``
      - boolean
-     - Copy topics/services from runtime nodes (default: true)
+     - Copy the bound node's topics, services and actions onto the linked
+       manifest app (default: true)
    * - ``allow_manifest_override``
      - boolean
-     - Manifest values can override runtime (default: true)
+     - Let manifest values outrank runtime values in the merge (default:
+       true). ``false`` is a blanket demotion of the manifest layer - see
+       :ref:`manifest-allow-manifest-override` for what it actually changes.
 
-**unmanifested_nodes options:**
+.. _manifest-unmanifested-nodes:
 
-- ``ignore`` - Don't expose unmanifested nodes
-- ``warn`` - Log warning, include as orphans (default)
-- ``error`` - Fail startup if orphan nodes detected
-- ``include_as_orphan`` - Include with ``source: "orphan"``
+unmanifested_nodes
+^^^^^^^^^^^^^^^^^^
+
+A node is *unmanifested* (an *orphan*) when it is present in the ROS graph and
+no manifest app binds to it.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Value
+     - Behaviour
+   * - ``ignore``
+     - Hide them. Every app that did not come from the manifest, the manual
+       asset inventory or a plugin is dropped from the entity tree, and
+       heuristic Components and Areas sitting in a namespace taken from one of
+       the orphan node FQNs are dropped with them. Note the reach: this
+       suppresses *every* non-manifest app, not only the ones that were
+       classified as orphans.
+   * - ``warn``
+     - Default. The nodes stay in the entity tree; the gateway logs one
+       warning per orphan node.
+   * - ``error``
+     - The nodes stay in the entity tree, exactly as under ``warn``. The
+       gateway logs one error naming the orphan count, and reports the nodes
+       on ``GET /api/v1/health`` in the ``warnings`` array under the code
+       ``unmanifested_nodes``, with the node fully-qualified names in
+       ``ros_node_fqns`` (``entity_ids`` is empty - a node name is not an
+       addressable entity id). **It does not fail startup.** The gateway keeps serving
+       and ``status`` stays ``"healthy"`` - see :doc:`/api/warning_codes`.
+   * - ``include_as_orphan``
+     - The same entity tree as ``warn``. The logging differs in shape as
+       well as level: ``warn`` emits one warning line per orphan node,
+       ``include_as_orphan`` emits a single info line giving the count. No
+       entity is tagged ``source: "orphan"`` - nothing in discovery ever
+       assigns that value.
+
+The four values are lower-case. ``Warn`` is not ``warn``: it is an
+unrecognised value and is treated as one.
+
+An unrecognised value raises validation warning ``R014``, and the parsed
+policy falls back to ``warn``. Because ``discovery.manifest_strict_validation``
+defaults to ``true`` and turns validation warnings into a load failure, a typo
+here rejects the manifest by default; with strict validation off the manifest
+loads, runs on ``warn``, and the gateway logs the rejected value along with
+the list of valid ones.
+
+.. _manifest-r015:
+
+Malformed structure: ``R015``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``R014`` is about a value the parser understands the *shape* of but not the
+*content* of. ``R015`` is the other half: the key is there but its YAML kind
+is wrong. It is raised when
+
+- the ``config:`` block (or the deprecated ``discovery:`` alias) is not a
+  mapping - a scalar or a sequence; or
+- one of the settings inside it is not the kind it must be:
+  ``unmanifested_nodes`` not a string, ``inherit_runtime_resources`` or
+  ``allow_manifest_override`` not a boolean.
+
+A key that carries no value at all is YAML null and means "not set". That is
+never an error: ``unmanifested_nodes:`` with nothing after it loads silently
+and the default applies.
+
+.. important::
+
+   **Advisory in this release.** ``R014`` and ``R015`` are reported on the log
+   channel only: they do **not** fail the load, whatever
+   ``discovery.manifest_strict_validation`` is set to. The manifest loads, the
+   offending block or setting is ignored, and its documented default applies.
+
+   This is a deliberate one-release grace period. The settings in this block
+   were parsed but never read before, so a manifest carrying
+   ``unmanifested_nodes: Warn`` or ``inherit_runtime_resources: 0`` loaded
+   without complaint; making them validation warnings immediately would refuse
+   that same file on upgrade under the shipped strict default, taking hybrid
+   discovery down to ``runtime_only`` for a deployment nobody edited.
+
+   **They become validation warnings in the next release**, at which point the
+   strictness dial does apply and a strict gateway rejects a manifest carrying
+   either. Fix them now while they are only noisy: grep your gateway log for
+   ``[R014]`` and ``[R015]``.
+
+Either way the malformed part costs only itself: the rest of the manifest is
+parsed normally rather than the whole file being abandoned.
+
+.. _manifest-inherit-runtime-resources:
+
+inherit_runtime_resources
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When a manifest app is linked to a running node, the default (``true``) copies
+that node's topics, services and actions onto the app, so its ``/data`` and
+``/operations`` collections describe what the node really exposes.
+
+With ``false``, the link itself is unchanged - the app still reports
+``is_online`` and still names the node it is bound to - but the copy does not
+happen, so the app exposes only the resources the manifest declares for it.
+An app that declares none therefore serves empty ``/data`` and
+``/operations`` collections while still being reported as online.
+
+This holds however the app is named. An app whose ``id`` equals the bound
+node's name is one entity by id with the runtime layer's view of that node, so
+the merge would otherwise fold the node's live topics and services in before
+linking runs; the declared collections are restored after the merge precisely
+so the flag means the same thing in both spellings.
+
+.. _manifest-allow-manifest-override:
+
+allow_manifest_override
+^^^^^^^^^^^^^^^^^^^^^^^
+
+**What it means.** With the shipped manifest and runtime layers, this flag
+controls exactly one thing: whether the manifest claims *exclusivity* over the
+hierarchy. ``true`` (the default) means a declared parent-child relationship is
+the whole truth and runtime-discovered members are dropped. ``false`` means the
+manifest stops claiming exclusivity, so runtime-discovered hosts and children
+join the union instead of being discarded.
+
+Against that layer pair it changes nothing else. (A discovery plugin is a
+third layer and widens this - see **Mechanism** below.) In particular it does
+**not** change
+an entity's provenance: ``x-medkit.source`` keeps naming the layer that
+declared the entity under every layer policy, because provenance is what the
+gateway keys its delete decisions on and is never negotiated between layers.
+
+If you need per-field-group control, do not reach for this flag - it is a
+blunt switch. Use ``discovery.merge_pipeline.layers.manifest.<group>`` in the
+gateway parameters, which sets one group at a time; the field groups and the
+policy values are listed under
+:doc:`Merge Policies </config/discovery-options>`. That page documents the
+parameters themselves and does not discuss this flag.
+
+**Mechanism.** The flag is shorthand for the per-field-group merge policies of
+the manifest layer: ``false`` demotes all five groups - identity, hierarchy,
+live_data, status, metadata - to ``fallback``, so the manifest layer only fills
+gaps the runtime layer leaves. Four of those five demotions are inert against
+the shipped runtime layer, which is why the visible result is narrower than the
+mechanism suggests:
+
+- **hierarchy** - the one that shows. Collection fields (``depends_on``, a
+  Function's ``hosted_by`` list) become the union of the manifest's and the
+  runtime layer's, rather than the manifest's alone. The scalar hierarchy
+  fields are unchanged: an App's ``is_located_on``, a Component's ``area``,
+  ``parent_component_id``, ``fqn`` and ``namespace``, and an Area's
+  ``namespace`` and ``parent_area``.
+- **identity**, **live_data**, **status** - no change. The runtime layer is
+  already ``fallback`` for identity and already ``authoritative`` for live data
+  and status, and a scalar merge behaves identically whether the manifest layer
+  outranks the runtime layer or ties with it.
+- **metadata** - no change, because ``source`` is the only metadata field the
+  runtime layer contributes and provenance is exempt from the policy. This
+  demotion becomes visible only when a discovery plugin contributes metadata of
+  its own: a ``variant`` or an external-entity classification from the plugin
+  layer then wins over the manifest's.
+
+**Precedence.** The blanket demotion is applied *before* the per-group gateway
+parameters, so an explicitly configured
+``discovery.merge_pipeline.layers.manifest.<group>`` wins over
+``allow_manifest_override: false`` for that one group; the other four stay
+demoted. Pinning ``hierarchy`` back to ``authoritative`` therefore restores
+manifest exclusivity while leaving the rest of the switch in force.
+
+The flag also only matters for an entity that both layers contribute under the
+same id. An entity that only the manifest declares is unaffected.
 
 .. code-block:: yaml
 

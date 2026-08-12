@@ -362,7 +362,7 @@ jobs:
             | grep -oE 'TIMEOUT "[0-9]+"' | sort -t'"' -k2 -n | uniq -c
 
       - name: Run unit + integration tests with ASan + UBSan
-        timeout-minutes: 30
+        timeout-minutes: 45
         env:
           # detect_leaks=0: FastDDS allocator leaks on shutdown (not our code)
           # new_delete_type_mismatch=0: ROS 2 DDS scalar/array new/delete mismatch
@@ -483,7 +483,7 @@ jobs:
             | grep -oE 'TIMEOUT "[0-9]+"' | sort -t'"' -k2 -n | uniq -c
 
       - name: Run unit + integration tests with TSan
-        timeout-minutes: 30
+        timeout-minutes: 45
         env:
           # Same factor as the ctest TIMEOUT rewrite above, for the wall-clock
           # budgets tests assert internally - ctest's clock cannot reach those.

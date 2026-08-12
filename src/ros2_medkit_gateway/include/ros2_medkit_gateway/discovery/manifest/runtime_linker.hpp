@@ -23,6 +23,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ros2_medkit_gateway {
@@ -103,10 +104,15 @@ class RuntimeLinker {
    * @param manifest_apps Apps from manifest
    * @param runtime_apps Apps discovered from ROS graph (each node is an App)
    * @param config Manifest config with orphan policy
+   * @param protected_ids Ids whose owning discovery layer declares them
+   *        protected from suppression. Passed in rather than recomputed so
+   *        this filter and the pipeline's own orphan sweep decide from one
+   *        source of truth; an empty set falls back to the source-tag rule
+   *        alone, which is what a caller with no pipeline context gets.
    * @return LinkingResult with linked apps and orphan info
    */
   LinkingResult link(const std::vector<App> & manifest_apps, const std::vector<App> & runtime_apps,
-                     const ManifestConfig & config);
+                     const ManifestConfig & config, const std::unordered_set<std::string> & protected_ids = {});
 
   /**
    * @brief Check if a specific app is linked to a runtime node

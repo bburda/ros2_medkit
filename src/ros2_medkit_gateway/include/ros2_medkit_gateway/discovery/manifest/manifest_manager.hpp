@@ -21,10 +21,13 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <atomic>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -286,6 +289,19 @@ class ManifestManager {
   rclcpp::Node * node_;
   mutable std::mutex mutex_;
 
+  /// Lock-free snapshot of the discovery configuration, for callers that must
+  /// never block on a manifest load.
+  ///
+  /// `/health` is one: it reads the configured policy on every request, and a
+  /// container liveness probe reads `/health`. load_manifest() holds mutex_
+  /// from entry through parse, fragment scan, inventory CSV and validation, so
+  /// a plugin-triggered reload on a deployment with a fragments directory
+  /// would park every concurrent probe and get the gateway restarted
+  /// mid-reload. Kept in step with `manifest_` at every point that assigns it.
+  std::atomic<ManifestConfig> cached_config_{ManifestConfig{}};
+  static_assert(std::is_trivially_copyable_v<ManifestConfig>,
+                "ManifestConfig must stay trivially copyable to live in an atomic");
+
   /// Merge the fragments found in `fragments_dir_` on top of `base`.
   /// Returns true on success (or no fragments); false if any fragment
   /// failed to parse or declared disallowed top-level fields.
@@ -304,6 +320,29 @@ class ManifestManager {
   /// see set_inventory_csv_path) so a CSV row can never trip the validator's
   /// hard duplicate-id errors and abort the load.
   bool apply_inventory_csv(Manifest & base);
+
+  /// Route the parser's two notice channels to their destinations.
+  ///
+  /// `Manifest::log_notices` (deprecated key, key collision, unknown top-level
+  /// key) go to the plain logger only. They must NOT reach
+  /// `validation_result_`: strict validation is on by default and turns every
+  /// validator warning into a load failure, which in hybrid mode silently
+  /// degrades discovery to runtime_only - so a deprecation notice routed there
+  /// would be fatal under the default configuration.
+  ///
+  /// `Manifest::validation_notices` ARE correctness problems and become
+  /// warnings on `validation_result_`, so they obey
+  /// `discovery.manifest_strict_validation`.
+  ///
+  /// Must be called AFTER `validation_result_` has been assigned from
+  /// `validator_.validate()`, which overwrites anything merged before it.
+  /// @param source_path value used as the warning's `path` field.
+  void merge_parse_notices(const Manifest & loaded, const std::string & source_path);
+
+  /// Log-only notices already emitted, so a plugin-triggered reload does not
+  /// reprint a deprecation warning on every refresh for the life of the
+  /// process. Not applied to validation notices, which are rebuilt per load.
+  std::set<std::string> logged_notices_;
 
   std::optional<Manifest> manifest_;
   std::string manifest_path_;

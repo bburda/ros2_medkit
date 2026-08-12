@@ -329,6 +329,11 @@ ros2_medkit_gateway:
         # Values: "authoritative", "enrichment", "fallback"
         # Defaults: manifest=AUTH for identity/hierarchy/metadata, ENRICH for live_data, FALLBACK for status
         #           runtime=AUTH for live_data/status, ENRICH for metadata, FALLBACK for identity/hierarchy
+        #
+        # A manifest can demote all five manifest-layer groups at once with
+        # `config.allow_manifest_override: false`. An explicit (non-empty) value
+        # set here is applied afterwards and therefore wins for that group,
+        # while the remaining groups stay demoted to fallback.
         layers:
           manifest:
             identity: ""

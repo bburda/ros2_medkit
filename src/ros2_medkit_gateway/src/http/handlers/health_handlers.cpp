@@ -20,6 +20,7 @@
 #include "ros2_medkit_gateway/core/auth/auth_models.hpp"
 #include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
 #include "ros2_medkit_gateway/core/discovery/discovery_enums.hpp"
+#include "ros2_medkit_gateway/core/entity_validation.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
@@ -56,6 +57,12 @@ http::Result<dto::Health> HealthHandlers::get_health(const http::TypedRequest & 
     response.status = "healthy";
     response.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
 
+    // Operator-actionable warnings the gateway flags without taking itself
+    // offline. Collected across every subsystem that can produce one, so the
+    // array and its schema version are part of the /health contract whether or
+    // not aggregation is configured.
+    std::vector<dto::HealthWarning> warnings;
+
     // Add discovery info
     auto * dm = ctx_.node() ? ctx_.node()->get_discovery_manager() : nullptr;
     if (dm) {
@@ -70,14 +77,43 @@ http::Result<dto::Health> HealthHandlers::get_health(const http::TypedRequest & 
 
       auto linking = dm->get_linking_result();
       if (linking) {
+        const auto manifest_config = dm->get_manifest_config();
+        const auto policy = manifest_config.unmanifested_nodes;
+
         dto::HealthDiscoveryLinking linking_dto;
         linking_dto.linked_count = static_cast<int64_t>(linking->node_to_app.size());
         linking_dto.orphan_count = static_cast<int64_t>(linking->orphan_nodes.size());
         linking_dto.binding_conflicts = static_cast<int64_t>(linking->binding_conflicts);
+        linking_dto.unmanifested_policy = discovery::ManifestConfig::policy_to_string(policy);
         if (!linking->warnings.empty()) {
           linking_dto.warnings = linking->warnings;
         }
         discovery.linking = linking_dto;
+
+        // The 'error' policy reports, it does not stop the process: a
+        // documentation-level setting must not be able to take a running
+        // gateway offline, and a permanently unhealthy status would disable
+        // every deployment gate that keys on a healthy -> unhealthy edge.
+        if (linking->has_errors(policy)) {
+          dto::HealthWarning warning;
+          warning.code = WARN_UNMANIFESTED_NODES;
+          warning.message =
+              std::to_string(linking->orphan_nodes.size()) +
+              " running ROS node(s) are not declared in the manifest while unmanifested_nodes is set to 'error' "
+              "(listed in ros_node_fqns). The gateway keeps serving. Declare them in the manifest, or relax the "
+              "policy to 'warn' or 'ignore'.";
+          // The subjects of this warning are ROS nodes, so they go in
+          // ros_node_fqns and entity_ids stays empty. Not a formality: the
+          // orphan list is taken from the UNFILTERED runtime app list
+          // (runtime_layer.cpp), before gap-fill, the namespace filters and
+          // the policy filter, so some of these nodes have no SOVD entity at
+          // all - and for those that do, the App id is derived from the bare
+          // node name and only becomes namespace-qualified when some other
+          // node collides with it (ros2_runtime_introspection.cpp), so it can
+          // change between two polls while the FQN cannot.
+          warning.ros_node_fqns = linking->orphan_nodes;
+          warnings.push_back(std::move(warning));
+        }
       }
 
       response.discovery = std::move(discovery);
@@ -112,18 +148,8 @@ http::Result<dto::Health> HealthHandlers::get_health(const http::TypedRequest & 
     if (auto * agg = ctx_.aggregation_manager()) {
       response.peers = agg->get_peer_status();
 
-      // Contract version for the warnings array. Increment whenever a code
-      // is added or the shape of a warning object changes so typed clients
-      // (MCP, Web UI, Foxglove) can feature-detect instead of relying on
-      // capabilities.aggregation (a boolean, too coarse).
-      // Keep in sync with docs/api/warning_codes.rst "Schema versioning".
-      response.warning_schema_version = static_cast<int64_t>(kWarningSchemaVersion);
-
-      // Surface operator-actionable aggregation warnings (x-medkit extension).
-      // Always an array when aggregation is active; empty means no active
-      // warnings. Clients can feature-detect via /.capabilities.aggregation
-      // in the root response.
-      std::vector<dto::HealthAggregationWarning> warnings;
+      // Aggregation warnings are only collectable when there is an aggregation
+      // manager; the array itself is not conditional on one.
       for (const auto & w : agg->get_leaf_warnings()) {
         std::string peers_list;
         for (size_t i = 0; i < w.peer_names.size(); ++i) {
@@ -132,19 +158,41 @@ http::Result<dto::Health> HealthHandlers::get_health(const http::TypedRequest & 
           }
           peers_list += w.peer_names[i];
         }
-        dto::HealthAggregationWarning warning;
+        dto::HealthWarning warning;
         warning.code = WARN_LEAF_ID_COLLISION;
         warning.message = "Component '" + w.entity_id + "' is announced by multiple peers (" + peers_list +
                           "); routing falls back to last-writer-wins which is non-deterministic. Resolve by "
                           "renaming the Component on one side or by modelling it as a hierarchical parent "
                           "(declare a child Component with parentComponentId='" +
                           w.entity_id + "' on the owning peer).";
-        warning.entity_ids = {w.entity_id};
+        // A Component id, so it belongs in entity_ids and this code names no
+        // ROS nodes - but the id came verbatim from a remote peer and nothing
+        // on that path validated it. entity_ids promises every element is
+        // addressable, so an id a client could not put in a URL is withheld
+        // rather than published: the message above still names the component,
+        // so only the machine-readable link is lost, and that link would not
+        // have worked.
+        if (auto valid = validate_entity_id(w.entity_id); valid) {
+          warning.entity_ids = {w.entity_id};
+        } else {
+          RCLCPP_WARN(HandlerContext::logger(),
+                      "Peer(s) [%s] announced Component id '%s', which is not a valid entity id (%s); omitting it "
+                      "from the '%s' warning's entity_ids",
+                      peers_list.c_str(), w.entity_id.c_str(), valid.error().c_str(), WARN_LEAF_ID_COLLISION);
+        }
         warning.peer_names = w.peer_names;
         warnings.push_back(std::move(warning));
       }
-      response.warnings = std::move(warnings);
     }
+
+    // Contract version for the warnings array. Increment whenever a code is
+    // added or the shape of a warning object changes so typed clients (MCP,
+    // Web UI, Foxglove) can feature-detect. Emitted unconditionally: keying it
+    // on capabilities.aggregation used to hide the whole warnings channel from
+    // every gateway that does not aggregate.
+    // Keep in sync with docs/api/warning_codes.rst "Schema versioning".
+    response.warning_schema_version = static_cast<int64_t>(kWarningSchemaVersion);
+    response.warnings = std::move(warnings);
 
     return response;
   } catch (const std::exception & e) {

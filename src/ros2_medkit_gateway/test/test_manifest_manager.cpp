@@ -639,6 +639,212 @@ TEST_F(ManifestManagerTest, GetScriptsEmptyWhenNoManifest) {
   EXPECT_TRUE(scripts.empty());
 }
 
+// =============================================================================
+// Discovery configuration: `config:` block and parse notices
+// =============================================================================
+
+namespace {
+
+/// Manifest whose discovery configuration is written under the documented
+/// top-level key.
+const std::string config_block_manifest = R"(
+manifest_version: "1.0"
+metadata:
+  name: "config-block"
+config:
+  unmanifested_nodes: "ignore"
+  inherit_runtime_resources: false
+areas:
+  - id: "area1"
+)";
+
+/// Same content under the deprecated alias.
+const std::string discovery_block_manifest = R"(
+manifest_version: "1.0"
+metadata:
+  name: "discovery-block"
+discovery:
+  unmanifested_nodes: "ignore"
+  inherit_runtime_resources: false
+areas:
+  - id: "area1"
+)";
+
+const std::string unknown_policy_manifest = R"(
+manifest_version: "1.0"
+metadata:
+  name: "unknown-policy"
+config:
+  unmanifested_nodes: "silent"
+areas:
+  - id: "area1"
+)";
+
+const std::string unknown_top_level_key_manifest = R"(
+manifest_version: "1.0"
+metadata:
+  name: "unknown-key"
+configuration:
+  unmanifested_nodes: "ignore"
+areas:
+  - id: "area1"
+)";
+
+/// Look up a warning by rule id. Takes the result by reference on purpose:
+/// `ManifestManager::get_validation_result()` returns BY VALUE, so the caller
+/// must keep the result alive for as long as it holds the returned pointer.
+const ros2_medkit_gateway::discovery::ValidationError *
+find_warning(const ros2_medkit_gateway::discovery::ValidationResult & result, const std::string & rule_id) {
+  for (const auto & warn : result.warnings) {
+    if (warn.rule_id == rule_id) {
+      return &warn;
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_F(ManifestManagerTest, ConfigBlockReachesGetConfig) {
+  ManifestManager mgr(nullptr);
+  ASSERT_TRUE(mgr.load_manifest_from_string(config_block_manifest, true));
+
+  auto config = mgr.get_config();
+  EXPECT_EQ(config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::IGNORE);
+  EXPECT_FALSE(config.inherit_runtime_resources);
+}
+
+TEST_F(ManifestManagerTest, DeprecatedDiscoveryBlockReachesGetConfigAndSurvivesStrictMode) {
+  ManifestManager mgr(nullptr);
+  // Strict mode turns validator warnings into a load failure, so a deprecation
+  // routed through the validator would make this load fail.
+  ASSERT_TRUE(mgr.load_manifest_from_string(discovery_block_manifest, true));
+
+  auto config = mgr.get_config();
+  EXPECT_EQ(config.unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::IGNORE);
+  EXPECT_FALSE(config.inherit_runtime_resources);
+  EXPECT_FALSE(mgr.get_validation_result().has_warnings());
+}
+
+TEST_F(ManifestManagerTest, UnknownTopLevelKeySurvivesStrictMode) {
+  ManifestManager mgr(nullptr);
+  ASSERT_TRUE(mgr.load_manifest_from_string(unknown_top_level_key_manifest, true));
+  EXPECT_FALSE(mgr.get_validation_result().has_warnings());
+}
+
+// R014 is ADVISORY for this release. It reaches the LOG, never
+// ValidationResult, so the strictness dial cannot act on it. That is
+// deliberate: this branch is what makes the discovery block read at all, so a
+// manifest carrying a bad policy value loaded fine before the upgrade, and
+// turning it into a load failure afterwards would take hybrid discovery down
+// to runtime_only for a file the operator never edited. It becomes a
+// validation warning in the next release.
+
+TEST_F(ManifestManagerTest, UnknownPolicyValueIsAdvisoryAndLoadsNonStrict) {
+  ManifestManager mgr(nullptr);
+  ASSERT_TRUE(mgr.load_manifest_from_string(unknown_policy_manifest, false));
+
+  auto result = mgr.get_validation_result();
+  EXPECT_EQ(find_warning(result, "R014"), nullptr)
+      << "R014 must not be a validation warning this release: " << result.summary();
+  // The documented fallback still applies.
+  EXPECT_EQ(mgr.get_config().unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+}
+
+// The point of the whole item: strict validation is the SHIPPED DEFAULT, and it
+// must not refuse a manifest over an advisory notice.
+TEST_F(ManifestManagerTest, UnknownPolicyValueStillLoadsUnderStrictValidation) {
+  ManifestManager mgr(nullptr);
+  EXPECT_TRUE(mgr.load_manifest_from_string(unknown_policy_manifest, true))
+      << "a bad policy value must not fail the load while R014 is advisory";
+  EXPECT_TRUE(mgr.is_manifest_active());
+  EXPECT_EQ(find_warning(mgr.get_validation_result(), "R014"), nullptr);
+  EXPECT_EQ(mgr.get_config().unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::WARN);
+}
+
+TEST_F(ManifestManagerTest, UnknownPolicyValueFromFileStillLoads) {
+  std::string path = write_temp_file("unknown_policy.yaml", unknown_policy_manifest);
+
+  ManifestManager mgr(nullptr);
+  ASSERT_TRUE(mgr.load_manifest(path, true));
+  EXPECT_TRUE(mgr.is_manifest_active());
+  EXPECT_EQ(find_warning(mgr.get_validation_result(), "R014"), nullptr);
+}
+
+// get_config() is on the liveness path: /health calls it on every request and
+// a container probe calls /health. load_manifest() holds the manager's mutex
+// from entry through parse, fragment scan, inventory CSV and validation, so if
+// get_config() took that mutex a plugin-triggered reload would park every
+// concurrent probe - and a probe with a short timeout restarts the gateway
+// mid-reload.
+//
+// Made deterministic with a large fragments directory: the load is slow enough
+// that a lock-taking reader would visibly stall. Before the snapshot existed,
+// the slowest observed get_config() was the length of a whole load.
+TEST_F(ManifestManagerTest, GetConfigNeverBlocksBehindAManifestLoad) {
+  const std::string base = R"(
+manifest_version: "1.0"
+config:
+  unmanifested_nodes: "ignore"
+components:
+  - id: base-ecu
+    name: "Base ECU"
+)";
+  const std::string base_path = write_temp_file("lockfree_base.yaml", base);
+
+  // A fragments directory big enough that a load takes real time.
+  const auto frag_dir =
+      std::filesystem::temp_directory_path() / ("medkit-lockfree-frags-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(frag_dir);
+  for (int i = 0; i < 400; ++i) {
+    std::ofstream(frag_dir / ("frag_" + std::to_string(i) + ".yaml"))
+        << "components:\n  - id: frag-" << i << "\n    name: \"Fragment " << i << "\"\n";
+  }
+
+  ManifestManager mgr(nullptr);
+  mgr.set_fragments_dir(frag_dir.string());
+  ASSERT_TRUE(mgr.load_manifest(base_path, false));
+  EXPECT_EQ(mgr.get_config().unmanifested_nodes, ManifestConfig::UnmanifestedNodePolicy::IGNORE);
+
+  std::atomic<bool> stop{false};
+  std::atomic<int64_t> worst_us{0};
+  std::thread reader([&] {
+    while (!stop.load()) {
+      const auto t0 = std::chrono::steady_clock::now();
+      auto cfg = mgr.get_config();
+      const auto elapsed =
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+      // Only ever the configured value or the default - never a torn read.
+      EXPECT_TRUE(cfg.unmanifested_nodes == ManifestConfig::UnmanifestedNodePolicy::IGNORE ||
+                  cfg.unmanifested_nodes == ManifestConfig::UnmanifestedNodePolicy::WARN);
+      int64_t prev = worst_us.load();
+      while (elapsed > prev && !worst_us.compare_exchange_weak(prev, elapsed)) {
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+  });
+
+  // Several reloads, each re-reading all 400 fragments under the mutex.
+  const auto load_start = std::chrono::steady_clock::now();
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_TRUE(mgr.reload_manifest());
+  }
+  const auto load_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - load_start).count();
+
+  stop.store(true);
+  reader.join();
+  std::error_code ec;
+  std::filesystem::remove_all(frag_dir, ec);
+
+  // The loads must have taken long enough for this to mean something.
+  ASSERT_GT(load_ms, 20) << "the fragment load was too fast to prove anything";
+  // A reader that took the load mutex would show a stall on the order of a
+  // whole load. Allow a wide margin for scheduler noise and sanitizers.
+  EXPECT_LT(worst_us.load(), load_ms * 1000 / 4) << "get_config() stalled for " << worst_us.load() << "us while "
+                                                 << load_ms << "ms of loading ran - it is taking the manifest lock";
+}
+
 int main(int argc, char ** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

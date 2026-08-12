@@ -107,6 +107,20 @@ class TopicsTestPlugin : public GatewayPlugin, public IntrospectionProvider {
     app.topics.publishes.push_back("/plugin_dev/value");
     result.new_entities.apps.push_back(std::move(app));
 
+    // A second app carrying a source tag the protection whitelist does NOT
+    // list. Providers pick their own tag (the beacon mapper stamps "beacon"),
+    // and protection must follow the owning LAYER rather than the string, so
+    // this app has to survive unmanifested_nodes=ignore exactly as the one
+    // above does.
+    App unlisted;
+    unlisted.id = "plugin_unlisted_source";
+    unlisted.name = "Plugin Device With Unlisted Source";
+    unlisted.component_id = "test_plugin_comp";
+    unlisted.external = true;
+    unlisted.is_online = true;
+    unlisted.source = "beacon";
+    result.new_entities.apps.push_back(std::move(unlisted));
+
     return result;
   }
 

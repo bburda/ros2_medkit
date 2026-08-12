@@ -218,7 +218,7 @@ class TestLeafCollisionAggregation(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertIn('warning_schema_version', body)
-        self.assertEqual(body['warning_schema_version'], 1)
+        self.assertEqual(body['warning_schema_version'], 2)
         collisions = [
             w for w in body.get('warnings', [])
             if w.get('code') == 'leaf_id_collision'

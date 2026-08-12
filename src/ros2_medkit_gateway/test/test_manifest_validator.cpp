@@ -645,7 +645,7 @@ manifest_version: "1.0"
 metadata:
   name: "Robot System"
   version: "1.0.0"
-discovery:
+config:
   unmanifested_nodes: "warn"
 areas:
   - id: "navigation"
