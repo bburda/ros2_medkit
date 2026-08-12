@@ -154,12 +154,24 @@ def get_test_domain_id(offset=0):
     return secondary[offset - 1]
 
 
+# Every budget below is multiplied by get_time_scale(), which is 1.0 unless a
+# sanitizer job asks for slack. These are exactly the "budgets asserted inside a
+# test" that function was written for: ctest's own TIMEOUT is rewritten x3 by
+# those jobs, and a wall-clock assertion inside the test never saw that factor.
+# PARAM_SERVICE_TIMEOUT below carries the evidence - it was raised by hand to 90
+# because a parameter service was still answering 503 more than 15s into a TSan
+# run.
+#
+# The polling INTERVALS are deliberately NOT scaled. They are not budgets: a
+# slower poll under a sanitizer would only find out later that the thing it
+# waits for is ready.
+
 # Gateway startup
-GATEWAY_STARTUP_TIMEOUT = 30.0
+GATEWAY_STARTUP_TIMEOUT = 30.0 * get_time_scale()
 GATEWAY_STARTUP_INTERVAL = 0.5
 
 # Discovery
-DISCOVERY_TIMEOUT = 60.0
+DISCOVERY_TIMEOUT = 60.0 * get_time_scale()
 DISCOVERY_INTERVAL = 0.5  # seconds between discovery polls
 
 # Parameter service readiness
@@ -170,15 +182,15 @@ DISCOVERY_INTERVAL = 0.5  # seconds between discovery polls
 # larger timeout costs nothing on the passing path (the poll returns the moment
 # the endpoint answers 200) and only bounds how long a genuinely dead service
 # waits before failing, well inside the sanitizer jobs' 360s ctest budget.
-PARAM_SERVICE_TIMEOUT = 90.0
+PARAM_SERVICE_TIMEOUT = 90.0 * get_time_scale()
 
 # Operations
-ACTION_TIMEOUT = 30.0
+ACTION_TIMEOUT = 30.0 * get_time_scale()
 
 # Faults
-FAULT_TIMEOUT = 30.0
-ROSBAG_TIMEOUT = 30.0
-SNAPSHOT_TIMEOUT = 30.0
+FAULT_TIMEOUT = 30.0 * get_time_scale()
+ROSBAG_TIMEOUT = 30.0 * get_time_scale()
+SNAPSHOT_TIMEOUT = 30.0 * get_time_scale()
 
 # Shutdown
 ALLOWED_EXIT_CODES = {0, -2, -15}  # OK, SIGINT, SIGTERM
