@@ -56,7 +56,12 @@ from sensor_msgs.msg import LaserScan
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # I100 as well as E402: `harness` is only importable because of the sys.path line above, so this
 # import cannot be moved up to where the alphabetical order would put it.
-from harness import create_watchdog_test_launch, poll_cleared, poll_faults  # noqa: E402, I100
+from harness import (  # noqa: E402, I100
+    create_watchdog_test_launch,
+    poll_cleared,
+    poll_fault_describing,
+    poll_faults,
+)
 
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
 
@@ -88,6 +93,14 @@ ALLOWLISTED_TARGET_TOPIC = '/hokuyo_scan'
 NS_TYPO_TOPIC = '/robott/odom'
 NS_TARGET_TOPIC = '/robot/odom'
 NAMESPACE_EDIT_DISTANCE = 1
+
+# Both non-allowlisted pairs land in ONE aggregated description, and that
+# description is capped at kMaxDescriptionChars (480). Measured with these
+# names: 217 chars for the LaserScan pair + 2 for the separator + 230 for the
+# namespace pair = 449, so 31 characters of headroom. Renaming a topic here, or
+# lengthening the detector's reason text, can push it over and truncate the pair
+# that sorts last - which fails as "the pair was never reported" and sends the
+# next reader hunting for a race that is not there.
 
 
 def generate_test_description():
@@ -143,23 +156,23 @@ class TestOrphanE2e(unittest.TestCase):
         rclpy.shutdown()
 
     def test_01_typo_pair_raises_naming_both(self):
-        fault = poll_faults(PORT, FAULT_CODE, timeout=60.0)
-        self.assertIsNotNone(
-            fault,
-            f'{FAULT_CODE} never raised for a pub-only {TYPO_TOPIC} / sub-only '
-            f'{TARGET_TOPIC} near-miss pair',
+        # Both pairs in this fixture are aggregated into ONE fault, and each
+        # crosses the detector's persistence gate on its own tick. Waiting only
+        # for the code returns whichever description was current, so this asks
+        # for the pair by name instead. The same applies to test_01a below.
+        found, description = poll_fault_describing(
+            PORT, FAULT_CODE, (TYPO_TOPIC, TARGET_TOPIC), timeout=60.0)
+        self.assertTrue(
+            found,
+            f'{FAULT_CODE} never named the pub-only {TYPO_TOPIC} / sub-only '
+            f'{TARGET_TOPIC} near-miss pair: {description!r}',
         )
-        description = fault.get('description', '')
-        self.assertIn(TYPO_TOPIC, description)
-        self.assertIn(TARGET_TOPIC, description)
 
     def test_01a_namespace_typo_pair_is_reported_too(self):
-        fault = poll_faults(PORT, FAULT_CODE, timeout=60.0)
-        self.assertIsNotNone(fault, f'{FAULT_CODE} is no longer raised')
-        description = fault.get('description', '')
-        self.assertIn(
-            NS_TYPO_TOPIC,
-            description,
+        found, description = poll_fault_describing(
+            PORT, FAULT_CODE, (NS_TYPO_TOPIC,), timeout=60.0)
+        self.assertTrue(
+            found,
             f'{NS_TYPO_TOPIC} / {NS_TARGET_TOPIC} differ only in the namespace, so they are '
             f'reported only if namespace_edit_distance={NAMESPACE_EDIT_DISTANCE} reached the '
             f'detector: {description}',
