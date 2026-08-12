@@ -27,7 +27,7 @@ launch-test package's configure into a hard error" - is exactly what CMake
 itself evaluates, so this asks CMake instead of a proxy for it: for each
 package that registers a launch test, configure it for real, once as an
 ordinary workspace build and once under system-package conditions
-(`CMAKE_INSTALL_PREFIX=/opt/ros/$ROS_DISTRO`, `CMAKE_INSTALL_LOCALSTATEDIR=/var`
+(`CMAKE_INSTALL_PREFIX=/opt/ros/<distro>`, `CMAKE_INSTALL_LOCALSTATEDIR=/var`
 - exactly what bloom's `debian/rules` passes), and compare what each run
 actually registered. No regex, on either side, decides what counts as a
 launch test. The configure/compare mechanics live in
@@ -46,6 +46,18 @@ ros2_medkit_diagnostic_bridge, ros2_medkit_fault_reporter,
 ros2_medkit_log_bridge - declared for this test specifically, since a
 package used at test time must be a test_depend even when nothing here
 find_package()s it at build time).
+
+The system-package prefix each configure below uses is SYSTEM_INSTALL_PREFIX,
+a literal - not this environment's own ROS_DISTRO. The guard's install-prefix
+check (see ROS2MedkitTestDomain.cmake) is a wildcard, `/opt/ros/<anything>`,
+not a comparison against the environment, so any distro name proves the same
+thing, and a literal keeps this test's outcome from depending on which
+distro happens to run it. An earlier version of the guard compared against
+`$ENV{ROS_DISTRO}` instead and never fired in the ROS build farm's binarydeb
+chroot, which has no ROS_DISTRO in its environment at all - see
+ros2_medkit_cmake/test/test_launch_test_guard.py's
+test_launch_test_is_not_registered_with_ros_distro_absent for the probe that
+catches a regression back to that.
 
 A seventh package registers launch tests too: ros2_medkit_graph_watchdog. It
 cannot be covered from here. It already test_depends on this package for its
@@ -67,7 +79,6 @@ declares a dependency on, so anything less is a real break, not a
 degradation to shrug off.
 """
 
-import os
 import pathlib
 import sys
 
@@ -79,6 +90,12 @@ from ros2_medkit_test_utils.cmake_guard import (
 )
 
 PACKAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# A literal, not this environment's own ROS_DISTRO - see the module docstring
+# above for why. Any name under /opt/ros/ proves the same thing against the
+# guard's wildcard prefix check, and humble is the one distro the guard exists
+# for.
+SYSTEM_INSTALL_PREFIX = '/opt/ros/humble'
 
 # The six packages ros2_medkit_integration_tests actually declares as
 # test_depend (directly, or - for ros2_medkit_gateway and
@@ -126,7 +143,7 @@ def repository_root():
 
     Unconditional, not a skip: this test is registered in CMakeLists.txt only
     when the same signal medkit_add_launch_test's own guard uses to detect a
-    system-package build (CMAKE_INSTALL_PREFIX=/opt/ros/$ROS_DISTRO plus
+    system-package build (CMAKE_INSTALL_PREFIX=/opt/ros/<distro> plus
     CMAKE_INSTALL_LOCALSTATEDIR) says otherwise - the ROS build farm's
     binarydeb chroot builds this package alone, with no sibling packages
     beside it, which is exactly when no repository root exists above it. A
@@ -142,22 +159,7 @@ def repository_root():
 
 
 @pytest.fixture(scope='session')
-def ros_distro():
-    """
-    Return ROS_DISTRO.
-
-    Unconditional, not a skip: colcon test always sources a ROS distribution
-    before running a test, so ROS_DISTRO is guaranteed to be set wherever
-    this test runs at all. Its absence is a broken environment, not a reason
-    to decline the check the environment promised it could run.
-    """
-    distro = os.environ.get('ROS_DISTRO')
-    assert distro, 'ROS_DISTRO is unset; colcon test always sources a ROS distribution first'
-    return distro
-
-
-@pytest.fixture(scope='session')
-def resolvable_packages(repository_root, ros_distro, tmp_path_factory):
+def resolvable_packages(repository_root, tmp_path_factory):
     """
     Baseline-configure every candidate exactly once; record which ones this environment reaches.
 
@@ -197,7 +199,7 @@ def resolvable_packages(repository_root, ros_distro, tmp_path_factory):
 
 @pytest.mark.parametrize('name', sorted(LAUNCH_TEST_PACKAGES))
 def test_guard_does_not_break_a_real_configure(
-    name, repository_root, ros_distro, resolvable_packages, tmp_path
+    name, repository_root, resolvable_packages, tmp_path
 ):
     """
     A system-package configure still succeeds, and suppresses the right tests.
@@ -219,7 +221,7 @@ def test_guard_does_not_break_a_real_configure(
     baseline_tests = registered_test_names(baseline_build)
 
     guarded_build = tmp_path / 'guarded_build'
-    guarded = configure(source_dir, guarded_build, f'/opt/ros/{ros_distro}', localstatedir='/var')
+    guarded = configure(source_dir, guarded_build, SYSTEM_INSTALL_PREFIX, localstatedir='/var')
     assert_guard_suppressed_launch_tests(name, baseline_tests, guarded, guarded_build)
 
 

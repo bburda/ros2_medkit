@@ -241,7 +241,7 @@ the domain there too, and the check below says so.
 #### Launch tests are not registered in a system package build
 
 `medkit_add_launch_test()` registers nothing when two conditions both hold -
-the install prefix is the ROS distribution root, AND
+the install prefix matches `/opt/ros/<anything>`, AND
 `CMAKE_INSTALL_LOCALSTATEDIR` is the absolute path `/var` - and prints why
 once per directory instead:
 
@@ -265,21 +265,31 @@ as `dh_auto_test || true`, the failures cannot stop the build, so what used to
 reach the build farm's log was every launch test failing for a reason that
 said nothing about the package.
 
-The install prefix alone is not a safe signal: `colcon build --install-base
-/opt/ros/<distro>` also installs straight into the distribution root, but its
-test step runs *after* its own install step, so its launch tests work fine.
-`CMAKE_INSTALL_LOCALSTATEDIR` is the second signal that tells the two apart -
-debhelper's `cmake` buildsystem always passes it
-(`-DCMAKE_INSTALL_LOCALSTATEDIR=/var`), and no `colcon build` ever does. The
-check is on the *value*, not merely `DEFINED`: a package that
+The prefix check does not compare against `$ENV{ROS_DISTRO}`: an earlier
+version of this guard did, and it never fired in the job it exists for - the
+binarydeb chroot has no `ROS_DISTRO` in its environment at all. That export
+lives only in the `ros_environment` package, which nothing in this repository
+depends on, or in a `ros:<distro>` Docker image's own `ENV`, neither of which
+the build farm's chroot carries. The prefix is matched against
+`/opt/ros/<anything>` instead, which needs nothing from the environment.
+
+The install prefix alone is not a safe signal, however it is matched: `colcon
+build --install-base /opt/ros/<distro>` also installs straight into the
+distribution root, but its test step runs *after* its own install step, so
+its launch tests work fine. `CMAKE_INSTALL_LOCALSTATEDIR` is the second
+signal that tells the two apart - debhelper's `cmake` buildsystem always
+passes it (`-DCMAKE_INSTALL_LOCALSTATEDIR=/var`), and no `colcon build` ever
+does. The check is on the *value*, not merely `DEFINED`: a package that
 `include(GNUInstallDirs)`s defines `CMAKE_INSTALL_LOCALSTATEDIR` itself, to
 the relative `var` (no leading slash), which is a different value from what
 debhelper passes - `DEFINED` alone cannot tell those apart, so the guard
 requires the absolute `/var`. No in-tree package includes `GNUInstallDirs`
 today, so this is hardening against a real default rather than a fix for an
-observed failure. Both comparisons (the prefix and `CMAKE_INSTALL_LOCALSTATEDIR`)
-are exact (`STREQUAL`), so a trailing slash is stripped from each before
-comparing rather than trusted to match bloom's spelling.
+observed failure. `CMAKE_INSTALL_LOCALSTATEDIR` is compared exactly
+(`STREQUAL`), with a trailing slash stripped first, because it is an ordinary
+cache variable nothing else normalises. `CMAKE_INSTALL_PREFIX` needs no such
+stripping: CMake itself normalises a trailing slash out of it before project
+code ever sees it (confirmed on CMake 3.22, 3.28 and 4.4).
 
 The "once per directory" of the printed message is a macro-scoped CMake
 variable, not a `CACHE` entry: a package that calls `medkit_add_launch_test`
@@ -337,10 +347,29 @@ entries must use `set_property(TEST ... APPEND PROPERTY ENVIRONMENT ...)`. A pla
 below says so. This is the general rule for `medkit_add_gtest`, `medkit_add_gmock`,
 `medkit_add_pytest_test` and `medkit_add_wrapped_test` - all four are always registered, so a
 call naming the test afterwards is safe, just easy to get wrong in the APPEND direction.
-**A launch test is the one exception**: it is not always registered (see "Launch tests are not
-registered in a system package build" above), so a `set_tests_properties` or `set_property`
-call naming it afterwards is not a subtler bug to get right, it is unsupported - use
-`medkit_add_launch_test`'s own `LABELS` and `ENV` parameters instead.
+**A launch test is the one exception, and only for `LABELS` and `ENVIRONMENT`**: those two are
+the only properties `medkit_add_launch_test` sets itself, so it is the only macro that owns
+them, and a launch test is not always registered (see "Launch tests are not registered in a
+system package build" above) - a `set_tests_properties` or `set_property` call naming
+`LABELS` or `ENVIRONMENT` on it afterwards is not a subtler bug to get right, it is
+unsupported; use `medkit_add_launch_test`'s own `LABELS` and `ENV` parameters instead.
+
+The macro does not own anything else. `RESOURCE_LOCK`, `RUN_SERIAL`, `WILL_FAIL`, `DEPENDS`
+and `SKIP_RETURN_CODE` have no route through `medkit_add_launch_test` at all -
+`ros2_medkit_graph_watchdog` already sets `RESOURCE_LOCK` this way on some of its gtests, and
+the same call works on a launch test too, guarded so it does not turn into a hard configure
+error on a build where the guard suppressed the test:
+
+```cmake
+medkit_add_launch_test(test_multi test/test_multi.test.py TIMEOUT 300)
+if(TEST test_multi)
+  set_property(TEST test_multi APPEND PROPERTY RESOURCE_LOCK "some_resource")
+endif()
+```
+
+`if(TEST <name>)` is true exactly when CMake registered a test by that name, so this form is
+correct under both guard states without asking the caller to know which one is in effect:
+skipped entirely when the guard suppressed the test, and an ordinary `APPEND` otherwise.
 
 The failure this scheme has to guard against is silent: a test registered with plain
 `ament_add_gtest` or `add_launch_test` does not fail, it runs on domain 0 and sees every node

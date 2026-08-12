@@ -253,6 +253,13 @@ if(BUILD_TESTING)
     test_graph_provider_greenwave 300
     test_graph_provider_stale 300
     test_graph_provider_sse 300)
+  # Names actually matched against a discovered test_name in the two loops
+  # below. Checked against _MEDKIT_TEST_TIMEOUT_OVERRIDES itself after both
+  # loops finish - see the FATAL_ERROR check at the end of this block - so a
+  # renamed or deleted test file leaves a stale entry here that fails the
+  # configure instead of silently reverting that test's budget to the glob
+  # default.
+  unset(_MEDKIT_TEST_TIMEOUT_OVERRIDES_SEEN)
 
   # Feature tests (atomic, independent, 120s timeout unless overridden above)
   file(GLOB FEATURE_TESTS test/features/*.test.py)
@@ -267,6 +274,7 @@ if(BUILD_TESTING)
     if(NOT _test_timeout_idx EQUAL -1)
       math(EXPR _test_timeout_value_idx "${_test_timeout_idx} + 1")
       list(GET _MEDKIT_TEST_TIMEOUT_OVERRIDES ${_test_timeout_value_idx} _test_timeout)
+      list(APPEND _MEDKIT_TEST_TIMEOUT_OVERRIDES_SEEN ${test_name})
     endif()
     medkit_add_launch_test(${test_name} ${test_file}
       TIMEOUT ${_test_timeout}
@@ -290,6 +298,7 @@ if(BUILD_TESTING)
     if(NOT _test_timeout_idx EQUAL -1)
       math(EXPR _test_timeout_value_idx "${_test_timeout_idx} + 1")
       list(GET _MEDKIT_TEST_TIMEOUT_OVERRIDES ${_test_timeout_value_idx} _test_timeout)
+      list(APPEND _MEDKIT_TEST_TIMEOUT_OVERRIDES_SEEN ${test_name})
     endif()
     medkit_add_launch_test(${test_name} ${test_file}
       TIMEOUT ${_test_timeout}
@@ -299,6 +308,33 @@ if(BUILD_TESTING)
     )
     math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
   endforeach()
+
+  # A stale entry in _MEDKIT_TEST_TIMEOUT_OVERRIDES used to be a silent
+  # no-op: list(FIND ...) above returns -1 for a name that matches no
+  # discovered test_name, the if() is skipped, and the test simply keeps
+  # whichever glob default it already had - nothing in either loop fails,
+  # and a test's budget quietly reverts from (say) 300 to 120 with no line
+  # in the configure log to say so. Every even-indexed name in the override
+  # list must therefore have matched some test_name in one of the two loops
+  # above, or this fails the configure instead of a test silently losing
+  # its budget.
+  list(LENGTH _MEDKIT_TEST_TIMEOUT_OVERRIDES _medkit_timeout_overrides_length)
+  if(_medkit_timeout_overrides_length GREATER 0)
+    math(EXPR _medkit_timeout_overrides_last_index "${_medkit_timeout_overrides_length} - 1")
+    foreach(_medkit_timeout_override_idx RANGE 0 ${_medkit_timeout_overrides_last_index} 2)
+      list(GET _MEDKIT_TEST_TIMEOUT_OVERRIDES ${_medkit_timeout_override_idx}
+        _medkit_timeout_override_name)
+      if(NOT _medkit_timeout_override_name IN_LIST _MEDKIT_TEST_TIMEOUT_OVERRIDES_SEEN)
+        message(FATAL_ERROR
+          "ros2_medkit_integration_tests: _MEDKIT_TEST_TIMEOUT_OVERRIDES names "
+          "'${_medkit_timeout_override_name}', which matched no test_name discovered "
+          "under test/features/*.test.py or test/scenarios/*.test.py. A stale entry "
+          "here used to be a silent no-op: the test it once named would quietly keep "
+          "the glob's default timeout instead of the override. Remove the entry, or "
+          "fix the name to match the renamed or moved test file.")
+      endif()
+    endforeach()
+  endif()
 endif()
 
 ament_package()

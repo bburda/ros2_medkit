@@ -45,14 +45,20 @@ because this package cannot depend on the packages that consume it - that
 would be circular - so it needs a package whose own dependency chain already
 reaches them.
 
-The guard itself fires on two independent signals - the install prefix is the
-ROS distribution root, AND ``CMAKE_INSTALL_LOCALSTATEDIR`` equals ``/var`` -
+The guard itself fires on two independent signals, both read from CMake
+variables rather than the environment - the install prefix matches
+``/opt/ros/<anything>``, AND ``CMAKE_INSTALL_LOCALSTATEDIR`` equals ``/var`` -
 because either alone has a false positive: the prefix alone would also catch
 ``colcon build --install-base /opt/ros/<distro>``, whose test step runs after
 its own install step and whose launch tests work fine, and checking only
 ``DEFINED`` would also catch ``include(GNUInstallDirs)``, which defines it
 itself as the relative ``var`` rather than the absolute ``/var`` debhelper
-passes on the command line.
+passes on the command line. An earlier version of the prefix check compared
+against ``$ENV{ROS_DISTRO}`` instead of a wildcard, and never fired in the ROS
+build farm's binarydeb chroot as a result: that environment has no
+``ROS_DISTRO`` set at all, so the old guard always returned TRUE (register)
+there - see ``test_launch_test_is_not_registered_with_ros_distro_absent``
+below, which is the probe that would have caught it.
 
 The guard covers launch tests only. gtests run fine in that chroot and are the
 only place our packages meet a minimal dependency closure, which is how the
@@ -126,6 +132,32 @@ enable_testing()
 medkit_add_pytest_test(probe_pytest_test probe_pytest TIMEOUT 10)
 """
 
+# A CXX project, not C or NONE: ament_cmake_gtest's own find_package chain
+# needs a C++ compiler to locate GTest with, and medkit_add_gtest's whole
+# point is a compiled test binary. cmake_guard.py's
+# assert_guard_suppressed_launch_tests backstops "the guard did not remove
+# everything" with a bare `assert guarded_tests`, and its docstring names
+# gtests explicitly - but nothing before this probe actually exercised a
+# gtest through the guard: a guard that also swallowed gtests would still
+# pass every real-package check, because ros2_medkit_log_bridge's own pytest
+# test would still be there to satisfy the assertion.
+GTEST_PROBE = """cmake_minimum_required(VERSION 3.14)
+project(medkit_gtest_guard_probe CXX)
+find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_gtest REQUIRED)
+include("{module}")
+enable_testing()
+medkit_add_gtest(probe_gtest_test probe_gtest.cpp)
+"""
+
+GTEST_PROBE_SOURCE = """#include <gtest/gtest.h>
+
+TEST(ProbeGtestGuard, Passes)
+{
+  EXPECT_TRUE(true);
+}
+"""
+
 # LABELS is a single word here on purpose: the point of this probe is ARGS,
 # not the LABELS multi-value splitting LAUNCH_PROBE already covers. If ARGS
 # leaked into LABELS the way it did before ARGS got its own keyword, LABELS
@@ -161,14 +193,23 @@ def configure_probe(
     """
     Configure a throwaway project and return the completed cmake process.
 
-    ROS_DISTRO is always set in the subprocess environment (jazzy by default,
-    overridable). A probe that skipped itself when ROS_DISTRO happened to be
-    unset in whoever runs this suite would let a deleted guard pass here right
-    along with a working one - that used to be true of this file and is
-    exactly what let the CRITICAL finding through unnoticed. The default is
-    jazzy rather than humble because that is the distro this suite otherwise
-    runs under; a guard hard-coded to jazzy would still pass every case here
-    if every case also used jazzy, which is why one case pins humble instead.
+    ROS_DISTRO is set to *ros_distro* in the subprocess environment (jazzy by
+    default, overridable) unless *ros_distro* is None, in which case it is
+    deleted from the environment instead of set - the actual state of the ROS
+    build farm's binarydeb chroot, which has no `ros_environment` package (the
+    only in-tree source of that export) and no Docker `ENV` setting it either.
+
+    The guard no longer reads ROS_DISTRO at all (see
+    ROS2MedkitTestDomain.cmake), so this parameter no longer decides the
+    guard's outcome the way it used to - but it did decide it, silently,
+    before this file gained `ros_distro=None` as a real case: every probe here
+    used to force ROS_DISTRO into the child environment unconditionally,
+    which is exactly the one state that does not hold in the target job, and
+    is how a guard that never fired there kept passing this whole file. The
+    default stays jazzy rather than humble because that is the distro this
+    suite otherwise runs under; a guard hard-coded to jazzy would still pass
+    every case here if every case also used jazzy, which is why one case pins
+    humble and another deletes ROS_DISTRO entirely.
     """
     source = tmp_path / 'probe'
     source.mkdir()
@@ -189,9 +230,13 @@ def configure_probe(
     # Override, not replace: cmake still needs the inherited AMENT_PREFIX_PATH /
     # CMAKE_PREFIX_PATH to resolve find_package(ament_cmake) and
     # find_package(launch_testing_ament_cmake) at all. Only ROS_DISTRO itself is
-    # pinned, so every probe imitates a chosen distro regardless of who runs it.
+    # touched, so every probe imitates a chosen distro - or its absence -
+    # regardless of who runs it.
     env = dict(os.environ)
-    env['ROS_DISTRO'] = ros_distro
+    if ros_distro is None:
+        env.pop('ROS_DISTRO', None)
+    else:
+        env['ROS_DISTRO'] = ros_distro
     return subprocess.run(
         cmake_args,
         capture_output=True,
@@ -313,20 +358,28 @@ def test_launch_test_is_registered_when_localstatedir_is_relative(tmp_path):
     assert 'probe_launch_test' in registered_tests(build), result.stdout
 
 
-def test_launch_test_is_not_registered_with_a_trailing_slash_on_the_prefix(tmp_path):
+def test_launch_test_is_not_registered_with_a_trailing_slash_on_localstatedir(tmp_path):
     """
-    A trailing slash on the install prefix does not disarm the guard.
+    A trailing slash on CMAKE_INSTALL_LOCALSTATEDIR does not disarm the guard.
 
-    The comparison is STREQUAL, which is exact, so the guard normalises the
-    prefix before comparing it rather than relying on the caller to spell it
-    exactly as bloom does.
+    This file used to probe a trailing slash on the install prefix instead,
+    and that probe could not fail however the guard's own code was written:
+    CMake itself strips a trailing slash from CMAKE_INSTALL_PREFIX before
+    project code ever sees it - confirmed on CMake 3.22, 3.28 and 4.4 - so
+    the guard's prefix match needs no normalisation of its own, and by the
+    time the guard runs the question was already settled upstream.
+    CMAKE_INSTALL_LOCALSTATEDIR is an ordinary cache variable nothing else
+    normalises, so the guard's own `string(REGEX REPLACE "/+$" ...)` on it is
+    the only thing standing between a trailing slash here and a failed
+    STREQUAL "/var" comparison - this is what actually needs a test, and this
+    pins that it works.
     """
     result, build = configure_probe(
         tmp_path,
         LAUNCH_PROBE,
-        '/opt/ros/jazzy/',
+        '/opt/ros/jazzy',
         {'probe_launch.test.py': '# empty launch test file\n'},
-        localstatedir='/var',
+        localstatedir='/var/',
     )
     assert result.returncode == 0, result.stderr
     assert 'probe_launch_test' not in registered_tests(build), result.stdout
@@ -353,6 +406,32 @@ def test_other_test_kinds_are_still_registered_in_a_system_build(tmp_path):
     assert 'probe_pytest_test' in registered_tests(build), result.stdout
 
 
+def test_gtest_is_still_registered_in_a_system_build(tmp_path):
+    """
+    The guard covers launch tests only, so a gtest still registers too.
+
+    The pytest half of this claim is
+    `test_other_test_kinds_are_still_registered_in_a_system_build` above;
+    this is the gtest half, which `cmake_guard.py`'s
+    `assert_guard_suppressed_launch_tests` docstring names but which no probe
+    here actually drove through the guard before this test: its own
+    backstop, a bare `assert guarded_tests`, would still pass for a guard
+    that also swallowed gtests, as long as some pytest test in the same
+    package survived to keep the set non-empty. This closes that gap
+    directly rather than relying on a real package always happening to carry
+    both kinds.
+    """
+    result, build = configure_probe(
+        tmp_path,
+        GTEST_PROBE,
+        '/opt/ros/jazzy',
+        {'probe_gtest.cpp': GTEST_PROBE_SOURCE},
+        localstatedir='/var',
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'probe_gtest_test' in registered_tests(build), result.stdout
+
+
 def test_launch_test_is_registered_with_a_non_distribution_prefix_and_localstatedir_set(tmp_path):
     """
     CMAKE_INSTALL_LOCALSTATEDIR alone does not suppress; the prefix still has to match.
@@ -377,12 +456,16 @@ def test_launch_test_is_registered_with_a_non_distribution_prefix_and_localstate
 
 def test_launch_test_is_not_registered_on_humble(tmp_path):
     """
-    The guard reads ROS_DISTRO rather than being hard-coded to one distro.
+    The guard's prefix match is a wildcard, not hard-coded to one distro.
 
     Humble is the only distro whose binarydeb job still runs package tests -
     the one this whole task exists for - so a guard that happened to work only
     for jazzy (every other case in this file) would not fire on the build that
-    matters and would still pass the suite.
+    matters and would still pass the suite. ros_distro='humble' here only
+    controls what the probe's subprocess environment looks like, matching the
+    real chroot's distro; it plays no part in the guard's own decision - see
+    test_launch_test_is_not_registered_with_ros_distro_absent below for the
+    case that proves the guard does not need it at all.
     """
     result, build = configure_probe(
         tmp_path,
@@ -394,6 +477,40 @@ def test_launch_test_is_not_registered_on_humble(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert 'probe_launch_test' not in registered_tests(build), result.stdout
+
+
+def test_launch_test_is_not_registered_with_ros_distro_absent(tmp_path):
+    """
+    The guard suppresses launch tests even when ROS_DISTRO is not in the environment at all.
+
+    This is the actual state of the ROS build farm's binarydeb chroot, not a
+    hypothetical: no in-tree package.xml declares ros_environment (the only
+    source of the ROS_DISTRO export outside a Docker image's own ENV), and
+    ros-humble-ros-environment does not appear in the farm's chroot install
+    log, so ROS_DISTRO is genuinely unset there. An earlier version of this
+    guard read ENV{ROS_DISTRO} and returned TRUE (register) the instant it
+    was undefined - which is exactly this case - so the guard never fired in
+    the one job it exists for, and every launch test kept failing on
+    resolution exactly as before the guard was written. Every other probe in
+    this file sets ROS_DISTRO in the child environment (see
+    configure_probe's docstring for why that was not incidental); this one
+    deletes it instead, which is what makes this the probe that would have
+    caught the regression before it shipped.
+    """
+    result, build = configure_probe(
+        tmp_path,
+        LAUNCH_PROBE,
+        '/opt/ros/humble',
+        {'probe_launch.test.py': '# empty launch test file\n'},
+        localstatedir='/var',
+        ros_distro=None,
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'probe_launch_test' not in registered_tests(build), (
+        f'the guard did not suppress the launch test with ROS_DISTRO absent from the '
+        f'environment - this is the exact condition of the ROS build farm binarydeb '
+        f'chroot the guard exists for:\n{result.stdout}'
+    )
 
 
 def test_args_reaches_add_launch_test_and_is_not_absorbed_by_labels(tmp_path):
