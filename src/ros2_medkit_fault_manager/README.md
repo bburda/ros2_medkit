@@ -118,8 +118,8 @@ unknown format string lands on. Neither backend is privileged over the other:
 whichever is configured, if its plugin is unavailable at startup the FaultManager
 logs a warning naming the missing package and falls back to the other one
 automatically, disabling capture only if neither loads. Both `rosbag2_storage_mcap`
-and `rosbag2_storage_default_plugins` (the sqlite3 plugin) are runtime dependencies
-of this package, so a normal install pulls in both backends. See
+and `rosbag2_storage_default_plugins` (which carries the sqlite3 plugin) are runtime
+dependencies of this package, so a normal install pulls in both backends. See
 `docs/config/fault-manager.rst` and `docs/tutorials/snapshots.rst` for the full
 parameter list and recording lifecycle.
 
