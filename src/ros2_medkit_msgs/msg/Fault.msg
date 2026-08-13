@@ -42,7 +42,10 @@ builtin_interfaces/Time last_occurred
 # Timestamp of the last PASSED event reported for this fault (zero = never)
 builtin_interfaces/Time last_passed
 
-# Total number of FAILED events aggregated across all sources
+# Number of times this fault has occurred, counted on edges: one for the first
+# FAILED event, and one more each time a FAILED event arrives while the fault is
+# CLEARED. Repeated FAILED events within one occurrence do not increment it;
+# last_occurred is what advances on those.
 uint32 occurrence_count
 
 # Current fault status (use STATUS_* constants)

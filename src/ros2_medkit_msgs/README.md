@@ -24,7 +24,7 @@ Core fault data model representing an aggregated fault condition with AUTOSAR DE
 | `first_occurred` | builtin_interfaces/Time | When fault was first reported |
 | `last_occurred` | builtin_interfaces/Time | When fault last occurred (FAILED events only) |
 | `last_passed` | builtin_interfaces/Time | When fault last reported PASSED (zero = never) |
-| `occurrence_count` | uint32 | Total FAILED events aggregated across all sources |
+| `occurrence_count` | uint32 | Times this fault has occurred, counted on edges (first FAILED, then each FAILED that arrives while CLEARED). Repeats within one occurrence do not increment it |
 | `status` | string | Current status (see STATUS_* constants) |
 | `reporting_sources` | string[] | List of source identifiers that reported this fault |
 
