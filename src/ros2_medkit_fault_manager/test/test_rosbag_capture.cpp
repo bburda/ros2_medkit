@@ -35,6 +35,7 @@
 #include <std_msgs/msg/string.hpp>
 
 #include "rclcpp/rclcpp.hpp"
+#include "rcutils/logging.h"
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
 #include "ros2_medkit_fault_manager/rosbag_capture.hpp"
 #include "ros2_medkit_fault_manager/snapshot_capture.hpp"
@@ -248,26 +249,28 @@ TEST_F(RosbagCaptureTest, DefaultFormatIsMcap) {
 
 // @verifies REQ_INTEROP_088
 TEST_F(RosbagCaptureTest, ConstructorFallsBackOnUnknownFormat) {
-  // An unknown format string must NOT terminate the node. It normalises to
-  // "sqlite3" first, then goes through the same real probe as an explicit
-  // sqlite3 configuration would, so this test uses the real probe on
-  // purpose - unlike the crash-safety tests below, which inject a double.
-  // That means the resolved format is not fixed: on a host with only mcap
-  // installed and not sqlite3 (the buildfarm chroot before
-  // rosbag2_storage_default_plugins lands as a real dependency), resolution
-  // falls back to mcap instead, which is the fallback being symmetric doing
-  // exactly its job, not a failure. The contract this test is actually about
-  // is that capture stays enabled and resolves to one of the two real
-  // backends, not "invalid_format" - not which one that happens to be here.
+  // An unknown format string must NOT terminate the node: it normalises to
+  // "sqlite3" before any probe runs. The probe is injected and reports every
+  // backend usable, so no fallback can move the format afterwards and the
+  // assertion pins normalisation and nothing else.
+  //
+  // The real probe cannot be used here. An unknown format reaches "sqlite3"
+  // down a second path with it - its own probe fails, and because the format
+  // is not literally "sqlite3" the fallback picks sqlite3 - so the two paths
+  // are indistinguishable by the resolved value and the assertion would hold
+  // whether normalisation ran or not.
   auto rosbag_config = create_rosbag_config();
   rosbag_config.format = "invalid_format";
   auto snapshot_config = create_snapshot_config();
+  RosbagCapture::StorageProbeFn all_usable = [](const std::string &) -> std::optional<std::string> {
+    return std::nullopt;
+  };
   std::shared_ptr<RosbagCapture> rb;
-  EXPECT_NO_THROW(rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config));
+  EXPECT_NO_THROW(
+      rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config, all_usable));
   ASSERT_NE(rb, nullptr);
   EXPECT_TRUE(rb->is_enabled());
-  EXPECT_TRUE(rb->config().format == "sqlite3" || rb->config().format == "mcap")
-      << "resolved format was '" << rb->config().format << "', neither a real backend";
+  EXPECT_EQ(rb->config().format, "sqlite3");
 }
 
 // The crash-safety branches below force the storage probe via an injected double,
