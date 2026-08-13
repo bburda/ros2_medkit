@@ -30,7 +30,6 @@ from launch import LaunchDescription
 import launch.actions
 import launch_ros.actions
 import launch_testing.actions
-import launch_testing.markers
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
