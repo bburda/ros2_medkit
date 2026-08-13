@@ -28,7 +28,9 @@ Core fault data model representing an aggregated fault condition.
    # Human-readable description of the fault condition
    string description
 
-   # Timestamp when this fault was first reported
+   # Timestamp when the current occurrence started (reset when a FAILED event
+   # reactivates a CLEARED fault, so it moves with occurrence_count instead of
+   # marking the fault's first report ever)
    builtin_interfaces/Time first_occurred
 
    # Timestamp when this fault last occurred (FAILED events only; a PASSED

@@ -21,7 +21,7 @@ Core fault data model representing an aggregated fault condition with AUTOSAR DE
 | `fault_code` | string | Global fault identifier (e.g., "MOTOR_OVERHEAT") |
 | `severity` | uint8 | Severity level (use SEVERITY_* constants) |
 | `description` | string | Human-readable description |
-| `first_occurred` | builtin_interfaces/Time | When fault was first reported |
+| `first_occurred` | builtin_interfaces/Time | When the current occurrence started; reset when a FAILED event reactivates a CLEARED fault, so it moves with `occurrence_count` |
 | `last_occurred` | builtin_interfaces/Time | When fault last occurred (FAILED events only) |
 | `last_passed` | builtin_interfaces/Time | When fault last reported PASSED (zero = never) |
 | `occurrence_count` | uint32 | Times this fault has occurred, counted on edges (first FAILED, then each FAILED that arrives while CLEARED). Repeats within one occurrence do not increment it |
