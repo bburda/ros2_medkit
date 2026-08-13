@@ -205,8 +205,14 @@ HEALING_ABSENCE_GRACE_TICKS = 3
 # respawn quickly relative to the absence budget above, not eat most of it.
 HEALING_REFRESH_DEBOUNCE_MS = 300
 # launch will not even ATTEMPT to restart the process before this elapses, so it is a
-# real, enforced floor under each blink's duration - not just a hint.
-HEALING_RESPAWN_DELAY_SEC = 0.3
+# real, enforced floor under each blink's duration - not just a hint. It has to exceed ONE
+# tick interval: a node that leaves and returns inside a single tick is never sampled
+# absent at all, so the absence grace this scenario is named for is not exercised and the
+# blink proves nothing. The ceiling is the other side of the same window - the whole
+# absence must stay under HEALING_ABSENCE_GRACE_TICKS ticks, or what is being exercised is
+# the ordinary sustained-absence path instead. Both edges are asserted per blink rather
+# than assumed from this constant.
+HEALING_RESPAWN_DELAY_SEC = 1.4
 # Slept after the SIGTERM before polling for the node's return: gives the respawn_delay
 # above, the new process's own startup, and DDS rediscovery room to finish before the
 # poll below starts, without itself risking the 3 s absence budget.
@@ -1515,14 +1521,19 @@ class TestLifecycleExpectationHealingThreshold(unittest.TestCase):
             'exercised a real departure at all, so nothing below proves the absence grace '
             'held',
         )
-        # Give the respawn_delay, the new process's own startup and DDS rediscovery room
-        # to finish, without itself risking the absence budget (HEALING_TICK_INTERVAL_MS
-        # * 3, kDefaultAbsenceGrace) the tracker's hold depends on.
-        self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=15.0),
-            f'blink {blink_number}: {TARGET_NODE} did not come back reading "unconfigured" '
-            '- the respawn or its rediscovery did not complete, so this blink cannot be '
-            'trusted to have stayed inside the absence grace',
+        # The return has to be proven from the DISCOVERY view, not from the watchdog's
+        # entity list: ReliabilityGate::status_json builds its entities from
+        # WarmupTracker::entries(), which RETAINS an entry for forget_grace_ ticks after
+        # the node stops being present. Polling the watchdog for "unconfigured" therefore
+        # matches the entry left over from before the SIGTERM and returns while the
+        # replacement process is milliseconds old - so everything measured from it,
+        # including the absence duration below, describes a node the tracker never saw
+        # leave. GET /apps carries no such retention.
+        self.assertTrue(
+            _poll_apps_present(PORT, TARGET_NODE, timeout=15.0),
+            f'blink {blink_number}: {TARGET_NODE} never came back into GET /apps - the '
+            'respawn or its rediscovery did not complete, so this blink cannot be trusted '
+            'to have stayed inside the absence grace',
         )
         absence_duration = time.monotonic() - absence_started
         # kDefaultAbsenceGrace ticks at this scenario's own (sped-up) cadence - the exact
@@ -1530,6 +1541,18 @@ class TestLifecycleExpectationHealingThreshold(unittest.TestCase):
         # it would be exercising the ordinary (and separately proven) sustained-absence
         # clear instead of the guard this scenario is actually about.
         grace_budget_sec = (HEALING_ABSENCE_GRACE_TICKS * HEALING_TICK_INTERVAL_MS) / 1000.0
+        tick_sec = HEALING_TICK_INTERVAL_MS / 1000.0
+        # The lower edge of the window, and the one that used to be missing entirely. The
+        # tracker only counts an absent TICK; an absence shorter than one tick interval can
+        # fall wholly between two samples, in which case the node was never observed away
+        # and this blink exercised nothing at all. An absence longer than one interval must
+        # contain at least one sample.
+        self.assertGreater(
+            absence_duration, tick_sec,
+            f'blink {blink_number}: {TARGET_NODE} was away for only {absence_duration:.2f}s, '
+            f'less than the {tick_sec:.1f}s tick interval - the tracker can have sampled it '
+            'as present on every tick, so this blink does not exercise the absence grace',
+        )
         self.assertLess(
             absence_duration, grace_budget_sec,
             f'blink {blink_number}: {TARGET_NODE} took {absence_duration:.2f}s to return - '
@@ -1537,7 +1560,14 @@ class TestLifecycleExpectationHealingThreshold(unittest.TestCase):
             'on staying inside, so this blink no longer proves the withheld-clear guard, '
             'only the ordinary sustained-absence clear',
         )
+        # Polled, not read once: launch updates process_details from its own event loop, so
+        # a single read here races the respawn it is meant to confirm - the gateway can see
+        # the replacement through DDS before launch has recorded it.
+        pid_deadline = time.monotonic() + 10.0
         new_pid = node_action.process_details['pid']
+        while new_pid == old_pid and time.monotonic() < pid_deadline:
+            time.sleep(0.1)
+            new_pid = node_action.process_details['pid']
         self.assertNotEqual(
             new_pid, old_pid,
             f'blink {blink_number}: the node process id did not change, so nothing '
