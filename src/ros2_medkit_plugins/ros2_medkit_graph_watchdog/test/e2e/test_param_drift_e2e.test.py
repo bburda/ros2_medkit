@@ -53,6 +53,7 @@ from harness import (  # noqa: E402, I100
     create_watchdog_test_launch,
     poll_cleared,
     poll_faults,
+    wait_until_faults_endpoint_live,
     wait_until_watchdog_armed,
 )
 
@@ -156,6 +157,16 @@ class TestParamDriftE2e(unittest.TestCase):
         # transport error into the same None a genuine absence produces, so a /faults that
         # died partway through this window would still pass - assert_fault_absent_throughout
         # instead fails naming which poll could not even ask.
+        # First contact with GET /faults happens HERE, and the window below is strict: one
+        # transport error fails it. On the distro running default FastDDS that first call also
+        # pays service discovery to the fault_manager, which can outlast the window's own 5 s
+        # per-poll timeout - so prove the channel is up first, with a budget that tolerates
+        # discovery, and let the window police only what it is for.
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=60.0),
+            'GET /faults never answered 200 - the fault surface is not up, so a silence '
+            'assertion below could not tell "no such fault" from "could not ask"',
+        )
         assert_fault_absent_throughout(self, PORT, FAULT_CODE, SILENT_CAPTURE_SEC)
 
         self._node.set_parameters(

@@ -69,6 +69,7 @@ from harness import (  # noqa: E402, I100
     assert_fault_absent_throughout,
     create_watchdog_test_launch,
     poll_faults,
+    wait_until_faults_endpoint_live,
     wait_until_watchdog_armed,
 )
 
@@ -152,6 +153,16 @@ class TestConfigPlumbingModeOff(unittest.TestCase):
         # absence produces, so a /faults that died partway through this window would still
         # pass - assert_fault_absent_throughout instead fails naming which poll could not
         # even ask.
+        # First contact with GET /faults happens HERE, and the window below is strict: one
+        # transport error fails it. On the distro running default FastDDS that first call also
+        # pays service discovery to the fault_manager, which can outlast the window's own 5 s
+        # per-poll timeout - so prove the channel is up first, with a budget that tolerates
+        # discovery, and let the window police only what it is for.
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=60.0),
+            'GET /faults never answered 200 - the fault surface is not up, so a silence '
+            'assertion below could not tell "no such fault" from "could not ask"',
+        )
         assert_fault_absent_throughout(self, PORT, 'GRAPH_PARAM_DRIFT', 20.0)
 
 
@@ -172,6 +183,14 @@ class TestConfigPlumbingModeOffYamlBool(unittest.TestCase):
         )
         # assert_fault_absent_throughout, not assertIsNone(poll_faults(...)) - see
         # TestConfigPlumbingModeOff's identical rationale above.
+        # Same first-contact gate as TestConfigPlumbingModeOff above: this class is its own
+        # CTest target in its own process, so it makes first contact with GET /faults itself
+        # and needs its own proof that the channel is up before the strict window.
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=60.0),
+            'GET /faults never answered 200 - the fault surface is not up, so the silence '
+            'assertion below could not tell "no such fault" from "could not ask"',
+        )
         assert_fault_absent_throughout(self, PORT, 'GRAPH_PARAM_DRIFT', 20.0)
 
 
