@@ -66,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # I100 as well as E402: `harness` is only importable because of the sys.path line above, so this
 # import cannot be moved up to where the alphabetical order would put it.
 from harness import (  # noqa: E402, I100
+    assert_fault_absent_throughout,
     create_watchdog_test_launch,
     poll_faults,
     wait_until_watchdog_armed,
@@ -146,13 +147,12 @@ class TestConfigPlumbingModeOff(unittest.TestCase):
         )
         # Proving absence means waiting out the full window: a detector that
         # (regression) ignored `mode` would have raised well within it.
-        fault = poll_faults(PORT, 'GRAPH_PARAM_DRIFT', timeout=20.0)
-        self.assertIsNone(
-            fault,
-            'GRAPH_PARAM_DRIFT raised despite '
-            'detectors.param_drift.mode="off" - the nested `mode` config was '
-            'not delivered to (or not honored by) the plugin',
-        )
+        # assert_fault_absent_throughout, not assertIsNone(poll_faults(...)): the latter
+        # swallows every non-200 response and transport error into the same None a genuine
+        # absence produces, so a /faults that died partway through this window would still
+        # pass - assert_fault_absent_throughout instead fails naming which poll could not
+        # even ask.
+        assert_fault_absent_throughout(self, PORT, 'GRAPH_PARAM_DRIFT', 20.0)
 
 
 class TestConfigPlumbingModeOffYamlBool(unittest.TestCase):
@@ -170,13 +170,9 @@ class TestConfigPlumbingModeOffYamlBool(unittest.TestCase):
             'graph_watchdog never reported an armed gate - the plugin did not load '
             'or its tick loop never ran, so an absent fault proves nothing',
         )
-        fault = poll_faults(PORT, 'GRAPH_PARAM_DRIFT', timeout=20.0)
-        self.assertIsNone(
-            fault,
-            'GRAPH_PARAM_DRIFT raised despite a bare '
-            'detectors.param_drift.mode: off - the YAML boolean form of "off" '
-            'was not honored by the plugin',
-        )
+        # assert_fault_absent_throughout, not assertIsNone(poll_faults(...)) - see
+        # TestConfigPlumbingModeOff's identical rationale above.
+        assert_fault_absent_throughout(self, PORT, 'GRAPH_PARAM_DRIFT', 20.0)
 
 
 # Each CTest target launches this file with one scenario, so only that scenario's case may

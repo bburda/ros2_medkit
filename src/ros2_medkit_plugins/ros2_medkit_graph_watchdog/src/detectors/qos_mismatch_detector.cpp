@@ -51,8 +51,8 @@ constexpr int kDefaultGrace = 3;
 
 /// Human-readable owner of an endpoint, for the fault description.
 std::string endpoint_name(const rclcpp::TopicEndpointInfo & endpoint) {
-  const std::string ns = endpoint.node_namespace();
-  const std::string name = endpoint.node_name();
+  const std::string & ns = endpoint.node_namespace();
+  const std::string & name = endpoint.node_name();
   if (ns.empty() || ns == "/") {
     return "/" + name;
   }
@@ -80,7 +80,7 @@ std::string join_names(const std::set<std::string> & names) {
 ///   else in the system reports it.
 ///
 /// A subscriber with zero publishers is an orphan (a different detector), not a QoS fault.
-/// See design doc / [[project_graph_watchdog_zero_config]].
+/// See design doc.
 class QosMismatchDetector : public Detector {
  public:
   std::string id() const override {

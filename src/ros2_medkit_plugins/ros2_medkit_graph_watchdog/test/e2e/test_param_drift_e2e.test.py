@@ -49,6 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # I100 as well as E402: `harness` is only importable because of the sys.path line above, so this
 # import cannot be moved up to where the alphabetical order would put it.
 from harness import (  # noqa: E402, I100
+    assert_fault_absent_throughout,
     create_watchdog_test_launch,
     poll_cleared,
     poll_faults,
@@ -149,13 +150,13 @@ class TestParamDriftE2e(unittest.TestCase):
         )
 
         # Give the detector time to capture the baseline BEFORE changing anything. Capturing
-        # must be silent, so a fault appearing here at all would mean the detector reports its
-        # own first read as drift.
-        self.assertIsNone(
-            poll_faults(PORT, FAULT_CODE, timeout=SILENT_CAPTURE_SEC),
-            'GRAPH_PARAM_DRIFT was raised before any parameter changed, so baseline capture is '
-            'not silent',
-        )
+        # must be silent, so a fault appearing here at all would mean the detector reports
+        # its own first read as drift. assert_fault_absent_throughout, not
+        # assertIsNone(poll_faults(...)): the latter swallows every non-200 response and
+        # transport error into the same None a genuine absence produces, so a /faults that
+        # died partway through this window would still pass - assert_fault_absent_throughout
+        # instead fails naming which poll could not even ask.
+        assert_fault_absent_throughout(self, PORT, FAULT_CODE, SILENT_CAPTURE_SEC)
 
         self._node.set_parameters(
             [rclpy.parameter.Parameter(PARAM_NAME, rclpy.Parameter.Type.DOUBLE, DRIFTED_VALUE)])

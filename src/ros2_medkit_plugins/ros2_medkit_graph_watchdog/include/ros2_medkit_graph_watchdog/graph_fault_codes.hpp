@@ -26,4 +26,15 @@ inline constexpr const char * kLatencyBudget = "GRAPH_LATENCY_BUDGET";
 // Extension of the frozen namespace above (new capability, beyond the original
 // six classes): a node the operator declared must-be-active is present but not active.
 inline constexpr const char * kNodeInactive = "GRAPH_NODE_INACTIVE";
+// Second extension, alongside kNodeInactive: a node the operator declared must-be-active
+// is present and matched, but its lifecycle label has never been read - an unverified
+// promise, not a confirmed violation, and deliberately its own record rather than content
+// folded into kNodeInactive.
+inline constexpr const char * kNodeUnreadable = "GRAPH_NODE_UNREADABLE";
+// Third extension, sibling of kNodeUnreadable: a node the operator declared must-be-active
+// is present and matched, but carries no tracked lifecycle at all (`lifecycle_state_of()`
+// returns nullopt - a typo, or a plain non-lifecycle node). Like kNodeUnreadable this is an
+// unverified promise, not a confirmed violation, and shares the same cause-blind unmeasured
+// clock as kNodeUnreadable - the two differ only in which cause the clock matured under.
+inline constexpr const char * kNodeNotManaged = "GRAPH_NODE_NOT_MANAGED";
 }  // namespace ros2_medkit_graph_watchdog::graph_fault_codes

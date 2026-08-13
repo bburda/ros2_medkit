@@ -64,6 +64,13 @@ class GraphWatchdogPlugin : public ros2_medkit_gateway::GatewayPlugin,
     return "graph_watchdog";
   }
   void configure(const nlohmann::json & config) override;
+  /// PRECONDITION: called exactly once, before any tick. It builds `gate_` and the
+  /// detector list and then spawns the tick thread, so everything the tick thread reads is
+  /// published to it by that thread creation and needs no lock afterwards. A second call
+  /// while the tick thread is running would rebuild both under a live reader with no
+  /// synchronisation at all. The gateway honours this (one call site, gateway_node.cpp),
+  /// which is why nothing here defends against the other case - stated rather than
+  /// enforced, because a guard would be untestable through any caller that respects it.
   void set_context(ros2_medkit_gateway::PluginContext & context) override;
   std::vector<PluginRoute> get_routes() override;
   void shutdown() override;
