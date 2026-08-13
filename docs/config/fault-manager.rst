@@ -293,10 +293,6 @@ Capture continuous rosbag recordings around fault events.
    * - ``rosbag.exclude_topics``
      - ``[]``
      - Topics to drop from whatever the selection mode picked.
-   * - ``rosbag.format``
-     - ``sqlite3``
-     - Storage format handed to rosbag2. Use ``mcap`` where the reader expects
-       it.
    * - ``rosbag.storage_path``
      - ``""``
      - Directory the bag files are written to. Empty falls back to the system

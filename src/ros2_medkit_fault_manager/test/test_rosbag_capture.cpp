@@ -14,14 +14,18 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -43,6 +47,80 @@ using ros2_medkit_fault_manager::RosbagConfig;
 using ros2_medkit_fault_manager::SnapshotConfig;
 
 namespace {
+
+/// Captures rcutils log output while alive and restores the console handler on
+/// every exit path - leaving the process-global handler installed would swallow
+/// the output of every later case in this binary.
+///
+/// The handler is a plain C function pointer with no user-data slot, so the live
+/// capture is reached through a file-static. Only the test thread logs in the
+/// cases that use this, but the pointer is atomic because the handler is
+/// process-global and other threads in this binary do log.
+class LogCapture {
+ public:
+  LogCapture() {
+    active().store(this);
+    rcutils_logging_set_output_handler(&LogCapture::handler);
+  }
+  ~LogCapture() {
+    rcutils_logging_set_output_handler(rcutils_logging_console_output_handler);
+    active().store(nullptr);
+  }
+  LogCapture(const LogCapture &) = delete;
+  LogCapture & operator=(const LogCapture &) = delete;
+  LogCapture(LogCapture &&) = delete;
+  LogCapture & operator=(LogCapture &&) = delete;
+
+  /// How many captured lines contain `needle`.
+  int count(const std::string & needle) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return static_cast<int>(std::count_if(lines_.begin(), lines_.end(), [&needle](const std::string & line) {
+      return line.find(needle) != std::string::npos;
+    }));
+  }
+
+ private:
+  static std::atomic<LogCapture *> & active() {
+    static std::atomic<LogCapture *> current{nullptr};
+    return current;
+  }
+
+  static void handler(const rcutils_log_location_t * /*location*/, int /*severity*/, const char * /*name*/,
+                      rcutils_time_point_value_t /*timestamp*/, const char * format, va_list * args) {
+    char buf[1024];
+    va_list copy;
+    va_copy(copy, *args);
+    // The format string arrives from the logging call site through the handler
+    // signature, so there is no literal to write here. The build runs
+    // -Werror=format=2; GCC exempts va_list-taking formatters from
+    // -Wformat-nonliteral, clang does not, and clang-tidy does not honour
+    // suppression comments for a diagnostic raised as an error. Scoped to the
+    // single call.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+    vsnprintf(buf, sizeof(buf), format, copy);
+#pragma GCC diagnostic pop
+    va_end(copy);
+    LogCapture * capture = active().load();
+    if (capture == nullptr) {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(capture->mutex_);
+    capture->lines_.emplace_back(buf);
+  }
+
+  mutable std::mutex mutex_;
+  std::vector<std::string> lines_;
+};
+
+/// The apt package name the storage warnings must name for `format`, built the
+/// same way the code under test builds it so the assertion does not have to
+/// hardcode a distro.
+std::string expected_storage_package(const std::string & format) {
+  const char * distro = std::getenv("ROS_DISTRO");
+  const std::string d = (distro != nullptr && *distro != '\0') ? distro : "$ROS_DISTRO";
+  return (format == "mcap") ? "ros-" + d + "-rosbag2-storage-mcap" : "ros-" + d + "-rosbag2-storage-default-plugins";
+}
 
 /// Multiplier for the wall-clock window and throughput thresholds
 /// ConcurrentCapturesInOneProcessSurviveEachOthersPluginTraffic asserts. The
@@ -254,6 +332,56 @@ TEST_F(RosbagCaptureTest, NoUsableBackendDisablesCaptureWithoutCrashing) {
       rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config, probe));
   ASSERT_NE(rb, nullptr);
   EXPECT_FALSE(rb->is_enabled());
+}
+
+TEST_F(RosbagCaptureTest, StorageWarningsNameInstallablePackages) {
+  // Both warnings that report an unavailable backend have to name what an
+  // operator installs, which is the apt package - not the ROS package name,
+  // which differs from it by the distro prefix and by underscore-versus-hyphen
+  // and leaves the reader to work out the translation.
+  auto snapshot_config = create_snapshot_config();
+  const std::string mcap_package = expected_storage_package("mcap");
+  const std::string sqlite_package = expected_storage_package("sqlite3");
+
+  // Neither backend loads: capture disables, and the message names both packages.
+  {
+    auto rosbag_config = create_rosbag_config();
+    rosbag_config.format = "mcap";
+    RosbagCapture::StorageProbeFn none_usable = [](const std::string &) -> std::optional<std::string> {
+      return std::string("simulated: backend unavailable");
+    };
+    LogCapture logs;
+    RosbagCapture rb(node_.get(), storage_.get(), rosbag_config, snapshot_config, none_usable);
+    ASSERT_FALSE(rb.is_enabled());
+    EXPECT_EQ(logs.count("install " + mcap_package + " " + sqlite_package), 1);
+  }
+
+  // Only the configured backend fails: capture falls back, and the message names
+  // the package for the format the operator asked for and lost.
+  {
+    auto rosbag_config = create_rosbag_config();
+    rosbag_config.format = "mcap";
+    RosbagCapture::StorageProbeFn mcap_missing = [](const std::string & f) -> std::optional<std::string> {
+      return (f == "mcap") ? std::optional<std::string>("simulated: mcap plugin not found") : std::nullopt;
+    };
+    LogCapture logs;
+    RosbagCapture rb(node_.get(), storage_.get(), rosbag_config, snapshot_config, mcap_missing);
+    ASSERT_TRUE(rb.is_enabled());
+    EXPECT_EQ(logs.count("install " + mcap_package), 1);
+  }
+
+  // The symmetric fallback, so neither package name can be hardcoded and pass.
+  {
+    auto rosbag_config = create_rosbag_config();
+    rosbag_config.format = "sqlite3";
+    RosbagCapture::StorageProbeFn sqlite_missing = [](const std::string & f) -> std::optional<std::string> {
+      return (f == "sqlite3") ? std::optional<std::string>("simulated: sqlite3 plugin not found") : std::nullopt;
+    };
+    LogCapture logs;
+    RosbagCapture rb(node_.get(), storage_.get(), rosbag_config, snapshot_config, sqlite_missing);
+    ASSERT_TRUE(rb.is_enabled());
+    EXPECT_EQ(logs.count("install " + sqlite_package), 1);
+  }
 }
 
 // @verifies REQ_INTEROP_088

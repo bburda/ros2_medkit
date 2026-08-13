@@ -41,17 +41,31 @@ namespace ros2_medkit_fault_manager {
 
 namespace {
 
-/// Actionable install hint for an unavailable storage backend.
-std::string storage_plugin_hint(const std::string & format) {
+/// Installable package name for the storage plugin backing `format`, empty for
+/// any other format.
+///
+/// The name an operator has to type, not the ROS package name: those differ by
+/// the distro prefix and by underscore-versus-hyphen, so a message carrying the
+/// ROS name leaves the reader to guess the translation.
+std::string storage_plugin_package(const std::string & format) {
   const char * distro = std::getenv("ROS_DISTRO");
   const std::string d = (distro && *distro) ? distro : "$ROS_DISTRO";
   if (format == "mcap") {
-    return "install ros-" + d + "-rosbag2-storage-mcap";
+    return "ros-" + d + "-rosbag2-storage-mcap";
   }
   if (format == "sqlite3") {
-    return "install ros-" + d + "-rosbag2-storage-default-plugins";
+    return "ros-" + d + "-rosbag2-storage-default-plugins";
   }
-  return "check the rosbag2 storage plugin installation";
+  return {};
+}
+
+/// Actionable install hint for an unavailable storage backend.
+std::string storage_plugin_hint(const std::string & format) {
+  const std::string package = storage_plugin_package(format);
+  if (package.empty()) {
+    return "check the rosbag2 storage plugin installation";
+  }
+  return "install " + package;
 }
 
 /// Monotonic nanoseconds, for measuring how long something took.
@@ -247,11 +261,14 @@ RosbagCapture::RosbagCapture(rclcpp::Node * node, FaultStorage * storage, const 
     const std::string reason = truncate_reason(*probe_err);
     const std::string other_format = (config_.format == "sqlite3") ? "mcap" : "sqlite3";
     if (auto other_err = storage_probe_(other_format)) {
+      // Both names are known here - the check above left `config_.format` as one
+      // of the two formats - so this is a command line an operator can paste.
+      const std::string packages = storage_plugin_package(config_.format) + " " + storage_plugin_package(other_format);
       RCLCPP_WARN(node_->get_logger(),
-                  "No usable rosbag storage backend: '%s' (%s) and '%s' (%s) both failed to load; install "
-                  "rosbag2_storage_mcap and rosbag2_storage_default_plugins. Black-box rosbag capture disabled "
-                  "(freeze-frame snapshots still work)",
-                  config_.format.c_str(), reason.c_str(), other_format.c_str(), truncate_reason(*other_err).c_str());
+                  "No usable rosbag storage backend: '%s' (%s) and '%s' (%s) both failed to load; install %s. "
+                  "Black-box rosbag capture disabled (freeze-frame snapshots still work)",
+                  config_.format.c_str(), reason.c_str(), other_format.c_str(), truncate_reason(*other_err).c_str(),
+                  packages.c_str());
       config_.enabled = false;
       return;
     }
