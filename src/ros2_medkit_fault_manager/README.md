@@ -184,8 +184,9 @@ single PASSED event); invalid thresholds fall back to safe defaults with a warni
 `CONFIRMED` and `HEALED` are **latched** (hysteresis): once reached, the status holds until the
 counter reaches the opposite threshold, so a single opposite-direction event cannot flip it. As a
 result a fault that becomes active again can take up to `healing_threshold - confirmation_threshold`
-events to return to the default (CONFIRMED-only) list; `occurrence_count` and `last_occurred` still
-update meanwhile.
+events to return to the default (CONFIRMED-only) list. During that window `last_occurred` still
+reflects the activity; `occurrence_count` does not, because it counts the edge that started the
+occurrence, not every report within it.
 
 ### Fault Lifecycle with Debounce
 

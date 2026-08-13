@@ -236,8 +236,9 @@ walks all the way to the opposite threshold. So PREFAILED/PREPASSED depend on th
 a CONFIRMED or HEALED fault keeps its status while the counter is between the thresholds - a single
 opposite-direction event cannot flip it. One consequence is a re-confirmation delay: a fault that
 becomes active again is not back in the default (CONFIRMED-only) list until the counter has fallen by
-up to ``healing_threshold - confirmation_threshold`` events. During that window ``occurrence_count``
-and ``last_occurred`` still reflect the activity.
+up to ``healing_threshold - confirmation_threshold`` events. During that window ``last_occurred``
+still reflects the activity; ``occurrence_count`` does not, because it counts the edge that started
+the occurrence, not every report within it.
 
 Thresholds must satisfy ``confirmation_threshold < 0 <= healing_threshold`` (``healing_threshold == 0``
 means heal on a single PASSED event); the node validates the

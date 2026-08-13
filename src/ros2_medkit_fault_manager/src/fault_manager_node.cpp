@@ -659,7 +659,8 @@ void FaultManagerNode::handle_report_fault(
       }
       just_confirmed = true;
     } else if (!is_new && fault_after->status == ros2_medkit_msgs::msg::Fault::STATUS_CONFIRMED) {
-      // Fault was already CONFIRMED, data updated (occurrence_count, sources, etc.)
+      // Fault was already CONFIRMED, data updated (last_occurred, severity, sources).
+      // Not occurrence_count: a re-report inside one occurrence does not touch it.
       if (!should_mute) {
         publish_fault_event(ros2_medkit_msgs::msg::FaultEvent::EVENT_UPDATED, *fault_after);
       }

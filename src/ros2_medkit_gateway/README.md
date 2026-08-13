@@ -822,7 +822,7 @@ Real-time fault event stream using Server-Sent Events (SSE). Clients receive ins
 
 **Event Types:**
 - `fault_confirmed` - Fault transitioned to CONFIRMED status
-- `fault_updated` - Fault data changed (occurrence_count, sources, etc.)
+- `fault_updated` - Fault data changed without a status transition (`last_occurred`, severity, reporting sources). Not `occurrence_count`, which only changes on an occurrence edge
 - `fault_cleared` - Fault ended: cleared via ClearFault service, or auto-healed by PASSED events (check `fault.status` for `CLEARED` vs `HEALED`)
 
 **Example:**
