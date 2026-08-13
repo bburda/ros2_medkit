@@ -77,7 +77,7 @@ constexpr int kDefaultGrace = 10;
 /// Watches every topic for a one-sided endpoint (pub-only or sub-only) with a near-miss,
 /// same-type counterpart in the same namespace carrying the complementary side - the signature of
 /// a remap / topic-name typo. See orphan_policy.hpp for the pure matching core (dedup,
-/// system-topic skip, same-namespace guard) and design doc / [[project_graph_watchdog_zero_config]].
+/// system-topic skip, same-namespace guard) and design doc.
 class OrphanDetector : public Detector {
  public:
   std::string id() const override {

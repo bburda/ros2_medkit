@@ -31,8 +31,10 @@ package.xml test_depend (see CMakeLists.txt) so that package is importable
 on PYTHONPATH once the workspace's install/setup.bash is sourced.
 """
 
+import http.server
 import json
 import os
+import threading
 import time
 
 from launch import LaunchDescription
@@ -57,6 +59,8 @@ def create_watchdog_test_launch(
     port=None,
     demo_delay=2.0,
     healing_enabled=True,
+    healing_threshold=3,
+    gateway_respawn=False,
 ):
     """Build a ``LaunchDescription`` that loads graph_watchdog into a real gateway.
 
@@ -84,6 +88,23 @@ def create_watchdog_test_launch(
         Passed to the fault_manager as ``healing_enabled`` so a detector's
         level-triggered PASSED clears can actually advance the debounce
         counter to HEALED (see the plugin README, "Closing the loop").
+    healing_threshold : int
+        Passed to the fault_manager as ``healing_threshold`` - the debounce
+        counter value a fault's consecutive PASSED reports must reach before
+        it heals. Defaults to 3, the fault_manager's own built-in default
+        (see ``FaultManagerNode``'s ``declare_parameter``), so passing it
+        through here changes no existing scenario's behaviour. A scenario
+        whose subject IS the debounce counter (a low threshold makes it
+        sensitive to even a single spurious PASSED) overrides this directly
+        rather than adding a second mechanism.
+    gateway_respawn : bool
+        If True, ``launch`` restarts the gateway when it exits. For the one
+        scenario whose subject is a gateway restart: the fault_manager and the
+        demo nodes are separate processes, so killing only the gateway leaves
+        a raised fault in the store and brings the plugin back with every
+        detector counter at zero - the state no single-process launch can
+        reach. Off by default so an unexpected gateway death stays a visible
+        failure in every other scenario.
 
     Returns
     -------
@@ -104,12 +125,13 @@ def create_watchdog_test_launch(
     if extra_gateway_params:
         params.update(extra_gateway_params)
 
-    gateway_node = create_gateway_node(port=port, extra_params=params)
+    gateway_node = create_gateway_node(port=port, extra_params=params, respawn=gateway_respawn)
 
     delayed_actions = create_demo_nodes(demo_nodes if demo_nodes is not None else [])
     delayed_actions.append(create_fault_manager_node(
         extra_params={
             'healing_enabled': healing_enabled,
+            'healing_threshold': healing_threshold,
             # AUTOSAR DEM-style debounce: -2 confirms a fault on its very first
             # FAILED report instead of requiring several ticks to accumulate,
             # so the positive-control assertion is fast and deterministic.
@@ -257,6 +279,111 @@ def wait_until_watchdog_armed(port, timeout=60.0, interval=0.5, app_id=None):
     return False
 
 
+def watchdog_detector_status(port, detector_id, timeout=5.0):
+    """Read one detector's own status block from ``GET /x-medkit-watchdog``.
+
+    The route's payload carries the reliability gate's state plus, under ``detectors``, a
+    block per detector that has something to say about itself. A detector-scoped condition
+    (the lifecycle_expectation tracked-node cap being saturated, say) is otherwise visible
+    only in the gateway's log, which no assertion at this tier can read.
+
+    Parameters
+    ----------
+    port : int
+        Gateway HTTP port.
+    detector_id : str
+        The detector's own ``id()``, e.g. ``'lifecycle_expectation'``.
+    timeout : float
+        Per-request timeout in seconds.
+
+    Returns
+    -------
+    dict or None
+        The detector's status block, or ``None`` when the route did not answer 200 or
+        carries no block for that detector.
+
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    try:
+        response = requests.get(f'{base}/x-medkit-watchdog', timeout=timeout)
+    except requests.exceptions.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    status = response.json().get('x-medkit-watchdog', {})
+    return (status.get('detectors') or {}).get(detector_id)
+
+
+def poll_detector_status(port, detector_id, field, expected, timeout=30.0, interval=0.5):
+    """Poll ``GET /x-medkit-watchdog`` until a detector status field equals `expected`.
+
+    Returns ``True`` once it does, ``False`` on timeout (after printing what was last seen,
+    which is gone once the launch tears down).
+    """
+    deadline = time.monotonic() + timeout
+    last_seen = 'no detectors block was ever returned'
+    while time.monotonic() < deadline:
+        block = watchdog_detector_status(port, detector_id)
+        if block is not None:
+            last_seen = json.dumps(block)
+            if block.get(field) == expected:
+                return True
+        time.sleep(interval)
+    print(f'poll_detector_status({detector_id!r}, {field!r}=={expected!r}) timed out after '
+          f'{timeout}s; last seen: {last_seen}')
+    return False
+
+
+def wait_until_faults_endpoint_live(port, timeout=30.0, interval=0.5):
+    """Poll ``GET /faults`` until it answers HTTP 200. ``True`` once it does.
+
+    The second half of the gate every absence assertion needs.
+    :func:`wait_until_watchdog_armed` proves the plugin side is alive - the .so loaded,
+    the tick loop ran - but it is served by the plugin INSIDE the gateway process and
+    says nothing about the fault surface. The gateway answers ``GET /faults`` with 503
+    while the fault_manager's service is unavailable, and :func:`poll_faults` inspects
+    only 200 responses and swallows every transport error, returning ``None`` on timeout -
+    which is exactly what an ``assertIsNone`` wants to see. So a launch whose
+    fault_manager crashed, hung, or never DDS-matched turns a silence assertion green for
+    the one reason it must never be green.
+
+    A 200 (whatever the body) proves the gateway reached the fault_manager in THIS launch.
+    What it does NOT prove is that the PLUGIN's own ReportFault client matched - only a
+    raise proves that, and that proof lives in the scenario that raises.
+
+    Parameters
+    ----------
+    port : int
+        Gateway HTTP port.
+    timeout : float
+        Maximum time to wait in seconds.
+    interval : float
+        Sleep between retries in seconds.
+
+    Returns
+    -------
+    bool
+        ``True`` once ``GET /faults`` answers 200, ``False`` on timeout.
+
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + timeout
+    last_seen = 'GET /faults was never answered at all'
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', timeout=5)
+            if response.status_code == 200:
+                return True
+            # 503 is the specific shape of "the fault_manager is not reachable" - worth
+            # naming, because it is the failure this gate exists for.
+            last_seen = f'HTTP {response.status_code} from GET /faults'
+        except requests.exceptions.RequestException as exc:
+            last_seen = f'GET /faults failed: {exc}'
+        time.sleep(interval)
+    print(f'wait_until_faults_endpoint_live timed out after {timeout}s; last seen: {last_seen}')
+    return False
+
+
 def poll_faults(port, code, timeout=30.0, interval=0.5):
     """Poll the GLOBAL ``GET /faults`` endpoint until `code` appears.
 
@@ -396,6 +523,182 @@ def poll_fault_describing(port, code, needles, timeout=60.0, interval=0.5):
         # we are waiting on.
         time.sleep(interval)
     return False, last_description
+
+
+def assert_fault_absent_throughout(test_case, port, code, duration, interval=0.5):
+    """Poll ``GET /faults`` every `interval` across the WHOLE `duration`.
+
+    Fails the moment either the channel or the claim breaks.
+    ``poll_faults`` is built for "wait until X appears" and is unsuitable for a silence
+    proof: it swallows every non-200 response and every transport error and returns
+    ``None`` on timeout - exactly what ``assertIsNone`` wants to see, so a ``/faults``
+    that died three seconds into a twenty-second silence window still passes. This
+    instead asks the whole way through: every single poll must answer 200 ("asked, and
+    there is no such fault") or the assertion fails naming which poll and why ("could not
+    ask"), and `code` must never appear in any of them. Use this (not
+    ``assertIsNone(poll_faults(...))``) for every scenario whose claim is sustained
+    silence over a window, not merely "absent right now".
+
+    Parameters
+    ----------
+    test_case : unittest.TestCase
+        Used for the actual assertion calls, so a failure here reports through the normal
+        unittest failure path rather than a bare ``AssertionError`` from a free function.
+    port : int
+        Gateway HTTP port.
+    code : str
+        The ``fault_code`` that must never appear.
+    duration : float
+        Total seconds to keep polling.
+    interval : float
+        Sleep between polls in seconds.
+
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + duration
+    polls = 0
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', timeout=5)
+        except requests.exceptions.RequestException as exc:
+            test_case.fail(
+                f'/faults became unreachable {polls} poll(s) into a {duration}s silence '
+                f'window (could not ask, which is not the same as "asked, and there is no '
+                f'such fault"): {exc}')
+            return
+        if response.status_code != 200:
+            test_case.fail(
+                f'/faults answered HTTP {response.status_code} {polls} poll(s) into a '
+                f'{duration}s silence window - the channel died mid-window, which a '
+                'silence assertion must not read as "no such fault"')
+            return
+        codes = {item.get('fault_code') for item in response.json().get('items', [])}
+        test_case.assertNotIn(
+            code, codes,
+            f'{code} appeared {polls} poll(s) into a {duration}s window that was supposed '
+            'to stay silent')
+        polls += 1
+        time.sleep(interval)
+    test_case.assertGreater(
+        polls, 0,
+        f'the {duration}s silence window never actually polled /faults - duration must be '
+        f'>= interval ({interval}s)')
+
+
+class _FlakyFaultsHandler(http.server.BaseHTTPRequestHandler):
+    """Stands in for a gateway whose ``GET /faults`` answers normally, then dies.
+
+    Answers 200 with an empty fault list for the first ``healthy_polls`` requests to
+    ``{API_BASE_PATH}/faults`` (this class's own attribute, set per instantiation via
+    ``make_handler``), then drops the connection with no response at all for every
+    request after that - the same "channel gone" shape a crashed or hung fault_manager
+    produces, distinct from an ordinary 503 (also exercised via ``dead_status``).
+    """
+
+    healthy_polls = 2
+    dead_status = None  # None = drop the connection; an int = answer with that status instead
+
+    def do_GET(self):
+        if self.path != f'{API_BASE_PATH}/faults':
+            self.send_response(404)
+            self.end_headers()
+            return
+        type(self).seen = getattr(type(self), 'seen', 0) + 1
+        if type(self).seen > type(self).healthy_polls:
+            if type(self).dead_status is None:
+                self.close_connection = True  # drop it: no response at all
+                return
+            self.send_response(type(self).dead_status)
+            self.end_headers()
+            return
+        body = json.dumps({'items': []}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, log_format, *args):
+        pass  # keep test output quiet - this is expected traffic, not diagnostics
+
+
+class _FlakyFaultsServer:
+    """Context manager for a local `_FlakyFaultsHandler` HTTP server.
+
+    Starts on a free port in a daemon thread and tears itself down on exit - the
+    boilerplate every leg of `prove_silence_proof_catches_a_dead_fault_surface` below
+    needs, factored out once so each leg reads as the claim it is checking rather than
+    server plumbing.
+    """
+
+    def __init__(self, healthy_polls, dead_status):
+        handler = type(
+            '_Handler', (_FlakyFaultsHandler,),
+            {'healthy_polls': healthy_polls, 'dead_status': dead_status})
+        self._server = http.server.HTTPServer(('127.0.0.1', 0), handler)
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+def prove_silence_proof_catches_a_dead_fault_surface(test_case):
+    """Prove `assert_fault_absent_throughout` catches a `/faults` that dies mid-window.
+
+    The test of the test - the exact hole `assertIsNone(poll_faults(...))` could not
+    see (see `assert_fault_absent_throughout`'s own docstring). Self-contained: a real
+    local HTTP server stands in for the gateway, answering normally for the first
+    couple of polls and then going dark, so this needs no ROS graph, no real gateway,
+    no fault_manager - only a real socket, so the failure mode under test (a channel
+    that goes silent) is real rather than mocked away.
+
+    Three things are proven per dead-channel shape, all required to make the RED
+    result mean something: (1) the OLD pattern this fix replaces - `poll_faults` +
+    `assertIsNone` - actually DOES pass against this exact dead server (the concrete
+    "previously passed" the brief asks this to demonstrate, not merely asserted in
+    prose); (2) `assert_fault_absent_throughout` raises against the SAME server
+    (`dead_status=None`, a dropped connection, and again `dead_status=503`, the
+    specific shape a real `/faults` gives while the fault_manager is unreachable - a
+    helper that only caught one dead-channel shape would leave the other exactly as
+    blind as `poll_faults` always was); (3), after the loop below, that the fixed
+    helper does NOT raise while the channel never dies - a helper wired to always fail
+    would make the RED result meaningless.
+
+    Raises whatever `test_case`'s own assertions raise on failure; callers use it from
+    inside a test method exactly like any other assertion helper.
+    """
+    for dead_status, label in ((None, 'a dropped connection'), (503, 'a 503 response')):
+        with _FlakyFaultsServer(healthy_polls=2, dead_status=dead_status) as fake:
+            # (1) The OLD pattern this fix replaces: prove it actually passes on this
+            # exact dead channel - the concrete "previously passed" this test exists
+            # to show, not merely asserted in prose.
+            test_case.assertIsNone(
+                poll_faults(fake.port, 'GRAPH_NODE_INACTIVE', timeout=2.0, interval=0.2),
+                f'the OLD pattern (poll_faults + assertIsNone) did NOT pass against a '
+                f'/faults that died via {label} - this self-test no longer '
+                'demonstrates the hole the fix closes')
+            # (2) The fixed helper must fail against the identical dead channel.
+            with test_case.assertRaises(
+                    AssertionError,
+                    msg=f'assert_fault_absent_throughout did not fail when /faults '
+                        f'died mid-window via {label} - it would pass on the exact '
+                        f'channel-death this fix exists to catch'):
+                assert_fault_absent_throughout(
+                    test_case, fake.port, 'GRAPH_NODE_INACTIVE', duration=2.0, interval=0.2)
+
+    # (3) The companion proof: a channel that never dies must not trip the assertion,
+    # or the RED result above would be meaningless (a helper wired to always fail
+    # "catches" everything by never being usable).
+    with _FlakyFaultsServer(healthy_polls=10_000, dead_status=None) as fake:
+        assert_fault_absent_throughout(
+            test_case, fake.port, 'GRAPH_NODE_INACTIVE', duration=1.0, interval=0.2)
 
 
 def poll_cleared(port, code, timeout=30.0, interval=0.5):

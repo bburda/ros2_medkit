@@ -508,7 +508,23 @@ std::vector<GraphWatchdogPlugin::PluginRoute> GraphWatchdogPlugin::get_routes() 
                      "graph_watchdog reliability gate not initialized");
       return;
     }
-    res.send_json(gate_->status_json());
+    auto payload = gate_->status_json();
+    // Detector-scoped status, beside the gate's own. `detectors_` is only ever mutated by
+    // set_context() and by shutdown() (which holds tick_mutex_, taken above), and each
+    // detector's own status_json() is required to be safe against a concurrent tick - see
+    // Detector::status_json.
+    nlohmann::json detectors = nlohmann::json::object();
+    for (const auto & [detector, mode] : detectors_) {
+      (void)mode;
+      auto status = detector->status_json();
+      if (!status.is_null()) {
+        detectors[detector->id()] = std::move(status);
+      }
+    }
+    if (!detectors.empty()) {
+      payload["x-medkit-watchdog"]["detectors"] = std::move(detectors);
+    }
+    res.send_json(payload);
   };
   std::vector<PluginRoute> routes;
   routes.push_back({"GET", R"(x-medkit-watchdog)", std::move(handler)});

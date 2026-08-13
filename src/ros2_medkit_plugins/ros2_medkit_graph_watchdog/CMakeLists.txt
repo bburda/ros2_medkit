@@ -185,6 +185,15 @@ if(BUILD_TESTING)
   medkit_target_dependencies(test_reliability_gate ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs)
   target_link_libraries(test_reliability_gate nlohmann_json::nlohmann_json)
 
+  # Pure matching logic over hand-built inputs: no rclcpp::Node anywhere in it. Depends on
+  # ros2_medkit_gateway/nlohmann_json only because it assembles a description through the
+  # real AggregatedFault::describe (R13/C1/C3's cap-filling test), the same reason
+  # test_aggregated_fault below needs it - not because anything here builds a live graph.
+  medkit_add_gtest(test_lifecycle_expectation_tracker test/test_lifecycle_expectation_tracker.cpp)
+  target_include_directories(test_lifecycle_expectation_tracker PRIVATE include)
+  medkit_target_dependencies(test_lifecycle_expectation_tracker ros2_medkit_gateway rclcpp ros2_medkit_msgs)
+  target_link_libraries(test_lifecycle_expectation_tracker nlohmann_json::nlohmann_json)
+
   # Pure matching logic over hand-built inputs: no rclcpp::Node anywhere in it.
   medkit_add_gtest(test_orphan_policy test/test_orphan_policy.cpp)
   target_include_directories(test_orphan_policy PRIVATE include)
@@ -202,7 +211,7 @@ if(BUILD_TESTING)
   medkit_target_dependencies(test_aggregated_fault ros2_medkit_gateway rclcpp ros2_medkit_msgs)
   target_link_libraries(test_aggregated_fault nlohmann_json::nlohmann_json)
 
-  # Real DDS endpoints read through the live graph API. The two that ALSO register a fake
+  # Real DDS endpoints read through the live graph API. The three that ALSO register a fake
   # /fault_manager/report_fault service share a RESOURCE_LOCK, because they spin real nodes for
   # many seconds and running them concurrently on this box starves the discovery each one waits
   # on - a domain of their own does not help with that.
@@ -253,6 +262,33 @@ if(BUILD_TESTING)
   set_tests_properties(test_param_drift_integration PROPERTIES TIMEOUT 300)
   set_property(TEST test_param_drift_integration APPEND PROPERTY
     RESOURCE_LOCK graph_watchdog_integration_domain)
+
+  # Registers a fake /fault_manager/report_fault service like orphan/param_drift above, so it
+  # shares the same RESOURCE_LOCK (see the comment on the integration block).
+  medkit_add_gtest(test_lifecycle_expectation_integration
+    test/test_lifecycle_expectation_integration.cpp
+    src/detectors/lifecycle_expectation_detector.cpp
+    src/detector_registry.cpp
+    src/reliability_gate.cpp
+    src/lifecycle_watcher.cpp
+    ${LIFECYCLE_STATE_READER_SOURCES})
+  target_include_directories(test_lifecycle_expectation_integration PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
+  medkit_target_dependencies(test_lifecycle_expectation_integration
+    ros2_medkit_gateway rclcpp rcutils ros2_medkit_msgs lifecycle_msgs)
+  target_link_libraries(test_lifecycle_expectation_integration nlohmann_json::nlohmann_json)
+  set_tests_properties(test_lifecycle_expectation_integration PROPERTIES TIMEOUT 120)
+  set_property(TEST test_lifecycle_expectation_integration APPEND PROPERTY
+    RESOURCE_LOCK graph_watchdog_integration_domain)
+
+  # Fixture node for the lifecycle_expectation e2e scenarios that need a node which looks
+  # managed, answers a chosen lifecycle label, and can stop advertising its lifecycle
+  # services on command - see test/e2e/droppable_lifecycle_node.cpp's file doc. It lives
+  # here rather than with the shared demo nodes because it exists purely for this
+  # package's own detector claims. Installed into lib/${PROJECT_NAME} so
+  # launch_ros.actions.Node(package=..., executable=...) can resolve it.
+  add_executable(droppable_lifecycle_node test/e2e/droppable_lifecycle_node.cpp)
+  medkit_target_dependencies(droppable_lifecycle_node rclcpp lifecycle_msgs)
+  install(TARGETS droppable_lifecycle_node RUNTIME DESTINATION lib/${PROJECT_NAME})
 
   # === QoS-mismatch e2e (launch_testing) ===
   #
@@ -350,6 +386,205 @@ if(BUILD_TESTING)
     test/test_launch_test_guard_system_build.py TIMEOUT 180)
   set_tests_properties(test_launch_test_guard_system_build PROPERTIES LABELS "integration")
   medkit_test_needs_no_domain(test_launch_test_guard_system_build)
+
+  # === Lifecycle-expectation e2e (launch_testing) ===
+  #
+  # Acceptance gate for the lifecycle_expectation detector: proves GRAPH_NODE_INACTIVE
+  # raises and heals through the REAL gateway + plugin .so + fault_manager stack against
+  # a REAL managed rclcpp_lifecycle demo node driven through real ChangeState
+  # transitions - the C++ integration test can only puppet the lifecycle label.
+  #
+  # One source file, eight CTest targets (the config_plumbing pattern): the plugin reads
+  # its config once at set_context() time, so each distinct config/fixture combination
+  # (main, unconfigured-by-default, negative-control, unreadable, healing_threshold,
+  # departure_keeps, not_managed, restart_loop) needs its own gateway process.
+  # WATCHDOG_E2E_SCENARIO selects which launch and which assertions run in each.
+  #
+  # 780 s. The budget is never shorter than the sum of the file's own internal deadlines
+  # plus the teardown the launch itself configures, because a budget under that sum is
+  # killed by ctest before the message a failing deadline exists to print reaches the log -
+  # turning every one of those diagnostics into a bare "timed out with no output". The sum,
+  # per test case:
+  #   test_01: arming gate (60) + raise poll (60) + entity-scoped poll (30)          = 150
+  #   test_02: CONFIGURE (30 service wait + 30 across the call attempts + 10 for the
+  #            already-applied check a retry can need) + still-raised poll (30)       = 100
+  #   test_02b: pre-restart record (30) + port-down wait (60) + post-restart arming
+  #             gate (90) + heal-sequence settle (4) + post record (30) + poll (30)   = 244
+  #   test_03: heal precondition (30) + ACTIVATE (30 + 30 + 10) + per-entity gate (60)
+  #            + heal poll (60)                                                       = 220
+  # 714 in total, and the run that exhausts it is the slow-but-PASSING run - every poll
+  # succeeding near its deadline. On top of that, teardown runs inside the same CTest
+  # budget: every launched process carries sigterm_timeout 30 + sigkill_timeout 15
+  # (launch_helpers.py), so a process that sits out SIGTERM costs up to ~45 s AFTER the last
+  # assertion. 714 + 45 = 759, and a passing run that reached the teardown would otherwise
+  # be flipped into a timeout with no output.
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_main
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 780
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19190" "WATCHDOG_E2E_SCENARIO=main" "${_WATCHDOG_E2E_ENV}")
+
+  # Shipped-default silence: no detectors.lifecycle_expectation config at all, with the
+  # unconfigured lifecycle node present - the README's zero-false-positive default claim,
+  # falsifiable nowhere else. 240 s: arming gate (60) + fault-surface gate (30) +
+  # label-read poll (30) + sustained silence window (20) + the post-window re-pin of the
+  # trigger (15) = 155 internal, plus the launch's own teardown (sigterm 30 + sigkill 15).
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_default_config
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 240
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19200" "WATCHDOG_E2E_SCENARIO=default_config" "${_WATCHDOG_E2E_ENV}")
+
+  # Negative control: the same grace and cadence as the main scenario, with require_active
+  # naming the self-activating variant of the same executable instead - an active required
+  # node must never raise, so the discriminating variable is the node's real lifecycle
+  # state. 240 s: per-entity arming gate (60) + fault-surface gate (30) + label-read poll
+  # (30) + sustained silence window (20) + the post-window re-pin (15) = 155 internal, plus
+  # the launch's own teardown (sigterm 30 + sigkill 15).
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_negative_control
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 240
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19210" "WATCHDOG_E2E_SCENARIO=negative_control" "${_WATCHDOG_E2E_ENV}")
+
+  # Proof that GRAPH_NODE_UNREADABLE itself raises and clears against a REAL, sustained
+  # GetState failure - launches unreadable_lifecycle_node.cpp (advertises get_state /
+  # change_state like a managed lifecycle node, but get_state never answers until told
+  # to) instead of the real rclcpp_lifecycle node every other scenario here uses. Needs
+  # its own, much faster tick cadence: kUnmeasuredHoldTicks (60, fixed - not
+  # configurable) is far more ticks than any `grace` window above ever waits out.
+  # 450 s: arming gate (60) + faults-live gate (30) + unread-label poll (30) = 120
+  # (test_01); silence poll (10) + end-of-window label poll (15) = 25 (test_02); raise
+  # poll (60, see UNREADABLE_RAISE_TIMEOUT_SEC's own arithmetic comment in the .test.py
+  # for why 60 s covers an expected ~8 s of tick-driven work) + INACTIVE re-check poll
+  # (3) + entity-scoped poll (30) = 93 (test_03); heal-precondition poll (30) +
+  # SetParameters call (30) + active-label poll (30) + heal poll (30) = 120 (test_04) -
+  # 358 internal, plus the launch's own teardown (sigterm 30 + sigkill 15).
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_unreadable
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 450
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19230" "WATCHDOG_E2E_SCENARIO=unreadable" "${_WATCHDOG_E2E_ENV}")
+
+  # The withheld-clear guard's pending leg, at the tier that runs the REAL fault_manager
+  # debounce state machine: a required node already reported stuck is SIGTERM'd and
+  # respawned twice (a real snapshot blink, not a lifecycle transition), each blink well
+  # inside the tracker's absence grace, against a sensitive healing_threshold of 1 - the
+  # value this package's own README recommends. 360 s: arming gate (60) + label poll (30)
+  # + raise poll (60) + two blinks (SIGTERM + up to 15 s rediscovery poll each, ~35 total)
+  # + settle (3) + post-blink record poll (30) + final label poll (15) = 233 internal,
+  # plus the launch's own teardown for TWO processes (sigterm 30 + sigkill 15 each, not
+  # fully serial) - the same generous margin the other scenarios budget.
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_healing_threshold
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 360
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19220" "WATCHDOG_E2E_SCENARIO=healing_threshold" "${_WATCHDOG_E2E_ENV}")
+
+  # A sibling to the "unreadable" scenario above, not an extension of it: it needs a
+  # PERMANENT kill (no respawn) of the same fixture process, which cannot share a
+  # gateway process with test_04's start_answering-driven clear without racing it -
+  # see TestLifecycleExpectationDepartureKeeps's own docstring. Proves that an
+  # already-reported node LEAVING the graph does not heal its fault: a lifecycle
+  # promise that was never verified is no more verified once the node is gone.
+  # Previously proven only by the integration tier's
+  # UnreadableNodeAlreadyReportedThatVanishesKeepsItsOwnRecord.
+  # 420 s: arming gate (60) + faults-live gate (30) + unread-label poll (30) = 120
+  # (test_01); raise poll (60, same UNREADABLE_RAISE_TIMEOUT_SEC arithmetic as the
+  # "unreadable" scenario above) + mutual-exclusion window (3) = 63 (test_02); departure
+  # poll (30) + settle (10) + record poll (30) + still-active poll (30) + description
+  # poll (10) + mutual-exclusion window (3) = 113 (test_03) - 296 internal, plus the
+  # launch's own teardown for TWO processes (sigterm 30 + sigkill 15 each, not fully
+  # serial) - the same generous margin healing_threshold budgets for the same launch shape.
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_departure_keeps
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 420
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19240" "WATCHDOG_E2E_SCENARIO=departure_keeps" "${_WATCHDOG_E2E_ENV}")
+
+  # The not-managed sibling of "unreadable"/"departure_keeps": proves GRAPH_NODE_NOT_MANAGED's
+  # own raise (naming the node, WARN severity, mutually exclusive with the other two codes)
+  # and the same evidence retention across a departure, against a PLAIN demo node with no
+  # lifecycle interface at all (`calibration`) rather than a purpose-built fixture - none
+  # was needed for this cause. 300 s: arming gate (60) + faults-live gate (30) + presence
+  # poll (5) = 95 (test_01); raise poll (60, same NOT_MANAGED_RAISE_TIMEOUT_SEC arithmetic
+  # as the "unreadable" scenario's UNREADABLE_RAISE_TIMEOUT_SEC - if anything cheaper, since
+  # there is no blocking GetState round trip to pay for) + two mutual-exclusion windows (6) +
+  # entity-scoped poll (30) = 96 (test_02); raise precondition (60) + departure poll (30) +
+  # settle (10) + record poll (30) + still-active poll (30) + description poll (10) +
+  # mutual-exclusion window (3) = 173 (test_03) - 364 internal is already over 300, so this
+  # budgets from the same internal-deadline-sum discipline as the sibling scenarios but
+  # rounds the target up to 480 s to also cover the launch's own teardown for TWO processes
+  # (sigterm 30 + sigkill 15 each, not fully serial).
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_not_managed
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 480
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19250" "WATCHDOG_E2E_SCENARIO=not_managed" "${_WATCHDOG_E2E_ENV}")
+
+  # The scenario the evidence-retention model exists for: a required node in a CRASH LOOP,
+  # killed and respawned on a cadence that never lets it accumulate the 60 consecutive
+  # PRESENT ticks kUnmeasuredHoldTicks needs. A node that keeps dying touches absence by
+  # construction, so a detector that discarded its clock there would stay silent forever -
+  # which is exactly the node this detector most exists to catch. Uses the same plain
+  # `calibration` fixture as "not_managed", with launch's own respawn.
+  # 300 s: arming gate (60) + faults-live gate (30) + presence poll (30) = 120; the kill
+  # loop's own wall-clock budget (45, RESTART_LOOP_WINDOW_SEC) plus the per-cycle
+  # departure/return polls it contains (30 + 30 on the worst single cycle) = 105 - 225
+  # internal, plus the launch's own teardown for TWO processes (sigterm 30 + sigkill 15
+  # each, not fully serial).
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_restart_loop
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 300
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19260" "WATCHDOG_E2E_SCENARIO=restart_loop" "${_WATCHDOG_E2E_ENV}")
+
+  # A FULL tracked-node cap: two required nodes and `tracked_node_cap: 1`, so one of them is
+  # refused on every tick. Reachable only because the cap is a config key. Proves the refusal
+  # is visible on the status route, that it WITHHOLDS GRAPH_NODE_INACTIVE's clear, and that a
+  # departed entry is collapsed so the present broken node is checked instead.
+  # 420 s: arming gate (60) + fault-surface gate (30) + two presence polls (60) + label poll
+  # (30) + raise poll (60) + saturation poll (30) = 270 (test_01); record poll (30) +
+  # SetParameters (30) + not-managed raise poll (60) + saturation re-check (15) + withhold
+  # window (10) + record poll (30) = 175 (test_02); departure poll (30) + presence poll (30)
+  # + admission poll (60) + saturation poll (30) + two record polls (60) = 210 (test_03).
+  # The sum is the SLOW-but-passing run, in which every poll succeeds near its deadline;
+  # the expected run is a small fraction of it, and CI slowness is what the margin is for.
+  # Rounded to 900 to also cover the launch's own teardown for THREE processes (sigterm 30 +
+  # sigkill 15 each, not fully serial).
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_cap_pressure
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 900
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19270" "WATCHDOG_E2E_SCENARIO=cap_pressure" "${_WATCHDOG_E2E_ENV}")
+
+  # One missed sweep before a clean shutdown must raise nothing, while the same drop held
+  # long enough to be corroborated must still be reported - two legs of one fixture whose
+  # only difference is the hold, so the pair discriminates instead of merely proving silence.
+  # Runs at a deliberately slow 500 ms cadence so the test can place its actions between
+  # ticks rather than race them. 480 s: arming gate (60) + fault-surface gate (30) + two
+  # label polls (60) = 150 (test_01); null-label poll (15) + departure poll (30) = 45
+  # (test_02); null-label poll (15) + the deliberate settled hold (5) + departure poll (30) +
+  # raise poll (90) = 140 (test_03); three record polls (15) = 15 (test_04) - 350 internal,
+  # plus the launch's own teardown for THREE processes.
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_unsettled_departure
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 480
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19280" "WATCHDOG_E2E_SCENARIO=unsettled_departure" "${_WATCHDOG_E2E_ENV}")
+
+  # `grace` at the value that used to be the accepted maximum. Under it the detector can
+  # neither raise nor heal GRAPH_NODE_INACTIVE for days, so the value must be refused and the
+  # documented default applied - measured by the fault actually appearing.
+  # 300 s: arming gate (60) + fault-surface gate (30) + label poll (30) + raise poll (60) =
+  # 180 (test_01); departure poll (30) + description poll (30) + record poll (10) = 70
+  # (test_02) - 250 internal, plus the launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_wide_grace
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 300
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19290" "WATCHDOG_E2E_SCENARIO=wide_grace" "${_WATCHDOG_E2E_ENV}")
+
+  # Records where "a departure never heals a fault" ends: it holds within one gateway
+  # lifetime, and a restart re-baselines because the restarted detector cannot tell an entry
+  # for a departed node from a misspelt one. Restarts the gateway by PID, like the "main"
+  # scenario. 420 s: arming gate (60) + label poll (30) + raise poll (60) + departure poll
+  # (30) + settle (4) + record poll (30) = 214 (test_01); port-down wait (60) + arming gate
+  # (90) + heal poll (90) + record poll (30) = 270 (test_02) - 484 internal is already over
+  # 420, so this budgets 600 and also covers the launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_lifecycle_expectation_e2e_restart_departed
+    test/e2e/test_lifecycle_expectation_e2e.test.py TIMEOUT 600
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19300" "WATCHDOG_E2E_SCENARIO=restart_departed" "${_WATCHDOG_E2E_ENV}")
 
   ros2_medkit_relax_vendor_warnings()
 

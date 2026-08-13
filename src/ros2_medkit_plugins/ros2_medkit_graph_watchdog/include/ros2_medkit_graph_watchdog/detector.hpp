@@ -135,6 +135,18 @@ class Detector {
     return 0;
   }
 
+  /// Detector-scoped status, surfaced under `detectors.<id>` on GET /x-medkit-watchdog next
+  /// to the reliability gate's own. For a condition that belongs to ONE detector and would
+  /// otherwise exist only in the gateway log - which no HTTP client and no e2e assertion can
+  /// read. Null (the default) means the detector has nothing to say and no key is added.
+  ///
+  /// Called on an HTTP handler thread while tick() runs on the plugin's tick thread, and the
+  /// handler holds no lock a detector takes, so an implementation must build its payload from
+  /// atomics (or other independently synchronised state) and must not block.
+  virtual nlohmann::json status_json() const {
+    return nullptr;
+  }
+
   /// Test-only injection hook for detectors that read parameters over a transport. Returns false
   /// when the detector does not use one, so a test can assert it reached the right detector rather
   /// than silently doing nothing.

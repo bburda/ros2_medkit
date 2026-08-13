@@ -62,6 +62,10 @@ DEMO_NODE_REGISTRY = {
     # the "active" lifecycle state (-> status "ready"). Distinct node name so it
     # can run alongside the unconfigured 'managed_lifecycle' in the same test.
     'managed_lifecycle_active': ('managed_lifecycle', 'managed_lifecycle_active', ''),
+    # Proof fixture for GRAPH_NODE_UNREADABLE: advertises get_state/change_state like a
+    # managed lifecycle node, but get_state never answers until its start_answering
+    # parameter is set true (see unreadable_lifecycle_node.cpp's file doc).
+    'unreadable_lifecycle': ('unreadable_lifecycle', 'unreadable_lifecycle', ''),
     # Regression fixture (#531): parameter services are discoverable
     # (wait_for_service succeeds) but list_parameters never replies.
     'unresponsive_param': ('demo_unresponsive_param_node', 'unresponsive_param', ''),
@@ -90,7 +94,8 @@ LIDAR_FAULTY_PARAMS = {
 # ---------------------------------------------------------------------------
 
 def create_gateway_node(*, port=DEFAULT_PORT, name='ros2_medkit_gateway',
-                        extra_params=None, coverage=True, extra_env=None):
+                        extra_params=None, coverage=True, extra_env=None,
+                        respawn=False, respawn_delay=1.0):
     """Create a ``gateway_node`` launch action with standard config.
 
     Parameters
@@ -108,6 +113,18 @@ def create_gateway_node(*, port=DEFAULT_PORT, name='ros2_medkit_gateway',
         Additional environment variables merged into ``additional_env`` on
         top of the coverage env. Useful for setting ``ROS_DOMAIN_ID`` to
         isolate a multi-gateway test's peers into distinct DDS domains.
+    respawn : bool
+        If True, ``launch`` restarts the gateway whenever it exits before the
+        launch itself is shutting down. Only for tests whose subject IS a
+        gateway restart (state that must survive one, or must not be
+        resurrected by one): a test kills the process by PID and lets launch
+        bring the same configuration back. Off by default, so an unexpected
+        gateway death stays a visible failure everywhere else.
+    respawn_delay : float
+        Seconds ``launch`` waits before restarting. Non-zero so the HTTP port
+        and the DDS participant are released before the replacement binds
+        them, which also gives a test a window in which the port is provably
+        down - the only way to tell "restarted" from "never died".
 
     Returns
     -------
@@ -130,6 +147,8 @@ def create_gateway_node(*, port=DEFAULT_PORT, name='ros2_medkit_gateway',
         output='screen',
         parameters=[params],
         additional_env=env,
+        respawn=respawn,
+        respawn_delay=respawn_delay,
         # Default SIGINT->SIGTERM escalation is 5s and SIGTERM->SIGKILL is 5s.
         # Under TSan/ASan/coverage the gateway shutdown sequence (mdns stop,
         # REST server stop, transport teardown, plugin shutdown, plus flushing

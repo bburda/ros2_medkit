@@ -34,6 +34,7 @@ find_package(example_interfaces REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+find_package(lifecycle_msgs REQUIRED)
 find_package(ros2_medkit_gateway REQUIRED)
 
 # === Demo node executables ===
@@ -93,6 +94,13 @@ medkit_target_dependencies(demo_param_beacon_node rclcpp)
 add_executable(managed_lifecycle demo_nodes/managed_lifecycle_node.cpp)
 medkit_target_dependencies(managed_lifecycle rclcpp rclcpp_lifecycle)
 
+# Proof fixture for GRAPH_NODE_UNREADABLE (see the file doc): a plain rclcpp::Node that
+# advertises get_state/change_state like managed_lifecycle above, but whose get_state
+# never answers until its start_answering parameter is flipped at runtime.
+add_executable(unreadable_lifecycle demo_nodes/unreadable_lifecycle_node.cpp)
+target_include_directories(unreadable_lifecycle PRIVATE ${_demo_include_dir})
+medkit_target_dependencies(unreadable_lifecycle rclcpp lifecycle_msgs)
+
 add_executable(demo_unresponsive_param_node demo_nodes/unresponsive_param_node.cpp)
 target_include_directories(demo_unresponsive_param_node PRIVATE ${_demo_include_dir})
 medkit_target_dependencies(demo_unresponsive_param_node rclcpp rcl_interfaces)
@@ -111,6 +119,7 @@ install(TARGETS
   demo_beacon_publisher
   demo_param_beacon_node
   managed_lifecycle
+  unreadable_lifecycle
   demo_unresponsive_param_node
   DESTINATION lib/${PROJECT_NAME}
 )
