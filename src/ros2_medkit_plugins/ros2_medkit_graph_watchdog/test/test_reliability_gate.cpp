@@ -35,9 +35,9 @@ class ReliabilityGateTest : public ::testing::Test {
   void TearDown() override {
     node_.reset();
   }
-  static IntrospectionInput snap(std::vector<std::string> app_ids) {
+  static IntrospectionInput snap(const std::vector<std::string> & app_ids) {
     IntrospectionInput in;
-    for (auto & id : app_ids) {
+    for (const auto & id : app_ids) {
       App a;
       a.id = id;
       in.apps.push_back(a);

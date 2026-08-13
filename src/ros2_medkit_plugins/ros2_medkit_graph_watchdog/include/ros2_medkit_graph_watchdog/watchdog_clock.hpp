@@ -40,7 +40,9 @@ class WatchdogClock {
     if (have_sample_ && use_sim_time_) {
       const bool wall_advanced = (wall_now - last_wall_) > std::chrono::milliseconds(1);
       const bool sim_advanced = sim_now.nanoseconds() > last_sim_ns_;
-      valid_ = !(wall_advanced && !sim_advanced);
+      // Wall time moving while sim time stands still is the stall. Anything else is fine:
+      // wall not advancing says nothing, and sim advancing proves the clock is live.
+      valid_ = !wall_advanced || sim_advanced;
     }
     last_sim_ns_ = sim_now.nanoseconds();
     last_wall_ = wall_now;

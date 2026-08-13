@@ -80,7 +80,7 @@ class QosMismatchIntegrationTest : public ::testing::Test {
     sink_ = std::make_shared<rclcpp::Node>("qm_it_sink");
     srv_ = sink_->create_service<ReportFault>(
         "/fault_manager/report_fault",
-        [this](const std::shared_ptr<ReportFault::Request> req, std::shared_ptr<ReportFault::Response> resp) {
+        [this](const std::shared_ptr<ReportFault::Request> & req, const std::shared_ptr<ReportFault::Response> & resp) {
           {
             std::lock_guard<std::mutex> lk(mtx_);
             received_.push_back(*req);
