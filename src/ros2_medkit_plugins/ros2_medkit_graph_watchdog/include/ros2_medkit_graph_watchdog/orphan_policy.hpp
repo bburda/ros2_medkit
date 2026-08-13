@@ -197,10 +197,16 @@ inline std::vector<OrphanFinding> find_orphans(const std::vector<TopicEndpointCo
     // one-character variant - leaves exactly this shape the moment its peer exits. Telling an
     // operator to "reconcile the two names" in that case hands them a wrong remediation on
     // top of whatever actually died.
-    out.push_back({pub_side, sub_side,
-                   "possible topic-name mismatch: publisher-only '" + pub_side + "' and subscriber-only '" + sub_side +
-                       "' share type " + t.type + " and differ by " + std::to_string(best) +
-                       " char(s) - either a remap typo or a departed counterpart; check both before renaming"});
+    std::string detail = "possible topic-name mismatch: publisher-only '";
+    detail += pub_side;
+    detail += "' and subscriber-only '";
+    detail += sub_side;
+    detail += "' share type ";
+    detail += t.type;
+    detail += " and differ by ";
+    detail += std::to_string(best);
+    detail += " char(s) - either a remap typo or a departed counterpart; check both before renaming";
+    out.push_back({pub_side, sub_side, std::move(detail)});
   }
   return out;
 }

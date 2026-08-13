@@ -168,39 +168,44 @@ class FakeContext : public ros2_medkit_gateway::RosPluginContext {
   rclcpp::Node * node() const override {
     return node_;
   }
-  std::optional<ros2_medkit_gateway::PluginEntityInfo> get_entity(const std::string &) const override {
+  std::optional<ros2_medkit_gateway::PluginEntityInfo> get_entity(const std::string & /*id*/) const override {
     return std::nullopt;
   }
-  std::vector<ros2_medkit_gateway::PluginEntityInfo> get_child_apps(const std::string &) const override {
+  std::vector<ros2_medkit_gateway::PluginEntityInfo>
+  get_child_apps(const std::string & /*component_id*/) const override {
     return {};
   }
-  nlohmann::json list_entity_faults(const std::string &) const override {
+  nlohmann::json list_entity_faults(const std::string & /*entity_id*/) const override {
     return nlohmann::json::array();
   }
   std::optional<ros2_medkit_gateway::PluginEntityInfo>
-  validate_entity_for_route(const ros2_medkit_gateway::PluginRequest &, ros2_medkit_gateway::PluginResponse &,
-                            const std::string &) const override {
+  validate_entity_for_route(const ros2_medkit_gateway::PluginRequest & /*req*/,
+                            ros2_medkit_gateway::PluginResponse & /*res*/,
+                            const std::string & /*entity_id*/) const override {
     return std::nullopt;
   }
-  void register_capability(ros2_medkit_gateway::SovdEntityType, const std::string &) override {
+  void register_capability(ros2_medkit_gateway::SovdEntityType /*entity_type*/,
+                           const std::string & /*capability_name*/) override {
   }
-  void register_entity_capability(const std::string &, const std::string &) override {
+  void register_entity_capability(const std::string & /*entity_id*/, const std::string & /*capability_name*/) override {
   }
-  std::vector<std::string> get_type_capabilities(ros2_medkit_gateway::SovdEntityType) const override {
+  std::vector<std::string> get_type_capabilities(ros2_medkit_gateway::SovdEntityType /*entity_type*/) const override {
     return {};
   }
-  std::vector<std::string> get_entity_capabilities(const std::string &) const override {
+  std::vector<std::string> get_entity_capabilities(const std::string & /*entity_id*/) const override {
     return {};
   }
-  ros2_medkit_gateway::LockAccessResult check_lock(const std::string &, const std::string &,
-                                                   const std::string &) const override {
+  ros2_medkit_gateway::LockAccessResult check_lock(const std::string & /*entity_id*/, const std::string & /*client_id*/,
+                                                   const std::string & /*collection*/) const override {
     return {};
   }
   tl::expected<ros2_medkit_gateway::LockInfo, ros2_medkit_gateway::LockError>
-  acquire_lock(const std::string &, const std::string &, const std::vector<std::string> &, int) override {
+  acquire_lock(const std::string & /*entity_id*/, const std::string & /*client_id*/,
+               const std::vector<std::string> & /*scopes*/, int /*expiration_seconds*/) override {
     return tl::make_unexpected(ros2_medkit_gateway::LockError{});
   }
-  tl::expected<void, ros2_medkit_gateway::LockError> release_lock(const std::string &, const std::string &) override {
+  tl::expected<void, ros2_medkit_gateway::LockError> release_lock(const std::string & /*entity_id*/,
+                                                                  const std::string & /*client_id*/) override {
     return {};
   }
   ros2_medkit_gateway::ResourceChangeNotifier * get_resource_change_notifier() override {
@@ -524,8 +529,8 @@ TEST_F(GraphWatchdogPluginTest, FaultClientDeliversRequestsAndDrainsItsOwnRespon
   int received = 0;
   auto srv = sink->create_service<ros2_medkit_msgs::srv::ReportFault>(
       "/fault_manager/report_fault",
-      [&received, &received_mutex](const std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Request>,
-                                   std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Response> resp) {
+      [&received, &received_mutex](const std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Request> & /*req*/,
+                                   const std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Response> & resp) {
         {
           std::lock_guard<std::mutex> lk(received_mutex);
           ++received;
