@@ -14,10 +14,15 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
+#include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include <lifecycle_msgs/msg/state.hpp>
 #include <lifecycle_msgs/msg/transition_event.hpp>
+#include <lifecycle_msgs/srv/get_state.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"  // App, IntrospectionInput, ServiceInfo
@@ -84,6 +89,27 @@ ros2_medkit_gateway::IntrospectionInput managed_node_snapshot(const std::string 
   return in;
 }
 
+// Same shape, but with App::id decoupled from the node it is bound to - the re-bind
+// cases below move `fqn` between snapshots while `id` stays put.
+ros2_medkit_gateway::IntrospectionInput managed_app_snapshot(const std::string & id, const std::string & fqn) {
+  auto in = managed_node_snapshot(fqn);
+  in.apps.front().id = id;
+  return in;
+}
+
+// Same App::id and same fqn, but the lifecycle services live somewhere else - a
+// `~/get_state` remap in the launch file, or a manifest-bound app re-pointed at another
+// node's services. The ~/transition_event topic is DERIVED from that path, so this is a
+// different node behind an unchanged name: the half of the binding identity that no other
+// test moves on its own.
+ros2_medkit_gateway::IntrospectionInput remapped_service_snapshot(const std::string & fqn,
+                                                                  const std::string & service_prefix) {
+  auto in = managed_node_snapshot(service_prefix);
+  in.apps.front().id = fqn;
+  in.apps.front().bound_fqn = fqn;
+  return in;
+}
+
 // N managed nodes in one snapshot, so a single update() queues more GetState work than the
 // per-tick blocking budget can possibly run.
 ros2_medkit_gateway::IntrospectionInput managed_nodes_snapshot(const std::vector<std::string> & ids) {
@@ -102,6 +128,28 @@ constexpr auto kPumpBudget = std::chrono::milliseconds(100);
 // matching, and the watcher's subscriptions are in a callback group NO node-wide executor
 // collects - pump_events() is the only thing that runs them, exactly as the plugin's tick
 // thread does in production.
+// Cancels the executor and joins its spin thread on every exit path, including the one a
+// fatal gtest assertion takes.
+class ExecutorJoin {
+ public:
+  ExecutorJoin(rclcpp::executors::SingleThreadedExecutor & exec, std::thread & spin) : exec_(exec), spin_(spin) {
+  }
+  ExecutorJoin(const ExecutorJoin &) = delete;
+  ExecutorJoin & operator=(const ExecutorJoin &) = delete;
+  ExecutorJoin(ExecutorJoin &&) = delete;
+  ExecutorJoin & operator=(ExecutorJoin &&) = delete;
+  ~ExecutorJoin() {
+    exec_.cancel();
+    if (spin_.joinable()) {
+      spin_.join();
+    }
+  }
+
+ private:
+  rclcpp::executors::SingleThreadedExecutor & exec_;
+  std::thread & spin_;
+};
+
 bool publish_until_label(ros2_medkit_graph_watchdog::LifecycleWatcher & w,
                          const rclcpp::Publisher<lifecycle_msgs::msg::TransitionEvent>::SharedPtr & pub,
                          const lifecycle_msgs::msg::TransitionEvent & msg, const std::string & id,
@@ -357,4 +405,171 @@ TEST_F(LifecycleWatcherTest, DepartedNodeRetainsLastLabelByFqnThenPrunes) {
   // One tick past retention -> pruned.
   w.update(ros2_medkit_gateway::IntrospectionInput{}, /*tick=*/10 + kRetentionTicks + 1);
   EXPECT_FALSE(w.departed_state_of(fqn).has_value());
+}
+
+// A tracked id whose BINDING moves (same App::id, different fqn / get_state path) is a
+// different node wearing the same name: the old node's label and ~/transition_event
+// subscription must be dropped and the id re-seeded through the new binding's GetState.
+// The old label here is a KNOWN "inactive" with the self-heal budget already spent, so
+// nothing else can heal it - an entry kept across the re-bind would keep gating the id
+// on a node that is no longer behind it.
+TEST_F(LifecycleWatcherTest, RebindToALiveNodeDropsTheOldLabelAndSeedsTheNewBinding) {
+  const std::string id = "/appk";
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+
+  // The OLD binding: no GetState service (seeds fail), label driven over a live
+  // ~/transition_event. The NEW binding: a GetState service that answers "active".
+  auto old_pub = node_->create_publisher<lifecycle_msgs::msg::TransitionEvent>(
+      "/rb_old/transition_event", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+  auto new_srv = node_->create_service<lifecycle_msgs::srv::GetState>(
+      "/rb_new/get_state", [](const std::shared_ptr<lifecycle_msgs::srv::GetState::Request> & /*req*/,
+                              const std::shared_ptr<lifecycle_msgs::srv::GetState::Response> & resp) {
+        resp->current_state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+        resp->current_state.label = "active";
+      });
+
+  w.update(managed_app_snapshot(id, "/rb_old"), /*tick=*/1);
+  ASSERT_TRUE(w.state_of(id).has_value());
+  const int fresh_budget = w.reseeds_remaining_for_test(id);
+  ASSERT_GT(fresh_budget, 0);
+
+  // The NEW binding's GetState service lives on node_, so node_ has to be spun for the
+  // watcher's reader to get an answer out of it. That executor never runs the watcher's
+  // own subscriptions - they sit in a callback group it does not collect - so the
+  // transition events below still go through pump_events(), exactly as in production.
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(node_);
+  std::thread spin([&exec]() {
+    exec.spin();
+  });
+  // A fatal assertion below returns straight out of the test body, and a joinable
+  // std::thread destroyed that way calls std::terminate - which aborts the whole binary
+  // and takes every remaining case in this file with it, hiding the failure that started
+  // it. The guard makes the join happen on that path too.
+  ExecutorJoin join_guard{exec, spin};
+
+  lifecycle_msgs::msg::TransitionEvent msg;
+  msg.goal_state.label = "inactive";
+  ASSERT_TRUE(publish_until_label(w, old_pub, msg, id, "inactive"));
+
+  // Drain the self-heal budget against the OLD (serviceless) binding, so the assertion
+  // below cannot be satisfied by a leftover re-seed happening to hit the new path - the
+  // re-bind handling itself has to do the healing.
+  for (std::uint64_t tick = 2; w.reseeds_remaining_for_test(id) > 0 && tick < 10; ++tick) {
+    w.update(managed_app_snapshot(id, "/rb_old"), tick);
+  }
+  ASSERT_EQ(w.reseeds_remaining_for_test(id), 0);
+  ASSERT_EQ(w.state_of(id).value_or(""), "inactive");
+
+  // The re-bind: same id, now bound to the live "/rb_new" node.
+  w.update(managed_app_snapshot(id, "/rb_new"), /*tick=*/10);
+  EXPECT_EQ(w.state_of(id).value_or(""), "active")
+      << "after a re-bind the id must carry the NEW binding's seeded state, not the old node's label";
+  EXPECT_TRUE(w.node_ok(id)) << "the old binding's non-active label must stop gating the id";
+  EXPECT_EQ(w.reseeds_remaining_for_test(id), fresh_budget)
+      << "a re-bound id must be re-seeded as a NEW entry (fresh self-heal budget), not healed in place";
+
+  // The old subscription must be gone with the old entry: the old node's transitions
+  // must no longer reach this id.
+  for (int i = 0; i < 10; ++i) {
+    old_pub->publish(msg);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    w.pump_events(kPumpBudget);
+  }
+  EXPECT_EQ(w.state_of(id).value_or(""), "active")
+      << "a transition published by the OLD binding after the re-bind overwrote the new binding's state";
+}
+
+// Re-bind to a binding with NO live node behind it: the id follows the new-binding
+// seeding semantics - tracked with an empty (unknown, ungated) label after the failed
+// GetState - and must NOT keep the old node's label.
+TEST_F(LifecycleWatcherTest, RebindToADeadBindingLeavesStateUnknownNotTheOldLabel) {
+  const std::string id = "/appd";
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+
+  w.update(managed_app_snapshot(id, "/rbd_old"), /*tick=*/1);
+  ASSERT_TRUE(w.state_of(id).has_value());
+  w.set_state_for_test(id, "inactive");  // the OLD binding's observed label
+
+  w.update(managed_app_snapshot(id, "/rbd_new"), /*tick=*/2);
+  EXPECT_EQ(w.state_of(id).value_or("<untracked>"), "")
+      << "a re-bind to a dead binding must leave the id unknown (empty seed), not wearing the old label";
+  EXPECT_TRUE(w.node_ok(id)) << "unknown must not gate - only a KNOWN non-active label does";
+}
+
+// The guard against overcorrection: an UNCHANGED binding across updates must never be
+// treated as a re-bind. The instrument is the self-heal budget, which counts what the
+// remote actually pays (GetState round trips): a drop + re-create would reset it to the
+// fresh value on every tick and record a phantom departure.
+TEST_F(LifecycleWatcherTest, SameBindingAcrossUpdatesIsNeverTreatedAsARebind) {
+  const std::string fqn = "/stable";
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+
+  w.update(managed_node_snapshot(fqn), /*tick=*/1);
+  const int fresh_budget = w.reseeds_remaining_for_test(fqn);
+  ASSERT_GT(fresh_budget, 0);
+
+  // Non-active label + budget left -> exactly one charged re-seed per update.
+  w.update(managed_node_snapshot(fqn), /*tick=*/2);
+  EXPECT_EQ(w.reseeds_remaining_for_test(fqn), fresh_budget - 1)
+      << "one update with the same binding must charge exactly one re-seed - a re-created entry "
+         "would reset the budget to "
+      << fresh_budget;
+  w.update(managed_node_snapshot(fqn), /*tick=*/3);
+  w.update(managed_node_snapshot(fqn), /*tick=*/4);
+  EXPECT_EQ(w.reseeds_remaining_for_test(fqn), 0)
+      << "the budget must drain monotonically across same-binding updates and stay drained";
+  EXPECT_TRUE(w.state_of(fqn).has_value()) << "the entry itself must survive every same-binding update";
+  EXPECT_FALSE(w.departed_state_of(fqn).has_value()) << "an unchanged binding must never be recorded as a departure";
+}
+
+// The OTHER half of the binding identity, on its own. Every re-bind test above moves the
+// fqn and the get_state path together (the snapshot builder derives one from the other), so
+// the path arm of the drop condition is never the thing that fires. Here only the SERVICE
+// path moves - the id and the fqn are unchanged - and it is still a different node: the
+// ~/transition_event subscription is derived from that path, so an entry kept across this
+// would keep enforcing the old node's label and listening on the old node's topic.
+TEST_F(LifecycleWatcherTest, MovingOnlyTheServicePathIsStillARebind) {
+  const std::string fqn = "/remapped";
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+
+  w.update(remapped_service_snapshot(fqn, "/svc_old"), /*tick=*/1);
+  ASSERT_TRUE(w.state_of(fqn).has_value());
+  const int fresh_budget = w.reseeds_remaining_for_test(fqn);
+  ASSERT_GT(fresh_budget, 0);
+  w.set_state_for_test(fqn, "inactive");  // the OLD binding's observed label
+
+  // Same id, same fqn - only the services moved.
+  w.update(remapped_service_snapshot(fqn, "/svc_new"), /*tick=*/2);
+  EXPECT_EQ(w.state_of(fqn).value_or("<untracked>"), "")
+      << "a node whose lifecycle services moved kept the old binding's label - the get_state path is half "
+         "the binding identity, and the transition_event topic is derived from it";
+  EXPECT_EQ(w.reseeds_remaining_for_test(fqn), fresh_budget)
+      << "the entry must be re-created (fresh self-heal budget), not healed in place";
+}
+
+// What a re-bind means for departed_state_of(): the OLD binding effectively departed, so
+// its last observed state is recorded under ITS fqn - same record shape and same
+// retention mechanics as a node vanishing from the snapshot.
+TEST_F(LifecycleWatcherTest, RebindRecordsTheOldBindingAsDepartedUnderItsOwnFqn) {
+  const std::string id = "/appr";
+  constexpr int kRetentionTicks = 3;
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_, kRetentionTicks);
+
+  w.update(managed_app_snapshot(id, "/rbr_old"), /*tick=*/1);
+  ASSERT_TRUE(w.state_of(id).has_value());
+  w.set_state_for_test(id, "inactive");
+
+  w.update(managed_app_snapshot(id, "/rbr_new"), /*tick=*/5);
+  const auto departed = w.departed_state_of("/rbr_old");
+  ASSERT_TRUE(departed.has_value()) << "a re-bind must record the OLD binding as departed under its fqn";
+  EXPECT_EQ(departed->label, "inactive");
+  EXPECT_TRUE(departed->saw_transition);
+  EXPECT_FALSE(departed->error_terminated);
+  EXPECT_FALSE(w.departed_state_of("/rbr_new").has_value())
+      << "the NEW binding is present, not departed - only the old one may be recorded";
+
+  // The record ages out through the ordinary retention prune.
+  w.update(managed_app_snapshot(id, "/rbr_new"), /*tick=*/5 + kRetentionTicks + 1);
+  EXPECT_FALSE(w.departed_state_of("/rbr_old").has_value());
 }
