@@ -19,7 +19,10 @@ jobs:
             os_image: ubuntu:resolute
     container:
       image: ${{ matrix.os_image }}
-    timeout-minutes: 60
+    # Must stay above the build plus the test step's own budget below, or the job cap kills the
+    # run before that step's cap can - which loses the "which step ran long" answer. The build
+    # side of this job is around 18 minutes.
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -86,10 +89,13 @@ jobs:
           ./scripts/ccache_report.sh "${{ matrix.ros_distro }}"
 
       - name: Run unit and integration tests
-        # The suite grew past the old 15-minute budget: on lyrical it was already taking
-        # 14m13s on main, so any new package tipped it over. This is real work finishing, not
-        # a hang.
-        timeout-minutes: 25
+        # The suite keeps outgrowing this budget as packages land, and every overrun so far has
+        # been real work finishing rather than a hang: 15 minutes was raised to 25 when lyrical
+        # reached 14m13s, and 25 was reached again once the graph watchdog's end-to-end scenarios
+        # arrived (lyrical 22m50s before them, jazzy 28m15s after). The jazzy job below caps the
+        # whole job instead of this step, so only these two distros can be killed mid-package -
+        # which reads as a test failure and hides every test the kill cut off.
+        timeout-minutes: 45
         env:
           # FastRTPS 2.6 on Humble has a known use-after-free in the
           # discovery-teardown path (EDP::unpairWriterProxy) that segfaults
