@@ -1077,7 +1077,7 @@ Query and manage faults.
             {
               "type": "rosbag",
               "name": "fault_recording",
-              "bulk_data_uri": "/apps/motor_controller/bulk-data/rosbags/550e8400-e29b-41d4-a716-446655440000",
+              "bulk_data_uri": "/apps/motor_controller/bulk-data/rosbags/fault_MOTOR_OVERHEAT_1738664999000",
               "size_bytes": 1234567,
               "duration_sec": 6.0,
               "format": "mcap"
@@ -1371,7 +1371,7 @@ Download a specific bulk-data file.
 
 .. code-block:: bash
 
-   curl -O -J http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/550e8400-e29b-41d4-a716-446655440000
+   curl -O -J http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/fault_MOTOR_OVERHEAT_1738664999000
 
 **Response Codes:**
 
@@ -2814,7 +2814,8 @@ Other extensions beyond SOVD:
   optional ``x-medkit`` SOVD payload-extension object with ``entity_type`` and ``entity_id``
   fields when the gateway can resolve the fault's first reporting source back to an entity,
   so consumers can hit ``/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}`` directly
-  without enumerating entities. Resolution is snapshotted at event arrival; the entire
+  without enumerating entities - that address serves the fault's newest recording. To reach an
+  older one, list ``/bulk-data/rosbags`` and use the descriptor ``id``. Resolution is snapshotted at event arrival; the entire
   ``x-medkit`` object is omitted when no entity can be resolved.
 - ``/health`` - Health check with discovery pipeline diagnostics
 - ``/version-info`` - Gateway version information

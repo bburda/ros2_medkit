@@ -476,7 +476,10 @@ std::string SSEFaultHandler::format_sse_event(const QueuedEvent & queued) {
   // SOVD payload extension: nest ``entity_type`` / ``entity_id`` under the
   // ``x-medkit`` response-extension object so global-stream consumers can
   // hit ``/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}``
-  // directly instead of HEAD-probing every entity. Flat ``x-medkit-*``
+  // directly instead of HEAD-probing every entity. That address is a
+  // compatibility one since #620 - bags are keyed by recording id now - and
+  // serves the fault's newest recording, which is what a stream consumer
+  // reacting to the event it just received wants. Flat ``x-medkit-*``
   // names are reserved for endpoint paths (``/x-medkit-graph``) and error
   // codes, not payload fields.
   if (queued.entity) {

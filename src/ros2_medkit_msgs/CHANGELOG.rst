@@ -2,6 +2,10 @@
 Changelog for package ros2_medkit_msgs
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+* ``GetRosbag.srv`` gains a ``recording_id`` request field (tried before ``fault_code`` and falling back to it when it names no recording, so a caller holding one identifier that may be either can set both; ``fault_code`` keeps its meaning of "the newest recording of this fault") and ``recording_id`` / ``fault_codes[]`` response fields. ``ListRosbags.srv`` gains a parallel ``recording_ids[]``. ``Snapshot.msg``'s ``bulk_data_id`` now carries a recording id for rosbag snapshots rather than the fault code; the field type is unchanged. Additive, but the service type hashes change, so the gateway and the fault manager must be deployed together (`#620 <https://github.com/selfpatch/ros2_medkit/issues/620>`_)
+
 0.6.0 (2026-06-22)
 ------------------
 * No functional changes; version bump for the coordinated 0.6.0 release.

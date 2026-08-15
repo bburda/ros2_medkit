@@ -30,6 +30,7 @@
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
 
 using ros2_medkit_fault_manager::DebounceConfig;
+using ros2_medkit_fault_manager::RosbagFileInfo;
 using ros2_medkit_fault_manager::SqliteFaultStorage;
 using ros2_medkit_msgs::msg::Fault;
 using ros2_medkit_msgs::srv::ReportFault;
@@ -911,6 +912,209 @@ TEST_F(SqliteFaultStorageTest, ConfirmedAtColumnMigratedIntoOldDatabase) {
   storage_->report_fault_event("NEW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "e", "/n", t,
                                default_config());
   EXPECT_EQ(read_confirmed_at(temp_db_path_, "NEW"), t.nanoseconds());
+}
+
+// --- #620: many recordings per fault -----------------------------------------
+
+namespace {
+
+/// Read PRAGMA index_list and report whether any index came from a table/column
+/// UNIQUE constraint (origin 'u'), which is the thing ALTER TABLE cannot drop.
+bool has_unique_constraint_index(const std::filesystem::path & db_path, const std::string & table) {
+  sqlite3 * raw = nullptr;
+  EXPECT_EQ(sqlite3_open(db_path.string().c_str(), &raw), SQLITE_OK);
+  sqlite3_stmt * stmt = nullptr;
+  const std::string sql = "PRAGMA index_list(" + table + ")";
+  EXPECT_EQ(sqlite3_prepare_v2(raw, sql.c_str(), -1, &stmt, nullptr), SQLITE_OK);
+  bool found = false;
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const auto * origin = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3));
+    if (origin != nullptr && std::string(origin) == "u") {
+      found = true;
+    }
+  }
+  sqlite3_finalize(stmt);
+  sqlite3_close(raw);
+  return found;
+}
+
+RosbagFileInfo make_rosbag(const std::string & code, const std::string & path, int64_t created_ns,
+                           size_t bytes = 1024) {
+  RosbagFileInfo info;
+  info.fault_code = code;
+  info.file_path = path;
+  info.format = "mcap";
+  info.duration_sec = 6.0;
+  info.size_bytes = bytes;
+  info.created_at_ns = created_ns;
+  return info;  // recording_id deliberately left empty - the backend must fill it
+}
+
+}  // namespace
+
+TEST_F(SqliteFaultStorageTest, LegacyUniqueConstraintIsRebuiltAwayAndRecordingIdBackfilled) {
+  // A database from before #620: fault_code carries a column-level UNIQUE and there
+  // is no recording_id column at all. Opening it must rebuild the table, keep every
+  // row, and derive recording_id from each path's basename.
+  storage_.reset();
+  std::filesystem::remove(temp_db_path_);
+  {
+    sqlite3 * raw = nullptr;
+    ASSERT_EQ(sqlite3_open(temp_db_path_.string().c_str(), &raw), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(raw,
+                           "CREATE TABLE rosbag_files ("
+                           " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                           " fault_code TEXT NOT NULL UNIQUE,"
+                           " file_path TEXT NOT NULL,"
+                           " format TEXT NOT NULL,"
+                           " duration_sec REAL NOT NULL,"
+                           " size_bytes INTEGER NOT NULL,"
+                           " created_at_ns INTEGER NOT NULL);"
+                           "INSERT INTO rosbag_files (fault_code, file_path, format, duration_sec, size_bytes, "
+                           "created_at_ns) VALUES ('A', '/bags/fault_A_100', 'mcap', 6.0, 10, 100);"
+                           "INSERT INTO rosbag_files (fault_code, file_path, format, duration_sec, size_bytes, "
+                           "created_at_ns) VALUES ('B', '/bags/fault_B_200', 'sqlite3', 6.0, 20, 200);",
+                           nullptr, nullptr, nullptr),
+              SQLITE_OK);
+    sqlite3_close(raw);
+  }
+  ASSERT_TRUE(has_unique_constraint_index(temp_db_path_, "rosbag_files")) << "fixture must start constrained";
+
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  EXPECT_FALSE(has_unique_constraint_index(temp_db_path_, "rosbag_files"))
+      << "the column-level UNIQUE must be gone, replaced by a named index";
+
+  const auto all = storage_->get_all_rosbag_files();
+  ASSERT_EQ(all.size(), 2u) << "no row may be lost in the rebuild";
+  // Oldest first, so the original insertion order survived the copy.
+  EXPECT_EQ(all[0].fault_code, "A");
+  EXPECT_EQ(all[1].fault_code, "B");
+  EXPECT_EQ(all[0].recording_id, "fault_A_100") << "backfilled from the path basename";
+  EXPECT_EQ(all[1].recording_id, "fault_B_200");
+}
+
+TEST_F(SqliteFaultStorageTest, ReopeningAMigratedDatabaseIsANoOp) {
+  // The migration runs on every open, so it has to be idempotent - a second and
+  // third open must not rebuild again, lose rows or re-backfill.
+  storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_100", 100));
+  const auto before = storage_->get_all_rosbag_files();
+
+  for (int i = 0; i < 2; ++i) {
+    storage_.reset();
+    storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+    const auto after = storage_->get_all_rosbag_files();
+    ASSERT_EQ(after.size(), before.size()) << "reopen #" << i + 1 << " changed the row count";
+    EXPECT_EQ(after[0].recording_id, before[0].recording_id);
+    EXPECT_FALSE(has_unique_constraint_index(temp_db_path_, "rosbag_files"));
+  }
+}
+
+TEST_F(SqliteFaultStorageTest, OneFaultKeepsSeveralRecordingsWhenTheCapAllows) {
+  storage_->set_max_rosbags_per_fault(3);
+  storage_->store_rosbag_file(make_rosbag("FLAP", "/bags/fault_FLAP_100", 100));
+  storage_->store_rosbag_file(make_rosbag("FLAP", "/bags/fault_FLAP_200", 200));
+
+  const auto rows = storage_->get_rosbag_files("FLAP");
+  ASSERT_EQ(rows.size(), 2u) << "the second recording must not replace the first";
+  EXPECT_EQ(rows[0].recording_id, "fault_FLAP_200") << "newest first";
+  EXPECT_EQ(rows[1].recording_id, "fault_FLAP_100");
+
+  // get_rosbag_file is "the newest", deterministically.
+  const auto newest = storage_->get_rosbag_file("FLAP");
+  ASSERT_TRUE(newest.has_value());
+  EXPECT_EQ(newest->recording_id, "fault_FLAP_200");
+}
+
+TEST_F(SqliteFaultStorageTest, CapKeepsTheNewestAndUnlinksTheEvictedBag) {
+  const auto bags = temp_db_path_.parent_path() / (temp_db_path_.stem().string() + "_bags");
+  const auto dir_a = bags / "fault_CAP_100";
+  const auto dir_b = bags / "fault_CAP_200";
+  std::filesystem::create_directories(dir_a);
+  std::filesystem::create_directories(dir_b);
+
+  storage_->set_max_rosbags_per_fault(1);
+  storage_->store_rosbag_file(make_rosbag("CAP", dir_a.string(), 100));
+  storage_->store_rosbag_file(make_rosbag("CAP", dir_b.string(), 200));
+
+  const auto rows = storage_->get_rosbag_files("CAP");
+  ASSERT_EQ(rows.size(), 1u) << "cap 1 is the historical behaviour: one recording per fault";
+  EXPECT_EQ(rows[0].file_path, dir_b.string());
+  EXPECT_FALSE(std::filesystem::exists(dir_a)) << "the evicted bag must be unlinked";
+  EXPECT_TRUE(std::filesystem::exists(dir_b));
+}
+
+TEST_F(SqliteFaultStorageTest, EvictingOneFaultsLinkKeepsABagASiblingStillReferences) {
+  // A burst shares one recording. Evicting it for one fault must not take the bytes
+  // the other fault still points at.
+  const auto bags = temp_db_path_.parent_path() / (temp_db_path_.stem().string() + "_bags");
+  const auto shared = bags / "fault_SHARED_100";
+  const auto later = bags / "fault_A_200";
+  std::filesystem::create_directories(shared);
+  std::filesystem::create_directories(later);
+
+  storage_->set_max_rosbags_per_fault(1);
+  storage_->store_rosbag_files({make_rosbag("A", shared.string(), 100), make_rosbag("B", shared.string(), 100)});
+  // A re-confirms with its own new bag, so A's link to the shared one is evicted.
+  storage_->store_rosbag_file(make_rosbag("A", later.string(), 200));
+
+  EXPECT_TRUE(std::filesystem::exists(shared)) << "B still references it";
+  const auto b_rows = storage_->get_rosbag_files("B");
+  ASSERT_EQ(b_rows.size(), 1u);
+  EXPECT_EQ(b_rows[0].file_path, shared.string());
+}
+
+TEST_F(SqliteFaultStorageTest, RecordingLookupReturnsEveryFaultOfTheBurst) {
+  storage_->store_rosbag_files({make_rosbag("A", "/bags/fault_A_100", 100), make_rosbag("B", "/bags/fault_A_100", 100),
+                                make_rosbag("C", "/bags/fault_A_100", 100)});
+
+  const auto rows = storage_->get_rosbag_files_by_recording("fault_A_100");
+  ASSERT_EQ(rows.size(), 3u) << "the download authorizes against this set";
+  EXPECT_EQ(rows[0].fault_code, "A");
+  EXPECT_EQ(rows[2].fault_code, "C");
+  EXPECT_TRUE(storage_->get_rosbag_files_by_recording("fault_NOPE_1").empty());
+}
+
+TEST_F(SqliteFaultStorageTest, DeleteRecordingRemovesEveryLinkAndTheBag) {
+  const auto bags = temp_db_path_.parent_path() / (temp_db_path_.stem().string() + "_bags");
+  const auto dir = bags / "fault_A_100";
+  std::filesystem::create_directories(dir);
+  storage_->store_rosbag_files({make_rosbag("A", dir.string(), 100), make_rosbag("B", dir.string(), 100)});
+
+  EXPECT_EQ(storage_->delete_rosbag_recording("fault_A_100"), 2u);
+  EXPECT_TRUE(storage_->get_rosbag_files("A").empty());
+  EXPECT_TRUE(storage_->get_rosbag_files("B").empty());
+  EXPECT_FALSE(std::filesystem::exists(dir));
+}
+
+TEST_F(SqliteFaultStorageTest, DropLinkLeavesTheOtherFaultsRecordingsAlone) {
+  storage_->set_max_rosbags_per_fault(0);  // unlimited, so nothing is evicted behind our backs
+  storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_100", 100));
+  storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_200", 200));
+
+  EXPECT_TRUE(storage_->drop_rosbag_link("A", "fault_A_100"));
+  const auto rows = storage_->get_rosbag_files("A");
+  ASSERT_EQ(rows.size(), 1u) << "only the named link goes";
+  EXPECT_EQ(rows[0].recording_id, "fault_A_200");
+  EXPECT_FALSE(storage_->drop_rosbag_link("A", "fault_A_100")) << "already gone";
+}
+
+TEST_F(SqliteFaultStorageTest, DeletingAFaultDropsAllItsRecordings) {
+  storage_->set_max_rosbags_per_fault(0);
+  storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_100", 100));
+  storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_200", 200));
+
+  EXPECT_TRUE(storage_->delete_rosbag_file("A"));
+  EXPECT_TRUE(storage_->get_rosbag_files("A").empty()) << "auto_cleanup drops the fault's whole history";
+}
+
+TEST_F(SqliteFaultStorageTest, SharedRecordingStillCountsOnceTowardsStorageWithSeveralRecordings) {
+  storage_->set_max_rosbags_per_fault(0);
+  storage_->store_rosbag_files(
+      {make_rosbag("A", "/bags/fault_A_100", 100, 4096), make_rosbag("B", "/bags/fault_A_100", 100, 4096)});
+  storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_200", 200, 1024));
+
+  EXPECT_EQ(storage_->get_total_rosbag_storage_bytes(), 4096u + 1024u) << "bytes belong to file_path, not to the row";
 }
 
 // Snapshot storage tests

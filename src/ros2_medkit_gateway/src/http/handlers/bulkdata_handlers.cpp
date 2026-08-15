@@ -112,6 +112,97 @@ std::string rosbag_recording_id(const std::string & file_path) {
   return p.filename().string();
 }
 
+std::vector<std::string> rosbag_attached_fault_codes(const nlohmann::json & rosbag_data,
+                                                     const std::string & requested_id) {
+  if (rosbag_data.contains("fault_codes") && rosbag_data["fault_codes"].is_array()) {
+    auto codes = rosbag_data["fault_codes"].get<std::vector<std::string>>();
+    if (!codes.empty()) {
+      return codes;
+    }
+  }
+  // No list on the wire: a peer that predates the field, where the addressed id
+  // was the fault code itself. Authorizing against it reproduces the old check.
+  return {requested_id};
+}
+
+std::vector<dto::BulkDataDescriptor>
+fold_rosbag_rows_into_descriptors(const std::vector<nlohmann::json> & rows,
+                                  const std::unordered_map<std::string, nlohmann::json> & faults_by_code) {
+  struct RecordingEntry {
+    std::string recording_id;
+    std::string format;
+    uint64_t size_bytes{0};
+    double duration_sec{0.0};
+    int64_t created_at_ns{0};
+    std::vector<std::string> fault_codes;
+  };
+  std::vector<RecordingEntry> recordings;
+  std::unordered_map<std::string, size_t> index_by_recording;
+
+  for (const auto & row : rows) {
+    // The fault manager supplies the recording id; falling back to the path
+    // basename covers a peer or a replay predating that field.
+    std::string recording_id = row.value("recording_id", "");
+    if (recording_id.empty()) {
+      recording_id = rosbag_recording_id(row.value("file_path", ""));
+    }
+    if (recording_id.empty()) {
+      continue;  // nothing addressable - a row with neither id nor path
+    }
+
+    const std::string fault_code = row.value("fault_code", "");
+    int64_t created_at_ns = 0;
+    if (auto it = faults_by_code.find(fault_code); it != faults_by_code.end()) {
+      const double first_occurred = it->second.value("first_occurred", 0.0);
+      created_at_ns = static_cast<int64_t>(first_occurred * 1'000'000'000);
+    }
+
+    if (auto found = index_by_recording.find(recording_id); found != index_by_recording.end()) {
+      auto & entry = recordings[found->second];
+      entry.fault_codes.push_back(fault_code);
+      // Earliest fault of the burst dates the recording.
+      if (created_at_ns != 0 && (entry.created_at_ns == 0 || created_at_ns < entry.created_at_ns)) {
+        entry.created_at_ns = created_at_ns;
+      }
+      continue;
+    }
+
+    RecordingEntry entry;
+    entry.recording_id = recording_id;
+    // Default to sqlite3 (the historical FaultManager default) when a bag predates
+    // the persisted format field; the per-bag metadata normally carries the real one.
+    entry.format = row.value("format", "sqlite3");
+    entry.size_bytes = row.value("size_bytes", uint64_t{0});
+    entry.duration_sec = row.value("duration_sec", 0.0);
+    entry.created_at_ns = created_at_ns;
+    entry.fault_codes.push_back(fault_code);
+    index_by_recording.emplace(recording_id, recordings.size());
+    recordings.push_back(std::move(entry));
+  }
+
+  std::vector<dto::BulkDataDescriptor> descriptors;
+  descriptors.reserve(recordings.size());
+  for (auto & entry : recordings) {
+    std::sort(entry.fault_codes.begin(), entry.fault_codes.end());
+    entry.fault_codes.erase(std::unique(entry.fault_codes.begin(), entry.fault_codes.end()), entry.fault_codes.end());
+
+    dto::BulkDataDescriptor descriptor;
+    descriptor.id = entry.recording_id;
+    descriptor.name = entry.recording_id + " recording " + format_timestamp_ns(entry.created_at_ns);
+    descriptor.mimetype = BulkDataHandlers::get_rosbag_mimetype(entry.format);
+    descriptor.size = entry.size_bytes;
+    descriptor.creation_date = format_timestamp_ns(entry.created_at_ns);
+    descriptor.x_medkit = nlohmann::json{{"fault_codes", entry.fault_codes},
+                                         {"duration_sec", entry.duration_sec},
+                                         {"format", entry.format},
+                                         // Redundant with the descriptor id, kept because
+                                         // clients already group on it.
+                                         {"recording_id", entry.recording_id}};
+    descriptors.push_back(std::move(descriptor));
+  }
+  return descriptors;
+}
+
 std::vector<std::string> compute_bulkdata_source_filters(const ThreadSafeEntityCache & cache,
                                                          const EntityInfo & entity) {
   // One rule for every entity type: the same fault-scope resolution that drives
@@ -235,44 +326,7 @@ BulkDataHandlers::list_descriptors(const http::TypedRequest & req) {
       }
     }
 
-    dto::Collection<dto::BulkDataDescriptor> response;
-    for (const auto & rosbag : all_rosbags) {
-      std::string fault_code = rosbag.value("fault_code", "");
-      // Default to sqlite3 (the historical FaultManager default) when a bag predates
-      // the persisted format field; the per-bag metadata normally carries the real one.
-      std::string format = rosbag.value("format", "sqlite3");
-      uint64_t size_bytes = rosbag.value("size_bytes", uint64_t{0});
-      double duration_sec = rosbag.value("duration_sec", 0.0);
-
-      // Use fault_code as bulk_data_id
-      std::string bulk_data_id = fault_code;
-
-      // Get timestamp from fault if available
-      int64_t created_at_ns = 0;
-      auto it = fault_map.find(fault_code);
-      if (it != fault_map.end()) {
-        double first_occurred = it->second.value("first_occurred", 0.0);
-        created_at_ns = static_cast<int64_t>(first_occurred * 1'000'000'000);
-      }
-
-      dto::BulkDataDescriptor descriptor;
-      descriptor.id = bulk_data_id;
-      descriptor.name = fault_code + " recording " + format_timestamp_ns(created_at_ns);
-      descriptor.mimetype = get_rosbag_mimetype(format);
-      descriptor.size = size_bytes;
-      descriptor.creation_date = format_timestamp_ns(created_at_ns);
-      json x_medkit{{"fault_code", fault_code}, {"duration_sec", duration_sec}, {"format", format}};
-      // Faults of one burst share a recording and each descriptor reports the
-      // full bag size; recording_id lets clients group the descriptors that
-      // serve the same bytes.
-      std::string recording_id = detail::rosbag_recording_id(rosbag.value("file_path", ""));
-      if (!recording_id.empty()) {
-        x_medkit["recording_id"] = recording_id;
-      }
-      descriptor.x_medkit = std::move(x_medkit);
-      response.items.push_back(std::move(descriptor));
-    }
-    return response;
+    return dto::Collection<dto::BulkDataDescriptor>{detail::fold_rosbag_rows_into_descriptors(all_rosbags, fault_map)};
   }
 
   // === Non-rosbag categories: served via BulkDataStore ===
@@ -342,24 +396,37 @@ http::Result<http::BinaryResponse> BulkDataHandlers::download(const http::TypedR
 
   if (category == "rosbags") {
     // === Rosbags: served via FaultManager ===
+    //
+    // The id is a recording id. A pre-#620 URL carrying a fault code still resolves:
+    // the fault manager tries the recording first and falls back to "the newest
+    // recording of this fault", which is what a fault-code URL has always returned.
+    // Both routes end up holding a recording before anything is authorized, so there
+    // is exactly one authorization semantic, not two.
     auto fault_mgr = ctx_.node()->get_fault_manager();
-    std::string fault_code = bulk_data_id;
 
-    auto rosbag_result = fault_mgr->get_rosbag(fault_code);
+    auto rosbag_result = fault_mgr->get_rosbag(bulk_data_id);
     if (!rosbag_result.success || !rosbag_result.data.contains("file_path")) {
       return tl::unexpected(
           make_error(404, ERR_RESOURCE_NOT_FOUND, "Bulk-data not found", json{{"bulk_data_id", bulk_data_id}}));
     }
 
-    // Security check: the bag belongs to this entity only when the fault it
-    // was captured for is within the entity's source scope. Read the fault
-    // once and test with the shared boundary-aware matcher - the transport's
-    // get_fault(code, source) check is a raw prefix match, so app id "plc"
-    // would claim the assets of "plc_line1".
+    // Security check: the bag belongs to this entity when ANY fault it was captured
+    // for is within the entity's source scope. Union rather than a single code
+    // because a burst shares one recording, and each of those faults already had its
+    // own downloadable copy of it before - so this grants nothing new, it only
+    // renames the door. Tested with the shared boundary-aware matcher: the
+    // transport's get_fault(code, source) check is a raw prefix match, so app id
+    // "plc" would otherwise claim the assets of "plc_line1".
     auto source_filters = get_source_filters(entity);
     std::set<std::string> scope(source_filters.begin(), source_filters.end());
-    auto fault_result = fault_mgr->get_fault(fault_code, "");
-    if (!fault_result.success || !faults::fault_in_source_scope(fault_result.data, scope)) {
+
+    const auto attached_codes = detail::rosbag_attached_fault_codes(rosbag_result.data, bulk_data_id);
+
+    const bool authorized = std::any_of(attached_codes.begin(), attached_codes.end(), [&](const std::string & code) {
+      auto fault_result = fault_mgr->get_fault(code, "");
+      return fault_result.success && faults::fault_in_source_scope(fault_result.data, scope);
+    });
+    if (!authorized) {
       return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "Bulk-data not found for this entity",
                                        json{{"entity_id", path_info->entity_id}}));
     }
@@ -369,7 +436,9 @@ http::Result<http::BinaryResponse> BulkDataHandlers::download(const http::TypedR
     // format field; metadata normally carries the real one persisted at capture time.
     std::string format = rosbag_result.data.value("format", "sqlite3");
     mimetype = get_rosbag_mimetype(format);
-    filename = fault_code + "." + format;
+    // Named after the recording that was actually served, which for a compatibility
+    // URL is not the segment the client sent.
+    filename = rosbag_result.data.value("recording_id", bulk_data_id) + "." + format;
 
     // Rosbag2 emits a directory layout - resolve the inner db3/mcap file.
     actual_path = resolve_rosbag_file_path(file_path);

@@ -85,7 +85,10 @@ nlohmann::json environment_data_to_json(const ros2_medkit_msgs::msg::Environment
       snap["captured_at_ns"] = s.captured_at_ns;
     } else if (s.type == "rosbag") {
       snap["snapshot_type"] = "rosbag";
-      snap["fault_code"] = s.bulk_data_id;
+      // Carries a RECORDING id now, so it is named after what it is. Calling it
+      // "fault_code" while it holds something else is how the next reader builds a
+      // URL out of the wrong value.
+      snap["bulk_data_id"] = s.bulk_data_id;
       snap["size_bytes"] = s.size_bytes;
       snap["duration_sec"] = s.duration_sec;
       snap["format"] = s.format;

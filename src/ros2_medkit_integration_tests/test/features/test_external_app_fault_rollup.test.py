@@ -161,7 +161,9 @@ class TestExternalAppFaultRollup(GatewayTestCase):
         regression: ``GET /areas/plc-cell/faults/<code>`` advertises
         ``/areas/plc-cell/bulk-data/rosbags/<code>``, which 404'd while the
         area resolved its bulk-data scope through the namespace path instead
-        of its hosted apps' reporting sources.
+        of its hosted apps' reporting sources. Since #620 the ``<code>`` in
+        those URLs is a recording id; the bare fault code still resolves
+        through the compatibility path and is checked here too.
 
         Runs before the rollup test (method order is alphabetical) and reports
         the same fault code; the report is idempotent for both tests.
@@ -176,12 +178,23 @@ class TestExternalAppFaultRollup(GatewayTestCase):
 
         self.wait_for_fault(f'/apps/{EXTERNAL_APP}', FAULT_CODE)
         bag_id = self.wait_for_fault_with_rosbag(f'/apps/{EXTERNAL_APP}')
-        self.assertEqual(bag_id, FAULT_CODE)
+        # A bag is addressed by its recording id, which names the fault it was
+        # captured for without being equal to it - one fault can hold several.
+        self.assertTrue(
+            bag_id.startswith(f'fault_{FAULT_CODE}_'),
+            f'unexpected recording id: {bag_id}')
 
         # App-level download: 200 + bytes.
-        app_uri = f'/apps/{EXTERNAL_APP}/bulk-data/rosbags/{FAULT_CODE}'
+        app_uri = f'/apps/{EXTERNAL_APP}/bulk-data/rosbags/{bag_id}'
         resp = self.get_raw(app_uri)
         self.assertGreater(len(resp.content), 0, f'{app_uri} returned no bytes')
+
+        # The pre-#620 address - the bare fault code - still serves the same
+        # bag, so anything built against the documented URL keeps working.
+        legacy_uri = f'/apps/{EXTERNAL_APP}/bulk-data/rosbags/{FAULT_CODE}'
+        legacy = self.get_raw(legacy_uri)
+        self.assertEqual(legacy.content, resp.content,
+                         f'{legacy_uri} no longer serves the same bytes')
 
         # Area rollup advertises an area-scoped URI for the same bag.
         detail = self.wait_for_fault_detail(
@@ -194,19 +207,19 @@ class TestExternalAppFaultRollup(GatewayTestCase):
             rosbag_snaps, 'area fault detail lost the rosbag snapshot')
         area_uri = rosbag_snaps[0].get('bulk_data_uri')
         self.assertEqual(
-            area_uri, f'/areas/{HOST_AREA}/bulk-data/rosbags/{FAULT_CODE}')
+            area_uri, f'/areas/{HOST_AREA}/bulk-data/rosbags/{bag_id}')
 
         # The area listing shows the bag and the advertised URI downloads.
         listing = self.get_json(f'/areas/{HOST_AREA}/bulk-data/rosbags')
         listed_ids = [item.get('id') for item in listing.get('items', [])]
-        self.assertIn(FAULT_CODE, listed_ids)
+        self.assertIn(bag_id, listed_ids)
         resp = self.get_raw(area_uri)
         self.assertGreater(len(resp.content), 0, f'{area_uri} returned no bytes')
 
         # Function rollup resolves the same scope.
         listing = self.get_json(f'/functions/{HOST_FUNCTION}/bulk-data/rosbags')
         listed_ids = [item.get('id') for item in listing.get('items', [])]
-        self.assertIn(FAULT_CODE, listed_ids)
+        self.assertIn(bag_id, listed_ids)
 
     def test_external_app_fault_appears_on_every_rollup(self):
         """The external app's fault surfaces on app, component, function, area.

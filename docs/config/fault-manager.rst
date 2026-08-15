@@ -250,6 +250,7 @@ Capture continuous rosbag recordings around fault events.
            max_buffer_mb: 256              # Ring-buffer RAM cap
            max_bag_size_mb: 50             # Max size per bag file
            max_total_storage_mb: 500       # Max total storage
+           max_bags_per_fault: 1           # Recordings kept per fault code
            auto_cleanup: true              # Auto-delete old bags
 
 .. list-table::
@@ -324,10 +325,33 @@ Capture continuous rosbag recordings around fault events.
      - Maximum total storage for all rosbags (MB). A recording shared by a
        burst of faults counts once towards the total, and eviction removes a
        whole burst's bag at a time (oldest first).
+   * - ``rosbag.max_bags_per_fault``
+     - ``1``
+     - How many recordings one fault code keeps. Past the cap the oldest is
+       unlinked, so the default reproduces the historical behaviour exactly: a
+       new recording replaces the previous one. ``0`` means unlimited, bounded
+       only by ``max_total_storage_mb``. ``3`` is a reasonable value for a fault
+       that flaps - see the note below before raising it.
    * - ``rosbag.auto_cleanup``
      - ``true``
-     - Delete a fault's bag when the fault is cleared. A recording shared by a
-       burst survives until the last fault referencing it clears.
+     - Delete a fault's bags when the fault is cleared. A recording shared by a
+       burst survives until the last fault referencing it clears. Leave this
+       ``false`` when raising ``max_bags_per_fault``, or acknowledging a fault
+       discards the history that was just kept.
+
+.. note::
+
+   ``max_bags_per_fault`` is a **fairness** knob, not a depth knob.
+   ``max_total_storage_mb`` is the real disk bound and eviction across it is
+   global and oldest-first, so a fault that flaps often enough will consume the
+   budget and push out every other fault's black box. Raise the per-fault cap
+   when you need the history of a specific intermittent fault; raise the total
+   budget with it if other faults still need theirs.
+
+   The cap keeps the newest recordings and evicts the oldest. It deliberately
+   does not match ``snapshots.max_per_fault``, which rejects new snapshots once
+   full: refusing a new recording would mean a technician standing next to a
+   machine faulting right now downloads a bag from three days ago.
 
 .. _rosbag-recording-lifecycle:
 

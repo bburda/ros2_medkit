@@ -1163,10 +1163,20 @@ std::vector<std::string> SqliteFaultStorage::store_rosbag_file_locked(const Rosb
   // Re-storing the SAME link refreshes it; a link to a DIFFERENT recording is a new
   // row now, which is the feature. Nothing is unlinked here - byte lifetime is the
   // cap's business below, and the caller's, after the commit.
+  //
+  // ON CONFLICT DO UPDATE, not INSERT OR REPLACE: the latter deletes the row and
+  // inserts a fresh one, so a refresh silently moves the link to the end of the id
+  // order. Every read below breaks created_at_ns ties by id, and the in-memory
+  // backend keeps its sequence number across a refresh, so REPLACE would put the
+  // two backends in a different order for a re-stored row inside a tie group.
   SqliteStatement stmt(db_,
-                       "INSERT OR REPLACE INTO rosbag_files "
+                       "INSERT INTO rosbag_files "
                        "(fault_code, recording_id, file_path, format, duration_sec, size_bytes, created_at_ns) "
-                       "VALUES (?, ?, ?, ?, ?, ?, ?)");
+                       "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                       "ON CONFLICT(fault_code, file_path) DO UPDATE SET "
+                       "recording_id = excluded.recording_id, format = excluded.format, "
+                       "duration_sec = excluded.duration_sec, size_bytes = excluded.size_bytes, "
+                       "created_at_ns = excluded.created_at_ns");
 
   stmt.bind_text(1, row.fault_code);
   stmt.bind_text(2, row.recording_id);
@@ -1376,13 +1386,15 @@ std::optional<RosbagFileInfo> SqliteFaultStorage::get_rosbag_file(const std::str
 bool SqliteFaultStorage::delete_rosbag_file(const std::string & fault_code) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // First get the file path so we can delete the actual file
-  std::string file_path;
+  // Every path, not the first one: a fault holds as many recordings as its cap
+  // allows, and stepping once would unlink one bag and leak the rest - rows gone,
+  // directories left behind, uncounted by a quota that sums rows.
+  std::set<std::string> paths;
   {
     SqliteStatement select_stmt(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ?");
     select_stmt.bind_text(1, fault_code);
-    if (select_stmt.step() == SQLITE_ROW) {
-      file_path = select_stmt.column_text(0);
+    while (select_stmt.step() == SQLITE_ROW) {
+      paths.insert(select_stmt.column_text(0));
     }
   }
 
@@ -1400,12 +1412,14 @@ bool SqliteFaultStorage::delete_rosbag_file(const std::string & fault_code) {
 
   const bool deleted = sqlite3_changes(db_) > 0;
 
-  // Unlink only once no fault references the bag any more. This row is already
+  // Unlink only once no fault references the bag any more. These rows are already
   // gone, so path_referenced() sees exactly the siblings of a shared recording.
-  if (!file_path.empty() && !path_referenced(file_path)) {
-    std::error_code ec;
-    std::filesystem::remove_all(file_path, ec);
-    // Ignore errors - file may already be deleted
+  for (const auto & path : paths) {
+    if (!path_referenced(path)) {
+      std::error_code ec;
+      std::filesystem::remove_all(path, ec);
+      // Ignore errors - file may already be deleted
+    }
   }
 
   return deleted;
@@ -1426,9 +1440,11 @@ size_t SqliteFaultStorage::delete_rosbag_files(const std::vector<std::string> & 
   try {
     for (const auto & code : fault_codes) {
       {
+        // while, not if: one fault code can name several recordings now, and the
+        // sweep must be able to reclaim every one of their bags.
         SqliteStatement select_stmt(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ?");
         select_stmt.bind_text(1, code);
-        if (select_stmt.step() == SQLITE_ROW) {
+        while (select_stmt.step() == SQLITE_ROW) {
           paths.insert(select_stmt.column_text(0));
         }
       }

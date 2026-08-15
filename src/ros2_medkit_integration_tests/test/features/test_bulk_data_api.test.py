@@ -135,10 +135,14 @@ class TestBulkDataApi(GatewayTestCase):
         # Verify x-medkit extension
         self.assertIn('x-medkit', descriptor)
         x_medkit = descriptor['x-medkit']
-        self.assertIn('fault_code', x_medkit)
-        # recording_id (bag directory basename) groups the descriptors of
-        # faults that share one recording.
+        # fault_codes, plural: one recording covers every fault of a burst, and
+        # the descriptor is per recording rather than per fault.
+        self.assertIn('fault_codes', x_medkit)
+        self.assertIsInstance(x_medkit['fault_codes'], list)
+        self.assertGreater(len(x_medkit['fault_codes']), 0)
+        # The descriptor id IS the recording id - that is what addresses the bag.
         self.assertIn('recording_id', x_medkit)
+        self.assertEqual(descriptor['id'], x_medkit['recording_id'])
         self.assertTrue(
             x_medkit['recording_id'].startswith('fault_'),
             f'recording_id should be the bag directory name, '

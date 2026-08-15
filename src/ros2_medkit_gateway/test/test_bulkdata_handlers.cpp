@@ -14,9 +14,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "ros2_medkit_gateway/core/discovery/models/app.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/area.hpp"
@@ -30,6 +33,7 @@
 #include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
 
 using namespace ros2_medkit_gateway;
+using json = nlohmann::json;
 using ros2_medkit_gateway::handlers::BulkDataHandlers;
 
 class BulkDataHandlersTest : public ::testing::Test {
@@ -75,9 +79,9 @@ TEST_F(BulkDataHandlersTest, GetRosbagMimetypeCasesSensitive) {
 }
 
 // === Shared-recording identifier tests ===
-// Faults of one burst share a recording; each fault's descriptor carries
-// x-medkit.recording_id = the bag directory basename, so clients can group
-// the descriptors that serve the same bytes.
+// The bag directory basename is the recording's public name: it addresses the
+// bag under /bulk-data/rosbags/{id} and groups the link rows serving the same
+// bytes.
 
 TEST_F(BulkDataHandlersTest, RecordingIdIsTheBagDirectoryBasename) {
   EXPECT_EQ(handlers::detail::rosbag_recording_id("/var/bags/fault_MOTOR_OVERHEAT_1738664999000"),
@@ -96,6 +100,114 @@ TEST_F(BulkDataHandlersTest, RecordingIdIsTheSameForEveryFaultOfTheBurst) {
 TEST_F(BulkDataHandlersTest, RecordingIdToleratesTrailingSlashAndEmptyPath) {
   EXPECT_EQ(handlers::detail::rosbag_recording_id("/var/bags/fault_X_123/"), "fault_X_123");
   EXPECT_EQ(handlers::detail::rosbag_recording_id(""), "");
+}
+
+// === Descriptor folding tests ===
+// The fault manager returns one row per (fault, recording) link. A burst of
+// correlated faults is several rows naming one bag, and one fault holding a
+// history is several rows with distinct bags. Both shapes have to come out as
+// one descriptor per recording.
+
+namespace {
+
+json rosbag_row(const std::string & fault_code, const std::string & recording_id, uint64_t size_bytes = 1024) {
+  return json{{"fault_code", fault_code}, {"recording_id", recording_id}, {"file_path", "/var/bags/" + recording_id},
+              {"format", "mcap"},         {"duration_sec", 5.0},          {"size_bytes", size_bytes}};
+}
+
+json fault_at(double first_occurred) {
+  return json{{"first_occurred", first_occurred}};
+}
+
+}  // namespace
+
+TEST_F(BulkDataHandlersTest, OneFaultWithSeveralRecordingsYieldsOneDescriptorEach) {
+  // The feature: a flapping fault keeps a history, and every recording in it
+  // has to be separately addressable.
+  const std::vector<json> rows{rosbag_row("FLAP", "fault_FLAP_3"), rosbag_row("FLAP", "fault_FLAP_2"),
+                               rosbag_row("FLAP", "fault_FLAP_1")};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, {});
+  ASSERT_EQ(descriptors.size(), 3u);
+  EXPECT_EQ(descriptors[0].id, "fault_FLAP_3") << "order follows the fault manager's listing";
+  EXPECT_EQ(descriptors[1].id, "fault_FLAP_2");
+  EXPECT_EQ(descriptors[2].id, "fault_FLAP_1");
+}
+
+TEST_F(BulkDataHandlersTest, ABurstCollapsesToOneDescriptorCarryingEveryFault) {
+  // Three rows, one bag. Emitting three items would repeat the id and report
+  // the bag's size three times, which reads as three bags worth of storage.
+  const std::vector<json> rows{rosbag_row("ROOT_CAUSE", "fault_ROOT_CAUSE_17"),
+                               rosbag_row("DOWNSTREAM_B", "fault_ROOT_CAUSE_17"),
+                               rosbag_row("DOWNSTREAM_A", "fault_ROOT_CAUSE_17")};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, {});
+  ASSERT_EQ(descriptors.size(), 1u);
+  EXPECT_EQ(descriptors[0].id, "fault_ROOT_CAUSE_17");
+  EXPECT_EQ(descriptors[0].size, 1024u) << "the bag is counted once, not once per attached fault";
+
+  ASSERT_TRUE(descriptors[0].x_medkit.has_value());
+  const auto & x = *descriptors[0].x_medkit;
+  ASSERT_TRUE(x.contains("fault_codes"));
+  EXPECT_EQ(x["fault_codes"], (json{"DOWNSTREAM_A", "DOWNSTREAM_B", "ROOT_CAUSE"})) << "sorted, so output is stable";
+  EXPECT_EQ(x["recording_id"], "fault_ROOT_CAUSE_17");
+  EXPECT_EQ(x["format"], "mcap");
+  EXPECT_DOUBLE_EQ(x["duration_sec"].get<double>(), 5.0);
+}
+
+TEST_F(BulkDataHandlersTest, TheSameFaultTwiceOnOneRecordingIsNotListedTwice) {
+  // Two source filters can both resolve to the same app, so the same row can
+  // arrive twice. A repeated code in fault_codes would be visible in the API.
+  const std::vector<json> rows{rosbag_row("DUP", "fault_DUP_1"), rosbag_row("DUP", "fault_DUP_1")};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, {});
+  ASSERT_EQ(descriptors.size(), 1u);
+  ASSERT_TRUE(descriptors[0].x_medkit.has_value());
+  EXPECT_EQ((*descriptors[0].x_medkit)["fault_codes"], (json{"DUP"}));
+}
+
+TEST_F(BulkDataHandlersTest, ARecordingIsDatedByTheEarliestFaultOfItsBurst) {
+  // Downstream faults confirm after the root cause, and the recording covers
+  // the whole burst, so the earliest is the honest creation date.
+  const std::vector<json> rows{rosbag_row("DOWNSTREAM", "fault_ROOT_9"), rosbag_row("ROOT", "fault_ROOT_9")};
+  const std::unordered_map<std::string, json> faults{{"DOWNSTREAM", fault_at(1700000900.0)},
+                                                     {"ROOT", fault_at(1700000000.0)}};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, faults);
+  ASSERT_EQ(descriptors.size(), 1u);
+  EXPECT_EQ(descriptors[0].creation_date, format_timestamp_ns(int64_t{1700000000} * 1'000'000'000));
+}
+
+TEST_F(BulkDataHandlersTest, DescriptorIdFallsBackToTheBasenameWhenTheRowHasNoRecordingId) {
+  // A peer or a replay predating the stored field still has to be addressable.
+  const std::vector<json> rows{json{{"fault_code", "OLD"}, {"file_path", "/var/bags/fault_OLD_5"}, {"format", "mcap"}}};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, {});
+  ASSERT_EQ(descriptors.size(), 1u);
+  EXPECT_EQ(descriptors[0].id, "fault_OLD_5");
+}
+
+TEST_F(BulkDataHandlersTest, ARowWithNeitherIdNorPathIsDroppedRatherThanAdvertised) {
+  // An empty id would render as /bulk-data/rosbags/ - a 404 the client cannot
+  // act on. Better absent than advertised and broken.
+  const std::vector<json> rows{json{{"fault_code", "GHOST"}, {"format", "mcap"}}, rosbag_row("REAL", "fault_REAL_1")};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, {});
+  ASSERT_EQ(descriptors.size(), 1u);
+  EXPECT_EQ(descriptors[0].id, "fault_REAL_1");
+}
+
+TEST_F(BulkDataHandlersTest, DistinctRecordingsEachReportTheirOwnSize) {
+  const std::vector<json> rows{rosbag_row("A", "fault_A_1", 2048), rosbag_row("B", "fault_B_1", 4096)};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, {});
+  ASSERT_EQ(descriptors.size(), 2u);
+  EXPECT_EQ(descriptors[0].size, 2048u);
+  EXPECT_EQ(descriptors[1].size, 4096u);
+}
+
+TEST_F(BulkDataHandlersTest, NoRowsYieldsNoDescriptors) {
+  EXPECT_TRUE(handlers::detail::fold_rosbag_rows_into_descriptors({}, {}).empty());
 }
 
 // === Shared timestamp utility tests ===
@@ -501,6 +613,99 @@ TEST_F(BulkDataSourceFiltersTest, FunctionWithComponentHostResolvesComponentApps
 // exact match or '/'-boundary prefix only. A raw prefix match (the transport's
 // get_fault(code, source) semantics) would let app id "plc" claim the bag of
 // "plc_line1".
+// === Download authorization tests ===
+// A recording is shared by a whole burst, so ownership is the union over its
+// attached faults. The scope matcher itself is unchanged and pinned below; what
+// is new is which codes get fed to it.
+
+TEST_F(BulkDataSourceFiltersTest, AttachedFaultCodesComeFromTheRecordingNotTheUrl) {
+  const nlohmann::json rosbag = {{"file_path", "/var/bags/fault_ROOT_1"},
+                                 {"recording_id", "fault_ROOT_1"},
+                                 {"fault_codes", {"ROOT", "DOWNSTREAM_A", "DOWNSTREAM_B"}}};
+
+  EXPECT_EQ(handlers::detail::rosbag_attached_fault_codes(rosbag, "fault_ROOT_1"),
+            (std::vector<std::string>{"ROOT", "DOWNSTREAM_A", "DOWNSTREAM_B"}));
+}
+
+TEST_F(BulkDataSourceFiltersTest, AttachedFaultCodesFallBackToTheRequestedIdOnAnOlderPeer) {
+  // The compatibility path: the id addressed was the fault code, and a peer
+  // that predates the field sends no list. Authorizing against the requested id
+  // is exactly the check that shipped before.
+  const nlohmann::json rosbag = {{"file_path", "/var/bags/fault_MOTOR_1"}};
+  EXPECT_EQ(handlers::detail::rosbag_attached_fault_codes(rosbag, "MOTOR_OVERHEAT"),
+            (std::vector<std::string>{"MOTOR_OVERHEAT"}));
+}
+
+TEST_F(BulkDataSourceFiltersTest, AttachedFaultCodesFallBackOnAnEmptyOrMalformedList) {
+  // Never return empty: an empty list makes any_of vacuously false, which would
+  // 404 a download the entity owns.
+  const nlohmann::json empty_list = {{"fault_codes", nlohmann::json::array()}};
+  EXPECT_EQ(handlers::detail::rosbag_attached_fault_codes(empty_list, "X"), (std::vector<std::string>{"X"}));
+
+  const nlohmann::json not_an_array = {{"fault_codes", "X"}};
+  EXPECT_EQ(handlers::detail::rosbag_attached_fault_codes(not_an_array, "X"), (std::vector<std::string>{"X"}));
+}
+
+TEST_F(BulkDataSourceFiltersTest, ABurstRecordingIsOwnedByAnyEntityOwningOneOfItsFaults) {
+  // One bag, three faults, two apps. Each app reaches the bag through its own
+  // fault - which is what it could already do when the bag was addressed by
+  // fault code.
+  App plc;
+  plc.id = "plc";
+  plc.external = true;
+  App vision;
+  vision.id = "vision";
+  vision.external = true;
+
+  ThreadSafeEntityCache cache;
+  cache.update_all({}, {}, {plc, vision}, {});
+
+  auto plc_entity = make_entity_info(EntityType::APP, "plc", "", "");
+  auto plc_filters = handlers::detail::compute_bulkdata_source_filters(cache, plc_entity);
+  std::set<std::string> plc_scope(plc_filters.begin(), plc_filters.end());
+
+  const std::vector<nlohmann::json> burst_faults = {nlohmann::json{{"reporting_sources", {"vision"}}},
+                                                    nlohmann::json{{"reporting_sources", {"plc"}}}};
+
+  const bool plc_authorized = std::any_of(burst_faults.begin(), burst_faults.end(), [&](const nlohmann::json & f) {
+    return faults::fault_in_source_scope(f, plc_scope);
+  });
+  EXPECT_TRUE(plc_authorized) << "the PLC owns one of the burst's faults";
+}
+
+TEST_F(BulkDataSourceFiltersTest, ABurstRecordingIsRejectedWhenNoAttachedFaultIsInScope) {
+  App plc;
+  plc.id = "plc";
+  plc.external = true;
+  App plc_line1;
+  plc_line1.id = "plc_line1";
+  plc_line1.external = true;
+
+  ThreadSafeEntityCache cache;
+  cache.update_all({}, {}, {plc, plc_line1}, {});
+
+  auto entity = make_entity_info(EntityType::APP, "plc", "", "");
+  auto filters = handlers::detail::compute_bulkdata_source_filters(cache, entity);
+  std::set<std::string> scope(filters.begin(), filters.end());
+
+  // The prefix-sibling rule has to survive the union: "plc" must not reach a
+  // burst owned entirely by "plc_line1", no matter how many faults it holds.
+  const std::vector<nlohmann::json> foreign_burst = {nlohmann::json{{"reporting_sources", {"plc_line1"}}},
+                                                     nlohmann::json{{"reporting_sources", {"plc_line1/axis2"}}}};
+
+  const bool authorized = std::any_of(foreign_burst.begin(), foreign_burst.end(), [&](const nlohmann::json & f) {
+    return faults::fault_in_source_scope(f, scope);
+  });
+  EXPECT_FALSE(authorized);
+
+  // ...while a descendant of the entity's own scope still reaches it.
+  const std::vector<nlohmann::json> own_burst = {nlohmann::json{{"reporting_sources", {"plc_line1"}}},
+                                                 nlohmann::json{{"reporting_sources", {"plc/axis1"}}}};
+  EXPECT_TRUE(std::any_of(own_burst.begin(), own_burst.end(), [&](const nlohmann::json & f) {
+    return faults::fault_in_source_scope(f, scope);
+  }));
+}
+
 TEST_F(BulkDataSourceFiltersTest, DownloadOwnershipScopeRejectsPrefixSiblingApp) {
   App plc;
   plc.id = "plc";

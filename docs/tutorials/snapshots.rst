@@ -266,7 +266,7 @@ Snapshots are included inline in the fault response as ``environment_data``:
          {
            "type": "rosbag",
            "name": "fault_recording",
-           "bulk_data_uri": "/apps/motor_controller/bulk-data/rosbags/550e8400-e29b-41d4-a716-446655440000",
+           "bulk_data_uri": "/apps/motor_controller/bulk-data/rosbags/fault_MOTOR_OVERHEAT_1738664999000",
            "size_bytes": 1234567,
            "duration_sec": 6.0,
            "format": "mcap"
@@ -286,7 +286,10 @@ Snapshots are included inline in the fault response as ``environment_data``:
   gateway start instead, marked ``x-medkit.capture_origin: startup``; a
   plugin entity that reports its link down contributes its last known values,
   marked ``connected: false`` in ``x-medkit``
-- ``rosbag``: Recording file available via bulk-data endpoint (binary format)
+- ``rosbag``: Recording file available via bulk-data endpoint (binary format).
+  One entry per recording the fault kept, newest first, each addressed by its own
+  ``bulk_data_uri``. With the default ``max_bags_per_fault`` of ``1`` there is at
+  most one.
 
 **Get snapshots from fault response using jq:**
 
@@ -700,6 +703,11 @@ Rosbag files are downloaded via SOVD bulk-data endpoints.
 
    curl http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags
 
+One item per **recording**, not per fault. A burst of correlated faults shares a
+single recording and appears once, with every fault it covers listed in
+``x-medkit.fault_codes``. A fault that confirmed several times contributes one
+item per recording it kept (see ``max_bags_per_fault`` below).
+
 **Response:**
 
 .. code-block:: json
@@ -707,13 +715,14 @@ Rosbag files are downloaded via SOVD bulk-data endpoints.
    {
      "items": [
        {
-         "id": "550e8400-e29b-41d4-a716-446655440000",
-         "name": "MOTOR_OVERHEAT recording",
+         "id": "fault_MOTOR_OVERHEAT_1738664999000",
+         "name": "fault_MOTOR_OVERHEAT_1738664999000 recording 2026-02-04T10:30:00.000Z",
          "mimetype": "application/x-mcap",
          "size": 1234567,
          "creation_date": "2026-02-04T10:30:00.000Z",
          "x-medkit": {
-           "fault_code": "MOTOR_OVERHEAT",
+           "fault_codes": ["MOTOR_OVERHEAT"],
+           "recording_id": "fault_MOTOR_OVERHEAT_1738664999000",
            "duration_sec": 6.0,
            "format": "mcap"
          }
@@ -723,12 +732,15 @@ Rosbag files are downloaded via SOVD bulk-data endpoints.
 
 **2. Download a specific rosbag:**
 
-Use the ``bulk_data_uri`` from the fault response, or construct from listing:
+Use the ``bulk_data_uri`` from the fault response, or the descriptor ``id`` from
+the listing. A URL carrying a bare fault code instead of a recording id still
+resolves and serves that fault's newest recording, so addresses built before
+recordings had their own identity keep working.
 
 .. code-block:: bash
 
    # Using bulk_data_uri from fault response
-   curl -O -J http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/550e8400-e29b-41d4-a716-446655440000
+   curl -O -J http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/fault_MOTOR_OVERHEAT_1738664999000
 
 The ``-J`` flag uses the server-provided filename from ``Content-Disposition`` header.
 

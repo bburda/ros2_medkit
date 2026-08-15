@@ -1277,20 +1277,21 @@ std::vector<std::string> RosbagCapture::evict_bags_over_quota(FaultStorage * sto
     return {};
   }
 
-  // get_all_rosbag_files() is one row per fault, and a burst of correlated faults
-  // shares one recording. Group the rows back into bags first: deleting a single
-  // row of a shared bag leaves the directory on disk (a sibling still points at
-  // it), so freeing its bytes per row would drop the running total below the real
-  // one and stop the eviction while the quota is still blown.
+  // get_all_rosbag_files() is one row per (fault, recording) link: a burst of
+  // correlated faults shares one recording, and one fault can hold several. Group
+  // the rows back into bags first: deleting a single row of a shared bag leaves the
+  // directory on disk (a sibling still points at it), so freeing its bytes per row
+  // would drop the running total below the real one and stop the eviction while the
+  // quota is still blown.
   std::vector<std::string> paths_oldest_first;
-  std::unordered_map<std::string, std::vector<std::string>> codes_by_path;
+  std::unordered_map<std::string, std::string> recording_by_path;
   std::unordered_map<std::string, size_t> bytes_by_path;
   for (const auto & bag : storage->get_all_rosbag_files()) {
-    auto & codes = codes_by_path[bag.file_path];
-    if (codes.empty()) {
+    // First row for this path decides its position in the oldest-first order; the
+    // rows arrive sorted, so that is the recording's own age.
+    if (recording_by_path.emplace(bag.file_path, bag.recording_id).second) {
       paths_oldest_first.push_back(bag.file_path);
     }
-    codes.push_back(bag.fault_code);
     // Mirror the storage accounting, which takes the largest row per path.
     auto & bytes = bytes_by_path[bag.file_path];
     bytes = std::max(bytes, bag.size_bytes);
@@ -1302,10 +1303,13 @@ std::vector<std::string> RosbagCapture::evict_bags_over_quota(FaultStorage * sto
       break;
     }
 
-    // One call per bag: the SQLite backend removes the whole burst's rows in a
-    // single transaction and unlinks the directory after the commit, so a crash
-    // mid-eviction cannot leave rows pointing at a removed bag.
-    storage->delete_rosbag_files(codes_by_path[path]);
+    // By RECORDING, not by fault code. The unit being evicted is a bag, and a
+    // fault can now hold several: deleting by code would take this fault's other,
+    // newer recordings with it, and their directories would never be unlinked
+    // because their paths were never collected - invisible to the quota from then
+    // on. One call per bag, so the SQLite backend still removes the whole burst's
+    // rows in one transaction and unlinks after the commit.
+    storage->delete_rosbag_recording(recording_by_path[path]);
     // Saturate rather than wrap: the quota must never be satisfied by underflow.
     current_bytes -= std::min(current_bytes, bytes_by_path[path]);
     evicted.push_back(path);

@@ -437,7 +437,10 @@ class InMemoryFaultStorage : public FaultStorage {
   };
   std::vector<RosbagRow> rosbag_files_;
   uint64_t rosbag_seq_{0};
-  size_t max_rosbags_per_fault_{0};  ///< 0 = unlimited
+  /// Defaults to 1, the pre-#620 behaviour: a new recording replaces the old one.
+  /// A backend constructed directly (tests, embedders) therefore behaves exactly as
+  /// it always did until someone opts into a history. 0 = unlimited.
+  size_t max_rosbags_per_fault_{1};
   DebounceConfig config_;
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
 };
