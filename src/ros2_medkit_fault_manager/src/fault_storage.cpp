@@ -20,6 +20,14 @@
 
 namespace ros2_medkit_fault_manager {
 
+std::string rosbag_recording_id(const std::string & file_path) {
+  std::filesystem::path p(file_path);
+  if (!p.has_filename()) {
+    p = p.parent_path();  // tolerate a trailing slash
+  }
+  return p.filename().string();
+}
+
 int32_t clamp_debounce_counter(int32_t counter, const DebounceConfig & config) {
   // Manual min/max rather than std::clamp: well-defined even if a bad config has lo > hi
   // (sanitize_debounce_config normally prevents that, but the storage layer must never UB).
@@ -385,21 +393,15 @@ std::optional<FreezeFrameData> InMemoryFaultStorage::get_freeze_frame(const std:
   return it->second;
 }
 
-void InMemoryFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
+void InMemoryFaultStorage::set_max_rosbags_per_fault(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
+  max_rosbags_per_fault_ = max_count;
+}
 
-  // Delete existing bag file if present (prevent orphaned files on re-confirm)
-  auto it = rosbag_files_.find(info.fault_code);
-  if (it != rosbag_files_.end()) {
-    if (it->second.file_path != info.file_path &&
-        !path_shared_with_other_fault(it->second.file_path, info.fault_code)) {
-      std::error_code ec;
-      std::filesystem::remove_all(it->second.file_path, ec);
-      // Ignore errors - file may already be deleted
-    }
-  }
-
-  rosbag_files_[info.fault_code] = info;
+void InMemoryFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
+  // Through the batch path deliberately: with a per-fault cap a single store is
+  // insert + trim, and both must publish together.
+  store_rosbag_files({info});
 }
 
 void InMemoryFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> & infos) {
@@ -408,32 +410,73 @@ void InMemoryFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> 
   }
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // Built beside the live map and swapped in, because swap cannot throw. The caller
-  // reads a throw here as "no row was written" and removes the recording, so a batch
-  // that stored half a burst and then threw would leave those rows naming a bag that
-  // is gone. Copying costs one allocation per stored recording, not per message.
+  // Built beside the live vector and swapped in, because swap cannot throw. The
+  // caller reads a throw here as "no row was written" and removes the recording, so
+  // a batch that stored half a burst and then threw would leave those rows naming a
+  // bag that is gone. Copying costs one allocation per stored recording, not per
+  // message. std::vector::swap is noexcept for the default allocator, exactly as
+  // std::map::swap was.
   auto updated = rosbag_files_;
+  uint64_t next_seq = rosbag_seq_;
+  std::set<std::string> evicted;
 
-  std::set<std::string> replaced;
-  for (const auto & info : infos) {
-    auto it = updated.find(info.fault_code);
-    if (it != updated.end() && it->second.file_path != info.file_path) {
-      replaced.insert(it->second.file_path);
+  for (const auto & in : infos) {
+    RosbagFileInfo row = in;
+    if (row.recording_id.empty()) {
+      row.recording_id = rosbag_recording_id(row.file_path);
     }
-    updated[info.fault_code] = info;
+
+    // Upsert on the (fault, recording) LINK - the same grain as the SQLite unique
+    // index. Re-storing the same link refreshes it; a link to a different recording
+    // appends, which is the feature.
+    auto it = std::find_if(updated.begin(), updated.end(), [&row](const RosbagRow & r) {
+      return r.info.fault_code == row.fault_code && r.info.file_path == row.file_path;
+    });
+    if (it != updated.end()) {
+      it->info = row;
+    } else {
+      updated.push_back(RosbagRow{row, ++next_seq});
+    }
+
+    if (max_rosbags_per_fault_ == 0) {
+      continue;
+    }
+
+    // Keep the newest N recordings of this fault, oldest evicted first - the same
+    // direction as evict_bags_over_quota, so the two eviction owners never need a
+    // tiebreak. At N = 1 this is the pre-#620 behaviour exactly.
+    std::vector<size_t> mine;
+    for (size_t i = 0; i < updated.size(); ++i) {
+      if (updated[i].info.fault_code == row.fault_code) {
+        mine.push_back(i);
+      }
+    }
+    if (mine.size() <= max_rosbags_per_fault_) {
+      continue;
+    }
+    std::sort(mine.begin(), mine.end(), [&updated](size_t a, size_t b) {
+      return std::tie(updated[a].info.created_at_ns, updated[a].seq) <
+             std::tie(updated[b].info.created_at_ns, updated[b].seq);
+    });
+    std::vector<size_t> doomed(mine.begin(), mine.begin() + static_cast<std::ptrdiff_t>(mine.size() - max_rosbags_per_fault_));
+    std::sort(doomed.rbegin(), doomed.rend());  // descending, so erase stays valid
+    for (size_t idx : doomed) {
+      evicted.insert(updated[idx].info.file_path);
+      updated.erase(updated.begin() + static_cast<std::ptrdiff_t>(idx));
+    }
   }
+
   rosbag_files_.swap(updated);
+  rosbag_seq_ = next_seq;
 
   // Unlinked only once every row is in, the way the SQLite backend unlinks after its
   // COMMIT: a throw above must leave the old rows pointing at bags that still exist.
-  // Sharing is decided on the finished batch, not on the state before it - two faults
-  // of one burst can have shared the bag being replaced, and checking row by row
-  // beforehand would find it still referenced by the sibling and leak it.
-  for (const auto & path : replaced) {
-    const bool still_referenced = std::any_of(rosbag_files_.begin(), rosbag_files_.end(), [&path](const auto & e) {
-      return e.second.file_path == path;
-    });
-    if (still_referenced) {
+  // Referencing is decided on the finished batch, not on the state before it - two
+  // faults of one burst can share the bag being evicted, and checking row by row
+  // beforehand would find it still held by a sibling that a later iteration then
+  // evicts, leaking the directory.
+  for (const auto & path : evicted) {
+    if (path_referenced(path)) {
       continue;
     }
     std::error_code ec;
@@ -445,38 +488,143 @@ void InMemoryFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> 
 std::optional<RosbagFileInfo> InMemoryFaultStorage::get_rosbag_file(const std::string & fault_code) const {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  auto it = rosbag_files_.find(fault_code);
-  if (it == rosbag_files_.end()) {
+  // Newest, matching the SQLite backend's ORDER BY created_at_ns DESC, id DESC.
+  const RosbagRow * best = nullptr;
+  for (const auto & row : rosbag_files_) {
+    if (row.info.fault_code != fault_code) {
+      continue;
+    }
+    if (best == nullptr ||
+        std::tie(best->info.created_at_ns, best->seq) < std::tie(row.info.created_at_ns, row.seq)) {
+      best = &row;
+    }
+  }
+  if (best == nullptr) {
     return std::nullopt;
   }
-  return it->second;
+  return best->info;
+}
+
+std::vector<RosbagFileInfo> InMemoryFaultStorage::get_rosbag_files(const std::string & fault_code) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::vector<const RosbagRow *> mine;
+  for (const auto & row : rosbag_files_) {
+    if (row.info.fault_code == fault_code) {
+      mine.push_back(&row);
+    }
+  }
+  std::sort(mine.begin(), mine.end(), [](const RosbagRow * a, const RosbagRow * b) {
+    return std::tie(b->info.created_at_ns, b->seq) < std::tie(a->info.created_at_ns, a->seq);  // newest first
+  });
+
+  std::vector<RosbagFileInfo> result;
+  result.reserve(mine.size());
+  for (const auto * row : mine) {
+    result.push_back(row->info);
+  }
+  return result;
+}
+
+std::vector<RosbagFileInfo> InMemoryFaultStorage::get_rosbag_files_by_recording(const std::string & recording_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::vector<RosbagFileInfo> result;
+  for (const auto & row : rosbag_files_) {
+    if (row.info.recording_id == recording_id) {
+      result.push_back(row.info);
+    }
+  }
+  std::sort(result.begin(), result.end(),
+            [](const RosbagFileInfo & a, const RosbagFileInfo & b) { return a.fault_code < b.fault_code; });
+  return result;
 }
 
 bool InMemoryFaultStorage::delete_rosbag_file(const std::string & fault_code) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  auto it = rosbag_files_.find(fault_code);
-  if (it == rosbag_files_.end()) {
+  // ALL recordings of this fault. Used by auto_cleanup on clear, where dropping the
+  // fault's whole black-box history is the intent.
+  std::set<std::string> touched;
+  const size_t before = rosbag_files_.size();
+  for (auto it = rosbag_files_.begin(); it != rosbag_files_.end();) {
+    if (it->info.fault_code == fault_code) {
+      touched.insert(it->info.file_path);
+      it = rosbag_files_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (rosbag_files_.size() == before) {
     return false;
   }
 
-  const std::string file_path = it->second.file_path;
-  rosbag_files_.erase(it);
-
-  // Try to delete the actual file, unless a sibling fault still points at it
-  if (!path_shared_with_other_fault(file_path, fault_code)) {
+  for (const auto & path : touched) {
+    if (path_referenced(path)) {
+      continue;  // a sibling fault of the burst still holds it
+    }
     std::error_code ec;
-    std::filesystem::remove_all(file_path, ec);
+    std::filesystem::remove_all(path, ec);
     // Ignore errors - file may already be deleted
   }
   return true;
 }
 
+bool InMemoryFaultStorage::drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::string path;
+  auto it = std::find_if(rosbag_files_.begin(), rosbag_files_.end(), [&](const RosbagRow & r) {
+    return r.info.fault_code == fault_code && r.info.recording_id == recording_id;
+  });
+  if (it == rosbag_files_.end()) {
+    return false;
+  }
+  path = it->info.file_path;
+  rosbag_files_.erase(it);
+
+  if (!path_referenced(path)) {
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
+  return true;
+}
+
+size_t InMemoryFaultStorage::delete_rosbag_recording(const std::string & recording_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::set<std::string> touched;
+  size_t removed = 0;
+  for (auto it = rosbag_files_.begin(); it != rosbag_files_.end();) {
+    if (it->info.recording_id == recording_id) {
+      touched.insert(it->info.file_path);
+      it = rosbag_files_.erase(it);
+      ++removed;
+    } else {
+      ++it;
+    }
+  }
+
+  for (const auto & path : touched) {
+    if (path_referenced(path)) {
+      continue;
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
+  return removed;
+}
+
 bool InMemoryFaultStorage::path_shared_with_other_fault(const std::string & file_path,
                                                         const std::string & fault_code) const {
-  return std::any_of(rosbag_files_.begin(), rosbag_files_.end(), [&](const auto & entry) {
-    return entry.first != fault_code && entry.second.file_path == file_path;
+  return std::any_of(rosbag_files_.begin(), rosbag_files_.end(), [&](const RosbagRow & row) {
+    return row.info.fault_code != fault_code && row.info.file_path == file_path;
   });
+}
+
+bool InMemoryFaultStorage::path_referenced(const std::string & file_path) const {
+  return std::any_of(rosbag_files_.begin(), rosbag_files_.end(),
+                     [&](const RosbagRow & row) { return row.info.file_path == file_path; });
 }
 
 size_t InMemoryFaultStorage::get_total_rosbag_storage_bytes() const {
@@ -488,9 +636,9 @@ size_t InMemoryFaultStorage::get_total_rosbag_storage_bytes() const {
   // finalised, so take the largest - matching the SQLite backend's MAX() and
   // never under-reporting what is on disk.
   std::map<std::string, size_t> bytes_per_path;
-  for (const auto & [code, info] : rosbag_files_) {
-    auto & bytes = bytes_per_path[info.file_path];
-    bytes = std::max(bytes, info.size_bytes);
+  for (const auto & row : rosbag_files_) {
+    auto & bytes = bytes_per_path[row.info.file_path];
+    bytes = std::max(bytes, row.info.size_bytes);
   }
 
   size_t total = 0;
@@ -503,36 +651,51 @@ size_t InMemoryFaultStorage::get_total_rosbag_storage_bytes() const {
 std::vector<RosbagFileInfo> InMemoryFaultStorage::get_all_rosbag_files() const {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  std::vector<RosbagFileInfo> result;
-  result.reserve(rosbag_files_.size());
-  for (const auto & [code, info] : rosbag_files_) {
-    result.push_back(info);
+  std::vector<const RosbagRow *> rows;
+  rows.reserve(rosbag_files_.size());
+  for (const auto & row : rosbag_files_) {
+    rows.push_back(&row);
   }
 
-  // Sort by creation time (oldest first)
-  std::sort(result.begin(), result.end(), [](const RosbagFileInfo & a, const RosbagFileInfo & b) {
-    return a.created_at_ns < b.created_at_ns;
+  // Oldest first, seq breaking the created_at_ns ties a burst guarantees - the
+  // SQLite side orders by created_at_ns ASC, id ASC for the same reason.
+  std::sort(rows.begin(), rows.end(), [](const RosbagRow * a, const RosbagRow * b) {
+    return std::tie(a->info.created_at_ns, a->seq) < std::tie(b->info.created_at_ns, b->seq);
   });
 
+  std::vector<RosbagFileInfo> result;
+  result.reserve(rows.size());
+  for (const auto * row : rows) {
+    result.push_back(row->info);
+  }
   return result;
 }
 
 std::vector<RosbagFileInfo> InMemoryFaultStorage::list_rosbags_for_entity(const std::string & entity_fqn) const {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  std::vector<RosbagFileInfo> result;
-
-  for (const auto & [fault_code, rosbag_info] : rosbag_files_) {
+  std::vector<const RosbagRow *> rows;
+  for (const auto & row : rosbag_files_) {
     // Check if any of the fault's reporting sources contain this entity
-    auto fault_it = faults_.find(fault_code);
-    if (fault_it != faults_.end()) {
-      const auto & fault_state = fault_it->second;
-      if (fault_state.reporting_sources.find(entity_fqn) != fault_state.reporting_sources.end()) {
-        result.push_back(rosbag_info);
-      }
+    auto fault_it = faults_.find(row.info.fault_code);
+    if (fault_it == faults_.end()) {
+      continue;
+    }
+    const auto & fault_state = fault_it->second;
+    if (fault_state.reporting_sources.find(entity_fqn) != fault_state.reporting_sources.end()) {
+      rows.push_back(&row);
     }
   }
 
+  std::sort(rows.begin(), rows.end(), [](const RosbagRow * a, const RosbagRow * b) {
+    return std::tie(b->info.created_at_ns, b->seq) < std::tie(a->info.created_at_ns, a->seq);  // newest first
+  });
+
+  std::vector<RosbagFileInfo> result;
+  result.reserve(rows.size());
+  for (const auto * row : rows) {
+    result.push_back(row->info);
+  }
   return result;
 }
 

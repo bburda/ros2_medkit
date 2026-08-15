@@ -64,6 +64,8 @@ class SqliteFaultStorage : public FaultStorage {
 
   void set_max_snapshots_per_fault(size_t max_count) override;
 
+  void set_max_rosbags_per_fault(size_t max_count) override;
+
   void store_snapshot(const SnapshotData & snapshot) override;
   std::vector<SnapshotData> get_snapshots(const std::string & fault_code,
                                           const std::string & topic_filter = "") const override;
@@ -74,7 +76,11 @@ class SqliteFaultStorage : public FaultStorage {
   void store_rosbag_file(const RosbagFileInfo & info) override;
   void store_rosbag_files(const std::vector<RosbagFileInfo> & infos) override;
   std::optional<RosbagFileInfo> get_rosbag_file(const std::string & fault_code) const override;
+  std::vector<RosbagFileInfo> get_rosbag_files(const std::string & fault_code) const override;
+  std::vector<RosbagFileInfo> get_rosbag_files_by_recording(const std::string & recording_id) const override;
   bool delete_rosbag_file(const std::string & fault_code) override;
+  bool drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) override;
+  size_t delete_rosbag_recording(const std::string & recording_id) override;
   size_t delete_rosbag_files(const std::vector<std::string> & fault_codes) override;
   size_t get_total_rosbag_storage_bytes() const override;
   std::vector<RosbagFileInfo> get_all_rosbag_files() const override;
@@ -91,6 +97,22 @@ class SqliteFaultStorage : public FaultStorage {
   /// Initialize database schema
   void initialize_schema();
 
+  /// Whether rosbag_files still carries the legacy column-level UNIQUE on
+  /// fault_code. Detected from the schema itself (PRAGMA index_list, origin 'u')
+  /// rather than from a version counter, so a fresh database, a migrated one and
+  /// one migrated by a later release all answer correctly with no bookkeeping.
+  bool rosbag_files_has_unique_constraint() const;
+
+  /// Rebuild rosbag_files without the legacy UNIQUE(fault_code), so one fault can
+  /// hold several recordings. SQLite cannot drop a column constraint in place and
+  /// CREATE TABLE IF NOT EXISTS is a no-op on an existing database, so this is the
+  /// documented table-rebuild procedure. Idempotent; no filesystem side effects.
+  void migrate_rosbag_files_drop_unique();
+
+  /// Add and backfill recording_id on databases that predate it. Backfill runs in
+  /// C++ through rosbag_recording_id() so the basename rule has one implementation.
+  void migrate_rosbag_files_add_recording_id();
+
   /// Whether a fault other than @p fault_code still references @p file_path.
   /// One recording can back several faults of the same burst, so the bag must
   /// only be unlinked once the last of them is gone. Caller holds mutex_.
@@ -101,7 +123,10 @@ class SqliteFaultStorage : public FaultStorage {
 
   /// store_rosbag_file body without taking mutex_. Caller holds mutex_ and
   /// unlinks the returned replaced-bag path once the row change is durable.
-  std::optional<std::string> store_rosbag_file_locked(const RosbagFileInfo & info);
+  /// @return file_paths whose last row for this fault the per-fault cap evicted.
+  /// The caller unlinks each only after the commit, and only if path_referenced()
+  /// still says nobody holds it.
+  std::vector<std::string> store_rosbag_file_locked(const RosbagFileInfo & info);
 
   /// Run a plain SQL statement or throw with the SQLite error. Caller holds mutex_.
   void exec_or_throw(const char * sql);
@@ -117,6 +142,7 @@ class SqliteFaultStorage : public FaultStorage {
   mutable std::mutex mutex_;
   DebounceConfig config_;
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
+  size_t max_rosbags_per_fault_{0};    ///< 0 = unlimited; recordings retained per fault code
 };
 
 }  // namespace ros2_medkit_fault_manager

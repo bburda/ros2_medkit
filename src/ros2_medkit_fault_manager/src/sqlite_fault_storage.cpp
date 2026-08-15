@@ -243,25 +243,212 @@ void SqliteFaultStorage::initialize_schema() {
     throw std::runtime_error("Failed to create freeze_frames table: " + error);
   }
 
-  // Create rosbag_files table for storing time-window bag file metadata
+  // Create rosbag_files table. One row = one LINK (a fault claiming a recording):
+  // several faults of a burst link to one bag, and one fault links to several bags
+  // over time. Bytes belong to file_path, not to the row.
+  //
+  // House rule, learned the hard way here: uniqueness is expressed with
+  // CREATE UNIQUE INDEX, never as a column constraint. The original
+  // `fault_code TEXT NOT NULL UNIQUE` could not be dropped with ALTER TABLE and
+  // forced the full table rebuild in migrate_rosbag_files_drop_unique() below.
+  // A named index would have been one DROP INDEX.
   const char * create_rosbag_files_table_sql = R"(
     CREATE TABLE IF NOT EXISTS rosbag_files (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      fault_code TEXT NOT NULL UNIQUE,
+      fault_code TEXT NOT NULL,
+      recording_id TEXT NOT NULL DEFAULT '',
       file_path TEXT NOT NULL,
       format TEXT NOT NULL,
       duration_sec REAL NOT NULL,
       size_bytes INTEGER NOT NULL,
       created_at_ns INTEGER NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_rosbag_files_fault_code ON rosbag_files(fault_code);
-    CREATE INDEX IF NOT EXISTS idx_rosbag_files_created_at ON rosbag_files(created_at_ns);
   )";
 
   if (sqlite3_exec(db_, create_rosbag_files_table_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
     std::string error = err_msg ? err_msg : "Unknown error";
     sqlite3_free(err_msg);
     throw std::runtime_error("Failed to create rosbag_files table: " + error);
+  }
+
+  // Order matters: drop the legacy constraint before adding the column, so the
+  // rebuild only ever has to copy the old column set.
+  migrate_rosbag_files_drop_unique();
+  migrate_rosbag_files_add_recording_id();
+
+  // Indexes last, so they serve a fresh table and a rebuilt one alike.
+  //
+  // idx_rosbag_files_path is capability, not tuning: path_referenced() and
+  // path_shared_with_other_fault() scan on file_path on every delete, against a
+  // table that now holds N rows per fault instead of one.
+  const char * create_rosbag_files_indexes_sql = R"(
+    CREATE INDEX IF NOT EXISTS idx_rosbag_files_fault_code ON rosbag_files(fault_code);
+    CREATE INDEX IF NOT EXISTS idx_rosbag_files_created_at ON rosbag_files(created_at_ns);
+    CREATE INDEX IF NOT EXISTS idx_rosbag_files_fault_created ON rosbag_files(fault_code, created_at_ns, id);
+    CREATE INDEX IF NOT EXISTS idx_rosbag_files_recording ON rosbag_files(recording_id);
+    CREATE INDEX IF NOT EXISTS idx_rosbag_files_path ON rosbag_files(file_path);
+  )";
+
+  if (sqlite3_exec(db_, create_rosbag_files_indexes_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = err_msg ? err_msg : "Unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create rosbag_files indexes: " + error);
+  }
+
+  // The grain the old UNIQUE was reaching for, expressed correctly. Keyed on
+  // file_path rather than recording_id: file_path is the identity of the thing on
+  // disk. Two bags in different directories sharing a basename would, under a
+  // recording_id key, make the second store silently REPLACE the first - a lost
+  // recording. Under a file_path key the same collision is only a mislabelled
+  // download. Deduplicate first, because a legacy database rebuilt above may hold
+  // rows this index would reject.
+  if (sqlite3_exec(db_,
+                   "DELETE FROM rosbag_files WHERE id NOT IN "
+                   "(SELECT MAX(id) FROM rosbag_files GROUP BY fault_code, file_path)",
+                   nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = err_msg ? err_msg : "Unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to deduplicate rosbag_files rows: " + error);
+  }
+
+  if (sqlite3_exec(db_,
+                   "CREATE UNIQUE INDEX IF NOT EXISTS idx_rosbag_files_fault_path "
+                   "ON rosbag_files(fault_code, file_path)",
+                   nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = err_msg ? err_msg : "Unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create rosbag_files unique index: " + error);
+  }
+}
+
+bool SqliteFaultStorage::rosbag_files_has_unique_constraint() const {
+  // origin 'u' == an index SQLite created for a UNIQUE table/column constraint,
+  // which ALTER TABLE cannot drop. 'c' == CREATE [UNIQUE] INDEX, which it can.
+  // The INTEGER PRIMARY KEY AUTOINCREMENT is a rowid alias and produces no
+  // index_list row at all, so it cannot be mistaken for one, and our own
+  // idx_rosbag_files_fault_path reports 'c'. That asymmetry is the whole reason
+  // this probe works without a version counter to maintain.
+  SqliteStatement info(db_, "PRAGMA index_list(rosbag_files)");
+  while (info.step() == SQLITE_ROW) {
+    if (info.column_text(3) == "u") {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SqliteFaultStorage::migrate_rosbag_files_drop_unique() {
+  if (!rosbag_files_has_unique_constraint()) {
+    return;  // fresh table, or already migrated - safe to re-run on every open
+  }
+
+  // SQLite's documented table-rebuild procedure. No filesystem side effects: the
+  // migration only moves rows, and it must NOT interpret a row whose bag is gone
+  // as garbage - with the default storage_path the bags live in the system temp
+  // directory and legitimately vanish across a reboot.
+  char * err_msg = nullptr;
+  const auto exec = [this, &err_msg](const char * sql, const char * what) {
+    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+      std::string error = err_msg ? err_msg : "Unknown error";
+      sqlite3_free(err_msg);
+      err_msg = nullptr;
+      throw std::runtime_error(std::string("rosbag_files migration failed (") + what + "): " + error);
+    }
+  };
+
+  exec("BEGIN IMMEDIATE", "begin");
+  try {
+    exec(
+        "CREATE TABLE rosbag_files_new ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " fault_code TEXT NOT NULL,"
+        " recording_id TEXT NOT NULL DEFAULT '',"
+        " file_path TEXT NOT NULL,"
+        " format TEXT NOT NULL,"
+        " duration_sec REAL NOT NULL,"
+        " size_bytes INTEGER NOT NULL,"
+        " created_at_ns INTEGER NOT NULL)",
+        "create new table");
+
+    // ORDER BY id so the fresh autoincrement ids preserve the old relative order.
+    // Every read below breaks created_at_ns ties by id, and a burst writes one
+    // created_at_ns for all its rows, so that tiebreak is load-bearing.
+    // recording_id stays '' here and is filled by the next migration step, which
+    // also has to serve a database that only lacks the column.
+    exec(
+        "INSERT INTO rosbag_files_new "
+        "(fault_code, recording_id, file_path, format, duration_sec, size_bytes, created_at_ns) "
+        "SELECT fault_code, '', file_path, format, duration_sec, size_bytes, created_at_ns "
+        "FROM rosbag_files ORDER BY id",
+        "copy rows");
+
+    exec("DROP TABLE rosbag_files", "drop old table");
+    exec("ALTER TABLE rosbag_files_new RENAME TO rosbag_files", "rename");
+    exec("COMMIT", "commit");
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
+  }
+}
+
+void SqliteFaultStorage::migrate_rosbag_files_add_recording_id() {
+  bool has_recording_id = false;
+  {
+    SqliteStatement info(db_, "PRAGMA table_info(rosbag_files)");
+    while (info.step() == SQLITE_ROW) {
+      if (info.column_text(1) == "recording_id") {
+        has_recording_id = true;
+        break;
+      }
+    }
+  }
+
+  char * err_msg = nullptr;
+  if (!has_recording_id) {
+    if (sqlite3_exec(db_, "ALTER TABLE rosbag_files ADD COLUMN recording_id TEXT NOT NULL DEFAULT ''", nullptr, nullptr,
+                     &err_msg) != SQLITE_OK) {
+      std::string error = err_msg ? err_msg : "Unknown error";
+      sqlite3_free(err_msg);
+      throw std::runtime_error("Failed to add recording_id column: " + error);
+    }
+  }
+
+  // Backfill in C++ rather than SQL. SQLite has no basename function, and the
+  // pure-SQL substitute is an unreadable nest of rtrim/replace that is correct only
+  // by a slash-counting argument. Going through rosbag_recording_id() means the
+  // invariant recording_id == basename(file_path) holds by construction, because
+  // new inserts call the same function.
+  std::vector<std::pair<int64_t, std::string>> pending;
+  {
+    SqliteStatement select(db_, "SELECT id, file_path FROM rosbag_files WHERE recording_id = ''");
+    while (select.step() == SQLITE_ROW) {
+      pending.emplace_back(select.column_int64(0), select.column_text(1));
+    }
+  }
+  if (pending.empty()) {
+    return;
+  }
+
+  if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = err_msg ? err_msg : "Unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to begin recording_id backfill: " + error);
+  }
+  try {
+    for (const auto & [row_id, file_path] : pending) {
+      SqliteStatement update(db_, "UPDATE rosbag_files SET recording_id = ? WHERE id = ?");
+      update.bind_text(1, rosbag_recording_id(file_path));
+      update.bind_int64(2, row_id);
+      update.step();
+    }
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+      std::string error = err_msg ? err_msg : "Unknown error";
+      sqlite3_free(err_msg);
+      throw std::runtime_error("Failed to commit recording_id backfill: " + error);
+    }
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
   }
 }
 
@@ -917,13 +1104,16 @@ void SqliteFaultStorage::exec_or_throw(const char * sql) {
   }
 }
 
-void SqliteFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
+void SqliteFaultStorage::set_max_rosbags_per_fault(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
-  const auto replaced = store_rosbag_file_locked(info);
-  if (replaced) {
-    std::error_code ec;
-    std::filesystem::remove_all(*replaced, ec);
-  }
+  max_rosbags_per_fault_ = max_count;
+}
+
+void SqliteFaultStorage::store_rosbag_file(const RosbagFileInfo & info) {
+  // Routed through the batch path deliberately: with a per-fault cap a single
+  // store is insert + trim, i.e. several statements that must share one
+  // transaction and one post-commit unlink pass.
+  store_rosbag_files({info});
 }
 
 void SqliteFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> & infos) {
@@ -933,71 +1123,238 @@ void SqliteFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> & 
   std::lock_guard<std::mutex> lock(mutex_);
 
   // One transaction for the whole burst: a crash mid-store must not leave some
-  // faults of the shared recording without their lookup row. Replaced bags are
-  // unlinked only after COMMIT - a ROLLBACK resurrects the old rows, which must
-  // keep pointing at bags that still exist.
-  std::vector<std::string> replaced;
+  // faults of the shared recording without their lookup row. Evicted bags are
+  // unlinked only after COMMIT - a ROLLBACK resurrects the rows, which must keep
+  // pointing at bags that still exist.
+  std::vector<std::string> evicted;
   exec_or_throw("BEGIN IMMEDIATE");
   try {
     for (const auto & info : infos) {
-      if (auto old_path = store_rosbag_file_locked(info)) {
-        replaced.push_back(*std::move(old_path));
-      }
+      auto paths = store_rosbag_file_locked(info);
+      evicted.insert(evicted.end(), std::make_move_iterator(paths.begin()), std::make_move_iterator(paths.end()));
     }
     exec_or_throw("COMMIT");
   } catch (...) {
     sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
     throw;
   }
-  for (const auto & path : replaced) {
+
+  // Referencing is re-checked on the committed state, not on the state each
+  // eviction saw: two faults of one burst can link the same bag, and a row-by-row
+  // check inside the loop would find it still held by a sibling that a later
+  // iteration then evicts, leaking the directory.
+  std::set<std::string> unique_paths(evicted.begin(), evicted.end());
+  for (const auto & path : unique_paths) {
+    if (path_referenced(path)) {
+      continue;
+    }
     std::error_code ec;
     std::filesystem::remove_all(path, ec);
   }
 }
 
-std::optional<std::string> SqliteFaultStorage::store_rosbag_file_locked(const RosbagFileInfo & info) {
-  // A re-confirm replaces the row; report the orphaned old bag to the caller,
-  // which unlinks it once the row change is durable.
-  std::optional<std::string> replaced;
-  {
-    SqliteStatement query_stmt(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ?");
-    query_stmt.bind_text(1, info.fault_code);
-    if (query_stmt.step() == SQLITE_ROW) {
-      std::string old_path = query_stmt.column_text(0);
-      if (old_path != info.file_path && !path_shared_with_other_fault(old_path, info.fault_code)) {
-        replaced = std::move(old_path);
-      }
-    }
+std::vector<std::string> SqliteFaultStorage::store_rosbag_file_locked(const RosbagFileInfo & info) {
+  RosbagFileInfo row = info;
+  if (row.recording_id.empty()) {
+    row.recording_id = rosbag_recording_id(row.file_path);
   }
 
-  // Use INSERT OR REPLACE to handle updates (fault_code is UNIQUE)
+  // Upserts on idx_rosbag_files_fault_path, i.e. on the (fault, recording) link.
+  // Re-storing the SAME link refreshes it; a link to a DIFFERENT recording is a new
+  // row now, which is the feature. Nothing is unlinked here - byte lifetime is the
+  // cap's business below, and the caller's, after the commit.
   SqliteStatement stmt(db_,
                        "INSERT OR REPLACE INTO rosbag_files "
-                       "(fault_code, file_path, format, duration_sec, size_bytes, created_at_ns) "
-                       "VALUES (?, ?, ?, ?, ?, ?)");
+                       "(fault_code, recording_id, file_path, format, duration_sec, size_bytes, created_at_ns) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)");
 
-  stmt.bind_text(1, info.fault_code);
-  stmt.bind_text(2, info.file_path);
-  stmt.bind_text(3, info.format);
+  stmt.bind_text(1, row.fault_code);
+  stmt.bind_text(2, row.recording_id);
+  stmt.bind_text(3, row.file_path);
+  stmt.bind_text(4, row.format);
   // Bind duration_sec as a double using sqlite3_bind_double directly
-  if (sqlite3_bind_double(stmt.get(), 4, info.duration_sec) != SQLITE_OK) {
+  if (sqlite3_bind_double(stmt.get(), 5, row.duration_sec) != SQLITE_OK) {
     throw std::runtime_error(std::string("Failed to bind duration_sec: ") + sqlite3_errmsg(db_));
   }
-  stmt.bind_int64(5, static_cast<int64_t>(info.size_bytes));
-  stmt.bind_int64(6, info.created_at_ns);
+  stmt.bind_int64(6, static_cast<int64_t>(row.size_bytes));
+  stmt.bind_int64(7, row.created_at_ns);
 
   if (stmt.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to store rosbag file: ") + sqlite3_errmsg(db_));
   }
-  return replaced;
+
+  if (max_rosbags_per_fault_ == 0) {
+    return {};  // unlimited per fault; only the global byte quota bounds this
+  }
+
+  // Keep the newest N recordings of this fault. Oldest-first eviction, the same
+  // direction as evict_bags_over_quota, so the two eviction owners never need a
+  // tiebreak. At N = 1 this reproduces the pre-#620 behaviour exactly: the new
+  // recording replaces the old and the old bag is unlinked.
+  const char * const doomed_sql =
+      "FROM rosbag_files WHERE fault_code = ?1 AND id NOT IN "
+      "(SELECT id FROM rosbag_files WHERE fault_code = ?1 "
+      " ORDER BY created_at_ns DESC, id DESC LIMIT ?2)";
+
+  std::vector<std::string> evicted;
+  {
+    SqliteStatement select(db_, (std::string("SELECT DISTINCT file_path ") + doomed_sql).c_str());
+    select.bind_text(1, row.fault_code);
+    select.bind_int64(2, static_cast<int64_t>(max_rosbags_per_fault_));
+    while (select.step() == SQLITE_ROW) {
+      evicted.push_back(select.column_text(0));
+    }
+  }
+  if (evicted.empty()) {
+    return {};
+  }
+
+  SqliteStatement del(db_, (std::string("DELETE ") + doomed_sql).c_str());
+  del.bind_text(1, row.fault_code);
+  del.bind_int64(2, static_cast<int64_t>(max_rosbags_per_fault_));
+  if (del.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to trim rosbag rows: ") + sqlite3_errmsg(db_));
+  }
+  return evicted;
+}
+
+namespace {
+
+/// Shared projection so every rosbag read decodes the same column order.
+RosbagFileInfo read_rosbag_row(SqliteStatement & stmt) {
+  RosbagFileInfo info;
+  info.fault_code = stmt.column_text(0);
+  info.recording_id = stmt.column_text(1);
+  info.file_path = stmt.column_text(2);
+  info.format = stmt.column_text(3);
+  info.duration_sec = sqlite3_column_double(stmt.get(), 4);
+  info.size_bytes = static_cast<size_t>(stmt.column_int64(5));
+  info.created_at_ns = stmt.column_int64(6);
+  return info;
+}
+
+constexpr const char * kRosbagColumns =
+    "fault_code, recording_id, file_path, format, duration_sec, size_bytes, created_at_ns";
+
+}  // namespace
+
+std::vector<RosbagFileInfo> SqliteFaultStorage::get_rosbag_files(const std::string & fault_code) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  SqliteStatement stmt(db_, (std::string("SELECT ") + kRosbagColumns +
+                             " FROM rosbag_files WHERE fault_code = ? ORDER BY created_at_ns DESC, id DESC")
+                                .c_str());
+  stmt.bind_text(1, fault_code);
+
+  std::vector<RosbagFileInfo> result;
+  while (stmt.step() == SQLITE_ROW) {
+    result.push_back(read_rosbag_row(stmt));
+  }
+  return result;
+}
+
+std::vector<RosbagFileInfo> SqliteFaultStorage::get_rosbag_files_by_recording(const std::string & recording_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  SqliteStatement stmt(db_, (std::string("SELECT ") + kRosbagColumns +
+                             " FROM rosbag_files WHERE recording_id = ? ORDER BY fault_code ASC")
+                                .c_str());
+  stmt.bind_text(1, recording_id);
+
+  std::vector<RosbagFileInfo> result;
+  while (stmt.step() == SQLITE_ROW) {
+    result.push_back(read_rosbag_row(stmt));
+  }
+  return result;
+}
+
+bool SqliteFaultStorage::drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::string path;
+  {
+    SqliteStatement select(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ? AND recording_id = ?");
+    select.bind_text(1, fault_code);
+    select.bind_text(2, recording_id);
+    if (select.step() != SQLITE_ROW) {
+      return false;
+    }
+    path = select.column_text(0);
+  }
+
+  exec_or_throw("BEGIN IMMEDIATE");
+  try {
+    SqliteStatement del(db_, "DELETE FROM rosbag_files WHERE fault_code = ? AND recording_id = ?");
+    del.bind_text(1, fault_code);
+    del.bind_text(2, recording_id);
+    if (del.step() != SQLITE_DONE) {
+      throw std::runtime_error(std::string("Failed to drop rosbag link: ") + sqlite3_errmsg(db_));
+    }
+    exec_or_throw("COMMIT");
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
+  }
+
+  if (!path_referenced(path)) {
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
+  return true;
+}
+
+size_t SqliteFaultStorage::delete_rosbag_recording(const std::string & recording_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::set<std::string> paths;
+  {
+    SqliteStatement select(db_, "SELECT DISTINCT file_path FROM rosbag_files WHERE recording_id = ?");
+    select.bind_text(1, recording_id);
+    while (select.step() == SQLITE_ROW) {
+      paths.insert(select.column_text(0));
+    }
+  }
+  if (paths.empty()) {
+    return 0;
+  }
+
+  size_t removed = 0;
+  exec_or_throw("BEGIN IMMEDIATE");
+  try {
+    SqliteStatement del(db_, "DELETE FROM rosbag_files WHERE recording_id = ?");
+    del.bind_text(1, recording_id);
+    if (del.step() != SQLITE_DONE) {
+      throw std::runtime_error(std::string("Failed to delete rosbag recording: ") + sqlite3_errmsg(db_));
+    }
+    removed = static_cast<size_t>(sqlite3_changes(db_));
+    exec_or_throw("COMMIT");
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
+  }
+
+  for (const auto & path : paths) {
+    if (path_referenced(path)) {
+      continue;  // another recording writes into the same directory - leave it
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
+  return removed;
 }
 
 std::optional<RosbagFileInfo> SqliteFaultStorage::get_rosbag_file(const std::string & fault_code) const {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  // ORDER BY is load-bearing now that a fault can hold several recordings. Without
+  // it SQLite may return any matching row, so the fault detail and the download
+  // would serve an arbitrary recording - non-deterministically, which no test
+  // catches reliably. id breaks the tie because a burst stamps one created_at_ns
+  // across all its rows.
   SqliteStatement stmt(db_,
-                       "SELECT fault_code, file_path, format, duration_sec, size_bytes, created_at_ns "
-                       "FROM rosbag_files WHERE fault_code = ?");
+                       "SELECT fault_code, recording_id, file_path, format, duration_sec, size_bytes, created_at_ns "
+                       "FROM rosbag_files WHERE fault_code = ? "
+                       "ORDER BY created_at_ns DESC, id DESC LIMIT 1");
   stmt.bind_text(1, fault_code);
 
   if (stmt.step() != SQLITE_ROW) {
@@ -1006,11 +1363,12 @@ std::optional<RosbagFileInfo> SqliteFaultStorage::get_rosbag_file(const std::str
 
   RosbagFileInfo info;
   info.fault_code = stmt.column_text(0);
-  info.file_path = stmt.column_text(1);
-  info.format = stmt.column_text(2);
-  info.duration_sec = sqlite3_column_double(stmt.get(), 3);
-  info.size_bytes = static_cast<size_t>(stmt.column_int64(4));
-  info.created_at_ns = stmt.column_int64(5);
+  info.recording_id = stmt.column_text(1);
+  info.file_path = stmt.column_text(2);
+  info.format = stmt.column_text(3);
+  info.duration_sec = sqlite3_column_double(stmt.get(), 4);
+  info.size_bytes = static_cast<size_t>(stmt.column_int64(5));
+  info.created_at_ns = stmt.column_int64(6);
 
   return info;
 }
@@ -1136,17 +1494,18 @@ std::vector<RosbagFileInfo> SqliteFaultStorage::get_all_rosbag_files() const {
   std::vector<RosbagFileInfo> result;
 
   SqliteStatement stmt(db_,
-                       "SELECT fault_code, file_path, format, duration_sec, size_bytes, created_at_ns "
-                       "FROM rosbag_files ORDER BY created_at_ns ASC");
+                       "SELECT fault_code, recording_id, file_path, format, duration_sec, size_bytes, created_at_ns "
+                       "FROM rosbag_files ORDER BY created_at_ns ASC, id ASC");
 
   while (stmt.step() == SQLITE_ROW) {
     RosbagFileInfo info;
     info.fault_code = stmt.column_text(0);
-    info.file_path = stmt.column_text(1);
-    info.format = stmt.column_text(2);
-    info.duration_sec = sqlite3_column_double(stmt.get(), 3);
-    info.size_bytes = static_cast<size_t>(stmt.column_int64(4));
-    info.created_at_ns = stmt.column_int64(5);
+    info.recording_id = stmt.column_text(1);
+    info.file_path = stmt.column_text(2);
+    info.format = stmt.column_text(3);
+    info.duration_sec = sqlite3_column_double(stmt.get(), 4);
+    info.size_bytes = static_cast<size_t>(stmt.column_int64(5));
+    info.created_at_ns = stmt.column_int64(6);
     result.push_back(info);
   }
 
@@ -1162,22 +1521,24 @@ std::vector<RosbagFileInfo> SqliteFaultStorage::list_rosbags_for_entity(const st
   // Use json_each() for proper JSON array querying instead of LIKE, which treats
   // '_' as a single-char wildcard and would produce false positives on ROS names.
   SqliteStatement stmt(db_,
-                       "SELECT r.fault_code, r.file_path, r.format, r.duration_sec, r.size_bytes, "
+                       "SELECT r.fault_code, r.recording_id, r.file_path, r.format, r.duration_sec, r.size_bytes, "
                        "r.created_at_ns "
                        "FROM rosbag_files r "
                        "JOIN faults f ON r.fault_code = f.fault_code "
-                       "JOIN json_each(f.reporting_sources) j ON j.value = ?");
+                       "JOIN json_each(f.reporting_sources) j ON j.value = ? "
+                       "ORDER BY r.created_at_ns DESC, r.id DESC");
 
   stmt.bind_text(1, entity_fqn);
 
   while (stmt.step() == SQLITE_ROW) {
     RosbagFileInfo info;
     info.fault_code = stmt.column_text(0);
-    info.file_path = stmt.column_text(1);
-    info.format = stmt.column_text(2);
-    info.duration_sec = sqlite3_column_double(stmt.get(), 3);
-    info.size_bytes = static_cast<size_t>(stmt.column_int64(4));
-    info.created_at_ns = stmt.column_int64(5);
+    info.recording_id = stmt.column_text(1);
+    info.file_path = stmt.column_text(2);
+    info.format = stmt.column_text(3);
+    info.duration_sec = sqlite3_column_double(stmt.get(), 4);
+    info.size_bytes = static_cast<size_t>(stmt.column_int64(5));
+    info.created_at_ns = stmt.column_int64(6);
     result.push_back(info);
   }
 
