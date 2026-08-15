@@ -37,7 +37,9 @@ string message_type
 
 # --- Rosbag fields (empty for freeze_frame type) ---
 
-# Identifier for bulk-data download (set to fault_code)
+# Identifier for bulk-data download. For a rosbag this is the RECORDING id (the
+# bag directory basename), not the fault code: one fault can hold several
+# recordings and each needs its own address.
 string bulk_data_id
 
 # File size in bytes

@@ -406,7 +406,12 @@ FaultResult Ros2FaultServiceTransport::get_snapshots(const std::string & fault_c
 FaultResult Ros2FaultServiceTransport::get_rosbag(const std::string & fault_code) {
   FaultResult result;
 
+  // The parameter is the bulk-data id, which is a recording id. It is sent in BOTH
+  // fields: the fault manager prefers recording_id and falls back to fault_code,
+  // which is what keeps a pre-#620 URL (and every existing .test.py that calls this
+  // service with a fault code) working unchanged.
   auto request = std::make_shared<ros2_medkit_msgs::srv::GetRosbag::Request>();
+  request->recording_id = fault_code;
   request->fault_code = fault_code;
 
   auto response = invoke_fault_service<ros2_medkit_msgs::srv::GetRosbag>(
@@ -420,10 +425,9 @@ FaultResult Ros2FaultServiceTransport::get_rosbag(const std::string & fault_code
   result.success = response->success;
 
   if (response->success) {
-    result.data = {{"file_path", response->file_path},
-                   {"format", response->format},
-                   {"duration_sec", response->duration_sec},
-                   {"size_bytes", response->size_bytes}};
+    result.data = {{"file_path", response->file_path},       {"recording_id", response->recording_id},
+                   {"fault_codes", response->fault_codes},   {"format", response->format},
+                   {"duration_sec", response->duration_sec}, {"size_bytes", response->size_bytes}};
   } else {
     result.error_message = response->error_message;
   }
@@ -450,15 +454,14 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
   if (response->success) {
     // The response uses parallel arrays. Trust nothing about the remote
     // service: a server bug or schema drift could ship arrays of different
-    // lengths, and indexing past end-of-vector is UB. Take the shortest
-    // length and surface the mismatch rather than silently truncate.
+    // lengths, and indexing past end-of-vector is UB. Any array that does not
+    // match fault_codes is reported as a mismatch rather than silently truncated.
     const size_t n = response->fault_codes.size();
-    const size_t shortest = std::min({n, response->file_paths.size(), response->formats.size(),
-                                      response->durations_sec.size(), response->sizes_bytes.size()});
-    if (shortest != n || response->file_paths.size() != n || response->formats.size() != n ||
+    if (response->recording_ids.size() != n || response->file_paths.size() != n || response->formats.size() != n ||
         response->durations_sec.size() != n || response->sizes_bytes.size() != n) {
       result.success = false;
       result.error_message = "ListRosbags response has mismatched array sizes (fault_codes=" + std::to_string(n) +
+                             ", recording_ids=" + std::to_string(response->recording_ids.size()) +
                              ", file_paths=" + std::to_string(response->file_paths.size()) +
                              ", formats=" + std::to_string(response->formats.size()) +
                              ", durations_sec=" + std::to_string(response->durations_sec.size()) +
@@ -468,6 +471,7 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
     json rosbags = json::array();
     for (size_t i = 0; i < n; ++i) {
       rosbags.push_back({{"fault_code", response->fault_codes[i]},
+                         {"recording_id", response->recording_ids[i]},
                          {"file_path", response->file_paths[i]},
                          {"format", response->formats[i]},
                          {"duration_sec", response->durations_sec[i]},

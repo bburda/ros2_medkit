@@ -935,7 +935,7 @@ class RosbagMetadataFailingStorage : public InMemoryFaultStorage {
 /// are durable and the bag they name must survive the failure.
 class RosbagQuotaSweepFailingStorage : public InMemoryFaultStorage {
  public:
-  size_t delete_rosbag_files(const std::vector<std::string> & /*fault_codes*/) override {
+  size_t delete_rosbag_recording(const std::string & /*recording_id*/) override {
     ++sweep_attempts;
     throw std::runtime_error("quota sweep unavailable");
   }

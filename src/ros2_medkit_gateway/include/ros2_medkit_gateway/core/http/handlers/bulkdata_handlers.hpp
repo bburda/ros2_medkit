@@ -15,6 +15,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -130,18 +131,62 @@ std::vector<std::string> compute_bulkdata_source_filters(const ThreadSafeEntityC
                                                          const EntityInfo & entity);
 
 /**
- * @brief Shared-recording identifier for a rosbag descriptor.
+ * @brief Identity of a rosbag recording, derived from its path.
  *
- * Faults confirmed in one burst share a single recording, and each fault gets
- * its own descriptor with the full bag size. The bag directory basename (e.g.
- * ``fault_MOTOR_OVERHEAT_1738662600000``) identifies the recording, so clients
- * can group descriptors that serve the same bytes. Empty when the path is
- * empty or has no usable basename.
+ * The bag directory basename (e.g. ``fault_MOTOR_OVERHEAT_1738662600000``) is
+ * the recording's public name: it addresses the bag under
+ * ``/bulk-data/rosbags/{id}`` and groups the link rows that serve the same
+ * bytes. The fault manager stores the same value; this derivation is the
+ * fallback for a peer or a replay that predates the stored field. Empty when
+ * the path is empty or has no usable basename.
  *
  * @param file_path Bag path as stored by the fault manager (directory)
  * @return Basename of the bag directory, or empty string
  */
 std::string rosbag_recording_id(const std::string & file_path);
+
+/**
+ * @brief Fault codes a rosbag download is authorized against.
+ *
+ * A recording is shared by every fault of a burst, so ownership is the union
+ * over those faults rather than a single code: the entity that owns any one of
+ * them may download the bag. That grants nothing new - before recordings had
+ * their own identity, each of those faults already addressed its own copy of
+ * the same bytes - it only renames the door.
+ *
+ * When the wire carries no ``fault_codes`` the response came from a peer that
+ * predates the field, where the addressed id *was* the fault code; authorizing
+ * against the requested id then reproduces the previous check exactly.
+ *
+ * @param rosbag_data Rosbag response from the fault manager
+ * @param requested_id The ``{file_id}`` path segment the client asked for
+ * @return Non-empty list of fault codes to test against the entity's scope
+ */
+std::vector<std::string> rosbag_attached_fault_codes(const nlohmann::json & rosbag_data,
+                                                     const std::string & requested_id);
+
+/**
+ * @brief Fold rosbag link rows into one descriptor per recording.
+ *
+ * The fault manager returns one row per ``(fault, recording)`` link, so a burst
+ * of correlated faults arrives as several rows naming one bag, and one fault
+ * can name several bags. Emitting one descriptor per row would repeat an id and
+ * report the full bag size once per attached fault, which reads as several bags
+ * worth of storage. Rows are therefore grouped by recording, the attached codes
+ * collected into ``x-medkit.fault_codes`` (sorted, so the output is stable), and
+ * the recording dated by the earliest fault of its burst. Rows with neither a
+ * recording id nor a usable path are dropped - nothing could address them.
+ *
+ * Order follows first appearance, which is the order the fault manager listed
+ * the rows in.
+ *
+ * @param rows Rosbag rows as returned by the fault manager
+ * @param faults_by_code Faults keyed by code, for timestamp enrichment
+ * @return One descriptor per distinct recording
+ */
+std::vector<dto::BulkDataDescriptor>
+fold_rosbag_rows_into_descriptors(const std::vector<nlohmann::json> & rows,
+                                  const std::unordered_map<std::string, nlohmann::json> & faults_by_code);
 
 }  // namespace detail
 

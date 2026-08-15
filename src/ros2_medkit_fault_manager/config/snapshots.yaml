@@ -145,7 +145,8 @@ rosbag:
 
   # Storage path for bag files (default: "" = system temp directory)
   # Empty string uses /tmp/rosbag_snapshots/
-  # Bag files are named: {fault_code}_{timestamp}/
+  # Bag files are named: fault_{fault_code}_{timestamp}/ and that directory name is
+  # the recording's public id - the last segment of its bulk-data URL.
   storage_path: ""
 
   # Maximum size per bag file in MB (default: 50)
@@ -153,8 +154,22 @@ rosbag:
   max_bag_size_mb: 50
 
   # Maximum total storage for all bag files in MB (default: 500)
-  # Oldest bags are deleted when this limit is exceeded
+  # Oldest bags are deleted when this limit is exceeded. This is the real disk bound;
+  # max_bags_per_fault below only decides how the budget is shared out.
   max_total_storage_mb: 500
+
+  # Recordings kept per fault code (default: 1, 0 = unlimited)
+  # A fault that keeps re-confirming leaves a trail of black boxes instead of only
+  # the latest one. Past the cap the fault's OLDEST recording is dropped, and the bag
+  # is deleted once no fault still references it (a burst shares one recording).
+  #
+  # 1 is the historical behaviour: each re-confirmation replaces the previous bag.
+  # 3 is a good starting point for an intermittent fault you are chasing.
+  #
+  # Think of this as fairness rather than depth: the disk is bounded by
+  # max_total_storage_mb either way, and a high value lets one flapping fault consume
+  # the budget and evict every other fault's recording.
+  max_bags_per_fault: 1
 
   # Maximum in-memory ring buffer size in MB (default: 256)
   # Oldest buffered messages are dropped once the buffer exceeds this, so a broad

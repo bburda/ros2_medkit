@@ -136,6 +136,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_sqlite_storage fault_manager_lib)
   medkit_target_dependencies(test_sqlite_storage rclcpp ros2_medkit_msgs)
 
+  # Rosbag retention parity: every assertion runs against both storage backends.
+  medkit_add_gtest(test_rosbag_storage_parity test/test_rosbag_storage_parity.cpp)
+  target_link_libraries(test_rosbag_storage_parity fault_manager_lib)
+  medkit_target_dependencies(test_rosbag_storage_parity rclcpp ros2_medkit_msgs)
+
   # Fault audit log tests (hash chain, verify, rotation, reopen)
   medkit_add_gtest(test_fault_audit_log test/test_fault_audit_log.cpp)
   target_link_libraries(test_fault_audit_log fault_manager_lib)
@@ -188,6 +193,12 @@ if(BUILD_TESTING)
     TIMEOUT 60 LABELS "integration")
 
   medkit_add_launch_test(test_rosbag_entity_scope test/test_rosbag_entity_scope.test.py TIMEOUT 120
+    LABELS "integration")
+
+  # The only suite running above max_bags_per_fault=1: drives confirm / clear /
+  # confirm on one code and asserts both recordings survive and stay separately
+  # addressable. Six occurrences plus their post-roll windows, hence the timeout.
+  medkit_add_launch_test(test_rosbag_history test/test_rosbag_history.test.py TIMEOUT 240
     LABELS "integration")
 
   # Parametrized over both storage formats (sqlite3 + mcap), so the launch

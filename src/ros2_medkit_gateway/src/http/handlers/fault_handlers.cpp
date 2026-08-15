@@ -335,26 +335,27 @@ dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_jso
           snap["x-medkit"]["source_timestamp"] = s["source_timestamp"];
         }
       } else if (snapshot_type == "rosbag") {
-        // Build absolute URI using entity path + fault_code as the bulk-data ID.
-        // This must match the download handler which looks up rosbags by fault_code,
-        // and list_descriptors which also uses fault_code as the descriptor ID.
-        // A malformed rosbag snapshot missing fault_code is a transport-side
-        // bug: we still fall back to the parent fault's code to preserve a
-        // usable bulk-data URI, but we log a WARN so operators notice.
-        std::string snap_fault_code;
-        if (s.contains("fault_code") && s["fault_code"].is_string()) {
-          snap_fault_code = s["fault_code"].get<std::string>();
+        // Build the absolute URI from the RECORDING id the transport supplied. It
+        // must match list_descriptors, which uses the same value as the descriptor
+        // id, and the download handler, which resolves it back to a recording.
+        //
+        // No fallback to the parent fault code any more. A fault can hold several
+        // recordings, so substituting its code would advertise one URL for all of
+        // them and serve whichever the compatibility path happened to pick. Better
+        // to omit the URI and say so: the snapshot still carries its size, duration
+        // and format, and the bulk-data listing remains a complete route to the bag.
+        if (s.contains("bulk_data_id") && s["bulk_data_id"].is_string() &&
+            !s["bulk_data_id"].get<std::string>().empty()) {
+          std::string bulk_data_uri = entity_path;
+          bulk_data_uri += "/bulk-data/rosbags/";
+          bulk_data_uri += s["bulk_data_id"].get<std::string>();
+          snap["bulk_data_uri"] = std::move(bulk_data_uri);
         } else {
           RCLCPP_WARN(HandlerContext::logger(),
-                      "Rosbag snapshot missing 'fault_code' field; falling back to parent fault code '%s' for entity "
-                      "'%s'",
+                      "Rosbag snapshot for fault '%s' on entity '%s' carries no 'bulk_data_id'; serving it without a "
+                      "bulk_data_uri. This is a transport-side bug.",
                       fault_code.c_str(), entity_path.c_str());
-          snap_fault_code = fault_code;
         }
-        std::string bulk_data_uri = entity_path;
-        bulk_data_uri += "/bulk-data/rosbags/";
-        bulk_data_uri += snap_fault_code;
-        snap["bulk_data_uri"] = std::move(bulk_data_uri);
         if (s.contains("size_bytes")) {
           snap["size_bytes"] = s["size_bytes"];
         }

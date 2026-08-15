@@ -142,7 +142,9 @@ class SqliteFaultStorage : public FaultStorage {
   mutable std::mutex mutex_;
   DebounceConfig config_;
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
-  size_t max_rosbags_per_fault_{0};    ///< 0 = unlimited; recordings retained per fault code
+  /// Defaults to 1, the pre-#620 behaviour: a new recording replaces the old one.
+  /// 0 = unlimited, bounded only by max_total_storage_mb.
+  size_t max_rosbags_per_fault_{1};
 };
 
 }  // namespace ros2_medkit_fault_manager

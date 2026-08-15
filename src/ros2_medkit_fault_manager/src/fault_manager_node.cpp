@@ -69,6 +69,34 @@ std::string validate_fault_code(const std::string & fault_code) {
   return "";  // Valid
 }
 
+/// Validate a recording id (the bag directory basename, `fault_<CODE>_<millis>`).
+///
+/// Same alphabet and the same no-`..` rule as a fault code, because the id ends up
+/// as a path segment and a filesystem lookup. The LENGTH bound is different: a
+/// recording id is `fault_` + a fault code + `_` + a millisecond stamp, so a
+/// maximal fault code produces ~148 characters and would be rejected by the
+/// fault-code validator it is derived from.
+std::string validate_recording_id(const std::string & recording_id) {
+  constexpr size_t kMaxRecordingIdLength = kMaxFaultCodeLength + 32;
+
+  if (recording_id.empty()) {
+    return "recording_id cannot be empty";
+  }
+  if (recording_id.length() > kMaxRecordingIdLength) {
+    return "recording_id exceeds maximum length of " + std::to_string(kMaxRecordingIdLength);
+  }
+  for (char c : recording_id) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-' && c != '.') {
+      return "recording_id contains invalid character '" + std::string(1, c) +
+             "'. Only alphanumeric, underscore, hyphen, and dot are allowed";
+    }
+  }
+  if (recording_id.find("..") != std::string::npos) {
+    return "recording_id cannot contain '..'";
+  }
+  return "";  // Valid
+}
+
 }  // namespace
 
 FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("fault_manager", options) {
@@ -296,6 +324,10 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
 
   // Initialize rosbag capture if enabled
   if (snapshot_config.rosbag.enabled) {
+    // The cap lives in the storage backend, not in RosbagCapture: it has to be
+    // atomic with the insert, the unlink has to happen after the backend's commit,
+    // and the "is this bag still referenced" rule is backend-private.
+    storage_->set_max_rosbags_per_fault(snapshot_config.rosbag.max_bags_per_fault);
     rosbag_capture_ = std::make_shared<RosbagCapture>(this, storage_.get(), snapshot_config.rosbag, snapshot_config);
   }
 
@@ -1014,17 +1046,20 @@ void FaultManagerNode::handle_get_fault(const std::shared_ptr<ros2_medkit_msgs::
     }
   }
 
-  // Get rosbag info if available
-  auto rosbag_info = storage_->get_rosbag_file(request->fault_code);
-  if (rosbag_info) {
+  // One entry per recording, newest first. A fault that keeps re-confirming leaves a
+  // trail of black boxes, and every one of them needs its own addressable id here -
+  // this list is the only place the fault itself advertises them.
+  for (const auto & rosbag_info : storage_->get_rosbag_files(request->fault_code)) {
     ros2_medkit_msgs::msg::Snapshot rosbag_snapshot;
     rosbag_snapshot.type = ros2_medkit_msgs::msg::Snapshot::TYPE_ROSBAG;
-    rosbag_snapshot.name = "rosbag_" + request->fault_code;
-    rosbag_snapshot.bulk_data_id = request->fault_code;
-    rosbag_snapshot.size_bytes = rosbag_info->size_bytes;
-    rosbag_snapshot.duration_sec = rosbag_info->duration_sec;
-    rosbag_snapshot.format = rosbag_info->format;
-    rosbag_snapshot.captured_at_ns = rosbag_info->created_at_ns;
+    rosbag_snapshot.name = "rosbag_" + rosbag_info.recording_id;
+    // The RECORDING, not the fault code: several recordings of one fault would
+    // otherwise all carry the same id and collapse into one download.
+    rosbag_snapshot.bulk_data_id = rosbag_info.recording_id;
+    rosbag_snapshot.size_bytes = rosbag_info.size_bytes;
+    rosbag_snapshot.duration_sec = rosbag_info.duration_sec;
+    rosbag_snapshot.format = rosbag_info.format;
+    rosbag_snapshot.captured_at_ns = rosbag_info.created_at_ns;
     // Freeze frame fields left empty for rosbag type
     response->environment_data.snapshots.push_back(rosbag_snapshot);
   }
@@ -1138,6 +1173,19 @@ SnapshotConfig FaultManagerNode::create_snapshot_config() {
       max_buffer = 256;
     }
     config.rosbag.max_buffer_mb = static_cast<size_t>(max_buffer);
+
+    // Recordings kept per fault code. 1 is the pre-#620 behaviour exactly - a new
+    // recording replaces the old one - so the mechanism ships switched off and any
+    // regression report is about the plumbing rather than the policy. Note this is a
+    // FAIRNESS knob more than a depth knob: max_total_storage_mb is the real disk
+    // bound, and a large per-fault cap lets one flapping fault eat the budget and
+    // evict every other fault's black box.
+    int64_t max_bags_per_fault = declare_parameter<int64_t>("snapshots.rosbag.max_bags_per_fault", 1);
+    if (max_bags_per_fault < 0) {
+      RCLCPP_WARN(get_logger(), "snapshots.rosbag.max_bags_per_fault must be >= 0. Treating as unlimited");
+      max_bags_per_fault = 0;
+    }
+    config.rosbag.max_bags_per_fault = static_cast<size_t>(max_bags_per_fault);
 
     config.rosbag.auto_cleanup = declare_parameter<bool>("snapshots.rosbag.auto_cleanup", true);
 
@@ -1337,47 +1385,93 @@ void FaultManagerNode::handle_get_snapshots(
 
 void FaultManagerNode::handle_get_rosbag(const std::shared_ptr<ros2_medkit_msgs::srv::GetRosbag::Request> & request,
                                          const std::shared_ptr<ros2_medkit_msgs::srv::GetRosbag::Response> & response) {
-  // Validate fault_code
-  std::string validation_error = validate_fault_code(request->fault_code);
-  if (!validation_error.empty()) {
-    response->success = false;
-    response->error_message = validation_error;
-    return;
+  // Two ways in. recording_id addresses one specific bag and is tried first;
+  // fault_code keeps working and means "the newest recording of this fault", which
+  // is what it has always meant back when a fault could only have one.
+  //
+  // A caller that cannot tell the two apart - the gateway, holding one URL segment
+  // that may be either - sets both to the same string and relies on this fallthrough.
+  // An id that names no recording is therefore not an answer yet, only a miss.
+  std::optional<RosbagFileInfo> rosbag_info;
+  std::vector<std::string> attached_codes;
+  std::string subject;
+
+  if (!request->recording_id.empty()) {
+    // Validation stays a hard failure: a traversal-shaped id is malformed on
+    // either reading, and falling back would quietly re-admit it as a fault code.
+    std::string validation_error = validate_recording_id(request->recording_id);
+    if (!validation_error.empty()) {
+      response->success = false;
+      response->error_message = validation_error;
+      return;
+    }
+
+    const auto rows = storage_->get_rosbag_files_by_recording(request->recording_id);
+    if (!rows.empty()) {
+      subject = "recording " + request->recording_id;
+      rosbag_info = rows.front();
+      for (const auto & row : rows) {
+        attached_codes.push_back(row.fault_code);
+      }
+    } else if (request->fault_code.empty()) {
+      response->success = false;
+      response->error_message = "No rosbag file available for recording: " + request->recording_id;
+      return;
+    }
   }
 
-  // Check if fault exists
-  auto fault = storage_->get_fault(request->fault_code);
-  if (!fault) {
-    response->success = false;
-    response->error_message = "Fault not found: " + request->fault_code;
-    return;
-  }
-
-  // Get rosbag info from storage
-  auto rosbag_info = storage_->get_rosbag_file(request->fault_code);
   if (!rosbag_info) {
-    response->success = false;
-    response->error_message = "No rosbag file available for fault: " + request->fault_code;
-    return;
+    std::string validation_error = validate_fault_code(request->fault_code);
+    if (!validation_error.empty()) {
+      response->success = false;
+      response->error_message = validation_error;
+      return;
+    }
+    subject = "fault " + request->fault_code;
+
+    // Check if fault exists
+    auto fault = storage_->get_fault(request->fault_code);
+    if (!fault) {
+      response->success = false;
+      response->error_message = "Fault not found: " + request->fault_code;
+      return;
+    }
+
+    rosbag_info = storage_->get_rosbag_file(request->fault_code);
+    if (!rosbag_info) {
+      response->success = false;
+      response->error_message = "No rosbag file available for fault: " + request->fault_code;
+      return;
+    }
+    // Report every fault the recording covers, not only the one asked about: the
+    // caller authorizes the download against this set.
+    for (const auto & row : storage_->get_rosbag_files_by_recording(rosbag_info->recording_id)) {
+      attached_codes.push_back(row.fault_code);
+    }
+    if (attached_codes.empty()) {
+      attached_codes.push_back(request->fault_code);
+    }
   }
 
   // Check if file exists
   if (!std::filesystem::exists(rosbag_info->file_path)) {
     response->success = false;
     response->error_message = "Rosbag file not found on disk: " + rosbag_info->file_path;
-    // Clean up the stale record
-    storage_->delete_rosbag_file(request->fault_code);
+    // Clean up the stale record BY RECORDING. Deleting by fault code would take the
+    // fault's other, healthy recordings with it because one of them vanished.
+    storage_->delete_rosbag_recording(rosbag_info->recording_id);
     return;
   }
 
   response->success = true;
   response->file_path = rosbag_info->file_path;
+  response->recording_id = rosbag_info->recording_id;
+  response->fault_codes = attached_codes;
   response->format = rosbag_info->format;
   response->duration_sec = rosbag_info->duration_sec;
   response->size_bytes = rosbag_info->size_bytes;
 
-  RCLCPP_DEBUG(get_logger(), "GetRosbag returned file '%s' for fault '%s'", rosbag_info->file_path.c_str(),
-               request->fault_code.c_str());
+  RCLCPP_DEBUG(get_logger(), "GetRosbag returned file '%s' for %s", rosbag_info->file_path.c_str(), subject.c_str());
 }
 
 void FaultManagerNode::handle_list_rosbags(
@@ -1394,14 +1488,21 @@ void FaultManagerNode::handle_list_rosbags(
   // Use batch storage API to get all rosbags for this entity
   auto rosbags = storage_->list_rosbags_for_entity(request->entity_fqn);
 
+  std::set<std::string> reaped;  // one cleanup per recording, not per row
   for (const auto & info : rosbags) {
     // Skip rosbags whose files no longer exist on disk
     if (!std::filesystem::exists(info.file_path)) {
-      storage_->delete_rosbag_file(info.fault_code);
+      // BY RECORDING: the bytes are gone for every fault that referenced them, so
+      // leaving the sibling rows would keep charging the quota for nothing. Deleting
+      // by fault code would instead take that fault's healthy recordings with it.
+      if (reaped.insert(info.recording_id).second) {
+        storage_->delete_rosbag_recording(info.recording_id);
+      }
       continue;
     }
 
     response->fault_codes.push_back(info.fault_code);
+    response->recording_ids.push_back(info.recording_id);
     response->file_paths.push_back(info.file_path);
     response->formats.push_back(info.format);
     response->durations_sec.push_back(info.duration_sec);

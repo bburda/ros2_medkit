@@ -22,6 +22,13 @@
 
 # The fault_code to get rosbag for.
 string fault_code
+
+# Address one specific recording instead. Tried before fault_code, and when it
+# names no recording the request falls back to fault_code - so a caller holding a
+# single identifier that may be either (a URL segment, say) can set both to it.
+# fault_code alone keeps its historical meaning, "the newest recording of this
+# fault".
+string recording_id
 ---
 # Response fields
 
@@ -31,6 +38,14 @@ bool success
 # Path to the rosbag file/directory.
 # Empty if success is false.
 string file_path
+
+# Identity of the recording that was served (its bag directory basename). Use this
+# as the bulk-data id.
+string recording_id
+
+# Every fault this recording covers - a burst of correlated faults shares one bag.
+# Callers authorize a download against this set, not against a single code.
+string[] fault_codes
 
 # Storage format: "sqlite3" or "mcap"
 string format

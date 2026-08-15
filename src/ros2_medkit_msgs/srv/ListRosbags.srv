@@ -32,6 +32,10 @@ bool success
 string[] fault_codes
 
 # Paths to the rosbag files/directories.
+# Parallel to fault_codes. Rows of one burst repeat the same recording id, which is
+# how a client groups the entries that serve the same bytes.
+string[] recording_ids
+
 string[] file_paths
 
 # Storage formats: "sqlite3" or "mcap"

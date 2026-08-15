@@ -165,6 +165,10 @@ class TestRosbagBoundaryDownload(GatewayTestCase):
     def _wait_for_bag_descriptor(self, fault_code, timeout=20.0):
         """Poll the bulk-data rosbag listing until *fault_code* has an item.
 
+        A descriptor is one recording, not one fault: the item is found through
+        ``x-medkit.fault_codes``, which lists every fault the bag covers. Its
+        ``id`` is the recording id and is deliberately not the fault code.
+
         Returns ``None`` on timeout rather than failing, so each call site can
         say what its own missing descriptor means.
         """
@@ -172,7 +176,7 @@ class TestRosbagBoundaryDownload(GatewayTestCase):
         while time.time() < deadline:
             listing = self.get_json(f'{APP_ENDPOINT}/bulk-data/rosbags')
             for item in listing.get('items', []):
-                if item.get('id') == fault_code:
+                if fault_code in item.get('x-medkit', {}).get('fault_codes', []):
                     return item
             time.sleep(0.5)
         return None
@@ -200,7 +204,8 @@ class TestRosbagBoundaryDownload(GatewayTestCase):
         # That recording is a zero-message post-fault-only bag: nothing has ever
         # been published on the only captured topic. The config docs promise such
         # a bag is still listed and downloadable, so pin it over HTTP rather than
-        # only at the fault manager's service.
+        # only at the fault manager's service. Addressed by fault code, which
+        # since #620 resolves through the compatibility path.
         empty_bag = self.get_raw(
             f'{APP_ENDPOINT}/bulk-data/rosbags/{LIDAR_OWN_FAULT}', timeout=10)
         self.assertEqual(empty_bag.content[:5], b'\x89MCAP',
@@ -259,14 +264,16 @@ class TestRosbagBoundaryDownload(GatewayTestCase):
         )
         self.assertIsNotNone(
             detail, "fault B's detail must list a rosbag snapshot")
+        # The detail advertises the recording, not the fault code: a fault can
+        # hold several recordings and only the id distinguishes them.
         self.assertTrue(
             detail['bulk_data_uri'].endswith(
-                f'/bulk-data/rosbags/{FAULT_B}'),
+                f'/bulk-data/rosbags/{x_medkit.get("recording_id")}'),
             f'unexpected bulk_data_uri: {detail["bulk_data_uri"]}')
 
         # --- Download through the gateway ---
         response = self.get_raw(
-            f'{APP_ENDPOINT}/bulk-data/rosbags/{FAULT_B}',
+            f'{APP_ENDPOINT}/bulk-data/rosbags/{x_medkit.get("recording_id")}',
             timeout=10,
         )
         self.assertIn('application/x-mcap',
