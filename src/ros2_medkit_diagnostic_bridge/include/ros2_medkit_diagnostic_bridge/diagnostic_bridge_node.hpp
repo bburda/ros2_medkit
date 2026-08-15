@@ -80,10 +80,18 @@ class DiagnosticBridgeNode : public rclcpp::Node {
   /// Load parameters from ROS2 parameter server
   void load_parameters();
 
+  /// Get (creating on first use) the FaultReporter for a given source_id
+  ros2_medkit_fault_reporter::FaultReporter * reporter_for(const std::string & source_id);
+
+  /// Resolve fault source_id for a diagnostic status.
+  /// Uses hardware_id as-is when present, else falls back to bridge FQN.
+  std::string source_id_for(const diagnostic_msgs::msg::DiagnosticStatus & status) const;
+
   // ROS2 components
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_sub_;
-  std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter> reporter_;
-  std::once_flag reporter_init_flag_;
+  // One FaultReporter per source_id to support correct source attribution.
+  std::map<std::string, std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter>> reporters_;
+  std::mutex reporters_mutex_;
 
   // Configuration
   std::string diagnostics_topic_;
