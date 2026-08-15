@@ -60,18 +60,46 @@ void DiagnosticBridgeNode::load_parameters() {
 }
 
 void DiagnosticBridgeNode::diagnostics_callback(const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr & msg) {
-  // Thread-safe lazy initialization of reporter (can't use shared_from_this in constructor)
-  std::call_once(reporter_init_flag_, [this]() {
-    reporter_ = std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(this->shared_from_this(),
-                                                                            get_fully_qualified_name());
-  });
-
   for (const auto & status : msg->status) {
     process_diagnostic(status);
   }
 }
 
+ros2_medkit_fault_reporter::FaultReporter * DiagnosticBridgeNode::reporter_for(const std::string & source_id) {
+  std::lock_guard<std::mutex> lock(reporters_mutex_);
+  auto it = reporters_.find(source_id);
+  if (it != reporters_.end()) {
+    return it->second.get();
+  }
+
+  // Multiple FaultReporters on one node are safe: FaultReporter guards
+  // parameter declaration with has_parameter().
+  auto reporter = std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(this->shared_from_this(), source_id);
+  auto * raw = reporter.get();
+  reporters_[source_id] = std::move(reporter);
+  return raw;
+}
+
+std::string DiagnosticBridgeNode::source_id_for(const diagnostic_msgs::msg::DiagnosticStatus & status) const {
+  if (!status.hardware_id.empty()) {
+    return status.hardware_id;
+  }
+
+  // Use a mutable clock copy - Humble's RCLCPP_WARN_THROTTLE requires non-const Clock.
+  rclcpp::Clock clock(*get_clock());
+  RCLCPP_WARN_THROTTLE(get_logger(), clock, 10000,
+                       "Diagnostic '%s' has empty hardware_id, using bridge source_id '%s'", status.name.c_str(),
+                       get_fully_qualified_name());
+  return get_fully_qualified_name();
+}
+
 void DiagnosticBridgeNode::process_diagnostic(const diagnostic_msgs::msg::DiagnosticStatus & status) {
+  const std::string source_id = source_id_for(status);
+  auto * reporter = reporter_for(source_id);
+  if (reporter == nullptr) {
+    return;
+  }
+
   const std::string fault_code = map_to_fault_code(status);
 
   // Skip if no mapping and auto-generate disabled
@@ -81,13 +109,13 @@ void DiagnosticBridgeNode::process_diagnostic(const diagnostic_msgs::msg::Diagno
 
   if (is_ok_level(status.level)) {
     // OK status -> send PASSED event for healing
-    reporter_->report_passed(fault_code);
+    reporter->report_passed(fault_code);
     RCLCPP_DEBUG(get_logger(), "Diagnostic OK: %s -> PASSED for %s", status.name.c_str(), fault_code.c_str());
   } else {
     // WARN, ERROR, STALE -> send FAILED event
     auto severity = map_to_severity(status.level);
     // severity is guaranteed to have value here (not OK level)
-    reporter_->report(fault_code, *severity, status.message);
+    reporter->report(fault_code, *severity, status.message);
     RCLCPP_DEBUG(get_logger(), "Diagnostic %s: %s -> fault %s (severity=%d)", status.name.c_str(),
                  status.message.c_str(), fault_code.c_str(), *severity);
   }
