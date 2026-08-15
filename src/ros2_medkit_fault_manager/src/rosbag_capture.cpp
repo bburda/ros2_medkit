@@ -563,6 +563,7 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
 
     RosbagFileInfo info;
     info.fault_code = fault_code;
+    info.recording_id = rosbag_recording_id(bag_path);
     info.file_path = bag_path;
     info.format = config_.format;
     // The span the recording was open, not the configured window: a buffer that
@@ -1515,6 +1516,7 @@ void RosbagCapture::finalize_post_fault_recording() {
   size_t bag_size = calculate_bag_size(bag_path);
 
   RosbagFileInfo info;
+  info.recording_id = rosbag_recording_id(bag_path);
   info.file_path = bag_path;
   info.format = config_.format;
   // The real span of the recording, not the configured pre+post window. A

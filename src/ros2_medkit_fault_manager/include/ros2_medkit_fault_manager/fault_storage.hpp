@@ -123,9 +123,23 @@ struct FreezeFrameData {
   int64_t captured_at_ns{0};
 };
 
-/// Rosbag file metadata for time-window recording
+/// Derive a recording's public identity from its bag path: the directory basename,
+/// `fault_<CODE>_<millis>`. Faults of one burst share a recording and therefore share
+/// this id.
+///
+/// Safe as a URL path segment because fault codes are validated to
+/// `[A-Za-z0-9_.-]` with no `..` before a bag is ever named after one, which makes
+/// that validation load-bearing for a second reason. The gateway reads the same value
+/// off the wire with its own copy of this rule; keep the two in step.
+std::string rosbag_recording_id(const std::string & file_path);
+
+/// One row = one LINK: a fault claiming a recording. Several faults of a burst link to
+/// one recording (same file_path, same recording_id), and one fault can link to several
+/// recordings over time. Bytes are owned by file_path, not by the row: a bag is unlinked
+/// only when its last row goes.
 struct RosbagFileInfo {
   std::string fault_code;
+  std::string recording_id;  ///< Basename of file_path; shared by every row of a burst
   std::string file_path;
   std::string format;        ///< "sqlite3" or "mcap"
   double duration_sec{0.0};  ///< Total duration of recorded data
@@ -191,6 +205,21 @@ class FaultStorage {
   virtual void set_max_snapshots_per_fault(size_t /*max_count*/) {
   }
 
+  /// Cap on RECORDINGS retained per fault code (0 = unlimited).
+  ///
+  /// Enforced inside store_rosbag_file(s), atomically with the insert: past the cap
+  /// the fault's OLDEST recordings lose their row, and a bag whose last referencing
+  /// row goes is unlinked once the store is durable.
+  ///
+  /// Keep-newest, deliberately the opposite of set_max_snapshots_per_fault's
+  /// reject-new. Snapshots guard against one capture writing a row per configured
+  /// topic and flooding the table, where keeping the earliest is right. A bag is
+  /// evidence about a machine you are about to inspect, so the recent one wins; and
+  /// keep-newest at 1 is exactly the pre-#620 behaviour, which is what makes the
+  /// default a no-op.
+  virtual void set_max_rosbags_per_fault(size_t /*max_count*/) {
+  }
+
   /// Store a snapshot captured when a fault was confirmed
   /// @param snapshot The snapshot data to store
   virtual void store_snapshot(const SnapshotData & snapshot) = 0;
@@ -240,10 +269,34 @@ class FaultStorage {
     }
   }
 
-  /// Get rosbag file info for a fault
+  /// The MOST RECENT recording of a fault, or nullopt.
+  ///
+  /// A fault can hold several recordings, so "the" recording is a choice: newest
+  /// wins, because a black box is evidence about the machine you are about to
+  /// inspect. Implementations must order deterministically - an unordered pick
+  /// serves an arbitrary recording, which no test catches reliably.
   /// @param fault_code The fault code to get rosbag for
   /// @return Rosbag file info if exists, nullopt otherwise
   virtual std::optional<RosbagFileInfo> get_rosbag_file(const std::string & fault_code) const = 0;
+
+  /// Every recording of a fault, newest first.
+  virtual std::vector<RosbagFileInfo> get_rosbag_files(const std::string & fault_code) const = 0;
+
+  /// Every row of one recording - one per fault the recording covers. Backs the
+  /// bulk-data download and the entity authorization scope check, both of which
+  /// start from a recording id and need the faults behind it.
+  virtual std::vector<RosbagFileInfo> get_rosbag_files_by_recording(const std::string & recording_id) const = 0;
+
+  /// Drop ONE (fault, recording) link. The bag is unlinked only when the removed row
+  /// was its last reference, so a sibling fault of the same burst keeps it alive.
+  /// @return true if a row was removed
+  virtual bool drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) = 0;
+
+  /// Delete one whole recording: every fault's link to it, and the bag. This is the
+  /// right unit for quota eviction and for a bag that has vanished from disk - both
+  /// are facts about the recording, not about one fault that happens to reference it.
+  /// @return number of rows removed
+  virtual size_t delete_rosbag_recording(const std::string & recording_id) = 0;
 
   /// Delete rosbag file record and the actual file for a fault. Faults from one
   /// burst can share a recording; the file is unlinked only with the last record
@@ -336,12 +389,17 @@ class InMemoryFaultStorage : public FaultStorage {
   void store_freeze_frame(const FreezeFrameData & frame) override;
   std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const override;
 
+  void set_max_rosbags_per_fault(size_t max_count) override;
   void store_rosbag_file(const RosbagFileInfo & info) override;
   /// All-or-nothing, as the base class requires: the batch is built beside the live
   /// map and swapped in, so a throw leaves the store exactly as it was.
   void store_rosbag_files(const std::vector<RosbagFileInfo> & infos) override;
   std::optional<RosbagFileInfo> get_rosbag_file(const std::string & fault_code) const override;
+  std::vector<RosbagFileInfo> get_rosbag_files(const std::string & fault_code) const override;
+  std::vector<RosbagFileInfo> get_rosbag_files_by_recording(const std::string & recording_id) const override;
   bool delete_rosbag_file(const std::string & fault_code) override;
+  bool drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) override;
+  size_t delete_rosbag_recording(const std::string & recording_id) override;
   size_t get_total_rosbag_storage_bytes() const override;
   std::vector<RosbagFileInfo> get_all_rosbag_files() const override;
   std::vector<RosbagFileInfo> list_rosbags_for_entity(const std::string & entity_fqn) const override;
@@ -357,11 +415,29 @@ class InMemoryFaultStorage : public FaultStorage {
   /// only be unlinked once the last of them is gone. Caller holds mutex_.
   bool path_shared_with_other_fault(const std::string & file_path, const std::string & fault_code) const;
 
+  /// Whether any row at all still references @p file_path. Caller holds mutex_.
+  bool path_referenced(const std::string & file_path) const;
+
   mutable std::mutex mutex_;
   std::map<std::string, FaultState> faults_;
   std::vector<SnapshotData> snapshots_;
   std::map<std::string, FreezeFrameData> freeze_frames_;  ///< fault_code -> freeze-frame (retained across clear)
-  std::map<std::string, RosbagFileInfo> rosbag_files_;    ///< fault_code -> rosbag info
+  /// One entry per LINK, mirroring the flat SQLite table rather than a map keyed by
+  /// fault code - a fault holds several recordings now, and a recording several
+  /// faults.
+  ///
+  /// `seq` is the in-memory twin of SQLite's autoincrement id and is load-bearing,
+  /// not decoration: a burst stamps ONE created_at_ns across every row it writes, so
+  /// ties are guaranteed. SQLite breaks them by id; without seq the two backends
+  /// would order differently and the parity tests would go flaky instead of failing
+  /// honestly.
+  struct RosbagRow {
+    RosbagFileInfo info;
+    uint64_t seq{0};
+  };
+  std::vector<RosbagRow> rosbag_files_;
+  uint64_t rosbag_seq_{0};
+  size_t max_rosbags_per_fault_{0};  ///< 0 = unlimited
   DebounceConfig config_;
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
 };
