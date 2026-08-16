@@ -115,7 +115,16 @@ std::string rosbag_recording_id(const std::string & file_path) {
 std::vector<std::string> rosbag_attached_fault_codes(const nlohmann::json & rosbag_data,
                                                      const std::string & requested_id) {
   if (rosbag_data.contains("fault_codes") && rosbag_data["fault_codes"].is_array()) {
-    auto codes = rosbag_data["fault_codes"].get<std::vector<std::string>>();
+    // Element by element rather than get<vector<string>>(): the array is built
+    // from a ROS string vector today and cannot hold anything else, but this
+    // function exists to tolerate a peer that predates the field, and a
+    // whole-array conversion throws on the first non-string it meets.
+    std::vector<std::string> codes;
+    for (const auto & code : rosbag_data["fault_codes"]) {
+      if (code.is_string()) {
+        codes.push_back(code.get<std::string>());
+      }
+    }
     if (!codes.empty()) {
       return codes;
     }
