@@ -87,9 +87,8 @@ std::string DiagnosticBridgeNode::source_id_for(const diagnostic_msgs::msg::Diag
 
   // Use a mutable clock copy - Humble's RCLCPP_WARN_THROTTLE requires non-const Clock.
   rclcpp::Clock clock(*get_clock());
-  RCLCPP_WARN_THROTTLE(get_logger(), clock, 10000,
-                       "Diagnostic '%s' has empty hardware_id, using bridge source_id '%s'", status.name.c_str(),
-                       get_fully_qualified_name());
+  RCLCPP_WARN_THROTTLE(get_logger(), clock, 10000, "Diagnostic '%s' has empty hardware_id, using bridge source_id '%s'",
+                       status.name.c_str(), get_fully_qualified_name());
   return get_fully_qualified_name();
 }
 
