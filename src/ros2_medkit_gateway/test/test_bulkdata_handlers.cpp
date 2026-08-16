@@ -33,7 +33,8 @@
 #include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
 
 using namespace ros2_medkit_gateway;
-using json = nlohmann::json;
+// No `using json = nlohmann::json` here: the namespace pulled in above already
+// declares that alias, and redeclaring it shadows it.
 using ros2_medkit_gateway::handlers::BulkDataHandlers;
 
 class BulkDataHandlersTest : public ::testing::Test {
