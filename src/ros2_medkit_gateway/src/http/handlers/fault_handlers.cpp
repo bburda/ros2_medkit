@@ -372,6 +372,14 @@ dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_jso
         if (s.contains("format")) {
           snap["format"] = s["format"];
         }
+        // Same x-medkit.captured_at shape the freeze frame emits, because that
+        // is the field the UIs already render. Zero means the recording predates
+        // the timestamp being carried, and an epoch date on screen would be a
+        // worse answer than none, so the key is left out.
+        const int64_t captured_at_ns = s.value("captured_at_ns", static_cast<int64_t>(0));
+        if (captured_at_ns > 0) {
+          snap["x-medkit"] = {{"captured_at", to_iso8601_ns(captured_at_ns)}};
+        }
       }
 
       snapshots.push_back(snap);

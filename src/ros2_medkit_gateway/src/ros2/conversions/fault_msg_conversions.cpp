@@ -92,6 +92,11 @@ nlohmann::json environment_data_to_json(const ros2_medkit_msgs::msg::Environment
       snap["size_bytes"] = s.size_bytes;
       snap["duration_sec"] = s.duration_sec;
       snap["format"] = s.format;
+      // The fault manager has always set this; only the freeze-frame branch
+      // forwarded it, so every rosbag reached the UI with no capture time and
+      // rendered "N/A". With one recording per fault that was cosmetic. With
+      // several it is the only thing that tells the occurrences apart.
+      snap["captured_at_ns"] = s.captured_at_ns;
       // bulk_data_uri intentionally omitted - handler appends per-request URL
     }
 
