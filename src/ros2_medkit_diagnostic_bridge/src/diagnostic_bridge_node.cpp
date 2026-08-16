@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
+#include <limits>
 
 #include "ros2_medkit_msgs/msg/fault.hpp"
 
@@ -30,13 +32,24 @@ DiagnosticBridgeNode::DiagnosticBridgeNode(const rclcpp::NodeOptions & options) 
         diagnostics_callback(msg);
       });
 
-  RCLCPP_INFO(get_logger(), "DiagnosticBridge started (topic=%s, auto_generate=%s, mappings=%zu)",
-              diagnostics_topic_.c_str(), auto_generate_codes_ ? "true" : "false", name_to_code_.size());
+  RCLCPP_INFO(get_logger(),
+              "DiagnosticBridge started (topic=%s, auto_generate=%s, use_hardware_id_as_source_id=%s, mappings=%zu)",
+              diagnostics_topic_.c_str(), auto_generate_codes_ ? "true" : "false",
+              use_hardware_id_as_source_id_ ? "true" : "false", name_to_code_.size());
 }
 
 void DiagnosticBridgeNode::load_parameters() {
   diagnostics_topic_ = declare_parameter<std::string>("diagnostics_topic", "/diagnostics");
   auto_generate_codes_ = declare_parameter<bool>("auto_generate_codes", true);
+  use_hardware_id_as_source_id_ = declare_parameter<bool>("use_hardware_id_as_source_id", false);
+  const int64_t max_tracked_sources = declare_parameter<int64_t>("max_tracked_sources", 512);
+  const int64_t max_tracked_sources_used =
+      std::clamp(max_tracked_sources, INT64_C(1), static_cast<int64_t>(std::numeric_limits<int>::max()));
+  if (max_tracked_sources_used != max_tracked_sources) {
+    RCLCPP_WARN(get_logger(), "max_tracked_sources=%" PRId64 " clamped to %" PRId64, max_tracked_sources,
+                max_tracked_sources_used);
+  }
+  max_tracked_sources_ = static_cast<int>(max_tracked_sources_used);
 
   std::vector<std::string> keyvalue_codes =
       declare_parameter<std::vector<std::string>>("keyvalue_codes", std::vector<std::string>());
@@ -69,40 +82,59 @@ ros2_medkit_fault_reporter::FaultReporter * DiagnosticBridgeNode::reporter_for(c
   std::lock_guard<std::mutex> lock(reporters_mutex_);
   auto it = reporters_.find(source_id);
   if (it != reporters_.end()) {
-    return it->second.get();
+    reporters_lru_.splice(reporters_lru_.end(), reporters_lru_, it->second);
+    return it->second->reporter.get();
   }
 
   // Multiple FaultReporters on one node are safe: FaultReporter guards
   // parameter declaration with has_parameter().
   auto reporter = std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(this->shared_from_this(), source_id);
   auto * raw = reporter.get();
-  reporters_[source_id] = std::move(reporter);
+  reporters_lru_.push_back(ReporterEntry{source_id, std::move(reporter)});
+  reporters_[source_id] = std::prev(reporters_lru_.end());
+
+  if (static_cast<int>(reporters_lru_.size()) > max_tracked_sources_) {
+    RCLCPP_WARN_ONCE(get_logger(), "max_tracked_sources (%d) reached; evicting least-recently-used reporters",
+                     max_tracked_sources_);
+    reporters_.erase(reporters_lru_.front().source_id);
+    reporters_lru_.pop_front();
+  }
   return raw;
 }
 
+size_t DiagnosticBridgeNode::tracked_reporter_count() {
+  std::lock_guard<std::mutex> lock(reporters_mutex_);
+  return reporters_.size();
+}
+
 std::string DiagnosticBridgeNode::source_id_for(const diagnostic_msgs::msg::DiagnosticStatus & status) const {
-  if (!status.hardware_id.empty()) {
+  if (use_hardware_id_as_source_id_ && !status.hardware_id.empty() && status.hardware_id.find('/') != std::string::npos) {
     return status.hardware_id;
   }
 
+  const std::string fqn = get_fully_qualified_name();
+
   // Use a mutable clock copy - Humble's RCLCPP_WARN_THROTTLE requires non-const Clock.
   rclcpp::Clock clock(*get_clock());
-  RCLCPP_WARN_THROTTLE(get_logger(), clock, 10000, "Diagnostic '%s' has empty hardware_id, using bridge source_id '%s'",
-                       status.name.c_str(), get_fully_qualified_name());
-  return get_fully_qualified_name();
+  RCLCPP_WARN_THROTTLE(
+      get_logger(), clock, 10000,
+      "Diagnostic '%s' hardware_id '%s' is not a slash-containing node ID or attribution is disabled, using bridge "
+      "source_id '%s'",
+      status.name.c_str(), status.hardware_id.c_str(), fqn.c_str());
+  return fqn;
 }
 
 void DiagnosticBridgeNode::process_diagnostic(const diagnostic_msgs::msg::DiagnosticStatus & status) {
-  const std::string source_id = source_id_for(status);
-  auto * reporter = reporter_for(source_id);
-  if (reporter == nullptr) {
-    return;
-  }
-
   const std::string fault_code = map_to_fault_code(status);
 
   // Skip if no mapping and auto-generate disabled
   if (fault_code.empty()) {
+    return;
+  }
+
+  const std::string source_id = source_id_for(status);
+  auto * reporter = reporter_for(source_id);
+  if (reporter == nullptr) {
     return;
   }
 

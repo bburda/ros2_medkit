@@ -107,6 +107,47 @@ TEST_F(DiagnosticBridgeTest, NodeCreation) {
   EXPECT_STREQ(node->get_name(), "diagnostic_bridge");
 }
 
+TEST_F(DiagnosticBridgeTest, SourceId_DefaultsToBridgeFqn) {
+  auto node = std::make_shared<DiagnosticBridgeNode>();
+  auto status = diagnostic_status("sensor", DiagStatus::ERROR);
+  status.hardware_id = "/sensor_node";
+
+  EXPECT_EQ(node->source_id_for(status), "/diagnostic_bridge");
+}
+
+TEST_F(DiagnosticBridgeTest, SourceId_UsesSlashContainingHardwareIdWhenEnabled) {
+  rclcpp::NodeOptions options;
+  options.append_parameter_override("use_hardware_id_as_source_id", true);
+  auto node = std::make_shared<DiagnosticBridgeNode>(options);
+  auto status = diagnostic_status("sensor", DiagStatus::ERROR);
+  status.hardware_id = "/sensor_node";
+
+  EXPECT_EQ(node->source_id_for(status), "/sensor_node");
+}
+
+TEST_F(DiagnosticBridgeTest, SourceId_NonSlashHardwareIdFallsBackToBridgeFqn) {
+  rclcpp::NodeOptions options;
+  options.append_parameter_override("use_hardware_id_as_source_id", true);
+  auto node = std::make_shared<DiagnosticBridgeNode>(options);
+  auto status = diagnostic_status("sensor", DiagStatus::ERROR);
+  status.hardware_id = "SERIAL123";
+
+  EXPECT_EQ(node->source_id_for(status), "/diagnostic_bridge");
+}
+
+TEST_F(DiagnosticBridgeTest, ReporterCache_IsBounded) {
+  rclcpp::NodeOptions options;
+  options.append_parameter_override("max_tracked_sources", 2);
+  auto node = std::make_shared<DiagnosticBridgeNode>(options);
+
+  ASSERT_EQ(node->tracked_reporter_count(), 0u);
+  ASSERT_NE(node->reporter_for("/source_a"), nullptr);
+  ASSERT_NE(node->reporter_for("/source_b"), nullptr);
+  EXPECT_EQ(node->tracked_reporter_count(), 2u);
+  ASSERT_NE(node->reporter_for("/source_c"), nullptr);
+  EXPECT_EQ(node->tracked_reporter_count(), 2u);
+}
+
 // Test fault code mapping with auto-generate
 TEST_F(DiagnosticBridgeTest, MapToFaultCode_AutoGenerate) {
   auto node = std::make_shared<DiagnosticBridgeNode>();

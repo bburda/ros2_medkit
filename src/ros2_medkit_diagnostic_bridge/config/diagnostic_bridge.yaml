@@ -7,6 +7,13 @@ diagnostic_bridge:
     # If false, only explicitly mapped diagnostics will be forwarded
     auto_generate_codes: true
 
+    # Use slash-containing diagnostic hardware_id values as fault source IDs.
+    # Disabled by default because hardware_id is often a serial number or device path.
+    use_hardware_id_as_source_id: false
+
+    # Maximum number of per-source FaultReporter instances retained by the bridge.
+    max_tracked_sources: 512
+
     # Custom diagnostic name to fault code mappings
     # Format: "name_to_code.<diagnostic_name>": "<FAULT_CODE>"
     # Example:
