@@ -235,6 +235,18 @@ class TestRosbagHistoryDownload(GatewayTestCase):
         self.assertEqual(len(rosbag_snaps), 2,
                          'the fault detail lists a different number of rosbag '
                          f'snapshots than the {len(all_ids)} recordings it has')
+        # Each recording carries its own capture time. The fault manager has
+        # always stamped one, but the transport dropped it on the rosbag branch,
+        # so every bag reached a client with none and the UIs rendered "N/A".
+        # With one recording per fault that was cosmetic; with several it removes
+        # the only field an engineer can use to pick an occurrence.
+        captured = [s.get('x-medkit', {}).get('captured_at') for s in rosbag_snaps]
+        for value in captured:
+            self.assertIsNotNone(value, 'a recording reached the client with no capture time')
+            self.assertRegex(value, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
+        self.assertEqual(len(set(captured)), 2,
+                         'both recordings report the same instant, so neither can be placed')
+
         advertised = {s['bulk_data_uri'] for s in rosbag_snaps}
         self.assertEqual(
             advertised,
