@@ -172,6 +172,13 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
               capture_queue_depth_,
               capture_queue_full_policy_ == QueueFullPolicy::kRejectNewest ? "reject_newest" : "drop_oldest");
 
+  // Off by default, which is the historical behaviour. Turn it on together with a
+  // rosbag history: recordings now survive an acknowledgement, so deleting the
+  // readings captured beside them leaves the fault holding bags whose values are
+  // gone. The per-fault cap bounds growth either way, so clearing was never the
+  // only thing keeping the table down.
+  auto retain_snapshots_on_clear = declare_parameter<bool>("snapshots.retain_on_clear", false);
+
   auto max_snapshots = declare_parameter<int>("snapshots.max_per_fault", 10);
   if (max_snapshots < 0) {
     RCLCPP_WARN(get_logger(), "snapshots.max_per_fault should be >= 0, got %ld. Disabling limit.", max_snapshots);
@@ -187,6 +194,7 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   // Apply snapshot limit to storage
   if (max_snapshots > 0) {
     storage_->set_max_snapshots_per_fault(static_cast<size_t>(max_snapshots));
+    storage_->set_retain_snapshots_on_clear(retain_snapshots_on_clear);
   }
 
   // Create event publisher for SSE streaming

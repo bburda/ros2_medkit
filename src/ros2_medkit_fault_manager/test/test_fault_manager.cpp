@@ -1520,6 +1520,49 @@ TEST(MatchesEntityTest, EmptySources) {
 
 // --- InMemoryFaultStorage snapshot limit tests ---
 
+TEST(InMemorySnapshotRetentionTest, ClearKeepsSnapshotsWhenEvidenceIsRetained) {
+  InMemoryFaultStorage storage;
+  rclcpp::Clock clock;
+  storage.report_fault_event("KEEP", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                             ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "keep", "/n", clock.now(),
+                             ros2_medkit_fault_manager::DebounceConfig{});
+  storage.set_retain_snapshots_on_clear(true);
+
+  ros2_medkit_fault_manager::SnapshotData row;
+  row.fault_code = "KEEP";
+  row.topic = "/t";
+  row.message_type = "std_msgs/msg/String";
+  row.data = "{}";
+  row.captured_at_ns = 1000;
+  row.capture_id = 1;
+  storage.store_snapshots({row});
+
+  ASSERT_TRUE(storage.clear_fault("KEEP"));
+
+  // Same rule as the SQLite side: with a history configured, acknowledging must
+  // not leave recordings whose matching readings were deleted.
+  EXPECT_EQ(storage.get_snapshots("KEEP").size(), 1u);
+}
+
+TEST(InMemorySnapshotRetentionTest, ClearStillDropsSnapshotsByDefault) {
+  InMemoryFaultStorage storage;
+  rclcpp::Clock clock;
+  storage.report_fault_event("DROP", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                             ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "drop", "/n", clock.now(),
+                             ros2_medkit_fault_manager::DebounceConfig{});
+
+  ros2_medkit_fault_manager::SnapshotData row;
+  row.fault_code = "DROP";
+  row.topic = "/t";
+  row.message_type = "std_msgs/msg/String";
+  row.data = "{}";
+  row.capture_id = 1;
+  storage.store_snapshots({row});
+
+  ASSERT_TRUE(storage.clear_fault("DROP"));
+  EXPECT_TRUE(storage.get_snapshots("DROP").empty()) << "the default must stay what it always was";
+}
+
 TEST(InMemorySnapshotLimitTest, KeepsTheNewestCaptureWholeAndDropsTheOldest) {
   InMemoryFaultStorage storage;
   storage.set_max_snapshots_per_fault(4);
