@@ -248,8 +248,13 @@ if(BUILD_TESTING)
   # greenwave_monitor node through the same 10s launch-ordering delay plus
   # warmup as test_graph_provider_greenwave above, and their staleness/SSE
   # polling budgets are similarly generous - both widened to match.
+  # test_rosbag_history_download drives two full occurrences of one real fault -
+  # break the range, wait for the confirmation, wait for the post-roll to finalise
+  # into a listed descriptor, repair, acknowledge - and then downloads every bag.
+  # Two of those cycles do not fit the feature glob's 120s.
   set(_MEDKIT_TEST_TIMEOUT_OVERRIDES
     test_rosbag_boundary_download 180
+    test_rosbag_history_download 180
     test_graph_provider_greenwave 300
     test_graph_provider_stale 300
     test_graph_provider_sse 300)
