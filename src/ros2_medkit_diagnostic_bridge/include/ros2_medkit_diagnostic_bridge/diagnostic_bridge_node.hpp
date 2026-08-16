@@ -14,11 +14,13 @@
 
 #pragma once
 
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
@@ -66,6 +68,16 @@ class DiagnosticBridgeNode : public rclcpp::Node {
   /// Check if diagnostic level indicates OK status
   static bool is_ok_level(uint8_t diagnostic_level);
 
+  /// Get (creating on first use) the FaultReporter for a given source_id.
+  ros2_medkit_fault_reporter::FaultReporter * reporter_for(const std::string & source_id);
+
+  /// Resolve fault source_id for a diagnostic status.
+  /// Uses a slash-containing hardware_id when enabled, else falls back to bridge FQN.
+  std::string source_id_for(const diagnostic_msgs::msg::DiagnosticStatus & status) const;
+
+  /// Number of currently tracked source reporters.
+  size_t tracked_reporter_count();
+
  private:
   /// Callback for /diagnostics messages
   void diagnostics_callback(const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr & msg);
@@ -80,22 +92,22 @@ class DiagnosticBridgeNode : public rclcpp::Node {
   /// Load parameters from ROS2 parameter server
   void load_parameters();
 
-  /// Get (creating on first use) the FaultReporter for a given source_id
-  ros2_medkit_fault_reporter::FaultReporter * reporter_for(const std::string & source_id);
-
-  /// Resolve fault source_id for a diagnostic status.
-  /// Uses hardware_id as-is when present, else falls back to bridge FQN.
-  std::string source_id_for(const diagnostic_msgs::msg::DiagnosticStatus & status) const;
-
   // ROS2 components
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_sub_;
-  // One FaultReporter per source_id to support correct source attribution.
-  std::map<std::string, std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter>> reporters_;
+  // One FaultReporter per source_id, bounded with LRU eviction.
+  struct ReporterEntry {
+    std::string source_id;
+    std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter> reporter;
+  };
+  std::list<ReporterEntry> reporters_lru_;
+  std::unordered_map<std::string, std::list<ReporterEntry>::iterator> reporters_;
   std::mutex reporters_mutex_;
 
   // Configuration
   std::string diagnostics_topic_;
   bool auto_generate_codes_;
+  bool use_hardware_id_as_source_id_{false};
+  int max_tracked_sources_{512};
   std::map<std::string, std::string> name_to_code_;
   std::vector<std::string> keyvalue_codes_;
 };

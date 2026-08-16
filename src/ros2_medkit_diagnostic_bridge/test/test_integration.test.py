@@ -55,6 +55,7 @@ def generate_test_description():
         parameters=[{
             'diagnostics_topic': '/diagnostics',
             'auto_generate_codes': True,
+            'use_hardware_id_as_source_id': True,
         }],
         # Give the node room to flush coverage data at shutdown before SIGKILL.
         sigterm_timeout='30',
