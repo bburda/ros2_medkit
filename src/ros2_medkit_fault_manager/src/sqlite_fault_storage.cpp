@@ -243,6 +243,29 @@ void SqliteFaultStorage::initialize_schema() {
     throw std::runtime_error("Failed to create freeze_frames table: " + error);
   }
 
+  // Migration: snapshots gained capture_id, which groups the rows of one capture.
+  // Without it the per-fault cap could not tell where a capture ended and trimmed
+  // by row, storing a confirmation's values in part. Rows written before it read
+  // as capture 0 - one legacy set, which is how they behaved anyway.
+  {
+    bool has_capture_id = false;
+    SqliteStatement info(db_, "PRAGMA table_info(snapshots)");
+    while (info.step() == SQLITE_ROW) {
+      if (info.column_text(1) == "capture_id") {
+        has_capture_id = true;
+        break;
+      }
+    }
+    if (!has_capture_id) {
+      if (sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN capture_id INTEGER NOT NULL DEFAULT 0", nullptr, nullptr,
+                       &err_msg) != SQLITE_OK) {
+        std::string error = err_msg ? err_msg : "Unknown error";
+        sqlite3_free(err_msg);
+        throw std::runtime_error("Failed to add capture_id column: " + error);
+      }
+    }
+  }
+
   // Create rosbag_files table. One row = one LINK (a fault claiming a recording):
   // several faults of a burst link to one bag, and one fault links to several bags
   // over time. Bytes belong to file_path, not to the row.
@@ -1001,31 +1024,83 @@ void SqliteFaultStorage::set_max_snapshots_per_fault(size_t max_count) {
 }
 
 void SqliteFaultStorage::store_snapshot(const SnapshotData & snapshot) {
+  store_snapshots({snapshot});
+}
+
+void SqliteFaultStorage::store_snapshots(const std::vector<SnapshotData> & snapshots) {
+  if (snapshots.empty()) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // Check snapshot limit per fault (reject-new strategy: keep earliest)
-  if (max_snapshots_per_fault_ > 0) {
-    SqliteStatement count_stmt(db_, "SELECT COUNT(*) FROM snapshots WHERE fault_code = ?");
-    count_stmt.bind_text(1, snapshot.fault_code);
-    if (count_stmt.step() == SQLITE_ROW &&
-        count_stmt.column_int64(0) >= static_cast<int64_t>(max_snapshots_per_fault_)) {
-      // Silent rejection: storage layer has no logger. Callers should log if needed.
-      return;  // Reject new - keep first N inserted snapshots
+  const std::string & fault_code = snapshots.front().fault_code;
+
+  // One transaction for the whole capture: a capture is all-or-nothing, and the
+  // old row-at-a-time path could leave a confirmation's values half stored.
+  exec_or_throw("BEGIN IMMEDIATE");
+  try {
+    {
+      SqliteStatement stmt(db_,
+                           "INSERT INTO snapshots (fault_code, topic, message_type, data, captured_at_ns, capture_id) "
+                           "VALUES (?, ?, ?, ?, ?, ?)");
+      for (const auto & snapshot : snapshots) {
+        stmt.reset();
+        stmt.bind_text(1, snapshot.fault_code);
+        stmt.bind_text(2, snapshot.topic);
+        stmt.bind_text(3, snapshot.message_type);
+        stmt.bind_text(4, snapshot.data);
+        stmt.bind_int64(5, snapshot.captured_at_ns);
+        stmt.bind_int64(6, snapshot.capture_id);
+        if (stmt.step() != SQLITE_DONE) {
+          throw std::runtime_error(std::string("Failed to store snapshot: ") + sqlite3_errmsg(db_));
+        }
+      }
     }
-  }
 
-  SqliteStatement stmt(db_,
-                       "INSERT INTO snapshots (fault_code, topic, message_type, data, captured_at_ns) "
-                       "VALUES (?, ?, ?, ?, ?)");
+    if (max_snapshots_per_fault_ > 0) {
+      // Trim whole capture sets, oldest first, until the fault fits. The old rule
+      // counted rows and rejected the NEW row once full, so a capture straddling
+      // the cap was stored in part - some topics present, the rest silently gone,
+      // indistinguishable from "that topic was not publishing". Keep-newest also
+      // stops this cap from opposing the rosbag one.
+      //
+      // The newest capture is never trimmed: if it alone exceeds the cap, the cap
+      // is smaller than this fault's topic count and tearing it would be the very
+      // thing being fixed.
+      SqliteStatement newest(db_, "SELECT MAX(capture_id) FROM snapshots WHERE fault_code = ?");
+      newest.bind_text(1, fault_code);
+      int64_t newest_capture = 0;
+      if (newest.step() == SQLITE_ROW) {
+        newest_capture = newest.column_int64(0);
+      }
 
-  stmt.bind_text(1, snapshot.fault_code);
-  stmt.bind_text(2, snapshot.topic);
-  stmt.bind_text(3, snapshot.message_type);
-  stmt.bind_text(4, snapshot.data);
-  stmt.bind_int64(5, snapshot.captured_at_ns);
+      SqliteStatement trim(db_,
+                           "DELETE FROM snapshots WHERE fault_code = ?1 AND capture_id = "
+                           "(SELECT MIN(capture_id) FROM snapshots WHERE fault_code = ?1) "
+                           "AND capture_id <> ?2");
+      SqliteStatement count(db_, "SELECT COUNT(*) FROM snapshots WHERE fault_code = ?");
+      while (true) {
+        count.reset();
+        count.bind_text(1, fault_code);
+        if (count.step() != SQLITE_ROW || static_cast<size_t>(count.column_int64(0)) <= max_snapshots_per_fault_) {
+          break;
+        }
+        trim.reset();
+        trim.bind_text(1, fault_code);
+        trim.bind_int64(2, newest_capture);
+        if (trim.step() != SQLITE_DONE) {
+          throw std::runtime_error(std::string("Failed to trim snapshots: ") + sqlite3_errmsg(db_));
+        }
+        if (sqlite3_changes(db_) == 0) {
+          break;  // only the newest capture is left and it is over on its own
+        }
+      }
+    }
 
-  if (stmt.step() != SQLITE_DONE) {
-    throw std::runtime_error(std::string("Failed to store snapshot: ") + sqlite3_errmsg(db_));
+    exec_or_throw("COMMIT");
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
   }
 }
 
@@ -1036,12 +1111,15 @@ std::vector<SnapshotData> SqliteFaultStorage::get_snapshots(const std::string & 
   std::vector<SnapshotData> result;
 
   std::string sql =
-      "SELECT fault_code, topic, message_type, data, captured_at_ns FROM snapshots WHERE fault_code "
+      "SELECT fault_code, topic, message_type, data, captured_at_ns, capture_id FROM snapshots WHERE fault_code "
       "= ?";
   if (!topic_filter.empty()) {
     sql += " AND topic = ?";
   }
-  sql += " ORDER BY captured_at_ns DESC";
+  // capture_id before the timestamp: the rows of one capture are written seconds
+  // apart under load and their timestamps interleave with a neighbouring capture's,
+  // so ordering by time alone splits a set the reader then cannot regroup.
+  sql += " ORDER BY capture_id DESC, captured_at_ns DESC";
 
   SqliteStatement stmt(db_, sql.c_str());
   stmt.bind_text(1, fault_code);
@@ -1056,6 +1134,7 @@ std::vector<SnapshotData> SqliteFaultStorage::get_snapshots(const std::string & 
     snapshot.message_type = stmt.column_text(2);
     snapshot.data = stmt.column_text(3);
     snapshot.captured_at_ns = stmt.column_int64(4);
+    snapshot.capture_id = stmt.column_int64(5);
     result.push_back(snapshot);
   }
 

@@ -348,20 +348,64 @@ void InMemoryFaultStorage::set_max_snapshots_per_fault(size_t max_count) {
 }
 
 void InMemoryFaultStorage::store_snapshot(const SnapshotData & snapshot) {
+  store_snapshots({snapshot});
+}
+
+void InMemoryFaultStorage::store_snapshots(const std::vector<SnapshotData> & snapshots) {
+  if (snapshots.empty()) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(mutex_);
+
+  const std::string fault_code = snapshots.front().fault_code;
+
+  // Built beside the live vector and swapped in, the shape store_rosbag_files
+  // uses: a capture is all-or-nothing, so a throw partway must not leave half of
+  // it stored.
+  auto updated = snapshots_;
+  updated.insert(updated.end(), snapshots.begin(), snapshots.end());
+
   if (max_snapshots_per_fault_ > 0) {
-    size_t count = 0;
-    for (const auto & s : snapshots_) {
-      if (s.fault_code == snapshot.fault_code) {
-        ++count;
+    // Evict whole capture sets, oldest first, until this fault fits.
+    //
+    // The old rule counted rows and rejected the NEW row once full, so a capture
+    // that straddled the cap was stored in part: some topics present, the rest
+    // silently absent, indistinguishable from "that topic was not publishing".
+    // Keep-newest also stops this cap from opposing the rosbag one.
+    const auto rows_for_fault = [&updated, &fault_code]() {
+      return static_cast<size_t>(std::count_if(updated.begin(), updated.end(), [&fault_code](const SnapshotData & s) {
+        return s.fault_code == fault_code;
+      }));
+    };
+
+    while (rows_for_fault() > max_snapshots_per_fault_) {
+      bool found = false;
+      int64_t oldest = 0;
+      for (const auto & s : updated) {
+        if (s.fault_code == fault_code && (!found || s.capture_id < oldest)) {
+          oldest = s.capture_id;
+          found = true;
+        }
+      }
+      if (!found) {
+        break;
+      }
+      const size_t before = updated.size();
+      updated.erase(std::remove_if(updated.begin(), updated.end(),
+                                   [&fault_code, oldest](const SnapshotData & s) {
+                                     return s.fault_code == fault_code && s.capture_id == oldest;
+                                   }),
+                    updated.end());
+      // One capture can exceed the cap on its own. Dropping every older set and
+      // still being over means the cap is smaller than this fault's topic count:
+      // keep the newest capture whole rather than tearing it.
+      if (updated.size() == before) {
+        break;
       }
     }
-    if (count >= max_snapshots_per_fault_) {
-      // Silent rejection: storage layer has no logger. Callers should log if needed.
-      return;  // Reject new - keep first N inserted snapshots
-    }
   }
-  snapshots_.push_back(snapshot);
+
+  snapshots_.swap(updated);
 }
 
 std::vector<SnapshotData> InMemoryFaultStorage::get_snapshots(const std::string & fault_code,

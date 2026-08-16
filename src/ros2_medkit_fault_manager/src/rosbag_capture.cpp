@@ -591,6 +591,19 @@ void RosbagCapture::on_fault_cleared(const std::string & fault_code) {
     return;
   }
 
+  // Acknowledging a fault must not destroy a history the operator asked to keep.
+  // auto_cleanup deletes EVERY recording of the fault, so with a cap above one the
+  // first acknowledgement wiped the whole trail that max_bags_per_fault had just
+  // been raised to collect - one default silently cancelling another. When a
+  // history is configured the cap governs retention and acknowledgement leaves the
+  // evidence alone; at the default cap of 1 this is exactly the old behaviour.
+  if (config_.max_bags_per_fault != 1) {
+    RCLCPP_DEBUG(node_->get_logger(),
+                 "Fault '%s' cleared; keeping its recordings because max_bags_per_fault is %zu, not 1",
+                 fault_code.c_str(), config_.max_bags_per_fault);
+    return;
+  }
+
   // A fault of the in-flight burst has no row yet: drop it from the recording
   // state so the finalize never writes one. A leftover row for a cleared fault
   // would keep the shared bag referenced forever and break the burst's cleanup.
