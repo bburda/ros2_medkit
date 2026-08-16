@@ -137,7 +137,7 @@ class TestDiagnosticBridgeIntegration(unittest.TestCase):
         result = future.result()
         return result.faults if result is not None else []
 
-    def publish_diagnostic(self, name, level, message='Test message'):
+    def publish_diagnostic(self, name, level, message='Test message', hardware_id='test_hw'):
         """Publish a single diagnostic message."""
         msg = DiagnosticArray()
         msg.header.stamp = self.node.get_clock().now().to_msg()
@@ -145,7 +145,7 @@ class TestDiagnosticBridgeIntegration(unittest.TestCase):
             level=level,
             name=name,
             message=message,
-            hardware_id='test_hw',
+            hardware_id=hardware_id,
         )]
         self.diag_pub.publish(msg)
 
@@ -153,7 +153,7 @@ class TestDiagnosticBridgeIntegration(unittest.TestCase):
         time.sleep(0.3)
 
     def publish_until(self, name, level, expected_code, *, predicate=None,
-                      message='Test message', statuses=None, timeout=25.0):
+                      message='Test message', hardware_id='test_hw', statuses=None, timeout=25.0):
         """
         Republish a diagnostic until a matching fault satisfies *predicate*.
 
@@ -175,7 +175,7 @@ class TestDiagnosticBridgeIntegration(unittest.TestCase):
         deadline = time.monotonic() + timeout
         last = None
         while time.monotonic() < deadline:
-            self.publish_diagnostic(name, level, message)
+            self.publish_diagnostic(name, level, message, hardware_id)
             fault = next(
                 (f for f in self.list_faults(statuses=statuses)
                  if f.fault_code == expected_code),
@@ -251,6 +251,38 @@ class TestDiagnosticBridgeIntegration(unittest.TestCase):
             self.publish_until(
                 diag_name, DiagnosticStatus.ERROR, expected_code,
             )
+
+    def test_06_hardware_id_is_forwarded_as_source(self):
+        """Test that hardware_id is forwarded into fault reporting_sources."""
+        self.publish_until(
+            'shared_sensor', DiagnosticStatus.STALE, 'SHARED_SENSOR',
+            message='No data from source A',
+            hardware_id='/my_lidar_driver',
+            predicate=lambda f: '/my_lidar_driver' in f.reporting_sources,
+        )
+
+        fault = self.publish_until(
+            'shared_sensor', DiagnosticStatus.STALE, 'SHARED_SENSOR',
+            message='No data from source B',
+            hardware_id='/my_camera_driver',
+            predicate=lambda f: '/my_lidar_driver' in f.reporting_sources
+            and '/my_camera_driver' in f.reporting_sources,
+        )
+
+        self.assertEqual(fault.severity, Fault.SEVERITY_CRITICAL)
+        self.assertIn('/my_lidar_driver', fault.reporting_sources)
+        self.assertIn('/my_camera_driver', fault.reporting_sources)
+
+    def test_07_empty_hardware_id_falls_back_to_bridge_source(self):
+        """Test that empty hardware_id falls back to the bridge node FQN."""
+        fault = self.publish_until(
+            'fallback_sensor', DiagnosticStatus.STALE, 'FALLBACK_SENSOR',
+            message='No data with empty hardware id',
+            hardware_id='',
+            predicate=lambda f: '/diagnostic_bridge' in f.reporting_sources,
+        )
+
+        self.assertIn('/diagnostic_bridge', fault.reporting_sources)
 
 
 @launch_testing.post_shutdown_test()
