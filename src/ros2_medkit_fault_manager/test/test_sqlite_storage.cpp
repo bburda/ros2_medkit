@@ -1655,41 +1655,82 @@ TEST_F(SqliteFaultStorageTest, BulkDeleteRemovesTheBurstAndUnlinksTheBagOnce) {
 // Snapshot limit tests (issue #308)
 // =============================================================================
 
-TEST_F(SqliteFaultStorageTest, SnapshotLimitRejectsNewWhenFull) {
+TEST_F(SqliteFaultStorageTest, SnapshotCapKeepsTheNewestCaptureWholeAndDropsTheOldest) {
   using ros2_medkit_fault_manager::SnapshotData;
 
   rclcpp::Clock clock;
   storage_->report_fault_event("MOTOR_OVERHEAT", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR,
                                "Motor overheated", "/motor_node", clock.now(), default_config());
 
-  // Set limit to 2 snapshots per fault
-  storage_->set_max_snapshots_per_fault(2);
+  // Two topics per capture, room for two captures.
+  storage_->set_max_snapshots_per_fault(4);
 
-  SnapshotData snap1;
-  snap1.fault_code = "MOTOR_OVERHEAT";
-  snap1.topic = "/motor/temp";
-  snap1.message_type = "std_msgs/msg/Float64";
-  snap1.data = R"({"data": 85.0})";
-  snap1.captured_at_ns = 1000;
+  const auto capture = [](int64_t id, int64_t at) {
+    std::vector<SnapshotData> rows;
+    for (const char * topic : {"/motor/temp", "/motor/rpm"}) {
+      SnapshotData row;
+      row.fault_code = "MOTOR_OVERHEAT";
+      row.topic = topic;
+      row.message_type = "std_msgs/msg/Float64";
+      row.data = R"({"data": 1.0})";
+      row.captured_at_ns = at;
+      row.capture_id = id;
+      rows.push_back(row);
+    }
+    return rows;
+  };
 
-  SnapshotData snap2 = snap1;
-  snap2.data = R"({"data": 90.0})";
-  snap2.captured_at_ns = 2000;
-
-  SnapshotData snap3 = snap1;
-  snap3.data = R"({"data": 95.0})";
-  snap3.captured_at_ns = 3000;
-
-  storage_->store_snapshot(snap1);
-  storage_->store_snapshot(snap2);
-  storage_->store_snapshot(snap3);  // Should be rejected
+  storage_->store_snapshots(capture(1, 1000));
+  storage_->store_snapshots(capture(2, 2000));
+  storage_->store_snapshots(capture(3, 3000));
 
   auto snapshots = storage_->get_snapshots("MOTOR_OVERHEAT");
-  ASSERT_EQ(snapshots.size(), 2u) << "Third snapshot should be rejected (limit=2)";
 
-  // Earliest snapshots kept (reject-new strategy), returned newest-first
-  EXPECT_EQ(snapshots[0].captured_at_ns, 2000);
-  EXPECT_EQ(snapshots[1].captured_at_ns, 1000);
+  // The third capture is stored WHOLE and the first goes whole. The old rule
+  // counted rows and rejected the new one once full, so capture 3 landed with one
+  // topic present and the other silently missing - a freeze frame with a hole in
+  // it that reads exactly like "that topic was not publishing".
+  ASSERT_EQ(snapshots.size(), 4u);
+  std::set<int64_t> captures;
+  for (const auto & s : snapshots) {
+    captures.insert(s.capture_id);
+  }
+  EXPECT_EQ(captures, (std::set<int64_t>{2, 3}));
+  for (int64_t id : {2, 3}) {
+    EXPECT_EQ(std::count_if(snapshots.begin(), snapshots.end(),
+                            [id](const SnapshotData & s) {
+                              return s.capture_id == id;
+                            }),
+              2)
+        << "capture " << id << " was stored in part";
+  }
+}
+
+TEST_F(SqliteFaultStorageTest, ACaptureLargerThanTheCapIsKeptWholeRatherThanTorn) {
+  using ros2_medkit_fault_manager::SnapshotData;
+
+  rclcpp::Clock clock;
+  storage_->report_fault_event("WIDE", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "many topics", "/n",
+                               clock.now(), default_config());
+  storage_->set_max_snapshots_per_fault(2);
+
+  std::vector<SnapshotData> rows;
+  for (int i = 0; i < 4; ++i) {
+    SnapshotData row;
+    row.fault_code = "WIDE";
+    row.topic = "/t" + std::to_string(i);
+    row.message_type = "std_msgs/msg/Float64";
+    row.data = "{}";
+    row.captured_at_ns = 1000;
+    row.capture_id = 7;
+    rows.push_back(row);
+  }
+  storage_->store_snapshots(rows);
+
+  // The cap is smaller than this fault's topic count. Trimming to it would mean
+  // storing the reading with holes, which is the failure being fixed; the capture
+  // stays whole and the operator can see the cap is too small.
+  EXPECT_EQ(storage_->get_snapshots("WIDE").size(), 4u);
 }
 
 TEST_F(SqliteFaultStorageTest, SnapshotLimitZeroMeansUnlimited) {

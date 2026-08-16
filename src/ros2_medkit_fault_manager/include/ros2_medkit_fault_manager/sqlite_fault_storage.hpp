@@ -67,6 +67,7 @@ class SqliteFaultStorage : public FaultStorage {
   void set_max_rosbags_per_fault(size_t max_count) override;
 
   void store_snapshot(const SnapshotData & snapshot) override;
+  void store_snapshots(const std::vector<SnapshotData> & snapshots) override;
   std::vector<SnapshotData> get_snapshots(const std::string & fault_code,
                                           const std::string & topic_filter = "") const override;
 

@@ -205,14 +205,17 @@ class SnapshotCapture {
   /// Capture a single topic on-demand (creates temporary subscription)
   /// On success also records the captured value into @p freeze_frame under the topic key.
   /// @return true if capture was successful
-  bool capture_topic_on_demand(const std::string & fault_code, const std::string & topic,
-                               nlohmann::json & freeze_frame);
+  /// Appends to @p rows rather than storing: a capture is persisted as one set,
+  /// so the per-fault cap can drop a whole old capture instead of truncating this
+  /// one topic by topic.
+  bool capture_topic_on_demand(const std::string & fault_code, const std::string & topic, nlohmann::json & freeze_frame,
+                               std::vector<SnapshotData> & rows);
 
   /// Capture a topic from background cache
   /// On success also records the cached value into @p freeze_frame under the topic key.
   /// @return true if data was available in cache
   bool capture_topic_from_cache(const std::string & fault_code, const std::string & topic,
-                                nlohmann::json & freeze_frame);
+                                nlohmann::json & freeze_frame, std::vector<SnapshotData> & rows);
 
   /// Initialize background subscriptions for all configured topics
   void init_background_subscriptions();

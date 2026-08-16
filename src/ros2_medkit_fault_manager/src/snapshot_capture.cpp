@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "ros2_medkit_fault_manager/snapshot_capture.hpp"
+#include <atomic>
 
 #include <rclcpp/generic_subscription.hpp>
 #include <rclcpp/serialization.hpp>
@@ -147,15 +148,21 @@ void SnapshotCapture::capture(const std::string & fault_code) {
 
   // Accumulate a compact dict of captured topic values alongside the per-topic snapshots.
   nlohmann::json freeze_frame = nlohmann::json::object();
+  // One id for the whole capture, minted here so every row of this confirmation
+  // shares it. Monotonic rather than a clock read: the rows are written seconds
+  // apart under load and a wall clock is not guaranteed to move forward.
+  static std::atomic<int64_t> capture_seq{0};
+  const int64_t capture_id = ++capture_seq;
+  std::vector<SnapshotData> rows;
   size_t captured_count = 0;
   for (const auto & topic : topics) {
     bool success = false;
     // Entity-default topics are not known at construction, so the background
     // cache never holds them - always sample those on demand.
     if (config_.background_capture && !entity_scoped) {
-      success = capture_topic_from_cache(fault_code, topic, freeze_frame);
+      success = capture_topic_from_cache(fault_code, topic, freeze_frame, rows);
     } else {
-      success = capture_topic_on_demand(fault_code, topic, freeze_frame);
+      success = capture_topic_on_demand(fault_code, topic, freeze_frame, rows);
     }
 
     if (success) {
@@ -165,6 +172,14 @@ void SnapshotCapture::capture(const std::string & fault_code) {
 
   RCLCPP_INFO(node_->get_logger(), "Captured %zu/%zu snapshots for fault '%s'", captured_count, topics.size(),
               fault_code.c_str());
+
+  // One write for the whole capture. Storing topic by topic let the per-fault cap
+  // reject the tail of a capture, leaving a freeze frame with holes and nothing
+  // saying which values were dropped.
+  for (auto & row : rows) {
+    row.capture_id = capture_id;
+  }
+  storage_->store_snapshots(rows);
 
   // Persist the compact freeze-frame keyed by fault_code (retained across clear_fault).
   // Only reached for faults with a configured capture set (unconfigured codes returned
@@ -301,7 +316,7 @@ std::vector<std::string> SnapshotCapture::resolve_entity_topics(const std::strin
 }
 
 bool SnapshotCapture::capture_topic_on_demand(const std::string & fault_code, const std::string & topic,
-                                              nlohmann::json & freeze_frame) {
+                                              nlohmann::json & freeze_frame, std::vector<SnapshotData> & rows) {
   // Get topic type
   std::string msg_type = get_topic_type(topic);
   if (msg_type.empty()) {
@@ -411,7 +426,7 @@ bool SnapshotCapture::capture_topic_on_demand(const std::string & fault_code, co
     snapshot.data = json_data.dump();
     snapshot.captured_at_ns = get_wall_clock_ns();
 
-    storage_->store_snapshot(snapshot);
+    rows.push_back(std::move(snapshot));
 
     // Record the value into the compact freeze-frame dict under the topic key.
     freeze_frame[topic] = std::move(json_data);
@@ -431,7 +446,7 @@ bool SnapshotCapture::capture_topic_on_demand(const std::string & fault_code, co
 }
 
 bool SnapshotCapture::capture_topic_from_cache(const std::string & fault_code, const std::string & topic,
-                                               nlohmann::json & freeze_frame) {
+                                               nlohmann::json & freeze_frame, std::vector<SnapshotData> & rows) {
   std::lock_guard<std::mutex> lock(cache_mutex_);
 
   auto it = message_cache_.find(topic);
@@ -450,7 +465,7 @@ bool SnapshotCapture::capture_topic_from_cache(const std::string & fault_code, c
   snapshot.data = cached.data;
   snapshot.captured_at_ns = cached.timestamp_ns;
 
-  storage_->store_snapshot(snapshot);
+  rows.push_back(std::move(snapshot));
 
   // Record the cached value into the compact freeze-frame dict. The cache holds a serialized
   // JSON string; parse it back so the frame nests structured values (fall back to the raw

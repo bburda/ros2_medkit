@@ -1520,25 +1520,36 @@ TEST(MatchesEntityTest, EmptySources) {
 
 // --- InMemoryFaultStorage snapshot limit tests ---
 
-TEST(InMemorySnapshotLimitTest, RejectsWhenFull) {
+TEST(InMemorySnapshotLimitTest, KeepsTheNewestCaptureWholeAndDropsTheOldest) {
   InMemoryFaultStorage storage;
-  storage.set_max_snapshots_per_fault(2);
+  storage.set_max_snapshots_per_fault(4);
 
-  ros2_medkit_fault_manager::SnapshotData snap;
-  snap.fault_code = "TEST";
-  snap.topic = "/test";
-  snap.message_type = "std_msgs/msg/String";
-  snap.data = "{}";
+  const auto capture = [](int64_t id, int64_t at) {
+    std::vector<ros2_medkit_fault_manager::SnapshotData> rows;
+    for (const char * topic : {"/a", "/b"}) {
+      ros2_medkit_fault_manager::SnapshotData row;
+      row.fault_code = "TEST";
+      row.topic = topic;
+      row.message_type = "std_msgs/msg/String";
+      row.data = "{}";
+      row.captured_at_ns = at;
+      row.capture_id = id;
+      rows.push_back(row);
+    }
+    return rows;
+  };
 
-  snap.captured_at_ns = 1000;
-  storage.store_snapshot(snap);
-  snap.captured_at_ns = 2000;
-  storage.store_snapshot(snap);
-  snap.captured_at_ns = 3000;
-  storage.store_snapshot(snap);  // Should be rejected
+  storage.store_snapshots(capture(1, 1000));
+  storage.store_snapshots(capture(2, 2000));
+  storage.store_snapshots(capture(3, 3000));
 
+  // Whole captures in, whole capture out. Counting rows and rejecting the new one
+  // stored capture 3 in part: one topic present, the rest silently absent.
   auto result = storage.get_snapshots("TEST");
-  EXPECT_EQ(result.size(), 2u);
+  ASSERT_EQ(result.size(), 4u);
+  for (const auto & s : result) {
+    EXPECT_NE(s.capture_id, 1) << "the oldest capture should have gone whole";
+  }
 }
 
 TEST(InMemorySnapshotLimitTest, UnlimitedWhenZero) {

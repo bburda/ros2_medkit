@@ -103,12 +103,18 @@ struct FaultState {
 using EventType = ros2_medkit_msgs::srv::ReportFault::Request;
 
 /// Snapshot data captured when a fault is confirmed
+/// One captured topic value. A confirmation writes one of these PER TOPIC, and
+/// all of them share a capture_id: they are one reading of the machine taken at
+/// one moment and only mean anything together.
 struct SnapshotData {
   std::string fault_code;
   std::string topic;
   std::string message_type;
   std::string data;  ///< JSON-encoded message data
   int64_t captured_at_ns{0};
+  /// Groups the rows of one capture. Monotonic within a fault manager process;
+  /// 0 on rows written before the field existed, which read as one legacy set.
+  int64_t capture_id{0};
 };
 
 /// Compact freeze-frame captured when a fault confirms: a single JSON object mapping
@@ -218,6 +224,19 @@ class FaultStorage {
   /// keep-newest at 1 is exactly the pre-#620 behaviour, which is what makes the
   /// default a no-op.
   virtual void set_max_rosbags_per_fault(size_t /*max_count*/) {
+  }
+
+  /// Store one capture as a unit.
+  ///
+  /// The per-fault cap applies to whole capture sets: past it the OLDEST set is
+  /// dropped entire, instead of the newest capture being truncated topic by topic
+  /// as it is written. Writing row by row is what produced freeze frames with
+  /// some topics silently missing and nothing on the wire saying which.
+  /// @param snapshots Every row of one capture; they share a capture_id
+  virtual void store_snapshots(const std::vector<SnapshotData> & snapshots) {
+    for (const auto & snapshot : snapshots) {
+      store_snapshot(snapshot);
+    }
   }
 
   /// Store a snapshot captured when a fault was confirmed
@@ -383,6 +402,7 @@ class InMemoryFaultStorage : public FaultStorage {
   void set_max_snapshots_per_fault(size_t max_count) override;
 
   void store_snapshot(const SnapshotData & snapshot) override;
+  void store_snapshots(const std::vector<SnapshotData> & snapshots) override;
   std::vector<SnapshotData> get_snapshots(const std::string & fault_code,
                                           const std::string & topic_filter = "") const override;
 

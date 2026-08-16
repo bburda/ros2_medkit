@@ -84,9 +84,11 @@ def generate_test_description():
             'snapshots.rosbag.storage_path': ROSBAG_STORAGE_PATH,
             # The feature under test.
             'snapshots.rosbag.max_bags_per_fault': MAX_BAGS_PER_FAULT,
-            # Acknowledging a fault must not take its evidence with it - the
-            # scenario is confirm, acknowledge, fault again.
-            'snapshots.rosbag.auto_cleanup': False,
+            # LEFT ON, which is the shipped default and the point: acknowledging
+            # used to delete every recording of the fault, so the history the cap
+            # above was raised to collect was wiped by the first acknowledgement.
+            'snapshots.rosbag.auto_cleanup': True,
+
         },
     )
 

@@ -1104,6 +1104,62 @@ TEST_F(RosbagCaptureIntegrationTest, FullFaultLifecycleWithNoMessages) {
   EXPECT_FALSE(capture.is_running());
 }
 
+TEST_F(RosbagCaptureIntegrationTest, AcknowledgingKeepsAHistoryTheOperatorConfiguredToKeep) {
+  // auto_cleanup deletes EVERY recording of the fault, so with a cap above one the
+  // first acknowledgement wiped the whole trail max_bags_per_fault had just been
+  // raised to collect - one default silently cancelling another. Raising the cap is
+  // an explicit request to keep a history, so retention governs and acknowledgement
+  // leaves the evidence alone.
+  InMemoryFaultStorage storage;
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_sec = 1.0;
+  rosbag_config.duration_after_sec = 0.0;
+  rosbag_config.auto_cleanup = true;
+  rosbag_config.max_bags_per_fault = 3;
+  storage.set_max_rosbags_per_fault(rosbag_config.max_bags_per_fault);
+
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture capture(node_.get(), &storage, rosbag_config, snapshot_config);
+  capture.start();
+  fill_buffer("/keep_history_probe");
+  capture.on_fault_confirmed("KEEPS_HISTORY");
+  spin_for(std::chrono::milliseconds(300));
+
+  ASSERT_FALSE(storage.get_rosbag_files("KEEPS_HISTORY").empty()) << "nothing was recorded to keep";
+  const auto before = storage.get_rosbag_files("KEEPS_HISTORY").size();
+
+  capture.on_fault_cleared("KEEPS_HISTORY");
+
+  EXPECT_EQ(storage.get_rosbag_files("KEEPS_HISTORY").size(), before)
+      << "acknowledging the fault destroyed the recordings the cap was raised to keep";
+  capture.stop();
+}
+
+TEST_F(RosbagCaptureIntegrationTest, AcknowledgingStillCleansUpWhenNoHistoryIsConfigured) {
+  // The shipped default: one recording per fault means there is no history to
+  // protect, so auto_cleanup keeps behaving exactly as it always has.
+  InMemoryFaultStorage storage;
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_sec = 1.0;
+  rosbag_config.duration_after_sec = 0.0;
+  rosbag_config.auto_cleanup = true;
+  rosbag_config.max_bags_per_fault = 1;
+
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture capture(node_.get(), &storage, rosbag_config, snapshot_config);
+  capture.start();
+  fill_buffer("/cleanup_probe");
+  capture.on_fault_confirmed("CLEANED_UP");
+  spin_for(std::chrono::milliseconds(300));
+
+  ASSERT_FALSE(storage.get_rosbag_files("CLEANED_UP").empty());
+
+  capture.on_fault_cleared("CLEANED_UP");
+
+  EXPECT_TRUE(storage.get_rosbag_files("CLEANED_UP").empty()) << "auto_cleanup stopped working at the default cap";
+  capture.stop();
+}
+
 TEST_F(RosbagCaptureIntegrationTest, MultipleFaultsHandled) {
   auto rosbag_config = create_rosbag_config();
   rosbag_config.duration_sec = 0.5;
