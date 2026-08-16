@@ -341,21 +341,28 @@ dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_jso
         //
         // No fallback to the parent fault code any more. A fault can hold several
         // recordings, so substituting its code would advertise one URL for all of
-        // them and serve whichever the compatibility path happened to pick. Better
-        // to omit the URI and say so: the snapshot still carries its size, duration
-        // and format, and the bulk-data listing remains a complete route to the bag.
-        if (s.contains("bulk_data_id") && s["bulk_data_id"].is_string() &&
-            !s["bulk_data_id"].get<std::string>().empty()) {
-          std::string bulk_data_uri = entity_path;
-          bulk_data_uri += "/bulk-data/rosbags/";
-          bulk_data_uri += s["bulk_data_id"].get<std::string>();
-          snap["bulk_data_uri"] = std::move(bulk_data_uri);
-        } else {
+        // them and serve whichever the compatibility path happened to pick.
+        //
+        // With no addressable id there is no snapshot to report: a rosbag entry
+        // is a pointer to bytes, and one that points nowhere is not degraded
+        // information, it is a download button that cannot work. Every rosbag
+        // snapshot this endpoint has ever emitted carried a bulk_data_uri, and
+        // consumers dereference it unguarded; dropping the entry keeps that
+        // invariant rather than inventing a new shape for them to crash on.
+        // Same rule as the bulk-data listing, which also drops an unaddressable
+        // row instead of advertising it.
+        if (!s.contains("bulk_data_id") || !s["bulk_data_id"].is_string() ||
+            s["bulk_data_id"].get<std::string>().empty()) {
           RCLCPP_WARN(HandlerContext::logger(),
-                      "Rosbag snapshot for fault '%s' on entity '%s' carries no 'bulk_data_id'; serving it without a "
-                      "bulk_data_uri. This is a transport-side bug.",
+                      "Rosbag snapshot for fault '%s' on entity '%s' carries no 'bulk_data_id'; omitting it, as "
+                      "nothing could address the recording. This is a transport-side bug.",
                       fault_code.c_str(), entity_path.c_str());
+          continue;
         }
+        std::string bulk_data_uri = entity_path;
+        bulk_data_uri += "/bulk-data/rosbags/";
+        bulk_data_uri += s["bulk_data_id"].get<std::string>();
+        snap["bulk_data_uri"] = std::move(bulk_data_uri);
         if (s.contains("size_bytes")) {
           snap["size_bytes"] = s["size_bytes"];
         }

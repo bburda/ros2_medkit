@@ -458,7 +458,8 @@ void InMemoryFaultStorage::store_rosbag_files(const std::vector<RosbagFileInfo> 
       return std::tie(updated[a].info.created_at_ns, updated[a].seq) <
              std::tie(updated[b].info.created_at_ns, updated[b].seq);
     });
-    std::vector<size_t> doomed(mine.begin(), mine.begin() + static_cast<std::ptrdiff_t>(mine.size() - max_rosbags_per_fault_));
+    std::vector<size_t> doomed(mine.begin(),
+                               mine.begin() + static_cast<std::ptrdiff_t>(mine.size() - max_rosbags_per_fault_));
     std::sort(doomed.rbegin(), doomed.rend());  // descending, so erase stays valid
     for (size_t idx : doomed) {
       evicted.insert(updated[idx].info.file_path);
@@ -494,8 +495,7 @@ std::optional<RosbagFileInfo> InMemoryFaultStorage::get_rosbag_file(const std::s
     if (row.info.fault_code != fault_code) {
       continue;
     }
-    if (best == nullptr ||
-        std::tie(best->info.created_at_ns, best->seq) < std::tie(row.info.created_at_ns, row.seq)) {
+    if (best == nullptr || std::tie(best->info.created_at_ns, best->seq) < std::tie(row.info.created_at_ns, row.seq)) {
       best = &row;
     }
   }
@@ -526,7 +526,8 @@ std::vector<RosbagFileInfo> InMemoryFaultStorage::get_rosbag_files(const std::st
   return result;
 }
 
-std::vector<RosbagFileInfo> InMemoryFaultStorage::get_rosbag_files_by_recording(const std::string & recording_id) const {
+std::vector<RosbagFileInfo>
+InMemoryFaultStorage::get_rosbag_files_by_recording(const std::string & recording_id) const {
   std::lock_guard<std::mutex> lock(mutex_);
 
   std::vector<RosbagFileInfo> result;
@@ -535,8 +536,9 @@ std::vector<RosbagFileInfo> InMemoryFaultStorage::get_rosbag_files_by_recording(
       result.push_back(row.info);
     }
   }
-  std::sort(result.begin(), result.end(),
-            [](const RosbagFileInfo & a, const RosbagFileInfo & b) { return a.fault_code < b.fault_code; });
+  std::sort(result.begin(), result.end(), [](const RosbagFileInfo & a, const RosbagFileInfo & b) {
+    return a.fault_code < b.fault_code;
+  });
   return result;
 }
 
@@ -623,8 +625,9 @@ bool InMemoryFaultStorage::path_shared_with_other_fault(const std::string & file
 }
 
 bool InMemoryFaultStorage::path_referenced(const std::string & file_path) const {
-  return std::any_of(rosbag_files_.begin(), rosbag_files_.end(),
-                     [&](const RosbagRow & row) { return row.info.file_path == file_path; });
+  return std::any_of(rosbag_files_.begin(), rosbag_files_.end(), [&](const RosbagRow & row) {
+    return row.info.file_path == file_path;
+  });
 }
 
 size_t InMemoryFaultStorage::get_total_rosbag_storage_bytes() const {
