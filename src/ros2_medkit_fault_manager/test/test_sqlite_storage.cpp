@@ -1256,6 +1256,31 @@ TEST_F(SqliteFaultStorageTest, ClearFaultDeletesAssociatedSnapshots) {
 
 // Freeze-frame storage tests
 // @verifies REQ_INTEROP_088
+TEST_F(SqliteFaultStorageTest, ClearFaultKeepsSnapshotsWhenEvidenceIsRetained) {
+  using ros2_medkit_fault_manager::SnapshotData;
+
+  rclcpp::Clock clock;
+  storage_->report_fault_event("KEEP", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "keep", "/n",
+                               clock.now(), default_config());
+  storage_->set_retain_snapshots_on_clear(true);
+
+  SnapshotData row;
+  row.fault_code = "KEEP";
+  row.topic = "/t";
+  row.message_type = "std_msgs/msg/Float64";
+  row.data = R"({"data": 1.0})";
+  row.captured_at_ns = 1000;
+  row.capture_id = 1;
+  storage_->store_snapshots({row});
+
+  ASSERT_TRUE(storage_->clear_fault("KEEP"));
+
+  // Recordings survive an acknowledgement once a history is configured, so the
+  // readings captured beside them have to as well - otherwise the fault is left
+  // holding bags whose values are gone, which is worse than losing both.
+  EXPECT_EQ(storage_->get_snapshots("KEEP").size(), 1u);
+}
+
 TEST_F(SqliteFaultStorageTest, StoreAndRetrieveFreezeFrame) {
   using ros2_medkit_fault_manager::FreezeFrameData;
   rclcpp::Clock clock;

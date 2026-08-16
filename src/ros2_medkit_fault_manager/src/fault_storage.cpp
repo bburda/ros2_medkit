@@ -298,12 +298,16 @@ bool InMemoryFaultStorage::clear_fault(const std::string & fault_code) {
     return false;
   }
 
-  // Delete associated snapshots when fault is cleared
-  snapshots_.erase(std::remove_if(snapshots_.begin(), snapshots_.end(),
-                                  [&fault_code](const SnapshotData & s) {
-                                    return s.fault_code == fault_code;
-                                  }),
-                   snapshots_.end());
+  // Acknowledging a fault drops its value snapshots, unless a history was asked
+  // for: with recordings retained past a clear, deleting the readings that go with
+  // them leaves a fault holding bags whose matching values are gone.
+  if (!retain_snapshots_on_clear_) {
+    snapshots_.erase(std::remove_if(snapshots_.begin(), snapshots_.end(),
+                                    [&fault_code](const SnapshotData & s) {
+                                      return s.fault_code == fault_code;
+                                    }),
+                     snapshots_.end());
+  }
 
   it->second.status = ros2_medkit_msgs::msg::Fault::STATUS_CLEARED;
   return true;
@@ -345,6 +349,11 @@ std::vector<std::string> InMemoryFaultStorage::check_time_based_confirmation(con
 void InMemoryFaultStorage::set_max_snapshots_per_fault(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
   max_snapshots_per_fault_ = max_count;
+}
+
+void InMemoryFaultStorage::set_retain_snapshots_on_clear(bool retain) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  retain_snapshots_on_clear_ = retain;
 }
 
 void InMemoryFaultStorage::store_snapshot(const SnapshotData & snapshot) {

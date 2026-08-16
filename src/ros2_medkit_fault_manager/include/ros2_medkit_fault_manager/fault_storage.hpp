@@ -226,6 +226,16 @@ class FaultStorage {
   virtual void set_max_rosbags_per_fault(size_t /*max_count*/) {
   }
 
+  /// Whether acknowledging a fault keeps the value snapshots it captured.
+  ///
+  /// Off by default, which is the historical behaviour: clear_fault deletes them.
+  /// Turn it on together with a rosbag history, or acknowledging leaves the fault
+  /// holding recordings whose matching readings are gone - evidence that no longer
+  /// lines up. Growth stays bounded by the per-fault cap either way, so clearing
+  /// was never the only thing holding the table down.
+  virtual void set_retain_snapshots_on_clear(bool /*retain*/) {
+  }
+
   /// Store one capture as a unit.
   ///
   /// The per-fault cap applies to whole capture sets: past it the OLDEST set is
@@ -400,6 +410,7 @@ class InMemoryFaultStorage : public FaultStorage {
   std::vector<std::string> check_time_based_confirmation(const rclcpp::Time & current_time) override;
 
   void set_max_snapshots_per_fault(size_t max_count) override;
+  void set_retain_snapshots_on_clear(bool retain) override;
 
   void store_snapshot(const SnapshotData & snapshot) override;
   void store_snapshots(const std::vector<SnapshotData> & snapshots) override;
@@ -463,6 +474,7 @@ class InMemoryFaultStorage : public FaultStorage {
   size_t max_rosbags_per_fault_{1};
   DebounceConfig config_;
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
+  bool retain_snapshots_on_clear_{false};
 };
 
 }  // namespace ros2_medkit_fault_manager

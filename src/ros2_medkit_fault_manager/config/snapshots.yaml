@@ -79,6 +79,13 @@ default_topics:
 # `default_topics` from this YAML file. Rosbag settings must be configured
 # via ROS 2 parameters (--ros-args -p snapshots.rosbag.*) or launch files.
 
+# Keep a fault's value snapshots when it is acknowledged (default: false)
+# Off is the historical behaviour: clearing a fault deletes them. Turn it on
+# together with rosbag.max_bags_per_fault, or acknowledging leaves the fault
+# holding recordings whose matching readings are gone - evidence that no longer
+# lines up. Growth stays bounded by max_per_fault either way.
+retain_on_clear: false
+
 rosbag:
   # Enable/disable rosbag capture (default: false)
   # When disabled, only JSON snapshots are captured

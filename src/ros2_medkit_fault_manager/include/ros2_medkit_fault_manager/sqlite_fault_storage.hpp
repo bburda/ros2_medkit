@@ -63,6 +63,7 @@ class SqliteFaultStorage : public FaultStorage {
   std::vector<std::string> check_time_based_confirmation(const rclcpp::Time & current_time) override;
 
   void set_max_snapshots_per_fault(size_t max_count) override;
+  void set_retain_snapshots_on_clear(bool retain) override;
 
   void set_max_rosbags_per_fault(size_t max_count) override;
 
@@ -143,6 +144,7 @@ class SqliteFaultStorage : public FaultStorage {
   mutable std::mutex mutex_;
   DebounceConfig config_;
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
+  bool retain_snapshots_on_clear_{false};
   /// Defaults to 1, the pre-#620 behaviour: a new recording replaces the old one.
   /// 0 = unlimited, bounded only by max_total_storage_mb.
   size_t max_rosbags_per_fault_{1};

@@ -900,10 +900,15 @@ bool SqliteFaultStorage::clear_fault(const std::string & fault_code) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   // Delete associated snapshots when fault is cleared
-  SqliteStatement delete_snapshots(db_, "DELETE FROM snapshots WHERE fault_code = ?");
-  delete_snapshots.bind_text(1, fault_code);
-  if (delete_snapshots.step() != SQLITE_DONE) {
-    throw std::runtime_error(std::string("Failed to delete snapshots: ") + sqlite3_errmsg(db_));
+  // Acknowledging a fault drops its value snapshots, unless a history was asked
+  // for: with recordings retained past a clear, deleting the readings that go with
+  // them leaves a fault holding bags whose matching values are gone.
+  if (!retain_snapshots_on_clear_) {
+    SqliteStatement delete_snapshots(db_, "DELETE FROM snapshots WHERE fault_code = ?");
+    delete_snapshots.bind_text(1, fault_code);
+    if (delete_snapshots.step() != SQLITE_DONE) {
+      throw std::runtime_error(std::string("Failed to delete snapshots: ") + sqlite3_errmsg(db_));
+    }
   }
 
   SqliteStatement stmt(db_, "UPDATE faults SET status = ? WHERE fault_code = ?");
@@ -1021,6 +1026,11 @@ std::vector<std::string> SqliteFaultStorage::check_time_based_confirmation(const
 void SqliteFaultStorage::set_max_snapshots_per_fault(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
   max_snapshots_per_fault_ = max_count;
+}
+
+void SqliteFaultStorage::set_retain_snapshots_on_clear(bool retain) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  retain_snapshots_on_clear_ = retain;
 }
 
 void SqliteFaultStorage::store_snapshot(const SnapshotData & snapshot) {
