@@ -217,12 +217,11 @@ class FaultStorage {
   /// the fault's OLDEST recordings lose their row, and a bag whose last referencing
   /// row goes is unlinked once the store is durable.
   ///
-  /// Keep-newest, deliberately the opposite of set_max_snapshots_per_fault's
-  /// reject-new. Snapshots guard against one capture writing a row per configured
-  /// topic and flooding the table, where keeping the earliest is right. A bag is
-  /// evidence about a machine you are about to inspect, so the recent one wins; and
-  /// keep-newest at 1 is exactly the pre-#620 behaviour, which is what makes the
-  /// default a no-op.
+  /// Keep-newest, the same direction as set_max_snapshots_per_fault. The two caps
+  /// differ in unit, not in policy: that one evicts whole capture SETS, this one
+  /// evicts RECORDINGS. A bag is evidence about a machine you are about to inspect,
+  /// so the recent one wins; and keep-newest at 1 is exactly the pre-#620
+  /// behaviour, which is what makes the default a no-op.
   virtual void set_max_rosbags_per_fault(size_t /*max_count*/) {
   }
 
@@ -234,6 +233,13 @@ class FaultStorage {
   /// lines up. Growth stays bounded by the per-fault cap either way, so clearing
   /// was never the only thing holding the table down.
   virtual void set_retain_snapshots_on_clear(bool /*retain*/) {
+  }
+
+  /// What set_retain_snapshots_on_clear was last given. Callers that write evidence
+  /// need it to tell "the acknowledgement deleted these on purpose" from "these
+  /// were meant to survive it".
+  virtual bool retains_snapshots_on_clear() const {
+    return false;
   }
 
   /// Store one capture as a unit.
@@ -253,12 +259,26 @@ class FaultStorage {
   /// @param snapshot The snapshot data to store
   virtual void store_snapshot(const SnapshotData & snapshot) = 0;
 
-  /// Get snapshots for a fault
+  /// Get snapshots for a fault, NEWEST capture set first.
+  ///
+  /// Ordered by capture_id descending, then captured_at_ns descending, in every
+  /// backend. Readers fold rows into a per-topic map, so insertion order would let
+  /// an older capture's values win on one backend and not the other.
   /// @param fault_code The fault code to get snapshots for
   /// @param topic_filter Optional topic filter (empty = all topics)
   /// @return Vector of snapshots for the fault
   virtual std::vector<SnapshotData> get_snapshots(const std::string & fault_code,
                                                   const std::string & topic_filter = "") const = 0;
+
+  /// Highest capture_id any stored snapshot holds, across every fault (0 when none).
+  ///
+  /// Capture ids are minted by a process-local counter, so a restart would otherwise
+  /// hand out ids BELOW the ones already on disk: the eviction that protects
+  /// MAX(capture_id) would then guard an old set and drop the one just written.
+  /// SnapshotCapture seeds its counter from this at construction.
+  virtual int64_t get_max_capture_id() const {
+    return 0;
+  }
 
   /// Store the compact freeze-frame captured for a fault (JSON dict of topic values).
   /// Keyed by fault_code: a later capture for the same code replaces the frame. The frame
@@ -315,11 +335,6 @@ class FaultStorage {
   /// bulk-data download and the entity authorization scope check, both of which
   /// start from a recording id and need the faults behind it.
   virtual std::vector<RosbagFileInfo> get_rosbag_files_by_recording(const std::string & recording_id) const = 0;
-
-  /// Drop ONE (fault, recording) link. The bag is unlinked only when the removed row
-  /// was its last reference, so a sibling fault of the same burst keeps it alive.
-  /// @return true if a row was removed
-  virtual bool drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) = 0;
 
   /// Delete one whole recording: every fault's link to it, and the bag. This is the
   /// right unit for quota eviction and for a bag that has vanished from disk - both
@@ -411,11 +426,13 @@ class InMemoryFaultStorage : public FaultStorage {
 
   void set_max_snapshots_per_fault(size_t max_count) override;
   void set_retain_snapshots_on_clear(bool retain) override;
+  bool retains_snapshots_on_clear() const override;
 
   void store_snapshot(const SnapshotData & snapshot) override;
   void store_snapshots(const std::vector<SnapshotData> & snapshots) override;
   std::vector<SnapshotData> get_snapshots(const std::string & fault_code,
                                           const std::string & topic_filter = "") const override;
+  int64_t get_max_capture_id() const override;
 
   void store_freeze_frame(const FreezeFrameData & frame) override;
   std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const override;
@@ -429,7 +446,6 @@ class InMemoryFaultStorage : public FaultStorage {
   std::vector<RosbagFileInfo> get_rosbag_files(const std::string & fault_code) const override;
   std::vector<RosbagFileInfo> get_rosbag_files_by_recording(const std::string & recording_id) const override;
   bool delete_rosbag_file(const std::string & fault_code) override;
-  bool drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) override;
   size_t delete_rosbag_recording(const std::string & recording_id) override;
   size_t get_total_rosbag_storage_bytes() const override;
   std::vector<RosbagFileInfo> get_all_rosbag_files() const override;
@@ -444,7 +460,6 @@ class InMemoryFaultStorage : public FaultStorage {
   /// Whether a fault other than @p fault_code still references @p file_path.
   /// One recording can back several faults of the same burst, so the bag must
   /// only be unlinked once the last of them is gone. Caller holds mutex_.
-  bool path_shared_with_other_fault(const std::string & file_path, const std::string & fault_code) const;
 
   /// Whether any row at all still references @p file_path. Caller holds mutex_.
   bool path_referenced(const std::string & file_path) const;

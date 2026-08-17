@@ -85,6 +85,9 @@ SnapshotCapture::SnapshotCapture(rclcpp::Node * node, FaultStorage * storage, co
     throw std::invalid_argument("SnapshotCapture requires a valid storage pointer");
   }
 
+  // Continue the sequence the store already holds; see capture_seq_.
+  capture_seq_.store(storage_->get_max_capture_id());
+
   // Compile regex patterns for performance
   size_t failed_patterns = 0;
   for (const auto & [pattern, topics] : config_.patterns) {
@@ -151,8 +154,7 @@ void SnapshotCapture::capture(const std::string & fault_code) {
   // One id for the whole capture, minted here so every row of this confirmation
   // shares it. Monotonic rather than a clock read: the rows are written seconds
   // apart under load and a wall clock is not guaranteed to move forward.
-  static std::atomic<int64_t> capture_seq{0};
-  const int64_t capture_id = ++capture_seq;
+  const int64_t capture_id = ++capture_seq_;
   std::vector<SnapshotData> rows;
   size_t captured_count = 0;
   for (const auto & topic : topics) {
@@ -179,7 +181,23 @@ void SnapshotCapture::capture(const std::string & fault_code) {
   for (auto & row : rows) {
     row.capture_id = capture_id;
   }
-  storage_->store_snapshots(rows);
+
+  // capture() runs on a pool worker while clear_fault runs on the service thread,
+  // and capture_topic_on_demand waits per silent topic, so an acknowledgement can
+  // land mid-capture. Row-by-row writes used to be swept by that clear; one batch
+  // written afterwards is not, and would resurrect readings the acknowledgement
+  // had just promised were gone - on SQLite, across restarts. Where the operator
+  // asked to retain snapshots there is no such promise, so the batch stands.
+  // Absent is not cleared: a caller driving the capture directly still stores.
+  // Mirrors rosbag_capture's wants_a_row.
+  const auto fault = storage_->get_fault(fault_code);
+  const bool acknowledged_mid_capture =
+      fault.has_value() && fault->status == ros2_medkit_msgs::msg::Fault::STATUS_CLEARED;
+  if (acknowledged_mid_capture && !storage_->retains_snapshots_on_clear()) {
+    RCLCPP_DEBUG(node_->get_logger(), "Dropping capture for '%s' - acknowledged while it ran", fault_code.c_str());
+  } else {
+    storage_->store_snapshots(rows);
+  }
 
   // Persist the compact freeze-frame keyed by fault_code (retained across clear_fault).
   // Only reached for faults with a configured capture set (unconfigured codes returned
