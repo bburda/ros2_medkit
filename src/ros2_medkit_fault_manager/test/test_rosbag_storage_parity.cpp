@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Rosbag retention parity between the two storage backends.
+/// Evidence retention parity between the two storage backends.
 ///
 /// A fault holding several recordings was enforced by the SQLite schema before, and
 /// separately by a std::map in the in-memory backend. Two enforcement points means two
 /// chances to diverge, and `storage_type: memory` silently keeping the old behaviour
 /// would be invisible to a suite that only exercises SQLite. Every assertion here
 /// therefore runs against both backends from one body.
+///
+/// Snapshots have the same shape and were left out of the first version of this file,
+/// which is how two backends ended up disagreeing about whether a capture larger than
+/// the cap survives at all, and about which capture `get_snapshots` returns first.
+/// Both suites live here so a new evidence table cannot be added to one backend only.
 
 #include <gtest/gtest.h>
 
@@ -30,8 +35,11 @@
 #include <string>
 #include <vector>
 
+#include "rclcpp/rclcpp.hpp"
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
 #include "ros2_medkit_fault_manager/sqlite_fault_storage.hpp"
+#include "ros2_medkit_msgs/msg/fault.hpp"
+#include "ros2_medkit_msgs/srv/report_fault.hpp"
 
 namespace {
 
@@ -39,6 +47,7 @@ using ros2_medkit_fault_manager::FaultStorage;
 using ros2_medkit_fault_manager::InMemoryFaultStorage;
 using ros2_medkit_fault_manager::rosbag_recording_id;
 using ros2_medkit_fault_manager::RosbagFileInfo;
+using ros2_medkit_fault_manager::SnapshotData;
 using ros2_medkit_fault_manager::SqliteFaultStorage;
 
 /// Backends differ only in how they are constructed, so the fixture reaches them
@@ -317,34 +326,6 @@ TYPED_TEST(RosbagRetentionParityTest, AnUnknownRecordingLooksUpEmptyRatherThanTh
   EXPECT_FALSE(this->storage_->get_rosbag_file("NOPE").has_value());
 }
 
-TYPED_TEST(RosbagRetentionParityTest, DroppingOneLinkLeavesTheFaultsOtherRecordings) {
-  this->storage_->set_max_rosbags_per_fault(0);
-  const auto doomed = this->row("DROP", "fault_DROP_1", 1000);
-  this->storage_->store_rosbag_file(doomed);
-  this->storage_->store_rosbag_file(this->row("DROP", "fault_DROP_2", 2000));
-
-  EXPECT_TRUE(this->storage_->drop_rosbag_link("DROP", "fault_DROP_1"));
-  const auto rows = this->storage_->get_rosbag_files("DROP");
-  ASSERT_EQ(rows.size(), 1u);
-  EXPECT_EQ(rows[0].recording_id, "fault_DROP_2");
-  EXPECT_FALSE(std::filesystem::exists(doomed.file_path));
-
-  EXPECT_FALSE(this->storage_->drop_rosbag_link("DROP", "fault_DROP_1")) << "dropping twice is not an error";
-}
-
-TYPED_TEST(RosbagRetentionParityTest, DroppingALinkKeepsABagASiblingStillReferences) {
-  this->storage_->set_max_rosbags_per_fault(0);
-  auto shared = this->row("DROPSH_A", "fault_DROPSH_1", 1000);
-  this->storage_->store_rosbag_file(shared);
-  shared.fault_code = "DROPSH_B";
-  this->storage_->store_rosbag_file(shared);
-
-  EXPECT_TRUE(this->storage_->drop_rosbag_link("DROPSH_A", "fault_DROPSH_1"));
-  EXPECT_TRUE(this->storage_->get_rosbag_files("DROPSH_A").empty());
-  EXPECT_EQ(this->storage_->get_rosbag_files("DROPSH_B").size(), 1u);
-  EXPECT_TRUE(std::filesystem::exists(shared.file_path));
-}
-
 TYPED_TEST(RosbagRetentionParityTest, DeletingARecordingRemovesEveryLinkAndTheBag) {
   // What the quota sweep calls. Deleting by fault code here would wipe the whole
   // history of every fault the bag touched.
@@ -409,6 +390,138 @@ TYPED_TEST(RosbagRetentionParityTest, GetAllRosbagFilesListsEveryRecordingOldest
   EXPECT_EQ(rows[0].recording_id, "fault_ALL_2");
   EXPECT_EQ(rows[1].recording_id, "fault_ALL_3");
   EXPECT_EQ(rows[2].recording_id, "fault_ALL_1");
+}
+
+/// Snapshot retention parity. Same two backends, same reason.
+template <typename Backend>
+class SnapshotRetentionParityTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ = std::filesystem::temp_directory_path() /
+           ("medkit_snap_parity_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
+    std::filesystem::remove_all(dir_);
+    std::filesystem::create_directories(dir_);
+    storage_ = BackendFactory<Backend>::make(dir_);
+  }
+
+  void TearDown() override {
+    storage_.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(dir_, ec);
+  }
+
+  /// One capture: `topics` rows sharing a capture_id, as SnapshotCapture writes them.
+  std::vector<SnapshotData> capture(const std::string & code, int64_t capture_id, size_t topics) {
+    std::vector<SnapshotData> rows;
+    for (size_t i = 0; i < topics; ++i) {
+      SnapshotData row;
+      row.fault_code = code;
+      row.topic = "/topic_" + std::to_string(i);
+      row.message_type = "std_msgs/msg/Float64";
+      row.data = R"({"data": )" + std::to_string(capture_id) + "}";
+      row.captured_at_ns = capture_id * 1000 + static_cast<int64_t>(i);
+      row.capture_id = capture_id;
+      rows.push_back(row);
+    }
+    return rows;
+  }
+
+  void confirm(const std::string & code) {
+    rclcpp::Clock clock;
+    storage_->report_fault_event(code, ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                                 ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "parity", "/node", clock.now(),
+                                 ros2_medkit_fault_manager::DebounceConfig{});
+  }
+
+  std::filesystem::path dir_;
+  std::unique_ptr<FaultStorage> storage_;
+};
+
+TYPED_TEST_SUITE(SnapshotRetentionParityTest, Backends);
+
+TYPED_TEST(SnapshotRetentionParityTest, ACaptureLargerThanTheCapIsKeptWholeRatherThanTorn) {
+  // The in-memory trim used to evict the newest set too, leaving the fault with no
+  // readings at all, while SQLite exempted it. `storage_type: memory` with the
+  // default cap of 10 and eleven configured topics lost every freeze frame.
+  this->storage_->set_max_snapshots_per_fault(3);
+  this->confirm("BIG");
+
+  this->storage_->store_snapshots(this->capture("BIG", 1, 5));
+
+  const auto rows = this->storage_->get_snapshots("BIG");
+  EXPECT_EQ(rows.size(), 5u) << "a capture over the cap on its own is kept entire";
+  for (const auto & row : rows) {
+    EXPECT_EQ(row.capture_id, 1);
+  }
+}
+
+TYPED_TEST(SnapshotRetentionParityTest, TheOldestWholeCaptureGoesFirstPastTheCap) {
+  this->storage_->set_max_snapshots_per_fault(4);
+  this->confirm("EVICT");
+
+  this->storage_->store_snapshots(this->capture("EVICT", 1, 2));
+  this->storage_->store_snapshots(this->capture("EVICT", 2, 2));
+  this->storage_->store_snapshots(this->capture("EVICT", 3, 2));
+
+  const auto rows = this->storage_->get_snapshots("EVICT");
+  ASSERT_EQ(rows.size(), 4u);
+  for (const auto & row : rows) {
+    EXPECT_NE(row.capture_id, 1) << "the oldest set goes whole, not row by row";
+  }
+}
+
+TYPED_TEST(SnapshotRetentionParityTest, GetSnapshotsReturnsTheNewestCaptureFirst) {
+  // The reader folds rows into a topic map and keeps the leading capture, so the
+  // order decides which values a client sees. In-memory returned insertion order,
+  // which is the oldest set first - the exact opposite of SQLite.
+  this->storage_->set_max_snapshots_per_fault(0);
+  this->confirm("ORDER");
+
+  this->storage_->store_snapshots(this->capture("ORDER", 1, 2));
+  this->storage_->store_snapshots(this->capture("ORDER", 2, 2));
+
+  const auto rows = this->storage_->get_snapshots("ORDER");
+  ASSERT_EQ(rows.size(), 4u);
+  EXPECT_EQ(rows.front().capture_id, 2) << "newest capture leads";
+  EXPECT_EQ(rows.back().capture_id, 1);
+}
+
+TYPED_TEST(SnapshotRetentionParityTest, MaxCaptureIdIsWhatARestartMustContinueFrom) {
+  // SnapshotCapture seeds its counter from this. A backend answering 0 with rows
+  // present would hand the next capture an id below the stored ones, and eviction
+  // protects the highest id - so the capture just written would be the one dropped.
+  this->storage_->set_max_snapshots_per_fault(0);
+  EXPECT_EQ(this->storage_->get_max_capture_id(), 0) << "nothing stored yet";
+
+  this->confirm("SEED_A");
+  this->confirm("SEED_B");
+  this->storage_->store_snapshots(this->capture("SEED_A", 4, 1));
+  this->storage_->store_snapshots(this->capture("SEED_B", 7, 1));
+
+  EXPECT_EQ(this->storage_->get_max_capture_id(), 7) << "global, not per fault";
+}
+
+TYPED_TEST(SnapshotRetentionParityTest, ClearFaultKeepsSnapshotsWhenEvidenceIsRetained) {
+  this->storage_->set_max_snapshots_per_fault(0);
+  this->confirm("KEEP");
+  this->storage_->set_retain_snapshots_on_clear(true);
+  this->storage_->store_snapshots(this->capture("KEEP", 1, 2));
+
+  ASSERT_TRUE(this->storage_->clear_fault("KEEP"));
+
+  EXPECT_EQ(this->storage_->get_snapshots("KEEP").size(), 2u);
+  EXPECT_TRUE(this->storage_->retains_snapshots_on_clear());
+}
+
+TYPED_TEST(SnapshotRetentionParityTest, ClearFaultDropsSnapshotsByDefault) {
+  this->storage_->set_max_snapshots_per_fault(0);
+  this->confirm("DROP");
+  this->storage_->store_snapshots(this->capture("DROP", 1, 2));
+
+  ASSERT_TRUE(this->storage_->clear_fault("DROP"));
+
+  EXPECT_TRUE(this->storage_->get_snapshots("DROP").empty());
+  EXPECT_FALSE(this->storage_->retains_snapshots_on_clear());
 }
 
 }  // namespace

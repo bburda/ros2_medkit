@@ -1087,18 +1087,6 @@ TEST_F(SqliteFaultStorageTest, DeleteRecordingRemovesEveryLinkAndTheBag) {
   EXPECT_FALSE(std::filesystem::exists(dir));
 }
 
-TEST_F(SqliteFaultStorageTest, DropLinkLeavesTheOtherFaultsRecordingsAlone) {
-  storage_->set_max_rosbags_per_fault(0);  // unlimited, so nothing is evicted behind our backs
-  storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_100", 100));
-  storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_200", 200));
-
-  EXPECT_TRUE(storage_->drop_rosbag_link("A", "fault_A_100"));
-  const auto rows = storage_->get_rosbag_files("A");
-  ASSERT_EQ(rows.size(), 1u) << "only the named link goes";
-  EXPECT_EQ(rows[0].recording_id, "fault_A_200");
-  EXPECT_FALSE(storage_->drop_rosbag_link("A", "fault_A_100")) << "already gone";
-}
-
 TEST_F(SqliteFaultStorageTest, DeletingAFaultDropsAllItsRecordings) {
   storage_->set_max_rosbags_per_fault(0);
   storage_->store_rosbag_file(make_rosbag("A", "/bags/fault_A_100", 100));

@@ -64,6 +64,7 @@ class SqliteFaultStorage : public FaultStorage {
 
   void set_max_snapshots_per_fault(size_t max_count) override;
   void set_retain_snapshots_on_clear(bool retain) override;
+  bool retains_snapshots_on_clear() const override;
 
   void set_max_rosbags_per_fault(size_t max_count) override;
 
@@ -71,6 +72,7 @@ class SqliteFaultStorage : public FaultStorage {
   void store_snapshots(const std::vector<SnapshotData> & snapshots) override;
   std::vector<SnapshotData> get_snapshots(const std::string & fault_code,
                                           const std::string & topic_filter = "") const override;
+  int64_t get_max_capture_id() const override;
 
   void store_freeze_frame(const FreezeFrameData & frame) override;
   std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const override;
@@ -81,7 +83,6 @@ class SqliteFaultStorage : public FaultStorage {
   std::vector<RosbagFileInfo> get_rosbag_files(const std::string & fault_code) const override;
   std::vector<RosbagFileInfo> get_rosbag_files_by_recording(const std::string & recording_id) const override;
   bool delete_rosbag_file(const std::string & fault_code) override;
-  bool drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) override;
   size_t delete_rosbag_recording(const std::string & recording_id) override;
   size_t delete_rosbag_files(const std::vector<std::string> & fault_codes) override;
   size_t get_total_rosbag_storage_bytes() const override;
@@ -118,7 +119,6 @@ class SqliteFaultStorage : public FaultStorage {
   /// Whether a fault other than @p fault_code still references @p file_path.
   /// One recording can back several faults of the same burst, so the bag must
   /// only be unlinked once the last of them is gone. Caller holds mutex_.
-  bool path_shared_with_other_fault(const std::string & file_path, const std::string & fault_code) const;
 
   /// Whether any fault at all still references @p file_path. Caller holds mutex_.
   bool path_referenced(const std::string & file_path) const;

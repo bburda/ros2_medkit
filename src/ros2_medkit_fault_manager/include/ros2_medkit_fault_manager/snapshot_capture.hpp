@@ -230,6 +230,14 @@ class SnapshotCapture {
   FaultStorage * storage_;
   SnapshotConfig config_;
 
+  /// Mints one id per capture, shared by every row of that capture.
+  ///
+  /// Seeded from storage at construction rather than started at zero: the ids
+  /// outlive the process on a persistent backend, and eviction protects the
+  /// HIGHEST id, so a counter that restarts below what is already stored makes the
+  /// freshly written capture the first one dropped.
+  std::atomic<int64_t> capture_seq_{0};
+
   /// Compiled regex patterns (cached for performance)
   std::vector<std::pair<std::regex, std::vector<std::string>>> compiled_patterns_;
 

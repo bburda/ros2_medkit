@@ -301,9 +301,9 @@ void SqliteFaultStorage::initialize_schema() {
 
   // Indexes last, so they serve a fresh table and a rebuilt one alike.
   //
-  // idx_rosbag_files_path is capability, not tuning: path_referenced() and
-  // path_shared_with_other_fault() scan on file_path on every delete, against a
-  // table that now holds N rows per fault instead of one.
+  // idx_rosbag_files_path is capability, not tuning: path_referenced() scans on
+  // file_path on every delete, against a table that now holds N rows per fault
+  // instead of one.
   const char * create_rosbag_files_indexes_sql = R"(
     CREATE INDEX IF NOT EXISTS idx_rosbag_files_fault_code ON rosbag_files(fault_code);
     CREATE INDEX IF NOT EXISTS idx_rosbag_files_created_at ON rosbag_files(created_at_ns);
@@ -462,7 +462,12 @@ void SqliteFaultStorage::migrate_rosbag_files_add_recording_id() {
       SqliteStatement update(db_, "UPDATE rosbag_files SET recording_id = ? WHERE id = ?");
       update.bind_text(1, rosbag_recording_id(file_path));
       update.bind_int64(2, row_id);
-      update.step();
+      // A dropped result here (SQLITE_BUSY, SQLITE_FULL) would leave the row with an
+      // empty recording_id while COMMIT still reported success, and an empty id is
+      // what delete_rosbag_recording refuses to act on.
+      if (update.step() != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to backfill recording_id: ") + sqlite3_errmsg(db_));
+      }
     }
     if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
       std::string error = err_msg ? err_msg : "Unknown error";
@@ -1033,6 +1038,11 @@ void SqliteFaultStorage::set_retain_snapshots_on_clear(bool retain) {
   retain_snapshots_on_clear_ = retain;
 }
 
+bool SqliteFaultStorage::retains_snapshots_on_clear() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return retain_snapshots_on_clear_;
+}
+
 void SqliteFaultStorage::store_snapshot(const SnapshotData & snapshot) {
   store_snapshots({snapshot});
 }
@@ -1149,6 +1159,19 @@ std::vector<SnapshotData> SqliteFaultStorage::get_snapshots(const std::string & 
   }
 
   return result;
+}
+
+int64_t SqliteFaultStorage::get_max_capture_id() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Global, not per fault: the counter that mints these is global, and seeding it
+  // below any id already on disk is what lets a restart evict the capture it just
+  // wrote. NULL on an empty table reads back as 0.
+  SqliteStatement stmt(db_, "SELECT IFNULL(MAX(capture_id), 0) FROM snapshots");
+  if (stmt.step() != SQLITE_ROW) {
+    return 0;
+  }
+  return stmt.column_int64(0);
 }
 
 void SqliteFaultStorage::store_freeze_frame(const FreezeFrameData & frame) {
@@ -1367,42 +1390,15 @@ std::vector<RosbagFileInfo> SqliteFaultStorage::get_rosbag_files_by_recording(co
   return result;
 }
 
-bool SqliteFaultStorage::drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  std::string path;
-  {
-    SqliteStatement select(db_, "SELECT file_path FROM rosbag_files WHERE fault_code = ? AND recording_id = ?");
-    select.bind_text(1, fault_code);
-    select.bind_text(2, recording_id);
-    if (select.step() != SQLITE_ROW) {
-      return false;
-    }
-    path = select.column_text(0);
-  }
-
-  exec_or_throw("BEGIN IMMEDIATE");
-  try {
-    SqliteStatement del(db_, "DELETE FROM rosbag_files WHERE fault_code = ? AND recording_id = ?");
-    del.bind_text(1, fault_code);
-    del.bind_text(2, recording_id);
-    if (del.step() != SQLITE_DONE) {
-      throw std::runtime_error(std::string("Failed to drop rosbag link: ") + sqlite3_errmsg(db_));
-    }
-    exec_or_throw("COMMIT");
-  } catch (...) {
-    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-    throw;
-  }
-
-  if (!path_referenced(path)) {
-    std::error_code ec;
-    std::filesystem::remove_all(path, ec);
-  }
-  return true;
-}
-
 size_t SqliteFaultStorage::delete_rosbag_recording(const std::string & recording_id) {
+  // An empty id is not a recording that happens to be unnamed, it is a row whose
+  // backfill did not finish. Matching on it would take every such row of every
+  // fault with one DELETE, and evict_bags_over_quota calls this with whatever the
+  // row held.
+  if (recording_id.empty()) {
+    return 0;
+  }
+
   std::lock_guard<std::mutex> lock(mutex_);
 
   std::set<std::string> paths;
@@ -1560,14 +1556,6 @@ size_t SqliteFaultStorage::delete_rosbag_files(const std::vector<std::string> & 
     }
   }
   return deleted;
-}
-
-bool SqliteFaultStorage::path_shared_with_other_fault(const std::string & file_path,
-                                                      const std::string & fault_code) const {
-  SqliteStatement stmt(db_, "SELECT COUNT(*) FROM rosbag_files WHERE file_path = ? AND fault_code != ?");
-  stmt.bind_text(1, file_path);
-  stmt.bind_text(2, fault_code);
-  return stmt.step() == SQLITE_ROW && stmt.column_int64(0) > 0;
 }
 
 bool SqliteFaultStorage::path_referenced(const std::string & file_path) const {

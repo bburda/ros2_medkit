@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <set>
+#include <tuple>
 
 namespace ros2_medkit_fault_manager {
 
@@ -356,6 +357,11 @@ void InMemoryFaultStorage::set_retain_snapshots_on_clear(bool retain) {
   retain_snapshots_on_clear_ = retain;
 }
 
+bool InMemoryFaultStorage::retains_snapshots_on_clear() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return retain_snapshots_on_clear_;
+}
+
 void InMemoryFaultStorage::store_snapshot(const SnapshotData & snapshot) {
   store_snapshots({snapshot});
 }
@@ -387,30 +393,36 @@ void InMemoryFaultStorage::store_snapshots(const std::vector<SnapshotData> & sna
       }));
     };
 
-    while (rows_for_fault() > max_snapshots_per_fault_) {
+    // One capture can exceed the cap on its own, so the newest set is exempt from
+    // eviction: half a freeze frame reads exactly like "those topics were silent".
+    // SqliteFaultStorage carries the same exemption as `AND capture_id <> ?2`, and
+    // the two backends have to agree or the evidence depends on storage_type.
+    int64_t newest = 0;
+    bool have_newest = false;
+    for (const auto & s : updated) {
+      if (s.fault_code == fault_code && (!have_newest || s.capture_id > newest)) {
+        newest = s.capture_id;
+        have_newest = true;
+      }
+    }
+
+    while (have_newest && rows_for_fault() > max_snapshots_per_fault_) {
       bool found = false;
       int64_t oldest = 0;
       for (const auto & s : updated) {
-        if (s.fault_code == fault_code && (!found || s.capture_id < oldest)) {
+        if (s.fault_code == fault_code && s.capture_id != newest && (!found || s.capture_id < oldest)) {
           oldest = s.capture_id;
           found = true;
         }
       }
       if (!found) {
-        break;
+        break;  // only the newest capture is left and it is over the cap on its own
       }
-      const size_t before = updated.size();
       updated.erase(std::remove_if(updated.begin(), updated.end(),
                                    [&fault_code, oldest](const SnapshotData & s) {
                                      return s.fault_code == fault_code && s.capture_id == oldest;
                                    }),
                     updated.end());
-      // One capture can exceed the cap on its own. Dropping every older set and
-      // still being over means the cap is smaller than this fault's topic count:
-      // keep the newest capture whole rather than tearing it.
-      if (updated.size() == before) {
-        break;
-      }
     }
   }
 
@@ -429,7 +441,23 @@ std::vector<SnapshotData> InMemoryFaultStorage::get_snapshots(const std::string 
       }
     }
   }
+  // Newest capture first, matching SqliteFaultStorage's ORDER BY. Insertion order
+  // would put the OLDEST set first here, and the reader folds rows into a per-topic
+  // map, so the values a client sees would depend on storage_type.
+  std::stable_sort(result.begin(), result.end(), [](const SnapshotData & a, const SnapshotData & b) {
+    return std::tie(b.capture_id, b.captured_at_ns) < std::tie(a.capture_id, a.captured_at_ns);
+  });
   return result;
+}
+
+int64_t InMemoryFaultStorage::get_max_capture_id() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  int64_t max_id = 0;
+  for (const auto & snapshot : snapshots_) {
+    max_id = std::max(max_id, snapshot.capture_id);
+  }
+  return max_id;
 }
 
 void InMemoryFaultStorage::store_freeze_frame(const FreezeFrameData & frame) {
@@ -625,27 +653,12 @@ bool InMemoryFaultStorage::delete_rosbag_file(const std::string & fault_code) {
   return true;
 }
 
-bool InMemoryFaultStorage::drop_rosbag_link(const std::string & fault_code, const std::string & recording_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  std::string path;
-  auto it = std::find_if(rosbag_files_.begin(), rosbag_files_.end(), [&](const RosbagRow & r) {
-    return r.info.fault_code == fault_code && r.info.recording_id == recording_id;
-  });
-  if (it == rosbag_files_.end()) {
-    return false;
-  }
-  path = it->info.file_path;
-  rosbag_files_.erase(it);
-
-  if (!path_referenced(path)) {
-    std::error_code ec;
-    std::filesystem::remove_all(path, ec);
-  }
-  return true;
-}
-
 size_t InMemoryFaultStorage::delete_rosbag_recording(const std::string & recording_id) {
+  // Mirrors SqliteFaultStorage: an empty id addresses a set, not a recording.
+  if (recording_id.empty()) {
+    return 0;
+  }
+
   std::lock_guard<std::mutex> lock(mutex_);
 
   std::set<std::string> touched;
@@ -668,13 +681,6 @@ size_t InMemoryFaultStorage::delete_rosbag_recording(const std::string & recordi
     std::filesystem::remove_all(path, ec);
   }
   return removed;
-}
-
-bool InMemoryFaultStorage::path_shared_with_other_fault(const std::string & file_path,
-                                                        const std::string & fault_code) const {
-  return std::any_of(rosbag_files_.begin(), rosbag_files_.end(), [&](const RosbagRow & row) {
-    return row.info.fault_code != fault_code && row.info.file_path == file_path;
-  });
 }
 
 bool InMemoryFaultStorage::path_referenced(const std::string & file_path) const {
