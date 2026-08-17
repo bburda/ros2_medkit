@@ -586,6 +586,122 @@ if(BUILD_TESTING)
     LABELS "integration;e2e"
     ENV "GATEWAY_TEST_PORT=19300" "WATCHDOG_E2E_SCENARIO=restart_departed" "${_WATCHDOG_E2E_ENV}")
 
+  # === node_death e2e (launch_testing) ===
+  #
+  # Written and watched failing before the node_death detector that satisfies it exists -
+  # this package carries no such detector yet, so every scenario below is expected to fail
+  # today. See test/e2e/test_node_death_e2e.test.py's own module docstring for the full
+  # story and which scenarios can even discriminate before the detector lands.
+
+  # 60 (arming gate, app_id-scoped - already implies presence, so this is not a separate
+  # budget) + 30 (departure poll) + 60 (raise poll) + 30 (entity-scoped fault poll) = 180
+  # internal, plus the two harness self-tests (a handful of seconds against a local
+  # stand-in server, no ROS graph involved). Rounded to 300 to also cover the launch's own
+  # teardown for TWO processes (sigterm 30 + sigkill 15 each, not fully serial).
+  medkit_add_launch_test(test_node_death_e2e_raise
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 300
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19310" "WATCHDOG_E2E_SCENARIO=raise" "${_WATCHDOG_E2E_ENV}")
+
+  # 60 (arming, app_id-scoped - already implies presence) + 30 (departure) + 60 (raise
+  # poll) + ~32 (presence poll after the respawn, plus its own enforced delay) + 60 (heal
+  # poll) = 242 internal. Rounded to 420 to also cover the launch's own teardown for TWO
+  # processes.
+  medkit_add_launch_test(test_node_death_e2e_clear_on_return
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 420
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19320" "WATCHDOG_E2E_SCENARIO=clear_on_return" "${_WATCHDOG_E2E_ENV}")
+
+  # Same drive as clear_on_return (60 arming, app_id-scoped + 30 faults-live + 30
+  # departure + 60 raise poll + ~32 presence-after-respawn = 212), plus the persistence
+  # window itself (20, SUSTAINED_WINDOW_SEC) instead of a heal poll = 232 internal.
+  # Rounded to 420 to also cover the launch's own teardown for TWO processes - same
+  # budget as clear_on_return since the internal sum is close and both drive one
+  # kill-then-return cycle.
+  medkit_add_launch_test(test_node_death_e2e_no_heal_standalone
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 420
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19330" "WATCHDOG_E2E_SCENARIO=no_heal_standalone" "${_WATCHDOG_E2E_ENV}")
+
+  # 60 (arming) + 30 (faults-live) + 30 (label poll to "active") + 30 (the ChangeState
+  # call itself) + 30 (separate label poll to "inactive") + 20 (silence window) + 15
+  # (end-of-window label check) = 215 internal, 260 with the launch's own teardown for
+  # TWO processes - three independent 30 s budgets, not one combined 30 s.
+  medkit_add_launch_test(test_node_death_e2e_deactivated_not_dead
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 300
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19340" "WATCHDOG_E2E_SCENARIO=deactivated_not_dead" "${_WATCHDOG_E2E_ENV}")
+
+  # 60 (arming - proves the hybrid-mode manifest actually loaded rather than silently
+  # degrading to runtime_only) + 30 (faults-live) + 30 (presence poll for the one online
+  # app) + 30 (a SEPARATE presence poll for the never-online app's manifest-derived
+  # snapshot entry) + 20 (silence window) = 170 internal, 215 with the launch's own
+  # teardown for TWO processes - two independent 30 s budgets, not one.
+  medkit_add_launch_test(test_node_death_e2e_manifest_never_online
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 240
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19350" "WATCHDOG_E2E_SCENARIO=manifest_never_online" "${_WATCHDOG_E2E_ENV}")
+
+  # test_01 (load-bearing): 60 (arming) + 30 (faults-live) + three renamed-node arm/kill
+  # cycles (30 presence poll on GET /apps, visible only because this scenario's own
+  # discovery.runtime.filter_internal_nodes is off + 60 app_id-scoped arming poll + 30
+  # departure poll + 15 process-reap budget each = 135 worst case, *3 = 405) + 20 (final
+  # silence window, SUSTAINED_WINDOW_SEC) = 515 internal.
+  # test_02: a constant comparison against the installed ros2cli package - no I/O, no
+  # polling, negligible budget.
+  # Rounded to 660 to also cover the launch's own teardown for the ONE launch-managed
+  # process (the gateway; this scenario declares no demo_nodes), plus however many
+  # renamed `demo_engine_temp_sensor` processes test_01 spawns and reaps itself across
+  # its three cycles (not launch-managed).
+  medkit_add_launch_test(test_node_death_e2e_ros2cli_ignored
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 660
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19360" "WATCHDOG_E2E_SCENARIO=ros2cli_ignored" "${_WATCHDOG_E2E_ENV}")
+
+  # 120 (two app_id-scoped arming gates, 60 each - one per colliding node, each already
+  # implying presence) + 30 (departure poll for the killed one) + 0 (the survivor's
+  # liveness check is a single non-blocking signal-0 probe, not a poll) + 60 (raise poll)
+  # + 5 (the describes-only window, MUTUAL_NAMING_WINDOW_SEC) = 215 internal. Rounded to
+  # 360 to also cover the launch's own teardown for THREE processes.
+  medkit_add_launch_test(test_node_death_e2e_bare_name_collision
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 360
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19370" "WATCHDOG_E2E_SCENARIO=bare_name_collision" "${_WATCHDOG_E2E_ENV}")
+
+  # 60 (arming) + 30 (faults-live) + 30 (presence poll) + 20 (silence window) + 5
+  # (end-of-window presence re-check) = 145 internal. Rounded to 240 to also cover the
+  # launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_node_death_e2e_fast_tick_floor
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 240
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19380" "WATCHDOG_E2E_SCENARIO=fast_tick_floor" "${_WATCHDOG_E2E_ENV}")
+
+  # 60 (arming, app_id-scoped - already implies presence) + FIVE kill cycles, four of
+  # which also acknowledge and re-arm on the respawned instance (30 departure + 60
+  # occurrence-count poll + ~32 app_id-scoped re-arm after the respawn = 122 each, *4 =
+  # 488) plus the fifth cycle's kill-and-confirm alone (30 + 60 = 90) + 30 (final record
+  # poll) = 668 internal. Rounded to 900, matching cap_pressure's own budget for a
+  # similarly multi-cycle scenario, to also cover the launch's own teardown for TWO
+  # processes plus CI-slowness margin across five cycles.
+  medkit_add_launch_test(test_node_death_e2e_restart_loop_occurrences
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 900
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19390" "WATCHDOG_E2E_SCENARIO=restart_loop_occurrences" "${_WATCHDOG_E2E_ENV}")
+
+  # 60 (arming, app_id-scoped - already implies presence) + 30 (departure) + 60 (raise
+  # poll) + 30 (record poll) = 180 (test_01); 60 (port-down wait) + 90 (global arming gate
+  # after the restart - TARGET_NODE is gone by design here, so this cannot be app_id-scoped
+  # the way test_01's is) + 30 (faults-live, proving the restarted gateway reconnected to
+  # the fault_manager before the persistence window below could mean anything) + 5
+  # (not-present check) + 20 (persistence window) + 30 (record poll) = 235 (test_02) - 415
+  # internal. Rounded to 600, the same budget as the sibling detector's restart_departed
+  # scenario (an identically-shaped gateway-restart test), to also cover the launch's own
+  # teardown for TWO processes.
+  medkit_add_launch_test(test_node_death_e2e_restart_rebaseline
+    test/e2e/test_node_death_e2e.test.py TIMEOUT 600
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19400" "WATCHDOG_E2E_SCENARIO=restart_rebaseline" "${_WATCHDOG_E2E_ENV}")
+
   ros2_medkit_relax_vendor_warnings()
 
 endif()
