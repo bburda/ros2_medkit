@@ -259,7 +259,41 @@ class TestRosbagHistoryDownload(GatewayTestCase):
         for uri in advertised:
             self.assertEqual(self.get_raw(uri, timeout=15).content[:5], b'\x89MCAP')
 
-    def test_02_the_fault_code_url_still_serves_the_newest_recording(self):
+    def test_02_every_recording_is_dated_by_its_own_capture(self):
+        """The listing must place each occurrence in time.
+
+        ``creation_date`` was read off the fault rather than the recording, so
+        every recording of one fault carried the same date - and this feature is
+        what lets a fault hold more than one, which makes that field the only way
+        to tell the occurrences apart. Worse, an acknowledged fault drops out of
+        the default fault listing, so the lookup missed and its recordings were
+        dated 1970 while the rows were still being served. By this point the
+        fault has been acknowledged twice, so both failure modes are live.
+
+        @verifies REQ_INTEROP_072
+        """
+        listing = self.get_json(f'{APP_ENDPOINT}/bulk-data/rosbags')
+        ours = [
+            item for item in listing.get('items', [])
+            if FAULT_CODE in item.get('x-medkit', {}).get('fault_codes', [])
+        ]
+        self.assertGreaterEqual(len(ours), 2, 'the history is not there to date')
+
+        dates = [item.get('creation_date') for item in ours]
+        for date in dates:
+            self.assertIsNotNone(date, 'a recording is listed with no creation date')
+            self.assertRegex(date, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
+            self.assertFalse(
+                date.startswith('1970'),
+                'an acknowledged fault dated its recordings to the epoch, which is '
+                'the fault dropping out of the listing rather than a real timestamp')
+
+        self.assertEqual(
+            len(set(dates)), len(dates),
+            'the recordings all report the same instant, so an engineer cannot '
+            'tell which occurrence each one belongs to')
+
+    def test_03_the_fault_code_url_still_serves_the_newest_recording(self):
         """The compatibility window, over HTTP.
 
         The repo's own docs and the SSE payload tell clients to build
@@ -288,7 +322,7 @@ class TestRosbagHistoryDownload(GatewayTestCase):
             legacy.content, self.get_raw(newest_uri, timeout=15).content,
             'the fault-code URL served something other than the newest recording')
 
-    def test_03_a_shared_burst_recording_is_listed_once(self):
+    def test_04_a_shared_burst_recording_is_listed_once(self):
         """One descriptor per recording, not per attached fault.
 
         The lidar's calibration fault confirms at startup and its own recording

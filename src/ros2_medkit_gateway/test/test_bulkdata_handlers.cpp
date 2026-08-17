@@ -120,6 +120,14 @@ json fault_at(double first_occurred) {
   return json{{"first_occurred", first_occurred}};
 }
 
+/// A row carrying the recording's own timestamp, which is what the fault manager
+/// sends now.
+json rosbag_row_made_at(const std::string & fault_code, const std::string & recording_id, int64_t created_at_ns) {
+  json row = rosbag_row(fault_code, recording_id);
+  row["created_at_ns"] = created_at_ns;
+  return row;
+}
+
 }  // namespace
 
 TEST_F(BulkDataHandlersTest, OneFaultWithSeveralRecordingsYieldsOneDescriptorEach) {
@@ -177,6 +185,34 @@ TEST_F(BulkDataHandlersTest, ARecordingIsDatedByTheEarliestFaultOfItsBurst) {
   const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, faults);
   ASSERT_EQ(descriptors.size(), 1u);
   EXPECT_EQ(descriptors[0].creation_date, format_timestamp_ns(int64_t{1700000000} * 1'000'000'000));
+}
+
+TEST_F(BulkDataHandlersTest, EachRecordingOfOneFaultIsDatedByItsOwnCapture) {
+  // Dating a recording by its fault gave every recording of that fault the same
+  // date - and holding more than one is the whole point of the change, so the date
+  // is exactly what tells the occurrences apart.
+  const std::vector<json> rows{rosbag_row_made_at("FLAP", "fault_FLAP_2", int64_t{1700000900} * 1'000'000'000),
+                               rosbag_row_made_at("FLAP", "fault_FLAP_1", int64_t{1700000000} * 1'000'000'000)};
+  const std::unordered_map<std::string, json> faults{{"FLAP", fault_at(1700000000.0)}};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, faults);
+  ASSERT_EQ(descriptors.size(), 2u);
+  EXPECT_EQ(descriptors[0].creation_date, format_timestamp_ns(int64_t{1700000900} * 1'000'000'000));
+  EXPECT_EQ(descriptors[1].creation_date, format_timestamp_ns(int64_t{1700000000} * 1'000'000'000));
+  EXPECT_NE(descriptors[0].creation_date, descriptors[1].creation_date);
+}
+
+TEST_F(BulkDataHandlersTest, AnAcknowledgedFaultsRecordingsKeepTheirRealDate) {
+  // list_faults excludes cleared faults by default, so an acknowledged fault is
+  // absent from the map while its rows are still listed. Reading the date off the
+  // fault dated those recordings 1970 - and this change is what makes an
+  // acknowledged fault keep them in the first place.
+  const std::vector<json> rows{rosbag_row_made_at("ACKED", "fault_ACKED_1", int64_t{1700000500} * 1'000'000'000)};
+
+  const auto descriptors = handlers::detail::fold_rosbag_rows_into_descriptors(rows, {});
+  ASSERT_EQ(descriptors.size(), 1u);
+  EXPECT_EQ(descriptors[0].creation_date, format_timestamp_ns(int64_t{1700000500} * 1'000'000'000));
+  EXPECT_EQ(descriptors[0].creation_date.rfind("1970", 0), std::string::npos) << "not the epoch";
 }
 
 TEST_F(BulkDataHandlersTest, DescriptorIdFallsBackToTheBasenameWhenTheRowHasNoRecordingId) {
@@ -645,6 +681,29 @@ TEST_F(BulkDataSourceFiltersTest, AttachedFaultCodesFallBackOnAnEmptyOrMalformed
 
   const nlohmann::json not_an_array = {{"fault_codes", "X"}};
   EXPECT_EQ(handlers::detail::rosbag_attached_fault_codes(not_an_array, "X"), (std::vector<std::string>{"X"}));
+}
+
+TEST_F(BulkDataSourceFiltersTest, AFaultCodeUrlIsRecognisedAsTheCompatibilityPath) {
+  // The segment named a fault; the answer is that fault's newest recording, whose
+  // id is something else. Authorizing on the union alone would 200 a code the
+  // entity does not own, so this path also demands the requested code in scope.
+  const nlohmann::json resolved_by_code = {{"recording_id", "fault_MOTOR_OVERHEAT_1738664999000"},
+                                           {"fault_codes", {"MOTOR_OVERHEAT", "MOTOR_STALL"}}};
+  EXPECT_TRUE(handlers::detail::rosbag_resolved_by_fault_code(resolved_by_code, "MOTOR_OVERHEAT"));
+}
+
+TEST_F(BulkDataSourceFiltersTest, ARecordingIdUrlIsNotTheCompatibilityPath) {
+  const nlohmann::json resolved_by_id = {{"recording_id", "fault_MOTOR_OVERHEAT_1738664999000"},
+                                         {"fault_codes", {"MOTOR_OVERHEAT", "MOTOR_STALL"}}};
+  EXPECT_FALSE(handlers::detail::rosbag_resolved_by_fault_code(resolved_by_id, "fault_MOTOR_OVERHEAT_1738664999000"));
+}
+
+TEST_F(BulkDataSourceFiltersTest, APeerWithoutRecordingIdsIsNotTreatedAsCompatibilityPath) {
+  // An older peer answers by fault code only and sends no recording id. The
+  // attached-codes fallback already reduces to the pre-#620 check there, so
+  // demanding a second one would 404 downloads that used to work.
+  const nlohmann::json older_peer = {{"file_path", "/var/bags/fault_MOTOR_1"}};
+  EXPECT_FALSE(handlers::detail::rosbag_resolved_by_fault_code(older_peer, "MOTOR_OVERHEAT"));
 }
 
 TEST_F(BulkDataSourceFiltersTest, ABurstRecordingIsOwnedByAnyEntityOwningOneOfItsFaults) {

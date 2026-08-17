@@ -166,6 +166,23 @@ std::vector<std::string> rosbag_attached_fault_codes(const nlohmann::json & rosb
                                                      const std::string & requested_id);
 
 /**
+ * @brief Did the fault manager read the URL segment as a FAULT CODE rather than a
+ *        recording id?
+ *
+ * True on the pre-#620 compatibility path, where the segment named a fault and the
+ * answer is that fault's newest recording. It matters for authorization: a burst
+ * shares one bag, so the union over attached faults would answer 200 for a fault
+ * code the entity does not own. The bytes are ones it could already fetch under its
+ * own code, but the 200 itself discloses that another fault shares its recording.
+ * On this path the requested code has to be in scope as well.
+ *
+ * @param rosbag_data Rosbag response from the fault manager
+ * @param requested_id The ``{file_id}`` path segment the client asked for
+ * @return True when the resolved recording is not the id that was asked for
+ */
+bool rosbag_resolved_by_fault_code(const nlohmann::json & rosbag_data, const std::string & requested_id);
+
+/**
  * @brief Fold rosbag link rows into one descriptor per recording.
  *
  * The fault manager returns one row per ``(fault, recording)`` link, so a burst
