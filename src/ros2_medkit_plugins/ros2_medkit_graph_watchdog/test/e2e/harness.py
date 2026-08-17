@@ -720,6 +720,77 @@ def assert_fault_describes_only(
         f'be >= interval ({interval}s)')
 
 
+def assert_fault_never_names(test_case, port, code, forbidden, duration, interval=0.5):
+    """Fail if `code`'s description EVER names a forbidden needle, whatever `code` itself does.
+
+    Distinct from the three assertions above in what it does NOT require: it takes no position
+    on whether `code` is raised at all. ``assert_fault_absent_throughout`` is too strong for a
+    claim like "no disappearance names THIS node" - a correct detector raising `code` for some
+    OTHER entity would trip it for a reason that has nothing to do with the node under test.
+    ``assert_fault_describes_only`` is too strong the other way: it REQUIRES `code` present on
+    every poll, which is wrong for a scenario where the code staying fully absent is itself a
+    correct outcome. This is the narrower claim in between: whenever `code` happens to be
+    present, on any poll, none of `forbidden` may appear in its description; `code` being absent
+    on a given poll is not a failure.
+
+    Same channel-alive discipline as the other window assertions: a request error or a non-200
+    is a failure naming which poll and why, never a silently-skipped sample.
+
+    Parameters
+    ----------
+    test_case : unittest.TestCase
+        Used for the actual assertion calls, so a failure here reports through the normal
+        unittest failure path rather than a bare ``AssertionError`` from a free function.
+    port : int
+        Gateway HTTP port.
+    code : str
+        The ``fault_code`` whose description must never name a forbidden needle. Its own
+        presence or absence is not judged.
+    forbidden : iterable of str
+        Substrings that must never appear in `code`'s description, on any poll where `code` is
+        present.
+    duration : float
+        Total seconds to keep polling.
+    interval : float
+        Sleep between polls in seconds.
+
+    """
+    forbidden = list(forbidden)
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + duration
+    polls = 0
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', timeout=5)
+        except requests.exceptions.RequestException as exc:
+            test_case.fail(
+                f'/faults became unreachable {polls} poll(s) into a {duration}s window (could '
+                f'not ask, which is not the same as "asked, and {code} never named a forbidden '
+                f'entity"): {exc}')
+            return
+        if response.status_code != 200:
+            test_case.fail(
+                f'/faults answered HTTP {response.status_code} {polls} poll(s) into a '
+                f'{duration}s window - the channel died mid-window, which this assertion must '
+                'not read as "never named a forbidden entity"')
+            return
+        items = {item.get('fault_code'): item for item in response.json().get('items', [])}
+        fault = items.get(code)
+        if fault is not None:
+            description = fault.get('description', '')
+            for needle in forbidden:
+                test_case.assertNotIn(
+                    needle, description,
+                    f"{code}'s description named forbidden text {needle!r} {polls} poll(s) "
+                    f'into a {duration}s window: {description!r}')
+        polls += 1
+        time.sleep(interval)
+    test_case.assertGreater(
+        polls, 0,
+        f'the {duration}s window never actually polled /faults - duration must be >= interval '
+        f'({interval}s)')
+
+
 class _FlakyFaultsHandler(http.server.BaseHTTPRequestHandler):
     """Stands in for a gateway whose ``GET /faults`` answers normally, then dies.
 
@@ -933,6 +1004,78 @@ def prove_describes_only_proof_catches_a_dead_fault_surface(test_case):
         assert_fault_describes_only(
             test_case, fake.port, code, required=['alpha'], forbidden=['gamma'],
             duration=1.0, interval=0.2)
+
+
+def prove_never_names_proof_catches_a_wrongly_scoped_absence(test_case):
+    """Prove `assert_fault_never_names` succeeds where a whole-code absence check would not.
+
+    The gap this closes: a claim like "no disappearance names THIS node" is not the same claim
+    as "this code never appears at all". A correct detector raising `code` for some OTHER entity
+    should leave a "never names X" assertion GREEN - it is exactly the case
+    `assert_fault_absent_throughout` cannot tell apart from a real defect, since it only ever
+    looks at whether the code is present, never at what it names.
+
+    (1) A `/faults` that answers healthily throughout, with `code` present but naming only an
+    unrelated entity, fails the OLD pattern (`assert_fault_absent_throughout` on the bare code) -
+    the concrete false failure this fix replaces, demonstrated rather than asserted in prose. (2)
+    The SAME server does not trip `assert_fault_never_names`. (3) A server whose `code` DOES name
+    the forbidden entity at some point trips the new helper - or it would never fail on the
+    actual defect it exists to catch. (4) The same channel-alive discipline the other three
+    window assertions already carry: a dead channel mid-window fails this one too.
+
+    Raises whatever `test_case`'s own assertions raise on failure; callers use it from inside a
+    test method exactly like any other assertion helper.
+    """
+    code = 'GRAPH_NODE_DISAPPEARED'
+    forbidden_entity = '/target/allowlisted'
+    unrelated_items = [
+        {'fault_code': code, 'description': f'{code}: node /other/unrelated is gone'}]
+    naming_items = [
+        {'fault_code': code, 'description': f'{code}: node {forbidden_entity} is gone'}]
+
+    with _FlakyFaultsServer(healthy_polls=10_000, dead_status=None,
+                            healthy_items=unrelated_items) as fake:
+        # (1) The OLD pattern this fix replaces: a whole-code absence check trips on a raise for
+        # an unrelated entity - the false failure this fix exists to stop, demonstrated rather
+        # than asserted.
+        with test_case.assertRaises(
+                AssertionError,
+                msg='assert_fault_absent_throughout did NOT fail against a code raised for an '
+                    'unrelated entity - this self-test no longer demonstrates the false failure '
+                    'the fix replaces'):
+            assert_fault_absent_throughout(test_case, fake.port, code, duration=1.0, interval=0.2)
+
+        # (2) The fixed helper must NOT fail on the identical server: the code is present, but
+        # never names the forbidden entity.
+        assert_fault_never_names(
+            test_case, fake.port, code, forbidden=[forbidden_entity], duration=1.0, interval=0.2)
+
+    with _FlakyFaultsServer(healthy_polls=10_000, dead_status=None,
+                            healthy_items=naming_items) as fake:
+        # (3) The fixed helper MUST fail once the description actually names the forbidden
+        # entity - or it would never catch the defect it exists for.
+        with test_case.assertRaises(
+                AssertionError,
+                msg='assert_fault_never_names did not fail when the description named the '
+                    'forbidden entity - it would pass on the exact defect this fix exists to '
+                    'catch'):
+            assert_fault_never_names(
+                test_case, fake.port, code, forbidden=[forbidden_entity],
+                duration=1.0, interval=0.2)
+
+    # (4) Channel-alive discipline, matching the other three window assertions: a dead channel
+    # mid-window must fail this one too, not be read as "never named a forbidden entity".
+    for dead_status, label in ((None, 'a dropped connection'), (503, 'a 503 response')):
+        with _FlakyFaultsServer(healthy_polls=2, dead_status=dead_status,
+                                healthy_items=unrelated_items) as fake:
+            with test_case.assertRaises(
+                    AssertionError,
+                    msg=f'assert_fault_never_names did not fail when /faults died mid-window '
+                        f'via {label} - it would pass on the exact channel-death this fix '
+                        'exists to catch'):
+                assert_fault_never_names(
+                    test_case, fake.port, code, forbidden=[forbidden_entity],
+                    duration=2.0, interval=0.2)
 
 
 def poll_cleared(port, code, timeout=30.0, interval=0.5):

@@ -1,0 +1,1046 @@
+#!/usr/bin/env python3
+# Copyright 2026 bburda
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""node_death boundary, config and instrument e2e: the seam with lifecycle_expectation.
+
+Sibling of test_node_death_e2e.test.py and test_node_death_suppression_e2e.test.py, same reason:
+this package carries no node_death detector yet, and R10's narrowing of lifecycle_expectation's
+absence handling has not landed either, so most rows here are expected to fail today. What makes
+this file different is B1 and B3: their claims are about lifecycle_expectation ALONE, which
+already ships, so they can genuinely discriminate today - see their own class docstrings for what
+was actually observed, not merely predicted.
+
+Runs as SEVEN separate CTest targets (see CMakeLists.txt). WATCHDOG_E2E_SCENARIO selects which
+launch and which assertions run:
+
+- "b1_inactive_present": a require_active node (managed_lifecycle, never activated) sits in the
+  graph past `grace`. GRAPH_NODE_INACTIVE raises and names it - GENUINELY GREEN, because
+  lifecycle_expectation already ships this. GRAPH_NODE_DISAPPEARED stays absent for the whole
+  window, which CANNOT DISCRIMINATE YET on its own (no detector exists to raise it) but would
+  also hold once node_death exists, because this node never leaves the graph.
+- "b2_inactive_below_grace_then_gone": the same node, killed after being observed non-active for
+  only a couple of ticks - comfortably below `grace`. R10's own worked example: absence today
+  CONTINUES an unmatured violation streak (change 4's R30, necessary only because no presence
+  detector existed), so GRAPH_NODE_INACTIVE is expected to mature from evidence gathered entirely
+  after the node could no longer be observed - the wrong-today behaviour the whole B2 row exists
+  to pin, proven with assert_fault_absent_throughout rather than presented as prose. The
+  below-grace precondition is itself proven from an OBSERVABLE (GRAPH_NODE_INACTIVE still absent
+  from /faults) immediately before the kill, not merely inferred from how little time has
+  elapsed - status_json() exposes no per-node violation-streak count (see
+  lifecycle_expectation_detector.cpp), so the fault surface is the only external evidence
+  available, and with confirmation_threshold=-2 the detector's first FAILED report IS the
+  confirmation. RED.
+- "b3_matured_then_gone": the same node, left long enough for GRAPH_NODE_INACTIVE to CONFIRM
+  before it is killed. The confirmed fault survives the departure AND keeps naming the node
+  (content follows the clocks, not the snapshot - already shipped, GENUINELY proven here with
+  assert_fault_describes_only rather than a code-only persistence check, which a detector that
+  dropped this node while keeping the code raised for another one would still pass) - but
+  GRAPH_NODE_DISAPPEARED never joins it, so the row is RED overall: PARTLY satisfied, per the
+  brief this file was written against.
+- "b4_healthy_then_gone": the self-activating variant (managed_lifecycle_active) reaches "active"
+  and is then killed outright. No GRAPH_NODE_INACTIVE is born from a healthy departure
+  (release_uncorroborated - already shipped, genuinely proven here), but GRAPH_NODE_DISAPPEARED
+  never raises. RED.
+- "b5_restart_loop_still_caught": the same require_active node, respawning under this test's own
+  control, killed and confirmed back five times over. Nothing here checks
+  GRAPH_NODE_INACTIVE - that is B2's and B3's row. This one is entirely about whether the
+  (future) presence code catches the departure EVERY cycle, which is what makes R10's narrowing
+  safe: once GRAPH_NODE_DISAPPEARED independently catches a restart loop, lifecycle_expectation
+  no longer has to evade it via an unmatured streak maturing on absence. Configures
+  detectors.node_death.miss_grace explicitly (B5_MISS_GRACE, comfortably past the documented
+  3000 ms floor) and drives the node's own respawn on a delay (B5_RESPAWN_DELAY_SEC) safely
+  longer than that nominal grace, so a correct detector CAN report every cycle - left at the
+  1.5 s launch-respawn floor, the outage would be shorter than the floor the detector enforces
+  and this row could never turn green for a right implementation, only a wrong one lucky enough
+  to report anyway. RED - no presence detector exists yet to catch even the first cycle.
+- "c4_config_endpoint_e2e": ONE gateway, ONE armed node, killed once, with a LARGE
+  detectors.node_death.miss_grace configured (C4_MISS_GRACE_LARGE - no documented ceiling exists
+  for this not-yet-built key). Proves the knob governs an observable by checking the SAME
+  gateway at two points on ONE timeline rather than comparing two gateways: a window
+  (C4_EARLY_WINDOW_SEC) long enough that a near-floor config (this suite's own ~4s convention -
+  B5_MISS_GRACE, D2_MISS_GRACE) would already have raised, in which this large-grace gateway
+  must stay silent - needle-scoped (assert_fault_never_names), so a raise for some unrelated
+  entity cannot decide the row - then, once the configured grace has had time to elapse, the
+  fault must still arrive and name the node: the large value delays the report, it does not
+  swallow it. RED.
+- "d2_ungated_clear": a death is confirmed, then the GATEWAY is restarted with a generous
+  warmup_cycles so the pre-arm window is wide enough to sample. During that window - before the
+  restarted plugin's own gate has armed anything - the stored fault's `last_passed` must stay
+  unset the whole time: an ungated detector tick must never report PASSED for a node it has not
+  actually measured in this process's lifetime. The window is bracketed by two single-shot reads
+  of the watchdog's own global_state, one immediately before it opens and one immediately after
+  it closes, both asserted != "armed" - restart-plus-recovery eating the whole nominal warmup
+  would otherwise let the sampled window land AFTER arming, and a legitimate post-arm PASSED
+  would then be misread as the ungated-clear bug this row exists to catch. RED at the very first
+  assertion (the initial raise, which needs the same missing detector every other row does), so
+  the warmup-window claim itself is unreachable today and is written for slice 2/3's benefit.
+
+### Which arming gate, and why B1/B2/B3/B5 use the global form
+
+The brief's default rule is: gate on `app_id=<the node a scenario perturbs>`, and reserve the
+global form for a scenario that perturbs the gateway itself. B1, B2, B3 and B5 are the documented
+exception, for a reason specific to a require_active node rather than a style choice: ONE of
+`ReliabilityGate`'s own preconditions for a per-entity `armed` state is
+`LifecycleWatcher::node_ok()`, which is false for exactly a tracked node that is not (yet)
+"active" - the very state these four scenarios' target node sits in for most or all of its life.
+Gating on `app_id=managed_lifecycle` would therefore wait for something that can only become true
+once the node activates, which for these four scenarios it never does. This is not a new call:
+test_lifecycle_expectation_e2e.test.py's own "main" scenario already gates the identical fixture
+globally, for the identical reason, and this file follows that precedent rather than inventing a
+new one. B4 (managed_lifecycle_active, which DOES reach "active" on its own) uses the app_id form,
+because for that one node the precondition genuinely becomes true.
+"""
+
+import os
+import signal
+import sys
+import time
+import unittest
+
+from launch.actions import TimerAction
+import launch_ros.actions
+import launch_testing
+import requests
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# I100 as well as E402: `harness` is only importable because of the sys.path line above, so this
+# import cannot be moved up to where the alphabetical order would put it.
+from harness import (  # noqa: E402, I100
+    API_BASE_PATH,
+    assert_fault_absent_throughout,
+    assert_fault_describes_only,
+    assert_fault_never_names,
+    assert_fault_persists_throughout,
+    create_watchdog_test_launch,
+    poll_cleared,
+    poll_detector_status,
+    poll_faults,
+    wait_until_faults_endpoint_live,
+    wait_until_watchdog_armed,
+)
+
+from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
+from ros2_medkit_test_utils.coverage import get_coverage_env  # noqa: E402
+from ros2_medkit_test_utils.launch_helpers import DEMO_NODE_REGISTRY  # noqa: E402
+
+# No default on purpose - see harness-consuming siblings' identical rationale: a default makes
+# this file FAIL OPEN. A KeyError is loud.
+SCENARIO = os.environ['WATCHDOG_E2E_SCENARIO']
+PORT = get_test_port()
+
+FAULT_CODE_INACTIVE = 'GRAPH_NODE_INACTIVE'
+FAULT_CODE_DISAPPEARED = 'GRAPH_NODE_DISAPPEARED'
+DETECTOR_ID_LIFECYCLE = 'lifecycle_expectation'
+_LIFECYCLE_PREFIX = f'plugins.graph_watchdog.detectors.{DETECTOR_ID_LIFECYCLE}'
+_NODE_DEATH_PREFIX = 'plugins.graph_watchdog.detectors.node_death'
+
+TICK_INTERVAL_MS = 200
+WARMUP_CYCLES = 3
+
+# The require_active node B1/B2/B3/B5 share: DEMO_NODE_REGISTRY's own 'managed_lifecycle' key -
+# stays "unconfigured" (never active) unless driven otherwise, the trigger every one of those
+# rows needs. B4 uses the self-activating 'managed_lifecycle_active' sibling instead.
+TARGET_NODE = 'managed_lifecycle'
+ACTIVE_NODE = 'managed_lifecycle_active'
+
+# grace small enough that B1 and B3 mature quickly - same value
+# test_lifecycle_expectation_e2e.test.py's own GRACE constant uses, for the same reason.
+GRACE = 3
+# B2's own grace: large enough that "killed after a couple of observed ticks" is unambiguously
+# BELOW it, whatever small overshoot this scenario's own polling interval costs.
+B2_GRACE = 15
+# B5's own grace: large relative to one restart cycle's uptime. Not load-bearing for what this
+# row actually asserts (see the module docstring - B5 checks GRAPH_NODE_DISAPPEARED only), kept
+# generous so lifecycle_expectation's own behaviour cannot accidentally become this row's story.
+B5_GRACE = 50
+# B5's own node_death.miss_grace, explicitly configured rather than left at whatever default a
+# future detector ships with: 20 ticks at TICK_INTERVAL_MS is 4000 ms nominal, the same
+# "comfortably past the documented 3000 ms floor" convention test_node_death_e2e.test.py's own
+# MISS_GRACE uses (config sweep C1 owns the floor's own boundary values). Left unconfigured, a
+# correct detector's own floor could make an outage shorter than 3000 ms unreportable regardless
+# of what this test does with the respawn timing below - this pins the wall-clock requirement so
+# the outage length is a deliberate choice, not a guess against an unknown default.
+B5_MISS_GRACE = 20
+# How long B5's own node is held down every cycle, overriding the launch-wide RESPAWN_DELAY_SEC
+# floor (1.5 s - too short to ever satisfy the 3000 ms floor above, let alone B5_MISS_GRACE's own
+# 4000 ms). 5 s gives the same order of margin (1000 ms, 25%) over B5_MISS_GRACE's nominal grace
+# that MISS_GRACE=20 itself gives over the 3000 ms floor. respawn_delay is an ENFORCED floor
+# under how soon launch may even attempt to restart a respawn=True process (see
+# _lifecycle_node_action's own docstring), so every cycle's actual outage is guaranteed to be at
+# least this long - a correct detector can therefore always report it, which is the property this
+# row needs to be satisfiable by a right implementation rather than only by a wrong one.
+B5_RESPAWN_DELAY_SEC = 5.0
+
+ARM_TIMEOUT_SEC = 60.0
+FAULTS_LIVE_TIMEOUT_SEC = 30.0
+PRESENCE_TIMEOUT_SEC = 30.0
+DEPARTURE_TIMEOUT_SEC = 30.0
+RAISE_TIMEOUT_SEC = 60.0
+CLEAR_TIMEOUT_SEC = 60.0
+# How long an absent or a persisting fault is watched for - measured from the arming gate, not
+# process start, so bringup cannot eat it. Matches test_node_death_e2e.test.py's identical
+# constant.
+SUSTAINED_WINDOW_SEC = 20.0
+
+# launch will not even ATTEMPT to restart a respawn=True process before this elapses - an
+# enforced floor under every kill-then-return gap this file measures.
+RESPAWN_DELAY_SEC = 1.5
+
+# ---- "b5_restart_loop_still_caught" scenario's own target --------------------------------------
+B5_CYCLES = 5
+
+# ---- "c4_config_endpoint_e2e" scenario's own fixtures -------------------------------------------
+C4_TARGET_NODE = 'calibration'
+C4_TARGET_EXECUTABLE = 'demo_calibration_service'
+C4_TARGET_NAMESPACE = '/powertrain/engine'
+# No documented ceiling exists for this not-yet-built key (see this package's own config sweep,
+# which the design docs record as still owing a representative large value), so this is chosen
+# only to sit unambiguously outside C4_EARLY_WINDOW_SEC below - 500 ticks at TICK_INTERVAL_MS is
+# 100s, four times that window.
+C4_MISS_GRACE_LARGE = 500
+# Long enough that a near-floor config (this suite's own MISS_GRACE=20/4000ms convention - see
+# B5_MISS_GRACE, D2_MISS_GRACE) would already have raised by the time this window ends, so
+# staying silent through it is evidence the large value is actually GOVERNING behaviour, not
+# merely accepted and ignored; short enough to sit comfortably inside C4_MISS_GRACE_LARGE's own
+# ~100s nominal grace.
+C4_EARLY_WINDOW_SEC = 25.0
+# Measured from the END of C4_EARLY_WINDOW_SEC, not from the kill: comfortably covers the
+# remaining ~75s to C4_MISS_GRACE_LARGE's own nominal grace-crossing point plus reporting
+# latency.
+C4_LATE_RAISE_TIMEOUT_SEC = 100.0
+
+# ---- "d2_ungated_clear" scenario's own fixtures -------------------------------------------------
+D2_TARGET_NODE = 'calibration'
+D2_TARGET_EXECUTABLE = 'demo_calibration_service'
+D2_TARGET_NAMESPACE = '/powertrain/engine'
+D2_MISS_GRACE = 20
+# Deliberately large so the RESTARTED gateway's own pre-arm window is wide enough to sample
+# several times over - the whole point of this scenario is watching what happens DURING that
+# window, not merely before and after it. 150 ticks at TICK_INTERVAL_MS is 30s nominal warmup:
+# generous headroom over the restart itself, which is not instantaneous - create_gateway_node's
+# own respawn_delay (1.0s default) is an ENFORCED floor before launch even attempts to start
+# the replacement process, on top of that process's own ROS init and HTTP bind. Measured live at
+# 25 ticks (5s nominal): GET /faults was still completely unreachable (connection refused, not
+# even a 503) at the very first poll after the old port was confirmed down - the replacement
+# gateway had not bound its port yet. 150 leaves room for that plus real bringup variance.
+D2_WARMUP_CYCLES = 150
+# How long the post-restart, pre-arm window is watched for a premature PASSED, once the fault
+# surface is confirmed reachable (see test_02's own wait_until_faults_endpoint_live call before
+# this window opens). Comfortably inside D2_WARMUP_CYCLES * TICK_INTERVAL_MS (~30s nominal), so
+# a poll landing here is provably still INSIDE the ungated window rather than after it.
+D2_UNGATED_WATCH_SEC = 3.5
+
+
+def _lifecycle_node_action(name, *, respawn=False, respawn_delay=RESPAWN_DELAY_SEC):
+    """One managed_lifecycle instance under `name`, with a PID handle the test can signal.
+
+    Uses DEMO_NODE_REGISTRY's own (executable, ros_name, namespace) triple for `name` so this
+    stays in lockstep with demo_nodes.launch.py, built by hand only because every scenario here
+    signals the process directly and create_demo_nodes() hands back no PID.
+
+    The registry triple alone is not enough for ACTIVE_NODE: `auto_activate` is a ROS
+    PARAMETER, not part of the registry, and create_demo_nodes() only sets it via its own
+    ``if key == 'managed_lifecycle_active':`` special case - reusing the registry lookup here
+    without also reusing that special case silently launches an ACTIVE_NODE instance that never
+    activates (a duplicate of the plain TARGET_NODE fixture, wearing a different name).
+    """
+    executable, ros_name, namespace = DEMO_NODE_REGISTRY[name]
+    node_kwargs = {
+        'package': 'ros2_medkit_integration_tests',
+        'executable': executable,
+        'name': ros_name,
+        'namespace': namespace,
+        'output': 'screen',
+        'additional_env': get_coverage_env('ros2_medkit_integration_tests'),
+        'sigterm_timeout': '30',
+        'sigkill_timeout': '15',
+        'respawn': respawn,
+        'respawn_delay': respawn_delay,
+    }
+    if name == ACTIVE_NODE:
+        node_kwargs['parameters'] = [{'auto_activate': True}]
+    return launch_ros.actions.Node(**node_kwargs)
+
+
+def generate_test_description():
+    detector_params = {
+        'plugins.graph_watchdog.tick_interval_ms': TICK_INTERVAL_MS,
+        'plugins.graph_watchdog.warmup_cycles': WARMUP_CYCLES,
+    }
+    demo_nodes = []
+    gateway_respawn = False
+
+    if SCENARIO == 'b1_inactive_present':
+        detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [TARGET_NODE]
+        detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = GRACE
+        demo_nodes = [TARGET_NODE]  # never killed - the whole point of this row
+    elif SCENARIO == 'b2_inactive_below_grace_then_gone':
+        detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [TARGET_NODE]
+        detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = B2_GRACE
+    elif SCENARIO == 'b3_matured_then_gone':
+        detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [TARGET_NODE]
+        detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = GRACE
+    elif SCENARIO == 'b4_healthy_then_gone':
+        detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [ACTIVE_NODE]
+        detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = GRACE
+    elif SCENARIO == 'b5_restart_loop_still_caught':
+        detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [TARGET_NODE]
+        detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = B5_GRACE
+        detector_params[f'{_NODE_DEATH_PREFIX}.miss_grace'] = B5_MISS_GRACE
+    elif SCENARIO == 'c4_config_endpoint_e2e':
+        detector_params[f'{_NODE_DEATH_PREFIX}.miss_grace'] = C4_MISS_GRACE_LARGE
+    elif SCENARIO == 'd2_ungated_clear':
+        detector_params[f'{_NODE_DEATH_PREFIX}.miss_grace'] = D2_MISS_GRACE
+        detector_params['plugins.graph_watchdog.warmup_cycles'] = D2_WARMUP_CYCLES
+        gateway_respawn = True
+    else:
+        raise RuntimeError(f'WATCHDOG_E2E_SCENARIO={SCENARIO!r} has no launch configuration')
+
+    launch_description, context = create_watchdog_test_launch(
+        detector_params=detector_params,
+        demo_nodes=demo_nodes,
+        port=PORT,
+        gateway_respawn=gateway_respawn,
+    )
+
+    if SCENARIO in ('b2_inactive_below_grace_then_gone', 'b3_matured_then_gone'):
+        target = _lifecycle_node_action(TARGET_NODE, respawn=False)
+        launch_description.add_action(TimerAction(period=2.0, actions=[target]))
+        context['target_node'] = target
+
+    if SCENARIO == 'b4_healthy_then_gone':
+        target = _lifecycle_node_action(ACTIVE_NODE, respawn=False)
+        launch_description.add_action(TimerAction(period=2.0, actions=[target]))
+        context['target_node'] = target
+
+    if SCENARIO == 'b5_restart_loop_still_caught':
+        target = _lifecycle_node_action(
+            TARGET_NODE, respawn=True, respawn_delay=B5_RESPAWN_DELAY_SEC)
+        launch_description.add_action(TimerAction(period=2.0, actions=[target]))
+        context['target_node'] = target
+
+    if SCENARIO == 'd2_ungated_clear':
+        target = launch_ros.actions.Node(
+            package='ros2_medkit_integration_tests',
+            executable=D2_TARGET_EXECUTABLE,
+            name=D2_TARGET_NODE,
+            namespace=D2_TARGET_NAMESPACE,
+            output='screen',
+            additional_env=get_coverage_env('ros2_medkit_integration_tests'),
+            sigterm_timeout='30',
+            sigkill_timeout='15',
+            # No respawn: the node must STAY gone across the gateway restart, or there would be
+            # nothing "stored" left for the warmup window to wrongly move toward healing.
+        )
+        launch_description.add_action(TimerAction(period=2.0, actions=[target]))
+        context['target_node'] = target
+
+    if SCENARIO == 'c4_config_endpoint_e2e':
+        target = launch_ros.actions.Node(
+            package='ros2_medkit_integration_tests',
+            executable=C4_TARGET_EXECUTABLE,
+            name=C4_TARGET_NODE,
+            namespace=C4_TARGET_NAMESPACE,
+            output='screen',
+            additional_env=get_coverage_env('ros2_medkit_integration_tests'),
+            sigterm_timeout='30',
+            sigkill_timeout='15',
+        )
+        launch_description.add_action(TimerAction(period=2.0, actions=[target]))
+        context['target_node'] = target
+
+    return launch_description, context
+
+
+# ---------------------------------------------------------------------------------------
+# Local helpers - read the same endpoints harness.py's own helpers do, or a service this
+# file's own scenario needs that no shared helper covers.
+# ---------------------------------------------------------------------------------------
+
+def _poll_apps_absent(port, app_id, timeout=30.0, interval=0.5):
+    """Poll ``GET /apps`` until `app_id` is no longer listed. ``True`` once it is gone."""
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + timeout
+    last_seen = 'GET /apps was never answered at all'
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/apps', timeout=5)
+            if response.status_code == 200:
+                ids = [item.get('id') for item in response.json().get('items', [])]
+                last_seen = str(ids)
+                if app_id not in ids:
+                    return True
+            else:
+                last_seen = f'HTTP {response.status_code} from GET /apps'
+        except requests.exceptions.RequestException as exc:
+            last_seen = f'GET /apps failed: {exc}'
+        time.sleep(interval)
+    print(f'_poll_apps_absent({app_id!r}) timed out after {timeout}s; last seen: {last_seen}')
+    return False
+
+
+def _poll_apps_present(port, app_id, timeout=30.0, interval=0.5):
+    """Poll ``GET /apps`` until `app_id` IS listed. ``True`` once it appears."""
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + timeout
+    last_seen = 'GET /apps was never answered at all'
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/apps', timeout=5)
+            if response.status_code == 200:
+                ids = [item.get('id') for item in response.json().get('items', [])]
+                last_seen = str(ids)
+                if app_id in ids:
+                    return True
+            else:
+                last_seen = f'HTTP {response.status_code} from GET /apps'
+        except requests.exceptions.RequestException as exc:
+            last_seen = f'GET /apps failed: {exc}'
+        time.sleep(interval)
+    print(f'_poll_apps_present({app_id!r}) timed out after {timeout}s; last seen: {last_seen}')
+    return False
+
+
+def _watchdog_global_state(port, timeout=5.0):
+    """One immediate read of GET /x-medkit-watchdog's own global_state field.
+
+    Not a polling helper: D2's pre-arm proof needs to know the state AT ONE INSTANT
+    (immediately before opening the ungated window, and again immediately after it closes),
+    not wait until some condition becomes true - a poll loop would blur exactly the boundary
+    this is meant to pin. Mirrors ReliabilityGate::status_json()'s own field (see
+    wait_until_watchdog_armed's docstring in harness.py: "armed" or "warming_up").
+
+    Returns the string, or ``None`` if the endpoint did not answer 200.
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    try:
+        response = requests.get(f'{base}/x-medkit-watchdog', timeout=timeout)
+    except requests.exceptions.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    return response.json().get('x-medkit-watchdog', {}).get('global_state')
+
+
+def _wait_until_port_is_down(port, timeout=60.0, interval=0.2):
+    """Wait until the gateway's HTTP port stops answering. ``True`` once it does."""
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            requests.get(f'{base}/health', timeout=2)
+        except requests.exceptions.RequestException:
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _fault_record(port, code, timeout=30.0, interval=0.5):
+    """Poll ``GET /faults?status=all`` until `code` appears, whatever its status.
+
+    ``poll_faults`` uses the default (pending+confirmed) filter, so a HEALED or CLEARED fault
+    disappears from it. D2 needs the record itself, including ``last_passed``, which survives
+    both. Returns the matching item dict, or ``None`` on timeout.
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', params={'status': 'all'}, timeout=5)
+            if response.status_code == 200:
+                for item in response.json().get('items', []):
+                    if item.get('fault_code') == code:
+                        return item
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return None
+
+
+def _fault_present_now(port, code, timeout=5.0):
+    """One immediate GET /faults check for whether `code` is in the active-fault list.
+
+    Not a polling helper: B2's below-grace precondition has to be read from an OBSERVABLE AT
+    ONE INSTANT, immediately before the kill that follows it - a poll loop's own sampling
+    interval would widen exactly the race this exists to shrink. Uses the same default
+    (pending+confirmed) filter as poll_faults, so "False" here means the same thing a
+    poll_faults timeout does: not (yet) raised.
+
+    Returns ``True``/``False``, or ``None`` if the endpoint did not answer 200 - the caller must
+    tell that apart from ``False``, the same channel-alive discipline every window assertion in
+    this package's harness already applies.
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    try:
+        response = requests.get(f'{base}/faults', timeout=timeout)
+    except requests.exceptions.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    codes = {item.get('fault_code') for item in response.json().get('items', [])}
+    return code in codes
+
+
+def _assert_never_passed_throughout(test_case, port, code, duration, interval=0.2):
+    """Fail unless `code`'s stored record has ``last_passed is None`` on EVERY poll.
+
+    D2's own claim ("no clear reaches the fault manager before the detector has measured") is
+    about a FIELD staying unset across a window, not about the fault's presence/absence -
+    neither ``assert_fault_absent_throughout`` nor ``assert_fault_persists_throughout`` reads
+    ``last_passed``, so this file carries its own, narrow local helper rather than stretching
+    either one to fit. Same channel-alive discipline as harness.py's own window assertions: a
+    request error or a non-200 fails the assertion naming which poll and why, rather than being
+    swallowed the way a bare ``poll_cleared``/``assertFalse`` pair would be.
+
+    Parameters
+    ----------
+    test_case : unittest.TestCase
+    port : int
+        Gateway HTTP port.
+    code : str
+        The ``fault_code`` whose record must show no PASSED report.
+    duration : float
+        Total seconds to keep polling.
+    interval : float
+        Sleep between polls in seconds.
+
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + duration
+    polls = 0
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', params={'status': 'all'}, timeout=5)
+        except requests.exceptions.RequestException as exc:
+            test_case.fail(
+                f'/faults became unreachable {polls} poll(s) into a {duration}s ungated-window '
+                f'check (could not ask, which is not the same as "asked, and {code} was never '
+                f'reported PASSED"): {exc}')
+            return
+        if response.status_code != 200:
+            test_case.fail(
+                f'/faults answered HTTP {response.status_code} {polls} poll(s) into a '
+                f'{duration}s ungated-window check - the channel died mid-window, which this '
+                'assertion must not read as "never reported PASSED"')
+            return
+        record = next(
+            (item for item in response.json().get('items', []) if item.get('fault_code') == code),
+            None)
+        if record is None:
+            test_case.fail(
+                f'{code} was missing from the store {polls} poll(s) into a {duration}s '
+                'ungated-window check that was supposed to keep watching its record')
+            return
+        test_case.assertIsNone(
+            record.get('last_passed'),
+            f'{code} was reported PASSED (last_passed={record.get("last_passed")!r}) '
+            f'{polls} poll(s) into a {duration}s window that starts before the restarted '
+            "detector's own gate has armed anything - an ungated clear reached the fault "
+            'manager before anything was actually measured',
+        )
+        polls += 1
+        time.sleep(interval)
+    test_case.assertGreater(
+        polls, 0,
+        f'the {duration}s ungated-window check never actually polled /faults - duration must '
+        f'be >= interval ({interval}s)')
+
+
+# ---------------------------------------------------------------------------------------
+# Scenarios
+# ---------------------------------------------------------------------------------------
+
+class TestBoundaryInactivePresent(unittest.TestCase):
+    """B1: a required node inactive past grace, still present: INACTIVE only.
+
+    GENUINELY GREEN, not a placeholder: lifecycle_expectation already ships, so the raise below
+    exercises real, already-merged code (LifecycleExpectationTracker's violation-streak clock
+    crossing `grace`). The GRAPH_NODE_DISAPPEARED absence half CANNOT DISCRIMINATE a correct
+    future node_death from no detector at all - with nothing to raise it, this absence is
+    trivially true today - though it is also the behaviour a correct node_death would keep
+    forever here, since this node never leaves the graph.
+    """
+
+    def test_inactive_past_grace_raises_no_disappeared(self):
+        # No target_node fixture: TARGET_NODE is launched via demo_nodes=[...] (create_demo_nodes
+        # gives no PID handle back, and this row never needs one - it kills nothing). Only the
+        # scenarios below that hand-build the node populate a 'target_node' context entry.
+        # Global gate: see the module docstring's "Which arming gate" section.
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
+            'graph_watchdog never reported an armed global state')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+        self.assertTrue(
+            _poll_apps_present(PORT, TARGET_NODE, timeout=PRESENCE_TIMEOUT_SEC),
+            f'{TARGET_NODE} never appeared on GET /apps - there is no present node here for '
+            'this row to measure',
+        )
+
+        fault = poll_faults(PORT, FAULT_CODE_INACTIVE, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(f'{FAULT_CODE_INACTIVE} never raised for {TARGET_NODE} past grace')
+        self.assertIn(TARGET_NODE, fault.get('description', ''))
+
+        assert_fault_absent_throughout(self, PORT, FAULT_CODE_DISAPPEARED, SUSTAINED_WINDOW_SEC)
+
+        # The trigger was pinned before the window; confirm it survived to the end too, or most
+        # of the window measured a graph this row was not actually about.
+        self.assertTrue(
+            _poll_apps_present(PORT, TARGET_NODE, timeout=5.0),
+            f'{TARGET_NODE} is no longer present at the end of the window - the trigger did '
+            'not survive it',
+        )
+
+
+class TestBoundaryInactiveBelowGraceThenGone(unittest.TestCase):
+    """B2: a required node inactive for FEWER ticks than grace, then it vanishes.
+
+    R10's own worked example, and the row it exists to pin: on ORIGIN/MAIN today, absence
+    CONTINUES a violation streak that had not yet matured when the node was last observed
+    (change 4's R30) - necessary only because no presence detector existed to catch a restart
+    loop any other way. Once GRAPH_NODE_DISAPPEARED has one, that continuation is no longer
+    needed and, per R10, must stop maturing an unmatured streak.
+
+    The below-grace precondition is proven from an OBSERVABLE immediately before the kill, not
+    inferred from how little time elapsed since tracking started: status_json() exposes no
+    per-node violation-streak count (see lifecycle_expectation_detector.cpp's own status_json,
+    which reports only tracking_saturated/tracked_nodes/tracked_node_cap), so the fault surface
+    itself is the only external evidence of whether the streak has crossed `grace`, and with
+    confirmation_threshold=-2 the detector's first FAILED report IS the confirmation - "absent
+    from /faults" and "not yet matured" are the same fact, one HTTP round trip apart. A failure
+    at that check names a timing problem in this test's OWN setup (B2_GRACE too tight against
+    how long arming took this run), never the R10 claim the kill exists to test - which is the
+    point of reading an observable immediately before acting instead of trusting a margin.
+
+    Observed, not merely predicted: this row is RED today, and specifically because
+    GRAPH_NODE_INACTIVE DOES eventually appear here - the assert_fault_absent_throughout call
+    below is the one expected to fail, not the GRAPH_NODE_DISAPPEARED raise beneath it (which
+    would also fail, for the ordinary missing-detector reason, but the run stops at the first
+    failure and never reaches it). See this file's own report for the observed timing.
+    """
+
+    def test_below_grace_departure_never_matures_inactive(self, target_node):
+        # Global gate: see the module docstring's "Which arming gate" section.
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
+            'graph_watchdog never reported an armed global state')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        # tracked_nodes becoming 1 is the tracker's own proof that it matched TARGET_NODE at
+        # least once - the earliest moment a kill is guaranteed not to land before the detector
+        # was even permitted to look. B2_GRACE is generous enough that the handful of extra
+        # ticks this poll's own interval can cost before the kill below still leaves the node
+        # comfortably below grace.
+        self.assertTrue(
+            poll_detector_status(
+                PORT, DETECTOR_ID_LIFECYCLE, 'tracked_nodes', 1, timeout=ARM_TIMEOUT_SEC),
+            f'lifecycle_expectation never reported tracking {TARGET_NODE} - it was never '
+            'matched at all, so killing it below would prove nothing about absence continuing '
+            'an unmatured streak',
+        )
+
+        # The row's own precondition, read from an observable immediately before the kill - see
+        # the class docstring for why this is the tightest proof available without new
+        # instrumentation. `is` rather than a plain falsy check: None (channel unreachable) must
+        # not be read as "confirmed absent".
+        below_grace = _fault_present_now(PORT, FAULT_CODE_INACTIVE)
+        self.assertIs(
+            below_grace, False,
+            f'{FAULT_CODE_INACTIVE} could not be proven absent immediately before the kill '
+            f'below (checked value: {below_grace!r}) - either the fault surface is unreachable, '
+            f'or B2_GRACE ({B2_GRACE} ticks) already matured before arming and discovery '
+            "finished this run, so the kill below would test B3's claim (already matured), not "
+            "this row's below-grace claim",
+        )
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{TARGET_NODE} never left GET /apps after SIGTERM')
+
+        # The row's own claim: GRAPH_NODE_INACTIVE must never appear. Expected to FAIL today.
+        assert_fault_absent_throughout(self, PORT, FAULT_CODE_INACTIVE, SUSTAINED_WINDOW_SEC)
+
+        # Unreachable today - the assertion above already failed and stopped the test. Written
+        # for slice 2/3, whose fix must make BOTH halves of this row true together.
+        fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(f'{FAULT_CODE_DISAPPEARED} never raised for the departed {TARGET_NODE}')
+        self.assertIn(TARGET_NODE, fault.get('description', ''))
+
+
+class TestBoundaryMaturedThenGone(unittest.TestCase):
+    """B3: a required node already CONFIRMED inactive, then it vanishes.
+
+    Two independent claims. The first is GENUINELY GREEN, already-shipped behaviour:
+    "content follows the clocks, not the snapshot" means a matured violation stays in
+    GRAPH_NODE_INACTIVE's content through a departure AND keeps naming the node - proven here
+    with assert_fault_describes_only against the real stack rather than a code-only persistence
+    check (a detector that dropped TARGET_NODE from the description while keeping some OTHER
+    node's violation raised under the same code would still pass a bare presence check), the
+    same claim test_lifecycle_expectation_e2e.test.py's own "departure_keeps" scenario proves for
+    the UNREADABLE code. The second - GRAPH_NODE_DISAPPEARED also joining once the node is gone,
+    still naming it - is RED, the ordinary missing-detector reason. The row as a whole is
+    therefore PARTLY satisfied, exactly as this file was written expecting.
+    """
+
+    def test_matured_inactive_survives_departure_disappeared_never_joins(self, target_node):
+        # Global gate: see the module docstring's "Which arming gate" section.
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
+            'graph_watchdog never reported an armed global state')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        fault = poll_faults(PORT, FAULT_CODE_INACTIVE, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(
+                f'{FAULT_CODE_INACTIVE} never raised for {TARGET_NODE} past grace - there is '
+                'nothing ALREADY CONFIRMED for the kill below to test the survival of')
+        self.assertIn(TARGET_NODE, fault.get('description', ''))
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{TARGET_NODE} never left GET /apps after SIGTERM')
+
+        # Genuinely green today: proves the matured violation is not healed by the departure,
+        # and that the surviving content still names TARGET_NODE rather than merely keeping the
+        # code raised (see the class docstring for why a code-only check is not enough here).
+        assert_fault_describes_only(
+            self, PORT, FAULT_CODE_INACTIVE, required=[TARGET_NODE], forbidden=[],
+            duration=SUSTAINED_WINDOW_SEC)
+
+        # RED today, the ordinary missing-detector reason - reached only because the assertion
+        # above passed, unlike B2's sibling call.
+        second = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+        if second is None:
+            self.fail(f'{FAULT_CODE_DISAPPEARED} never raised for the departed {TARGET_NODE}')
+        self.assertIn(TARGET_NODE, second.get('description', ''))
+
+
+class TestBoundaryHealthyThenGone(unittest.TestCase):
+    """B4: a required node reaches active, then shuts down: DISAPPEARED only.
+
+    The INACTIVE-absence half is GENUINELY GREEN, already-shipped behaviour
+    (`release_uncorroborated`: a node last measured healthy that then departs starts no
+    violation) - proven here against the real stack, checked FIRST so its own result is never
+    masked by the DISAPPEARED half's inevitable timeout. The DISAPPEARED-raise half is RED, the
+    ordinary missing-detector reason.
+    """
+
+    def test_healthy_departure_raises_only_disappeared(self, target_node):
+        # app_id form: unlike B1/B2/B3/B5's target, this node reaches "active" on its own, so
+        # the per-entity armed precondition (LifecycleWatcher::node_ok()) genuinely becomes
+        # true here - see the module docstring's "Which arming gate" section.
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=ACTIVE_NODE),
+            f'graph_watchdog never reported {ACTIVE_NODE} armed')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, ACTIVE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{ACTIVE_NODE} never left GET /apps after SIGTERM')
+
+        # Genuinely green today: an active-then-departed node never becomes INACTIVE content.
+        assert_fault_absent_throughout(self, PORT, FAULT_CODE_INACTIVE, SUSTAINED_WINDOW_SEC)
+
+        fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(f'{FAULT_CODE_DISAPPEARED} never raised for the departed {ACTIVE_NODE}')
+        self.assertIn(ACTIVE_NODE, fault.get('description', ''))
+
+
+class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
+    """B5: a required node in a restart loop is still caught, every cycle, by the presence code.
+
+    The most important row in this file: it is what makes B2's narrowing (R10) safe. Once
+    GRAPH_NODE_DISAPPEARED independently catches a departure regardless of how briefly the node
+    was up, lifecycle_expectation no longer has to lean on an unmatured streak maturing on
+    absence to keep a restart-looping node from evading every code. This row does not touch
+    GRAPH_NODE_INACTIVE at all - that claim belongs to B2 and B3.
+
+    Every cycle's outage is held down for B5_RESPAWN_DELAY_SEC, safely longer than the
+    explicitly-configured B5_MISS_GRACE this scenario launches with (see the module docstring):
+    left at launch's own 1.5 s respawn floor with no miss_grace configured, a correct detector's
+    own wall-clock floor could make the outage unreportable regardless of how many cycles this
+    test waits out, which is a row a right implementation cannot satisfy - not evidence of a
+    defect in one. Every raise is also checked by NAME, not merely by code, so a detector
+    reporting the same code for some other entity every cycle could not pass in TARGET_NODE's
+    place.
+
+    RED today: no presence detector exists yet, so even the FIRST cycle's raise never happens.
+    """
+
+    def test_five_restarts_each_raise_and_clear(self, target_node):
+        # Global gate: see the module docstring's "Which arming gate" section.
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
+            'graph_watchdog never reported an armed global state')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+        self.assertTrue(
+            _poll_apps_present(PORT, TARGET_NODE, timeout=PRESENCE_TIMEOUT_SEC),
+            f'{TARGET_NODE} never appeared on GET /apps - there is no present node here to '
+            'restart',
+        )
+
+        pid = target_node.process_details['pid']
+        for cycle in range(1, B5_CYCLES + 1):
+            os.kill(pid, signal.SIGTERM)
+            self.assertTrue(
+                _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+                f'cycle {cycle}: {TARGET_NODE} never left GET /apps after SIGTERM',
+            )
+
+            fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+            if fault is None:
+                self.fail(f'cycle {cycle}: {FAULT_CODE_DISAPPEARED} never raised')
+            self.assertIn(
+                TARGET_NODE, fault.get('description', ''),
+                f'cycle {cycle}: {FAULT_CODE_DISAPPEARED} raised but did not name {TARGET_NODE}')
+
+            self.assertTrue(
+                _poll_apps_present(
+                    PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC + B5_RESPAWN_DELAY_SEC),
+                f'cycle {cycle}: {TARGET_NODE} never came back after the SIGTERM',
+            )
+            # A fresh pid every cycle: read it back rather than assume launch's respawn keeps
+            # the value this test already has.
+            pid = target_node.process_details['pid']
+
+            self.assertTrue(
+                poll_cleared(PORT, FAULT_CODE_DISAPPEARED, timeout=CLEAR_TIMEOUT_SEC),
+                f'cycle {cycle}: {FAULT_CODE_DISAPPEARED} never cleared once {TARGET_NODE} '
+                'came back - this row is about EVERY cycle being caught AND released, not a '
+                'single continuous outage',
+            )
+
+
+class TestBoundaryConfigEndpointE2E(unittest.TestCase):
+    """C4: `detectors.node_death.miss_grace` visibly changes when a death is reported.
+
+    One gateway, one armed node, killed once, with a LARGE miss_grace configured
+    (C4_MISS_GRACE_LARGE - no documented ceiling exists for this not-yet-built key). Proves the
+    knob governs an OBSERVABLE, not merely that the plugin accepts it at startup, by checking the
+    SAME gateway at two points on ONE timeline rather than comparing two gateways: first, a
+    window (C4_EARLY_WINDOW_SEC) long enough that a near-floor config (this suite's own ~4s
+    convention - B5_MISS_GRACE, D2_MISS_GRACE) would already have raised, in which this
+    large-grace gateway must stay silent - needle-scoped (assert_fault_never_names), so a
+    detector raising for some unrelated entity cannot decide the row; second, once the
+    configured grace has had time to elapse, the fault must still arrive and name the node - the
+    large value delays the report, it does not swallow it.
+
+    RED today: no node_death detector exists, so the raise in the second half never happens.
+    """
+
+    def test_large_miss_grace_delays_then_still_reports(self, target_node):
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=C4_TARGET_NODE),
+            f'graph_watchdog never reported {C4_TARGET_NODE} armed')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, C4_TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{C4_TARGET_NODE} never left GET /apps after SIGTERM')
+
+        # Needle-scoped: a raise for some OTHER entity must not decide this row (see
+        # assert_fault_never_names's own docstring). Long enough that a near-floor config would
+        # already have raised; short enough to sit well inside C4_MISS_GRACE_LARGE's own grace.
+        assert_fault_never_names(
+            self, PORT, FAULT_CODE_DISAPPEARED, forbidden=[C4_TARGET_NODE],
+            duration=C4_EARLY_WINDOW_SEC)
+
+        # Past the configured grace, the same knob that delayed the raise must not have
+        # suppressed it outright.
+        fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=C4_LATE_RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(
+                f'{FAULT_CODE_DISAPPEARED} never raised for {C4_TARGET_NODE} even past the '
+                'configured C4_MISS_GRACE_LARGE grace')
+        self.assertIn(C4_TARGET_NODE, fault.get('description', ''))
+
+
+class TestBoundaryUngatedClear(unittest.TestCase):
+    """D2: an ungated clear must not push a stored fault toward healing before anything measured.
+
+    RED today at the very first assertion - the ordinary missing-detector reason, before this
+    scenario's restart even happens. Everything from the restart onward is unreachable in this
+    run and is written for slice 2/3: a death is confirmed, the GATEWAY is restarted with a wide
+    warmup_cycles, and the pre-arm window that follows is watched for a premature PASSED on the
+    stored record.
+    """
+
+    def test_01_the_fault_raises_before_the_restart(self, target_node):
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=D2_TARGET_NODE),
+            f'graph_watchdog never reported {D2_TARGET_NODE} armed')
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, D2_TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{D2_TARGET_NODE} never left GET /apps after SIGTERM')
+
+        fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(
+                f'{FAULT_CODE_DISAPPEARED} never raised for the departed {D2_TARGET_NODE} - '
+                'there is nothing STORED for the restart below to wrongly move toward healing')
+        self.assertIn(D2_TARGET_NODE, fault.get('description', ''))
+
+        record = _fault_record(PORT, FAULT_CODE_DISAPPEARED, timeout=DEPARTURE_TIMEOUT_SEC)
+        if record is None:
+            self.fail(f'{FAULT_CODE_DISAPPEARED} vanished from the store entirely')
+        self.assertIsNone(
+            record.get('last_passed'),
+            f'{FAULT_CODE_DISAPPEARED} was already reported PASSED before the restart '
+            f'(last_passed={record.get("last_passed")!r}) - there is nothing left here for '
+            'the restart below to wrongly preserve or wrongly heal',
+        )
+
+    def test_02_the_pre_arm_window_never_reports_passed(self, gateway_node, target_node):
+        del target_node  # stays gone by design; not signalled again in this method
+        old_pid = gateway_node.process_details['pid']
+        os.kill(old_pid, signal.SIGTERM)
+        self.assertTrue(
+            _wait_until_port_is_down(PORT, timeout=60.0),
+            f'the gateway (pid {old_pid}) kept answering after SIGTERM - nothing restarted')
+
+        # Gate on the fault surface being reachable AT ALL before opening the ungated-window
+        # clock. A restarted gateway's HTTP server - let alone its round trip to the
+        # fault_manager, a separate process this restart never touched - is not up the instant
+        # the OLD port stops answering: create_gateway_node's own respawn_delay is an ENFORCED
+        # floor before launch even starts the replacement, before that process's own ROS init
+        # and HTTP bind. A poll issued before either is up cannot ask this row's own question
+        # ("was PASSED reported") at all - it can only observe a channel that does not exist
+        # yet, which _assert_never_passed_throughout correctly reports as unreachable rather
+        # than silently reading as "never reported PASSED". Confirmed live: without this gate,
+        # the very first poll after the old port went down found GET /faults refusing the
+        # connection outright.
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 after the restart - the ungated-window check below '
+            'would have no live channel to ask anything on',
+        )
+
+        # The window has to be PROVEN pre-arm, not merely assumed from D2_WARMUP_CYCLES's own
+        # nominal budget: if restart-plus-HTTP-recovery above ate most or all of that nominal
+        # warmup, the watchdog could already be armed by the time the window below opens, and
+        # any PASSED it then observes would be legitimate post-arm behaviour, not the
+        # ungated-clear bug this row exists to catch. One immediate read, not a poll - the point
+        # is the state AT THIS INSTANT, immediately before the window starts.
+        pre_state = _watchdog_global_state(PORT)
+        self.assertNotEqual(
+            pre_state, 'armed',
+            f'the gateway was already armed (global_state={pre_state!r}) before the ungated '
+            'window below could even open - restart-plus-recovery consumed the whole nominal '
+            f'warmup (D2_WARMUP_CYCLES={D2_WARMUP_CYCLES}), so any PASSED observed below would '
+            'be legitimate post-arm behaviour, not the ungated-clear bug this row exists to '
+            'catch; widen D2_WARMUP_CYCLES rather than trusting this window without proof',
+        )
+
+        # The claim under test: for D2_UNGATED_WATCH_SEC once the surface is reachable, the
+        # stored fault's last_passed must stay None - comfortably before D2_WARMUP_CYCLES *
+        # TICK_INTERVAL_MS (~30s nominal) elapses, so the window is provably still INSIDE the
+        # period during which the restarted plugin's own gate has not armed anything.
+        _assert_never_passed_throughout(
+            self, PORT, FAULT_CODE_DISAPPEARED, D2_UNGATED_WATCH_SEC)
+
+        # The other bracket: prove the window closed still inside pre-arm too, or the samples
+        # above are not provably pre-arm from end to end - only from their own start.
+        post_state = _watchdog_global_state(PORT)
+        self.assertNotEqual(
+            post_state, 'armed',
+            f'the gateway armed (global_state={post_state!r}) DURING the {D2_UNGATED_WATCH_SEC}s '
+            'ungated window above - the samples it collected are no longer provably pre-arm '
+            'from end to end, so they cannot be read as evidence about the ungated-clear bug '
+            'this row exists to catch',
+        )
+
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=90.0),
+            'the gateway never came back armed after the restart - the warmup window this row '
+            'is about never actually ended, so the check above proved nothing about a window '
+            'that closes')
+        self.assertNotEqual(
+            gateway_node.process_details['pid'], old_pid,
+            'the gateway process id did not change, so this test never restarted anything')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 after the restart - the persistence check below '
+            'would prove nothing',
+        )
+        self.assertFalse(
+            _poll_apps_present(PORT, D2_TARGET_NODE, timeout=5.0),
+            f'{D2_TARGET_NODE} is back in GET /apps - this row is about a restart with the '
+            'node STILL gone, and it came back instead',
+        )
+
+        assert_fault_persists_throughout(self, PORT, FAULT_CODE_DISAPPEARED, SUSTAINED_WINDOW_SEC)
+
+        record = _fault_record(PORT, FAULT_CODE_DISAPPEARED, timeout=DEPARTURE_TIMEOUT_SEC)
+        if record is None:
+            self.fail(f'{FAULT_CODE_DISAPPEARED} vanished from the store after the restart')
+        self.assertIsNone(
+            record.get('last_passed'),
+            f'the restarted gateway reported {FAULT_CODE_DISAPPEARED} PASSED for a node it can '
+            f'never have observed in this process (last_passed={record.get("last_passed")!r})',
+        )
+
+
+# Each CTest target launches this file with one scenario, so only that scenario's case may
+# run. Removing the others from the module (rather than skipping them) means each run reports
+# exactly one case, and a missing result is a real failure rather than an expected line of
+# output - see test_node_death_e2e.test.py's identical rationale.
+_SCENARIO_CASES = {
+    'b1_inactive_present': 'TestBoundaryInactivePresent',
+    'b2_inactive_below_grace_then_gone': 'TestBoundaryInactiveBelowGraceThenGone',
+    'b3_matured_then_gone': 'TestBoundaryMaturedThenGone',
+    'b4_healthy_then_gone': 'TestBoundaryHealthyThenGone',
+    'b5_restart_loop_still_caught': 'TestBoundaryRestartLoopStillCaught',
+    'c4_config_endpoint_e2e': 'TestBoundaryConfigEndpointE2E',
+    'd2_ungated_clear': 'TestBoundaryUngatedClear',
+}
+if SCENARIO not in _SCENARIO_CASES:
+    raise RuntimeError(
+        f'WATCHDOG_E2E_SCENARIO={SCENARIO!r} is not one of {sorted(_SCENARIO_CASES)}; the '
+        'CTest target and this file disagree about which scenarios exist')
+for _scenario, _case_name in _SCENARIO_CASES.items():
+    if _scenario != SCENARIO:
+        del globals()[_case_name]
+
+
+@launch_testing.post_shutdown_test()
+class TestShutdown(unittest.TestCase):
+    """Verify the gateway/fault_manager/demo stack exits cleanly."""
+
+    def test_exit_codes(self, proc_info):
+        for info in proc_info:
+            self.assertIn(
+                info.returncode,
+                ALLOWED_EXIT_CODES,
+                f'Process {info.process_name} exited with {info.returncode}',
+            )
