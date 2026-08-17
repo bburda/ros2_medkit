@@ -194,8 +194,10 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   // Apply snapshot limit to storage
   if (max_snapshots > 0) {
     storage_->set_max_snapshots_per_fault(static_cast<size_t>(max_snapshots));
-    storage_->set_retain_snapshots_on_clear(retain_snapshots_on_clear);
   }
+  // Independent of the cap: max_per_fault 0 means unlimited, and retention across
+  // acknowledgement is a separate question from how many sets are kept.
+  storage_->set_retain_snapshots_on_clear(retain_snapshots_on_clear);
 
   // Create event publisher for SSE streaming
   event_publisher_ = create_publisher<ros2_medkit_msgs::msg::FaultEvent>("~/events", rclcpp::QoS(100).reliable());
@@ -337,6 +339,19 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
     // and the "is this bag still referenced" rule is backend-private.
     storage_->set_max_rosbags_per_fault(snapshot_config.rosbag.max_bags_per_fault);
     rosbag_capture_ = std::make_shared<RosbagCapture>(this, storage_.get(), snapshot_config.rosbag, snapshot_config);
+
+    // The recapture cooldown gates the capture job as a whole, bags included, so it
+    // puts a floor under how often a history can actually grow: a fault that
+    // re-confirms faster than the cooldown keeps ONE recording however high the cap
+    // is. That is the flapping fault the cap exists for, so say it out loud at
+    // startup rather than leaving an operator to infer it from a short history.
+    if (snapshot_config.rosbag.max_bags_per_fault != 1 && snapshot_recapture_cooldown_sec_ > 0.0) {
+      RCLCPP_WARN(get_logger(),
+                  "snapshots.rosbag.max_bags_per_fault is %zu but snapshots.recapture_cooldown_sec is %.1fs, so a "
+                  "fault that returns sooner than that still keeps one recording. Lower the cooldown to collect a "
+                  "history of fast-repeating faults.",
+                  snapshot_config.rosbag.max_bags_per_fault, snapshot_recapture_cooldown_sec_);
+    }
   }
 
   // Drive captures through a bounded pool instead of one thread per fault.
@@ -1334,8 +1349,23 @@ void FaultManagerNode::handle_get_snapshots(
     return;
   }
 
-  // Get snapshots from storage
+  // Get snapshots from storage, newest capture set first.
   auto snapshots = storage_->get_snapshots(request->fault_code, request->topic);
+
+  // One capture set, not a blend of several. The response is a topic -> value map,
+  // so folding every retained set into it makes the last row per topic win: with
+  // several sets kept, some topics would come from the newest reading and some from
+  // an older one, under a single captured_at. Keeping only the newest set means the
+  // values shown were all sampled at the same moment, which is what a freeze frame
+  // claims to be.
+  if (!snapshots.empty()) {
+    const int64_t newest_capture = snapshots.front().capture_id;
+    snapshots.erase(std::remove_if(snapshots.begin(), snapshots.end(),
+                                   [newest_capture](const SnapshotData & s) {
+                                     return s.capture_id != newest_capture;
+                                   }),
+                    snapshots.end());
+  }
 
   // Build JSON response
   nlohmann::json result;
@@ -1515,6 +1545,7 @@ void FaultManagerNode::handle_list_rosbags(
     response->formats.push_back(info.format);
     response->durations_sec.push_back(info.duration_sec);
     response->sizes_bytes.push_back(info.size_bytes);
+    response->created_at_ns.push_back(info.created_at_ns);
   }
 
   response->success = true;
