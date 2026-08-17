@@ -394,8 +394,15 @@ class TestRosbagHistory(unittest.TestCase):
 
         recordings = []
         seen = set()
-        for _ in range(MAX_BAGS_PER_FAULT + 1):
-            self.assertTrue(self._clear_fault(fault_code).success or True)
+        for occurrence in range(MAX_BAGS_PER_FAULT + 1):
+            cleared = self._clear_fault(fault_code)
+            # Nothing to acknowledge before the first occurrence; from then on a
+            # failed clear means the fault never left CONFIRMED, and the next
+            # occurrence would reuse the recording instead of making a new one -
+            # which surfaces later as a timeout that names the wrong cause.
+            if occurrence > 0:
+                self.assertTrue(cleared.success,
+                                f'clear before occurrence {occurrence} failed: {cleared.message}')
             recording = self._record_occurrence(fault_code, seen)
             seen.add(recording.recording_id)
             recordings.append(recording)

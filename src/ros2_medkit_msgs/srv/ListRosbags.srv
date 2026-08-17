@@ -31,11 +31,12 @@ bool success
 # Fault codes for each rosbag (parallel array with other fields).
 string[] fault_codes
 
-# Paths to the rosbag files/directories.
+# Public identity of each recording.
 # Parallel to fault_codes. Rows of one burst repeat the same recording id, which is
 # how a client groups the entries that serve the same bytes.
 string[] recording_ids
 
+# Paths to the rosbag files/directories.
 string[] file_paths
 
 # Storage formats: "sqlite3" or "mcap"
@@ -46,6 +47,12 @@ float64[] durations_sec
 
 # File sizes in bytes.
 uint64[] sizes_bytes
+
+# When each recording was made, nanoseconds since the epoch.
+# One fault keeps several recordings, so this is what separates one occurrence from
+# another; the fault's own first_occurred dates them all the same, and dates them
+# 1970 once the fault is acknowledged and drops out of the default fault listing.
+int64[] created_at_ns
 
 # Error message if success is false.
 string error_message

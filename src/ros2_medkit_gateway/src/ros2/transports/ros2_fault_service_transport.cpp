@@ -458,14 +458,16 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
     // match fault_codes is reported as a mismatch rather than silently truncated.
     const size_t n = response->fault_codes.size();
     if (response->recording_ids.size() != n || response->file_paths.size() != n || response->formats.size() != n ||
-        response->durations_sec.size() != n || response->sizes_bytes.size() != n) {
+        response->durations_sec.size() != n || response->sizes_bytes.size() != n ||
+        response->created_at_ns.size() != n) {
       result.success = false;
       result.error_message = "ListRosbags response has mismatched array sizes (fault_codes=" + std::to_string(n) +
                              ", recording_ids=" + std::to_string(response->recording_ids.size()) +
                              ", file_paths=" + std::to_string(response->file_paths.size()) +
                              ", formats=" + std::to_string(response->formats.size()) +
                              ", durations_sec=" + std::to_string(response->durations_sec.size()) +
-                             ", sizes_bytes=" + std::to_string(response->sizes_bytes.size()) + ")";
+                             ", sizes_bytes=" + std::to_string(response->sizes_bytes.size()) +
+                             ", created_at_ns=" + std::to_string(response->created_at_ns.size()) + ")";
       return result;
     }
     json rosbags = json::array();
@@ -475,7 +477,8 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
                          {"file_path", response->file_paths[i]},
                          {"format", response->formats[i]},
                          {"duration_sec", response->durations_sec[i]},
-                         {"size_bytes", response->sizes_bytes[i]}});
+                         {"size_bytes", response->sizes_bytes[i]},
+                         {"created_at_ns", response->created_at_ns[i]}});
     }
     result.data = {{"rosbags", rosbags}};
   } else {

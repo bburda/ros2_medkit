@@ -134,6 +134,13 @@ std::vector<std::string> rosbag_attached_fault_codes(const nlohmann::json & rosb
   return {requested_id};
 }
 
+bool rosbag_resolved_by_fault_code(const nlohmann::json & rosbag_data, const std::string & requested_id) {
+  const std::string resolved = rosbag_data.value("recording_id", "");
+  // An absent id means a peer that predates the field; it answers by fault code
+  // only, and the attached-codes fallback already reduces to the old check there.
+  return !resolved.empty() && resolved != requested_id;
+}
+
 std::vector<dto::BulkDataDescriptor>
 fold_rosbag_rows_into_descriptors(const std::vector<nlohmann::json> & rows,
                                   const std::unordered_map<std::string, nlohmann::json> & faults_by_code) {
@@ -160,16 +167,25 @@ fold_rosbag_rows_into_descriptors(const std::vector<nlohmann::json> & rows,
     }
 
     const std::string fault_code = row.value("fault_code", "");
-    int64_t created_at_ns = 0;
-    if (auto it = faults_by_code.find(fault_code); it != faults_by_code.end()) {
-      const double first_occurred = it->second.value("first_occurred", 0.0);
-      created_at_ns = static_cast<int64_t>(first_occurred * 1'000'000'000);
+    // The recording's own timestamp. Taking it from the fault gave every recording
+    // of one fault the same date - and this change is what lets a fault hold more
+    // than one, so the date is exactly what tells the occurrences apart. An
+    // acknowledged fault is missing from the default fault listing entirely, which
+    // dated its recordings 1970 while the rows were still served. Fall back to the
+    // fault only for a row that predates the field.
+    int64_t created_at_ns = row.value("created_at_ns", int64_t{0});
+    if (created_at_ns == 0) {
+      if (auto it = faults_by_code.find(fault_code); it != faults_by_code.end()) {
+        const double first_occurred = it->second.value("first_occurred", 0.0);
+        created_at_ns = static_cast<int64_t>(first_occurred * 1'000'000'000);
+      }
     }
 
     if (auto found = index_by_recording.find(recording_id); found != index_by_recording.end()) {
       auto & entry = recordings[found->second];
       entry.fault_codes.push_back(fault_code);
-      // Earliest fault of the burst dates the recording.
+      // Rows of one burst carry the same recording timestamp, so this only decides
+      // anything on the fallback path, where each row is dated by its own fault.
       if (created_at_ns != 0 && (entry.created_at_ns == 0 || created_at_ns < entry.created_at_ns)) {
         entry.created_at_ns = created_at_ns;
       }
@@ -428,6 +444,21 @@ http::Result<http::BinaryResponse> BulkDataHandlers::download(const http::TypedR
     // "plc" would otherwise claim the assets of "plc_line1".
     auto source_filters = get_source_filters(entity);
     std::set<std::string> scope(source_filters.begin(), source_filters.end());
+
+    // The compatibility path needs the REQUESTED code in scope, not just some code
+    // the recording is attached to. A burst shares one bag, so authorizing on the
+    // union alone answers 200 for a fault code this entity does not own - the bytes
+    // are ones it could already fetch under its own code, but the 200 itself tells
+    // the caller that another fault shares its recording. build_sovd_fault_response
+    // refuses to mix sources for the same reason. When the id really was a recording
+    // id there is no requested code and the union is the whole answer.
+    if (detail::rosbag_resolved_by_fault_code(rosbag_result.data, bulk_data_id)) {
+      auto requested = fault_mgr->get_fault(bulk_data_id, "");
+      if (!requested.success || !faults::fault_in_source_scope(requested.data, scope)) {
+        return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "Bulk-data not found for this entity",
+                                         json{{"entity_id", path_info->entity_id}}));
+      }
+    }
 
     const auto attached_codes = detail::rosbag_attached_fault_codes(rosbag_result.data, bulk_data_id);
 

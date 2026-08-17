@@ -1334,13 +1334,13 @@ List all bulk-data items in a category for the entity.
    {
      "items": [
        {
-         "id": "550e8400-e29b-41d4-a716-446655440000",
-         "name": "MOTOR_OVERHEAT recording 2026-02-04T10:30:00Z",
+         "id": "fault_MOTOR_OVERHEAT_1738664999000",
+         "name": "fault_MOTOR_OVERHEAT_1738664999000 recording 2026-02-04T10:30:00.000Z",
          "mimetype": "application/x-mcap",
          "size": 1234567,
          "creation_date": "2026-02-04T10:30:00.000Z",
          "x-medkit": {
-           "fault_code": "MOTOR_OVERHEAT",
+           "fault_codes": ["MOTOR_OVERHEAT", "MOTOR_STALL"],
            "duration_sec": 6.0,
            "format": "mcap",
            "recording_id": "fault_MOTOR_OVERHEAT_1738664999000"
@@ -1349,10 +1349,13 @@ List all bulk-data items in a category for the entity.
      ]
    }
 
-For ``rosbags``, faults confirmed in one burst share a single recording: each
-fault gets its own descriptor with the full bag size, and
-``x-medkit.recording_id`` (the bag directory name) is the same for every
-descriptor served from that recording, so clients can group them.
+For ``rosbags``, the descriptor ``id`` is the recording id - the bag directory
+name - and it is what the download URL takes. There is **one descriptor per
+recording**, not one per fault: faults confirmed in one burst share a single
+recording, and ``x-medkit.fault_codes`` lists every fault attached to it. A
+recording therefore reports its size once. One fault code can appear on several
+descriptors, one per occurrence it kept, told apart by ``creation_date``, which
+is the time that recording was made.
 
 Download Bulk Data
 ~~~~~~~~~~~~~~~~~~
@@ -1364,7 +1367,7 @@ Download a specific bulk-data file.
 **Response Headers:**
 
 - ``Content-Type``: ``application/x-mcap`` (MCAP format) or ``application/x-sqlite3`` (db3)
-- ``Content-Disposition``: ``attachment; filename="FAULT_CODE.mcap"``
+- ``Content-Disposition``: ``attachment; filename="<recording_id>.mcap"`` (named after the recording actually served, which for a pre-#620 fault-code URL is not the segment the client sent)
 - ``Access-Control-Expose-Headers``: ``Content-Disposition``
 
 **Example:**
