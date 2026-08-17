@@ -117,10 +117,13 @@ std::string DiagnosticBridgeNode::source_id_for(const diagnostic_msgs::msg::Diag
     return status.hardware_id;
   }
 
-  RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 10000,
-      "Diagnostic '%s' hardware_id '%s' is not a slash-containing node ID, using bridge source_id '%s'",
-      status.name.c_str(), status.hardware_id.c_str(), fqn.c_str());
+  // Not RCLCPP_WARN_THROTTLE: this method is const, so get_clock() yields a const
+  // Clock, and Clock::now() is non-const on Humble. Once per process is also the
+  // right cadence here - the throttle keeps one static per call site, so it would
+  // name a single diagnostic every 10s and never the others.
+  RCLCPP_WARN_ONCE(get_logger(),
+                   "Diagnostic '%s' hardware_id '%s' is not a slash-containing node ID, using bridge source_id '%s'",
+                   status.name.c_str(), status.hardware_id.c_str(), fqn.c_str());
   return fqn;
 }
 
