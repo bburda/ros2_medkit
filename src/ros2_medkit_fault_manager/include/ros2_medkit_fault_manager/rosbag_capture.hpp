@@ -255,6 +255,18 @@ class RosbagCapture {
   /// @return True when the rows are durable.
   bool store_rows_or_discard_bag(const std::vector<RosbagFileInfo> & rows, const std::string & bag_path);
 
+  /// Whether the operator asked this fault code to keep a recording history.
+  ///
+  /// A cap of exactly 1 is the pre-#620 single-recording behaviour, where
+  /// auto_cleanup deleting the recording on acknowledgement is right. Anything
+  /// else - including 0, which means unlimited - is a history someone configured,
+  /// and acknowledgement must not be what takes it away. Both places that act on
+  /// auto_cleanup ask this, or the two disagree about the same fault: one keeps
+  /// the rows and the other deletes the bag out from under them.
+  bool keeps_history() const {
+    return config_.max_bags_per_fault != 1;
+  }
+
   /// Start the post-fault window: re-arm the timer, creating it the first time.
   ///
   /// The timer is created once and re-armed, never replaced per recording. A timer

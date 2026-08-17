@@ -28,6 +28,8 @@
 #include "rclcpp/rclcpp.hpp"
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
 #include "ros2_medkit_fault_manager/snapshot_capture.hpp"
+#include "ros2_medkit_msgs/msg/fault.hpp"
+#include "ros2_medkit_msgs/srv/report_fault.hpp"
 
 using ros2_medkit_fault_manager::InMemoryFaultStorage;
 using ros2_medkit_fault_manager::SnapshotCapture;
@@ -619,6 +621,137 @@ TEST_F(EntityDefaultCaptureTest, BarePluginIdNeverMatchesSameNamedNode) {
   capture.capture("BARE_ID_FAULT");
 
   EXPECT_FALSE(storage_->get_freeze_frame("BARE_ID_FAULT").has_value());
+}
+
+namespace {
+
+/// Block until the capture node can see a publisher on the topic; the on-demand
+/// subscription samples nothing before discovery completes.
+void await_publisher(const std::shared_ptr<rclcpp::Node> & node, const std::string & topic) {
+  const auto start = std::chrono::steady_clock::now();
+  while (node->count_publishers(topic) == 0 && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_GT(node->count_publishers(topic), 0u);
+}
+
+/// Put the fault in the store as CONFIRMED, the way a real confirmation would.
+void confirm_fault(ros2_medkit_fault_manager::FaultStorage * storage, const std::string & code) {
+  rclcpp::Clock clock;
+  storage->report_fault_event(code, ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                              ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "test", "/node", clock.now(),
+                              ros2_medkit_fault_manager::DebounceConfig{});
+}
+
+}  // namespace
+
+// A restart must not hand out capture ids below the ones already stored: eviction
+// protects the HIGHEST id, so a counter starting at zero makes the capture just
+// written the first one dropped, and get_snapshots returns the stale set first.
+TEST_F(SnapshotCaptureTest, CaptureIdContinuesFromWhatStorageAlreadyHolds) {
+  storage_->set_max_snapshots_per_fault(0);
+
+  // Rows from an earlier process, under a different fault: the counter is global.
+  ros2_medkit_fault_manager::SnapshotData earlier;
+  earlier.fault_code = "SOMETHING_ELSE";
+  earlier.topic = "/old";
+  earlier.message_type = "std_msgs/msg/Float64";
+  earlier.data = R"({"data": 1.0})";
+  earlier.captured_at_ns = 1;
+  earlier.capture_id = 41;
+  storage_->store_snapshots({earlier});
+
+  auto pub = node_->create_publisher<std_msgs::msg::Float64>("/plc/seeded", rclcpp::QoS(10));
+
+  SnapshotConfig config;
+  config.enabled = true;
+  config.background_capture = false;
+  config.timeout_sec = 5.0;
+  config.fault_specific["SEEDED_FAULT"] = {"/plc/seeded"};
+  // Constructed AFTER the rows exist, exactly as a fault manager starting on a
+  // populated database would be.
+  SnapshotCapture capture(node_.get(), storage_.get(), config);
+
+  ScopedPublisherThread pub_thread([&pub](std::atomic<bool> & stop) {
+    while (!stop.load()) {
+      std_msgs::msg::Float64 msg;
+      msg.data = 3.0;
+      pub->publish(msg);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  });
+  await_publisher(node_, "/plc/seeded");
+
+  confirm_fault(storage_.get(), "SEEDED_FAULT");
+  capture.capture("SEEDED_FAULT");
+
+  const auto rows = storage_->get_snapshots("SEEDED_FAULT");
+  ASSERT_FALSE(rows.empty());
+  EXPECT_GT(rows.front().capture_id, 41) << "the new capture outranks everything already stored";
+}
+
+// An acknowledgement can land while a capture is still sampling: clear_fault deletes
+// the fault's rows, and a batch written afterwards would put them back.
+TEST_F(SnapshotCaptureTest, ACaptureFinishingAfterAcknowledgementIsNotStored) {
+  storage_->set_max_snapshots_per_fault(0);
+  auto pub = node_->create_publisher<std_msgs::msg::Float64>("/plc/acked", rclcpp::QoS(10));
+
+  SnapshotConfig config;
+  config.enabled = true;
+  config.background_capture = false;
+  config.timeout_sec = 5.0;
+  config.fault_specific["ACKED_FAULT"] = {"/plc/acked"};
+  SnapshotCapture capture(node_.get(), storage_.get(), config);
+
+  ScopedPublisherThread pub_thread([&pub](std::atomic<bool> & stop) {
+    while (!stop.load()) {
+      std_msgs::msg::Float64 msg;
+      msg.data = 5.0;
+      pub->publish(msg);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  });
+  await_publisher(node_, "/plc/acked");
+
+  confirm_fault(storage_.get(), "ACKED_FAULT");
+  ASSERT_TRUE(storage_->clear_fault("ACKED_FAULT"));
+
+  capture.capture("ACKED_FAULT");
+
+  EXPECT_TRUE(storage_->get_snapshots("ACKED_FAULT").empty())
+      << "acknowledgement promised these were gone; the batch must not resurrect them";
+}
+
+// ...unless the operator asked for snapshots to survive acknowledgement, in which
+// case no such promise was made and the readings are worth keeping.
+TEST_F(SnapshotCaptureTest, ACaptureFinishingAfterAcknowledgementIsStoredWhenEvidenceIsRetained) {
+  storage_->set_max_snapshots_per_fault(0);
+  storage_->set_retain_snapshots_on_clear(true);
+  auto pub = node_->create_publisher<std_msgs::msg::Float64>("/plc/retained", rclcpp::QoS(10));
+
+  SnapshotConfig config;
+  config.enabled = true;
+  config.background_capture = false;
+  config.timeout_sec = 5.0;
+  config.fault_specific["RETAINED_FAULT"] = {"/plc/retained"};
+  SnapshotCapture capture(node_.get(), storage_.get(), config);
+
+  ScopedPublisherThread pub_thread([&pub](std::atomic<bool> & stop) {
+    while (!stop.load()) {
+      std_msgs::msg::Float64 msg;
+      msg.data = 9.0;
+      pub->publish(msg);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  });
+  await_publisher(node_, "/plc/retained");
+
+  confirm_fault(storage_.get(), "RETAINED_FAULT");
+  ASSERT_TRUE(storage_->clear_fault("RETAINED_FAULT"));
+
+  capture.capture("RETAINED_FAULT");
+
+  EXPECT_FALSE(storage_->get_snapshots("RETAINED_FAULT").empty());
 }
 
 int main(int argc, char ** argv) {

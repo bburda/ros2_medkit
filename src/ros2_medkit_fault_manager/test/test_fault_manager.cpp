@@ -1484,6 +1484,51 @@ TEST_F(FreezeFrameRetentionTest, GetFaultServesRetainedFreezeFrameAfterClear) {
   EXPECT_DOUBLE_EQ(parsed["/ff_pressure"]["data"].get<double>(), 91.25);
 }
 
+// snapshots.max_per_fault and snapshots.retain_on_clear are independent settings.
+class UnlimitedSnapshotRetentionTest : public FaultEventPublishingTest {
+ protected:
+  std::vector<rclcpp::Parameter> fault_manager_overrides() override {
+    auto overrides = FaultEventPublishingTest::fault_manager_overrides();
+    overrides.emplace_back("snapshots.enabled", true);
+    overrides.emplace_back("snapshots.timeout_sec", 5.0);
+    overrides.emplace_back("snapshots.default_topics", std::vector<std::string>{"/unlimited_pressure"});
+    overrides.emplace_back("snapshots.max_per_fault", 0);  // documented as unlimited
+    overrides.emplace_back("snapshots.retain_on_clear", true);
+    return overrides;
+  }
+};
+
+TEST_F(UnlimitedSnapshotRetentionTest, RetentionAppliesWithNoPerFaultCap) {
+  // set_retain_snapshots_on_clear used to sit inside `if (max_per_fault > 0)`, so
+  // choosing the documented "0 = unlimited" silently turned retention off as well
+  // and acknowledging a fault still deleted its readings.
+  EXPECT_TRUE(fault_manager_->get_storage().retains_snapshots_on_clear())
+      << "an unlimited cap swallowed the retention setting";
+
+  auto pub = test_node_->create_publisher<std_msgs::msg::Float64>("/unlimited_pressure", rclcpp::QoS(10));
+  auto timer = test_node_->create_wall_timer(std::chrono::milliseconds(20), [&pub]() {
+    std_msgs::msg::Float64 msg;
+    msg.data = 12.5;
+    pub->publish(msg);
+  });
+
+  ASSERT_TRUE(spin_until([this]() {
+    return fault_manager_->count_publishers("/unlimited_pressure") > 0;
+  }));
+  ASSERT_TRUE(call_report_fault("UNCAPPED_FAULT", Fault::SEVERITY_ERROR, "/test_node"));
+
+  ASSERT_TRUE(spin_until(
+      [this]() {
+        return !fault_manager_->get_storage().get_snapshots("UNCAPPED_FAULT").empty();
+      },
+      std::chrono::milliseconds(10000)));
+
+  ASSERT_TRUE(call_clear_fault("UNCAPPED_FAULT"));
+
+  EXPECT_FALSE(fault_manager_->get_storage().get_snapshots("UNCAPPED_FAULT").empty())
+      << "acknowledgement deleted readings the operator asked to keep";
+}
+
 // matches_entity helper tests
 TEST(MatchesEntityTest, ExactMatch) {
   std::vector<std::string> sources = {"motor_controller"};

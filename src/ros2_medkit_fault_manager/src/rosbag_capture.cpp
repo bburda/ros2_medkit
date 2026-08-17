@@ -592,12 +592,12 @@ void RosbagCapture::on_fault_cleared(const std::string & fault_code) {
   }
 
   // Acknowledging a fault must not destroy a history the operator asked to keep.
-  // auto_cleanup deletes EVERY recording of the fault, so with a cap above one the
-  // first acknowledgement wiped the whole trail that max_bags_per_fault had just
+  // auto_cleanup deletes EVERY recording of the fault, so with a history configured
+  // the first acknowledgement wiped the whole trail that max_bags_per_fault had just
   // been raised to collect - one default silently cancelling another. When a
   // history is configured the cap governs retention and acknowledgement leaves the
   // evidence alone; at the default cap of 1 this is exactly the old behaviour.
-  if (config_.max_bags_per_fault != 1) {
+  if (keeps_history()) {
     RCLCPP_DEBUG(node_->get_logger(),
                  "Fault '%s' cleared; keeping its recordings because max_bags_per_fault is %zu, not 1",
                  fault_code.c_str(), config_.max_bags_per_fault);
@@ -1554,7 +1554,11 @@ void RosbagCapture::finalize_post_fault_recording() {
   // it rather than trust a flag captured earlier. Only under auto_cleanup: without
   // it, a cleared fault is meant to keep its black box.
   const auto wants_a_row = [this](const std::string & code) {
-    if (!config_.auto_cleanup) {
+    // Same rule as on_fault_cleared: without auto_cleanup, or with a history
+    // configured, a cleared fault keeps its black box. Checking only auto_cleanup
+    // here let an acknowledgement arriving during the post-roll drop every row and
+    // delete the bag, while on_fault_cleared had just decided to keep it.
+    if (!config_.auto_cleanup || keeps_history()) {
       return true;
     }
     const auto fault = storage_->get_fault(code);

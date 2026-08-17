@@ -1135,6 +1135,43 @@ TEST_F(RosbagCaptureIntegrationTest, AcknowledgingKeepsAHistoryTheOperatorConfig
   capture.stop();
 }
 
+TEST_F(RosbagCaptureIntegrationTest, AcknowledgingDuringThePostRollKeepsAConfiguredHistory) {
+  // on_fault_cleared already refuses to destroy a configured history, but the
+  // post-roll finalize decided separately and looked only at auto_cleanup. An
+  // acknowledgement landing while the window was still open therefore wrote no
+  // rows and deleted the bag - undoing the decision on_fault_cleared had just
+  // made, for the same fault, in the same process.
+  InMemoryFaultStorage storage;
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.duration_sec = 1.0;
+  rosbag_config.duration_after_sec = 0.3;  // still open when the clear lands
+  rosbag_config.auto_cleanup = true;
+  rosbag_config.max_bags_per_fault = 3;
+  storage.set_max_rosbags_per_fault(rosbag_config.max_bags_per_fault);
+
+  rclcpp::Clock clock;
+  storage.report_fault_event("ACK_MID_ROLL", ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED,
+                             ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR, "mid roll", "/node", clock.now(),
+                             ros2_medkit_fault_manager::DebounceConfig{});
+
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture capture(node_.get(), &storage, rosbag_config, snapshot_config);
+  capture.start();
+  fill_buffer("/ack_mid_roll_probe");
+  capture.on_fault_confirmed("ACK_MID_ROLL");
+
+  // The acknowledgement arrives while the post-fault window still runs, so the
+  // store reports the fault as CLEARED by the time finalize asks.
+  ASSERT_TRUE(storage.clear_fault("ACK_MID_ROLL"));
+  capture.on_fault_cleared("ACK_MID_ROLL");
+
+  spin_for(std::chrono::milliseconds(900));  // past the post-roll and the finalize
+
+  EXPECT_FALSE(storage.get_rosbag_files("ACK_MID_ROLL").empty())
+      << "the post-roll finalize deleted a history on_fault_cleared had decided to keep";
+  capture.stop();
+}
+
 TEST_F(RosbagCaptureIntegrationTest, AcknowledgingStillCleansUpWhenNoHistoryIsConfigured) {
   // The shipped default: one recording per fault means there is no history to
   // protect, so auto_cleanup keeps behaving exactly as it always has.
