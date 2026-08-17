@@ -108,18 +108,18 @@ size_t DiagnosticBridgeNode::tracked_reporter_count() {
 }
 
 std::string DiagnosticBridgeNode::source_id_for(const diagnostic_msgs::msg::DiagnosticStatus & status) const {
-  if (use_hardware_id_as_source_id_ && !status.hardware_id.empty() && status.hardware_id.find('/') != std::string::npos) {
+  const std::string fqn = get_fully_qualified_name();
+  if (!use_hardware_id_as_source_id_) {
+    return fqn;
+  }
+
+  if (!status.hardware_id.empty() && status.hardware_id.find('/') != std::string::npos) {
     return status.hardware_id;
   }
 
-  const std::string fqn = get_fully_qualified_name();
-
-  // Use a mutable clock copy - Humble's RCLCPP_WARN_THROTTLE requires non-const Clock.
-  rclcpp::Clock clock(*get_clock());
   RCLCPP_WARN_THROTTLE(
-      get_logger(), clock, 10000,
-      "Diagnostic '%s' hardware_id '%s' is not a slash-containing node ID or attribution is disabled, using bridge "
-      "source_id '%s'",
+      get_logger(), *get_clock(), 10000,
+      "Diagnostic '%s' hardware_id '%s' is not a slash-containing node ID, using bridge source_id '%s'",
       status.name.c_str(), status.hardware_id.c_str(), fqn.c_str());
   return fqn;
 }
