@@ -167,10 +167,16 @@ TARGET_EXECUTABLE = 'demo_calibration_service'
 TARGET_NAMESPACE = '/powertrain/engine'
 
 # launch will not even ATTEMPT to restart a respawn=True process before this elapses, so
-# it is a real, enforced floor under every kill-then-return gap this file measures - over
-# one tick interval, so the absence is genuinely sampled rather than healed inside a single
-# tick.
-RESPAWN_DELAY_SEC = 1.5
+# it is a real, enforced floor under every kill-then-return gap this file measures. Must
+# clear the detector's OWN raise threshold, not just be "over one tick interval": a death is
+# reported once misses EXCEED miss_grace, i.e. after (MISS_GRACE + 1) * TICK_INTERVAL_MS =
+# 21 * 200ms = 4200ms of real absence. A respawn_delay short of that heals the outage before
+# a correct detector could ever confirm it, so clear_on_return/no_heal_standalone/
+# restart_loop_occurrences (the three scenarios that actually respawn TARGET_NODE) would
+# time out waiting for a raise that is never supposed to happen - not a detector defect.
+# 5.0s mirrors B5_RESPAWN_DELAY_SEC in the boundary e2e file: comfortably past 4200ms with
+# the same order of margin, plus real DDS-discovery overhead on top of the delay itself.
+RESPAWN_DELAY_SEC = 5.0
 
 ARM_TIMEOUT_SEC = 60.0
 FAULTS_LIVE_TIMEOUT_SEC = 30.0
@@ -229,6 +235,13 @@ ROS2CLI_FAKE_NODE_PREFIX = '_ros2cli_fake_'
 # How many renamed-node arm/kill cycles the scenario runs, and how many distinct
 # ROS2CLI_FAKE_NODE_PREFIX-named nodes it exercises.
 ROS2CLI_CYCLES = 3
+# How long the before/after tracked_count samples may take to settle (see
+# _poll_stable_tracked_count) - generous against gateway-internal infrastructure (confirmed
+# live: a hidden `_param_client_node`, visible only because this scenario turns off
+# filter_internal_nodes) arming on its own schedule, not against anything this scenario's
+# own cycles do. Must comfortably exceed _poll_stable_tracked_count's own stable_seconds
+# default (10.0), or the poll could time out before stability was ever even reachable.
+STABLE_TRACKED_COUNT_TIMEOUT_SEC = 40.0
 
 # ---- the "restart_loop_occurrences" scenario's own target -------------------------------
 RESTART_LOOP_OCCURRENCES_TARGET = 5
@@ -565,6 +578,51 @@ def _call_change_state_once(client_node, service_name, transition_id, timeout=30
     return result is not None and result.success
 
 
+def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, interval=1.0):
+    """Poll the detector's status block until ``tracked_count`` holds steady.
+
+    "Holds steady" means the SAME value for a continuous `stable_seconds` before `timeout`
+    elapses. A single sample says nothing about whether the graph has settled: node_death is
+    zero-config and tracks every armed App, not just this scenario's own three renamed
+    fixtures. With `discovery.runtime.filter_internal_nodes` off (this scenario's own
+    requirement - see the class docstring), that includes normally-hidden gateway-internal
+    nodes too: confirmed live, the gateway keeps its own hidden `_param_client_node` for
+    querying newly-discovered nodes' parameters (the same path that logs "Parameter service
+    not available for node: ..." for each renamed fixture below), and that node is present
+    from early on but can still be inside its OWN per-entity warmup - and so absent from
+    tracked_count - at the moment a single sample happens to land, only to arm and join the
+    tracked set a few seconds later. A single `before` sample can therefore catch it
+    mid-warmup while a single `after` sample catches it already armed, reading as
+    tracked_count GROWTH that has nothing to do with the ros2cli exclusion this row is
+    actually about. `stable_seconds` has to be long enough to let that settle BEFORE either
+    sample is trusted, not merely long enough to smooth over network jitter - a handful of
+    consecutive reads close together would still land inside the SAME few-second warmup
+    window and call it "stable" too early.
+
+    Returns ``(status, stable)`` - `status` is the LAST status block read (possibly still
+    unsettled, so a caller can still report what it saw), `stable` is False if the value
+    never held for a continuous `stable_seconds` inside `timeout`. A status that reads None
+    on every poll (no `detectors.node_death` block at all - meaning no such detector is
+    registered) counts as stable at None: the caller's existing ``if before is not None``
+    gate still skips the comparison the same way a single-sample None always did.
+    """
+    deadline = time.monotonic() + timeout
+    status = None
+    last_count = None
+    streak_start = None
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        status = watchdog_detector_status(port, detector_id)
+        count = status.get('tracked_count') if status is not None else None
+        if count != last_count:
+            last_count = count
+            streak_start = now
+        elif now - streak_start >= stable_seconds:
+            return status, True
+        time.sleep(interval)
+    return status, False
+
+
 # ---------------------------------------------------------------------------------------
 # Scenarios
 # ---------------------------------------------------------------------------------------
@@ -864,14 +922,25 @@ class TestNodeDeathRos2cliIgnored(unittest.TestCase):
     fails loudly the day the convention changes instead of quietly testing a prefix
     nothing real uses anymore.
 
-    CANNOT DISCRIMINATE YET: see TestNodeDeathDeactivatedNotDead's own note. The
-    tracked-count half of test_01's claim is additionally unverifiable today for a
-    second, independent reason: GET /x-medkit-watchdog carries no `detectors.node_death`
-    block at all while no such detector is registered, so
-    `watchdog_detector_status(PORT, DETECTOR_ID)` returns None on every read here. That is
-    the one condition allowed to skip the comparison; once a detector exists the block
-    stops being None and a subsequent disappearance or malformed shape fails instead of
-    being silently discarded (see test_01's own comment).
+    The tracked-count half of test_01's claim compares two STABLE reads
+    (_poll_stable_tracked_count), not two single samples: node_death is zero-config and
+    tracks every armed App in the graph, not just this scenario's own three renamed
+    fixtures, and with `discovery.runtime.filter_internal_nodes` off (this scenario's own
+    requirement, see above) that includes gateway-internal hidden nodes too. Confirmed live:
+    the gateway keeps a hidden `_param_client_node` for querying newly-discovered nodes'
+    parameters - present from early on, but still inside its OWN per-entity warmup, and so
+    briefly absent from tracked_count, at the moment a bare single sample happens to land. A
+    `before`/`after` pair of single samples straddling that node's own warmup completion
+    would read as tracked_count growth that has nothing to do with the ros2cli exclusion
+    this row is actually about - `_poll_stable_tracked_count` requires the value to hold for
+    a continuous stable_seconds specifically so that kind of late arrival is waited out
+    before either sample is trusted, not merely smoothed over. If
+    `watchdog_detector_status(PORT, DETECTOR_ID)` returns None on every read - no
+    `detectors.node_death` block at all, meaning no such detector is registered - that
+    counts as "stable at None" and is the one condition allowed to skip the comparison
+    entirely; once a detector exists the block stops being None and a subsequent
+    disappearance, a malformed shape, or a tracked_count that never actually settles fails
+    loudly instead of being silently discarded (see test_01's own comments).
     """
 
     def _spawn_renamed_node(self, name):
@@ -912,7 +981,14 @@ class TestNodeDeathRos2cliIgnored(unittest.TestCase):
             wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
             'GET /faults never answered 200 - the absence below would prove nothing')
 
-        before = watchdog_detector_status(PORT, DETECTOR_ID)
+        before, before_stable = _poll_stable_tracked_count(
+            PORT, DETECTOR_ID, timeout=STABLE_TRACKED_COUNT_TIMEOUT_SEC)
+        self.assertTrue(
+            before_stable or before is None,
+            f'tracked_count never settled before the renamed-node cycles even started (last '
+            f'read: {before!r}) - the before/after comparison below would measure a moving '
+            "target, not this row's own claim",
+        )
         for cycle in range(1, ROS2CLI_CYCLES + 1):
             name = f'{ROS2CLI_FAKE_NODE_PREFIX}{cycle}'
             proc = self._spawn_renamed_node(name)
@@ -946,7 +1022,8 @@ class TestNodeDeathRos2cliIgnored(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait(timeout=15)
-        after = watchdog_detector_status(PORT, DETECTOR_ID)
+        after, after_stable = _poll_stable_tracked_count(
+            PORT, DETECTOR_ID, timeout=STABLE_TRACKED_COUNT_TIMEOUT_SEC)
         # `before` is None today, on every run - no node_death detector is registered at
         # all, so there is no block to compare and this half of the claim cannot
         # discriminate anything yet (see the class docstring). That is the ONLY condition
@@ -957,6 +1034,13 @@ class TestNodeDeathRos2cliIgnored(unittest.TestCase):
         # block that vanishes or loses its shape MID-scenario fail loudly instead of being
         # discarded along with the genuinely-inapplicable case.
         if before is not None:
+            self.assertTrue(
+                after_stable,
+                f'tracked_count never settled after the renamed-node cycles (last read: '
+                f'{after!r}) - cannot tell whether the ros2cli exclusion held or something '
+                'else in the graph is simply still arming, so reporting this rather than '
+                'comparing against a moving target',
+            )
             self.assertIsNotNone(
                 after,
                 f'the node_death detector status block was present before the '
@@ -968,13 +1052,18 @@ class TestNodeDeathRos2cliIgnored(unittest.TestCase):
                 f"the node_death detector status block lost its 'tracked_count' field "
                 f'after the renamed-node cycles ({before!r} -> {after!r})',
             )
-            self.assertEqual(
-                before.get('tracked_count'), after.get('tracked_count'),
-                f'the node_death detector status block reports a different tracked_count '
-                f'after {ROS2CLI_CYCLES} renamed-node arm/kill cycles ({before!r} -> '
-                f'{after!r}) - nodes matching the ros2cli naming convention are '
-                'accumulating as tracked state',
-            )
+            if before.get('tracked_count') != after.get('tracked_count'):
+                try:
+                    apps_url = f'http://127.0.0.1:{PORT}{API_BASE_PATH}/apps'
+                    apps_now = requests.get(apps_url, timeout=5).json().get('items', [])
+                    ids_now = [item.get('id') for item in apps_now]
+                except requests.exceptions.RequestException as exc:
+                    ids_now = f'GET /apps failed: {exc}'
+                self.fail(
+                    f'the node_death detector status block reports a different tracked_count '
+                    f'after {ROS2CLI_CYCLES} renamed-node arm/kill cycles ({before!r} -> '
+                    f'{after!r}) - GET /apps right now: {ids_now!r}',
+                )
 
         assert_fault_absent_throughout(self, PORT, FAULT_CODE, SUSTAINED_WINDOW_SEC)
 

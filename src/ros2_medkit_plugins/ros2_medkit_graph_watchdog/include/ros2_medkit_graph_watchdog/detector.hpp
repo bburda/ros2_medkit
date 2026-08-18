@@ -74,10 +74,18 @@ struct DetectorContext {
       nullptr;                                    ///< entities this tick (id + bound_fqn); null in bare-context tests
   const std::atomic<bool> * cancelled = nullptr;  ///< plugin shutdown flag; a long sweep polls it (null => never)
 
-  void raise_fault(const std::string & code, uint8_t severity, const std::string & description,
+  /// Returns true only once `async_send_request` has actually been called - false for every
+  /// suppression path (Advisory/Off, no client, empty source_id, reliability gate, service
+  /// not ready). A caller that needs to know whether a raise genuinely reached the wire -
+  /// not merely that this call was ATTEMPTED with a non-empty report - must use this return
+  /// value rather than inferring it from its own inputs: node_death_detector.cpp's
+  /// ever_raised_ guard is exactly that caller, and every one of these suppression paths is
+  /// silent by design (no detector should have to duplicate them to know whether it may
+  /// later trust its own silence as a clear).
+  bool raise_fault(const std::string & code, uint8_t severity, const std::string & description,
                    const std::string & source_id) {
     if (!mode_emits(mode) || !fault_client) {
-      return;  // Advisory/Off suppressed, or client not yet wired.
+      return false;  // Advisory/Off suppressed, or client not yet wired.
     }
     if (source_id.empty()) {
       if (gateway_node) {
@@ -85,21 +93,24 @@ struct DetectorContext {
                          "graph_watchdog: dropping fault '%s' with empty source_id (detector contract violation)",
                          code.c_str());
       }
-      return;
+      return false;
     }
     if (!reliability_allows(gate, source_id)) {
-      return;  // entity warming up or lifecycle-inactive: suppressed by the reliability core.
+      return false;  // entity warming up or lifecycle-inactive: suppressed by the reliability core.
     }
     if (!fault_client->service_is_ready()) {
-      return;  // fault_manager not reachable yet; avoid unbounded pending_requests_ growth.
+      return false;  // fault_manager not reachable yet; avoid unbounded pending_requests_ growth.
     }
     fault_client->async_send_request(std::make_shared<ros2_medkit_msgs::srv::ReportFault::Request>(
         make_fault_report(source_id, code, severity, description)));
+    return true;
   }
 
-  void clear_fault(const std::string & code, const std::string & source_id) {
+  /// See raise_fault()'s own doc on the return value - identical contract, minus the
+  /// reliability-gate check clear_fault() has never applied.
+  bool clear_fault(const std::string & code, const std::string & source_id) {
     if (!mode_emits(mode) || !fault_client) {
-      return;  // Advisory/Off suppressed, or client not yet wired.
+      return false;  // Advisory/Off suppressed, or client not yet wired.
     }
     if (source_id.empty()) {
       if (gateway_node) {
@@ -107,13 +118,14 @@ struct DetectorContext {
                          "graph_watchdog: dropping fault-clear '%s' with empty source_id (detector contract violation)",
                          code.c_str());
       }
-      return;
+      return false;
     }
     if (!fault_client->service_is_ready()) {
-      return;  // fault_manager not reachable yet; avoid unbounded pending_requests_ growth.
+      return false;  // fault_manager not reachable yet; avoid unbounded pending_requests_ growth.
     }
     fault_client->async_send_request(
         std::make_shared<ros2_medkit_msgs::srv::ReportFault::Request>(make_fault_clear(source_id, code)));
+    return true;
   }
 };
 

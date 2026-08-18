@@ -332,6 +332,34 @@ TEST_F(GraphWatchdogPluginTest, PluginScopePruneGraceStillAppliesWhenTheDetector
   EXPECT_EQ(g_captured_config["prune_grace"].get<int>(), 42) << "the plugin-scope value is still the default";
 }
 
+// compute_departed_retention_ticks() needs no ROS node at all - it reads only its own
+// config_snapshot parameter plus tick_interval_ms_/prune_grace_, both left at their
+// constructor defaults (1000, 60) when configure()/set_context() are never called.
+TEST(ComputeDepartedRetentionTicks, OversizedNodeDeathPruneGraceIsRejectedNotTruncated) {
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  const int ticks = plugin.compute_departed_retention_ticks_for_test(
+      nlohmann::json{{"detectors", {{"node_death", {{"prune_grace", 4294967296LL}}}}}});
+  // 4294967296 (2^32) narrowed to int BEFORE a range check wraps to exactly 0, which passes
+  // a bare ">= 0" check silently - node_death_detector.cpp's own configure() rejects this
+  // same value and keeps its default (60), so the correct retention here is computed from
+  // that same default: prune_ticks=max(60, miss_grace+1), miss_grace floored to 2 at the
+  // 1000ms default tick (unaffected, since the floor only bites below ~1500ms), so
+  // 60+2+1=63. A narrow-then-validate bug would instead compute from the wrapped 0:
+  // max(0,3)+2+1=6.
+  EXPECT_EQ(ticks, 63);
+}
+
+TEST(ComputeDepartedRetentionTicks, OversizedNodeDeathMissGraceIsRejectedNotTruncated) {
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  const int ticks = plugin.compute_departed_retention_ticks_for_test(
+      nlohmann::json{{"detectors", {{"node_death", {{"miss_grace", 4294967296LL}}}}}});
+  // Same shape as the prune_grace case above, for the other field this function reads the
+  // same way. miss_grace stays at its default (2, unaffected by the floor at the 1000ms
+  // default tick), prune_grace stays at the plugin's own default (60):
+  // prune_ticks=max(60,3)=60, retention=60+2+1=63.
+  EXPECT_EQ(ticks, 63);
+}
+
 TEST_F(GraphWatchdogPluginTest, ExportsAdvertiseCorrectApiVersion) {
   EXPECT_EQ(plugin_api_version(), ros2_medkit_gateway::PLUGIN_API_VERSION);
 }

@@ -211,6 +211,60 @@ if(BUILD_TESTING)
   medkit_target_dependencies(test_aggregated_fault ros2_medkit_gateway rclcpp ros2_medkit_msgs)
   target_link_libraries(test_aggregated_fault nlohmann_json::nlohmann_json)
 
+  # Pure interface/logic: DetectorContext is only ever default-constructed (every pointer
+  # null), so no rclcpp::init() is needed anywhere in this one.
+  medkit_add_gtest(test_suppressor test/test_suppressor.cpp)
+  target_include_directories(test_suppressor PRIVATE include)
+  medkit_target_dependencies(test_suppressor rclcpp ros2_medkit_msgs)
+  target_link_libraries(test_suppressor nlohmann_json::nlohmann_json)
+
+  # AllowlistSuppressor::suppresses() ignores ctx entirely - same "no rclcpp::init()" shape
+  # as test_suppressor above.
+  medkit_add_gtest(test_allowlist_suppressor test/test_allowlist_suppressor.cpp)
+  target_include_directories(test_allowlist_suppressor PRIVATE include)
+  medkit_target_dependencies(test_allowlist_suppressor rclcpp ros2_medkit_msgs)
+  target_link_libraries(test_allowlist_suppressor nlohmann_json::nlohmann_json)
+
+  # Reads a REAL ReliabilityGate (needs a real rclcpp::Node for its LifecycleWatcher),
+  # driven through set_departed_lifecycle_state_for_test() rather than a live managed node.
+  medkit_add_gtest(test_lifecycle_shutdown_suppressor
+    test/test_lifecycle_shutdown_suppressor.cpp
+    src/reliability_gate.cpp
+    src/lifecycle_watcher.cpp
+    ${LIFECYCLE_STATE_READER_SOURCES})
+  target_include_directories(test_lifecycle_shutdown_suppressor PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
+  medkit_target_dependencies(test_lifecycle_shutdown_suppressor ros2_medkit_gateway rclcpp ros2_medkit_msgs lifecycle_msgs)
+  target_link_libraries(test_lifecycle_shutdown_suppressor nlohmann_json::nlohmann_json)
+
+  # Pure logic over hand-built present/armed sets: no rclcpp::Node anywhere in it. Depends
+  # on ros2_medkit_gateway/nlohmann_json only because the D1 case assembles a description
+  # through the real AggregatedFault::describe_ordered(), the same reason
+  # test_lifecycle_expectation_tracker above needs it.
+  medkit_add_gtest(test_node_liveness_tracker test/test_node_liveness_tracker.cpp)
+  target_include_directories(test_node_liveness_tracker PRIVATE include)
+  medkit_target_dependencies(test_node_liveness_tracker ros2_medkit_gateway rclcpp ros2_medkit_msgs)
+  target_link_libraries(test_node_liveness_tracker nlohmann_json::nlohmann_json)
+
+  # Registers a fake /fault_manager/report_fault service like the QoS/orphan/param_drift/
+  # lifecycle_expectation integration tests above, so it shares their RESOURCE_LOCK.
+  medkit_add_gtest(test_node_death_integration
+    test/test_node_death_integration.cpp
+    src/detectors/node_death_detector.cpp
+    src/detector_registry.cpp
+    src/reliability_gate.cpp
+    src/lifecycle_watcher.cpp
+    ${LIFECYCLE_STATE_READER_SOURCES})
+  target_include_directories(test_node_death_integration PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
+  medkit_target_dependencies(test_node_death_integration
+    ros2_medkit_gateway rclcpp rcutils ros2_medkit_msgs lifecycle_msgs)
+  target_link_libraries(test_node_death_integration nlohmann_json::nlohmann_json)
+  # N11's churn sweep and the two retention-boundary cases each drive dozens of ticks; none
+  # needs real DDS endpoint discovery (every snapshot is hand-built), so this is generous
+  # against CI slowness rather than against any real per-tick cost.
+  set_tests_properties(test_node_death_integration PROPERTIES TIMEOUT 120)
+  set_property(TEST test_node_death_integration APPEND PROPERTY
+    RESOURCE_LOCK graph_watchdog_integration_domain)
+
   # Real DDS endpoints read through the live graph API. The three that ALSO register a fake
   # /fault_manager/report_fault service share a RESOURCE_LOCK, because they spin real nodes for
   # many seconds and running them concurrently on this box starves the discovery each one waits

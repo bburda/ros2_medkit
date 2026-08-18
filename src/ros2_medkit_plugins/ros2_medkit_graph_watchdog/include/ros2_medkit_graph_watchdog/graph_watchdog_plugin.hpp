@@ -92,6 +92,15 @@ class GraphWatchdogPlugin : public ros2_medkit_gateway::GatewayPlugin,
   /// clears the pending map as it reads it.
   std::size_t prune_pending_fault_requests_for_test();
 
+  /// Test-only: exposes the otherwise-private compute_departed_retention_ticks() so a unit
+  /// test can drive its config-validation directly (malformed/oversized miss_grace or
+  /// prune_grace) without constructing a full ROS gate/node - it has no ROS dependency of
+  /// its own, only tick_interval_ms_/prune_grace_ (set via configure()+load_parameters())
+  /// and the JSON it is handed.
+  int compute_departed_retention_ticks_for_test(const nlohmann::json & config_snapshot) const {
+    return compute_departed_retention_ticks(config_snapshot);
+  }
+
  private:
   void load_parameters();
   void run_tick_loop();  ///< Body of tick_thread_: tick() + interruptible wait, until shutdown.

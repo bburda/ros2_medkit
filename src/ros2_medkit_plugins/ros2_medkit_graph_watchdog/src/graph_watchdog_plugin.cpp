@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <set>
 #include <string>
@@ -35,6 +36,7 @@
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_graph_watchdog/aggregated_fault.hpp"  // kGraphWatchdogEntityId
 #include "ros2_medkit_graph_watchdog/detector_config.hpp"
+#include "ros2_medkit_graph_watchdog/detector_config_keys.hpp"  // min_node_death_miss_grace
 #include "ros2_medkit_graph_watchdog/detector_registry.hpp"
 #include "ros2_medkit_graph_watchdog/reliability_gate.hpp"
 
@@ -149,10 +151,17 @@ int GraphWatchdogPlugin::compute_departed_retention_ticks(const nlohmann::json &
     const auto & detectors = config_snapshot["detectors"];
     if (detectors.contains("node_death") && detectors["node_death"].is_object()) {
       const auto & node_death_cfg = detectors["node_death"];
+      // ROS/JSON integers are wide: read int64_t and range-check it BEFORE narrowing to int,
+      // mirroring node_death_detector.cpp's own identical reads of these same two fields. A
+      // value above kMaxNodeDeathGraceTicks (or above INT_MAX) narrowed first can wrap back
+      // into an accepted-looking band and pass the ">= 0" check silently - node_death's own
+      // configure() would reject that same value and keep its default, so a plugin that
+      // narrowed first would size this window from a number the detector never actually
+      // uses, under- or over-running the retention this function exists to get right.
       if (node_death_cfg.contains("miss_grace") && node_death_cfg["miss_grace"].is_number_integer()) {
-        const int candidate = node_death_cfg["miss_grace"].get<int>();
-        if (candidate >= 0) {
-          node_death_miss_grace = candidate;
+        const std::int64_t wide = node_death_cfg["miss_grace"].get<std::int64_t>();
+        if (wide >= 0 && wide <= kMaxNodeDeathGraceTicks) {
+          node_death_miss_grace = static_cast<int>(wide);
         }
       }
       // Same reason we read miss_grace here: prune_grace is a per-detector key whose
@@ -162,13 +171,30 @@ int GraphWatchdogPlugin::compute_departed_retention_ticks(const nlohmann::json &
       // detectors.node_death.prune_grace, and node_death would then re-raise a
       // cleanly-shut-down node it should have silently reclaimed (see the formula below).
       if (node_death_cfg.contains("prune_grace") && node_death_cfg["prune_grace"].is_number_integer()) {
-        const int candidate = node_death_cfg["prune_grace"].get<int>();
-        if (candidate >= 0) {
-          node_death_prune_grace = candidate;
+        const std::int64_t wide = node_death_cfg["prune_grace"].get<std::int64_t>();
+        if (wide >= 0 && wide <= kMaxNodeDeathGraceTicks) {
+          node_death_prune_grace = static_cast<int>(wide);
         }
       }
     }
   }
+  // Defensive, not another validation pass: node_death_prune_grace's default is prune_grace_
+  // (this plugin's own, separately-loaded field), which this function does not otherwise
+  // touch or re-check here - clamping it to the SAME ceiling the detector-scoped override
+  // above already enforces is what keeps the arithmetic below from overflowing regardless of
+  // what that field happens to hold.
+  node_death_prune_grace = std::min(node_death_prune_grace, static_cast<int>(kMaxNodeDeathGraceTicks));
+  // node_death's own configure() unconditionally raises miss_grace to its wall-clock floor
+  // (min_node_death_miss_grace(), detector_config_keys.hpp) whenever the configured tick is fast
+  // enough to need it - "unconditionally" because that floor applies to node_death's
+  // DEFAULT miss_grace too, not only an operator-set one. A fast tick is exactly this
+  // plugin's own tick_interval_ms_, already loaded by the time set_context() calls this
+  // (load_parameters() runs first). Applied here too, and outside the "detectors.node_death
+  // exists" check above: mirroring only the RAW config value - or only flooring it when an
+  // operator happened to configure node_death at all - would leave this window sized for a
+  // miss_grace smaller than the one node_death will actually use, which is the exact
+  // under-run the rest of this function's comment describes.
+  node_death_miss_grace = std::max(node_death_miss_grace, min_node_death_miss_grace(tick_interval_ms_));
   // prune_ticks mirrors node_death's OWN prune_ticks_ clamp (node_death_detector.cpp's
   // configure()): max(prune_grace, miss_grace + 1). The departed-lifecycle label must
   // survive not just past the FIRST tick node_death evaluates suppression on

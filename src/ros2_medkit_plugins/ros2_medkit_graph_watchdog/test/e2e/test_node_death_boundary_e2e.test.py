@@ -41,29 +41,33 @@ launch and which assertions run:
   lifecycle_expectation_detector.cpp), so the fault surface is the only external evidence
   available, and with confirmation_threshold=-2 the detector's first FAILED report IS the
   confirmation. RED.
-- "b3_matured_then_gone": the same node, left long enough for GRAPH_NODE_INACTIVE to CONFIRM
-  before it is killed. The confirmed fault survives the departure AND keeps naming the node
-  (content follows the clocks, not the snapshot - already shipped, GENUINELY proven here with
-  assert_fault_describes_only rather than a code-only persistence check, which a detector that
-  dropped this node while keeping the code raised for another one would still pass) - but
-  GRAPH_NODE_DISAPPEARED never joins it, so the row is RED overall: PARTLY satisfied, per the
-  brief this file was written against.
+- "b3_matured_then_gone": a require_active node driven to "active" first (arming it for
+  node_death - see TestBoundaryMaturedThenGone's own class docstring for why that is not
+  optional), then to "inactive" via a real DEACTIVATE transition and left there long enough
+  for GRAPH_NODE_INACTIVE to CONFIRM, before it is killed. The confirmed fault survives the
+  departure AND keeps naming the node (content follows the clocks, not the snapshot - already
+  shipped, GENUINELY proven here with assert_fault_describes_only rather than a code-only
+  persistence check, which a detector that dropped this node while keeping the code raised for
+  another one would still pass), and GRAPH_NODE_DISAPPEARED now joins it too, since the node
+  was genuinely armed before it died.
 - "b4_healthy_then_gone": the self-activating variant (managed_lifecycle_active) reaches "active"
   and is then killed outright. No GRAPH_NODE_INACTIVE is born from a healthy departure
   (release_uncorroborated - already shipped, genuinely proven here), but GRAPH_NODE_DISAPPEARED
   never raises. RED.
-- "b5_restart_loop_still_caught": the same require_active node, respawning under this test's own
-  control, killed and confirmed back five times over. Nothing here checks
-  GRAPH_NODE_INACTIVE - that is B2's and B3's row. This one is entirely about whether the
-  (future) presence code catches the departure EVERY cycle, which is what makes R10's narrowing
-  safe: once GRAPH_NODE_DISAPPEARED independently catches a restart loop, lifecycle_expectation
-  no longer has to evade it via an unmatured streak maturing on absence. Configures
-  detectors.node_death.miss_grace explicitly (B5_MISS_GRACE, comfortably past the documented
-  3000 ms floor) and drives the node's own respawn on a delay (B5_RESPAWN_DELAY_SEC) safely
-  longer than that nominal grace, so a correct detector CAN report every cycle - left at the
-  1.5 s launch-respawn floor, the outage would be shorter than the floor the detector enforces
-  and this row could never turn green for a right implementation, only a wrong one lucky enough
-  to report anyway. RED - no presence detector exists yet to catch even the first cycle.
+- "b5_restart_loop_still_caught": the same require_active node, now reaching "active" on EVERY
+  respawn (not merely the first start - see TestBoundaryRestartLoopStillCaught's own class
+  docstring for why a node that never arms would make this row unsatisfiable by any correct
+  implementation), restart-looping under this test's own control, killed and confirmed back
+  five times over. Nothing here checks GRAPH_NODE_INACTIVE - that is B2's and B3's row. This
+  one is entirely about whether the presence code catches the departure EVERY cycle, which is
+  what makes R10's narrowing safe: once GRAPH_NODE_DISAPPEARED independently catches a restart
+  loop, lifecycle_expectation no longer has to evade it via an unmatured streak maturing on
+  absence. Configures detectors.node_death.miss_grace explicitly (B5_MISS_GRACE, comfortably
+  past the documented 3000 ms floor) and drives the node's own respawn on a delay
+  (B5_RESPAWN_DELAY_SEC) safely longer than that nominal grace, so a correct detector CAN
+  report every cycle - left at the 1.5 s launch-respawn floor, the outage would be shorter than
+  the floor the detector enforces and this row could never turn green for a right
+  implementation, only a wrong one lucky enough to report anyway.
 - "c4_config_endpoint_e2e": ONE gateway, ONE armed node, killed once, with a LARGE
   detectors.node_death.miss_grace configured (C4_MISS_GRACE_LARGE - no documented ceiling exists
   for this not-yet-built key). Proves the knob governs an observable by checking the SAME
@@ -86,20 +90,27 @@ launch and which assertions run:
   assertion (the initial raise, which needs the same missing detector every other row does), so
   the warmup-window claim itself is unreachable today and is written for slice 2/3's benefit.
 
-### Which arming gate, and why B1/B2/B3/B5 use the global form
+### Which arming gate, and why B1/B2 use the global form
 
 The brief's default rule is: gate on `app_id=<the node a scenario perturbs>`, and reserve the
-global form for a scenario that perturbs the gateway itself. B1, B2, B3 and B5 are the documented
+global form for a scenario that perturbs the gateway itself. B1 and B2 are the documented
 exception, for a reason specific to a require_active node rather than a style choice: ONE of
 `ReliabilityGate`'s own preconditions for a per-entity `armed` state is
 `LifecycleWatcher::node_ok()`, which is false for exactly a tracked node that is not (yet)
-"active" - the very state these four scenarios' target node sits in for most or all of its life.
-Gating on `app_id=managed_lifecycle` would therefore wait for something that can only become true
-once the node activates, which for these four scenarios it never does. This is not a new call:
-test_lifecycle_expectation_e2e.test.py's own "main" scenario already gates the identical fixture
-globally, for the identical reason, and this file follows that precedent rather than inventing a
-new one. B4 (managed_lifecycle_active, which DOES reach "active" on its own) uses the app_id form,
-because for that one node the precondition genuinely becomes true.
+"active" - the very state these two scenarios' target node sits in for its whole life (B1 never
+drives it past "unconfigured" at all; B2 kills it before it ever could reach "active"). Gating on
+`app_id=managed_lifecycle` would therefore wait for something that never becomes true in either
+scenario. This is not a new call: test_lifecycle_expectation_e2e.test.py's own "main" scenario
+already gates the identical fixture globally, for the identical reason, and this file follows
+that precedent rather than inventing a new one.
+
+B3, B4 and B5 all use the app_id form instead, because for each of them the per-entity
+precondition genuinely becomes true: B4's target (managed_lifecycle_active) has always
+self-activated on its own; B3 and B5 now launch TARGET_NODE (managed_lifecycle) with
+auto_activate too, specifically so node_death can track it at all - see
+`_lifecycle_node_action`'s own docstring and B3/B5's own class docstrings for why a target that
+never reaches "active" would make GRAPH_NODE_DISAPPEARED structurally unreachable for either
+row, not merely slower to catch.
 """
 
 import os
@@ -111,6 +122,10 @@ import unittest
 from launch.actions import TimerAction
 import launch_ros.actions
 import launch_testing
+from lifecycle_msgs.msg import Transition
+from lifecycle_msgs.srv import ChangeState, GetState
+import rclpy
+from rclpy.node import Node
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -242,20 +257,27 @@ D2_WARMUP_CYCLES = 150
 D2_UNGATED_WATCH_SEC = 3.5
 
 
-def _lifecycle_node_action(name, *, respawn=False, respawn_delay=RESPAWN_DELAY_SEC):
+def _lifecycle_node_action(
+        name, *, respawn=False, respawn_delay=RESPAWN_DELAY_SEC, auto_activate=None):
     """One managed_lifecycle instance under `name`, with a PID handle the test can signal.
 
     Uses DEMO_NODE_REGISTRY's own (executable, ros_name, namespace) triple for `name` so this
     stays in lockstep with demo_nodes.launch.py, built by hand only because every scenario here
     signals the process directly and create_demo_nodes() hands back no PID.
 
-    The registry triple alone is not enough for ACTIVE_NODE: `auto_activate` is a ROS
-    PARAMETER, not part of the registry, and create_demo_nodes() only sets it via its own
-    ``if key == 'managed_lifecycle_active':`` special case - reusing the registry lookup here
-    without also reusing that special case silently launches an ACTIVE_NODE instance that never
-    activates (a duplicate of the plain TARGET_NODE fixture, wearing a different name).
+    `auto_activate` is a ROS PARAMETER, not part of the registry triple, so it has to be set
+    here explicitly rather than inferred from it. Defaults to whether `name` is ACTIVE_NODE -
+    the historical convention every scenario but B3/B5 relies on - but a caller launching
+    TARGET_NODE (managed_lifecycle) for a scenario that needs it to actually ARM for
+    node_death passes `auto_activate=True` explicitly: node_death only ever tracks a node it
+    has seen armed at least once (reliability_allows() requires "active" for a managed node -
+    LifecycleWatcher::node_ok()), so a require_active node that never activates is invisible
+    to it no matter what happens to it afterwards. See TestBoundaryMaturedThenGone and
+    TestBoundaryRestartLoopStillCaught's own class docstrings.
     """
     executable, ros_name, namespace = DEMO_NODE_REGISTRY[name]
+    if auto_activate is None:
+        auto_activate = name == ACTIVE_NODE
     node_kwargs = {
         'package': 'ros2_medkit_integration_tests',
         'executable': executable,
@@ -268,7 +290,7 @@ def _lifecycle_node_action(name, *, respawn=False, respawn_delay=RESPAWN_DELAY_S
         'respawn': respawn,
         'respawn_delay': respawn_delay,
     }
-    if name == ACTIVE_NODE:
+    if auto_activate:
         node_kwargs['parameters'] = [{'auto_activate': True}]
     return launch_ros.actions.Node(**node_kwargs)
 
@@ -314,8 +336,19 @@ def generate_test_description():
         gateway_respawn=gateway_respawn,
     )
 
-    if SCENARIO in ('b2_inactive_below_grace_then_gone', 'b3_matured_then_gone'):
+    if SCENARIO == 'b2_inactive_below_grace_then_gone':
+        # No auto_activate: this row's own claim needs a node that never reaches "active" -
+        # see the module docstring's "Which arming gate" section.
         target = _lifecycle_node_action(TARGET_NODE, respawn=False)
+        launch_description.add_action(TimerAction(period=2.0, actions=[target]))
+        context['target_node'] = target
+
+    if SCENARIO == 'b3_matured_then_gone':
+        # auto_activate=True: this row's SECOND claim (GRAPH_NODE_DISAPPEARED) needs
+        # node_death to have tracked the node at all, which requires it to have been armed -
+        # see TestBoundaryMaturedThenGone's own class docstring and
+        # _lifecycle_node_action's.
+        target = _lifecycle_node_action(TARGET_NODE, respawn=False, auto_activate=True)
         launch_description.add_action(TimerAction(period=2.0, actions=[target]))
         context['target_node'] = target
 
@@ -325,8 +358,11 @@ def generate_test_description():
         context['target_node'] = target
 
     if SCENARIO == 'b5_restart_loop_still_caught':
+        # auto_activate=True: every respawned instance needs to reach "active" on its own
+        # for node_death to ever track it - see TestBoundaryRestartLoopStillCaught's own
+        # class docstring and _lifecycle_node_action's.
         target = _lifecycle_node_action(
-            TARGET_NODE, respawn=True, respawn_delay=B5_RESPAWN_DELAY_SEC)
+            TARGET_NODE, respawn=True, respawn_delay=B5_RESPAWN_DELAY_SEC, auto_activate=True)
         launch_description.add_action(TimerAction(period=2.0, actions=[target]))
         context['target_node'] = target
 
@@ -557,6 +593,63 @@ def _assert_never_passed_throughout(test_case, port, code, duration, interval=0.
         f'be >= interval ({interval}s)')
 
 
+def _get_lifecycle_label(client_node, service_name, timeout=10.0):
+    """One ``GetState`` call against `service_name`. Returns the state label, or ``None``.
+
+    Creates its own client rather than taking one, matching
+    test_node_death_e2e.test.py's identical helper.
+    """
+    client = client_node.create_client(GetState, service_name)
+    try:
+        if not client.wait_for_service(timeout_sec=timeout):
+            return None
+        future = client.call_async(GetState.Request())
+        rclpy.spin_until_future_complete(client_node, future, timeout_sec=timeout)
+        result = future.result()
+        return None if result is None else result.current_state.label
+    finally:
+        client_node.destroy_client(client)
+
+
+def _poll_lifecycle_label(client_node, service_name, expected_label, timeout=30.0, interval=0.5):
+    """Poll ``GetState`` until `service_name` answers `expected_label`. ``True`` once it does.
+
+    One client for the whole poll, matching test_node_death_e2e.test.py's identical helper.
+    """
+    client = client_node.create_client(GetState, service_name)
+    try:
+        deadline = time.monotonic() + timeout
+        last_seen = f'{service_name} was never answered at all'
+        while time.monotonic() < deadline:
+            if client.wait_for_service(timeout_sec=interval):
+                future = client.call_async(GetState.Request())
+                rclpy.spin_until_future_complete(client_node, future, timeout_sec=interval)
+                result = future.result()
+                if result is not None:
+                    last_seen = result.current_state.label
+                    if last_seen == expected_label:
+                        return True
+            time.sleep(interval)
+        print(f'_poll_lifecycle_label({service_name!r}, expected={expected_label!r}) timed '
+              f'out after {timeout}s; last seen: {last_seen!r}')
+        return False
+    finally:
+        client_node.destroy_client(client)
+
+
+def _call_change_state_once(client_node, service_name, transition_id, timeout=30.0):
+    """One ``ChangeState`` call against `service_name`. ``True`` on ``result.success``."""
+    client = client_node.create_client(ChangeState, service_name)
+    if not client.wait_for_service(timeout_sec=timeout):
+        return False
+    request = ChangeState.Request()
+    request.transition.id = transition_id
+    future = client.call_async(request)
+    rclpy.spin_until_future_complete(client_node, future, timeout_sec=timeout)
+    result = future.result()
+    return result is not None and result.success
+
+
 # ---------------------------------------------------------------------------------------
 # Scenarios
 # ---------------------------------------------------------------------------------------
@@ -685,28 +778,75 @@ class TestBoundaryInactiveBelowGraceThenGone(unittest.TestCase):
 
 
 class TestBoundaryMaturedThenGone(unittest.TestCase):
-    """B3: a required node already CONFIRMED inactive, then it vanishes.
+    """B3: a required node reaches active, is driven non-active past grace, then vanishes.
 
-    Two independent claims. The first is GENUINELY GREEN, already-shipped behaviour:
-    "content follows the clocks, not the snapshot" means a matured violation stays in
-    GRAPH_NODE_INACTIVE's content through a departure AND keeps naming the node - proven here
+    Two independent claims, BOTH satisfiable now. The first - "content follows the clocks, not
+    the snapshot" keeps a matured GRAPH_NODE_INACTIVE violation in place through the departure,
+    still naming the node - is already-shipped lifecycle_expectation behaviour, proven here
     with assert_fault_describes_only against the real stack rather than a code-only persistence
     check (a detector that dropped TARGET_NODE from the description while keeping some OTHER
     node's violation raised under the same code would still pass a bare presence check), the
-    same claim test_lifecycle_expectation_e2e.test.py's own "departure_keeps" scenario proves for
-    the UNREADABLE code. The second - GRAPH_NODE_DISAPPEARED also joining once the node is gone,
-    still naming it - is RED, the ordinary missing-detector reason. The row as a whole is
-    therefore PARTLY satisfied, exactly as this file was written expecting.
+    same claim test_lifecycle_expectation_e2e.test.py's own "departure_keeps" scenario proves
+    for the UNREADABLE code.
+
+    The second - GRAPH_NODE_DISAPPEARED also joining once the node is gone, still naming it -
+    needs node_death to have TRACKED the node at all, which only ever happens for a node armed
+    at least once: reliability_allows() requires "active" for a MANAGED node
+    (LifecycleWatcher::node_ok()). A managed_lifecycle instance that stays "unconfigured" its
+    whole life is never armed and so is structurally invisible to node_death whatever happens
+    to it afterwards - the second claim would be unreachable by ANY correct implementation
+    against that fixture, not merely an unimplemented one. This is why the launch drives
+    TARGET_NODE through "active" FIRST (arming it - the same mechanism B4's target uses), THEN
+    a real DEACTIVATE transition (maturing GRAPH_NODE_INACTIVE the same way the original
+    "stays unconfigured" fixture did), THEN kills it: the node this row's second claim needs
+    has to have been alive and armed at some point before it can ever be reported disappeared.
+    A future edit that reverts TARGET_NODE to launching without auto_activate would silently
+    make the second half of this row unreachable again.
     """
 
-    def test_matured_inactive_survives_departure_disappeared_never_joins(self, target_node):
-        # Global gate: see the module docstring's "Which arming gate" section.
+    @classmethod
+    def setUpClass(cls):
+        rclpy.init()
+        cls._client_node = Node('node_death_boundary_b3_client')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._client_node.destroy_node()
+        rclpy.shutdown()
+
+    def test_matured_inactive_survives_departure_and_disappeared_joins(self, target_node):
+        get_state_service = f'/{TARGET_NODE}/get_state'
+        change_state_service = f'/{TARGET_NODE}/change_state'
+
+        # app_id form: this node reaches "active" on its own now (auto_activate=True), so the
+        # per-entity armed precondition (LifecycleWatcher::node_ok()) genuinely becomes true -
+        # see the module docstring's "Which arming gate" section.
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
-            'graph_watchdog never reported an armed global state')
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=TARGET_NODE),
+            f'graph_watchdog never reported {TARGET_NODE} armed')
         self.assertTrue(
             wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
             'GET /faults never answered 200 - nothing below would prove anything')
+
+        self.assertTrue(
+            _poll_lifecycle_label(
+                type(self)._client_node, get_state_service, 'active',
+                timeout=PRESENCE_TIMEOUT_SEC),
+            f'{TARGET_NODE} never reached "active" on its own - the trigger this row needs (a '
+            'node armed for node_death, then driven non-active) was never set up',
+        )
+        self.assertTrue(
+            _call_change_state_once(
+                type(self)._client_node, change_state_service,
+                Transition.TRANSITION_DEACTIVATE, timeout=PRESENCE_TIMEOUT_SEC),
+            'the real DEACTIVATE transition was rejected or never answered',
+        )
+        self.assertTrue(
+            _poll_lifecycle_label(
+                type(self)._client_node, get_state_service, 'inactive',
+                timeout=PRESENCE_TIMEOUT_SEC),
+            f'{TARGET_NODE} never reached "inactive" after DEACTIVATE',
+        )
 
         fault = poll_faults(PORT, FAULT_CODE_INACTIVE, timeout=RAISE_TIMEOUT_SEC)
         if fault is None:
@@ -720,15 +860,16 @@ class TestBoundaryMaturedThenGone(unittest.TestCase):
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
 
-        # Genuinely green today: proves the matured violation is not healed by the departure,
-        # and that the surviving content still names TARGET_NODE rather than merely keeping the
-        # code raised (see the class docstring for why a code-only check is not enough here).
+        # Already-shipped lifecycle_expectation behaviour: proves the matured violation is not
+        # healed by the departure, and that the surviving content still names TARGET_NODE
+        # rather than merely keeping the code raised (see the class docstring for why a
+        # code-only check is not enough here).
         assert_fault_describes_only(
             self, PORT, FAULT_CODE_INACTIVE, required=[TARGET_NODE], forbidden=[],
             duration=SUSTAINED_WINDOW_SEC)
 
-        # RED today, the ordinary missing-detector reason - reached only because the assertion
-        # above passed, unlike B2's sibling call.
+        # Reached only because the assertion above passed, unlike B2's sibling call. Reachable
+        # AT ALL because TARGET_NODE was armed before it died - see the class docstring.
         second = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
         if second is None:
             self.fail(f'{FAULT_CODE_DISAPPEARED} never raised for the departed {TARGET_NODE}')
@@ -746,9 +887,9 @@ class TestBoundaryHealthyThenGone(unittest.TestCase):
     """
 
     def test_healthy_departure_raises_only_disappeared(self, target_node):
-        # app_id form: unlike B1/B2/B3/B5's target, this node reaches "active" on its own, so
-        # the per-entity armed precondition (LifecycleWatcher::node_ok()) genuinely becomes
-        # true here - see the module docstring's "Which arming gate" section.
+        # app_id form: unlike B1/B2's target, this node reaches "active" on its own, so the
+        # per-entity armed precondition (LifecycleWatcher::node_ok()) genuinely becomes true
+        # here - see the module docstring's "Which arming gate" section.
         self.assertTrue(
             wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=ACTIVE_NODE),
             f'graph_watchdog never reported {ACTIVE_NODE} armed')
@@ -779,6 +920,20 @@ class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
     absence to keep a restart-looping node from evading every code. This row does not touch
     GRAPH_NODE_INACTIVE at all - that claim belongs to B2 and B3.
 
+    The target launches with auto_activate (the same mechanism B4's target uses) and keeps that
+    parameter across every respawn, not merely the first start: node_death only ever tracks a
+    node it has seen ARMED at least once (reliability_allows() requires "active" for a managed
+    node - LifecycleWatcher::node_ok()), so a fixture that never activates would make
+    GRAPH_NODE_DISAPPEARED structurally unreachable for every cycle here, not merely slow to
+    catch - this row carries the evidence that R10's narrowing is safe, so it has to run
+    against a node that can actually be reported. Each cycle's respawned instance is re-armed
+    (app_id-scoped wait_until_watchdog_armed, not merely presence) before the NEXT kill for the
+    identical reason a fresh process needs it the first time: a kill landing before a
+    just-restarted instance reaches "active" would leave that cycle's death untracked too, and
+    the following poll_faults would time out for a precondition reason having nothing to do
+    with the claim this row is about. A future edit that reverts TARGET_NODE to launching
+    without auto_activate would silently make every cycle of this row unreachable again.
+
     Every cycle's outage is held down for B5_RESPAWN_DELAY_SEC, safely longer than the
     explicitly-configured B5_MISS_GRACE this scenario launches with (see the module docstring):
     left at launch's own 1.5 s respawn floor with no miss_grace configured, a correct detector's
@@ -787,23 +942,18 @@ class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
     defect in one. Every raise is also checked by NAME, not merely by code, so a detector
     reporting the same code for some other entity every cycle could not pass in TARGET_NODE's
     place.
-
-    RED today: no presence detector exists yet, so even the FIRST cycle's raise never happens.
     """
 
     def test_five_restarts_each_raise_and_clear(self, target_node):
-        # Global gate: see the module docstring's "Which arming gate" section.
+        # app_id form: this node reaches "active" on its own now (auto_activate=True), so the
+        # per-entity armed precondition genuinely becomes true - see the module docstring's
+        # "Which arming gate" section and this class's own docstring.
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
-            'graph_watchdog never reported an armed global state')
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=TARGET_NODE),
+            f'graph_watchdog never reported {TARGET_NODE} armed')
         self.assertTrue(
             wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
             'GET /faults never answered 200 - nothing below would prove anything')
-        self.assertTrue(
-            _poll_apps_present(PORT, TARGET_NODE, timeout=PRESENCE_TIMEOUT_SEC),
-            f'{TARGET_NODE} never appeared on GET /apps - there is no present node here to '
-            'restart',
-        )
 
         pid = target_node.process_details['pid']
         for cycle in range(1, B5_CYCLES + 1):
@@ -820,10 +970,15 @@ class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
                 TARGET_NODE, fault.get('description', ''),
                 f'cycle {cycle}: {FAULT_CODE_DISAPPEARED} raised but did not name {TARGET_NODE}')
 
+            # app_id-scoped again, not just present: the respawned instance is a NEW process
+            # node_death has not armed yet, and the next iteration is about to kill it - the
+            # same precondition the FIRST kill above needed (see the class docstring).
             self.assertTrue(
-                _poll_apps_present(
-                    PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC + B5_RESPAWN_DELAY_SEC),
-                f'cycle {cycle}: {TARGET_NODE} never came back after the SIGTERM',
+                wait_until_watchdog_armed(
+                    PORT, timeout=DEPARTURE_TIMEOUT_SEC + B5_RESPAWN_DELAY_SEC,
+                    app_id=TARGET_NODE),
+                f'cycle {cycle}: {TARGET_NODE} never came back armed after the SIGTERM - '
+                'launch did not respawn it, or the respawned instance never reached "active"',
             )
             # A fresh pid every cycle: read it back rather than assume launch's respawn keeps
             # the value this test already has.

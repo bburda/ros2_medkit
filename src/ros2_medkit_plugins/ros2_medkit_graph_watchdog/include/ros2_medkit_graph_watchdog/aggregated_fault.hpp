@@ -72,16 +72,21 @@ class AggregatedFault {
   AggregatedFault(const char * code, std::uint8_t severity) : code_(code), severity_(severity) {
   }
 
-  void emit(DetectorContext & ctx, const std::map<std::string, std::string> & affected) const {
+  /// Returns whatever ctx.raise_fault()/ctx.clear_fault() returned - true only if the
+  /// request actually reached async_send_request(), never merely because `affected` was
+  /// non-empty. A caller that wants to know whether a raise genuinely went out (not just
+  /// that one was attempted) must read this return value - see DetectorContext::raise_fault's
+  /// own doc for why the two are not the same thing.
+  bool emit(DetectorContext & ctx, const std::map<std::string, std::string> & affected) const {
     const std::string source = graph_source_id(ctx);
     if (affected.empty()) {
-      ctx.clear_fault(code_, source);
-      return;
+      return ctx.clear_fault(code_, source);
     }
-    ctx.raise_fault(code_, severity_, describe(affected), source);
+    return ctx.raise_fault(code_, severity_, describe(affected), source);
   }
 
-  /// emit() with a caller-chosen ORDER for the description.
+  /// emit() with a caller-chosen ORDER for the description. Return value: see emit()'s own
+  /// doc.
   ///
   /// The map overload above lists entities lexicographically, which is fine when every
   /// entry is equally interesting. It is not fine when the set mixes long-standing entries
@@ -89,14 +94,13 @@ class AggregatedFault {
   /// `order` names the keys of `affected` in the order they should appear; any key of
   /// `affected` missing from `order` is appended afterwards, so a caller can never silently
   /// drop an entity by getting the ordering wrong.
-  void emit_ordered(DetectorContext & ctx, const std::map<std::string, std::string> & affected,
+  bool emit_ordered(DetectorContext & ctx, const std::map<std::string, std::string> & affected,
                     const std::vector<std::string> & order) const {
     const std::string source = graph_source_id(ctx);
     if (affected.empty()) {
-      ctx.clear_fault(code_, source);
-      return;
+      return ctx.clear_fault(code_, source);
     }
-    ctx.raise_fault(code_, severity_, describe_ordered(affected, order), source);
+    return ctx.raise_fault(code_, severity_, describe_ordered(affected, order), source);
   }
 
   /// Join the affected entities into one description, capped at kMaxDescriptionChars.
