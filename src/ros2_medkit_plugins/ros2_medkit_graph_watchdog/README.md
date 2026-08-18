@@ -53,7 +53,7 @@ id itself is warned about the same way, with the registered ids listed.
 |-----|------|---------|---------|
 | `mode` | string \| bool | `raise` | As above. |
 | `require_active` | string[] | `[]` | Node names that must be in the `active` lifecycle state, each matched against a live node by its `App::id`, its full FQN (`/ns/name`), or the bare leaf of that FQN. A bare name matches that node in EVERY namespace (a fleet-wide "all `controller_server`s must be active"); use a full FQN to pin one robot's. Both the bare and the FQN form match against the node's stable FQN, so they survive the `App::id` renaming that a same-bare-name collision triggers; an entry written as an `App::id` also works, but can stop matching on a multi-robot graph for exactly that reason. Empty = the detector checks nothing and emits nothing. A `require_active` that is not a string array warns and is ignored; an empty-string entry warns and is skipped - never dropped silently, since the operator would go on believing the node is covered. |
-| `grace` | int | `5` | Consecutive not-active ticks a required node tolerates before being reported inactive - bringup time for a managed node to reach `active` (configure + activate) before the expectation is enforced. Counted per NODE, not per matching entry: a node named by both a bare-name and a full-FQN entry still advances its streak once per tick, so mixing the two documented forms cannot halve the grace that was configured. Past the absence grace the streak keeps advancing while the node is ABSENT, so a node that leaves the graph while violating is still confirmed. Accepted range 0..300 - five minutes at the shipped 1 s cadence, and already an extravagant allowance for a managed node to reach `active`. The upper end is a real bound rather than a formality: `grace` also decides how long a node that LEFT the graph while not-active sits unsettled in the tracker, and `GRAPH_NODE_INACTIVE`'s clear is withheld for EVERY node while it does, so at the old maximum of `INT_MAX - 1` the fault could neither raise nor heal for about 24 days. The check runs on the wide integer, so a value that only fits after truncation is rejected rather than silently turned into a hair-trigger. Anything outside the range warns and keeps the default. |
+| `grace` | int | `5` | Consecutive not-active ticks a required node tolerates before being reported inactive - bringup time for a managed node to reach `active` (configure + activate) before the expectation is enforced. Counted per NODE, not per matching entry: a node named by both a bare-name and a full-FQN entry still advances its streak once per tick, so mixing the two documented forms cannot halve the grace that was configured. An ALREADY-CONFIRMED streak keeps its content while the node is ABSENT, so a node that leaves the graph after being confirmed stays confirmed; a streak that has not yet crossed `grace` is HELD rather than advanced while absent, so a node is never confirmed out of ticks gathered while nobody could observe it - only a PRESENT tick may still cross `grace`. Accepted range 0..300 - five minutes at the shipped 1 s cadence, and already an extravagant allowance for a managed node to reach `active`. The upper end is a real bound rather than a formality: `grace` decides how long a PRESENT node may go unreported, and how long a node returning from a departure still inactive takes to (re-)mature, so at the old maximum of `INT_MAX - 1` that PRESENT-side silence lasted about 24 days at the shipped cadence with no warning. It does NOT bound how long a node that leaves the graph BELOW `grace` sits unsettled - that lasts for as long as the node stays gone, independent of `grace` (see "Bounded by evidence, not by age" below). The check runs on the wide integer, so a value that only fits after truncation is rejected rather than silently turned into a hair-trigger. Anything outside the range warns and keeps the default. |
 | `prune_grace` | int | `60` | Consecutive ticks an IDLE tracked node - both clocks at zero and no matured ownership, so nothing to lose - may stay ABSENT from the graph before its bookkeeping is reclaimed. A node carrying evidence is never reclaimed by age at all, however long it stays gone, so this key cannot erase a fault's own state; the map is bounded instead by `tracked_node_cap` (see "Bounded by evidence, not by age"). Injected for every detector at plugin scope and overridable per detector; a value outside 0..3600 warns and this detector keeps its own default of 60. The range check runs on the wide integer, so an out-of-int-range value is rejected rather than truncated. The value is used as written - there is no `grace + 1` clamp, because there is no longer anything for one to protect. |
 | `tracked_node_cap` | int | `512` | The most nodes this detector keeps bookkeeping for at once. It is what bounds the map, since evidence is never reclaimed by age (see "Bounded by evidence, not by age"): at the cap, idle entries are reclaimed first, then entries for DEPARTED nodes are collapsed into a count, and only if every tracked node is PRESENT and carrying evidence is a newly matched node refused - which withholds `GRAPH_NODE_INACTIVE`'s clear and is reported both in the log and on `GET /x-medkit-watchdog`. 512 is comfortably above every node in a realistic graph (a full Nav2 stack plus perception is roughly a hundred nodes; a ten-robot fleet sharing one domain a few hundred), so raising it is only needed where `require_active` legitimately matches more PRESENT nodes than that. Accepted range 1..16384 - 16384 is about 8 MB of bookkeeping at roughly 500 bytes per tracked node, and a deployment needing more distinct required-node identities alive at once has identity churn rather than a large fleet. Anything outside the range, including 0 (a cap of nothing would mean checking nothing), warns and keeps the default; the check runs on the wide integer, so an out-of-int-range value is rejected rather than truncated. |
 
@@ -659,7 +659,8 @@ node's SETTLED observation had started, and resets nothing:
 
 | Settled observation | What sustained absence does |
 |---|---|
-| `inactive` (or any non-active label) | the violation streak keeps climbing, so the node is eventually reported under `GRAPH_NODE_INACTIVE` even though it is gone |
+| `inactive`, ALREADY reported under `GRAPH_NODE_INACTIVE` | the streak continues exactly as it did on its last present tick, so the fault stays raised and keeps naming a node that is no longer there |
+| `inactive`, not yet past `grace` | the streak is HELD - neither advanced (no fault is born while nobody can observe the node) nor erased (a node that returns still inactive resumes rather than re-earning `grace`) |
 | unread label, or no tracked lifecycle | the unmeasured clock keeps climbing under that same cause, so the node is eventually reported under `GRAPH_NODE_UNREADABLE` / `GRAPH_NODE_NOT_MANAGED` |
 | `active` | nothing. Anything the node had started but not corroborated is released, the entry becomes idle and is reclaimed silently |
 
@@ -681,11 +682,13 @@ leaves has corroborated that long before the hold that reports it.
 
 Three consequences worth stating plainly:
 
-- **A departure never heals a fault, within one gateway lifetime.** A node measured
-  not-active, or corroborated as unmeasurable, that then leaves the graph keeps its fault -
-  the operator declared it must be ACTIVE, it was not, and being gone is not an answer. The
-  fault's description switches to saying the node has since left the graph, so nobody is
-  sent looking for it. **Across a gateway restart it does not hold**, and that is a real
+- **A departure never heals a fault it has already earned, within one gateway lifetime.** A
+  node CONFIRMED not-active, or corroborated as unmeasurable, that then leaves the graph
+  keeps its fault - the operator declared it must be ACTIVE, it was not, and being gone is
+  not an answer. The fault's description switches to saying the node has since left the
+  graph, so nobody is sent looking for it. A node that had NOT yet been confirmed when it
+  left earns nothing from leaving either - see "Absence continues the last CORROBORATED
+  observation" above. **Across a gateway restart it does not hold**, and that is a real
   boundary rather than an oversight: the restarted detector has no measurements at all, the
   departed node is not in the graph, and its `require_active` entry therefore matches
   nothing - which is indistinguishable from a misspelt entry, since the only component that
@@ -698,19 +701,32 @@ Three consequences worth stating plainly:
 - **A departure never STARTS one.** A node measured `active` that shuts down raises
   nothing, and neither does one whose lifecycle services went missing from a sweep or two
   immediately before it did. Reporting a healthy node that left is the presence class's job
-  (`GRAPH_NODE_DISAPPEARED`), which still has no detector in this package - the one gap
-  left here, and a much narrower one than "a node absent past the grace is invisible
-  whichever clock it was on".
+  (`GRAPH_NODE_DISAPPEARED`, this package's own `node_death` detector), not this one's -
+  a much narrower boundary than "a node absent past the grace is invisible whichever clock
+  it was on".
 - **A departed node never crowds out a present one.** Entries for departed nodes are
   collapsed into a count when the tracked-node cap needs the slot - see "Bounded by
   evidence, not by age" below.
 
-Why: every erasure horizon is an evasion for a node that touches it periodically. A node
-in a restart loop - start, crash, respawn delay, start - touches absence by construction,
-and that is the node this detector most exists to catch. Discarding its evidence on
-absence let it alternate `(unreadable, absent x N)`, `(not-managed, absent x N)` or
-`(inactive, absent x N)` forever without ever accumulating enough of anything to be
-reported.
+Why, for the two UNMEASURED causes: every erasure horizon is an evasion for a node that
+touches it periodically. A node in a restart loop - start, crash, respawn delay, start -
+touches absence by construction, and discarding its evidence on absence would let it
+alternate `(unreadable, absent x N)` or `(not-managed, absent x N)` forever without ever
+accumulating enough of anything to be reported.
+
+The VIOLATION streak used to need the identical rule for the identical reason - a node
+alternating `(inactive, absent x N)` would otherwise never accumulate `grace` + 1 either.
+That is no longer the only thing standing between such a node and invisibility:
+`GRAPH_NODE_DISAPPEARED` (this package's `node_death` detector) now independently reports
+every departure in the same restart loop, whether or not the node was ever measured
+not-active first. So a below-`grace` streak that goes absent is simply HELD rather than
+matured on the strength of the absence alone - maturing it would raise
+`GRAPH_NODE_INACTIVE` from ticks gathered while nobody could observe the node, a fault its
+presence never earned. An ALREADY-matured streak still continues through absence exactly
+as before: two codes standing at once for the same node (`GRAPH_NODE_INACTIVE` because it
+was measured not-active, `GRAPH_NODE_DISAPPEARED` because it is gone) is not a problem to
+fix - they say different, both-true things. The narrowing is only that the second fault is
+never BORN from an absence.
 
 **Content follows the clocks, not the snapshot.** Whether a node happened to be in this
 tick's matches decides nothing about what it reports: a node whose streak is past `grace`
@@ -792,14 +808,21 @@ at a different N. So:
   in the same tick, never partially. There is no `grace + 1` clamp any more, and none is
   needed: a node carrying evidence is exempt by construction rather than by arithmetic, so
   `prune_grace: 0` means exactly 0.
-- **A non-idle entry is never pruned by age at all.** It cannot grow without bound in time
-  either: past the absence grace its clock advances every tick, so it matures within at most
-  `grace + absence_grace + 1` ticks (a violation streak) or `60 + absence_grace + 1` (an
-  unmeasured clock) and gets reported. Those two numbers are also the longest
-  `GRAPH_NODE_INACTIVE`'s clear can be withheld by one departed node, which is why `grace` is
-  capped at 300 rather than accepted up to the int maximum: at the old maximum the bound was
-  about 24 days at the shipped cadence, i.e. the fault could neither raise nor heal for
-  anybody, with no warning and no way to tell it from a working detector finding nothing.
+- **A non-idle entry is never pruned by age at all.** An entry whose UNMEASURED clock is
+  still climbing cannot grow without bound in time either: past the absence grace it
+  advances every tick, so it matures within at most `60 + absence_grace + 1` ticks and gets
+  reported - the longest `GRAPH_NODE_UNREADABLE` or `GRAPH_NODE_NOT_MANAGED`'s clear can be
+  withheld by one departed node. A below-`grace` VIOLATION streak has no such bound while its
+  node stays gone: absence holds it rather than advancing it, so it neither matures nor
+  becomes idle for as long as the node is away, however long that is. That is not a new way
+  to withhold `GRAPH_NODE_INACTIVE`'s clear - the clear was already gated on every required
+  node's status being settled, so one node this indecisive already blocked it before this
+  design; what changes is only that the fault never NAMES it, since the departure itself is
+  `GRAPH_NODE_DISAPPEARED`'s evidence to report. `grace` is still capped at 300 rather than
+  accepted up to the int maximum, because it independently bounds how long a PRESENT node may
+  go unreported and how long a returning node takes to re-mature: at the old maximum of
+  `INT_MAX - 1` that PRESENT-side bound was about 24 days at the shipped cadence, with no
+  warning and no way to tell a silently-withheld detector from one finding nothing.
 - **The map is bounded by `tracked_node_cap`** (default 512, accepted range 1..16384). At
   the cap, idle entries are reclaimed first (free - they carry nothing), then entries for
   DEPARTED nodes are collapsed into a count so a PRESENT node always wins a slot; only if
@@ -886,13 +909,14 @@ re-established the node is fine.
 
 What never blocks `GRAPH_NODE_INACTIVE`'s raise: a RAISE is never withheld (a violation
 read from the nodes that did answer is real regardless of the unmeasured ones). An entry
-that HAS matched and later stops matching does not re-enter reason 1 either. Every hold is
-bounded, and every one of them releases by SETTLING the node's status rather than by
-giving up on it: the never-matched hold and both unmeasured-clock causes release after 60
-consecutive ticks (a minute at the shipped 1s cadence), whether the node is present or
-gone; a below-`grace` violation streak releases as soon as the node reads `active` or its
-streak passes `grace` and the fault is raised - which, past the absence grace, happens
-while the node is absent too.
+that HAS matched and later stops matching does not re-enter reason 1 either. The
+never-matched hold and both unmeasured-clock causes are bounded (60 consecutive ticks, a
+minute at the shipped cadence) and release by SETTLING the node's status rather than by
+giving up on it, whether the node is present or gone. A below-`grace` violation streak
+releases the same way - as soon as the node reads `active`, or a PRESENT tick pushes its
+streak past `grace` and the fault is raised - but while the node stays absent that release
+has no timeout of its own: absence holds the streak rather than advancing it, so the hold
+lasts for exactly as long as the node does not return.
 Because a withheld clear is indistinguishable from a detector that is working and
 finding nothing, a hold that lives past 10 consecutive ticks is explained in the log once
 per episode, naming every reason in force and, for the node-keyed ones, how many nodes
@@ -998,12 +1022,17 @@ still fit inside the 480-char cap (`3 * 150 + 2 * 2 = 454 <= 480`).
    read and a not-managed one across absence gaps longer than the absence grace; that the
    violation streak survives non-maturing unmeasured ticks and RESUMES rather than
    restarting (counted exactly, and read through `pending_violation` - the only field that
-   differs during the climbing window); absence CONTINUING whichever clock the node's last
-   real observation started (a blink holds it unchanged; past the blink tolerance it
-   advances, so a node absent long enough matures or crosses grace on absence alone and its
-   detail says the node has left the graph), a matured fault surviving a departure, a node
-   measured ACTIVE that vanishes raising nothing and being reclaimed, and the three
-   `(X, absent x N)` restart-loop shapes for N at the absence grace and past it; the
+   differs during the climbing window); absence CONTINUING an already-matured fault exactly
+   as it was on its last present tick (a blink holds either clock unchanged; past the blink
+   tolerance an unmeasured clock still climbing keeps climbing and matures on absence alone,
+   its detail then saying the node has left the graph, while a below-grace violation streak
+   is instead HELD - neither advanced nor erased - and RESUMES rather than restarts once the
+   node returns, proven both from a single long absence and from many short ones
+   interleaved with matched reads), a matured violation fault surviving a departure, a node
+   measured ACTIVE that vanishes raising nothing and being reclaimed, and the two
+   `(unreadable/not-managed, absent x N)` restart-loop shapes for N at the absence grace and
+   past it (their `inactive` sibling now pinned to the opposite claim, at the same two N: it
+   never crosses grace from absence alone); the
    `pending` set and its per-reason breakdown; new-first ordering for all three
    fault-shaped maps, including the lexicographic tie-break when several cross together;
    the remote-supplied label's own trim budget ahead of the whole-detail backstop, and the
@@ -1037,8 +1066,9 @@ still fit inside the 480-char cap (`3 * 150 + 2 * 2 = 454 <= 480`).
    warning, the withheld-clear guard's releases and its once-per-episode log line, the
    blink-plus-unread-re-seed sequence, the no-match warning, a filler batch sized (from
    the real detail-building code) to exceed the 480-char cap aggregating into one fault
-   with the fresh crossing named first, a PRESENT node crossing on the same tick as a batch
-   of departed ones being named ahead of them (and not truncated away by them), a required
+   with the fresh crossing named first, a PRESENT node crossing grace fresh while a batch of
+   already-departed, already-matured ones sits absent-and-content being named ahead of them
+   (and not truncated away by them), a required
    node appearing mid-run, a re-bind under the same `App::id`, and the
    reconfigure/config-validation edge cases. The
    unmeasured clock's own split is pinned directly, for BOTH codes symmetrically: a
@@ -1058,8 +1088,11 @@ still fit inside the 480-char cap (`3 * 150 + 2 * 2 = 454 <= 480`).
    filler batch, the same new-first ordering; an already-reported node of either cause
    KEEPING its own record once it vanishes (and its description switching to say the node
    has left the graph), a node returning from that absence staying reported with no
-   clear/re-raise churn, each of the three restart-loop shapes raising its own code, the
-   `inactive` <-> `not-managed` alternation across absence gaps, a node measured ACTIVE
+   clear/re-raise churn, each of the two UNMEASURED restart-loop shapes raising its own code
+   from absence alone (their `inactive` sibling instead pinned to counting only real reads,
+   never crossing from any of the interleaved absence gaps), the
+   `inactive` <-> `not-managed` alternation across absence gaps now counting only the
+   MEASURED not-active legs, a node measured ACTIVE
    that vanishes raising nothing under any of the three, and a withheld `GRAPH_NODE_INACTIVE`
    clear releasing when the absent node's clock MATURES into its sibling's content rather
    than when the node is given up on; the two wire strings pinned as hand-typed literals

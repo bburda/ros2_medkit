@@ -415,14 +415,19 @@ situation never changed.
 **Absence continues the last CORROBORATED observation, it never erases.** A node not matched
 at all this tick is ABSENT, a fact separate from any observed state (there is no label to
 classify). For up to ``absence_grace`` (a fixed 3 ticks) consecutive absent ticks a node's
-whole state is held unchanged - the blink tolerance. Past ``absence_grace`` absence ADVANCES
-whichever clock the node's SETTLED observation had started, and resets nothing: a
-settled-``INACTIVE`` node keeps climbing its violation streak, a
+whole state is held unchanged - the blink tolerance. Past ``absence_grace`` absence resets
+nothing, but what it ADVANCES depends on whether the node's SETTLED observation is already
+CONTENT: a settled-``INACTIVE`` node ALREADY reported under ``GRAPH_NODE_INACTIVE`` keeps its
+streak exactly as it was, so the fault stays raised; one not yet past ``grace`` is instead
+HELD - neither advanced (no fault born from evidence gathered while nobody could observe the
+node) nor erased (it resumes rather than restarts on return). A
 settled-``UNREADABLE``/``NOT_MANAGED`` node keeps climbing its unmeasured clock under that
-same cause, and a settled-``ACTIVE`` node advances nothing at all - anything it had started
-but not corroborated is released, so the entry becomes idle and is reclaimed silently. So a
-departure never heals a fault and never starts one; what it changes is the detail phrase,
-which then says the node has since left the graph.
+same cause regardless of maturity - that clock's own absence behaviour is unrelated to this
+distinction. A settled-``ACTIVE`` node advances nothing at all - anything it had started but
+not corroborated is released, so the entry becomes idle and is reclaimed silently. So a
+departure never heals a fault it has already earned, and never starts one out of evidence
+gathered while the node could not be observed; what it changes, for an already-raised fault,
+is the detail phrase, which then says the node has since left the graph.
 
 **What "settled" means, and why an unmeasured reading needs corroborating.** A real
 measurement (``ACTIVE`` or a non-active label) settles at once - a label is a fact about the
@@ -451,15 +456,24 @@ record heals with nothing having been measured. Re-seeding the tracker from the 
 startup would change that and is not implemented; the boundary is pinned by the
 ``restart_departed`` e2e scenario rather than left to be discovered.
 
-Why the erasure went away rather than moving: every erasure horizon is an evasion for a
-node that touches it periodically. A node in a restart loop - start, crash, respawn delay,
-start - touches absence by construction, and that is the node this detector most exists to
-catch, so discarding its evidence let it alternate ``(UNREADABLE, ABSENT x N)``,
-``(NOT_MANAGED, ABSENT x N)`` or ``(INACTIVE, ABSENT x N)`` forever without ever
-accumulating enough of anything to be reported. Reporting a HEALTHY node that left remains
-the presence class's job (``GRAPH_NODE_DISAPPEARED``, still no detector of its own) - the
-single gap this class keeps, and a far narrower one than "a node absent past the grace is
-invisible whichever clock it was on".
+Why the erasure went away rather than moving, for the two UNMEASURED causes: every erasure
+horizon is an evasion for a node that touches it periodically. A node in a restart loop -
+start, crash, respawn delay, start - touches absence by construction, and discarding its
+evidence would let it alternate ``(UNREADABLE, ABSENT x N)`` or ``(NOT_MANAGED, ABSENT x N)``
+forever without ever accumulating enough of anything to be reported.
+
+The VIOLATION streak needed the identical rule for the identical reason once - a node
+alternating ``(INACTIVE, ABSENT x N)`` would otherwise never accumulate ``grace`` + 1 either.
+It no longer does: ``GRAPH_NODE_DISAPPEARED`` (this package's own ``node_death`` detector)
+now independently reports every departure in the same restart loop, whether or not the node
+was ever measured not-active first. So a below-``grace`` streak that goes absent is simply
+HELD rather than matured on the strength of the absence alone - two codes standing at once
+for the same node is not a problem to fix, it is ``GRAPH_NODE_INACTIVE`` and
+``GRAPH_NODE_DISAPPEARED`` saying different, both-true things; the narrowing is only that the
+second fault is never BORN from an absence. Reporting a HEALTHY node that left remains
+``GRAPH_NODE_DISAPPEARED``'s job as well - the single gap this class kept before that
+detector existed, and a far narrower one than "a node absent past the grace is invisible
+whichever clock it was on".
 
 **Content follows the clocks, not the snapshot.** Whether a node was in this tick's matches
 decides nothing about what it reports: a node past ``grace`` stays in
@@ -516,14 +530,21 @@ different N. So ``prune_ticks`` (the operator's ``prune_grace``, used as written
 no ``grace + 1`` clamp any more, because there is nothing left for one to protect) reclaims
 IDLE entries only: both clocks at zero and no matured ownership, i.e. nothing to lose, and
 still atomically - ONE map entry per node, gone in the same tick, never partially. A
-non-idle entry is never pruned by age, and cannot grow without bound in time either: past
-the absence grace its clock advances every tick, so it matures within at most
-``grace + absence_grace + 1`` ticks (a violation streak) or ``60 + absence_grace + 1`` (an
-unmeasured clock) and is reported. Those are also the longest ``GRAPH_NODE_INACTIVE``'s clear
-can be withheld by one departed node, which is why ``grace`` is capped at 300 instead of
-being accepted up to ``INT_MAX - 1``: at the old maximum the bound was roughly 24 days at the
-shipped cadence, during which the fault could neither raise nor heal for ANY node - silence
-indistinguishable from a working detector finding nothing.
+non-idle entry is never pruned by age. An entry whose UNMEASURED clock is still climbing
+cannot grow without bound in time either: past the absence grace it advances every tick, so
+it matures within at most ``60 + absence_grace + 1`` ticks and is reported - the longest
+``GRAPH_NODE_UNREADABLE`` or ``GRAPH_NODE_NOT_MANAGED``'s clear can be withheld by one
+departed node. A below-``grace`` VIOLATION streak has no such bound while its node stays
+gone: absence holds it rather than advancing it, so it neither matures nor becomes idle for
+as long as the node is away. That is not a new way to withhold ``GRAPH_NODE_INACTIVE``'s
+clear - the clear was already gated on every required node's status being settled, so one
+node this indecisive already blocked it; what changes is only that the fault never NAMES it,
+since the departure itself is ``GRAPH_NODE_DISAPPEARED``'s evidence to report. ``grace`` is
+still capped at 300 instead of being accepted up to ``INT_MAX - 1``, because it independently
+bounds how long a PRESENT node may go unreported and how long a returning node takes to
+re-mature: at the old maximum that PRESENT-side bound was roughly 24 days at the shipped
+cadence, with no warning - silence indistinguishable from a working detector finding
+nothing.
 
 What bounds the map is ``tracked_node_cap`` (default 512, ``kDefaultTrackedNodeCap``,
 accepted range 1..16384): at the cap idle entries are reclaimed first, then entries for
@@ -583,12 +604,14 @@ started over (a restarted gateway, a reconfigure - ``configure()`` rebuilds the 
 
 Either reason withholds the emission entirely, neither raise nor clear. A raise is never
 withheld: a violation read from the nodes that DID answer is real regardless of the
-unmeasured ones. Every hold is bounded: the never-matched leg and both unmeasured
-causes all release after 60 consecutive ticks (a minute at the shipped cadence,
-mirroring ``param_drift``'s frozen hold), whether the node is present or gone - the pending
-leg releases as soon as the node reads ``active``, or its streak passes grace and the fault
-is raised again, which past the absence grace happens while the node is absent too. Every
-hold releases by SETTLING the node's status, never by giving up on it. Because a correctly
+unmeasured ones. The never-matched leg and both unmeasured causes are bounded: they release
+after 60 consecutive ticks (a minute at the shipped cadence, mirroring ``param_drift``'s
+frozen hold), whether the node is present or gone. The pending leg releases the same
+way - as soon as the node reads ``active``, or a PRESENT tick pushes its streak past grace
+and the fault is raised again - but while the node stays absent that release has no timeout
+of its own: absence holds a below-grace streak rather than advancing it, so the hold lasts
+for exactly as long as the node does not return. Every hold releases by SETTLING the node's
+status, never by giving up on it. Because a correctly
 withheld clear and a detector with nothing to report look identical from outside, a hold
 that lives past 10 consecutive ticks is explained in the log once per episode, naming
 every reason in force and, for the node-keyed ones, the count behind each and one node
@@ -684,13 +707,19 @@ overlapping - plus the shared-watcher seam the re-bind behaviour lives in:
    alternation this redesign closes - a node alternating between unreadable and
    not-managed, indefinitely and on every single tick, still matures the shared clock;
    the ``INACTIVE``/``NOT_MANAGED`` alternation across absence gaps longer than the
-   absence grace; the violation streak surviving non-maturing unmeasured ticks and
-   RESUMING rather than restarting, counted exactly and read through
-   ``pending_violation``; absence CONTINUING whichever clock the last real observation
-   started - a blink holds it unchanged, past the blink tolerance it advances, a matured
-   fault survives a departure, a node measured ACTIVE that vanishes raises nothing and is
-   reclaimed, and the three ``(X, ABSENT x N)`` restart-loop shapes are swept at the
-   absence grace and past it; the ``pending`` set and its per-reason breakdown; new-first
+   absence grace, now counting only the MEASURED not-active legs; the violation streak
+   surviving non-maturing unmeasured ticks and RESUMING rather than restarting, counted
+   exactly and read through ``pending_violation``; absence CONTINUING an already-matured
+   fault exactly as it was on its last present tick - a blink holds either clock unchanged;
+   past the blink tolerance an unmeasured clock still climbing keeps climbing and matures on
+   absence alone, while a below-grace violation streak is instead HELD and RESUMES rather
+   than restarts once the node returns, proven both from one long absence and from many
+   short ones interleaved with matched reads; a matured violation fault survives a
+   departure, a node measured ACTIVE that vanishes raises nothing and is reclaimed, and the
+   two ``(UNREADABLE/NOT_MANAGED, ABSENT x N)`` restart-loop shapes are swept at the
+   absence grace and past it (their ``INACTIVE`` sibling pinned to the opposite claim at the
+   same two N: it never crosses grace from absence alone); the ``pending`` set and its
+   per-reason breakdown; new-first
    ordering for all three fault-shaped maps; the remote-supplied label's own trim budget
    ahead of the whole-detail backstop, reapplied to a matured unreadable node's detail
    (which carries no label, only a fqn and a "required by" list); the age horizon
@@ -725,8 +754,9 @@ overlapping - plus the shared-watcher seam the re-bind behaviour lives in:
    releases and its once-per-episode log line; the blink-plus-unread-re-seed sequence;
    a filler batch sized (from the real detail-building code) to exceed the 480-char cap
    aggregating into one fault with the fresh crossing named first; a PRESENT node crossing
-   on the same tick as a batch of departed ones being named ahead of them rather than
-   truncated away by them; a required node appearing mid-run; a re-bind under the same
+   grace fresh while a batch of already-departed, already-matured ones sits
+   absent-and-content, named ahead of them rather than truncated away by them; a required
+   node appearing mid-run; a re-bind under the same
    ``App::id``; and the reconfigure/config-validation edge cases. The unmeasured clock's own split is pinned directly,
    for BOTH codes symmetrically: a managed node whose ``GetState`` genuinely never
    answers (through ``set_managed_app`` and a real, failing seed - proven by asserting
@@ -744,8 +774,13 @@ overlapping - plus the shared-watcher seam the re-bind behaviour lives in:
    new-first ordering; an already-reported node of either cause KEEPING its own record
    once it vanishes, with its description switching to say the node has left the graph; a
    node returning from that absence staying reported with no clear/re-raise churn; each of
-   the three restart-loop shapes raising its own code, and the ``inactive``/``not-managed``
-   alternation across absence gaps; a withheld ``GRAPH_NODE_INACTIVE`` clear releasing when
+   the two UNMEASURED restart-loop shapes raising its own code from absence alone (their
+   ``INACTIVE`` sibling instead pinned to counting only real reads, never crossing from any
+   of the interleaved absence gaps), and the ``inactive``/``not-managed``
+   alternation across absence gaps now counting only the MEASURED not-active legs; a
+   below-grace streak surviving the tightest ``prune_grace`` without being confirmed while
+   the node stays absent, and resuming (not restarting) once it returns; a withheld
+   ``GRAPH_NODE_INACTIVE`` clear releasing when
    the absent node's clock MATURES into its sibling's content rather than when the node is
    given up on; the two wire strings pinned as hand-typed literals; and the independence
    claim in both directions.
@@ -761,9 +796,11 @@ overlapping - plus the shared-watcher seam the re-bind behaviour lives in:
    non-string entries each warning, the unclamped prune horizon reaching idle bookkeeping
    at exactly the configured ``prune_grace`` (0, 1 and 4 - the smallest positive value
    included, since neither documented endpoint sweeps it) while a node carrying evidence
-   survives it - including the ``grace: 0, prune_grace: 0`` corner and a wide ``grace``
-   beside the tightest ``prune_grace``, whose instrument is the CONFIRMATION rather than the
-   map size - ``tracked_node_cap`` validated at both range endpoints and one value past each
+   survives it - including the ``grace: 0, prune_grace: 0`` corner (an UNMEASURED clock, the
+   only kind that keeps climbing while absent) and a wide ``grace`` beside the tightest
+   ``prune_grace`` for a below-grace VIOLATION streak, whose instrument is that it is neither
+   confirmed nor pruned while the node stays absent, and resumes rather than restarts once it
+   returns - ``tracked_node_cap`` validated at both range endpoints and one value past each
    with the key proven IN FORCE at both ends, boundedness under identity churn at the real
    512-node cap by collapsing the departed rather than refusing the live node, and saturation
    reported once per EPISODE with a second episode reported again after the first ends.

@@ -60,14 +60,22 @@ constexpr int kDefaultGrace = 5;
 // that reports a node on its very first not-active tick, with no warning and no default.
 //
 // The upper end used to be INT_MAX - 1, which is not a wide tolerance but an off switch with
-// no warning attached. `grace` bounds two things at once: how long a node may read not-active
-// before being reported, AND how long a node that LEFT the graph while not-active sits in the
-// tracker's pending set - during which GRAPH_NODE_INACTIVE's clear is withheld for every
-// node, so the fault can neither raise nor heal for anybody. At INT_MAX - 1 that is roughly
-// 24 days at the shipped cadence; five minutes is already an extravagant allowance for a
-// managed node to reach `active`, and it makes the worst-case withhold something an operator
-// can reason about. A deployment that genuinely needs longer wants a slower tick, not a
-// detector that is silent for weeks.
+// no warning attached. `grace` bounds how long a node that STAYS IN THE GRAPH may read
+// not-active before being reported, and how long a node that returns from a departure still
+// inactive takes to (re-)mature - both advance on present ticks, which this value directly
+// caps. At INT_MAX - 1 that is roughly 24 days at the shipped cadence either way; five minutes
+// is already an extravagant allowance for a managed node to reach `active`, and it makes the
+// worst-case PRESENT withhold something an operator can reason about. A deployment that
+// genuinely needs longer wants a slower tick, not a detector that is silent for weeks.
+//
+// It does NOT bound a node that leaves the graph before its streak matures: absence holds a
+// below-grace streak rather than advancing it (see LifecycleExpectationTracker's own class
+// doc), so that entry sits in the tracker's pending set for as long as the node stays gone,
+// however long that is, independent of `grace`. That is not a new way to withhold
+// GRAPH_NODE_INACTIVE's clear for every OTHER node - the clear was already gated on every
+// required node's status being settled, so one node this indecisive already blocked it before
+// this bound existed. What changes is that the departure itself is GRAPH_NODE_DISAPPEARED's
+// evidence to report, not this detector's.
 constexpr std::int64_t kMaxGrace = 300;
 /// Consecutive ticks an entry must match ONLY unmanaged nodes before the typo warning
 /// fires. One transient tick is not evidence: discover_apps() wraps the per-node service

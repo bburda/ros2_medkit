@@ -35,9 +35,11 @@ inline constexpr int kDefaultNoMatchWarnTicks = 10;
 /// clocks start moving again. Inside this budget a node's whole state is simply HELD:
 /// zeroing it on the first blink would mean a node dropping out of one snapshot in every
 /// few never accumulates enough consecutive present ticks on either clock below to be
-/// reported at all. PAST this budget absence CONTINUES whatever the node's last real
-/// observation had started - it never restarts a clock and never discards one. See
-/// "Absence continues, it never erases" in LifecycleExpectationTracker's class doc.
+/// reported at all. PAST this budget absence still never DISCARDS a clock, but it may no
+/// longer be the one thing MOVING it either: an already-matured fault CONTINUES exactly as
+/// it did on its last present tick, while a violation streak that has not yet matured is
+/// simply held at whatever it already reached - only a present tick can still advance it.
+/// See "Absence continues, it never erases" in LifecycleExpectationTracker's class doc.
 inline constexpr int kDefaultAbsenceGrace = 3;
 
 /// Default bound on how many nodes this tracker keeps state for at once - the operator's
@@ -300,23 +302,33 @@ struct LifecycleExpectationReport {
 /// be measured at all. PAST `absence_grace` absence advances whichever clock the node's
 /// `NodeState::settled_observed` says it was on, and resets nothing:
 ///
-/// - settled kInactive: the violation streak keeps climbing, so a node measured not-active
-///   that then vanishes eventually raises GRAPH_NODE_INACTIVE about a node that is no
-///   longer there. That is the honest reading of the expectation the operator wrote: the
-///   node must be ACTIVE, it was not, and now it is gone. Any UNCORROBORATED unmeasured
-///   spell it had also started is dropped here rather than held: nothing is left to read,
-///   and a clock that can never mature would keep the entry non-idle - and therefore
-///   `pending` - for the life of the process.
+/// - settled kInactive, ALREADY REPORTED under GRAPH_NODE_INACTIVE (its streak past
+///   `grace`): the streak continues exactly as it did on its last present tick - frozen at
+///   `grace` + 1 either way, see advance_violation_streak's own "frozen one past itself" -
+///   so a node measured not-active and confirmed that then vanishes keeps its fault raised,
+///   still naming a node that is no longer there. That is the honest reading of the
+///   expectation the operator wrote: the node must be ACTIVE, it was not and was already
+///   said so, and now it is gone too.
+/// - settled kInactive, NOT YET REPORTED (streak at or below `grace`): the streak is HELD,
+///   neither advanced nor erased. Maturing it here would raise GRAPH_NODE_INACTIVE from
+///   ticks gathered while the node could not be observed at all - evidence the operator's
+///   own graph never witnessed. The entry keeps what it already earned, so a node that
+///   RETURNS still inactive resumes its streak rather than re-earning `grace` from zero;
+///   starting a NEW violation from a departure nobody could watch is the presence class's
+///   job (GRAPH_NODE_DISAPPEARED), not this one's.
+///
+///   Either way, any UNCORROBORATED unmeasured spell the node had also started is dropped
+///   here rather than held: nothing is left to read, and a clock that can never mature
+///   would keep the entry non-idle - and therefore `pending` - for the life of the process.
 /// - settled kUnreadable or kNotManaged: the unmeasured clock keeps climbing, under the
 ///   cause that observation set - absence carries no label, so it cannot change one.
 /// - settled kActive: nothing advances, and anything the node had started but not
 ///   corroborated is released, so the entry becomes idle and is reclaimed silently. An
 ///   entry that is already CONTENT (a matured unmeasured clock, or a streak past `grace`)
 ///   is never released - a departure heals nothing. Starting a NEW violation from a healthy
-///   departure is the presence class's job (GRAPH_NODE_DISAPPEARED), which still has no
-///   detector in this package and is still out of scope - the single remaining gap here,
-///   and a far narrower one than "a node absent past the grace is invisible whichever clock
-///   it was on".
+///   departure is the presence class's job (GRAPH_NODE_DISAPPEARED, this package's own
+///   node_death detector), not this class's - a far narrower boundary than "a node absent
+///   past the grace is invisible whichever clock it was on".
 ///
 /// **What "settled" means, and the alternatives rejected for it.** A real measurement
 /// (kActive or kInactive) settles IMMEDIATELY: a lifecycle label is a fact about the node,
@@ -350,17 +362,28 @@ struct LifecycleExpectationReport {
 /// ABSENT x N)` forever and never accumulate enough of anything to be reported, which is
 /// precisely the node this detector most exists to catch.
 ///
-/// **Bounded by evidence, not by age.** Since absence no longer erases anything, an entry
-/// carrying a live clock is never reclaimed by age either - the two are the same defect
-/// seen twice, and moving the horizon rather than removing it would leave the evasion in
-/// place at a different N. `prune_ticks` therefore reclaims only IDLE entries (both clocks
-/// zero, no matured ownership), which carry nothing to lose. What bounds the map instead is
-/// `tracked_node_cap`. A non-idle entry cannot grow without bound in time either way: past
-/// `absence_grace` its clock advances every tick, so it matures within at most
-/// `grace` + `absence_grace` + 1 ticks (violation) or `unmeasured_hold_ticks` +
-/// `absence_grace` + 1 (unmeasured) and is reported. Both bounds are why the detector caps
-/// the `grace` it accepts: they are also the longest GRAPH_NODE_INACTIVE's clear can be
-/// withheld by one departed node.
+/// **Bounded by evidence, not by age.** Since absence no longer erases anything a MATURED
+/// entry carries, that entry is never reclaimed by age - a departure must not heal what it
+/// cannot un-happen. `prune_ticks` therefore reclaims only IDLE entries (both clocks zero,
+/// no matured ownership, no live-but-unmatured streak), which carry nothing to lose. What
+/// bounds the map's SIZE instead is `tracked_node_cap`.
+///
+/// A node whose UNMEASURED clock is still climbing keeps the bound this class shipped with:
+/// past `absence_grace` it advances every tick regardless of maturity - that clock's own
+/// absence behaviour is unrelated to this slice, see the two unmeasured causes above - so it
+/// matures within at most `unmeasured_hold_ticks` + `absence_grace` + 1 ticks and is
+/// reported, which is also the longest GRAPH_NODE_UNREADABLE or GRAPH_NODE_NOT_MANAGED's
+/// clear can be withheld by one departed node.
+///
+/// A VIOLATION streak below `grace` has no such bound while its node stays gone: absence
+/// holds it rather than advancing it, so it neither matures nor becomes idle for as long as
+/// the node is away, however long that is. This is not a new way to withhold
+/// GRAPH_NODE_INACTIVE's clear - an aggregate, level-triggered fault already could not
+/// assert "every required node is healthy" while any one of them was unsettled, whether that
+/// unsettled node was HELD (`pending`) or climbing toward CONTENT (`affected`), so a node
+/// this indecisive already blocked the same clear before this design. What changes is only
+/// that GRAPH_NODE_INACTIVE never NAMES it: the node's departure is GRAPH_NODE_DISAPPEARED's
+/// evidence to report, not evidence gathered by watching an entry nobody could measure.
 ///
 /// **A present node always wins a slot.** At the cap the order is: reclaim IDLE entries
 /// (they carry nothing); then collapse DEPARTED entries - lexicographically last first,
@@ -532,12 +555,16 @@ class LifecycleExpectationTracker {
     }
 
     // Absence loop: every tracked node NOT matched this tick. Inside absence_grace_
-    // everything is HELD unchanged (a blink). Past it, absence CONTINUES whichever clock
-    // the node's last REAL observation had started, and resets nothing - see "Absence
-    // continues, it never erases" in the class doc. A node last measured kActive continues
-    // nothing: a healthy node shutting down is GRAPH_NODE_DISAPPEARED's business, which
-    // still has no detector in this package and stays out of scope. Only IDLE bookkeeping
-    // is reclaimed by age, because only an idle entry has nothing to lose.
+    // everything is HELD unchanged (a blink). Past it, absence resets nothing but no longer
+    // advances everything either - see "Absence continues, it never erases" in the class
+    // doc. A node last measured kInactive continues an ALREADY-matured violation exactly as
+    // it was, but a below-grace one is simply held, never matured on the strength of absence
+    // alone. A node last measured kUnreadable/kNotManaged keeps climbing its unmeasured
+    // clock regardless of maturity - that clock's own absence behaviour is unrelated to this
+    // slice. A node last measured kActive continues nothing: a healthy node shutting down is
+    // GRAPH_NODE_DISAPPEARED's business, which this package's node_death detector now
+    // covers. Only IDLE bookkeeping is reclaimed by age, because only an idle entry has
+    // nothing to lose.
     for (auto it = nodes_.begin(); it != nodes_.end();) {
       const std::string & fqn = it->first;
       NodeState & node = it->second;
@@ -555,7 +582,21 @@ class LifecycleExpectationTracker {
             // the node: there is nothing left to read, and a clock that can never mature
             // would keep this entry non-idle - and therefore `pending` - forever.
             node.unmeasured_clock = 0;
-            advance_violation_streak(node, fqn, crossed_violation);
+            // Keyed on whether the violation is already CONTENT (is_content(), which for a
+            // settled-kInactive node reduces to violation_streak > grace_: unmeasured_matured
+            // cannot be true here, since a real kInactive measurement always clears it a few
+            // lines above) - "has this node's violation already been reported", not "how many
+            // ticks has it accumulated". Already reported: absence continues it exactly like
+            // any other tick would - advance_violation_streak() no-ops past `grace` regardless
+            // (see its own "frozen one past itself") - so this call only documents that
+            // maturity, once earned, survives a departure. Not yet reported: maturing it here
+            // would raise GRAPH_NODE_INACTIVE from ticks gathered while nobody could observe
+            // the node, so the streak is left untouched - neither advanced (no fault is born
+            // from an absence) nor erased (a node that RETURNS still inactive resumes from
+            // here rather than re-earning `grace` from zero).
+            if (is_content(node)) {
+              advance_violation_streak(node, fqn, crossed_violation);
+            }
             break;
           case LifecycleObservedState::kUnreadable:
           case LifecycleObservedState::kNotManaged:
@@ -779,8 +820,12 @@ class LifecycleExpectationTracker {
   /// unmeasured clock STILL CLIMBING counts under its cause rather than being dropped:
   /// absence advances it every tick and nothing can reset it any more, so it would have
   /// matured under that cause within a bounded number of ticks anyway, and dropping it
-  /// instead would let freeing a slot heal a fault. An idle entry contributes nothing -
-  /// idle entries are reclaimed before this ever runs.
+  /// instead would let freeing a slot heal a fault. A violation streak counts only once it
+  /// has already matured (past `grace`), for the opposite reason: unlike the unmeasured
+  /// clock, absence does not keep advancing a streak that has not yet matured (see the
+  /// kInactive case in update()'s absence loop), so it would NOT have matured anyway - and
+  /// collapsing it as content would fabricate a violation the node never earned. An idle
+  /// entry, or a live-but-unmatured streak, contributes nothing.
   void count_collapsed(const NodeState & node) {
     if (node.unmeasured_matured || node.unmeasured_clock > 0) {
       if (node.cause == LifecycleUnmeasuredCause::kUnreadable) {
@@ -788,7 +833,7 @@ class LifecycleExpectationTracker {
       } else {
         ++collapsed_not_managed_;
       }
-    } else if (node.violation_streak > 0) {
+    } else if (node.violation_streak > grace_) {
       ++collapsed_inactive_;
     }
   }

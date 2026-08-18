@@ -1752,14 +1752,18 @@ TEST_F(LifecycleExpectationIntegrationTest, ANodeCrossingAfterTheCapIsFullIsName
 // broke - and the operator is then told about the one that is gone instead of the one that
 // needs attention.
 //
-// Paced so both crossings land on one tick: the departed batch is measured not-active once
-// and then vanishes, its streaks resuming past the 3-tick absence grace, while the present
-// node starts its own streak exactly late enough that the two reach `grace + 1` together. The
-// batch is sized by fill_count_past_cap from the REAL detail builder, so its details alone
-// exceed the 480-char cap - which is what makes "which one is named" a real choice rather
-// than a cosmetic ordering, and the present node's id sorts LAST among them all.
+// Past R10, a departed node can no longer cross INTO GRAPH_NODE_INACTIVE from a below-grace
+// streak (see the tracker's own class doc), so "both cross on the same tick" is no longer a
+// reachable shape for this fault - a departed entry only ever carries content it EARNED
+// before it left. What is still reachable, and still the real question, is whether a node
+// that just broke is named ahead of a pile of nodes that broke earlier and left: the departed
+// batch matures FIRST while present, THEN leaves for good, THEN present_id joins and crosses
+// grace fresh, on its own tick, while the batch is still absent-and-content. The batch is
+// sized by fill_count_past_cap from the REAL detail builder, so its details alone exceed the
+// 480-char cap - which is what makes "which one is named" a real choice rather than a
+// cosmetic ordering - and the present node's id sorts LAST among them all.
 TEST_F(LifecycleExpectationIntegrationTest, PresentNodeCrossingWithDepartedOnesIsNamedAheadOfThem) {
-  constexpr int kGrace = 5;
+  constexpr int kGrace = 1;
   std::vector<std::string> departed_ids;
   const std::size_t departed_count = fill_count_past_cap("g", departed_ids);
   ASSERT_GT(departed_count, 1u);
@@ -1783,19 +1787,27 @@ TEST_F(LifecycleExpectationIntegrationTest, PresentNodeCrossingWithDepartedOnesI
     gate.set_lifecycle_state_for_test(id, "inactive");
   }
 
-  // Tick 1: the soon-to-depart batch is measured not-active (streak 1). The present node is
-  // not in the graph yet, so it is not tracked at all.
+  // The departed batch matures FIRST, on its own: present_id is not in the snapshot yet.
   set_apps(departed_ids);
-  det->tick(ctx);
-  // Ticks 2-3: everything absent. Inside the 3-tick absence grace, so the batch's streaks are
-  // simply held.
-  set_apps({});
-  det->tick(ctx);
-  det->tick(ctx);
+  for (int i = 0; i < kGrace + 1; ++i) {
+    det->tick(ctx);
+    std::this_thread::sleep_for(5ms);
+  }
+  std::this_thread::sleep_for(200ms);
+  ASSERT_TRUE(any_failed_desc_contains(kGraphSource, departed_ids.front()))
+      << "the departed batch never matured, so nothing below tests what an ALREADY-CONTENT entry "
+         "does once it leaves - only what a fresh crossing does";
 
-  // Ticks 4-9: only the present node is in the graph, reading not-active. Its streak runs
-  // 1..6 across these six ticks; the batch's absence passes the grace on tick 5 and its
-  // streaks resume 2..6 across ticks 5-9. Both reach grace + 1 on tick 9 - the same tick.
+  // The batch leaves for good, past the absence grace. It is already matured, so absence
+  // continues it unconditionally - "has since left the graph" and all.
+  set_apps({});
+  for (int i = 0; i < kDefaultAbsenceGrace + 2; ++i) {
+    det->tick(ctx);
+    std::this_thread::sleep_for(5ms);
+  }
+
+  // present_id joins and crosses grace fresh, on its own tick, while the departed batch is
+  // still absent-and-content.
   const auto failed_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
   set_apps({present_id});
   for (int i = 0; i < kGrace + 1; ++i) {
@@ -1803,7 +1815,7 @@ TEST_F(LifecycleExpectationIntegrationTest, PresentNodeCrossingWithDepartedOnesI
     std::this_thread::sleep_for(5ms);
   }
   ASSERT_TRUE(wait_for_count(kGraphSource, ReportFault::Request::EVENT_FAILED, failed_before + 1))
-      << "nothing crossed at all, so this test never reached the tick it is about";
+      << "present_id never crossed grace, so this test never reached the tick it is about";
   std::this_thread::sleep_for(300ms);
 
   const std::string desc = last_failed_description(kGraphSource);
@@ -1812,6 +1824,10 @@ TEST_F(LifecycleExpectationIntegrationTest, PresentNodeCrossingWithDepartedOnesI
       << "the PRESENT node that crossed on this very tick was truncated out of the description by "
          "nodes that had already left the graph - the operator is told about the departures and not "
          "about the node that just broke. Full description: "
+      << desc;
+  ASSERT_NE(desc.find(departed_ids.front()), std::string::npos)
+      << "the departed batch left no trace at all, so the ordering claim below would be vacuous - its "
+         "evidence must survive the departure, just behind present_id. Full description: "
       << desc;
   EXPECT_LT(desc.find(present_id), desc.find(departed_ids.front()))
       << "the present node is named, but behind a departed one - a departure is never more urgent "
@@ -3168,11 +3184,15 @@ TEST_F(LifecycleExpectationIntegrationTest, NotManagedNodeInARestartLoopIsStillR
          "never raised GRAPH_NODE_NOT_MANAGED";
 }
 
-// The pair no test at any tier covered: a MEASURED not-active read alternating with a
-// NOT-MANAGED one, the two separated by absence runs longer than the absence grace. Driven
-// through the REAL gate rather than the injection seam, which can only ever SET a label and
-// never remove tracking: toggling whether "a" carries GetState/ChangeState services is what
-// produces a genuine nullopt for a previously-tracked fqn.
+// A MEASURED not-active read alternating with a NOT-MANAGED one, the two separated by
+// absence runs longer than the absence grace. Driven through the REAL gate rather than the
+// injection seam, which can only ever SET a label and never remove tracking: toggling
+// whether "a" carries GetState/ChangeState services is what produces a genuine nullopt for a
+// previously-tracked fqn. Past R10, neither the not-managed legs (which never touch the
+// violation streak) nor the absence gaps (which hold a below-grace streak rather than
+// advancing it) contribute anything on their own - only the repeated MEASURED not-active
+// legs do, one real tick at a time - so this still raises, from real evidence accumulated
+// across several cycles of presence rather than from any of the gaps in between.
 TEST_F(LifecycleExpectationIntegrationTest, InactiveAlternatingWithNotManagedAcrossAbsenceGapsRaisesInactive) {
   set_apps({});
   ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
@@ -3263,6 +3283,15 @@ TEST_F(LifecycleExpectationIntegrationTest, HealthyNodeThatVanishesRaisesNothing
   EXPECT_EQ(det->tracked_count_for_test(), 0u) << "an idle entry for a departed healthy node was never reclaimed";
 }
 
+// Unlike its UNREADABLE and NOT-MANAGED siblings above, GRAPH_NODE_INACTIVE no longer treats
+// this shape as an evasion to close on its own: past R10, absence contributes nothing to a
+// below-grace violation streak (see the tracker's own class doc), so a node that is inactive
+// for one tick and then gone for a run, forever, only accumulates evidence from its PRESENT
+// ticks - one per cycle here. It is still eventually reported, because it really was measured
+// not-active repeatedly; it just now takes grace + 1 cycles of presence rather than grace + 1
+// ticks of any kind. Closing the evasion in the ABSENCE itself is GRAPH_NODE_DISAPPEARED's job
+// now (this package's own node_death detector), not this streak leaning on a departure it
+// cannot corroborate.
 TEST_F(LifecycleExpectationIntegrationTest, InactiveNodeInARestartLoopIsStillReported) {
   set_apps({"a"});
   ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
@@ -3892,16 +3921,15 @@ TEST(LifecycleExpectationConfig, LiveClockIsNotErasedAtTheTightestGraceAndPruneG
 }
 
 // The combination the old clamp existed for - a wide `grace` next to the tightest
-// `prune_grace` - is now simply safe: a node still climbing toward that wide grace is
-// carrying evidence, so the hair-trigger prune horizon never reaches it, and it goes on to
-// be confirmed at exactly the tick it would have been confirmed at anyway.
-//
-// The instrument is the CONFIRMATION, not the map size. A map size of 1 is satisfied by an
-// implementation that keeps the entry but freezes its clock through absence - which is the
-// bug that makes a node vanishing while not-active permanently invisible, i.e. exactly the
-// thing this test is named for. It is a fixture test rather than a bare configure()-level one
-// for that reason: only the fake ReportFault sink can see the raise.
-TEST_F(LifecycleExpectationIntegrationTest, WideGraceWithTheTightestPruneGraceStillConfirmsAVanishedNode) {
+// `prune_grace` - is where a below-grace streak's two guarantees have to meet: it must not be
+// reclaimed as IDLE (it is not - violation_streak != 0 - even though it is small), and past
+// R10 it must not be silently matured by the absence run either (only a present tick may
+// still advance it - see the tracker's own class doc). So the entry survives, HELD, exactly
+// where it was: never confirmed while the node stays gone, never pruned either, and ready to
+// resume - not restart - the moment the node returns. It is a fixture test rather than a bare
+// configure()-level one because only the fake ReportFault sink can see the (absence of a)
+// raise.
+TEST_F(LifecycleExpectationIntegrationTest, BelowGraceStreakSurvivesTheTightestPruneGraceWithoutConfirmingWhileAbsent) {
   set_apps({"a"});
   ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
   arm_global_grace(gate);
@@ -3918,18 +3946,38 @@ TEST_F(LifecycleExpectationIntegrationTest, WideGraceWithTheTightestPruneGraceSt
   std::this_thread::sleep_for(200ms);
   ASSERT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
       << "the node was confirmed on its first not-active tick, so grace(4) was never in force and "
-         "the absence run below proves nothing about a clock that has to keep climbing";
+         "the absence run below proves nothing about a below-grace streak";
 
-  // "a" vanishes with a streak of 1 out of 4. Absence must go on advancing it, so it is
-  // confirmed while GONE - and the tightest prune horizon must not reach it on the way.
+  // "a" vanishes with a streak of 1 out of 4, at the tightest prune_grace (0) - an IDLE entry
+  // would be reclaimed on the very next absent tick.
   set_apps({});
-  ASSERT_TRUE(poll_for_new(kGraphSource, ReportFault::Request::EVENT_FAILED, failed_before, *det, ctx))
-      << "a node that left the graph with a streak below a wide grace was never confirmed at all - "
-         "its clock was frozen or its entry pruned while absent, so a node that vanishes while "
-         "not-active is permanently invisible";
-  EXPECT_EQ(det->tracked_count_for_test(), 1u)
-      << "the entry was pruned by the tightest prune_grace despite carrying evidence";
-  EXPECT_TRUE(any_failed_desc_contains(kGraphSource, "has since left the graph"))
-      << "the confirmation did not say the node had left the graph, so an operator is sent looking "
-         "for a node that is no longer there";
+  for (int i = 0; i < 20; ++i) {
+    det->tick(ctx);
+    std::this_thread::sleep_for(5ms);
+  }
+  std::this_thread::sleep_for(200ms);
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
+      << "GRAPH_NODE_INACTIVE was confirmed from a below-grace streak while the node was absent the "
+         "whole time - a fault born from evidence gathered while nobody could observe the node";
+  ASSERT_EQ(det->tracked_count_for_test(), 1u)
+      << "the entry was reclaimed by the tightest prune_grace despite carrying a live (if below-grace) "
+         "streak - is_idle() must not treat a non-zero streak as nothing to lose";
+
+  // It resumes rather than restarts: held at 1, three more present ticks reach grace(4), the
+  // fourth crosses it - due on that exact tick and no later, so a streak that had restarted
+  // from zero (needing a fifth) would still read grace here, not past it.
+  set_apps({"a"});
+  for (int i = 0; i < 3; ++i) {
+    det->tick(ctx);  // resumed streak 2, 3, 4 (== grace, not past it)
+    std::this_thread::sleep_for(5ms);
+  }
+  std::this_thread::sleep_for(200ms);
+  ASSERT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
+      << "resumed streak reached grace(4) but was already confirmed one tick early";
+  det->tick(ctx);  // resumed streak 5 > grace: due on this exact tick
+  EXPECT_TRUE(wait_for_count(kGraphSource, ReportFault::Request::EVENT_FAILED, failed_before + 1))
+      << "resumed streak 5 > grace(4) was not confirmed on this exact tick - the streak restarted "
+         "from zero on return instead of resuming where the absence had held it";
+  EXPECT_TRUE(any_failed_desc_contains(kGraphSource, "a"))
+      << "the confirmation did not name the node once it finally raised";
 }
