@@ -10,10 +10,11 @@ and is driven by the plugin's own executor from the tick thread, never by the ga
 ROS executor.
 
 This package carries the plugin skeleton, the central reliability gate that holds raises
-until the graph has quiesced, and four detectors, `qos_mismatch`, `orphan`,
-`param_drift` and `lifecycle_expectation`. The remaining
-silent-fault classes land in follow-up changes, each against its own issue; their fault
-codes are already reserved in the frozen `GRAPH_*` namespace (see "Fault codes").
+until the graph has quiesced, and five detectors, `qos_mismatch`, `orphan`,
+`param_drift`, `lifecycle_expectation` and `node_death`. Two silent-fault classes remain
+undelivered, `GRAPH_TF_STALE` and `GRAPH_LATENCY_BUDGET`; they land in follow-up changes,
+each against its own issue, and their fault codes are already reserved in the frozen
+`GRAPH_*` namespace (see "Fault codes").
 
 ## Build
 
@@ -56,6 +57,62 @@ id itself is warned about the same way, with the registered ids listed.
 | `grace` | int | `5` | Consecutive not-active ticks a required node tolerates before being reported inactive - bringup time for a managed node to reach `active` (configure + activate) before the expectation is enforced. Counted per NODE, not per matching entry: a node named by both a bare-name and a full-FQN entry still advances its streak once per tick, so mixing the two documented forms cannot halve the grace that was configured. An ALREADY-CONFIRMED streak keeps its content while the node is ABSENT, so a node that leaves the graph after being confirmed stays confirmed; a streak that has not yet crossed `grace` is HELD rather than advanced while absent, so a node is never confirmed out of ticks gathered while nobody could observe it - only a PRESENT tick may still cross `grace`. Accepted range 0..300 - five minutes at the shipped 1 s cadence, and already an extravagant allowance for a managed node to reach `active`. The upper end is a real bound rather than a formality: `grace` decides how long a PRESENT node may go unreported, and how long a node returning from a departure still inactive takes to (re-)mature, so at the old maximum of `INT_MAX - 1` that PRESENT-side silence lasted about 24 days at the shipped cadence with no warning. It does NOT bound how long a node that leaves the graph BELOW `grace` sits unsettled - that lasts for as long as the node stays gone, independent of `grace` (see "Bounded by evidence, not by age" below). The check runs on the wide integer, so a value that only fits after truncation is rejected rather than silently turned into a hair-trigger. Anything outside the range warns and keeps the default. |
 | `prune_grace` | int | `60` | Consecutive ticks an IDLE tracked node - both clocks at zero and no matured ownership, so nothing to lose - may stay ABSENT from the graph before its bookkeeping is reclaimed. A node carrying evidence is never reclaimed by age at all, however long it stays gone, so this key cannot erase a fault's own state; the map is bounded instead by `tracked_node_cap` (see "Bounded by evidence, not by age"). Injected for every detector at plugin scope and overridable per detector; a value outside 0..3600 warns and this detector keeps its own default of 60. The range check runs on the wide integer, so an out-of-int-range value is rejected rather than truncated. The value is used as written - there is no `grace + 1` clamp, because there is no longer anything for one to protect. |
 | `tracked_node_cap` | int | `512` | The most nodes this detector keeps bookkeeping for at once. It is what bounds the map, since evidence is never reclaimed by age (see "Bounded by evidence, not by age"): at the cap, idle entries are reclaimed first, then entries for DEPARTED nodes are collapsed into a count, and only if every tracked node is PRESENT and carrying evidence is a newly matched node refused - which withholds `GRAPH_NODE_INACTIVE`'s clear and is reported both in the log and on `GET /x-medkit-watchdog`. 512 is comfortably above every node in a realistic graph (a full Nav2 stack plus perception is roughly a hundred nodes; a ten-robot fleet sharing one domain a few hundred), so raising it is only needed where `require_active` legitimately matches more PRESENT nodes than that. Accepted range 1..16384 - 16384 is about 8 MB of bookkeeping at roughly 500 bytes per tracked node, and a deployment needing more distinct required-node identities alive at once has identity churn rather than a large fleet. Anything outside the range, including 0 (a cap of nothing would mean checking nothing), warns and keeps the default; the check runs on the wide integer, so an out-of-int-range value is rejected rather than truncated. |
+
+### `node_death` keys
+
+Zero-config, unlike every detector above: there is no `require_active`-style list of nodes
+to watch, because every armed App in the graph is a candidate.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `mode` | string \| bool | `raise` | As above. |
+| `miss_grace` | int | `2` | Consecutive missed ticks a tracked node tolerates before being reported dead - a death is reported once misses EXCEED this, i.e. after `miss_grace + 1` ticks. Accepted range 0..3600, and additionally floored to whatever wall-clock window the configured `tick_interval_ms` needs (see "The wall-clock floor" below); a value below that floor is silently raised to it, with a warning naming the ms window it actually spans. |
+| `prune_grace` | int | `60` | Plugin-injected default (overridable here); how long a key being DURABLY suppressed (see "Suppression" below) may sit unreported before its bookkeeping is reclaimed. Accepted range 0..3600. The value actually used is `max(prune_grace, miss_grace + 1)`, a silent internal floor rather than a rejection: without it, a durably-suppressed key could be reclaimed the very tick it would first have become eligible to report, losing the report rather than merely suppressing it. |
+| `allowlist` | string[] | `[]` | Node identities never reported dead. A dead key matches if it - or a name the same node is also known by - is present verbatim: the key's own fqn, its bare leaf, or (captured while the node was still present) its `App::id`. Has no effect unless named in `suppress`; naming it without a configured list is a no-op. |
+| `suppress` | string[] | `[]` | Suppression mechanisms to activate: `"allowlist"` and `"lifecycle"`. Any other entry warns as unrecognized and is ignored; a non-string or non-array entry warns the same way. |
+| `tracked_node_cap` | int | `512` | The most node identities this detector keeps bookkeeping for at once. Accepted range 1..16384; `0` is refused rather than clamped, since a cap of nothing would mean tracking nothing. See "Bounded by evidence, not by age" below for the eviction order - and for why, unlike the sibling detector's identical-looking cap, this one can never actually refuse a newcomer. |
+
+`tick_interval_ms` is not an own key of this detector, but this is the one detector that
+reads the plugin-injected value directly, to compute `miss_grace`'s wall-clock floor below.
+
+**Liveness, and why membership in the snapshot is not enough.** `App::is_online` is what
+this detector tracks, never mere presence in the entity snapshot. In runtime-only discovery
+the two happen to coincide - a dead node's App leaves the snapshot entirely - but a manifest
+keeps a bound App present with only `is_online` cleared once its ROS binding disappears, and
+hybrid discovery inherits that same shape; counting snapshot membership alone would make a
+manifest-declared node immortal. A managed lifecycle node that merely deactivates keeps
+`is_online: true` - its process is still running, only its ROS 2 lifecycle state changed -
+so a deactivation is never mistaken for a death either; that is `lifecycle_expectation`'s
+concern, not this one's (see "The boundary with `lifecycle_expectation`" below).
+
+Tracking is keyed on the STABLE fqn (`App::effective_fqn()`), never `App::id`: an id is
+recomputed every sweep and only gains a namespace prefix once a same-bare-name collision
+currently exists anywhere in the graph, so a live node's id can change out from under a key
+built from it.
+
+**What is never tracked.**
+
+| Excluded | Why |
+|---|---|
+| Peer-aggregated apps (`app.source` starting `peer:`) | A peer app carries no ROS binding of its own, so `effective_fqn()` is empty for every one of them; tracking them would collapse an entire peer fleet onto one `""` key, and one online peer app would mask every other peer app's departure. |
+| `_ros2cli_<pid>` nodes | Every `ros2` CLI invocation (`ros2 topic echo`, `ros2 param get`, ...) spins up a real, short-lived node under this prefix - rcl's own hidden-node naming convention, matched structurally rather than guessed at. Letting these through would accumulate one permanently "dead" entry per CLI invocation for the life of the gateway. |
+| An App that never comes online | A key is admitted to tracking only once it has been armed by the reliability gate at least once. A manifest App whose binding never starts is never armed and so can never be falsely called dead; a node still inside its `warmup_cycles` window gets the identical protection. Once tracked, though, a node's continued life-or-death judgement rests on PRESENCE alone, not on staying armed - a tracked node that later goes lifecycle-inactive is not thereby mistaken for dead. |
+
+Composable/component nodes hosted in one process die together: if the container process
+dies, every node it hosted leaves the snapshot on the same tick, and all of them are named in
+the one aggregated fault rather than raising one fault each.
+
+**The wall-clock floor on `miss_grace`.** The entity snapshot a tick reads is not rebuilt
+every tick: runtime discovery rebuilds it off a graph event debounced to about one refresh
+per second, so several consecutive ticks between two refreshes see the IDENTICAL snapshot. A
+`miss_grace` counted purely in ticks does not count independent samples of the graph -
+shorten `tick_interval_ms` enough and one stale cache generation gets re-counted as several
+misses. The floor raises `miss_grace`, for the configured `tick_interval_ms`, to the
+smallest value whose `(miss_grace + 1) * tick_interval_ms` window is still at least 3000 ms -
+one graph-cache refresh cycle plus margin. At the shipped 1000 ms tick the floor is exactly
+the shipped default (`miss_grace: 2`), so the default configuration is unaffected; only a
+faster-than-default tick ever raises the effective grace, and it does so with a warning
+naming the window it actually spans.
 
 ### `orphan` keys
 
@@ -603,8 +660,8 @@ lifecycle state (`inactive`/`unconfigured`/`finalized`), or its lifecycle promis
 not be MEASURED at all - a managed node whose label has never been read, or a node with
 no tracked lifecycle whatsoever. On a Nav2 stack a `controller_server` stuck inactive
 means the robot silently will not act - no crash, no log, nothing on `/diagnostics` or
-`/rosout`. Presence itself is a different fault class (`GRAPH_NODE_DISAPPEARED`, reserved
-in the frozen namespace for a follow-up change): this detector only ever STARTS reporting a
+`/rosout`. Presence itself is a different fault class (`GRAPH_NODE_DISAPPEARED`, this
+package's own `node_death` detector): this detector only ever STARTS reporting a
 node it has measured while PRESENT. A node that leaves the graph having only ever been
 measured healthy is left entirely to the presence class - but one that leaves while already
 under one of these three faults keeps it, because a node the operator declared must-be-
@@ -1232,6 +1289,210 @@ still fit inside the 480-char cap (`3 * 150 + 2 * 2 = 454 <= 480`).
    crash loop is the case this detector most exists to catch, and it is the one that a
    design discarding evidence on absence makes permanently silent.
 
+#### `node_death` (GRAPH_NODE_DISAPPEARED)
+
+Watches every armed App in the graph for one that goes offline, and raises
+`GRAPH_NODE_DISAPPEARED` naming it. Zero-config, unlike `lifecycle_expectation`'s
+operator-declared `require_active` list: every armed App is a candidate. See the
+`node_death` key table and the "Liveness", "What is never tracked" and "The wall-clock
+floor on `miss_grace`" notes above the `orphan` key table for what counts as alive, what
+this detector never tracks, and why `miss_grace` has a floor - none of that is repeated
+here.
+
+**Suppression.** Nothing is suppressed unless the operator names the mechanism in
+`suppress` - a configured `allowlist` that `suppress` does not name has NO effect, and a
+startup warning says so. Two mechanisms exist, activated independently of each other:
+
+| Name | Mechanism | Durable |
+|---|---|---|
+| `"allowlist"` | `AllowlistSuppressor` over the configured `allowlist` set - the same three-way match (fqn, bare leaf, `App::id`) `lifecycle_expectation`'s `require_active` uses, so an operator who has one working can expect the other to accept the same shapes. Exact match only, never a prefix or a shared suffix. | Yes |
+| `"lifecycle"` | `LifecycleShutdownSuppressor` - suppresses a departure that the reliability gate classifies as a clean managed-lifecycle shutdown. See "Clean-shutdown suppression" below for what counts as clean. | Yes |
+
+Every field is re-validated from scratch on every `configure()` call: a malformed
+`allowlist` entry, an unrecognized `suppress` name, or a `suppress`/`allowlist` entry of the
+wrong type each produce their own named warning rather than being silently dropped. A
+candidate is suppressed the moment ANY active mechanism votes yes, order-independent -
+which one runs first never changes the result. Suppression is independent of `mode`: a
+suppressed key never becomes content in the first place, while `mode` separately decides
+whether non-suppressed content is actually sent (`advisory` observes without sending,
+`off` disables).
+
+**Durability, and why only a durable veto may reclaim bookkeeping.** Whether a suppressor is
+durable answers whether its "yes" is a standing fact about the key rather than a condition
+that can later stop holding. Both mechanisms here are durable: an operator-declared allowlist
+entry does not start matching and then stop on its own, and a departure's observed shutdown
+shape does not change after the fact. Durability is what makes reclaiming a suppressed key's
+tracker bookkeeping (`prune_grace` consecutive suppressed ticks) sound - a NON-durable veto
+could lift later even after its key's bookkeeping was discarded, leaving a live, unsuppressed
+death with nothing left to report it: a false heal that silently outlives the very condition
+that produced it. A durable veto never lifts for a given key once it has fired, so reclaiming
+under it loses nothing. Durable defaults to false, the safe assumption for a suppressor
+nobody has reasoned about yet; both suppressors here override it explicitly to true.
+Reclaiming is re-checked against the durable suppressors specifically, never merely "no
+longer in this tick's report", because a key can be dropped from a tick's report by ANY
+suppressor in the chain while a durable one also happens to cover it - whether a key may be
+reclaimed depends on WHICH suppressor vetoed it, not on whether it survived the filter.
+
+**Clean-shutdown suppression - what counts as clean.** `LifecycleShutdownSuppressor` reads
+the lifecycle watcher's cached label for the departed node's LAST observed transition:
+
+| Last observed label | Suppressed? |
+|---|---|
+| `shuttingdown` | Yes - only reachable via a deliberate SHUTDOWN transition, so the label alone is enough. |
+| `finalized`, with an observed transition and never through the error branch | Yes. |
+| `finalized`, with no observed transition, or reached through the error branch | No. |
+| `unconfigured` | No, deliberately - it is also the resting state of a node whose `configure()` failed or that never activated at all, and suppressing on it would hide exactly that startup failure. |
+| Any other label, or no departure on record at all | No (abstains). |
+
+`finalized` needs the extra corroboration because it is also where a node's `on_error`
+override lands after `ON_ERROR_FAILURE`/`ON_ERROR_ERROR` out of `errorprocessing` - the
+standard way a driver reports a hardware fault it cannot recover from, which is precisely the
+death an operator needs reported, not silenced. Without an observed transition history the
+departure is unclassified and stays reported - the safe direction. This mechanism is
+stateless by construction: a detector's `configure()` (where the suppressor chain is built)
+runs before any per-tick context exists, so it stores nothing at construction and reads the
+gate fresh on every call. Its retention window is not this detector's own to size, either:
+before this detector's own `configure()` has run, the plugin predicts the same
+`prune_ticks_` (`max(prune_grace, miss_grace + 1)`) this detector will compute, then sizes
+the lifecycle watcher's departed-node retention from it with enough margin that a
+clean-shutdown label is still cached at this detector's own reclaim tick, one tick to
+spare - see `GraphWatchdogPlugin::compute_departed_retention_ticks()` for the exact
+arithmetic, which is larger than `prune_ticks_` alone.
+
+**Bounded by evidence, not by age.** This detector is zero-config over every armed App in
+the graph - a strictly larger scope than `lifecycle_expectation`'s named `require_active`
+set - so identity churn (nodes reappearing under ever-new names, one per run or per
+namespace) would grow the tracker's map without a bound if nothing capped it. An
+unsuppressed, still-dead entry is never reclaimed by age - `prune_grace` is the only reclaim
+path there is, and it only ever applies to a durably-suppressed key - so `tracked_node_cap`
+is what actually bounds memory. At the cap: idle entries (present, carrying no evidence) are
+evicted first - free, since a still-armed one is simply re-tracked a moment later - then
+departed entries are collapsed into one synthetic count, keeping at most three individually
+named, and only if even that leaves no room is every departed entry collapsed.
+
+Unlike `lifecycle_expectation`'s identical-looking cap, this one cannot actually refuse a
+newcomer. `LifecycleExpectationTracker` carries two clocks per node, so a node can be
+simultaneously present and mid-violation - neither idle nor departed, and so un-evictable -
+which is what lets its cap genuinely saturate and withhold `GRAPH_NODE_INACTIVE`'s clear.
+`NodeLivenessTracker` carries exactly one piece of per-key state (a miss count), so every
+tracked identity is always either idle or departed; collapsing every departed entry always
+empties enough room, so a newcomer is never actually refused while the cap is at least 1.
+`tracking_saturated` and `tracked_node_cap` still appear in this detector's own
+`GET /x-medkit-watchdog` block, in the same shape the sibling reports them, but the field is
+never observed true here - the shared shape exists for consistency with the sibling
+detector, not because saturation is reachable in this one.
+
+**The boundary with `lifecycle_expectation`.** `GRAPH_NODE_INACTIVE` and
+`GRAPH_NODE_DISAPPEARED` can both be raised for the same node at the same time, and that is
+CORRECT, not a defect this detector removes: `GRAPH_NODE_INACTIVE` says a required node is
+present but not active, `GRAPH_NODE_DISAPPEARED` says a node is gone, and an operator facing
+each has a different repair - reactivate it, or find out why it left. A node CONFIRMED
+`GRAPH_NODE_INACTIVE` that then departs keeps that fault (its description switches to say
+the node has since left the graph) AND now also raises `GRAPH_NODE_DISAPPEARED`, since this
+detector tracks every armed App independently of whatever `lifecycle_expectation` thinks of
+it.
+
+What changed is narrower than that. Before this detector existed,
+`lifecycle_expectation`'s own violation streak let a SUSTAINED absence mature an unconfirmed
+(below-`grace`) streak into a confirmed `GRAPH_NODE_INACTIVE` - the only way a node stuck in
+a restart loop, never observed long enough to cross `grace` while present, would ever be
+reported at all. Now that this detector independently reports every such departure, that
+absence-alone maturity is gone: absence CONTINUES a violation that has already matured past
+`grace` (the fault stays raised, still naming the node), but no longer CREATES one that has
+not. A node that was briefly non-active and then died is reported as gone
+(`GRAPH_NODE_DISAPPEARED`) rather than also acquiring an inactive fault born from ticks
+gathered while nobody could observe it. See `lifecycle_expectation`'s own "Absence continues
+the last CORROBORATED observation, it never erases" section above for the mechanism.
+
+**Repeated failures: what `occurrence_count` and the captured evidence answer, and don't.**
+An operator asking "how many times did this node die in the last hour" reads it off the
+fault record itself, not off this detector: `GRAPH_NODE_DISAPPEARED`'s own
+`occurrence_count` (`GET /api/v1/apps/graph_watchdog/faults`, or the scoped
+`GET /api/v1/apps/graph_watchdog/faults/GRAPH_NODE_DISAPPEARED`) starts at 1 on the first
+raise and increments by exactly one each time a FAILED report reactivates a record that was
+CLEARED - never merely re-raised while still CONFIRMED, and never merely HEALED. Healing
+(the fault manager's debounce counter crossing `healing_threshold` on clean sweeps, see
+"Closing the loop" above) and clearing are different things: `DELETE
+/api/v1/apps/graph_watchdog/faults/GRAPH_NODE_DISAPPEARED` - the fault manager's own
+`~/clear_fault` underneath - is what acknowledges an occurrence and closes its cycle. A
+still-CONFIRMED, or still-HEALED-but-unacknowledged, fault that fires FAILED again is the
+SAME occurrence continuing, not a new one, so restarting the dead node fast enough to heal it
+before anyone acknowledges it will not move the count.
+
+The honest limits, read off this branch's fault-manager storage rather than assumed: the
+per-fault rosbag store enforces `fault_code` as UNIQUE, so a fault can hold at most one
+recording at a time - a later confirmation's capture replaces the earlier one on disk rather
+than accumulating a history. The freeze frame is the same shape: one row per `fault_code`,
+overwritten on every capture, so a fifth occurrence's captured values overwrite the first's.
+What survives every occurrence by default is the count itself; a hash-chained record of
+every raise/clear/heal transition also exists, but only once the fault manager's own
+`audit_log.enabled` is turned on, which it is not by default. Recordings and the freeze
+frame do not accumulate a per-occurrence history either way.
+
+**Test tiers.**
+
+1. **Unit**: `test_node_liveness_tracker.cpp` pins the pure presence/absence state machine -
+   a key present but never armed is never tracked; once armed, presence alone (not
+   continued arming) keeps a tracked key's miss counter at zero; a key is reported dead only
+   once misses exceed `miss_grace`; freshness ordering keeps a brand-new death out of a
+   capped description's blind spot; `prune()` reclaims a key only once it has been
+   suppressed for MORE than `prune_ticks` CONSECUTIVE calls, resets the streak the moment a
+   veto lifts even once, and never reclaims an unsuppressed death no matter how long it
+   stays dead; the cap evicts idle entries before collapsing departed ones, keeps the
+   collapsed count monotone within one tracker lifetime, and - the property most at odds
+   with a naive read of the sibling detector - can never actually report
+   `tracking_saturated` at all, because every tracked key here is always either idle or
+   collapsible, never both at once the way the sibling's two clocks allow. `test_suppressor.cpp`
+   pins the `Suppressor` interface (`durable()` defaults false) and the free
+   `apply_suppressors()` helper (order-independent, null-safe, returns the dropped count) -
+   this detector's own filtering is hand-inlined rather than a call to that helper, because
+   it layers an id-form check the helper's plain string-keyed signature cannot express.
+   `test_allowlist_suppressor.cpp` and `test_lifecycle_shutdown_suppressor.cpp` pin each
+   suppressor's own matching rules independently of any detector.
+2. **Integration** (`test_node_death_integration.cpp`): the full config contract
+   (`miss_grace`, `prune_grace` and `tick_interval_ms` range checks and their floor
+   interaction; malformed `allowlist`/`suppress` entries; `tracked_node_cap` range checks,
+   including a value far past `INT_MAX` rejected rather than wrapped; an unknown top-level
+   key), that a peer-aggregated app and an `is_online: false` app are never tracked, that
+   the tracked count stays bounded and shrinks after a reclaim under sustained identity
+   churn (and, without any suppression configured at all, that `tracked_node_cap` still
+   bounds memory under unsuppressed churn while the fault stays raised), that a clean
+   managed-lifecycle departure is suppressed exactly AT the `miss_grace` boundary and stays
+   reclaimed - not re-raised - past the retention window the plugin sizes for it, that the
+   allowlist's id-form suppresses only the colliding node and not its namesake, and the
+   ungated-clear guard's four properties: a stored fault stays unhealed while an unrelated
+   node arms alone, a clear flows once this process instance has genuinely raised, the guard
+   tracks DELIVERY rather than intent (an attempted-but-undelivered raise never earns a
+   clear), and a reconfigure while the node is absent does not withhold a clear the process
+   had already earned.
+3. **E2e**, three files, each launching its own real gateway + fault_manager + demo-node
+   stack:
+   - `test/e2e/test_node_death_e2e.test.py` (ten scenarios): raise and name the node; clear
+     once it returns; no heal with the fault manager's healing disabled; a lifecycle
+     DEACTIVATE is never mistaken for a death; a manifest app that never comes online is
+     never called dead; a `_ros2cli_*`-prefixed node is never tracked, checked against
+     ros2cli's own naming constant; a bare-name collision names only the node that actually
+     exited; a fast tick alone, nothing else perturbing the graph, raises nothing; a
+     five-cycle restart loop, acknowledged between cycles, reaches `occurrence_count: 5`;
+     and a fault confirmed before a gateway restart stays CONFIRMED across it.
+   - `test/e2e/test_node_death_suppression_e2e.test.py` (five scenarios): the allowlist
+     suppresses the node it names; the SAME allowlist left unnamed in `suppress` is inert,
+     and a startup warning says so; a managed lifecycle node that reached a clean shutdown
+     is never named while an active sibling that was simply killed still is; naming a node
+     on the allowlist alone, with `suppress` unset, does not suppress it; and a death held
+     well past `prune_grace` stays CONFIRMED and keeps naming the node, proving pruning
+     bookkeeping is not the same thing as healing the fault.
+   - `test/e2e/test_node_death_boundary_e2e.test.py` (seven scenarios, the seam with
+     `lifecycle_expectation`): a node stuck inactive but never gone is
+     `GRAPH_NODE_INACTIVE`'s alone; the same node killed while still below `grace` raises
+     `GRAPH_NODE_DISAPPEARED` alone, with no `GRAPH_NODE_INACTIVE` ever born from the
+     departure; a node killed AFTER `GRAPH_NODE_INACTIVE` has confirmed raises BOTH codes at
+     once, the confirmed one still naming the node; a healthy node that is simply killed
+     raises `GRAPH_NODE_DISAPPEARED` alone; a restart-looping required node is caught every
+     cycle regardless of whether it ever matures under `lifecycle_expectation`; a large
+     `miss_grace` delays the report but does not swallow it; and a restarted gateway's own
+     warmup window never produces a spurious PASSED for a node it has not yet re-measured.
+
 ## Reliability (bringup-quiesce)
 
 Silent-fault detectors are prone to bringup noise: a node joining the graph, a
@@ -1356,6 +1617,11 @@ namespace beyond the original six, all raised by `lifecycle_expectation`:
 two share one cause-blind unmeasured clock internally (see the detector section above)
 but are always two DISTINCT codes on the wire - the clock's blindness to which cause it
 is seeing never leaks into which fault code a node ends up reported under.
+
+Of these nine, seven currently have a detector raising them: `qos_mismatch`
+(`GRAPH_QOS_MISMATCH`), `orphan` (`GRAPH_ORPHAN`), `param_drift` (`GRAPH_PARAM_DRIFT`),
+`node_death` (`GRAPH_NODE_DISAPPEARED`), and `lifecycle_expectation`'s three above. Two
+remain undelivered: `GRAPH_TF_STALE` and `GRAPH_LATENCY_BUDGET`.
 
 Splitting the unmeasured cases out of `GRAPH_NODE_INACTIVE` has two consequences nothing
 else states. Anything downstream that filters or correlates on `GRAPH_NODE_INACTIVE`
