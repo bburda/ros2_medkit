@@ -173,9 +173,17 @@ TARGET_NAMESPACE = '/powertrain/engine'
 # a correct detector could ever confirm it, so clear_on_return/no_heal_standalone/
 # restart_loop_occurrences (the three scenarios that actually respawn TARGET_NODE) would
 # time out waiting for a raise that is never supposed to happen - not a detector defect.
-# 5.0s mirrors B5_RESPAWN_DELAY_SEC in the boundary e2e file: comfortably past 4200ms with
-# the same order of margin, plus real DDS-discovery overhead on top of the delay itself.
-RESPAWN_DELAY_SEC = 5.0
+# 15.0s mirrors B5_RESPAWN_DELAY_SEC in the boundary e2e file: see that constant's own
+# comment for the full arithmetic. In short, 4200ms nominal grace is not the whole budget a
+# tick-counted miss_grace needs - the entity cache is refreshed on a debounced graph event
+# (up to 1100ms of latency on either end of the outage, gateway_node.cpp) and the plugin's
+# own tick loop can run slower than its configured period under CI contention with no
+# enforced upper bound - and NodeLivenessTracker::update() resets a key's miss count to zero
+# the instant it is seen present again, so a cycle that loses this race does not merely raise
+# late, it never raises at all. A former 5.0s value left only 800ms of margin, under the
+# debounce ceiling alone; 15.0s budgets three nominal-grace windows for tick-loop slippage
+# plus the full debounce ceiling on top (13700ms), with headroom to spare.
+RESPAWN_DELAY_SEC = 15.0
 
 ARM_TIMEOUT_SEC = 60.0
 FAULTS_LIVE_TIMEOUT_SEC = 30.0

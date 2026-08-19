@@ -201,6 +201,14 @@ PRUNE_GRACE = MISS_GRACE + 1
 # TARGET_NODE's (suppressed, prune-eligible) bookkeeping never touches it.
 SECOND_NODE = 'prune_second_unsuppressed'
 SECOND_NAMESPACE = '/powertrain/unsuppressed'
+# How long the reclaim-delta baseline is allowed to take to SETTLE (see
+# _poll_stable_tracked_count) before either node departs. wait_until_watchdog_armed(app_id=...)
+# only proves the gate considers TARGET_NODE/SECOND_NODE armed, not that node_death's own tick
+# has already added their keys to tracker_ (see that helper's own docstring) - this is generous
+# against that residual lag, not against anything this scenario's own cycle does. Mirrors
+# test_node_death_e2e.test.py's identical STABLE_TRACKED_COUNT_TIMEOUT_SEC, same detector, same
+# hazard.
+STABLE_TRACKED_COUNT_TIMEOUT_SEC = 40.0
 
 
 def _target_node_action():
@@ -407,6 +415,43 @@ def _call_change_state_once(client_node, service_name, transition_id, timeout=30
         return result is not None and result.success
     finally:
         client_node.destroy_client(client)
+
+
+def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, interval=0.5):
+    """Poll the detector's status block until ``tracked_count`` holds steady.
+
+    "Holds steady" means the SAME value for a continuous `stable_seconds` before `timeout`
+    elapses. A single sample proves nothing about whether node_death has actually caught up:
+    wait_until_watchdog_armed(app_id=...) only proves the RELIABILITY GATE considers an entity
+    armed, not that node_death's own tick has already added its key to tracker_ - see that
+    helper's own docstring ("What this does NOT prove is that a detector has already READ the
+    app... Callers that need a captured baseline must still allow the sweep a window after this
+    returns"). A baseline read immediately after both TARGET_NODE and SECOND_NODE gate-arm can
+    therefore land before either one (or both) has actually joined tracked_count, understating
+    the baseline - and since this row's own claim is a tracked_count DELTA off that baseline, an
+    understated baseline makes the later reclaim assertion fail for a reason that has nothing to
+    do with prune(). Same helper, same detector, same hazard as
+    test_node_death_e2e.test.py's identical ``_poll_stable_tracked_count``.
+
+    Returns ``(status, stable)`` - `status` is the LAST status block read (possibly still
+    unsettled, so a caller can still report what it saw), `stable` is False if the value never
+    held for a continuous `stable_seconds` inside `timeout`.
+    """
+    deadline = time.monotonic() + timeout
+    status = None
+    last_count = None
+    streak_start = None
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        status = watchdog_detector_status(port, detector_id)
+        count = status.get('tracked_count') if status is not None else None
+        if count != last_count:
+            last_count = count
+            streak_start = now
+        elif now - streak_start >= stable_seconds:
+            return status, True
+        time.sleep(interval)
+    return status, False
 
 
 # ---------------------------------------------------------------------------------------
@@ -642,8 +687,19 @@ class TestSuppressionPruneNoFalseHeal(unittest.TestCase):
         )
 
         # Baseline for the reclaim delta: both nodes are present and tracked NOW, before
-        # either departs.
-        baseline = watchdog_detector_status(PORT, 'node_death')
+        # either departs. wait_until_watchdog_armed above proves the GATE considers both
+        # armed, not that node_death's own tick has already added their keys to tracker_ (see
+        # _poll_stable_tracked_count's own docstring) - so the baseline is read only once
+        # tracked_count has genuinely settled, not off the first sample after both gate-arm.
+        baseline, stable = _poll_stable_tracked_count(
+            PORT, 'node_death', timeout=STABLE_TRACKED_COUNT_TIMEOUT_SEC)
+        self.assertTrue(
+            stable,
+            f'node_death tracked_count never held steady before either node departed (last '
+            f'read: {baseline!r}) - the baseline below could not be trusted to already '
+            f'include {TARGET_NODE} and {SECOND_NODE}, which would make the reclaim delta '
+            'below meaningless',
+        )
         self.assertIsNotNone(baseline, 'no node_death status block on GET /x-medkit-watchdog')
         baseline_count = baseline['tracked_count']
 

@@ -218,13 +218,28 @@ B5_GRACE = 50
 B5_MISS_GRACE = 20
 # How long B5's own node is held down every cycle, overriding the launch-wide RESPAWN_DELAY_SEC
 # floor (1.5 s - too short to ever satisfy the 3000 ms floor above, let alone B5_MISS_GRACE's own
-# 4000 ms). 5 s gives the same order of margin (1000 ms, 25%) over B5_MISS_GRACE's nominal grace
-# that MISS_GRACE=20 itself gives over the 3000 ms floor. respawn_delay is an ENFORCED floor
-# under how soon launch may even attempt to restart a respawn=True process (see
-# _lifecycle_node_action's own docstring), so every cycle's actual outage is guaranteed to be at
-# least this long - a correct detector can therefore always report it, which is the property this
-# row needs to be satisfiable by a right implementation rather than only by a wrong one.
-B5_RESPAWN_DELAY_SEC = 5.0
+# 4000 ms). respawn_delay is an ENFORCED floor under how soon launch may even attempt to restart
+# a respawn=True process (see _lifecycle_node_action's own docstring), so every cycle's actual
+# outage is guaranteed to be at least this long - a correct detector can therefore always report
+# it, which is the property this row needs to be satisfiable by a right implementation rather
+# than only by a wrong one.
+#
+# The margin over B5_MISS_GRACE's nominal grace ([B5_MISS_GRACE + 1] * TICK_INTERVAL_MS =
+# 4200 ms) has to cover two things a tick count alone does not see. First, the entity cache a
+# tick reads is rebuilt on a debounced graph event "always serviced within refresh_debounce_ms
+# + one 100 ms tick" (gateway_node.cpp) - 1100 ms worst case before either end of the outage
+# (the death, or the respawned node's return) is even visible to node_death's own snapshot.
+# Second, the plugin's tick loop wakes on a condition-variable timed wait, not a hardware
+# clock (GraphWatchdogPlugin::wait_for_next_tick), and nothing bounds how much CI contention
+# can slow it below its configured 200 ms period. A former 5.0 s value left only 800 ms of
+# margin over the 4200 ms nominal grace - smaller than the debounce ceiling alone - and
+# NodeLivenessTracker::update() resets a key's miss count to zero the instant it is seen
+# present again, with no way to recover a miss already lost that way: a cycle that lost this
+# race was not merely reported late, GRAPH_NODE_DISAPPEARED never raised for it at all. 15.0 s
+# budgets three full nominal-grace windows (12600 ms) for tick-loop slippage plus the entire
+# 1100 ms debounce ceiling on top (13700 ms total), so the observed outage stays reportable
+# even if this scenario's own ticks run at under a third of their configured rate.
+B5_RESPAWN_DELAY_SEC = 15.0
 
 ARM_TIMEOUT_SEC = 60.0
 FAULTS_LIVE_TIMEOUT_SEC = 30.0
