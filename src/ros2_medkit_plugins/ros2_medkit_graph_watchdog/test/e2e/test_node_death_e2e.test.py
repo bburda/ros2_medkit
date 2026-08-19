@@ -147,12 +147,17 @@ FAULT_CODE = 'GRAPH_NODE_DISAPPEARED'
 DETECTOR_ID = 'node_death'
 _DETECTOR_PREFIX = f'plugins.graph_watchdog.detectors.{DETECTOR_ID}'
 
-# Fast tick cadence + a miss_grace comfortably PAST the documented 3000 ms floor (config
-# sweep C1 owns the floor's own boundary values; this file only needs to not accidentally
-# land ON it while proving an ordinary raise). 20 ticks * 200 ms = 4000 ms nominal grace.
+# Fast tick cadence + a miss_grace comfortably PAST the documented 3000 ms floor
+# (min_node_death_miss_grace(200) == 14, detector_config_keys.hpp) without sitting exactly on
+# it. "config sweep C1" (NodeDeathIntegrationTest.C1_* in test_node_death_integration.cpp) owns
+# the floor's own boundary values, but never exercises tick_interval_ms=200 at all (its own
+# cases run at 1, 1000 and 3000 ms), so there is no boundary value at this tick period to land
+# on by accident - 16 carries two ticks of headroom purely to keep this row visibly off the
+# floor itself. 16 ticks * 200 ms = 3400 ms nominal grace; RESPAWN_DELAY_SEC below is sized
+# against this value.
 TICK_INTERVAL_MS = 200
 WARMUP_CYCLES = 3
-MISS_GRACE = 20
+MISS_GRACE = 16
 
 # The plain node most scenarios kill: DEMO_NODE_REGISTRY's own executable/name/namespace
 # for the 'calibration' key, constructed by hand (not via demo_nodes=[...]) wherever a
@@ -169,21 +174,23 @@ TARGET_NAMESPACE = '/powertrain/engine'
 # it is a real, enforced floor under every kill-then-return gap this file measures. Must
 # clear the detector's OWN raise threshold, not just be "over one tick interval": a death is
 # reported once misses EXCEED miss_grace, i.e. after (MISS_GRACE + 1) * TICK_INTERVAL_MS =
-# 21 * 200ms = 4200ms of real absence. A respawn_delay short of that heals the outage before
+# 17 * 200ms = 3400ms of real absence. A respawn_delay short of that heals the outage before
 # a correct detector could ever confirm it, so clear_on_return/no_heal_standalone/
 # restart_loop_occurrences (the three scenarios that actually respawn TARGET_NODE) would
 # time out waiting for a raise that is never supposed to happen - not a detector defect.
-# 15.0s mirrors B5_RESPAWN_DELAY_SEC in the boundary e2e file: see that constant's own
-# comment for the full arithmetic. In short, 4200ms nominal grace is not the whole budget a
-# tick-counted miss_grace needs - the entity cache is refreshed on a debounced graph event
-# (up to 1100ms of latency on either end of the outage, gateway_node.cpp) and the plugin's
-# own tick loop can run slower than its configured period under CI contention with no
-# enforced upper bound - and NodeLivenessTracker::update() resets a key's miss count to zero
-# the instant it is seen present again, so a cycle that loses this race does not merely raise
-# late, it never raises at all. A former 5.0s value left only 800ms of margin, under the
-# debounce ceiling alone; 15.0s budgets three nominal-grace windows for tick-loop slippage
-# plus the full debounce ceiling on top (13700ms), with headroom to spare.
-RESPAWN_DELAY_SEC = 15.0
+# Mirrors B5_RESPAWN_DELAY_SEC in the boundary e2e file (same detector, same tick interval,
+# same derivation - see that constant's own comment for the full arithmetic). 3400ms nominal
+# grace is not the whole budget a tick-counted miss_grace needs: the entity cache is refreshed
+# on a debounced graph event, up to 1100ms of latency on either end of the outage
+# (gateway_node.cpp), and the plugin's own tick loop can run slower than its configured period
+# under CI contention with no enforced upper bound. Margin under the 1100ms debounce ceiling
+# alone can be erased by a single unlucky refresh regardless of tick-loop speed, and
+# NodeLivenessTracker::update() resets a key's miss count to zero the instant it is seen
+# present again, so a cycle that loses this race does not raise late, it never raises at all.
+# 12.5s clears 3*3400+1100=11300ms (a tick loop running at a third of its configured rate,
+# plus the full debounce ceiling on top) by 1200ms - worst-case observed window
+# 12500-1100=11400ms, 3.35x the nominal grace.
+RESPAWN_DELAY_SEC = 12.5
 
 ARM_TIMEOUT_SEC = 60.0
 FAULTS_LIVE_TIMEOUT_SEC = 30.0
