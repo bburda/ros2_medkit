@@ -14,13 +14,11 @@
 # limitations under the License.
 """node_death e2e: GRAPH_NODE_DISAPPEARED against the REAL gateway + fault_manager + graph.
 
-Written before the detector that satisfies it exists (this package carries no node_death
-detector yet), so every scenario here is expected to fail today. A scenario that asserts a
-RAISE fails because the fault never appears - the missing-fault message names the real
-cause. A scenario that asserts an ABSENCE (a node that must never be called dead) fails
-nothing today, because an absent detector produces the same silence a correct one would;
-those scenarios cannot discriminate until the detector exists, and are marked as such in
-each class's own docstring below.
+A scenario that asserts a RAISE proves the fault actually appears, naming the missing-fault
+case as the failure mode when it does not. A scenario that asserts an ABSENCE (a node that must
+never be called dead) cannot, by itself, discriminate a correct detector from no detector at
+all, because both produce the same silence; those scenarios are marked as such in each class's
+own docstring below.
 
 Runs as TEN separate CTest targets (see CMakeLists.txt), each launching its OWN
 gateway+fault_manager+demo-node stack, exactly as test_lifecycle_expectation_e2e.test.py

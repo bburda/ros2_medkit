@@ -14,12 +14,11 @@
 # limitations under the License.
 """node_death suppression e2e: allowlist, self-suppression and pruning against the REAL stack.
 
-Sibling of test_node_death_e2e.test.py, same reason and same shape: this package carries no
-node_death detector yet, so every scenario here is expected to fail today. A row that asserts a
-RAISE fails because the fault never appears - the missing-fault message names the real cause. A
-row that asserts an ABSENCE cannot discriminate a correct suppressor from no detector at all,
-because both produce the same silence; those rows are marked CANNOT DISCRIMINATE YET in their own
-class docstring.
+Sibling of test_node_death_e2e.test.py, same shape: each RAISE row proves the fault actually
+appears, naming the missing-fault case as the failure mode when it does not. An ABSENCE row
+cannot, by itself, discriminate a correct suppressor from no detector at all, because both
+produce the same silence; those rows are marked CANNOT DISCRIMINATE YET in their own class
+docstring.
 
 Runs as FIVE separate CTest targets (see CMakeLists.txt), each launching its OWN
 gateway+fault_manager+demo-node stack - the plugin reads its config once at set_context() time, so
@@ -59,16 +58,19 @@ which assertions run:
 - "suppression_is_opt_in": the allowlist key is set, but ``suppress`` is not configured AT ALL -
   merely naming a node on the allowlist must not suppress it by itself. The fault raises and
   names the node.
-- "prune_no_false_heal": a node killed and left gone well past
-  ``detectors.node_death.prune_grace`` - long enough that reclaiming its bookkeeping is eligible.
-  The fault must stay CONFIRMED, AND KEEP NAMING THE NODE, the whole time: pruning bookkeeping is
-  not the same thing as the violation healing, and a detector that let the two get confused would
-  level-trigger an empty aggregate the moment it forgot the node, clearing a fault for a node
-  that is still gone - and a code-only persistence check would also pass a detector that kept the
-  CODE raised for some OTHER node while quietly dropping this one, so the proof is
-  assert_fault_describes_only, not assert_fault_persists_throughout. The source version of this
-  test used ``poll_cleared`` + ``assertFalse``, which has exactly the dead-channel blind spot
-  prove_persistence_proof_catches_a_dead_fault_surface exists to catch.
+- "prune_no_false_heal": TWO independent nodes. TARGET_NODE carries
+  ``allowlist: [TARGET_NODE]`` with ``suppress: ["allowlist"]`` - the ONLY shape pruning ever
+  applies to (``NodeLivenessTracker::prune()`` reclaims a key only once it has been DURABLY
+  suppressed; an unsuppressed death has no reclaim path at all - see node_liveness_tracker.hpp's
+  own doc). SECOND_NODE carries no suppression at all, so its death is an ordinary, permanently
+  outstanding fault - the control this row needs, since a single-node shape cannot tell "prune()
+  reclaimed the right key" from "prune() reclaimed (or healed) something it should not have".
+  Both are killed; TARGET_NODE's bookkeeping is then observed reclaimed past
+  ``detectors.node_death.prune_grace`` as a `tracked_count` DELTA of exactly one off a baseline
+  (never against zero - the aggregate also carries every other armed App in the graph, so it can
+  never read exactly zero), while SECOND_NODE's fault must stay CONFIRMED and keep naming it,
+  never TARGET_NODE, for a window spanning straight through the tick TARGET_NODE's own reclaim
+  happens on.
 
 Every scenario gates on wait_until_watchdog_armed(PORT, app_id=...) BEFORE asserting anything -
 see harness.py's own docstring for why a stack that never came up otherwise produces exactly the
@@ -119,10 +121,12 @@ from harness import (  # noqa: E402, I100
     assert_fault_describes_only,
     assert_fault_never_names,
     create_watchdog_test_launch,
+    poll_detector_status,
     poll_faults,
     prove_never_names_proof_catches_a_wrongly_scoped_absence,
     wait_until_faults_endpoint_live,
     wait_until_watchdog_armed,
+    watchdog_detector_status,
 )
 
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
@@ -193,6 +197,13 @@ LIFECYCLE_GRACE = 5
 # show it.
 PRUNE_GRACE = MISS_GRACE + 1
 
+# ---- "prune_no_false_heal" scenario's own second, UNSUPPRESSED node ----------------------------
+# A second, independent identity carrying no suppression at all, so its death is an ordinary,
+# permanently-outstanding fault - the control this row needs to prove that reclaiming
+# TARGET_NODE's (suppressed, prune-eligible) bookkeeping never touches it.
+SECOND_NODE = 'prune_second_unsuppressed'
+SECOND_NAMESPACE = '/powertrain/unsuppressed'
+
 
 def _target_node_action():
     """One manually-constructed TARGET_NODE action, with a PID handle the test can signal.
@@ -208,6 +219,24 @@ def _target_node_action():
         executable=TARGET_EXECUTABLE,
         name=TARGET_NODE,
         namespace=TARGET_NAMESPACE,
+        output='screen',
+        additional_env=get_coverage_env('ros2_medkit_integration_tests'),
+        sigterm_timeout='30',
+        sigkill_timeout='15',
+    )
+
+
+def _second_node_action():
+    """SECOND_NODE: a second, independent, never-allowlisted identity for "prune_no_false_heal".
+
+    Same executable as TARGET_NODE, under its own name/namespace so it is a genuinely distinct
+    node - built by hand for the same PID-handle reason _target_node_action() is.
+    """
+    return launch_ros.actions.Node(
+        package='ros2_medkit_integration_tests',
+        executable=TARGET_EXECUTABLE,
+        name=SECOND_NODE,
+        namespace=SECOND_NAMESPACE,
         output='screen',
         additional_env=get_coverage_env('ros2_medkit_integration_tests'),
         sigterm_timeout='30',
@@ -267,6 +296,10 @@ def generate_test_description():
     elif SCENARIO == 'prune_no_false_heal':
         detector_params[f'{_NODE_DEATH_PREFIX}.miss_grace'] = MISS_GRACE
         detector_params[f'{_NODE_DEATH_PREFIX}.prune_grace'] = PRUNE_GRACE
+        # Durable suppression is the only path prune() ever reclaims through - see the
+        # module docstring's own note on why an unsuppressed death cannot exercise it.
+        detector_params[f'{_NODE_DEATH_PREFIX}.allowlist'] = [TARGET_NODE]
+        detector_params[f'{_NODE_DEATH_PREFIX}.suppress'] = ['allowlist']
     else:
         raise RuntimeError(f'WATCHDOG_E2E_SCENARIO={SCENARIO!r} has no launch configuration')
 
@@ -281,6 +314,11 @@ def generate_test_description():
         target = _target_node_action()
         launch_description.add_action(TimerAction(period=2.0, actions=[target]))
         context['target_node'] = target
+
+    if SCENARIO == 'prune_no_false_heal':
+        second = _second_node_action()
+        launch_description.add_action(TimerAction(period=2.0, actions=[second]))
+        context['second_node'] = second
 
     if SCENARIO == 'lifecycle_clean_shutdown':
         clean = _lifecycle_node_action(CLEAN_NODE, auto_activate=False)
@@ -585,38 +623,75 @@ class TestSuppressionOptIn(unittest.TestCase):
 
 
 class TestSuppressionPruneNoFalseHeal(unittest.TestCase):
-    """A death left gone well past `prune_grace` never gets healed by pruning its bookkeeping.
+    """Reclaiming an allowlisted key's bookkeeping never heals an unrelated, still-true fault.
 
-    Expected RED today: nothing in this package raises GRAPH_NODE_DISAPPEARED yet, so the raise
-    poll below times out and the failure message names the missing fault, not a harness error.
+    Two independent nodes. TARGET_NODE is on the allowlist (suppress: ["allowlist"]) - the
+    ONLY shape prune() ever reclaims through: node_liveness_tracker.hpp's own doc states the
+    consequence directly - an unsuppressed death has no reclaim path at all and so must stay
+    reported "permanent until acknowledged" for as long as it is actually dead. That is
+    exactly why this row cannot point its reclaim proof at an unsuppressed node (the panel's
+    finding against this row's predecessor): SECOND_NODE, carrying no suppression, is that
+    permanently-outstanding control, not a second reclaim candidate.
+
+    Reclaim itself is proven as a tracked_count DELTA off a baseline, not against zero: the
+    aggregate also carries every other armed App in the graph (the gateway's own entity among
+    them), so it can never read exactly zero regardless of whether pruning works.
     """
 
-    def test_pruned_bookkeeping_does_not_heal_the_fault(self, target_node):
+    def test_pruning_the_suppressed_key_never_heals_the_unsuppressed_one(
+            self, target_node, second_node):
         self.assertTrue(
             wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=TARGET_NODE),
             f'graph_watchdog never reported {TARGET_NODE} armed')
         self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=SECOND_NODE),
+            f'graph_watchdog never reported {SECOND_NODE} armed')
+        self.assertTrue(
             wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
-            'GET /faults never answered 200 - a persistence claim below would prove nothing '
-            'about the detector if the channel itself never came up',
+            'GET /faults never answered 200 - the claims below would prove nothing about the '
+            'detector if the channel itself never came up',
         )
 
+        # Baseline for the reclaim delta: both nodes are present and tracked NOW, before
+        # either departs.
+        baseline = watchdog_detector_status(PORT, 'node_death')
+        self.assertIsNotNone(baseline, 'no node_death status block on GET /x-medkit-watchdog')
+        baseline_count = baseline['tracked_count']
+
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        os.kill(second_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
+        self.assertTrue(
+            _poll_apps_absent(PORT, SECOND_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{SECOND_NODE} never left GET /apps after SIGTERM')
 
+        # SECOND_NODE carries no suppression: it must raise, ordinarily, like any other death.
         fault = poll_faults(PORT, FAULT_CODE, timeout=RAISE_TIMEOUT_SEC)
         if fault is None:
-            self.fail(f'{FAULT_CODE} never raised after {TARGET_NODE} exited')
+            self.fail(f'{FAULT_CODE} never raised after {SECOND_NODE} exited')
 
-        # PRUNE_GRACE ticks at TICK_INTERVAL_MS is comfortably inside this window, so pruning
-        # is eligible well before the window ends - the exact condition this row is about.
-        # describes_only, not persists_throughout: a code-only check would also pass a detector
-        # that kept FAULT_CODE raised for some OTHER node while pruning silently dropped this
-        # one from the description.
+        # PRUNE_GRACE consecutive suppressed ticks reclaims TARGET_NODE's own bookkeeping -
+        # tracked_count dropping by exactly one from the baseline, proving prune() genuinely
+        # ran (not merely that TARGET_NODE was never raised, which a deleted prune() would
+        # also produce). SECOND_NODE's own departed-but-unsuppressed entry stays tracked
+        # throughout - only TARGET_NODE's disappears - so the delta is exactly one.
+        self.assertTrue(
+            poll_detector_status(
+                PORT, 'node_death', 'tracked_count', baseline_count - 1,
+                timeout=RAISE_TIMEOUT_SEC),
+            f'{TARGET_NODE} was never reclaimed - detectors.node_death.tracked_count never '
+            f'dropped by exactly one from its baseline ({baseline_count}) even after '
+            'PRUNE_GRACE, so this row cannot tell a working prune() from one that never runs')
+
+        # The reclaim above must never have touched SECOND_NODE's own, unrelated, genuinely
+        # outstanding fault: it must stay CONFIRMED and keep naming SECOND_NODE - never
+        # TARGET_NODE - for a window spanning straight through the reclaim tick just observed.
+        # describes_only, not a bare presence check: a detector that let pruning heal the
+        # wrong entry, or empty the description, must turn this row red.
         assert_fault_describes_only(
-            self, PORT, FAULT_CODE, required=[TARGET_NODE], forbidden=[],
+            self, PORT, FAULT_CODE, required=[SECOND_NODE], forbidden=[TARGET_NODE],
             duration=SUSTAINED_WINDOW_SEC)
 
 

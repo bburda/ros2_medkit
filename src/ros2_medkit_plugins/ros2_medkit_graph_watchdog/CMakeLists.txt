@@ -163,6 +163,7 @@ if(BUILD_TESTING)
     src/detector_registry.cpp
     src/reliability_gate.cpp
     src/lifecycle_watcher.cpp
+    src/detectors/node_death_detector.cpp
     ${LIFECYCLE_STATE_READER_SOURCES})
   target_include_directories(test_graph_watchdog_plugin PRIVATE include ${GATEWAY_SRC_INCLUDE_DIR})
   medkit_target_dependencies(test_graph_watchdog_plugin
@@ -642,10 +643,9 @@ if(BUILD_TESTING)
 
   # === node_death e2e (launch_testing) ===
   #
-  # Written and watched failing before the node_death detector that satisfies it exists -
-  # this package carries no such detector yet, so every scenario below is expected to fail
-  # today. See test/e2e/test_node_death_e2e.test.py's own module docstring for the full
-  # story and which scenarios can even discriminate before the detector lands.
+  # Exercises the node_death detector end to end against a real gateway + fault_manager +
+  # demo-node stack. See test/e2e/test_node_death_e2e.test.py's own module docstring for the
+  # full scenario list and what each row proves.
 
   # 60 (arming gate, app_id-scoped - already implies presence, so this is not a separate
   # budget) + 30 (departure poll) + 60 (raise poll) + 30 (entity-scoped fault poll) = 180
@@ -758,9 +758,10 @@ if(BUILD_TESTING)
 
   # === node_death suppression e2e (launch_testing) ===
   #
-  # Written and watched failing before the node_death detector and suppression framework that
-  # satisfy them exist - see test/e2e/test_node_death_suppression_e2e.test.py's own module
-  # docstring for the full story and which scenarios can even discriminate before they land.
+  # Exercises the node_death detector's suppression framework (allowlist, self-suppression,
+  # pruning) against a real gateway + fault_manager + demo-node stack - see
+  # test/e2e/test_node_death_suppression_e2e.test.py's own module docstring for the full
+  # scenario list and what each row proves.
 
   # 60 (arming, app_id-scoped) + 30 (faults-live) + 30 (departure poll) + 20 (absence window,
   # SUSTAINED_WINDOW_SEC) = 140 internal, plus the harness self-test for assert_fault_never_names
@@ -804,22 +805,25 @@ if(BUILD_TESTING)
     ENV "GATEWAY_TEST_PORT=19440" "WATCHDOG_E2E_SCENARIO=suppression_is_opt_in"
       "${_WATCHDOG_E2E_ENV}")
 
-  # 60 (arming, app_id-scoped) + 30 (faults-live) + 30 (departure poll) + 60 (raise poll) + 20
-  # (persistence window, SUSTAINED_WINDOW_SEC - PRUNE_GRACE ticks elapse comfortably inside it)
-  # = 200 internal. Rounded to 300 to also cover the launch's own teardown for TWO processes.
+  # Two independent nodes (TARGET_NODE, allowlisted; SECOND_NODE, not) - see the module
+  # docstring's own note on why a single unsuppressed node cannot exercise pruning at all.
+  # 60+60 (arming, app_id-scoped, one per node) + 30 (faults-live) + 30+30 (departure poll,
+  # one per node) + 60 (raise poll, SECOND_NODE) + 60 (reclaim poll on
+  # detectors.node_death.tracked_count via GET /x-medkit-watchdog - PRUNE_GRACE ticks elapse
+  # comfortably inside it) + 20 (describes-only window, SUSTAINED_WINDOW_SEC) = 350 internal.
+  # Rounded to 600 to also cover the launch's own teardown for THREE processes.
   medkit_add_launch_test(test_node_death_suppression_e2e_prune_no_false_heal
-    test/e2e/test_node_death_suppression_e2e.test.py TIMEOUT 300
+    test/e2e/test_node_death_suppression_e2e.test.py TIMEOUT 600
     LABELS "integration;e2e"
     ENV "GATEWAY_TEST_PORT=19450" "WATCHDOG_E2E_SCENARIO=prune_no_false_heal"
       "${_WATCHDOG_E2E_ENV}")
 
   # === node_death boundary, config and instrument e2e (launch_testing) ===
   #
-  # Written and watched failing before the node_death detector exists and before R10's
-  # narrowing of lifecycle_expectation's absence handling lands - see
-  # test/e2e/test_node_death_boundary_e2e.test.py's own module docstring for the full story,
-  # including which rows (B1, B3) already discriminate today because lifecycle_expectation
-  # alone is enough to satisfy them.
+  # Exercises the seam between node_death and lifecycle_expectation, plus config/instrument
+  # boundary cases, against a real gateway + fault_manager + demo-node stack - see
+  # test/e2e/test_node_death_boundary_e2e.test.py's own module docstring for the full scenario
+  # list and which rows (B1, B3) are satisfied by lifecycle_expectation alone.
 
   # 60 (global arming) + 30 (faults-live) + 30 (presence poll) + 60 (raise poll, INACTIVE) + 20
   # (absence window, DISAPPEARED, SUSTAINED_WINDOW_SEC) + 5 (end-of-window presence recheck) =

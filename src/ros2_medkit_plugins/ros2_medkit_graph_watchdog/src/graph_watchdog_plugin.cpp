@@ -75,6 +75,43 @@ typename rclcpp::Client<ServiceT>::SharedPtr create_client_in_group(rclcpp::Node
   return node->create_client<ServiceT>(name, rmw_qos_profile_services_default, group);
 #endif
 }
+
+/// What node_death's own configure() will resolve `prune_grace` to, mirroring that
+/// detector's exact validation (a non-negative integer no larger than
+/// kMaxNodeDeathGraceTicks) so this function and the config actually injected into
+/// node_death's own dcfg (set_context()'s detector loop, below) can never disagree - both
+/// call this, so there is exactly one place that decision is made.
+///
+/// Falls back to `plugin_prune_grace` (clamped into node_death's own accepted range - a
+/// defensive clamp, not another validation pass: load_parameters() only checks
+/// `>= 0` for its own field) exactly when node_death's own configure() would ALSO fall back:
+/// the per-detector value is absent, the wrong JSON type, negative, or past
+/// kMaxNodeDeathGraceTicks. Before this existed, the plugin's own retention math used this
+/// same fallback while set_context() injected the plugin default only when the per-detector
+/// key was ABSENT - so a PRESENT but malformed `detectors.node_death.prune_grace` reached
+/// node_death's configure() unfiltered, which falls back to ITS OWN hardcoded default
+/// instead of `plugin_prune_grace`. The two fallbacks coincide at their shared default (60)
+/// and only diverge when an operator's plugin-scope `prune_grace` differs from it - which is
+/// exactly the gap a test that never varies the plugin-scope value off 60 cannot catch.
+int resolve_node_death_prune_grace(const nlohmann::json & config_snapshot, int plugin_prune_grace) {
+  if (config_snapshot.contains("detectors") && config_snapshot["detectors"].is_object()) {
+    const auto & detectors = config_snapshot["detectors"];
+    if (detectors.contains("node_death") && detectors["node_death"].is_object()) {
+      const auto & node_death_cfg = detectors["node_death"];
+      // ROS/JSON integers are wide: read int64_t and range-check it BEFORE narrowing to int,
+      // mirroring node_death_detector.cpp's own identical read of this same field. A value
+      // above kMaxNodeDeathGraceTicks (or above INT_MAX) narrowed first can wrap back into
+      // an accepted-looking band and pass silently.
+      if (node_death_cfg.contains("prune_grace") && node_death_cfg["prune_grace"].is_number_integer()) {
+        const std::int64_t wide = node_death_cfg["prune_grace"].get<std::int64_t>();
+        if (wide >= 0 && wide <= kMaxNodeDeathGraceTicks) {
+          return static_cast<int>(wide);
+        }
+      }
+    }
+  }
+  return std::min(plugin_prune_grace, static_cast<int>(kMaxNodeDeathGraceTicks));
+}
 }  // namespace
 
 ros2_medkit_gateway::IntrospectionResult
@@ -146,13 +183,12 @@ int GraphWatchdogPlugin::compute_departed_retention_ticks(const nlohmann::json &
   // configure() has not run yet at the point set_context() needs this value, so its
   // own kDefaultMissGrace/clamping cannot be reused directly here.
   int node_death_miss_grace = kDefaultNodeDeathMissGrace;
-  int node_death_prune_grace = prune_grace_;
   if (config_snapshot.contains("detectors") && config_snapshot["detectors"].is_object()) {
     const auto & detectors = config_snapshot["detectors"];
     if (detectors.contains("node_death") && detectors["node_death"].is_object()) {
       const auto & node_death_cfg = detectors["node_death"];
       // ROS/JSON integers are wide: read int64_t and range-check it BEFORE narrowing to int,
-      // mirroring node_death_detector.cpp's own identical reads of these same two fields. A
+      // mirroring node_death_detector.cpp's own identical read of this same field. A
       // value above kMaxNodeDeathGraceTicks (or above INT_MAX) narrowed first can wrap back
       // into an accepted-looking band and pass the ">= 0" check silently - node_death's own
       // configure() would reject that same value and keep its default, so a plugin that
@@ -164,26 +200,14 @@ int GraphWatchdogPlugin::compute_departed_retention_ticks(const nlohmann::json &
           node_death_miss_grace = static_cast<int>(wide);
         }
       }
-      // Same reason we read miss_grace here: prune_grace is a per-detector key whose
-      // plugin-scope value is only a default, so the retention window must be computed from
-      // whatever node_death will ACTUALLY clamp its prune_ticks_ to. Reading prune_grace_
-      // unconditionally would under-run the retention whenever an operator raises
-      // detectors.node_death.prune_grace, and node_death would then re-raise a
-      // cleanly-shut-down node it should have silently reclaimed (see the formula below).
-      if (node_death_cfg.contains("prune_grace") && node_death_cfg["prune_grace"].is_number_integer()) {
-        const std::int64_t wide = node_death_cfg["prune_grace"].get<std::int64_t>();
-        if (wide >= 0 && wide <= kMaxNodeDeathGraceTicks) {
-          node_death_prune_grace = static_cast<int>(wide);
-        }
-      }
     }
   }
-  // Defensive, not another validation pass: node_death_prune_grace's default is prune_grace_
-  // (this plugin's own, separately-loaded field), which this function does not otherwise
-  // touch or re-check here - clamping it to the SAME ceiling the detector-scoped override
-  // above already enforces is what keeps the arithmetic below from overflowing regardless of
-  // what that field happens to hold.
-  node_death_prune_grace = std::min(node_death_prune_grace, static_cast<int>(kMaxNodeDeathGraceTicks));
+  // prune_grace is a per-detector key whose plugin-scope value is only a default, so the
+  // retention window must be computed from whatever node_death will ACTUALLY clamp its
+  // prune_ticks_ to - see resolve_node_death_prune_grace()'s own doc for why this must be
+  // the SAME function set_context() uses to inject node_death's own dcfg, not a parallel
+  // re-derivation of the same rule.
+  const int node_death_prune_grace = resolve_node_death_prune_grace(config_snapshot, prune_grace_);
   // node_death's own configure() unconditionally raises miss_grace to its wall-clock floor
   // (min_node_death_miss_grace(), detector_config_keys.hpp) whenever the configured tick is fast
   // enough to need it - "unconditionally" because that floor applies to node_death's
@@ -203,14 +227,14 @@ int GraphWatchdogPlugin::compute_departed_retention_ticks(const nlohmann::json &
   // node_death's own RECLAIM tick (T_depart + miss_grace + prune_ticks): only a durable
   // suppressor (lifecycle_clean_shutdown IS one, see suppressor.hpp) may feed
   // NodeLivenessTracker::prune(), and that reclaim can only happen while the suppressor
-  // still actively vetoes the id - i.e. while the label is still cached. If the label
-  // expired even one tick earlier (the old `max(prune_grace, miss_grace + 1)` retention
-  // - the SAME length as prune_ticks, but anchored miss_grace ticks later at
-  // T_depart instead of T_death), the suppressor would abstain right at the reclaim
-  // tick, node_death would RAISE instead of silently reclaiming, and - because the
-  // label is now gone for good - the id could never be suppressed again: a permanent
-  // false GRAPH_NODE_DISAPPEARED for a cleanly-shut-down node. The extra "+1" keeps one
-  // full tick of margin past the reclaim tick itself. See
+  // still actively vetoes the id - i.e. while the label is still cached. A retention window
+  // anchored at T_depart instead and merely as long as prune_ticks itself (`max(prune_grace,
+  // miss_grace + 1)`, with no `+ node_death_miss_grace + 1` on top) would expire miss_grace
+  // ticks too early: the suppressor would then abstain right at the reclaim tick, node_death
+  // would RAISE instead of silently reclaiming, and - because the label is now gone for good
+  // - the id could never be suppressed again: a permanent false GRAPH_NODE_DISAPPEARED for a
+  // cleanly-shut-down node. The extra "+1" below keeps one full tick of margin past the
+  // reclaim tick itself. See
   // test_node_death_integration.cpp's CleanShutdownDepartureIsReclaimedNotReRaisedPastRetention
   // for the regression this formula fixes.
   const int prune_ticks = std::max(node_death_prune_grace, node_death_miss_grace + 1);
@@ -293,6 +317,17 @@ void GraphWatchdogPlugin::set_context(ros2_medkit_gateway::PluginContext & conte
       // unconditionally silently discarded the per-detector setting.
       if (!dcfg.contains("prune_grace")) {
         dcfg["prune_grace"] = prune_grace_;
+      }
+      if (id == "node_death") {
+        // node_death is the one detector this plugin also predicts the behaviour of BEFORE
+        // configure() runs (compute_departed_retention_ticks(), above, sizes the lifecycle
+        // watcher's own retention off it) - so what actually reaches its configure() here
+        // must be byte-for-byte the value that prediction assumed, not merely "the operator's
+        // value when well-formed, else whatever node_death happens to default to on its own."
+        // Re-resolving (rather than trusting the injection above) also covers a PRESENT but
+        // malformed detectors.node_death.prune_grace, which the absence check above leaves
+        // untouched even though node_death's own configure() will still reject it.
+        dcfg["prune_grace"] = resolve_node_death_prune_grace(config_snapshot, prune_grace_);
       }
       detector->configure(dcfg);
     } catch (const std::exception & e) {

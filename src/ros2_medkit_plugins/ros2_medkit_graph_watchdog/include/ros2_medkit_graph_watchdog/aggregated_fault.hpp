@@ -29,8 +29,8 @@ namespace ros2_medkit_graph_watchdog {
 /// external entity from its own IntrospectionProvider (graph_watchdog_plugin.cpp).
 ///
 /// It must be an entity the plugin owns, not a borrowed one. Scoping these faults to the
-/// host Component - the obvious choice, and what this used to do - makes them reachable
-/// from NO endpoint: `collect_component_app_fqns` (fault_scope.cpp) only puts a
+/// host Component instead - the obvious-looking alternative - makes them reachable from NO
+/// endpoint: `collect_component_app_fqns` (fault_scope.cpp) only puts a
 /// component's bare id in the scope set when `external` is true, and a runtime host
 /// Component built by HostInfoProvider never sets it, so `/components/<host>/faults` and
 /// the scoped detail route both drop the fault. There is no server-level
@@ -74,9 +74,9 @@ class AggregatedFault {
 
   /// Returns whatever ctx.raise_fault()/ctx.clear_fault() returned - true only if the
   /// request actually reached async_send_request(), never merely because `affected` was
-  /// non-empty. A caller that wants to know whether a raise genuinely went out (not just
-  /// that one was attempted) must read this return value - see DetectorContext::raise_fault's
-  /// own doc for why the two are not the same thing.
+  /// non-empty. That proves local enqueue, not fault_manager receipt (the client is
+  /// fire-and-forget) - see DetectorContext::raise_fault's own doc for exactly what this
+  /// return value does and does not prove.
   bool emit(DetectorContext & ctx, const std::map<std::string, std::string> & affected) const {
     const std::string source = graph_source_id(ctx);
     if (affected.empty()) {

@@ -38,11 +38,13 @@ namespace ros2_medkit_graph_watchdog {
 struct NodeDeathReport {
   std::map<std::string, std::string> dead;
   std::vector<std::string> keys_by_freshness;
-  /// LEVEL: true on every tick a newly-armed key had to be refused because
-  /// `tracked_key_cap` is full of present keys all carrying evidence, and nothing could be
-  /// reclaimed or collapsed. Stays true for as long as the condition lasts - a refused key
-  /// is still armed on the following tick and refused again. Mirrors
-  /// LifecycleExpectationReport::tracking_saturated.
+  /// LEVEL: true on every tick the DEPARTED (misses_ > 0) subset of the tracked map still
+  /// exceeds `tracked_key_cap` after collapsing every entry it safely could - i.e. entries
+  /// still mid-grace, which collapsing must never touch (see collapse_matured()'s own doc),
+  /// are alone enough to keep it over the cap. Stays true for as long as the condition
+  /// lasts. NOT the same condition LifecycleExpectationReport::tracking_saturated names for
+  /// the sibling tracker: an ARMED/PRESENT key is never refused here (see the class doc), so
+  /// this can no longer mean "a newly-armed key went unwatched."
   bool tracking_saturated = false;
   /// EDGE: the first tick of a saturation episode, for a caller's one-time warning. Re-arms
   /// when the episode ends.
@@ -69,15 +71,45 @@ struct NodeDeathReport {
 /// arm once and are never seen again, which this detector's zero-config "every armed App is
 /// a candidate" scope makes the common case on any fleet with per-run or per-namespace
 /// names - has no age-based or suppression-based removal path at all. `tracked_key_cap` is
-/// what bounds the map against exactly that growth; see make_room()'s own doc for the
-/// eviction order, deliberately the same one LifecycleExpectationTracker uses for its own
-/// `tracked_node_cap`: idle entries first (nothing to lose), then departed entries collapsed
-/// into a count that still keeps the fault raised, and a present key never evicted to make
-/// room for another - refusing the newcomer instead, with `tracking_saturated` saying so, is
-/// the safe direction, because a map full of the dead that refuses a genuinely broken
-/// PRESENT node is the exact failure a presence detector exists to prevent. This detector
-/// tracks every armed App - a strictly larger set than a require_active list - so the bound
-/// matters even more here than it does for the sibling it is mirrored from.
+/// what bounds the map against exactly that growth.
+///
+/// **What the cap bounds, and why it differs from its own past shape.** The unbounded
+/// growth an earlier review found is entirely in DEPARTED keys: a dead node's entry is never
+/// reclaimed by anything but a durable suppressor, so unique dead identities accumulate for
+/// the life of the process. A PRESENT key does not have that problem - its count at any
+/// instant is bounded by the live graph, which is bounded by reality (a large single-robot
+/// graph runs to roughly a hundred nodes, a ten-robot fleet to a few hundred - see
+/// kDefaultTrackedKeyCap) - and it carries no state worth reclaiming anyway (misses_ == 0).
+/// So the cap here bounds only the DEPARTED subset (misses_ > 0): admission of an
+/// ARMED/PRESENT key is therefore NEVER refused and never evicts anything, at any map size.
+/// A tracked_key_cap smaller than the live graph is consequently not saturation - the extra
+/// present entries simply coexist with a full departed set - only a departed set that stays
+/// oversized even after every eligible collapse is.
+///
+/// Collapsing (folding a departed identity into the one collapsed_dead_count_, see
+/// collapse_matured()) may ONLY apply to an entry that has ACTUALLY crossed `miss_grace_` -
+/// a confirmed death. Collapsing one that is merely mid-grace would report a death the node
+/// has not earned, permanently (the identity is erased, so the node returning cannot un-ring
+/// it) - the exact fabrication an earlier shape of this cap produced. An immature departed
+/// entry is therefore never evicted by the cap either: it is kept, tracked exactly like any
+/// other departed entry, until it either matures (and becomes a collapse candidate) or the
+/// node returns (and the entry goes idle again). Under sustained pressure from still-maturing
+/// churn the departed set may consequently exceed tracked_key_cap_ for a few ticks - bounded
+/// by recent churn rate times miss_grace_, not by how long the process has been running,
+/// which is the growth this cap exists to prevent in the first place.
+///
+/// Why this differs from LifecycleExpectationTracker's make_room(), despite looking
+/// parallel: that tracker keeps TWO clocks per key (a violation streak and an unmeasured
+/// clock), so one node's entry can be PRESENT and carrying evidence at the same time - that
+/// third state is what makes its idle/collapsible/present-and-evidential three-way eviction
+/// order meaningful, and is also why IT can evict a present entry without losing anything
+/// (the evidence lives in the clocks, not in presence). This tracker keeps exactly one piece
+/// of per-key state (`misses_`), so a key is always either present-and-empty (idle) or
+/// absent-and-evidential (departed) - there is no third state, and evicting a present entry
+/// here would only ever throw away a key that could simply be re-admitted next tick anyway,
+/// at the cost of losing any death that happens to land in the eviction window (only ONLINE
+/// nodes re-enter `armed`, so an evicted-while-present node that then dies is never
+/// re-admitted at all). The sibling's shape does not transfer.
 class NodeLivenessTracker {
  public:
   /// Sentinel `prune_ticks` meaning "never reclaim anything." The default for callers that
@@ -90,16 +122,16 @@ class NodeLivenessTracker {
   /// runs to roughly a hundred nodes, a ten-robot fleet sharing one domain to a few hundred,
   /// so even an operator whose graph is entirely in scope (every App here, versus only
   /// require_active's named subset there) stays comfortably under it at a cost of a few
-  /// hundred KB. Growth past it can only come from identity CHURN, which is exactly what
-  /// the cap exists to bound.
+  /// hundred KB. Growth past it can only come from DEPARTED identity churn, which is exactly
+  /// what the cap exists to bound - a present key never counts against it at all (see the
+  /// class doc).
   static constexpr int kDefaultTrackedKeyCap = 512;
 
-  /// Most DEPARTED entries kept individually named when the cap has to make room for a
-  /// present key; the rest are collapsed into the one count. Mirrors
+  /// Most DEPARTED, matured (confirmed dead) entries kept individually named when the
+  /// departed set has to be shrunk; the rest are collapsed into the one count. Mirrors
   /// LifecycleExpectationTracker::kMaxNamedDepartedEntries and its reasoning: past three, a
   /// name is pure cost (AggregatedFault::kMaxDescriptionChars cannot fit a fourth alongside
-  /// the freshest entries this tracker already prioritises), and the cost is a slot a
-  /// PRESENT key needs.
+  /// the freshest entries this tracker already prioritises).
   static constexpr int kMaxNamedDepartedEntries = 3;
 
   /// Key for the collapsed-departed synthetic report entry. '!' sorts below every character
@@ -118,26 +150,29 @@ class NodeLivenessTracker {
 
   NodeDeathReport update(const std::set<std::string> & present, const std::set<std::string> & armed) {
     NodeDeathReport report;
+    // Unconditional: a PRESENT/armed key is never refused a slot and never costs an
+    // existing entry its own - see the class doc for why this differs from the sibling.
     for (const auto & key : armed) {
-      if (known_.count(key) > 0) {
-        continue;  // already tracked - re-affirms nothing, admission already happened
-      }
-      if (known_.size() >= static_cast<std::size_t>(tracked_key_cap_) && !make_room()) {
-        report.tracking_saturated = true;
-        continue;  // refused this tick; armed again next tick, so it is retried, not lost
-      }
-      known_.insert(key);
+      known_.insert(key);  // no-op if already tracked
     }
-    report.saturation_started = report.tracking_saturated && !saturated_last_tick_;
-    saturated_last_tick_ = report.tracking_saturated;
 
-    std::vector<std::pair<int, std::string>> by_miss_count;
     for (const auto & key : known_) {
       if (present.count(key) > 0) {
         misses_[key] = 0;
-        continue;
+      } else {
+        ++misses_[key];
       }
-      const int misses = ++misses_[key];
+    }
+
+    // Bounds the DEPARTED subset only, and only by collapsing entries that have ACTUALLY
+    // matured - never a present or still-immature one. Runs BEFORE the report below is
+    // built, so a just-collapsed identity never simultaneously appears both individually and
+    // inside the collapsed count.
+    report.tracking_saturated = enforce_departed_cap();
+
+    std::vector<std::pair<int, std::string>> by_miss_count;
+    for (const auto & key : known_) {
+      const int misses = misses_.at(key);
       if (misses > miss_grace_) {
         report.dead[key] = "node " + key + " disappeared (" + std::to_string(misses) + " missed cycles)";
         by_miss_count.emplace_back(misses, key);
@@ -158,6 +193,8 @@ class NodeLivenessTracker {
     for (auto & entry : by_miss_count) {
       report.keys_by_freshness.push_back(std::move(entry.second));
     }
+    report.saturation_started = report.tracking_saturated && !saturated_last_tick_;
+    saturated_last_tick_ = report.tracking_saturated;
     return report;
   }
 
@@ -190,7 +227,8 @@ class NodeLivenessTracker {
 
   /// How many keys are currently tracked (known_/misses_ size) - a test seam so a suite can
   /// assert the map stays bounded under churn without exposing the map itself. Never
-  /// counts collapsed-departed identities: they no longer have one to count.
+  /// counts collapsed-departed identities: they no longer have one to count. Includes
+  /// present entries, which are not bounded by tracked_key_cap_ at all (see the class doc).
   std::size_t tracked_count() const {
     return known_.size();
   }
@@ -205,83 +243,61 @@ class NodeLivenessTracker {
   }
 
  private:
-  /// An entry with nothing to lose: currently present, so its miss streak is zero. (A
-  /// present key's suppressed_streak_ is always zero too - prune()'s own suppressed set is
-  /// built by the caller only from keys that were candidates for report.dead, and presence
-  /// resets misses_ before that candidacy could ever arise - so misses_ alone decides.)
-  /// Evicting one loses nothing: if it is still armed on a later tick it is simply
-  /// re-tracked, identical to never having been evicted at all.
-  bool is_idle(const std::string & key) const {
-    auto it = misses_.find(key);
-    return it == misses_.end() || it->second == 0;
-  }
-
-  /// Frees a slot for a newly-armed key. Idle entries first (see is_idle()); then departed
-  /// entries (misses_ > 0 - currently missing, carrying SOME evidence, confirmed past
-  /// miss_grace_ or not) are collapsed into kCollapsedKey's one count, keeping at most
-  /// kMaxNamedDepartedEntries of them individually named; if even that leaves no room every
-  /// departed entry is collapsed.
-  ///
-  /// Returns bool, mirroring LifecycleExpectationTracker::make_room()'s identical contract
-  /// ("false means refuse the newcomer, never evict a key still needed"), but for THIS
-  /// tracker every tracked key is, at the instant this runs, either idle (present, so
-  /// step 1 frees it - and if it is still armed it is simply re-tracked a moment later
-  /// in the very same update(), indistinguishable from never having been evicted) or
-  /// departed (step 2 collapses it). There is no third state - unlike the sibling, whose
-  /// clocks let a node be simultaneously present and mid-violation, hence neither idle nor
-  /// departed and so un-evictable - so collapsing every departed entry (keep_named=0)
-  /// always empties known_ and this function cannot actually return false while
-  /// tracked_key_cap_ >= 1 (guaranteed by the constructor). Kept returning bool anyway:
-  /// the contract is what the caller (update()) relies on, a future key state that DOES
-  /// carry present-and-unevictable evidence must not have to rediscover this shape, and
-  /// NodeLivenessTrackerCap's own SaturationNeverFiresBecauseEveryKeyIsEitherIdleOrCollapsible
-  /// test pins the current, narrower reality rather than leaving it undocumented.
-  ///
-  /// A departed entry collapsed here is not necessarily one this tick's caller will end up
-  /// reporting unsuppressed: suppression is decided by the caller AFTER update() returns,
-  /// so under simultaneous cap exhaustion and a suppressible departure among the collapse
-  /// victims, kCollapsedKey's count can count an identity the caller would otherwise have
-  /// silently suppressed. Deliberate, not overlooked: this tracker is pure presence/absence
-  /// bookkeeping with no knowledge of suppression (see the class doc), the cap being full at
-  /// all is itself the operator-visible condition to act on, and erring toward reporting one
-  /// extra is the same direction every other tracker choice in this package already errs -
-  /// silently losing a genuine death is the failure mode collapsing exists to prevent, and a
-  /// narrow, cap-exhaustion-only overcount is a far smaller cost than that.
-  bool make_room() {
-    for (auto it = known_.begin(); it != known_.end();) {
-      if (is_idle(*it)) {
-        const std::string key = *it;
-        it = known_.erase(it);
-        misses_.erase(key);
-        suppressed_streak_.erase(key);
-      } else {
-        ++it;
+  /// How many known_ keys currently carry evidence (misses_ > 0) - present (idle) entries
+  /// never count. What tracked_key_cap_ actually bounds; see the class doc.
+  std::size_t departed_count() const {
+    std::size_t n = 0;
+    for (const auto & [key, misses] : misses_) {
+      (void)key;
+      if (misses > 0) {
+        ++n;
       }
     }
-    if (known_.size() < static_cast<std::size_t>(tracked_key_cap_)) {
-      return true;
-    }
-    collapse_departed(kMaxNamedDepartedEntries);
-    if (known_.size() < static_cast<std::size_t>(tracked_key_cap_)) {
-      return true;
-    }
-    collapse_departed(0);
-    return known_.size() < static_cast<std::size_t>(tracked_key_cap_);
+    return n;
   }
 
-  /// Collapse departed entries (misses_ > 0) into collapsed_dead_count_ until at most
-  /// `keep_named` remain individually tracked. Lexicographically LAST first, so the
-  /// survivors are a stable prefix and the same graph always keeps the same names - mirrors
-  /// LifecycleExpectationTracker::collapse_departed's identical choice.
-  void collapse_departed(std::size_t keep_named) {
-    std::vector<std::string> departed;
-    for (const auto & key : known_) {
-      if (!is_idle(key)) {
-        departed.push_back(key);
+  /// Shrinks the DEPARTED subset of known_ to at most tracked_key_cap_ where it safely can,
+  /// by collapsing MATURED entries (misses_ > miss_grace_) - never a present or immature
+  /// one; see the class doc for why. Two stages, mirroring
+  /// LifecycleExpectationTracker::make_room()'s identical shape for the same reason: first
+  /// collapse down to kMaxNamedDepartedEntries (keeping a few individually named when that
+  /// alone is enough to clear the cap), and only if the departed set is STILL over cap -
+  /// meaning immature entries alone already account for the excess - collapse the rest of
+  /// the matured ones too, since every one collapsed still reduces the pressure even when it
+  /// cannot fully relieve it.
+  ///
+  /// Returns true when the departed set remains over tracked_key_cap_ even after collapsing
+  /// every matured entry available - i.e. immature (still mid-grace) entries alone exceed
+  /// the cap. That condition is left standing rather than forced down: an immature entry is
+  /// never a collapse candidate, so there is nothing further this function may safely do
+  /// about it.
+  bool enforce_departed_cap() {
+    if (departed_count() <= static_cast<std::size_t>(tracked_key_cap_)) {
+      return false;
+    }
+    collapse_matured(kMaxNamedDepartedEntries);
+    if (departed_count() <= static_cast<std::size_t>(tracked_key_cap_)) {
+      return false;
+    }
+    collapse_matured(0);
+    return departed_count() > static_cast<std::size_t>(tracked_key_cap_);
+  }
+
+  /// Fold MATURED departed entries (misses_ > miss_grace_) into collapsed_dead_count_ until
+  /// at most `keep_named` remain individually tracked. NEVER touches an immature departed
+  /// entry (0 < misses_ <= miss_grace_) or a present one - collapsing either would report
+  /// (or lose) a death the node has not actually earned yet. Lexicographically LAST first,
+  /// so the survivors are a stable prefix and the same graph always keeps the same names -
+  /// mirrors LifecycleExpectationTracker::collapse_departed's identical choice.
+  void collapse_matured(std::size_t keep_named) {
+    std::vector<std::string> matured;
+    for (const auto & [key, misses] : misses_) {
+      if (misses > miss_grace_) {
+        matured.push_back(key);
       }
     }
-    for (std::size_t i = departed.size(); i > keep_named; --i) {
-      const std::string & key = departed[i - 1];
+    for (std::size_t i = matured.size(); i > keep_named; --i) {
+      const std::string & key = matured[i - 1];
       ++collapsed_dead_count_;
       known_.erase(key);
       misses_.erase(key);
@@ -291,15 +307,20 @@ class NodeLivenessTracker {
 
   int miss_grace_;
   int prune_ticks_;
-  int tracked_key_cap_;  ///< clamped to at least 1 in the constructor
+  int tracked_key_cap_;  ///< clamped to at least 1 in the constructor; bounds departed_count() only
   std::set<std::string> known_;
   std::map<std::string, int> misses_;
   std::map<std::string, int> suppressed_streak_;
   bool saturated_last_tick_ = false;  ///< for the saturation EDGE (see NodeDeathReport)
-  /// Departed entries folded into a count to free slots for present keys. Monotone within
-  /// one tracker lifetime by design, mirroring the sibling: a gateway restart or a detector
-  /// reconfigure both replace this object wholesale (see node_death_detector.cpp's own
-  /// configure()), which is the only thing that ever resets it.
+  /// Departed, MATURED entries folded into a count to shrink the departed set back toward
+  /// tracked_key_cap_. Monotone within one tracker lifetime by design, mirroring the
+  /// sibling: a gateway restart or a detector reconfigure both replace this object wholesale
+  /// (see node_death_detector.cpp's own configure()), which is the only thing that ever
+  /// resets it. A collapsed identity returning does not decrement it - the identity itself
+  /// is gone, so there is no way to tell which of possibly-several collapsed departures came
+  /// back - the aggregate fault this count keeps raised clears only via a reconfigure (which
+  /// also re-baselines whatever is present at that point) or an operator's explicit
+  /// acknowledgement.
   int collapsed_dead_count_ = 0;
 };
 

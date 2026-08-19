@@ -100,8 +100,11 @@ bool is_ros2cli_node(const std::string & fqn) {
 ///
 /// Composable/component nodes hosted in one process die together: if the container
 /// process dies, every node it hosted vanishes from the snapshot on the same tick, and all
-/// of them are named in the one aggregated fault rather than one fault each (see
-/// AggregatedFault).
+/// of them are folded into the one aggregated fault rather than one fault each (see
+/// AggregatedFault) - individually named up to AggregatedFault::kMaxDescriptionChars and
+/// NodeLivenessTracker::kMaxNamedDepartedEntries, whichever runs out first; past either
+/// limit the remainder are still counted, just not named (see NodeLivenessTracker's own
+/// collapsed-count doc).
 class NodeDeathDetector : public Detector {
  public:
   std::string id() const override {
@@ -220,13 +223,16 @@ class NodeDeathDetector : public Detector {
   /// writes to it. tick() publishes into these atomics once per sweep instead, so this
   /// method touches nothing tick() also touches.
   ///
-  /// `tracking_saturated` is the one an operator acts on: it means tracked_node_cap is full
-  /// of present keys all carrying evidence, so a newly-armed key is going UNCHECKED - a
-  /// presence detector that has refused to track a genuinely broken node cannot assert
-  /// anything about it either way. The fix is a require_active-style narrower allowlist
-  /// entry set is not available here (this detector is zero-config by design), so it is
-  /// either fewer distinct identities in the graph or a larger tracked_node_cap - both of
-  /// which need tracked_count/tracked_node_cap alongside it to reason about.
+  /// `tracking_saturated` is the one an operator acts on: it means the number of DEPARTED
+  /// (not yet confirmed dead, or already collapsed) identities exceeds tracked_node_cap even
+  /// after collapsing every confirmed death it safely could - so a newly confirmed death
+  /// among them may not get an individual name, only a place in the collapsed count. An
+  /// armed/present key is never refused tracking by this cap (see NodeLivenessTracker's own
+  /// class doc), so this is never "a node is going unchecked." The fix is a
+  /// require_active-style narrower allowlist entry set is not available here (this detector
+  /// is zero-config by design), so it is either less simultaneous departure churn or a larger
+  /// tracked_node_cap - both of which need tracked_count/tracked_node_cap alongside it to
+  /// reason about.
   nlohmann::json status_json() const override {
     return {{"tracked_count", tracked_count_.load()},
             {"tracking_saturated", saturated_.load()},
@@ -351,10 +357,11 @@ class NodeDeathDetector : public Detector {
       // silent because an earlier one already spent the warning. Mirrors
       // lifecycle_expectation_detector.cpp's identical saturation_started handling.
       RCLCPP_WARN(ctx.gateway_node->get_logger(),
-                  "graph_watchdog node_death: already tracking %d keys - the most this detector keeps "
-                  "state for - and every one of them is carrying evidence, so a newly armed key is NOT "
-                  "being checked. Raise 'tracked_node_cap' if this graph genuinely carries this many "
-                  "distinct identities at once",
+                  "graph_watchdog node_death: %d departed identities exceed tracked_node_cap even after "
+                  "collapsing every confirmed death - a newly confirmed death may not be named "
+                  "individually until some of these clear or are collapsed in turn. Every armed/present "
+                  "node is still being checked; raise 'tracked_node_cap' if this graph genuinely churns "
+                  "this many simultaneous departures at once",
                   tracked_node_cap_.load());
     }
 
@@ -364,8 +371,10 @@ class NodeDeathDetector : public Detector {
     // zero-config, so unlike lifecycle_expectation's require_active it has no fixed,
     // enumerable set of entries to ask "have I re-observed all of them yet" before trusting
     // its own silence. ever_raised_ stands in for that: this process may only clear
-    // GRAPH_NODE_DISAPPEARED once it has ITSELF put a genuine FAILED on the wire at least
-    // once.
+    // GRAPH_NODE_DISAPPEARED once it has ITSELF actually handed a FAILED request for it to
+    // the fault client at least once - not merely decided one was warranted. See
+    // DetectorContext::raise_fault's own doc for exactly what that return value does and
+    // does not prove.
     //
     // Tracked-key COUNT is deliberately not the signal, though it may look like an equally
     // good proxy: any App elsewhere in the graph - the gateway's own node included - tends
@@ -388,8 +397,9 @@ class NodeDeathDetector : public Detector {
     // shape of false-clear this guard exists to rule out, one level deeper: kill a node
     // while the service is down, wait past miss_grace, restore the service, let the node
     // return - a flag set from "the report was non-empty" would already be true by then
-    // though no FAILED had ever actually gone out, and the empty report on return would
-    // then emit a PASSED for an occurrence the fault manager never heard about. Retried
+    // though async_send_request() had never actually been called for it, and the empty
+    // report on return would then emit a PASSED for an occurrence never even attempted.
+    // Retried
     // every tick the report stays non-empty (emit_ordered() runs unconditionally above the
     // guard once report.dead is non-empty, whether or not ever_raised_ is already true), so
     // a raise that fails here is simply attempted again next tick rather than lost.

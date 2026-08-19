@@ -202,15 +202,17 @@ TEST(NodeLivenessTrackerFreshness, PlainLexicographicOrderWouldHaveCutTheFreshEn
          "alphabetically-last fresh id is the one the cap would have cut";
 }
 
-// ---- tracked_key_cap: the bound that keeps known_/misses_/suppressed_streak_ from growing
-// without limit under identity churn, mirroring LifecycleExpectationTracker's own
-// tracked_node_cap and its eviction order (idle first, then departed collapsed into a count).
+// ---- tracked_key_cap: the bound that keeps the DEPARTED subset of known_/misses_/
+// suppressed_streak_ from growing without limit under identity churn. A present entry never
+// counts against it and is never evicted to make room - see node_liveness_tracker.hpp's own
+// class doc for why this tracker's cap does not mirror LifecycleExpectationTracker's.
 
 TEST(NodeLivenessTrackerCap, TrackedCountNeverExceedsTheConfiguredCapUnderChurn) {
   NodeLivenessTracker tracker(/*miss_grace=*/0, NodeLivenessTracker::kNoPrune, /*tracked_key_cap=*/5);
   std::size_t max_seen = 0;
-  // 200 distinct, never-repeating identities - the shape a fleet of per-run or
-  // per-namespace-named nodes produces, each armed once then gone for good.
+  // 200 distinct, never-repeating identities, never present again once armed - every one
+  // instantly departed (miss_grace=0), so this exercises exactly the DEPARTED-subset cap the
+  // review found missing, with no present entries in the mix to blur the measurement.
   for (int i = 0; i < 200; ++i) {
     tracker.update({}, {"/churn_" + std::to_string(i)});
     max_seen = std::max(max_seen, tracker.tracked_count());
@@ -219,39 +221,69 @@ TEST(NodeLivenessTrackerCap, TrackedCountNeverExceedsTheConfiguredCapUnderChurn)
                              "exist unexercised - this is the row the review found missing";
 }
 
-TEST(NodeLivenessTrackerCap, IdleEntryIsEvictedBeforeADepartedOneToMakeRoom) {
-  NodeLivenessTracker tracker(/*miss_grace=*/0, NodeLivenessTracker::kNoPrune, /*tracked_key_cap=*/2);
-  tracker.update({"/idle"}, {"/idle"});      // present, tracked, idle (zero misses)
-  tracker.update({"/idle"}, {"/departed"});  // "/idle" stays present; "/departed" arms, absent
-  ASSERT_EQ(tracker.update({"/idle"}, {}).dead.count("/departed"), 1u) << "confirmed dead: carries evidence";
-  ASSERT_EQ(tracker.tracked_count(), 2u) << "cap is now exactly full: one idle, one departed";
+TEST(NodeLivenessTrackerCap, PresentEntriesExceedingTheCapAreAllStillIndividuallyReportableOnDeath) {
+  // C1 regression, at the tracker level: the earlier shape of this cap evicted PRESENT
+  // entries to admit a newcomer once the map (not merely the departed subset) reached
+  // tracked_key_cap - at 513 armed nodes against the default 512, only one survived. A
+  // present key must never be refused a slot or evicted for one, at any map size.
+  NodeLivenessTracker tracker(/*miss_grace=*/0, NodeLivenessTracker::kNoPrune, /*tracked_key_cap=*/5);
+  std::set<std::string> ids;
+  for (int i = 0; i < 50; ++i) {
+    ids.insert("/n" + std::to_string(i));
+  }
+  auto report = tracker.update(ids, ids);  // 50 present, armed keys - ten times the cap
+  EXPECT_TRUE(report.dead.empty());
+  EXPECT_EQ(tracker.tracked_count(), 50u) << "a cap on the DEPARTED subset must never refuse "
+                                             "or evict a present key, however many there are";
 
-  // A third, brand-new key arms while full, and "/idle" is kept present (so it would stay
-  // idle if it survives) but is NOT re-armed - the point is to prove the EVICTION choice,
-  // not to re-admit it. The idle entry must be the one that goes, not the departed one -
-  // evicting the departed entry would silently drop its evidence instead of collapsing it
-  // into content.
-  auto report = tracker.update({"/idle", "/newcomer"}, {"/newcomer"});
-  EXPECT_EQ(tracker.tracked_count(), 2u);
-  EXPECT_EQ(report.dead.count("/departed"), 1u) << "the departed entry's evidence must survive";
-  EXPECT_FALSE(report.tracking_saturated) << "idle eviction alone was enough; nothing was refused";
+  ids.erase(ids.begin());  // kill exactly one of the fifty
+  report = tracker.update(ids, ids);
+  EXPECT_EQ(report.dead.size(), 1u) << "the one node that actually died must be reported - "
+                                       "the other 49, still present, never competed for the "
+                                       "departed cap at all";
 }
 
-TEST(NodeLivenessTrackerCap, DepartedEntryIsCollapsedIntoACountWhenNoIdleEntryCanFreeRoom) {
+TEST(NodeLivenessTrackerCap, ImmatureDepartedEntriesAreNeverCollapsedOrReportedUnderCapPressure) {
+  // C2 regression, at the tracker level: the earlier shape of this cap collapsed every
+  // NON-idle entry to make room, which included entries carrying only one below-grace miss -
+  // fabricating a death the node had not actually earned, permanently (the identity is
+  // erased, so the node returning cannot un-report it). An entry that has not crossed
+  // miss_grace_ must never be a collapse candidate, however much departed-set pressure exists.
+  NodeLivenessTracker tracker(/*miss_grace=*/2, NodeLivenessTracker::kNoPrune, /*tracked_key_cap=*/1);
+  tracker.update({"/a", "/b"}, {"/a", "/b"});  // both present, armed
+  auto report = tracker.update({}, {});        // both miss 1 of 2 - departed count(2) > cap(1)
+  EXPECT_TRUE(report.dead.empty()) << "neither has crossed miss_grace yet";
+  EXPECT_EQ(report.dead.count(NodeLivenessTracker::kCollapsedKey), 0u)
+      << "capacity pressure from two BELOW-GRACE entries must never manufacture a collapsed "
+         "death - the earlier shape of this cap did exactly that";
+  EXPECT_EQ(tracker.tracked_count(), 2u) << "both identities must survive the pressure "
+                                            "untouched, so they can still mature genuinely";
+  EXPECT_TRUE(report.tracking_saturated) << "the departed set (2) still exceeds the cap (1) "
+                                            "even though nothing was eligible to collapse - an "
+                                            "accurate, non-fabricating pressure signal";
+}
+
+TEST(NodeLivenessTrackerCap, MaturedDepartedEntriesAreCollapsedIntoACountUnderCapPressure) {
   NodeLivenessTracker tracker(/*miss_grace=*/0, NodeLivenessTracker::kNoPrune, /*tracked_key_cap=*/1);
   tracker.update({}, {"/victim"});
   ASSERT_EQ(tracker.update({}, {}).dead.count("/victim"), 1u);
   ASSERT_EQ(tracker.tracked_count(), 1u);
 
-  // "/victim" is departed, not idle - make_room() cannot free it via eviction, so admitting
-  // "/newcomer" must collapse it instead of refusing the newcomer.
-  auto report = tracker.update({"/newcomer"}, {"/newcomer"});
-  EXPECT_EQ(tracker.tracked_count(), 1u) << "the collapsed identity is gone, replaced by the newcomer";
-  EXPECT_EQ(report.dead.count("/victim"), 0u) << "it can no longer be named individually";
+  // "/newcomer" arms already absent - departed on its very first tick, same as "/victim" was.
+  // Both are MATURED (miss_grace=0), and the departed set (2) now exceeds the cap (1): there
+  // is no present entry to spare (there never is, for this tracker) and no immature entry to
+  // leave alone either, so admitting the newcomer must collapse matured entries instead of
+  // refusing it.
+  auto report = tracker.update({}, {"/newcomer"});
+  EXPECT_EQ(tracker.tracked_count(), 0u) << "cap(1) is below kMaxNamedDepartedEntries, so even "
+                                            "the two-stage collapse cannot leave either one "
+                                            "individually named";
+  EXPECT_EQ(report.dead.count("/victim"), 0u);
+  EXPECT_EQ(report.dead.count("/newcomer"), 0u);
   ASSERT_EQ(report.dead.count(NodeLivenessTracker::kCollapsedKey), 1u)
-      << "but it must still count as content, or a departure the cap forced out would "
-         "silently heal the fault instead of being collapsed into it";
-  EXPECT_NE(report.dead.at(NodeLivenessTracker::kCollapsedKey).find('1'), std::string::npos);
+      << "both confirmed deaths must still count as content, or the cap forcing them out of "
+         "individual tracking would silently heal the fault instead of collapsing it";
+  EXPECT_NE(report.dead.at(NodeLivenessTracker::kCollapsedKey).find('2'), std::string::npos);
   ASSERT_FALSE(report.keys_by_freshness.empty());
   EXPECT_EQ(report.keys_by_freshness.front(), NodeLivenessTracker::kCollapsedKey)
       << "the collapsed count must never be the entry a capped description cuts, since it is "
@@ -261,24 +293,30 @@ TEST(NodeLivenessTrackerCap, DepartedEntryIsCollapsedIntoACountWhenNoIdleEntryCa
 TEST(NodeLivenessTrackerCap, CollapsedCountIsMonotoneAndKeepsAccumulating) {
   NodeLivenessTracker tracker(/*miss_grace=*/0, NodeLivenessTracker::kNoPrune, /*tracked_key_cap=*/1);
   tracker.update({}, {"/first"});
-  tracker.update({}, {});                    // "/first" confirmed dead, occupies the only slot
-  tracker.update({"/second"}, {"/second"});  // collapses "/first"
-  tracker.update({}, {});
-  tracker.update({}, {});
-  auto later = tracker.update({"/third"}, {"/third"});  // "/second" now departed too; collapses it
-  ASSERT_EQ(later.dead.count(NodeLivenessTracker::kCollapsedKey), 1u);
-  EXPECT_NE(later.dead.at(NodeLivenessTracker::kCollapsedKey).find('2'), std::string::npos)
-      << "two distinct identities have now been collapsed - the count must not have reset "
-         "when the slot changed hands the second time";
+  tracker.update({}, {});                               // "/first" confirmed dead, occupies the only slot
+  auto after_second = tracker.update({}, {"/second"});  // "/second" arms already-departed: both collapse
+  ASSERT_EQ(after_second.dead.count(NodeLivenessTracker::kCollapsedKey), 1u);
+  EXPECT_NE(after_second.dead.at(NodeLivenessTracker::kCollapsedKey).find('2'), std::string::npos);
+  ASSERT_EQ(tracker.tracked_count(), 0u);
+
+  auto after_third = tracker.update({}, {"/third"});  // one free slot: "/third" stays named alone
+  EXPECT_EQ(tracker.tracked_count(), 1u);
+  EXPECT_NE(after_third.dead.at(NodeLivenessTracker::kCollapsedKey).find('2'), std::string::npos)
+      << "the count from the first collapse must persist even on a tick that collapses nothing new";
+
+  auto after_fourth = tracker.update({}, {"/fourth"});  // "/fourth" arms already-departed: collapses both
+  ASSERT_EQ(after_fourth.dead.count(NodeLivenessTracker::kCollapsedKey), 1u);
+  EXPECT_NE(after_fourth.dead.at(NodeLivenessTracker::kCollapsedKey).find('4'), std::string::npos)
+      << "two more distinct identities have now been collapsed - the count must not have reset "
+         "when the slot changed hands again";
 }
 
-TEST(NodeLivenessTrackerCap, SaturationNeverFiresBecauseEveryKeyIsEitherIdleOrCollapsible) {
-  // Pinning a real property of THIS tracker's model, not merely an untested field: unlike
-  // LifecycleExpectationTracker (whose two clocks let a node be simultaneously present and
-  // mid-violation, hence neither idle nor departed), NodeLivenessTracker has exactly one
-  // piece of per-key state, so a tracked key is always either idle (present) or departed
-  // (absent) - collapsing every departed entry always empties known_, so make_room() can
-  // never actually run out of room while tracked_key_cap_ >= 1. See make_room()'s own doc.
+TEST(NodeLivenessTrackerCap, AtZeroMissGraceEveryDepartedEntryIsInstantlyMaturedSoSaturationNeverFires) {
+  // NOT a general property of this tracker - see
+  // ImmatureDepartedEntriesAreNeverCollapsedOrReportedUnderCapPressure above for the case
+  // that DOES saturate. At miss_grace=0 every departed entry matures on its very first
+  // missed tick, so there is never an immature entry the cap has to leave alone: collapsing
+  // every matured entry always succeeds in bringing the departed set back under the cap.
   NodeLivenessTracker tracker(/*miss_grace=*/0, NodeLivenessTracker::kNoPrune, /*tracked_key_cap=*/1);
   bool ever_saturated = false;
   for (int i = 0; i < 50; ++i) {
@@ -288,5 +326,4 @@ TEST(NodeLivenessTrackerCap, SaturationNeverFiresBecauseEveryKeyIsEitherIdleOrCo
     ever_saturated = ever_saturated || report.tracking_saturated;
   }
   EXPECT_FALSE(ever_saturated);
-  EXPECT_LE(tracker.tracked_count(), 1u);
 }

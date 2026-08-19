@@ -513,26 +513,172 @@ TEST_F(NodeDeathIntegrationTest, N11_TrackedNodeCapBoundsUnsuppressedChurnAndKee
   };
 
   // 20 distinct, unsuppressed identities - no allowlist, no suppress configured. Each is
-  // armed on its own tick, then given a tick fully absent before the next one arrives, so
-  // by the time a later identity needs a slot every existing entry has already missed at
-  // least once and is genuinely departed (misses_ > 0) - none idle-evictable "for free".
-  // That is deliberate: a churn pattern that always leaves an idle entry around (e.g. one
-  // continuously-present anchor app) lets make_room() clear room by idle-eviction alone
-  // forever and never actually reaches collapse_departed(), which would prove nothing about
-  // the claim this row exists for. warmup_cycles=0 makes the fully-empty ticks harmless -
-  // the global bringup grace re-arms on the very next non-empty tick regardless.
+  // armed on its own tick (PRESENT, so it never competes for the departed cap that tick),
+  // then given a tick fully absent, where it matures instantly (miss_grace=0) and becomes a
+  // departed-cap candidate. warmup_cycles=0 makes the fully-empty ticks harmless - the
+  // global bringup grace re-arms on the very next non-empty tick regardless.
   for (int i = 0; i < 20; ++i) {
     run_tick({app_of("churn_" + std::to_string(i))});
     run_tick({});
   }
 
-  EXPECT_LE(max_seen, 3u) << "tracked_node_cap must actually engage under scale past it - "
-                             "without it this would grow past 20, unbounded for the life of "
-                             "the process";
+  // kCap + 1, not kCap: a present/armed key is never refused a slot or evicted for one (see
+  // node_liveness_tracker.hpp's class doc) - only the DEPARTED subset is bounded. This
+  // churn's own admission tick therefore transiently coexists with a departed set already
+  // at the cap: kCap matured entries plus the one brand-new present arrival, until THAT one
+  // departs on the very next tick and the departed set's own collapse brings it back to
+  // kCap. Without the cap this would grow past 20, unbounded for the life of the process.
+  constexpr std::size_t kCap = 3;
+  EXPECT_LE(max_seen, kCap + 1) << "tracked_node_cap must actually engage under scale past it";
   std::this_thread::sleep_for(50ms);
   EXPECT_TRUE(any_failed_desc_contains(kGraphSource, {"more node(s) disappeared"}))
       << "identities the cap forced out of individual tracking must still count as content, "
          "or a death the cap collapsed would silently heal instead of staying raised";
+}
+
+// =============================================================================================
+// Cap redesign regressions. Both sit PAST tracked_node_cap, in the two directions a cap that
+// bounds the wrong thing gets wrong: a graph LARGER than the cap (every death must still be
+// reported), and departed-set CHURN below miss_grace (capacity pressure must never fabricate a
+// death). See node_liveness_tracker.hpp's own class doc for the ruling these pin.
+// =============================================================================================
+
+TEST_F(NodeDeathIntegrationTest, CapC1_GraphLargerThanTheDefaultCapStillReportsADeathAmongItsPresentMajority) {
+  // Reproduces the exact sequence the panel found: at the shipped default tracked_node_cap
+  // (512), 513 armed nodes used to leave only one survivor once make_room() evicted every
+  // present entry to admit the newcomer - and evicting a present entry can permanently lose
+  // any death landing in the eviction window, because only ONLINE nodes re-enter `armed`.
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}});  // default tracked_node_cap (512)
+  auto ctx = make_ctx(&gate);
+
+  // 513 armed, present nodes - one more than the default cap - lexically ordered zero-padded
+  // ids so the very first admitted is also lexically first, matching the panel's own repro.
+  std::vector<App> apps;
+  apps.reserve(514);
+  for (int i = 0; i < 513; ++i) {
+    std::string idx = std::to_string(i);
+    idx.insert(idx.begin(), 3 - idx.size(), '0');
+    apps.push_back(app_of("n" + idx));
+  }
+  apps.push_back(anchor_app());
+  set_apps(apps);
+  gate.update(snapshot_, 1);
+  det->tick(ctx);
+  ASSERT_EQ(det->tracked_count_for_test(), 514u)
+      << "every armed/present node must be tracked - none refused for capacity, however many "
+         "there are";
+
+  // Kill only the first one; every other node (512 of them) plus the anchor stay present.
+  apps.erase(apps.begin());
+  set_apps(apps);
+  gate.update(snapshot_, 2);
+  det->tick(ctx);  // misses(1) > miss_grace(0): dead
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_TRUE(any_failed_desc_contains(kGraphSource, {"n000"}))
+      << "the one node that actually died among 513 present ones must still be reported - a "
+         "cap that evicts present entries to make room can lose exactly this death";
+}
+
+TEST_F(NodeDeathIntegrationTest, CapC2_ChurnUnderCapPressureNeverFabricatesADeathBeforeMissGrace) {
+  // Reproduces the panel's exact sequence: at cap(2) with three entries carrying only one
+  // below-grace miss each, a make_room() that collapsed every non-idle entry used to fold all
+  // three into the collapsed count, raising GRAPH_NODE_DISAPPEARED before any of them had
+  // actually crossed miss_grace, and unhealably (their identities were erased).
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 2}, {"tracked_node_cap", 2}});
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("a"), app_of("b"), app_of("c"), anchor_app()});
+  gate.update(snapshot_, 1);
+  det->tick(ctx);  // arms a, b, c
+
+  set_apps({anchor_app()});  // a, b, c all depart on the same tick
+  gate.update(snapshot_, 2);
+  det->tick(ctx);  // each misses 1 of 2 (miss_grace) - below grace, but the departed COUNT
+                   // (3) exceeds tracked_node_cap(2): the exact capacity pressure that used
+                   // to force make_room() to collapse entries before grace.
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), 0u)
+      << "none of a/b/c has crossed miss_grace yet - capacity pressure alone must never "
+         "report any of them dead early";
+  EXPECT_EQ(det->tracked_count_for_test(), 4u)
+      << "the anchor (idle) plus all three of a/b/c must still be individually tracked - none "
+         "had matured, so none was an eligible collapse candidate despite the departed count "
+         "exceeding the cap";
+
+  // "/a" returns, relieving the pressure before anything matured; "/b" and "/c" stay gone and
+  // now genuinely cross miss_grace - proving the pressure above did not silently erase either
+  // identity (which would make it un-reportable, since only ONLINE nodes re-enter `armed`).
+  set_apps({app_of("a"), anchor_app()});
+  gate.update(snapshot_, 3);
+  det->tick(ctx);  // b, c miss 2 == miss_grace, not yet; a is present again (idle)
+  gate.update(snapshot_, 4);
+  det->tick(ctx);  // b, c miss 3 > miss_grace: genuinely, individually dead - the departed
+                   // count (2) no longer exceeds the cap(2), so nothing is collapsed
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_TRUE(any_failed_desc_contains(kGraphSource, {"/b"}));
+  EXPECT_TRUE(any_failed_desc_contains(kGraphSource, {"/c"}));
+  EXPECT_EQ(det->tracked_count_for_test(), 4u) << "anchor and a (idle), b and c (departed) - none collapsed";
+}
+
+TEST_F(NodeDeathIntegrationTest, CapCollapsedDeathClearsOnceTheGraphRecoversAndTheDetectorIsReconfigured) {
+  // A cap-forced collapse is a confirmed death that can no longer be named individually - it
+  // still keeps GRAPH_NODE_DISAPPEARED raised, by design (collapsed_dead_count_ is monotone
+  // within one tracker lifetime: the identities are gone, so there is no way to tell which of
+  // possibly-several collapsed departures came back). What was untested is whether such a
+  // fault can EVER clear again once the graph genuinely recovers - proven here through the
+  // same reconfigure path ReconfigureWhileAbsentDoesNotWithholdAnEarnedClearOnceTheNodeReturns
+  // already proves for an ordinary (uncollapsed) outstanding fault: a live reconfigure rebuilds
+  // tracker_ (and so collapsed_dead_count_) from scratch while preserving ever_raised_, so a
+  // clean re-observation of an all-present graph clears it.
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}, {"tracked_node_cap", 1}});
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("a"), app_of("b"), anchor_app()});
+  gate.update(snapshot_, 1);
+  det->tick(ctx);  // arms a, b
+
+  set_apps({anchor_app()});  // a, b both depart
+  gate.update(snapshot_, 2);
+  det->tick(ctx);  // both miss 1 > miss_grace(0): matured; departed count(2) > cap(1): collapsed
+
+  std::this_thread::sleep_for(50ms);
+  ASSERT_EQ(det->tracked_count_for_test(), 1u)
+      << "precondition: both identities collapsed - only the anchor (idle, uncapped) remains";
+  ASSERT_TRUE(any_failed_desc_contains(kGraphSource, {"more node(s) disappeared"}))
+      << "precondition: the collapse must itself have been reported as a genuine raise";
+
+  set_apps({app_of("a"), app_of("b"), anchor_app()});  // the graph recovers: both return
+  gate.update(snapshot_, 3);
+  det->tick(ctx);
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_PASSED), 0u)
+      << "merely returning must NOT by itself clear a collapsed death - collapsed_dead_count_ "
+         "stays raised until an operator actually acts on the cap-saturation warning";
+
+  // The operator's actual remedy: reconfigure (raising tracked_node_cap, say - the cap value
+  // itself does not matter here, only that configure() rebuilds tracker_ from scratch).
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}, {"tracked_node_cap", 16}});
+  gate.update(snapshot_, 4);  // a, b are present in this same, unchanged snapshot
+  det->tick(ctx);
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_GT(count_faults(kGraphSource, ReportFault::Request::EVENT_PASSED), 0u)
+      << "once reconfigured, a clean re-observation of an all-present graph must clear the "
+         "fault - ever_raised_ survives reconfigure (see ReconfigureWhileAbsentDoesNot... "
+         "above) precisely so this recovery path is not permanently stuck";
 }
 
 // =============================================================================================
@@ -611,9 +757,12 @@ TEST_F(NodeDeathIntegrationTest, C1_MissGraceOneBelowTheFloorWarnsAndIsBumped) {
 
 TEST_F(NodeDeathIntegrationTest, C1_PruneGraceBelowMissGracePlusOneIsSilentlyClampedUp) {
   // The clamp is not a rejection (no warning is owed for it - prune_grace=0 is itself a
-  // perfectly legal value), so this is a BEHAVIOURAL proof: an allowlisted, durably dead
-  // key must not be reclaimed before miss_grace + 1 = 3 consecutive suppressed ticks, even
-  // though prune_grace=0 was configured (which would reclaim after just 1 if unclamped).
+  // perfectly legal value), so this is a BEHAVIOURAL proof, in two halves: an allowlisted,
+  // durably dead key must not be reclaimed before miss_grace + 1 = 3 consecutive suppressed
+  // ticks, even though prune_grace=0 was configured (which would reclaim after just 1 if
+  // unclamped) - AND it must actually BE reclaimed once that clamped horizon passes, or this
+  // row could not tell the claimed clamp from prune() being broken entirely (neither would
+  // move tracked_count off 1 at the first-eligible tick either).
   ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
   auto det = make_node_death();
   ASSERT_TRUE(det);
@@ -634,6 +783,17 @@ TEST_F(NodeDeathIntegrationTest, C1_PruneGraceBelowMissGracePlusOneIsSilentlyCla
   }
   ASSERT_EQ(det->tracked_count_for_test(), 1u) << "the clamp must not have reclaimed it yet "
                                                   "at the very tick it first became eligible";
+
+  // prune_ticks = max(prune_grace=0, miss_grace(2)+1=3) = 3. Suppression is first evaluated
+  // at t=4 (streak 1); reclaim once the streak exceeds 3, i.e. streak 4 at t=7. Ticked to 9
+  // for margin.
+  for (std::uint64_t t = 5; t <= 9; ++t) {
+    gate.update(snapshot_, t);
+    det->tick(ctx);
+  }
+  EXPECT_EQ(det->tracked_count_for_test(), 0u)
+      << "past the clamped horizon the durably-suppressed key must actually be reclaimed - a "
+         "clamp that silently became 'never prune' would leave this at 1 forever";
 }
 
 // =============================================================================================
@@ -1011,6 +1171,51 @@ TEST_F(NodeDeathIntegrationTest, EverRaisedTracksDeliveryNotIntentSoAnUndelivere
   std::this_thread::sleep_for(50ms);
   EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_PASSED), 0u)
       << "no FAILED for this occurrence ever reached the wire, so no PASSED may either";
+}
+
+TEST_F(NodeDeathIntegrationTest, AdvisoryModeStillObservesAndAccumulatesMissesWithoutEmittingAnything) {
+  // README's own contract: "advisory = observe, do not push". The sibling test above proves
+  // the "do not push" half; this proves the "observe" half is not a no-op masquerading as
+  // one - a detector that skipped tracker_.update() entirely in Advisory mode would ALSO
+  // send nothing, and would be indistinguishable from a correct one by that test alone.
+  //
+  // Proof: accumulate misses PAST miss_grace while in Advisory (so the node is genuinely
+  // dead from the tracker's own point of view, just never reported), then switch to Raise
+  // mode WITHOUT letting the node return. A detector that truly kept observing raises on
+  // this very first Raise-mode tick, because the miss count already crossed the threshold
+  // during the Advisory window; one that had paused observation would need miss_grace + 1
+  // MORE ticks from here to reach the same threshold from zero.
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 2}});
+  auto ctx = make_ctx(&gate);
+  ctx.mode = DetectorMode::Advisory;
+
+  set_apps({app_of("victim"), anchor_app()});
+  gate.update(snapshot_, 0);
+  det->tick(ctx);  // arms "victim"
+
+  set_apps({anchor_app()});                 // victim departs
+  for (std::uint64_t t = 1; t <= 3; ++t) {  // misses 1, 2, 3 (> miss_grace(2)): genuinely dead
+    gate.update(snapshot_, t);
+    det->tick(ctx);
+  }
+  EXPECT_EQ(det->tracked_count_for_test(), 2u)
+      << "Advisory mode must still track victim and anchor exactly as Raise mode would";
+
+  std::this_thread::sleep_for(50ms);
+  ASSERT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), 0u)
+      << "precondition: Advisory mode must have genuinely suppressed the raise so far";
+
+  ctx.mode = DetectorMode::Raise;
+  gate.update(snapshot_, 4);  // victim still absent - no recovery here
+  det->tick(ctx);
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_GT(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), 0u)
+      << "the very first Raise-mode tick must already raise, proving the miss count had "
+         "already crossed miss_grace DURING the Advisory window rather than starting fresh";
 }
 
 TEST_F(NodeDeathIntegrationTest, ReconfigureWhileAbsentDoesNotWithholdAnEarnedClearOnceTheNodeReturns) {

@@ -14,12 +14,10 @@
 # limitations under the License.
 """node_death boundary, config and instrument e2e: the seam with lifecycle_expectation.
 
-Sibling of test_node_death_e2e.test.py and test_node_death_suppression_e2e.test.py, same reason:
-this package carries no node_death detector yet, and R10's narrowing of lifecycle_expectation's
-absence handling has not landed either, so most rows here are expected to fail today. What makes
-this file different is B1 and B3: their claims are about lifecycle_expectation ALONE, which
-already ships, so they can genuinely discriminate today - see their own class docstrings for what
-was actually observed, not merely predicted.
+Sibling of test_node_death_e2e.test.py and test_node_death_suppression_e2e.test.py, same shape.
+What makes this file different is B1 and B3: their claims are about lifecycle_expectation ALONE,
+independent of node_death, so an absence assertion there still discriminates a correct detector
+from no detector at all - see their own class docstrings for what was actually observed.
 
 Runs as SEVEN separate CTest targets (see CMakeLists.txt). WATCHDOG_E2E_SCENARIO selects which
 launch and which assertions run:

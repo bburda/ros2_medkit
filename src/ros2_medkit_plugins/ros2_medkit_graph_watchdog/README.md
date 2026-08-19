@@ -70,7 +70,7 @@ to watch, because every armed App in the graph is a candidate.
 | `prune_grace` | int | `60` | Plugin-injected default (overridable here); how long a key being DURABLY suppressed (see "Suppression" below) may sit unreported before its bookkeeping is reclaimed. Accepted range 0..3600. The value actually used is `max(prune_grace, miss_grace + 1)`, a silent internal floor rather than a rejection: without it, a durably-suppressed key could be reclaimed the very tick it would first have become eligible to report, losing the report rather than merely suppressing it. |
 | `allowlist` | string[] | `[]` | Node identities never reported dead. A dead key matches if it - or a name the same node is also known by - is present verbatim: the key's own fqn, its bare leaf, or (captured while the node was still present) its `App::id`. Has no effect unless named in `suppress`; naming it without a configured list is a no-op. |
 | `suppress` | string[] | `[]` | Suppression mechanisms to activate: `"allowlist"` and `"lifecycle"`. Any other entry warns as unrecognized and is ignored; a non-string or non-array entry warns the same way. |
-| `tracked_node_cap` | int | `512` | The most node identities this detector keeps bookkeeping for at once. Accepted range 1..16384; `0` is refused rather than clamped, since a cap of nothing would mean tracking nothing. See "Bounded by evidence, not by age" below for the eviction order - and for why, unlike the sibling detector's identical-looking cap, this one can never actually refuse a newcomer. |
+| `tracked_node_cap` | int | `512` | The most DEPARTED (not-yet-confirmed-dead or already-collapsed) identities this detector keeps individual bookkeeping for at once - a present/armed node is never counted against it and never refused tracking. Accepted range 1..16384; `0` is refused rather than clamped, since a cap of nothing would mean tracking nothing. See "Bounded by evidence, not by age" below for what it actually bounds and why, unlike the sibling detector's identical-looking cap, a newcomer here is never the thing refused. |
 
 `tick_interval_ms` is not an own key of this detector, but this is the one detector that
 reads the plugin-injected value directly, to compute `miss_grace`'s wall-clock floor below.
@@ -99,8 +99,11 @@ built from it.
 | An App that never comes online | A key is admitted to tracking only once it has been armed by the reliability gate at least once. A manifest App whose binding never starts is never armed and so can never be falsely called dead; a node still inside its `warmup_cycles` window gets the identical protection. Once tracked, though, a node's continued life-or-death judgement rests on PRESENCE alone, not on staying armed - a tracked node that later goes lifecycle-inactive is not thereby mistaken for dead. |
 
 Composable/component nodes hosted in one process die together: if the container process
-dies, every node it hosted leaves the snapshot on the same tick, and all of them are named in
-the one aggregated fault rather than raising one fault each.
+dies, every node it hosted leaves the snapshot on the same tick, and all of them are folded
+into the one aggregated fault rather than raising one fault each - individually named up to
+the description's 480-character cap and up to 3 at once under `tracked_node_cap` pressure,
+whichever runs out first; past either limit the remainder still count toward the fault, just
+not by name (see "Bounding the tracked-key map" below).
 
 **The wall-clock floor on `miss_grace`.** The entity snapshot a tick reads is not rebuilt
 every tick: runtime discovery rebuilds it off a graph event debounced to about one refresh
@@ -1365,22 +1368,37 @@ set - so identity churn (nodes reappearing under ever-new names, one per run or 
 namespace) would grow the tracker's map without a bound if nothing capped it. An
 unsuppressed, still-dead entry is never reclaimed by age - `prune_grace` is the only reclaim
 path there is, and it only ever applies to a durably-suppressed key - so `tracked_node_cap`
-is what actually bounds memory. At the cap: idle entries (present, carrying no evidence) are
-evicted first - free, since a still-armed one is simply re-tracked a moment later - then
-departed entries are collapsed into one synthetic count, keeping at most three individually
-named, and only if even that leaves no room is every departed entry collapsed.
+is what actually bounds memory: specifically, the DEPARTED subset of it (identities carrying
+a nonzero miss count). A PRESENT entry never counts against the cap and is never evicted to
+make room for anything, at any map size: it costs nothing to keep (an idle entry is simply
+re-tracked a moment later if it is still armed), and it is bounded by the live graph, not by
+churn, which is bounded by reality rather than by this cap. So a graph carrying far more
+nodes than `tracked_node_cap` is not, by itself, capacity pressure at all - every one of them
+is still tracked and every genuine death among them still reported; only a departed set that
+is itself larger than the cap is.
 
-Unlike `lifecycle_expectation`'s identical-looking cap, this one cannot actually refuse a
-newcomer. `LifecycleExpectationTracker` carries two clocks per node, so a node can be
-simultaneously present and mid-violation - neither idle nor departed, and so un-evictable -
-which is what lets its cap genuinely saturate and withhold `GRAPH_NODE_INACTIVE`'s clear.
-`NodeLivenessTracker` carries exactly one piece of per-key state (a miss count), so every
-tracked identity is always either idle or departed; collapsing every departed entry always
-empties enough room, so a newcomer is never actually refused while the cap is at least 1.
-`tracking_saturated` and `tracked_node_cap` still appear in this detector's own
-`GET /x-medkit-watchdog` block, in the same shape the sibling reports them, but the field is
-never observed true here - the shared shape exists for consistency with the sibling
-detector, not because saturation is reachable in this one.
+At that point, the cap collapses departed entries into one synthetic count, keeping at most
+three individually named - but ONLY entries that have actually crossed `miss_grace` (a
+confirmed death). An entry that is merely mid-grace is never a collapse candidate: folding it
+into the count would report a death the node has not earned, permanently, since collapsing
+erases the identity and a node returning cannot un-report what was never real. Under
+sustained pressure from still-maturing churn the departed set may therefore exceed
+`tracked_node_cap` for a few ticks - bounded by how fast new departures arrive times
+`miss_grace`, not by how long the process has been running, which is the growth this cap
+exists to prevent in the first place. `tracking_saturated` reports exactly this: the departed
+set still exceeds `tracked_node_cap` even after collapsing every confirmed death it safely
+could, because immature entries alone account for the excess.
+
+Unlike `lifecycle_expectation`'s identical-looking cap, a PRESENT/armed key here is never the
+thing evicted to free a slot. `LifecycleExpectationTracker` carries two clocks per node, so a
+node can be simultaneously present and mid-violation - a third state this tracker does not
+have, and what makes evicting a present entry there lose nothing (the evidence lives in the
+clocks). `NodeLivenessTracker` carries exactly one piece of per-key state (a miss count), so
+a tracked identity is always either present-and-empty or absent-and-evidential; evicting a
+present one here would only ever discard a key that could simply be re-admitted next tick
+anyway, at the cost of losing any death that happens to land in the eviction window - only
+ONLINE nodes re-enter `armed`, so an evicted-while-present node that then dies is never
+re-admitted at all. The sibling's eviction order does not transfer.
 
 **The boundary with `lifecycle_expectation`.** `GRAPH_NODE_INACTIVE` and
 `GRAPH_NODE_DISAPPEARED` can both be raised for the same node at the same time, and that is
@@ -1438,11 +1456,15 @@ frame do not accumulate a per-occurrence history either way.
    capped description's blind spot; `prune()` reclaims a key only once it has been
    suppressed for MORE than `prune_ticks` CONSECUTIVE calls, resets the streak the moment a
    veto lifts even once, and never reclaims an unsuppressed death no matter how long it
-   stays dead; the cap evicts idle entries before collapsing departed ones, keeps the
-   collapsed count monotone within one tracker lifetime, and - the property most at odds
-   with a naive read of the sibling detector - can never actually report
-   `tracking_saturated` at all, because every tracked key here is always either idle or
-   collapsible, never both at once the way the sibling's two clocks allow. `test_suppressor.cpp`
+   stays dead. On the cap: a graph carrying ten times `tracked_node_cap` present keys is
+   never refused or evicted, and every genuine death among them is still individually
+   reported; two entries carrying only a below-grace miss each are never collapsed or
+   reported under cap pressure, however much the departed count exceeds the cap, and
+   `tracking_saturated` reports exactly that condition; matured (confirmed-dead) entries ARE
+   collapsed into a monotonically-accumulating count once the departed set exceeds the cap
+   and no present or immature entry is available to spare; and at `miss_grace: 0`, where
+   every departure matures instantly, saturation never fires at all - a narrower, honestly-
+   scoped property than a blanket "can never saturate" claim. `test_suppressor.cpp`
    pins the `Suppressor` interface (`durable()` defaults false) and the free
    `apply_suppressors()` helper (order-independent, null-safe, returns the dropped count) -
    this detector's own filtering is hand-inlined rather than a call to that helper, because
@@ -1456,15 +1478,24 @@ frame do not accumulate a per-occurrence history either way.
    key), that a peer-aggregated app and an `is_online: false` app are never tracked, that
    the tracked count stays bounded and shrinks after a reclaim under sustained identity
    churn (and, without any suppression configured at all, that `tracked_node_cap` still
-   bounds memory under unsuppressed churn while the fault stays raised), that a clean
-   managed-lifecycle departure is suppressed exactly AT the `miss_grace` boundary and stays
-   reclaimed - not re-raised - past the retention window the plugin sizes for it, that the
-   allowlist's id-form suppresses only the colliding node and not its namesake, and the
-   ungated-clear guard's four properties: a stored fault stays unhealed while an unrelated
-   node arms alone, a clear flows once this process instance has genuinely raised, the guard
-   tracks DELIVERY rather than intent (an attempted-but-undelivered raise never earns a
-   clear), and a reconfigure while the node is absent does not withhold a clear the process
-   had already earned.
+   bounds memory under unsuppressed churn while the fault stays raised), that the
+   `prune_grace` clamp is not merely never-reclaimed-yet but actually reclaims once its
+   clamped horizon passes, that Advisory mode keeps accumulating misses (provable by
+   switching to Raise mode without letting the node return and observing an immediate raise)
+   rather than merely declining to send, that a clean managed-lifecycle departure is
+   suppressed exactly AT the `miss_grace` boundary and stays reclaimed - not re-raised - past
+   the retention window the plugin sizes for it, that the allowlist's id-form suppresses only
+   the colliding node and not its namesake, and the ungated-clear guard's four properties: a
+   stored fault stays unhealed while an unrelated node arms alone, a clear flows once this
+   process instance has itself handed a FAILED request to the fault client, the guard tracks
+   that handoff rather than intent (an attempted-but-never-sent raise never earns a clear),
+   and a reconfigure while the node is absent does not withhold a clear the process had
+   already earned. Three more rows sit past the cap specifically: 513 armed nodes against the
+   default `tracked_node_cap` (512) still report the one that dies; three below-grace entries
+   under `tracked_node_cap: 2` never fabricate a death and still mature into a genuine one
+   once the pressure passes; and a cap-forced collapse stays raised through a genuine
+   recovery but clears once reconfigured, mirroring the ungated-clear guard's own reconfigure
+   test for an ordinary (uncollapsed) fault.
 3. **E2e**, three files, each launching its own real gateway + fault_manager + demo-node
    stack:
    - `test/e2e/test_node_death_e2e.test.py` (ten scenarios): raise and name the node; clear
@@ -1479,9 +1510,13 @@ frame do not accumulate a per-occurrence history either way.
      suppresses the node it names; the SAME allowlist left unnamed in `suppress` is inert,
      and a startup warning says so; a managed lifecycle node that reached a clean shutdown
      is never named while an active sibling that was simply killed still is; naming a node
-     on the allowlist alone, with `suppress` unset, does not suppress it; and a death held
-     well past `prune_grace` stays CONFIRMED and keeps naming the node, proving pruning
-     bookkeeping is not the same thing as healing the fault.
+     on the allowlist alone, with `suppress` unset, does not suppress it; and an ALLOWLISTED
+     death (the only shape pruning ever applies to - see "Bounded by evidence, not by age")
+     held well past `prune_grace` is actually reclaimed (`tracked_count` on
+     `GET /x-medkit-watchdog` drops to 0, not merely "no fault ever appeared", which a
+     deleted `prune()` would also produce), while never once raising `GRAPH_NODE_DISAPPEARED`
+     for it - proving pruning a suppressed key's bookkeeping is not itself an event the
+     aggregate reacts to.
    - `test/e2e/test_node_death_boundary_e2e.test.py` (seven scenarios, the seam with
      `lifecycle_expectation`): a node stuck inactive but never gone is
      `GRAPH_NODE_INACTIVE`'s alone; the same node killed while still below `grace` raises

@@ -76,12 +76,16 @@ struct DetectorContext {
 
   /// Returns true only once `async_send_request` has actually been called - false for every
   /// suppression path (Advisory/Off, no client, empty source_id, reliability gate, service
-  /// not ready). A caller that needs to know whether a raise genuinely reached the wire -
-  /// not merely that this call was ATTEMPTED with a non-empty report - must use this return
-  /// value rather than inferring it from its own inputs: node_death_detector.cpp's
-  /// ever_raised_ guard is exactly that caller, and every one of these suppression paths is
-  /// silent by design (no detector should have to duplicate them to know whether it may
-  /// later trust its own silence as a clear).
+  /// not ready). This proves the request was handed to rclcpp's client library for sending,
+  /// nothing more: the client is deliberately fire-and-forget (see
+  /// GraphWatchdogPlugin::set_context()'s own note on why - nothing consumes the future), so
+  /// a true return does NOT prove fault_manager received or processed the request, only that
+  /// this call was not one of the silent-decline paths above. A caller that needs to
+  /// distinguish "genuinely attempted" from "merely warranted" (report non-empty) - not
+  /// receipt - must use this return value rather than inferring it from its own inputs:
+  /// node_death_detector.cpp's ever_raised_ guard is exactly that caller, and every one of
+  /// these suppression paths is silent by design (no detector should have to duplicate them
+  /// to know whether it may later trust its own silence as a clear).
   bool raise_fault(const std::string & code, uint8_t severity, const std::string & description,
                    const std::string & source_id) {
     if (!mode_emits(mode) || !fault_client) {
