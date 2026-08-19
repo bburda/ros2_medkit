@@ -19,7 +19,7 @@ What makes this file different is B1 and B3: their claims are about lifecycle_ex
 independent of node_death, so an absence assertion there still discriminates a correct detector
 from no detector at all - see their own class docstrings for what was actually observed.
 
-Runs as SEVEN separate CTest targets (see CMakeLists.txt). WATCHDOG_E2E_SCENARIO selects which
+Runs as EIGHT separate CTest targets (see CMakeLists.txt). WATCHDOG_E2E_SCENARIO selects which
 launch and which assertions run:
 
 - "b1_inactive_present": a require_active node (managed_lifecycle, never activated) sits in the
@@ -80,6 +80,17 @@ launch and which assertions run:
   entity cannot decide the row - then, once the configured grace has had time to elapse, the
   fault must still arrive and name the node: the large value delays the report, it does not
   swallow it. RED.
+- "b6_never_armed_below_grace_then_gone": TARGET_NODE launched WITHOUT auto_activate, so it
+  sits at "unconfigured" its entire life and never once reaches "active" - the gate's
+  per-entity `armed` precondition (LifecycleWatcher::node_ok()) is therefore false for the
+  whole test, and node_death can never track it (NodeLivenessTracker only ever tracks a key
+  the gate has armed at least once). Killed after being observed non-active for only a
+  couple of ticks - comfortably below `grace`, proven the same way B2 proves it (an
+  immediate, single-instant read of GET /faults right before the kill, not inferred from
+  elapsed time). With node_death structurally unable to report this departure,
+  GRAPH_NODE_INACTIVE is the only detector that ever could - so unlike B2, absence maturing
+  the below-grace streak is not a defect here, it is the whole point: this is the row that
+  proves the silence a node like this used to fall into is gone.
 - "d2_ungated_clear": a death is confirmed, then the GATEWAY is restarted with a generous
   warmup_cycles so the pre-arm window is wide enough to sample. During that window - before the
   restarted plugin's own gate has armed anything - the stored fault's `last_passed` must stay
@@ -95,15 +106,17 @@ launch and which assertions run:
 ### Which arming gate, and why B1 alone uses the global form
 
 The brief's default rule is: gate on `app_id=<the node a scenario perturbs>`, and reserve the
-global form for a scenario that perturbs the gateway itself. B1 is the documented exception, for
-a reason specific to a require_active node rather than a style choice: ONE of `ReliabilityGate`'s
-own preconditions for a per-entity `armed` state is `LifecycleWatcher::node_ok()`, which is false
-for exactly a tracked node that is not (yet) "active" - the very state B1's target sits in for
-its whole life, on purpose, since B1 never drives it past "unconfigured" at all - that IS the
-row's claim. Gating on `app_id=managed_lifecycle` would therefore wait for something that never
-becomes true in that scenario. This is not a new call: test_lifecycle_expectation_e2e.test.py's
-own "main" scenario already gates the identical fixture globally, for the identical reason, and
-this file follows that precedent rather than inventing a new one.
+global form for a scenario that perturbs the gateway itself. B1 and B6 are the documented
+exceptions, for a reason specific to a require_active node rather than a style choice: ONE of
+`ReliabilityGate`'s own preconditions for a per-entity `armed` state is
+`LifecycleWatcher::node_ok()`, which is false for exactly a tracked node that is not (yet)
+"active" - the very state both targets sit in for their whole life, on purpose, since neither
+drives its node past "unconfigured" at all - that IS each row's claim (B1: still present; B6:
+gone before its own grace). Gating on `app_id=managed_lifecycle` would therefore wait for
+something that never becomes true in either scenario. This is not a new call:
+test_lifecycle_expectation_e2e.test.py's own "main" scenario already gates the identical fixture
+globally, for the identical reason, and this file follows that precedent rather than inventing a
+new one.
 
 B2, B3, B4 and B5 all use the app_id form instead, because for each of them the per-entity
 precondition genuinely becomes true: B4's target (managed_lifecycle_active) has always
@@ -111,7 +124,10 @@ self-activated on its own; B2, B3 and B5 now launch TARGET_NODE (managed_lifecyc
 auto_activate too, specifically so node_death can track it at all - see
 `_lifecycle_node_action`'s own docstring and B2/B3/B5's own class docstrings for why a target
 that never reaches "active" would make GRAPH_NODE_DISAPPEARED structurally unreachable for any
-of the three, not merely slower to catch.
+of the three, not merely slower to catch. B6 is the one row where that same unreachability is
+not a precondition to avoid but the claim under test, so it deliberately launches TARGET_NODE
+the OTHER way - without auto_activate - and asserts GRAPH_NODE_DISAPPEARED stays silent rather
+than waiting for it.
 
 B2 was the one row that got this wrong, twice in the same way: correct for the row's INACTIVE
 half (which needs the node observed below `grace`, so it must never mature past it) and fatal
@@ -186,6 +202,9 @@ GRACE = 3
 # B2's own grace: large enough that "killed after a couple of observed ticks" is unambiguously
 # BELOW it, whatever small overshoot this scenario's own polling interval costs.
 B2_GRACE = 15
+# B6's own grace: same magnitude as B2_GRACE and for the identical reason - "killed after a
+# couple of observed ticks" must be unambiguously BELOW it.
+B6_GRACE = 15
 # B5's own grace: large relative to one restart cycle's uptime. Not load-bearing for what this
 # row actually asserts (see the module docstring - B5 checks GRAPH_NODE_DISAPPEARED only), kept
 # generous so lifecycle_expectation's own behaviour cannot accidentally become this row's story.
@@ -331,6 +350,9 @@ def generate_test_description():
         detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [TARGET_NODE]
         detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = B5_GRACE
         detector_params[f'{_NODE_DEATH_PREFIX}.miss_grace'] = B5_MISS_GRACE
+    elif SCENARIO == 'b6_never_armed_below_grace_then_gone':
+        detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [TARGET_NODE]
+        detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = B6_GRACE
     elif SCENARIO == 'c4_config_endpoint_e2e':
         detector_params[f'{_NODE_DEATH_PREFIX}.miss_grace'] = C4_MISS_GRACE_LARGE
     elif SCENARIO == 'd2_ungated_clear':
@@ -367,6 +389,14 @@ def generate_test_description():
 
     if SCENARIO == 'b4_healthy_then_gone':
         target = _lifecycle_node_action(ACTIVE_NODE, respawn=False)
+        launch_description.add_action(TimerAction(period=2.0, actions=[target]))
+        context['target_node'] = target
+
+    if SCENARIO == 'b6_never_armed_below_grace_then_gone':
+        # auto_activate deliberately omitted (defaults False for TARGET_NODE): this row's
+        # whole claim is that the node NEVER arms - see the module docstring's "Which arming
+        # gate" section and TestBoundaryNeverArmedBelowGraceThenGone's own class docstring.
+        target = _lifecycle_node_action(TARGET_NODE, respawn=False)
         launch_description.add_action(TimerAction(period=2.0, actions=[target]))
         context['target_node'] = target
 
@@ -1048,6 +1078,111 @@ class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
             )
 
 
+class TestBoundaryNeverArmedBelowGraceThenGone(unittest.TestCase):
+    """B6: a required node that never arms, killed below grace: INACTIVE only, and it must raise.
+
+    The row B2 cannot cover. B2's target reaches "active" first, so node_death can track it and
+    GRAPH_NODE_DISAPPEARED is the one to report a below-grace departure - which is exactly why
+    absence must NOT mature GRAPH_NODE_INACTIVE there. This target never reaches "active" at
+    all: LifecycleWatcher::node_ok() is false for its whole life, the gate never arms it
+    (per-entity `armed` requires "active" for a managed node), and node_death only ever tracks a
+    key the gate has armed at least once - so GRAPH_NODE_DISAPPEARED is structurally unable to
+    report this departure, whatever kills it. lifecycle_expectation is the only detector that
+    ever could, and closing that silence means absence has to be allowed to mature a below-grace
+    streak here, the opposite of B2's claim for the opposite reason.
+
+    Both halves are checked: GRAPH_NODE_INACTIVE must raise and name the node (the silence
+    closing), and GRAPH_NODE_DISAPPEARED must stay absent throughout (the structural reason the
+    silence existed at all - if this half ever raised, node_death would have tracked a node the
+    gate never armed, which would be its own defect, not evidence this row's fix works).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rclpy.init()
+        cls._client_node = Node('node_death_boundary_b6_client')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._client_node.destroy_node()
+        rclpy.shutdown()
+
+    def test_never_armed_departure_matures_inactive_disappeared_silent(self, target_node):
+        get_state_service = f'/{TARGET_NODE}/get_state'
+
+        # Global gate: see the module docstring's "Which arming gate" section - this target
+        # never reaches "active", so the app_id-scoped form would wait for something that
+        # never becomes true.
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
+            'graph_watchdog never reported an armed global state')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+        self.assertTrue(
+            _poll_apps_present(PORT, TARGET_NODE, timeout=PRESENCE_TIMEOUT_SEC),
+            f'{TARGET_NODE} never appeared on GET /apps - there is no present node here for '
+            'this row to measure',
+        )
+        self.assertTrue(
+            _poll_lifecycle_label(
+                type(self)._client_node, get_state_service, 'unconfigured',
+                timeout=PRESENCE_TIMEOUT_SEC),
+            f'{TARGET_NODE} did not sit at "unconfigured" - the trigger this row needs (a '
+            'required node that never arms) was never set up',
+        )
+
+        # tracked_nodes becoming 1 is the tracker's own proof that it matched TARGET_NODE at
+        # least once - the earliest moment a kill is guaranteed not to land before the
+        # detector was even permitted to look. B6_GRACE is generous enough that the handful
+        # of extra ticks this poll's own interval can cost before the kill below still leaves
+        # the node comfortably below grace.
+        self.assertTrue(
+            poll_detector_status(
+                PORT, DETECTOR_ID_LIFECYCLE, 'tracked_nodes', 1, timeout=ARM_TIMEOUT_SEC),
+            f'lifecycle_expectation never reported tracking {TARGET_NODE} - it was never '
+            'matched at all, so killing it below would prove nothing about absence maturing '
+            'a violation the presence detector could never have reported',
+        )
+
+        # The row's own precondition, read from an observable immediately before the kill -
+        # same instrument as B2's identical check, for the identical reason: `is` rather than
+        # a plain falsy check, since None (channel unreachable) must not be read as
+        # "confirmed absent".
+        below_grace = _fault_present_now(PORT, FAULT_CODE_INACTIVE)
+        self.assertIs(
+            below_grace, False,
+            f'{FAULT_CODE_INACTIVE} could not be proven absent immediately before the kill '
+            f'below (checked value: {below_grace!r}) - either the fault surface is '
+            f'unreachable, or B6_GRACE ({B6_GRACE} ticks) already matured while the node was '
+            'still present, so the kill below would prove nothing about absence maturing the '
+            'violation',
+        )
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{TARGET_NODE} never left GET /apps after SIGTERM')
+
+        # The row this file exists to add: with node_death structurally unable to track a
+        # node that was never armed, lifecycle_expectation's own absence handling has to be
+        # the one that matures the below-grace streak, or the departure is reported by
+        # nothing at all.
+        fault = poll_faults(PORT, FAULT_CODE_INACTIVE, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(
+                f'{FAULT_CODE_INACTIVE} never raised for the departed {TARGET_NODE} - a node '
+                'the presence detector could never have reported went unreported by every '
+                'detector')
+        self.assertIn(TARGET_NODE, fault.get('description', ''))
+
+        # The structural half: GRAPH_NODE_DISAPPEARED must never raise for this node. It was
+        # never armed, so node_death could never have tracked it in the first place - a raise
+        # here would mean node_death tracked a node the gate never armed, not that this row's
+        # fix works.
+        assert_fault_absent_throughout(self, PORT, FAULT_CODE_DISAPPEARED, SUSTAINED_WINDOW_SEC)
+
+
 class TestBoundaryConfigEndpointE2E(unittest.TestCase):
     """C4: `detectors.node_death.miss_grace` visibly changes when a death is reported.
 
@@ -1232,6 +1367,7 @@ _SCENARIO_CASES = {
     'b3_matured_then_gone': 'TestBoundaryMaturedThenGone',
     'b4_healthy_then_gone': 'TestBoundaryHealthyThenGone',
     'b5_restart_loop_still_caught': 'TestBoundaryRestartLoopStillCaught',
+    'b6_never_armed_below_grace_then_gone': 'TestBoundaryNeverArmedBelowGraceThenGone',
     'c4_config_endpoint_e2e': 'TestBoundaryConfigEndpointE2E',
     'd2_ungated_clear': 'TestBoundaryUngatedClear',
 }

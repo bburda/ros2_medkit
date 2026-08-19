@@ -878,6 +878,16 @@ if(BUILD_TESTING)
     ENV "GATEWAY_TEST_PORT=19500" "WATCHDOG_E2E_SCENARIO=b5_restart_loop_still_caught"
       "${_WATCHDOG_E2E_ENV}")
 
+  # 60 (global arming) + 30 (faults-live) + 30 (presence poll) + 60 (tracked_nodes==1 poll) +
+  # 30 (departure poll) + 60 (raise poll, INACTIVE) + 20 (absence window, DISAPPEARED,
+  # SUSTAINED_WINDOW_SEC) = 290 internal. Rounded to 360 to also cover the launch's own
+  # teardown for TWO processes.
+  medkit_add_launch_test(test_node_death_boundary_e2e_b6_never_armed_below_grace_then_gone
+    test/e2e/test_node_death_boundary_e2e.test.py TIMEOUT 360
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19530" "WATCHDOG_E2E_SCENARIO=b6_never_armed_below_grace_then_gone"
+      "${_WATCHDOG_E2E_ENV}")
+
   # 60 (arming, app_id-scoped) + 30 (faults-live) + 30 (departure poll) + 25 (early silence
   # window, C4_EARLY_WINDOW_SEC, needle-scoped) + 100 (late raise poll,
   # C4_LATE_RAISE_TIMEOUT_SEC) = 245 internal - five independent budgets, not merged. One

@@ -68,14 +68,18 @@ constexpr int kDefaultGrace = 5;
 // worst-case PRESENT withhold something an operator can reason about. A deployment that
 // genuinely needs longer wants a slower tick, not a detector that is silent for weeks.
 //
-// It does NOT bound a node that leaves the graph before its streak matures: absence holds a
-// below-grace streak rather than advancing it (see LifecycleExpectationTracker's own class
-// doc), so that entry sits in the tracker's pending set for as long as the node stays gone,
-// however long that is, independent of `grace`. That is not a new way to withhold
-// GRAPH_NODE_INACTIVE's clear for every OTHER node - the clear was already gated on every
-// required node's status being settled, so one node this indecisive already blocked it before
-// this bound existed. What changes is that the departure itself is GRAPH_NODE_DISAPPEARED's
-// evidence to report, not this detector's.
+// Whether it also bounds a node that leaves the graph before its streak matures depends on
+// whether that node was ever ARMED (see LifecycleExpectationTracker's own class doc). For one
+// the reliability gate has armed at least once, `grace` does NOT bound it: absence holds a
+// below-grace streak rather than advancing it, so that entry sits in the tracker's pending
+// set for as long as the node stays gone, however long that is - GRAPH_NODE_DISAPPEARED can
+// report that departure instead, so nothing here needs to hurry it. That is not a new way to
+// withhold GRAPH_NODE_INACTIVE's clear for every OTHER node - the clear was already gated on
+// every required node's status being settled, so one node this indecisive already blocked it
+// before this bound existed. For a node that was NEVER armed - node_death only ever tracks a
+// node the gate has armed, so this is the one departure nothing else can report - `grace`
+// DOES still bound it: absence keeps advancing the streak too, so it matures within `grace` +
+// `absence_grace` + 1 ticks either way.
 constexpr std::int64_t kMaxGrace = 300;
 /// Consecutive ticks an entry must match ONLY unmanaged nodes before the typo warning
 /// fires. One transient tick is not evidence: discover_apps() wraps the per-node service
@@ -316,9 +320,19 @@ class LifecycleExpectationDetector : public Detector {
         if (state.has_value()) {
           entry_has_managed_match.insert(id);
         }
+        // Whether the gate currently allows a fault to be raised for this SAME app.id - the
+        // exact predicate node_death's own presence detector uses to decide whether it will
+        // ever be able to track this node at all (reliability_allows(), see
+        // node_death_detector.cpp's identical call). Reading it here, from the one gate both
+        // detectors share on the same tick, is what makes "armed" trustworthy rather than a
+        // guess: it is not derived from this node's own lifecycle label, it IS the fact the
+        // presence detector would itself consult if asked right now. The tracker needs it to
+        // tell a node the presence detector could someday report from one it structurally
+        // never can - see LifecycleExpectationTracker's own class doc.
+        const bool armed = reliability_allows(ctx.gate, app.id);
         // One match per (entry, node): the tracker keys violations by NODE, so two
         // namesakes are both reported instead of one silently replacing the other.
-        matches.push_back(LifecycleMatch{id, fqn, state});
+        matches.push_back(LifecycleMatch{id, fqn, state, armed});
       }
     }
     std::set<std::string> matched_entries;

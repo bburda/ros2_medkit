@@ -39,9 +39,12 @@ using ros2_medkit_graph_watchdog::LifecycleMatch;
 using M = std::vector<LifecycleMatch>;
 
 // Violations are keyed by the NODE, so a match carries both the config entry that
-// matched and the node's stable fqn.
-LifecycleMatch match(const std::string & entry, const std::string & fqn, std::optional<std::string> state) {
-  return LifecycleMatch{entry, fqn, std::move(state)};
+// matched and the node's stable fqn. `armed` defaults true, matching LifecycleMatch's own
+// default: a call that does not pass it exercises a node the presence detector could
+// report, and only a test about the never-armed split passes `false` explicitly.
+LifecycleMatch match(const std::string & entry, const std::string & fqn, std::optional<std::string> state,
+                     bool armed = true) {
+  return LifecycleMatch{entry, fqn, std::move(state), armed};
 }
 
 // ---- Violation streak: unchanged behaviour from before this slice's redesign ----
@@ -620,6 +623,104 @@ TEST(LifecycleExpectation, InactiveInterleavedWithAbsenceRunsNeverCrossesGraceFr
            "absence run either stole progress from a match or silently added some of its own";
     EXPECT_EQ(crossed.newly_affected, (std::vector<std::string>{"/a"}));
   }
+}
+
+// ---- Never armed: nothing else can ever report the departure, so absence must mature it ----
+
+// The node the row above cannot cover: one the reliability gate never armed at all. Compare
+// directly against InactiveInterleavedWithAbsenceRunsNeverCrossesGraceFromAbsenceAlone above -
+// same shape, same grace, same absence budget - with the single difference being `armed`.
+// There the presence detector could report the departure instead, so absence merely holds a
+// below-grace streak; here nothing else in the plugin ever will, so absence has to be the one
+// that matures it, or the node's departure is reported by nothing at all.
+TEST(LifecycleExpectation, NeverArmedNodeMaturesFromAbsenceAloneAndStaysGone) {
+  constexpr int kGrace = 5;
+  constexpr int kAbsenceGrace = 2;
+  LifecycleExpectationTracker t({"a"}, kGrace, kAbsenceGrace);
+  ASSERT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty())
+      << "sanity: one present tick, streak 1 <= grace";
+
+  // Node vanishes forever. Inside the blink tolerance nothing moves - a never-armed node
+  // gets the same blink tolerance as any other.
+  for (int i = 0; i < kAbsenceGrace; ++i) {
+    EXPECT_TRUE(t.update(M{}).affected.empty()) << "absence " << i << ": still inside the blink tolerance";
+  }
+  // Past the blink, absence itself keeps the streak climbing. It was 1 after the one present
+  // tick above, so exactly (kGrace - 1) further absent ticks reach kGrace (still not past it)
+  // and the next one crosses.
+  for (int i = 0; i < kGrace - 1; ++i) {
+    EXPECT_TRUE(t.update(M{}).affected.empty()) << "past the blink, iteration " << i;
+  }
+  auto matured = t.update(M{});
+  ASSERT_EQ(matured.affected.count("/a"), 1u)
+      << "a below-grace violation on a node the presence detector could never have reported "
+         "must still mature from absence alone, or its departure is reported by nothing";
+  EXPECT_NE(matured.affected.at("/a").find("has since left the graph"), std::string::npos);
+  EXPECT_EQ(matured.newly_affected, (std::vector<std::string>{"/a"}));
+
+  // And it stays matured while the node remains gone - absence never un-matures a violation,
+  // never-armed or not.
+  for (int i = 0; i < 5; ++i) {
+    auto still = t.update(M{});
+    EXPECT_EQ(still.affected.count("/a"), 1u) << "iteration " << i;
+    EXPECT_TRUE(still.newly_affected.empty()) << "iteration " << i << ": no re-raise churn while merely absent";
+  }
+}
+
+// The narrowing itself, restated for the case it must keep working for: a node armed once
+// (however briefly) before it went non-active. `ever_armed` is sticky, so the CURRENT tick
+// reading non-active - which, against a real gate, means NOT currently armed, since a managed
+// node's node_ok() is false whenever it reads anything but "active" - must not un-arm it. This
+// is the fact GRAPH_NODE_DISAPPEARED needs in order to be ABLE to report this exact node, so
+// GRAPH_NODE_INACTIVE must stay out of the way, exactly as
+// InactiveInterleavedWithAbsenceRunsNeverCrossesGraceFromAbsenceAlone already pins for the
+// unqualified (default-armed) case.
+TEST(LifecycleExpectation, ArmedNodeBelowGraceThenGoneStillDoesNotMatureFromAbsence) {
+  constexpr int kGrace = 5;
+  constexpr int kAbsenceGrace = 2;
+  LifecycleExpectationTracker t({"a"}, kGrace, kAbsenceGrace);
+  ASSERT_TRUE(t.update(M{match("a", "/a", "active", /*armed=*/true)}).affected.empty()) << "sanity: arms the node";
+  ASSERT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty())
+      << "sanity: one inactive tick, streak 1 <= grace";
+
+  for (int i = 0; i < kAbsenceGrace + 20; ++i) {
+    auto report = t.update(M{});
+    EXPECT_TRUE(report.affected.empty()) << "iteration " << i
+                                         << ": a node the presence detector could report must never have "
+                                            "its below-grace streak matured by absence alone";
+    EXPECT_EQ(report.pending_violation.count("/a"), 1u)
+        << "iteration " << i << ": the streak must stay HELD, not erased either";
+  }
+}
+
+// A never-armed node that RESUMES rather than restarts: absence-driven progress survives the
+// return exactly like a present-tick streak already does (see
+// ViolationStreakSurvivesNonMaturingUnmeasuredTicksAndIsNotRestarted for the unmeasured-clock
+// analogue), counted exactly enough that a mutant which restarted the streak at zero - either
+// on absence or on return - would need more matched ticks than this test gives it.
+TEST(LifecycleExpectation, NeverArmedNodeResumesRatherThanRestartingAfterReturning) {
+  constexpr int kGrace = 5;
+  constexpr int kAbsenceGrace = 2;
+  LifecycleExpectationTracker t({"a"}, kGrace, kAbsenceGrace);
+  t.update(M{match("a", "/a", "inactive", /*armed=*/false)});                                // streak 1
+  ASSERT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty());  // streak 2
+
+  // Vanishes long enough to pass the blink and advance on absence alone a few times, but
+  // stops short of grace: 2 held (absent_ticks 1..kAbsenceGrace) + 1 advancing tick
+  // (absent_ticks kAbsenceGrace+1, streak 2 -> 3).
+  for (int i = 0; i < kAbsenceGrace + 1; ++i) {
+    EXPECT_TRUE(t.update(M{}).affected.empty()) << "absence " << i;
+  }
+
+  // Node returns, still inactive. If absence above had genuinely advanced the streak to 3
+  // (not restarted it), exactly 2 more matched ticks reach grace(5) and the 3rd crosses.
+  EXPECT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty()) << "streak 3 -> 4";
+  EXPECT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty()) << "streak 4 -> 5 == grace";
+  auto crossed = t.update(M{match("a", "/a", "inactive", /*armed=*/false)});  // streak 5 -> 6 > grace
+  EXPECT_EQ(crossed.affected.count("/a"), 1u)
+      << "the streak restarted at zero across the absence run instead of resuming what absence "
+         "had already advanced - a node that departs and returns while never armed would then "
+         "need far longer than grace + 1 present ticks to ever be reported";
 }
 
 // The tightest prune horizon the documented config space can produce (grace: 0 with

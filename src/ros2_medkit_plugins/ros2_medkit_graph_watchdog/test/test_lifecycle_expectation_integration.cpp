@@ -3922,13 +3922,19 @@ TEST(LifecycleExpectationConfig, LiveClockIsNotErasedAtTheTightestGraceAndPruneG
 
 // The combination the old clamp existed for - a wide `grace` next to the tightest
 // `prune_grace` - is where a below-grace streak's two guarantees have to meet: it must not be
-// reclaimed as IDLE (it is not - violation_streak != 0 - even though it is small), and past
-// R10 it must not be silently matured by the absence run either (only a present tick may
-// still advance it - see the tracker's own class doc). So the entry survives, HELD, exactly
-// where it was: never confirmed while the node stays gone, never pruned either, and ready to
-// resume - not restart - the moment the node returns. It is a fixture test rather than a bare
-// configure()-level one because only the fake ReportFault sink can see the (absence of a)
-// raise.
+// reclaimed as IDLE (it is not - violation_streak != 0 - even though it is small), and it must
+// not be silently matured by the absence run either (only a present tick may still advance it
+// - see the tracker's own class doc). So the entry survives, HELD, exactly where it was: never
+// confirmed while the node stays gone, never pruned either, and ready to resume - not restart
+// - the moment the node returns. It is a fixture test rather than a bare configure()-level one
+// because only the fake ReportFault sink can see the (absence of a) raise.
+//
+// The node is armed (read "active") once before anything else: this claim holds only for a
+// node the presence detector could itself have reported (node_death tracks any node the gate
+// has armed at least once), so the fixture has to BE one, or the absence run below would be
+// proving something about a different node than the one this test names. A node that never
+// arms gets absence-driven maturation instead - see
+// NeverArmedBelowGraceStreakMaturesFromAbsenceInsteadOfHoldingIndefinitely below for that one.
 TEST_F(LifecycleExpectationIntegrationTest, BelowGraceStreakSurvivesTheTightestPruneGraceWithoutConfirmingWhileAbsent) {
   set_apps({"a"});
   ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
@@ -3938,6 +3944,10 @@ TEST_F(LifecycleExpectationIntegrationTest, BelowGraceStreakSurvivesTheTightestP
   ASSERT_TRUE(det);
   det->configure(nlohmann::json{{"require_active", nlohmann::json::array({"a"})}, {"grace", 4}, {"prune_grace", 0}});
   auto ctx = make_ctx(DetectorMode::Raise, &gate);
+
+  gate.set_lifecycle_state_for_test("a", "active");
+  ASSERT_TRUE(poll_for_new(kGraphSource, ReportFault::Request::EVENT_PASSED, 0, *det, ctx))
+      << "the healthy baseline never cleared, so the node below cannot be shown to have armed";
   gate.set_lifecycle_state_for_test("a", "inactive");
 
   const auto failed_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
@@ -3980,4 +3990,48 @@ TEST_F(LifecycleExpectationIntegrationTest, BelowGraceStreakSurvivesTheTightestP
          "from zero on return instead of resuming where the absence had held it";
   EXPECT_TRUE(any_failed_desc_contains(kGraphSource, "a"))
       << "the confirmation did not name the node once it finally raised";
+}
+
+// The row the test immediately above cannot cover: a node that is NEVER armed, because it
+// never once reads "active" - exactly a require_active node that comes up unconfigured and
+// stays there. node_death only ever tracks a key the reliability gate has armed at least
+// once, so nothing else in the plugin can ever report this node's departure; through the
+// real gate and the real (fake-service-backed) fault client, a below-grace streak on such a
+// node must still mature from absence alone, or the departure is reported by nothing at all.
+// Same grace, same streak-at-departure, same fixture shape as
+// BelowGraceStreakSurvivesTheTightestPruneGraceWithoutConfirmingWhileAbsent immediately
+// above, with arming the only difference - together the two rows prove the split is keyed on
+// arming and nothing else.
+TEST_F(LifecycleExpectationIntegrationTest, NeverArmedBelowGraceStreakMaturesFromAbsenceInsteadOfHoldingIndefinitely) {
+  set_apps({"a"});
+  ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
+  arm_global_grace(gate);
+
+  auto det = make_lifecycle_expectation();
+  ASSERT_TRUE(det);
+  det->configure(nlohmann::json{{"require_active", nlohmann::json::array({"a"})}, {"grace", 4}});
+  auto ctx = make_ctx(DetectorMode::Raise, &gate);
+
+  // Never armed: "a" reads non-active from the very first tick and never once reads "active",
+  // so LifecycleWatcher::node_ok() is false for its whole life here and the gate never arms
+  // it.
+  gate.set_lifecycle_state_for_test("a", "inactive");
+
+  const auto failed_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
+  det->tick(ctx);  // streak 1, well below grace(4)
+  ASSERT_EQ(det->tracked_count_for_test(), 1u);
+  std::this_thread::sleep_for(200ms);
+  ASSERT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
+      << "the node was confirmed on its first not-active tick, so grace(4) was never in force and "
+         "the absence run below proves nothing about a below-grace streak";
+
+  // "a" vanishes with a streak of 1 out of 4. Nothing else will ever report this departure,
+  // so absence itself has to mature the streak.
+  set_apps({});
+  ASSERT_TRUE(poll_for_new(kGraphSource, ReportFault::Request::EVENT_FAILED, failed_before, *det, ctx))
+      << "a below-grace violation on a node the presence detector could never have tracked did "
+         "not mature from absence alone - its departure is reported by nothing at all";
+  EXPECT_TRUE(any_failed_desc_contains(kGraphSource, "has since left the graph"))
+      << "the fault matured from absence must say the node has since left the graph, or the "
+         "operator is sent looking for a node that is not there";
 }

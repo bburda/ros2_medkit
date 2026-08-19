@@ -54,7 +54,7 @@ id itself is warned about the same way, with the registered ids listed.
 |-----|------|---------|---------|
 | `mode` | string \| bool | `raise` | As above. |
 | `require_active` | string[] | `[]` | Node names that must be in the `active` lifecycle state, each matched against a live node by its `App::id`, its full FQN (`/ns/name`), or the bare leaf of that FQN. A bare name matches that node in EVERY namespace (a fleet-wide "all `controller_server`s must be active"); use a full FQN to pin one robot's. Both the bare and the FQN form match against the node's stable FQN, so they survive the `App::id` renaming that a same-bare-name collision triggers; an entry written as an `App::id` also works, but can stop matching on a multi-robot graph for exactly that reason. Empty = the detector checks nothing and emits nothing. A `require_active` that is not a string array warns and is ignored; an empty-string entry warns and is skipped - never dropped silently, since the operator would go on believing the node is covered. |
-| `grace` | int | `5` | Consecutive not-active ticks a required node tolerates before being reported inactive - bringup time for a managed node to reach `active` (configure + activate) before the expectation is enforced. Counted per NODE, not per matching entry: a node named by both a bare-name and a full-FQN entry still advances its streak once per tick, so mixing the two documented forms cannot halve the grace that was configured. An ALREADY-CONFIRMED streak keeps its content while the node is ABSENT, so a node that leaves the graph after being confirmed stays confirmed; a streak that has not yet crossed `grace` is HELD rather than advanced while absent, so a node is never confirmed out of ticks gathered while nobody could observe it - only a PRESENT tick may still cross `grace`. Accepted range 0..300 - five minutes at the shipped 1 s cadence, and already an extravagant allowance for a managed node to reach `active`. The upper end is a real bound rather than a formality: `grace` decides how long a PRESENT node may go unreported, and how long a node returning from a departure still inactive takes to (re-)mature, so at the old maximum of `INT_MAX - 1` that PRESENT-side silence lasted about 24 days at the shipped cadence with no warning. It does NOT bound how long a node that leaves the graph BELOW `grace` sits unsettled - that lasts for as long as the node stays gone, independent of `grace` (see "Bounded by evidence, not by age" below). The check runs on the wide integer, so a value that only fits after truncation is rejected rather than silently turned into a hair-trigger. Anything outside the range warns and keeps the default. |
+| `grace` | int | `5` | Consecutive not-active ticks a required node tolerates before being reported inactive - bringup time for a managed node to reach `active` (configure + activate) before the expectation is enforced. Counted per NODE, not per matching entry: a node named by both a bare-name and a full-FQN entry still advances its streak once per tick, so mixing the two documented forms cannot halve the grace that was configured. An ALREADY-CONFIRMED streak keeps its content while the node is ABSENT, so a node that leaves the graph after being confirmed stays confirmed; a streak that has not yet crossed `grace` on a node the presence detector could also report (it was armed at least once) is HELD rather than advanced while absent, so a node is never confirmed out of ticks gathered while nobody could observe it - only a PRESENT tick may still cross `grace` for that node. A node that was NEVER armed gets no such hold: `node_death` can never track it either, so absence keeps advancing its streak too, the same as a present tick would. Accepted range 0..300 - five minutes at the shipped 1 s cadence, and already an extravagant allowance for a managed node to reach `active`. The upper end is a real bound rather than a formality: `grace` decides how long a PRESENT node may go unreported, and how long a node returning from a departure still inactive takes to (re-)mature, so at the old maximum of `INT_MAX - 1` that PRESENT-side silence lasted about 24 days at the shipped cadence with no warning. Whether it also bounds how long a node that leaves the graph BELOW `grace` sits unsettled depends on the same split: for an armed node that lasts for as long as the node stays gone, independent of `grace` (see "Bounded by evidence, not by age" below); for a never-armed one `grace` bounds that too, since absence matures it within `grace + absence_grace + 1` ticks either way. The check runs on the wide integer, so a value that only fits after truncation is rejected rather than silently turned into a hair-trigger. Anything outside the range warns and keeps the default. |
 | `prune_grace` | int | `60` | Consecutive ticks an IDLE tracked node - both clocks at zero and no matured ownership, so nothing to lose - may stay ABSENT from the graph before its bookkeeping is reclaimed. A node carrying evidence is never reclaimed by age at all, however long it stays gone, so this key cannot erase a fault's own state; the map is bounded instead by `tracked_node_cap` (see "Bounded by evidence, not by age"). Injected for every detector at plugin scope and overridable per detector; a value outside 0..3600 warns and this detector keeps its own default of 60. The range check runs on the wide integer, so an out-of-int-range value is rejected rather than truncated. The value is used as written - there is no `grace + 1` clamp, because there is no longer anything for one to protect. |
 | `tracked_node_cap` | int | `512` | The most nodes this detector keeps bookkeeping for at once. It is what bounds the map, since evidence is never reclaimed by age (see "Bounded by evidence, not by age"): at the cap, idle entries are reclaimed first, then entries for DEPARTED nodes are collapsed into a count, and only if every tracked node is PRESENT and carrying evidence is a newly matched node refused - which withholds `GRAPH_NODE_INACTIVE`'s clear and is reported both in the log and on `GET /x-medkit-watchdog`. 512 is comfortably above every node in a realistic graph (a full Nav2 stack plus perception is roughly a hundred nodes; a ten-robot fleet sharing one domain a few hundred), so raising it is only needed where `require_active` legitimately matches more PRESENT nodes than that. Accepted range 1..16384 - 16384 is about 8 MB of bookkeeping at roughly 500 bytes per tracked node, and a deployment needing more distinct required-node identities alive at once has identity churn rather than a large fleet. Anything outside the range, including 0 (a cap of nothing would mean checking nothing), warns and keeps the default; the check runs on the wide integer, so an out-of-int-range value is rejected rather than truncated. |
 
@@ -720,7 +720,8 @@ node's SETTLED observation had started, and resets nothing:
 | Settled observation | What sustained absence does |
 |---|---|
 | `inactive`, ALREADY reported under `GRAPH_NODE_INACTIVE` | the streak continues exactly as it did on its last present tick, so the fault stays raised and keeps naming a node that is no longer there |
-| `inactive`, not yet past `grace` | the streak is HELD - neither advanced (no fault is born while nobody can observe the node) nor erased (a node that returns still inactive resumes rather than re-earning `grace`) |
+| `inactive`, not yet past `grace`, node WAS armed at some point | the streak is HELD - neither advanced (no fault is born while nobody can observe the node) nor erased (a node that returns still inactive resumes rather than re-earning `grace`). The presence detector could report this exact departure instead (`node_death` tracks any node the reliability gate has armed at least once), so this detector does not need to. |
+| `inactive`, not yet past `grace`, node was NEVER armed | the streak keeps climbing on absence exactly as it would on a present tick. `node_death` only ever tracks a node the gate has armed, so a node that never reached that bar is structurally invisible to it no matter what happens afterwards - if this detector held the streak too, the departure would be reported by nothing at all. |
 | unread label, or no tracked lifecycle | the unmeasured clock keeps climbing under that same cause, so the node is eventually reported under `GRAPH_NODE_UNREADABLE` / `GRAPH_NODE_NOT_MANAGED` |
 | `active` | nothing. Anything the node had started but not corroborated is released, the entry becomes idle and is reclaimed silently |
 
@@ -776,17 +777,26 @@ accumulating enough of anything to be reported.
 
 The VIOLATION streak used to need the identical rule for the identical reason - a node
 alternating `(inactive, absent x N)` would otherwise never accumulate `grace` + 1 either.
-That is no longer the only thing standing between such a node and invisibility:
-`GRAPH_NODE_DISAPPEARED` (this package's `node_death` detector) now independently reports
-every departure in the same restart loop, whether or not the node was ever measured
-not-active first. So a below-`grace` streak that goes absent is simply HELD rather than
-matured on the strength of the absence alone - maturing it would raise
-`GRAPH_NODE_INACTIVE` from ticks gathered while nobody could observe the node, a fault its
-presence never earned. An ALREADY-matured streak still continues through absence exactly
-as before: two codes standing at once for the same node (`GRAPH_NODE_INACTIVE` because it
-was measured not-active, `GRAPH_NODE_DISAPPEARED` because it is gone) is not a problem to
-fix - they say different, both-true things. The narrowing is only that the second fault is
-never BORN from an absence.
+Where the presence class CAN also report the same departure, that is no longer the only
+thing standing between such a node and invisibility: `GRAPH_NODE_DISAPPEARED` (this
+package's `node_death` detector) independently reports it, whether or not the node was
+ever measured not-active first. But `node_death` only ever tracks an App once the
+reliability gate has armed it, and the gate refuses to arm a MANAGED node that is not
+`active` (`LifecycleWatcher::node_ok()`) - so a `require_active` node that never reaches
+`active` is never armed, is never tracked by `node_death`, and its departure can never
+raise `GRAPH_NODE_DISAPPEARED`, whatever kills it. The tracker therefore splits on whether
+a node was EVER armed, read from the reliability gate itself rather than guessed from the
+observed label: once armed, a below-`grace` streak that goes absent is simply HELD -
+maturing it would raise `GRAPH_NODE_INACTIVE` from ticks gathered while nobody could
+observe the node, a fault its presence never earned, and `GRAPH_NODE_DISAPPEARED` is there
+to report the departure instead. A node that was NEVER armed gets no such backstop -
+`GRAPH_NODE_DISAPPEARED` structurally cannot report it - so absence keeps advancing its
+streak exactly as a present tick would, maturing it within the same bound an armed node's
+UNMEASURED clock already has (`grace` + `absence_grace` + 1 ticks). An ALREADY-matured
+streak still continues through absence exactly as before, for either kind of node: two
+codes standing at once for the same node (`GRAPH_NODE_INACTIVE` because it was measured
+not-active, `GRAPH_NODE_DISAPPEARED` because it is gone) is not a problem to fix - they say
+different, both-true things.
 
 **Content follows the clocks, not the snapshot.** Whether a node happened to be in this
 tick's matches decides nothing about what it reports: a node whose streak is past `grace`
@@ -872,14 +882,18 @@ at a different N. So:
   still climbing cannot grow without bound in time either: past the absence grace it
   advances every tick, so it matures within at most `60 + absence_grace + 1` ticks and gets
   reported - the longest `GRAPH_NODE_UNREADABLE` or `GRAPH_NODE_NOT_MANAGED`'s clear can be
-  withheld by one departed node. A below-`grace` VIOLATION streak has no such bound while its
-  node stays gone: absence holds it rather than advancing it, so it neither matures nor
-  becomes idle for as long as the node is away, however long that is. That is not a new way
-  to withhold `GRAPH_NODE_INACTIVE`'s clear - the clear was already gated on every required
-  node's status being settled, so one node this indecisive already blocked it before this
-  design; what changes is only that the fault never NAMES it, since the departure itself is
-  `GRAPH_NODE_DISAPPEARED`'s evidence to report. `grace` is still capped at 300 rather than
-  accepted up to the int maximum, because it independently bounds how long a PRESENT node may
+  withheld by one departed node. A below-`grace` VIOLATION streak on a node that was NEVER
+  armed shares that same bound, for the same reason it advances at all while absent: it
+  matures within at most `grace + absence_grace + 1` ticks, because nothing else will ever
+  report that node's departure either. Only once a node HAS been armed does its below-grace
+  streak lose the bound: absence then holds it rather than advancing it, so it neither
+  matures nor becomes idle for as long as the node is away, however long that is. That is
+  not a new way to withhold `GRAPH_NODE_INACTIVE`'s clear - the clear was already gated on
+  every required node's status being settled, so one node this indecisive already blocked
+  it before this design; what changes is only that the fault never NAMES an ARMED node's
+  departure, since that node's evidence belongs to `GRAPH_NODE_DISAPPEARED` instead. `grace`
+  is still capped at 300 rather than accepted up to the int maximum, because it independently
+  bounds how long a PRESENT node may
   go unreported and how long a returning node takes to re-mature: at the old maximum of
   `INT_MAX - 1` that PRESENT-side bound was about 24 days at the shipped cadence, with no
   warning and no way to tell a silently-withheld detector from one finding nothing.
@@ -1092,7 +1106,10 @@ still fit inside the 480-char cap (`3 * 150 + 2 * 2 = 454 <= 480`).
    measured ACTIVE that vanishes raising nothing and being reclaimed, and the two
    `(unreadable/not-managed, absent x N)` restart-loop shapes for N at the absence grace and
    past it (their `inactive` sibling now pinned to the opposite claim, at the same two N: it
-   never crosses grace from absence alone); the
+   never crosses grace from absence alone, for a node that was armed at some point - a node
+   that was NEVER armed instead matures from absence alone within `grace + absence_grace + 1`
+   ticks, exactly like the unmeasured clock does, and resumes rather than restarts on return
+   the same way an armed node's held streak does); the
    `pending` set and its per-reason breakdown; new-first ordering for all three
    fault-shaped maps, including the lexicographic tie-break when several cross together;
    the remote-supplied label's own trim budget ahead of the whole-detail backstop, and the
@@ -1410,17 +1427,24 @@ the node has since left the graph) AND now also raises `GRAPH_NODE_DISAPPEARED`,
 detector tracks every armed App independently of whatever `lifecycle_expectation` thinks of
 it.
 
-What changed is narrower than that. Before this detector existed,
-`lifecycle_expectation`'s own violation streak let a SUSTAINED absence mature an unconfirmed
-(below-`grace`) streak into a confirmed `GRAPH_NODE_INACTIVE` - the only way a node stuck in
-a restart loop, never observed long enough to cross `grace` while present, would ever be
-reported at all. Now that this detector independently reports every such departure, that
-absence-alone maturity is gone: absence CONTINUES a violation that has already matured past
-`grace` (the fault stays raised, still naming the node), but no longer CREATES one that has
-not. A node that was briefly non-active and then died is reported as gone
-(`GRAPH_NODE_DISAPPEARED`) rather than also acquiring an inactive fault born from ticks
-gathered while nobody could observe it. See `lifecycle_expectation`'s own "Absence continues
-the last CORROBORATED observation, it never erases" section above for the mechanism.
+What changed is narrower than that, and it only applies to a node this detector could ever
+have tracked. Before this detector existed, `lifecycle_expectation`'s own violation streak
+let a SUSTAINED absence mature an unconfirmed (below-`grace`) streak into a confirmed
+`GRAPH_NODE_INACTIVE` - the only way a node stuck in a restart loop, never observed long
+enough to cross `grace` while present, would ever be reported at all. Where this detector
+can independently report the same departure - which needs the node to have been ARMED at
+least once, since `node_death` only ever tracks an App the reliability gate has armed, and
+the gate refuses to arm a MANAGED node that is not `active` - that absence-alone maturity is
+gone: absence CONTINUES a violation that has already matured past `grace` (the fault stays
+raised, still naming the node), but no longer CREATES one that has not. A node that was
+briefly non-active and then died is reported as gone (`GRAPH_NODE_DISAPPEARED`) rather than
+also acquiring an inactive fault born from ticks gathered while nobody could observe it. A
+`require_active` node that never reaches `active` is never armed, is never tracked here, and
+its departure can never raise `GRAPH_NODE_DISAPPEARED` - for that one node,
+`lifecycle_expectation` keeps the older behaviour: absence still matures a below-`grace`
+streak, because it is structurally the only detector that will ever get to report it. See
+`lifecycle_expectation`'s own "Absence continues the last CORROBORATED observation, it never
+erases" section above for the mechanism.
 
 **Repeated failures: what `occurrence_count` and the captured evidence answer, and don't.**
 An operator asking "how many times did this node die in the last hour" reads it off the
@@ -1517,16 +1541,19 @@ frame do not accumulate a per-occurrence history either way.
      deleted `prune()` would also produce), while never once raising `GRAPH_NODE_DISAPPEARED`
      for it - proving pruning a suppressed key's bookkeeping is not itself an event the
      aggregate reacts to.
-   - `test/e2e/test_node_death_boundary_e2e.test.py` (seven scenarios, the seam with
+   - `test/e2e/test_node_death_boundary_e2e.test.py` (eight scenarios, the seam with
      `lifecycle_expectation`): a node stuck inactive but never gone is
-     `GRAPH_NODE_INACTIVE`'s alone; the same node killed while still below `grace` raises
-     `GRAPH_NODE_DISAPPEARED` alone, with no `GRAPH_NODE_INACTIVE` ever born from the
-     departure; a node killed AFTER `GRAPH_NODE_INACTIVE` has confirmed raises BOTH codes at
-     once, the confirmed one still naming the node; a healthy node that is simply killed
-     raises `GRAPH_NODE_DISAPPEARED` alone; a restart-looping required node is caught every
-     cycle regardless of whether it ever matures under `lifecycle_expectation`; a large
-     `miss_grace` delays the report but does not swallow it; and a restarted gateway's own
-     warmup window never produces a spurious PASSED for a node it has not yet re-measured.
+     `GRAPH_NODE_INACTIVE`'s alone; the same node, ARMED first, then killed while still below
+     `grace`, raises `GRAPH_NODE_DISAPPEARED` alone, with no `GRAPH_NODE_INACTIVE` ever born
+     from the departure; a node killed AFTER `GRAPH_NODE_INACTIVE` has confirmed raises BOTH
+     codes at once, the confirmed one still naming the node; a healthy node that is simply
+     killed raises `GRAPH_NODE_DISAPPEARED` alone; a restart-looping required node is caught
+     every cycle regardless of whether it ever matures under `lifecycle_expectation`; a node
+     that is NEVER armed, killed while still below `grace`, raises `GRAPH_NODE_INACTIVE`
+     alone instead - `node_death` cannot track a node the gate never armed, so absence has to
+     mature the violation here; a large `miss_grace` delays the report but does not swallow
+     it; and a restarted gateway's own warmup window never produces a spurious PASSED for a
+     node it has not yet re-measured.
 
 ## Reliability (bringup-quiesce)
 
