@@ -730,14 +730,14 @@ if(BUILD_TESTING)
     LABELS "integration;e2e"
     ENV "GATEWAY_TEST_PORT=19380" "WATCHDOG_E2E_SCENARIO=fast_tick_floor" "${_WATCHDOG_E2E_ENV}")
 
-  # 60 (arming, app_id-scoped - already implies presence) + FIVE kill cycles, four of
-  # which also acknowledge and re-arm on the respawned instance (30 departure + 60
-  # occurrence-count poll + 42.5 app_id-scoped re-arm after the respawn
-  # [DEPARTURE_TIMEOUT_SEC + RESPAWN_DELAY_SEC] = 132.5 each, *4 = 530) plus the fifth
-  # cycle's kill-and-confirm alone (30 + 60 = 90) + 30 (final record poll) = 710 internal.
-  # Rounded to 900, matching cap_pressure's own budget for a similarly multi-cycle scenario,
-  # to also cover the launch's own teardown for TWO processes plus CI-slowness margin
-  # across five cycles.
+  # 60 (arming, app_id-scoped - already implies presence) + THREE kill cycles (see
+  # RESTART_LOOP_OCCURRENCES_TARGET's own comment for why three), two of which also
+  # acknowledge and re-arm on the respawned instance (30 departure + 60 occurrence-count
+  # poll + 42.5 app_id-scoped re-arm after the respawn [DEPARTURE_TIMEOUT_SEC +
+  # RESPAWN_DELAY_SEC] = 132.5 each, *2 = 265) plus the third cycle's kill-and-confirm alone
+  # (30 + 60 = 90) + 30 (final record poll) = 445 internal. Rounded to 900, matching
+  # cap_pressure's own budget for a similarly multi-cycle scenario, to also cover the
+  # launch's own teardown for TWO processes plus CI-slowness margin.
   medkit_add_launch_test(test_node_death_e2e_restart_loop_occurrences
     test/e2e/test_node_death_e2e.test.py TIMEOUT 900
     LABELS "integration;e2e"
@@ -866,16 +866,17 @@ if(BUILD_TESTING)
     ENV "GATEWAY_TEST_PORT=19490" "WATCHDOG_E2E_SCENARIO=b4_healthy_then_gone"
       "${_WATCHDOG_E2E_ENV}")
 
-  # 60 (global arming) + 30 (faults-live) + 30 (presence poll) + FIVE restart cycles, each (30
-  # departure poll + 60 raise poll + 42.5 presence-after-respawn poll [DEPARTURE_TIMEOUT_SEC +
-  # B5_RESPAWN_DELAY_SEC] + 60 clear poll = 192.5), *5 = 962.5, plus the 120 preamble = 1082.5
-  # internal - four independent per-cycle budgets, not one merged figure, times five cycles.
-  # B5_RESPAWN_DELAY_SEC (12.5 s) replaces the launch-wide RESPAWN_DELAY_SEC (1.5 s) for this
-  # scenario alone: the outage has to stay safely above the detector's own wall-clock floor for
-  # every cycle to be reportable by a correct implementation - see that constant's own comment
-  # for the margin arithmetic. Rounded to 1500, well past the 900 this package's own
-  # restart-loop-shaped scenarios already use for a smaller sum, to also cover the launch's own
-  # teardown for TWO processes across five cycles of CI-slowness margin.
+  # 60 (global arming) + 30 (faults-live) + 30 (presence poll) + THREE restart cycles (see
+  # B5_CYCLES's own comment for why three), each (30 departure poll + 60 raise poll + 42.5
+  # presence-after-respawn poll [DEPARTURE_TIMEOUT_SEC + B5_RESPAWN_DELAY_SEC] + 60 clear
+  # poll = 192.5), *3 = 577.5, plus the 120 preamble = 697.5 internal - four independent
+  # per-cycle budgets, not one merged figure, times three cycles. B5_RESPAWN_DELAY_SEC
+  # (12.5 s) replaces the launch-wide RESPAWN_DELAY_SEC (1.5 s) for this scenario alone: the
+  # outage has to stay safely above the detector's own wall-clock floor for every cycle to be
+  # reportable by a correct implementation - see that constant's own comment for the margin
+  # arithmetic. Rounded to 1500, well past the 900 this package's own restart-loop-shaped
+  # scenarios already use for a smaller sum, to also cover the launch's own teardown for TWO
+  # processes plus CI-slowness margin.
   medkit_add_launch_test(test_node_death_boundary_e2e_b5_restart_loop_still_caught
     test/e2e/test_node_death_boundary_e2e.test.py TIMEOUT 1500
     LABELS "integration;e2e"

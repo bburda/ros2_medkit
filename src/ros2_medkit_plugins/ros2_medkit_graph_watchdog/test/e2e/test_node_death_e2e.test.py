@@ -72,9 +72,9 @@ launch and which assertions run:
   TestNodeDeathFastTickFloor's own docstring for what was investigated and why forcing the
   stronger condition was not implemented - see TestNodeDeathDeactivatedNotDead's own note
   for what this absence does and does not prove either way.
-- "restart_loop_occurrences": a node killed and restarted five times, each cycle closed
+- "restart_loop_occurrences": a node killed and restarted three times, each cycle closed
   with an explicit acknowledge before the next kill. The fault's occurrence_count reaches
-  5 - the fault manager's own occurrence model (a FAILED event reactivating a CLEARED
+  3 - the fault manager's own occurrence model (a FAILED event reactivating a CLEARED
   record bumps the count; a re-report on a still-active fault does not) rather than any
   trick the detector plays. See TestNodeDeathRestartLoopOccurrences's own docstring for why
   this class stops at occurrence_count and does not attempt the per-occurrence RECORDING
@@ -258,7 +258,15 @@ ROS2CLI_CYCLES = 3
 STABLE_TRACKED_COUNT_TIMEOUT_SEC = 40.0
 
 # ---- the "restart_loop_occurrences" scenario's own target -------------------------------
-RESTART_LOOP_OCCURRENCES_TARGET = 5
+# The claim under test is that occurrence_count tracks the number of genuine deaths. Three
+# distinct occurrences demonstrate that exactly as well as five: what would falsify the claim
+# is a count that stops incrementing (a detector that goes silent after the first cycle) or
+# double-counts (an ungated clear or a duplicate FAILED inflating the number), and either
+# failure mode shows up by the third cycle - a fourth or fifth would only repeat the same
+# proof at the full cost of RESPAWN_DELAY_SEC apiece. If a future change ever needs more
+# cycles to expose something this one does not, raising this single constant is the whole
+# edit.
+RESTART_LOOP_OCCURRENCES_TARGET = 3
 
 
 def _target_node_action(*, respawn=False, respawn_delay=RESPAWN_DELAY_SEC):
@@ -368,7 +376,7 @@ def generate_test_description():
 
     if SCENARIO in ('clear_on_return', 'no_heal_standalone', 'restart_loop_occurrences'):
         # respawn=True: every one of these scenarios kills the node and then needs it back
-        # - once for clear_on_return/no_heal_standalone, five times in a loop for
+        # - once for clear_on_return/no_heal_standalone, three times in a loop for
         # restart_loop_occurrences - and create_demo_nodes() gives no PID handle to SIGTERM
         # by hand in the first place, so this fixture is built here regardless.
         target = _target_node_action(respawn=True, respawn_delay=RESPAWN_DELAY_SEC)
@@ -1256,7 +1264,7 @@ class TestNodeDeathFastTickFloor(unittest.TestCase):
 
 
 class TestNodeDeathRestartLoopOccurrences(unittest.TestCase):
-    """A node killed and restarted five times: occurrence_count reaches 5.
+    """A node killed and restarted three times: occurrence_count reaches 3.
 
     Each cycle: kill, wait for the fault to CONFIRM (a fresh occurrence), wait for the node
     to come back, THEN explicitly acknowledge it via DELETE
@@ -1281,7 +1289,7 @@ class TestNodeDeathRestartLoopOccurrences(unittest.TestCase):
     something structurally impossible to ever pass - neither is written.
     """
 
-    def test_five_kills_reach_occurrence_count_five(self, target_node):
+    def test_repeated_kills_reach_matching_occurrence_count(self, target_node):
         # app_id=TARGET_NODE: see TestNodeDeathRaise's identical gate for why the global
         # gate alone is not enough before a kill. Re-checked before every LATER kill too
         # (below), since a respawned instance needs its own read just as much as the first.

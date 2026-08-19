@@ -60,7 +60,7 @@ launch and which assertions run:
   respawn (not merely the first start - see TestBoundaryRestartLoopStillCaught's own class
   docstring for why a node that never arms would make this row unsatisfiable by any correct
   implementation), restart-looping under this test's own control, killed and confirmed back
-  five times over. Nothing here checks GRAPH_NODE_INACTIVE - that is B2's and B3's row. This
+  three times over. Nothing here checks GRAPH_NODE_INACTIVE - that is B2's and B3's row. This
   one is entirely about whether the presence code catches the departure EVERY cycle, which is
   what makes it safe to forbid absence from maturing an unmatured streak: once
   GRAPH_NODE_DISAPPEARED independently catches a restart loop, lifecycle_expectation no longer
@@ -259,7 +259,14 @@ SUSTAINED_WINDOW_SEC = 20.0
 RESPAWN_DELAY_SEC = 1.5
 
 # ---- "b5_restart_loop_still_caught" scenario's own target --------------------------------------
-B5_CYCLES = 5
+# The claim under test is that the presence code catches EVERY cycle of a restart loop, not
+# merely the first: three consecutive kill/raise/clear cycles establish that - this is a loop,
+# and each turn of it is caught. A fourth or fifth cycle would repeat an already-proven claim at
+# the full cost of B5_RESPAWN_DELAY_SEC apiece, buying no additional discriminating power against
+# the failure this row exists to catch (a detector that only reports the first departure, or
+# stops reporting after one). If a future change ever needs more cycles to expose something this
+# one does not, raising this single constant is the whole edit.
+B5_CYCLES = 3
 
 # ---- "c4_config_endpoint_e2e" scenario's own fixtures -------------------------------------------
 C4_TARGET_NODE = 'calibration'
@@ -1047,7 +1054,7 @@ class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
     place.
     """
 
-    def test_five_restarts_each_raise_and_clear(self, target_node):
+    def test_every_restart_cycle_raises_and_clears(self, target_node):
         # app_id form: this node reaches "active" on its own now (auto_activate=True), so the
         # per-entity armed precondition genuinely becomes true - see the module docstring's
         # "Which arming gate" section and this class's own docstring.
