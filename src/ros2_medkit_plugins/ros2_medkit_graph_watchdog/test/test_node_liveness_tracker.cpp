@@ -211,14 +211,14 @@ TEST(NodeLivenessTrackerCap, TrackedCountNeverExceedsTheConfiguredCapUnderChurn)
   NodeLivenessTracker tracker(/*miss_grace=*/0, NodeLivenessTracker::kNoPrune, /*tracked_key_cap=*/5);
   std::size_t max_seen = 0;
   // 200 distinct, never-repeating identities, never present again once armed - every one
-  // instantly departed (miss_grace=0), so this exercises exactly the DEPARTED-subset cap the
-  // review found missing, with no present entries in the mix to blur the measurement.
+  // instantly departed (miss_grace=0), so this exercises exactly the DEPARTED-subset cap at a
+  // scale that pushes past it, with no present entries in the mix to blur the measurement.
   for (int i = 0; i < 200; ++i) {
     tracker.update({}, {"/churn_" + std::to_string(i)});
     max_seen = std::max(max_seen, tracker.tracked_count());
   }
   EXPECT_LE(max_seen, 5u) << "the cap must actually engage under scale past it, not merely "
-                             "exist unexercised - this is the row the review found missing";
+                             "exist unexercised";
 }
 
 TEST(NodeLivenessTrackerCap, PresentEntriesExceedingTheCapAreAllStillIndividuallyReportableOnDeath) {

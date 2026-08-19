@@ -17,8 +17,8 @@
 Sibling of test_node_death_e2e.test.py, same shape: each RAISE row proves the fault actually
 appears, naming the missing-fault case as the failure mode when it does not. An ABSENCE row
 cannot, by itself, discriminate a correct suppressor from no detector at all, because both
-produce the same silence; those rows are marked CANNOT DISCRIMINATE YET in their own class
-docstring.
+produce the same silence; each such row's own class docstring says so and states what the row
+catches instead.
 
 Runs as FIVE separate CTest targets (see CMakeLists.txt), each launching its OWN
 gateway+fault_manager+demo-node stack - the plugin reads its config once at set_context() time, so
@@ -27,15 +27,18 @@ which assertions run:
 
 - "allowlist_suppresses": ``detectors.node_death.allowlist: [TARGET_NODE]`` with
   ``suppress: ["allowlist"]`` - the node is armed, then killed. No GRAPH_NODE_DISAPPEARED names
-  it, for a sustained window - the brief's own claim, and a narrower one than "the code never
-  appears at all": a correct detector raising the code for some OTHER entity must leave this row
-  green, so the assertion is needle-scoped (assert_fault_never_names) rather than a bare absence
-  check. CANNOT DISCRIMINATE YET: with no detector at all no disappearance ever names anything,
-  so this is trivially true whether or not a correct suppressor exists behind it.
+  it, for a sustained window - narrower than "the code never appears at all": a correct
+  detector raising the code for some OTHER entity must leave this row green, so the assertion
+  is needle-scoped (assert_fault_never_names) rather than a bare absence check. CANNOT
+  DISCRIMINATE BY ITSELF: silence here is consistent with a suppressor correctly
+  honouring the allowlist, and equally consistent with one that never consults it, since both
+  leave the code unraised.
 - "allowlist_not_named_is_inert": the SAME allowlist, but ``suppress`` does not name
-  "allowlist" (R11's behaviour change against the ported source: the source activates a
-  configured allowlist unconditionally). The fault raises and names the node - a genuine RAISE
-  row - and a startup warning says the list is inert. The warning half is read straight off the
+  "allowlist" - naming an entry on the allowlist is not, by itself, a request to suppress it;
+  only listing the mechanism in ``suppress`` opts it in, unlike the ported source, which
+  activated a configured allowlist unconditionally. The fault raises and names the node - a
+  genuine RAISE row - and a startup warning says the list is inert. The warning half is read
+  straight off the
   gateway process's own stderr via launch_testing's ``proc_output`` fixture, the same instrument
   test_startup_param_clamp_warnings.test.py already uses for an identical "did we say so" claim -
   no new harness helper, just a capability already available at this tier and never exercised in
@@ -43,8 +46,9 @@ which assertions run:
   substring "allowlist": a line mentioning the word for an unrelated reason (reporting its size,
   say) must not satisfy a warning this specific, so the pattern requires "allowlist" and
   "suppress" on the SAME line at WARN severity - see _INERT_ALLOWLIST_WARNING_RE.
-- "lifecycle_clean_shutdown": R4's self-suppression boundary, not a lifecycle-agnostic notion of
-  "clean". Two identical managed_lifecycle instances, both listed in
+- "lifecycle_clean_shutdown": self-suppression - a node this package already watches through
+  lifecycle_expectation is suppressed only when it departed while not active, not a
+  lifecycle-agnostic notion of "clean". Two identical managed_lifecycle instances, both listed in
   ``detectors.lifecycle_expectation.require_active`` (self-suppression needs BOTH "this node is
   require_active-owned" and "it departed while not active" - the lifecycle label alone would
   over-suppress a node nobody is watching), AND ``detectors.node_death.suppress: ["lifecycle"]``
@@ -82,19 +86,13 @@ one would wait for something that can never become true. It gates on the GLOBAL 
 instead, exactly as test_lifecycle_expectation_e2e.test.py's own "main" scenario does for the
 identical reason.
 
-R11's config choices in "allowlist_not_named_is_inert" and "lifecycle_clean_shutdown" are
-best-informed placeholders where this package's design docs describe a behaviour but not yet a
-literal config surface: ``suppress: ["lifecycle"]`` for the second, real suppression mechanism
-this port carries (state.md's own naming: ``lifecycle_shutdown_suppressor.hpp``) is this file's
-best guess at the string node_death's future config will accept for it. In
-"allowlist_not_named_is_inert" it is chosen so the row is a well-formed "suppress names
-something, but not allowlist" rather than a malformed-entry row (C2's own territory); in
-"lifecycle_clean_shutdown" it is the entry that actually has to be present for the row's own
-claim to be testable at all - self-suppression is opt-in like every other mechanism here, so
-without naming it a correct detector reports both departed nodes. If slice 2 lands a different
-literal name, both lines are the ones to update - neither row's CLAIM (an allowlist not named in
-suppress does not suppress; a require_active node that departed while not active is not named)
-depends on which string names the other mechanism.
+"allowlist_not_named_is_inert" and "lifecycle_clean_shutdown" both configure
+``suppress: ["lifecycle"]`` for the second suppression mechanism this port carries (see
+lifecycle_shutdown_suppressor.hpp). In "allowlist_not_named_is_inert" it is chosen so the row
+is a well-formed "suppress names something, but not allowlist" rather than a malformed-entry
+row (C2's own territory); in "lifecycle_clean_shutdown" it is the entry that actually has to be
+present for the row's own claim to be testable at all - self-suppression is opt-in like every
+other mechanism here, so without naming it a correct detector reports both departed nodes.
 """
 
 import os
@@ -169,12 +167,12 @@ SUSTAINED_WINDOW_SEC = 20.0
 # only needs to be generous against process-startup jitter, not against anything downstream.
 WARNING_TIMEOUT_SEC = 30.0
 
-# Matches a single stderr line that names BOTH config keys R11's ruling is about, at WARN
-# severity - not the bare substring "allowlist", which a detector could satisfy with an
-# unrelated line ("allowlist contains 1 entry") while never claiming anything is inert. Neither
-# token pins node_death's own future wording (which does not exist yet - see the module
-# docstring), but the codebase's own convention (test_startup_param_clamp_warnings.test.py) is
-# to echo a config key verbatim in its warning, and R11 itself says this must warn - i.e. be
+# Matches a single stderr line that names BOTH "allowlist" and "suppress" - the two config
+# keys an inert allowlist is about - at WARN severity, not the bare substring "allowlist",
+# which a detector could satisfy with an unrelated line ("allowlist contains 1 entry") while
+# never claiming anything is inert. Neither token pins node_death's own exact wording, but the
+# codebase's own convention (test_startup_param_clamp_warnings.test.py) is to echo a config key
+# verbatim in its warning, and an allowlist that suppress does not name must say so - i.e. be
 # logged via RCLCPP_WARN, whose default format always stamps the literal "[WARN]" tag. Requiring
 # all three on one line, in any order, rules out a routine config-echo (no [WARN]), a bare size
 # report (no "suppress"), and an unrelated warning that happens to mention "suppress" for a
@@ -418,16 +416,18 @@ def _call_change_state_once(client_node, service_name, transition_id, timeout=30
 class TestSuppressionAllowlistSuppresses(unittest.TestCase):
     """A node named in the allowlist, with suppress opting the allowlist in, is never named.
 
-    The claim is needle-scoped, matching the brief's own wording ("no GRAPH_NODE_DISAPPEARED
-    names it"), not "the code never appears at all": a correct detector raising the code for
-    some OTHER entity in this launch (the fault_manager's own node, say) must leave this row
-    green, since that has nothing to do with whether allowlist-suppression works. A bare
-    code-absence check cannot tell the two apart, so this uses assert_fault_never_names.
+    The claim is needle-scoped ("no GRAPH_NODE_DISAPPEARED names it"), not "the code never
+    appears at all": a correct detector raising the code for some OTHER entity in this launch
+    (the fault_manager's own node, say) must leave this row green, since that has nothing to do
+    with whether allowlist-suppression works. A bare code-absence check cannot tell the two
+    apart, so this uses assert_fault_never_names.
 
-    CANNOT DISCRIMINATE YET: with no node_death detector at all, no disappearance ever names
-    anything, so this is trivially true today whether or not a correct suppressor exists behind
-    it. Recorded as such rather than presented as evidence; slice 2 owes the row that fails once
-    the detector exists but the suppressor does not honour the allowlist.
+    CANNOT DISCRIMINATE BY ITSELF: silence here is consistent with a suppressor correctly
+    honouring the allowlist, and equally consistent with one that never consults it, since both
+    leave the code unraised. Recorded as such rather than presented as proof of correct
+    suppression - ``test_allowlist_suppressor.cpp`` pins the matcher's own discrimination
+    directly, and ``prune_no_false_heal`` below runs the SAME allowlist against a second,
+    unlisted node under the identical config to show the two are told apart.
     """
 
     def test_allowlisted_death_never_raises(self, target_node):
@@ -464,14 +464,7 @@ class TestSuppressionAllowlistSuppresses(unittest.TestCase):
 
 
 class TestSuppressionAllowlistNotNamedIsInert(unittest.TestCase):
-    """An allowlist that `suppress` does not name has no effect, and says so (R11).
-
-    Expected RED today, for the standard missing-detector reason: nothing in this package raises
-    GRAPH_NODE_DISAPPEARED yet, so the raise poll below times out and the failure message names
-    the missing fault, not a harness error. The startup-warning half is unreachable in the same
-    run for the same reason (there is no detector to log it), but is still written and exercised
-    up to its own timeout so the assertion is ready the moment slice 2 lands.
-    """
+    """An allowlist that `suppress` does not name has no effect, and says so."""
 
     def test_inert_allowlist_still_raises_and_warns(self, target_node, proc_output, gateway_node):
         self.assertTrue(
@@ -492,7 +485,7 @@ class TestSuppressionAllowlistNotNamedIsInert(unittest.TestCase):
 
         # The warning is read straight off the gateway's own stderr - the same instrument
         # test_startup_param_clamp_warnings.test.py already uses for an identical "did we say
-        # so" claim. No exact wording is pinned (node_death's own log text does not exist yet);
+        # so" claim. No exact wording is pinned (node_death's own log text is free to change);
         # this asks that a WARN-severity line names BOTH "allowlist" and "suppress" together -
         # see _INERT_ALLOWLIST_WARNING_RE for why the bare substring "allowlist" is not enough.
         self.assertTrue(
@@ -501,28 +494,27 @@ class TestSuppressionAllowlistNotNamedIsInert(unittest.TestCase):
                 timeout=WARNING_TIMEOUT_SEC),
             "no startup WARNING naming both 'allowlist' and 'suppress' on the same line "
             f"appeared on the gateway's stderr within {WARNING_TIMEOUT_SEC}s - a configured "
-            'allowlist that suppress does not name must say so at WARN severity (R11)',
+            'allowlist that suppress does not name must say so at WARN severity',
         )
 
 
 class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
-    """Self-suppression (R4): a require_active node that departed while not active is not named.
+    """Self-suppression: a require_active node that departed while not active is not named.
 
     Two managed_lifecycle instances, both require_active-owned - self-suppression needs "this
     node is owned by lifecycle_expectation", "it departed while not active", AND
     ``detectors.node_death.suppress`` naming the mechanism (suppression is opt-in like every
     other mechanism this package carries); the lifecycle label alone would over-suppress a node
     nobody is watching, and leaving suppress unset would make a correct detector report both
-    departed nodes. CLEAN_NODE is driven
-    through a real UNCONFIGURED_SHUTDOWN transition (reaching "finalized", a non-active label)
-    before its process dies; KILLED_NODE reaches "active" on its own and is killed outright,
-    still active. Only the second is a departure lifecycle_expectation has nothing else to say
-    about.
+    departed nodes. CLEAN_NODE is driven through a real UNCONFIGURED_SHUTDOWN transition
+    (reaching "finalized", a non-active label) before its process dies; KILLED_NODE reaches
+    "active" on its own and is killed outright, still active. Only the second is a departure
+    lifecycle_expectation has nothing else to say about.
 
-    Expected RED today for the standard missing-detector reason: GRAPH_NODE_DISAPPEARED never
-    raises for either node, so the raise poll for KILLED_NODE times out. The "CLEAN_NODE is
-    never named" half cannot discriminate a working self-suppressor from no detector at all
-    until node_death exists.
+    GRAPH_NODE_DISAPPEARED raises and names KILLED_NODE. The "CLEAN_NODE is never named" half
+    cannot, by itself, discriminate a working self-suppressor from no detector at all - both
+    leave CLEAN_NODE unnamed - so it is proven alongside the positive KILLED_NODE claim rather
+    than on its own.
     """
 
     @classmethod
@@ -597,11 +589,7 @@ class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
 
 
 class TestSuppressionOptIn(unittest.TestCase):
-    """An allowlist entry with no `suppress` key at all does not suppress by itself.
-
-    Expected RED today: nothing in this package raises GRAPH_NODE_DISAPPEARED yet, so the raise
-    poll below times out and the failure message names the missing fault, not a harness error.
-    """
+    """An allowlist entry with no `suppress` key at all does not suppress by itself."""
 
     def test_no_suppress_key_still_raises(self, target_node):
         self.assertTrue(
@@ -629,9 +617,10 @@ class TestSuppressionPruneNoFalseHeal(unittest.TestCase):
     ONLY shape prune() ever reclaims through: node_liveness_tracker.hpp's own doc states the
     consequence directly - an unsuppressed death has no reclaim path at all and so must stay
     reported "permanent until acknowledged" for as long as it is actually dead. That is
-    exactly why this row cannot point its reclaim proof at an unsuppressed node (the panel's
-    finding against this row's predecessor): SECOND_NODE, carrying no suppression, is that
-    permanently-outstanding control, not a second reclaim candidate.
+    exactly why this row cannot point its reclaim proof at an unsuppressed node: prune() would
+    never reclaim it, so a reclaim assertion against it could only ever fail. SECOND_NODE,
+    carrying no suppression, is instead the permanently-outstanding control, not a second
+    reclaim candidate.
 
     Reclaim itself is proven as a tracked_count DELTA off a baseline, not against zero: the
     aggregate also carries every other armed App in the graph (the gateway's own entity among

@@ -1471,6 +1471,20 @@ every raise/clear/heal transition also exists, but only once the fault manager's
 `audit_log.enabled` is turned on, which it is not by default. Recordings and the freeze
 frame do not accumulate a per-occurrence history either way.
 
+**A second death while the first is still outstanding gets no evidence of its own.** This
+detector folds every currently-affected node into ONE `GRAPH_NODE_DISAPPEARED` record (see
+"The boundary with `lifecycle_expectation`" above) - so a node dying while another's death is
+still CONFIRMED is added to the description, but the report that adds it is a re-report on an
+already-active fault, not a new occurrence: the same distinction "Repeated failures" above
+draws for one node dying twice applies just as much across two different nodes sharing the
+one code. `occurrence_count` does not move, no state transition fires, and - for the same
+reason "The honest limits" above gives - neither a freeze frame nor a recording is captured
+for the second node; only whichever death actually confirmed the record has either.
+Acknowledging between the two deaths avoids this: `DELETE
+/api/v1/apps/graph_watchdog/faults/GRAPH_NODE_DISAPPEARED` closes the first occurrence, so the
+second node's next report reactivates a CLEARED record instead of updating a CONFIRMED one - a
+genuine new occurrence, with its own `occurrence_count` and its own capture.
+
 **Test tiers.**
 
 1. **Unit**: `test_node_liveness_tracker.cpp` pins the pure presence/absence state machine -

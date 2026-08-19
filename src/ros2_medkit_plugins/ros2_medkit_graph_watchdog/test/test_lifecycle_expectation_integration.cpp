@@ -1752,7 +1752,7 @@ TEST_F(LifecycleExpectationIntegrationTest, ANodeCrossingAfterTheCapIsFullIsName
 // broke - and the operator is then told about the one that is gone instead of the one that
 // needs attention.
 //
-// Past R10, a departed node can no longer cross INTO GRAPH_NODE_INACTIVE from a below-grace
+// A departed node can no longer cross INTO GRAPH_NODE_INACTIVE from a below-grace
 // streak (see the tracker's own class doc), so "both cross on the same tick" is no longer a
 // reachable shape for this fault - a departed entry only ever carries content it EARNED
 // before it left. What is still reachable, and still the real question, is whether a node
@@ -3188,7 +3188,7 @@ TEST_F(LifecycleExpectationIntegrationTest, NotManagedNodeInARestartLoopIsStillR
 // absence runs longer than the absence grace. Driven through the REAL gate rather than the
 // injection seam, which can only ever SET a label and never remove tracking: toggling
 // whether "a" carries GetState/ChangeState services is what produces a genuine nullopt for a
-// previously-tracked fqn. Past R10, neither the not-managed legs (which never touch the
+// previously-tracked fqn. Neither the not-managed legs (which never touch the
 // violation streak) nor the absence gaps (which hold a below-grace streak rather than
 // advancing it) contribute anything on their own - only the repeated MEASURED not-active
 // legs do, one real tick at a time - so this still raises, from real evidence accumulated
@@ -3284,7 +3284,7 @@ TEST_F(LifecycleExpectationIntegrationTest, HealthyNodeThatVanishesRaisesNothing
 }
 
 // Unlike its UNREADABLE and NOT-MANAGED siblings above, GRAPH_NODE_INACTIVE no longer treats
-// this shape as an evasion to close on its own: past R10, absence contributes nothing to a
+// this shape as an evasion to close on its own: absence contributes nothing to a
 // below-grace violation streak (see the tracker's own class doc), so a node that is inactive
 // for one tick and then gone for a run, forever, only accumulates evidence from its PRESENT
 // ticks - one per cycle here. It is still eventually reported, because it really was measured

@@ -1105,6 +1105,49 @@ hash-chained record of every raise/clear/heal transition also exists, but only o
 fault manager's own ``audit_log.enabled`` is turned on, which it is not by default.
 Recordings and the freeze frame do not accumulate a per-occurrence history either way.
 
+**A second death while the first is still outstanding gets no evidence of its own.** This
+detector folds every currently-affected node into ONE ``GRAPH_NODE_DISAPPEARED`` record via
+``AggregatedFault::emit()`` (see "The boundary with" ``lifecycle_expectation`` above): a
+second node dying while the fault is still CONFIRMED is added to the description on the next
+tick, but the ``ReportFault`` call that carries it lands on ``fault_storage.cpp``'s
+already-CONFIRMED, still-FAILED branch - the same re-report-not-a-new-occurrence path
+"Repeated failures" above describes for one node dying twice, reached here by two different
+nodes sharing one code instead. ``occurrence_count`` does not move, the fault manager
+publishes ``EVENT_UPDATED`` rather than ``EVENT_CONFIRMED``, and ``just_confirmed`` in
+``fault_manager_node.cpp`` stays false - which is what gates ``capture_pool_``, so neither a
+freeze frame nor a recording is captured for the second node. Acknowledging between the two
+deaths avoids this: the DELETE route's ``~/clear_fault`` closes the first occurrence, so the
+second node's next FAILED report reactivates a CLEARED record instead of updating a CONFIRMED
+one - a genuine new occurrence, with its own ``occurrence_count`` and its own capture.
+
+Two fixes were measured and rejected here, so this is not open for reconsideration without
+new evidence:
+
+- **Clear-then-raise from inside the detector does nothing.** ``AggregatedFault`` already has
+  both halves available - ``emit()`` sends a PASSED-shaped ``clear_fault()`` when ``affected``
+  is empty, a FAILED-shaped ``raise_fault()`` otherwise - so sending one right after the other
+  on the same tick looks like a free fix. It is not: ``compute_debounce_status()``'s
+  hysteresis latch holds a CONFIRMED (or HEALED) status until the debounce counter itself
+  crosses the OPPOSITE threshold, and a single PASSED event only moves that counter by one
+  step. Unless the fault happened to sit exactly one step short of ``healing_threshold``
+  already, the clear changes nothing the status can see, and the raise that follows lands
+  right back on the same already-CONFIRMED branch as before.
+- **Calling the real** ``~/clear_fault`` **service instead is worse than doing nothing.**
+  ``SqliteFaultStorage::clear_fault()`` runs ``DELETE FROM snapshots WHERE fault_code = ?`` -
+  it deletes the per-topic readings captured for the fault it clears, keeping only the
+  freeze-frame row. And ``ClearFault.srv``'s own ``skip_correlation_auto_clear`` defaults to
+  false, so clearing a root cause also clears every symptom the correlation engine attributes
+  to it unless the caller explicitly opts out (the gateway's own REST DELETE routes do; a
+  detector reaching for this service directly would have to remember to as well). Having the
+  detector call this automatically the moment a second node dies would destroy the FIRST
+  node's evidence - snapshots and correlated symptoms alike - to chase evidence for the
+  second, before anyone has necessarily seen the first.
+
+A correct fix does not belong in this detector at all: it needs an operation in the fault
+manager that re-confirms a CONFIRMED record - bumping ``occurrence_count``, publishing
+``EVENT_CONFIRMED`` again, and re-arming ``just_confirmed`` for a fresh capture - without
+routing through CLEARED and without deleting anything the first occurrence already earned.
+
 **Test tiers.** Three tiers each prove a different layer, deliberately not overlapping,
 plus the suppression chain the detector shares no code with any sibling for:
 

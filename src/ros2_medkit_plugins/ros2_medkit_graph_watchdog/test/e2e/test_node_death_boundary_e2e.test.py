@@ -25,22 +25,22 @@ launch and which assertions run:
 - "b1_inactive_present": a require_active node (managed_lifecycle, never activated) sits in the
   graph past `grace`. GRAPH_NODE_INACTIVE raises and names it - GENUINELY GREEN, because
   lifecycle_expectation already ships this. GRAPH_NODE_DISAPPEARED stays absent for the whole
-  window, which CANNOT DISCRIMINATE YET on its own (no detector exists to raise it) but would
-  also hold once node_death exists, because this node never leaves the graph.
+  window - absence alone cannot distinguish a detector that correctly stays silent here from
+  one that raises nothing at all, but staying silent is also the permanently correct behaviour,
+  since this node never leaves the graph.
 - "b2_inactive_below_grace_then_gone": the same node, now driven to "active" FIRST (arming it
   for node_death - see TestBoundaryInactiveBelowGraceThenGone's own class docstring for why
   that is not optional), then to "inactive" via a real DEACTIVATE transition, then killed after
-  being observed non-active for only a couple of ticks - comfortably below `grace`. R10's own
-  worked example: absence used to CONTINUE an unmatured violation streak (change 4's R30,
-  necessary only because no presence detector existed), so GRAPH_NODE_INACTIVE used to mature
-  from evidence gathered entirely after the node could no longer be observed - the defect the
-  whole B2 row exists to pin, proven with assert_fault_absent_throughout rather than presented
-  as prose. The below-grace precondition is itself proven from an OBSERVABLE (GRAPH_NODE_INACTIVE
-  still absent from /faults) immediately before the kill, not merely inferred from how little
-  time has elapsed - status_json() exposes no per-node violation-streak count (see
-  lifecycle_expectation_detector.cpp), so the fault surface is the only external evidence
-  available, and with confirmation_threshold=-2 the detector's first FAILED report IS the
-  confirmation. Both halves of the row are now reachable together: no GRAPH_NODE_INACTIVE is
+  being observed non-active for only a couple of ticks - comfortably below `grace`. Absence may
+  continue a violation that has already matured, but must never mature one that has not: this row
+  pins the defect where GRAPH_NODE_INACTIVE used to mature from evidence gathered entirely after
+  the node could no longer be observed, proven with assert_fault_absent_throughout rather than
+  presented as prose. The below-grace precondition is itself proven from an OBSERVABLE
+  (GRAPH_NODE_INACTIVE still absent from /faults) immediately before the kill, not merely
+  inferred from how little time has elapsed - status_json() exposes no per-node violation-streak
+  count (see lifecycle_expectation_detector.cpp), so the fault surface is the only external
+  evidence available, and with confirmation_threshold=-2 the detector's first FAILED report IS
+  the confirmation. Both halves of the row are now reachable together: no GRAPH_NODE_INACTIVE is
   born from the departure, and GRAPH_NODE_DISAPPEARED raises because the node was armed before
   it died.
 - "b3_matured_then_gone": a require_active node driven to "active" first (arming it for
@@ -62,17 +62,18 @@ launch and which assertions run:
   implementation), restart-looping under this test's own control, killed and confirmed back
   five times over. Nothing here checks GRAPH_NODE_INACTIVE - that is B2's and B3's row. This
   one is entirely about whether the presence code catches the departure EVERY cycle, which is
-  what makes R10's narrowing safe: once GRAPH_NODE_DISAPPEARED independently catches a restart
-  loop, lifecycle_expectation no longer has to evade it via an unmatured streak maturing on
-  absence. Configures detectors.node_death.miss_grace explicitly (B5_MISS_GRACE, comfortably
-  past the documented 3000 ms floor) and drives the node's own respawn on a delay
+  what makes it safe to forbid absence from maturing an unmatured streak: once
+  GRAPH_NODE_DISAPPEARED independently catches a restart loop, lifecycle_expectation no longer
+  has to evade it via an unmatured streak maturing on absence. Configures
+  detectors.node_death.miss_grace explicitly (B5_MISS_GRACE, comfortably past the documented 3000
+  ms floor) and drives the node's own respawn on a delay
   (B5_RESPAWN_DELAY_SEC) safely longer than that nominal grace, so a correct detector CAN
   report every cycle - left at the 1.5 s launch-respawn floor, the outage would be shorter than
   the floor the detector enforces and this row could never turn green for a right
   implementation, only a wrong one lucky enough to report anyway.
 - "c4_config_endpoint_e2e": ONE gateway, ONE armed node, killed once, with a LARGE
-  detectors.node_death.miss_grace configured (C4_MISS_GRACE_LARGE - no documented ceiling exists
-  for this not-yet-built key). Proves the knob governs an observable by checking the SAME
+  detectors.node_death.miss_grace configured (C4_MISS_GRACE_LARGE, comfortably under the
+  documented 3600-tick ceiling). Proves the knob governs an observable by checking the SAME
   gateway at two points on ONE timeline rather than comparing two gateways: a window
   (C4_EARLY_WINDOW_SEC) long enough that a near-floor config (this suite's own ~4s convention -
   B5_MISS_GRACE, D2_MISS_GRACE) would already have raised, in which this large-grace gateway
@@ -99,15 +100,14 @@ launch and which assertions run:
   of the watchdog's own global_state, one immediately before it opens and one immediately after
   it closes, both asserted != "armed" - restart-plus-recovery eating the whole nominal warmup
   would otherwise let the sampled window land AFTER arming, and a legitimate post-arm PASSED
-  would then be misread as the ungated-clear bug this row exists to catch. RED at the very first
-  assertion (the initial raise, which needs the same missing detector every other row does), so
-  the warmup-window claim itself is unreachable today and is written for slice 2/3's benefit.
+  would then be misread as the ungated-clear bug this row exists to catch.
 
 ### Which arming gate, and why B1 alone uses the global form
 
-The brief's default rule is: gate on `app_id=<the node a scenario perturbs>`, and reserve the
-global form for a scenario that perturbs the gateway itself. B1 and B6 are the documented
-exceptions, for a reason specific to a require_active node rather than a style choice: ONE of
+The default rule every scenario in this file follows: gate on `app_id=<the node a scenario
+perturbs>`, and reserve the global form for a scenario that perturbs the gateway itself. B1 and
+B6 are the documented exceptions, for a reason specific to a require_active node rather than a
+style choice: ONE of
 `ReliabilityGate`'s own preconditions for a per-entity `armed` state is
 `LifecycleWatcher::node_ok()`, which is false for exactly a tracked node that is not (yet)
 "active" - the very state both targets sit in for their whole life, on purpose, since neither
@@ -129,15 +129,14 @@ not a precondition to avoid but the claim under test, so it deliberately launche
 the OTHER way - without auto_activate - and asserts GRAPH_NODE_DISAPPEARED stays silent rather
 than waiting for it.
 
-B2 was the one row that got this wrong, twice in the same way: correct for the row's INACTIVE
-half (which needs the node observed below `grace`, so it must never mature past it) and fatal
-for its DISAPPEARED half (which needs node_death to have tracked the node at all, and a node
-that never arms is structurally invisible to it regardless of what kills it). Gating globally
-and never activating the target was the right call the FIRST time this file was written, when
-B2 only had to prove the inactive half was broken - it stopped being the right call the moment
-GRAPH_NODE_DISAPPEARED's own claim was added to the same row. The fix is the one every other
-row in this file already uses: reach "active" first, however briefly, before doing anything
-else to the node a DISAPPEARED claim depends on.
+B2 is the row where getting this wrong is easiest to miss: gating globally and never activating
+the target would still be correct for the INACTIVE half (which needs the node observed below
+`grace`, so it must never mature past it) while being fatal for the DISAPPEARED half (which
+needs node_death to have tracked the node at all, and a node that never arms is structurally
+invisible to it regardless of what kills it) - a row built that way could pass while silently
+proving nothing about the half it got wrong. B2 therefore follows the same rule every other row
+in this file uses: reach "active" first, however briefly, before doing anything else to the node
+a DISAPPEARED claim depends on.
 """
 
 import os
@@ -249,10 +248,9 @@ B5_CYCLES = 5
 C4_TARGET_NODE = 'calibration'
 C4_TARGET_EXECUTABLE = 'demo_calibration_service'
 C4_TARGET_NAMESPACE = '/powertrain/engine'
-# No documented ceiling exists for this not-yet-built key (see this package's own config sweep,
-# which the design docs record as still owing a representative large value), so this is chosen
-# only to sit unambiguously outside C4_EARLY_WINDOW_SEC below - 500 ticks at TICK_INTERVAL_MS is
-# 100s, four times that window.
+# Comfortably under the documented ceiling (3600 ticks - node_death's own kMaxNodeDeathGraceTicks
+# applies to miss_grace and prune_grace alike), chosen only to sit unambiguously outside
+# C4_EARLY_WINDOW_SEC below - 500 ticks at TICK_INTERVAL_MS is 100s, four times that window.
 C4_MISS_GRACE_LARGE = 500
 # Long enough that a near-floor config (this suite's own MISS_GRACE=20/4000ms convention - see
 # B5_MISS_GRACE, D2_MISS_GRACE) would already have raised by the time this window ends, so
@@ -702,10 +700,9 @@ class TestBoundaryInactivePresent(unittest.TestCase):
 
     GENUINELY GREEN, not a placeholder: lifecycle_expectation already ships, so the raise below
     exercises real, already-merged code (LifecycleExpectationTracker's violation-streak clock
-    crossing `grace`). The GRAPH_NODE_DISAPPEARED absence half CANNOT DISCRIMINATE a correct
-    future node_death from no detector at all - with nothing to raise it, this absence is
-    trivially true today - though it is also the behaviour a correct node_death would keep
-    forever here, since this node never leaves the graph.
+    crossing `grace`). The GRAPH_NODE_DISAPPEARED absence half cannot, by itself, distinguish a
+    correct node_death from no detector at all - but staying silent is also the permanently
+    correct behaviour here, since this node never leaves the graph.
     """
 
     def test_inactive_past_grace_raises_no_disappeared(self):
@@ -744,11 +741,12 @@ class TestBoundaryInactivePresent(unittest.TestCase):
 class TestBoundaryInactiveBelowGraceThenGone(unittest.TestCase):
     """B2: a required node inactive for FEWER ticks than grace, then it vanishes.
 
-    R10's own worked example, and the row it exists to pin: absence used to CONTINUE a
-    violation streak that had not yet matured when the node was last observed (change 4's R30)
-    - necessary only because no presence detector existed to catch a restart loop any other
-    way. Once GRAPH_NODE_DISAPPEARED has one, that continuation is no longer needed and, per
-    R10, must stop maturing an unmatured streak.
+    Absence may continue a violation that has already matured, but must never mature one that
+    has not: the row it exists to pin is a defect where absence used to CONTINUE a violation
+    streak that had not yet matured when the node was last observed - necessary only because no
+    presence detector existed to catch a restart loop any other way. Once GRAPH_NODE_DISAPPEARED
+    has one, that continuation is no longer needed and absence must stop maturing an unmatured
+    streak.
 
     Both of this row's claims are satisfiable together, which took getting the arming gate
     wrong once to learn: the target must reach "active" FIRST, or GRAPH_NODE_DISAPPEARED can
@@ -770,8 +768,8 @@ class TestBoundaryInactiveBelowGraceThenGone(unittest.TestCase):
     confirmation - "absent from /faults" and "not yet matured" are the same fact, one HTTP
     round trip apart. A failure at that check names a timing problem in this test's OWN setup
     (B2_GRACE too tight against how long the DEACTIVATE round trip took this run), never the
-    R10 claim the kill exists to test - which is the point of reading an observable immediately
-    before acting instead of trusting a margin.
+    absence-must-not-mature claim the kill exists to test - which is the point of reading an
+    observable immediately before acting instead of trusting a margin.
     """
 
     @classmethod
@@ -968,8 +966,8 @@ class TestBoundaryHealthyThenGone(unittest.TestCase):
     The INACTIVE-absence half is GENUINELY GREEN, already-shipped behaviour
     (`release_uncorroborated`: a node last measured healthy that then departs starts no
     violation) - proven here against the real stack, checked FIRST so its own result is never
-    masked by the DISAPPEARED half's inevitable timeout. The DISAPPEARED-raise half is RED, the
-    ordinary missing-detector reason.
+    masked by the DISAPPEARED half's own timeout budget. The DISAPPEARED half proves node_death
+    raises and names a node that was healthy right up to the moment it departed.
     """
 
     def test_healthy_departure_raises_only_disappeared(self, target_node):
@@ -988,7 +986,8 @@ class TestBoundaryHealthyThenGone(unittest.TestCase):
             _poll_apps_absent(PORT, ACTIVE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{ACTIVE_NODE} never left GET /apps after SIGTERM')
 
-        # Genuinely green today: an active-then-departed node never becomes INACTIVE content.
+        # Already-shipped lifecycle_expectation behaviour: an active-then-departed node never
+        # becomes INACTIVE content.
         assert_fault_absent_throughout(self, PORT, FAULT_CODE_INACTIVE, SUSTAINED_WINDOW_SEC)
 
         fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
@@ -1000,21 +999,22 @@ class TestBoundaryHealthyThenGone(unittest.TestCase):
 class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
     """B5: a required node in a restart loop is still caught, every cycle, by the presence code.
 
-    The most important row in this file: it is what makes B2's narrowing (R10) safe. Once
-    GRAPH_NODE_DISAPPEARED independently catches a departure regardless of how briefly the node
-    was up, lifecycle_expectation no longer has to lean on an unmatured streak maturing on
-    absence to keep a restart-looping node from evading every code. This row does not touch
-    GRAPH_NODE_INACTIVE at all - that claim belongs to B2 and B3.
+    The most important row in this file: it is what makes it safe for B2 to forbid absence from
+    maturing an unmatured streak. Once GRAPH_NODE_DISAPPEARED independently catches a departure
+    regardless of how briefly the node was up, lifecycle_expectation no longer has to lean on an
+    unmatured streak maturing on absence to keep a restart-looping node from evading every code.
+    This row does not touch GRAPH_NODE_INACTIVE at all - that claim belongs to B2 and B3.
 
     The target launches with auto_activate (the same mechanism B4's target uses) and keeps that
     parameter across every respawn, not merely the first start: node_death only ever tracks a
     node it has seen ARMED at least once (reliability_allows() requires "active" for a managed
     node - LifecycleWatcher::node_ok()), so a fixture that never activates would make
     GRAPH_NODE_DISAPPEARED structurally unreachable for every cycle here, not merely slow to
-    catch - this row carries the evidence that R10's narrowing is safe, so it has to run
-    against a node that can actually be reported. Each cycle's respawned instance is re-armed
-    (app_id-scoped wait_until_watchdog_armed, not merely presence) before the NEXT kill for the
-    identical reason a fresh process needs it the first time: a kill landing before a
+    catch - this row carries the evidence that forbidding absence from maturing an unmatured
+    streak is safe, so it has to run against a node that can actually be reported. Each cycle's
+    respawned instance is re-armed (app_id-scoped wait_until_watchdog_armed, not merely
+    presence) before the NEXT kill for the identical reason a fresh process needs it the first
+    time: a kill landing before a
     just-restarted instance reaches "active" would leave that cycle's death untracked too, and
     the following poll_faults would time out for a precondition reason having nothing to do
     with the claim this row is about. A future edit that reverts TARGET_NODE to launching
@@ -1187,7 +1187,7 @@ class TestBoundaryConfigEndpointE2E(unittest.TestCase):
     """C4: `detectors.node_death.miss_grace` visibly changes when a death is reported.
 
     One gateway, one armed node, killed once, with a LARGE miss_grace configured
-    (C4_MISS_GRACE_LARGE - no documented ceiling exists for this not-yet-built key). Proves the
+    (C4_MISS_GRACE_LARGE, comfortably under the documented 3600-tick ceiling). Proves the
     knob governs an OBSERVABLE, not merely that the plugin accepts it at startup, by checking the
     SAME gateway at two points on ONE timeline rather than comparing two gateways: first, a
     window (C4_EARLY_WINDOW_SEC) long enough that a near-floor config (this suite's own ~4s
@@ -1196,8 +1196,6 @@ class TestBoundaryConfigEndpointE2E(unittest.TestCase):
     detector raising for some unrelated entity cannot decide the row; second, once the
     configured grace has had time to elapse, the fault must still arrive and name the node - the
     large value delays the report, it does not swallow it.
-
-    RED today: no node_death detector exists, so the raise in the second half never happens.
     """
 
     def test_large_miss_grace_delays_then_still_reports(self, target_node):
@@ -1233,11 +1231,10 @@ class TestBoundaryConfigEndpointE2E(unittest.TestCase):
 class TestBoundaryUngatedClear(unittest.TestCase):
     """D2: an ungated clear must not push a stored fault toward healing before anything measured.
 
-    RED today at the very first assertion - the ordinary missing-detector reason, before this
-    scenario's restart even happens. Everything from the restart onward is unreachable in this
-    run and is written for slice 2/3: a death is confirmed, the GATEWAY is restarted with a wide
-    warmup_cycles, and the pre-arm window that follows is watched for a premature PASSED on the
-    stored record.
+    test_01 confirms the death and its stored record. test_02 then restarts the GATEWAY with a
+    wide warmup_cycles, and watches the pre-arm window that follows for a premature PASSED on
+    the stored record - the restarted detector must not report anything about a node it has
+    never actually measured in this process's lifetime.
     """
 
     def test_01_the_fault_raises_before_the_restart(self, target_node):

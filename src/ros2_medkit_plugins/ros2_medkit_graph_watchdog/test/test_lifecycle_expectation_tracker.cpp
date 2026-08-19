@@ -594,8 +594,8 @@ TEST(LifecycleExpectation, NotManagedInterleavedWithAbsenceRunsStillMaturesAndRe
 // absence run - however many, however long, however far past kDefaultAbsenceGrace - must
 // contribute NOTHING to a streak that has not yet crossed `grace`. Crossing happens at
 // exactly grace + 1 MATCHED "inactive" reads, never earlier and never later, whatever the
-// interleaved absence pattern looks like. This is R10's narrowing, pinned directly against
-// the exact shape that used to defeat it.
+// interleaved absence pattern looks like - absence must never mature an unmatured streak,
+// pinned directly against the exact shape that used to defeat that rule.
 TEST(LifecycleExpectation, InactiveInterleavedWithAbsenceRunsNeverCrossesGraceFromAbsenceAlone) {
   for (const int run_length : kAbsenceRunLengths) {
     constexpr int kGrace = 3;
@@ -1366,8 +1366,9 @@ TEST(LifecycleExpectation, CorroboratedUnmeasuredRunBeforeADepartureIsStillRepor
 // tick), and a node that departs immediately after keeps that content unconditionally, the
 // same as any other already-matured entry. Without instant settling for a real measurement,
 // the corroboration rule built for the unmeasured clock would swallow the very case grace: 0
-// exists for. grace: 0 also keeps this test meaningful post-R10: at any grace > 0 a single
-// read leaves the streak BELOW grace, and a below-grace streak is now held rather than
+// exists for. grace: 0 also keeps this test meaningful now that absence alone may not mature
+// a below-grace streak: at any grace > 0 a single read leaves the streak BELOW grace, and a
+// below-grace streak is now held rather than
 // confirmed by a departure - see BelowGraceStreakStaysPendingForeverWhileAbsentAndNever
 // BecomesContent for that (deliberately different) claim.
 TEST(LifecycleExpectation, OneMeasuredNotActiveReadBeforeADepartureStillConfirms) {
@@ -1472,9 +1473,9 @@ TEST(LifecycleExpectation, ANodeReturningAfterItsEntryWasCollapsedIsMeasuredAfre
 // counting "only an already-matured one". Here grace is wide enough that the departed entry
 // is genuinely BELOW it when the cap forces its collapse: under the design this replaces,
 // absence kept advancing it regardless, so folding it into collapsed_inactive_ merely
-// anticipated a maturity it would have reached anyway. Past R10 that is no longer true - a
-// below-grace streak held by absence never matures on its own - so collapsing it as content
-// would fabricate a violation the node never earned.
+// anticipated a maturity it would have reached anyway. That is no longer true now that
+// absence alone never matures a below-grace streak - so collapsing it as content would
+// fabricate a violation the node never earned.
 TEST(LifecycleExpectation, BelowGraceDepartedEntryCollapsedAtTheCapContributesNothingToTheCount) {
   constexpr int kCap = 1;
   LifecycleExpectationTracker t({"/held", "/live"}, /*grace=*/5, /*absence_grace=*/1, kDefaultNoMatchWarnTicks,

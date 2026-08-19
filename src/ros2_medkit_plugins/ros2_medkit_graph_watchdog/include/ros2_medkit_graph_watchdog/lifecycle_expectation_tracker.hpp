@@ -396,11 +396,11 @@ struct LifecycleExpectationReport {
 /// bounds the map's SIZE instead is `tracked_node_cap`.
 ///
 /// A node whose UNMEASURED clock is still climbing keeps the bound this class shipped with:
-/// past `absence_grace` it advances every tick regardless of maturity - that clock's own
-/// absence behaviour is unrelated to this slice, see the two unmeasured causes above - so it
-/// matures within at most `unmeasured_hold_ticks` + `absence_grace` + 1 ticks and is
-/// reported, which is also the longest GRAPH_NODE_UNREADABLE or GRAPH_NODE_NOT_MANAGED's
-/// clear can be withheld by one departed node.
+/// past `absence_grace` it advances every tick regardless of maturity - unlike the violation
+/// streak above, this clock's own absence behaviour did not change, see the two unmeasured
+/// causes above - so it matures within at most `unmeasured_hold_ticks` + `absence_grace` + 1
+/// ticks and is reported, which is also the longest GRAPH_NODE_UNREADABLE or
+/// GRAPH_NODE_NOT_MANAGED's clear can be withheld by one departed node.
 ///
 /// A VIOLATION streak on a node that was NEVER armed shares that same bound, for the same
 /// reason it advances at all while absent (see the kInactive case above): it matures within
@@ -601,8 +601,8 @@ class LifecycleExpectationTracker {
     // doc. A node last measured kInactive continues an ALREADY-matured violation exactly as
     // it was, but a below-grace one is simply held, never matured on the strength of absence
     // alone. A node last measured kUnreadable/kNotManaged keeps climbing its unmeasured
-    // clock regardless of maturity - that clock's own absence behaviour is unrelated to this
-    // slice. A node last measured kActive continues nothing: a healthy node shutting down is
+    // clock regardless of maturity - that clock's own absence behaviour did not change. A node
+    // last measured kActive continues nothing: a healthy node shutting down is
     // GRAPH_NODE_DISAPPEARED's business, which this package's node_death detector now
     // covers. Only IDLE bookkeeping is reclaimed by age, because only an idle entry has
     // nothing to lose.

@@ -33,9 +33,8 @@ launch and which assertions run:
   alongside the real assertions without depending on them, the way the lifecycle e2e's
   "default_config" scenario runs the silence one.
 - "clear_on_return": the same, then the node is started again. The fault clears once the
-  node is back - the occurrence model's own "outage genuinely ended" case (see R7 in this
-  package's design history: no forced transition, the detector closes a cycle when the
-  graph actually recovers).
+  node is back - the occurrence model's own "outage genuinely ended" case: no forced
+  transition, the detector closes a cycle when the graph actually recovers.
 - "no_heal_standalone": the same drive as clear_on_return, but the fault_manager runs with
   healing OFF. The fault does NOT clear - not a defect, the documented shape of a debounce
   hysteresis latch that only a HEALED-enabled config can cross - proven as a SUSTAINED
@@ -45,22 +44,24 @@ launch and which assertions run:
   through a real ChangeState call, while its process keeps running throughout. No
   GRAPH_NODE_DISAPPEARED for the whole window - node_death is a presence detector; a
   lifecycle transition is not a departure, and telling the two apart is
-  lifecycle_expectation's job, not this one's (see B1-B5 in this package's design history,
-  none of them this slice's to write). CANNOT DISCRIMINATE YET: see
-  TestNodeDeathDeactivatedNotDead's own docstring.
+  lifecycle_expectation's job, not this one's (see B1-B5 in
+  test_node_death_boundary_e2e.test.py, none of them written here). See
+  TestNodeDeathDeactivatedNotDead's own docstring for what this absence does and does not
+  prove.
 - "manifest_never_online": a hybrid-mode manifest declares an App whose ROS binding never
   starts. No GRAPH_NODE_DISAPPEARED for it, ever - the promise the public issue leads with:
   a manifest node keeps its App in the snapshot with the online flag cleared, so a detector
-  that counted snapshot membership alone would call it immortal. CANNOT DISCRIMINATE YET:
-  see TestNodeDeathManifestNeverOnline's own docstring.
+  that counted snapshot membership alone would call it immortal - see
+  TestNodeDeathManifestNeverOnline's own docstring for what this absence does and does not
+  prove.
 - "ros2cli_ignored": a node renamed to carry the ros2cli hidden-node prefix is armed then
   killed, three times over with distinct names. No fault, and the detector's own
   tracked-count status field does not grow across the three cycles - a node matching the
   naming convention must not accumulate as permanent tracked state, regardless of what
   process gave it that name. A second check pins that fixture's prefix against the
   installed ros2cli package's own naming constants, so the fixture cannot silently drift
-  from what ros2cli itself actually uses. CANNOT DISCRIMINATE YET: see
-  TestNodeDeathRos2cliIgnored's own docstring.
+  from what ros2cli itself actually uses - see TestNodeDeathRos2cliIgnored's own docstring
+  for what this absence does and does not prove.
 - "bare_name_collision": two nodes named 'calibration' in different namespaces; one exits.
   The fault names the one that exited and does not name the one still running - proven with
   assert_fault_describes_only so the claim holds over the WHOLE window, not one lucky read.
@@ -69,8 +70,8 @@ launch and which assertions run:
   generation (config sweep C1 owns the miss_grace floor's own boundary values), only that
   fast ticking alone, with nothing perturbing the graph, is safe - see
   TestNodeDeathFastTickFloor's own docstring for what was investigated and why forcing the
-  stronger condition was not implemented. CANNOT DISCRIMINATE YET either way: see
-  TestNodeDeathDeactivatedNotDead's own note.
+  stronger condition was not implemented - see TestNodeDeathDeactivatedNotDead's own note
+  for what this absence does and does not prove either way.
 - "restart_loop_occurrences": a node killed and restarted five times, each cycle closed
   with an explicit acknowledge before the next kill. The fault's occurrence_count reaches
   5 - the fault manager's own occurrence model (a FAILED event reactivating a CLEARED
@@ -223,7 +224,7 @@ COLLISION_APP_ID_B = 'coll_b_calibration'
 MUTUAL_NAMING_WINDOW_SEC = 5.0
 
 # ---- the "ros2cli_ignored" scenario's own fixtures -----------------------------------------
-# The naming convention the (future) node_death detector filters on: a leaf node name
+# The naming convention node_death filters on: a leaf node name
 # starting with this prefix, regardless of what process created it. The load-bearing half
 # of this scenario proves the convention itself, not any particular producer of it - see
 # TestNodeDeathRos2cliIgnored's own docstring for why that distinction is the whole point.
@@ -314,11 +315,10 @@ def generate_test_description():
             # OFF for this scenario only. Left at its true default (on), a node named
             # like the ros2cli convention would be invisible upstream of EVERYTHING -
             # GET /apps, the entity cache, any IntrospectionProvider plugin gets fed
-            # from it - which would make this scenario pass for the same wrong reason
-            # a reviewer already caught once: never tracked at all, rather than tracked
-            # and then correctly excluded by name. This scenario is about the (future)
-            # node_death detector's OWN name-based exclusion, which needs a node the
-            # detector's input can actually see. See the class docstring.
+            # from it - which would make this scenario pass for the wrong reason: never
+            # tracked at all, rather than tracked and then correctly excluded by name.
+            # This scenario is about node_death's OWN name-based exclusion, which needs a
+            # node the detector's input can actually see. See the class docstring.
             'discovery.runtime.filter_internal_nodes': False,
         }
     elif SCENARIO == 'bare_name_collision':
@@ -499,7 +499,7 @@ def _poll_apps_present(port, app_id, timeout=30.0, interval=0.5):
 
 
 def _clear_fault(port, entity_path, code, timeout=10.0):
-    """``DELETE {entity_path}/faults/{code}`` - the REST acknowledge, R7's ``~/clear_fault``.
+    """``DELETE {entity_path}/faults/{code}`` - the REST acknowledge, ``~/clear_fault``.
 
     Unconditional: it writes CLEARED whatever the fault's current status is
     (``fault_storage.cpp``'s own ``clear_fault`` takes no status guard), which is exactly
@@ -626,12 +626,7 @@ def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, 
 # ---------------------------------------------------------------------------------------
 
 class TestNodeDeathRaise(unittest.TestCase):
-    """A plain node's process exits: GRAPH_NODE_DISAPPEARED names it.
-
-    Expected RED today: nothing in this package raises GRAPH_NODE_DISAPPEARED yet, so the
-    raise poll below times out and the failure message names the missing fault - not a
-    harness error.
-    """
+    """A plain node's process exits: GRAPH_NODE_DISAPPEARED names it."""
 
     def test_process_exit_raises_naming_the_node(self, target_node):
         # app_id=TARGET_NODE, not the global gate: the global gate is satisfied by ANY
@@ -680,7 +675,10 @@ class TestNodeDeathRaise(unittest.TestCase):
 
 
 class TestNodeDeathClearOnReturn(unittest.TestCase):
-    """A dead node coming back clears the fault - R7's "the outage genuinely ended" case."""
+    """A dead node coming back clears the fault.
+
+    The occurrence model's own "outage genuinely ended" case.
+    """
 
     def test_node_returning_clears_the_fault(self, target_node):
         # app_id=TARGET_NODE: see TestNodeDeathRaise's identical gate for why the global
@@ -756,11 +754,11 @@ class TestNodeDeathNoHealStandalone(unittest.TestCase):
 class TestNodeDeathDeactivatedNotDead(unittest.TestCase):
     """A managed node that DEACTIVATES but keeps running is never called dead.
 
-    CANNOT DISCRIMINATE YET: with no node_death detector at all, GRAPH_NODE_DISAPPEARED
-    never appears for ANY reason, so this absence is trivially true today - it proves
-    nothing about whether a future detector actually tells "deactivated" apart from
-    "gone". Recorded as such rather than presented as evidence; slice 2 owes the check
-    that this fails once the detector is made to report a deactivated-but-alive node.
+    Absence alone cannot distinguish a detector that correctly ignores lifecycle state
+    from one that raises nothing at all - both leave GRAPH_NODE_DISAPPEARED silent here.
+    What this row catches is a detector that conflates "not active" with "gone":
+    node_death tracks graph PRESENCE only, so a node that deactivates without leaving the
+    graph must never be named.
 
     Uses managed_lifecycle_active (self-activates via launch's own auto_activate
     parameter) rather than extending droppable_lifecycle_node.cpp: that fixture's own
@@ -830,10 +828,11 @@ class TestNodeDeathDeactivatedNotDead(unittest.TestCase):
 class TestNodeDeathManifestNeverOnline(unittest.TestCase):
     """A manifest-declared App that never comes online is never called dead.
 
-    CANNOT DISCRIMINATE YET: see TestNodeDeathDeactivatedNotDead's own note - with no
-    detector at all this absence is trivially true. This is the promise the public issue
-    leads with: a manifest node keeps its App in the snapshot with the online flag
-    cleared, so a detector that counted snapshot membership alone would call it immortal.
+    Absence alone cannot distinguish a detector that correctly reads the online flag from
+    one that raises nothing at all - see TestNodeDeathDeactivatedNotDead's own note. What
+    it catches: a manifest node keeps its App in the snapshot with the online flag
+    cleared, so a detector that counted snapshot membership alone would call it immortal;
+    node_death instead arms only apps it has read online at least once.
     """
 
     NEVER_ONLINE_APP_ID = 'lidar-sensor'  # declared in demo_nodes_manifest.yaml; its
@@ -871,8 +870,8 @@ class TestNodeDeathManifestNeverOnline(unittest.TestCase):
 class TestNodeDeathRos2cliIgnored(unittest.TestCase):
     """A node named like ros2cli's own hidden-node convention is never tracked or raised.
 
-    What the (future) node_death detector actually implements for this case is a NAME
-    test: it takes the leaf after the last ``/`` and checks whether it starts with
+    What node_death actually implements for this case is a NAME test: it takes the leaf
+    after the last ``/`` and checks whether it starts with
     ``_ros2cli_``. Nothing in that check knows or cares that a real `ros2` CLI process
     produced the node - so the fixture that measures it should not depend on one either.
 
@@ -902,9 +901,9 @@ class TestNodeDeathRos2cliIgnored(unittest.TestCase):
     explicitly OFF (see `generate_test_description`). Left at its true default (on), a
     ``_ros2cli_``-named node would be invisible upstream of everything - GET /apps, the
     entity cache, any `IntrospectionProvider` plugin's own input - which would make this
-    scenario pass for the exact wrong reason a reviewer already caught once: never
-    tracked at all, rather than tracked and then correctly excluded by name. This
-    scenario is about the detector's OWN name-based exclusion (belt-and-braces on top of,
+    scenario pass for the exact wrong reason: never tracked at all, rather than tracked
+    and then correctly excluded by name. This scenario is about the detector's OWN
+    name-based exclusion (belt-and-braces on top of,
     not a substitute for, the gateway's separate and already-covered generic filter), and
     that requires a node the detector's input can actually see.
 
@@ -1022,15 +1021,14 @@ class TestNodeDeathRos2cliIgnored(unittest.TestCase):
                     proc.wait(timeout=15)
         after, after_stable = _poll_stable_tracked_count(
             PORT, DETECTOR_ID, timeout=STABLE_TRACKED_COUNT_TIMEOUT_SEC)
-        # `before` is None today, on every run - no node_death detector is registered at
-        # all, so there is no block to compare and this half of the claim cannot
-        # discriminate anything yet (see the class docstring). That is the ONLY condition
-        # allowed to skip the comparison. Once a detector exists, `before` stops being
-        # None, and from that point on `after` disappearing or losing its field is a
-        # regression, not something to fold silently into "no detector yet": checking
-        # `before is not None` alone (not also `after is not None`) is what makes a status
-        # block that vanishes or loses its shape MID-scenario fail loudly instead of being
-        # discarded along with the genuinely-inapplicable case.
+        # `before` reads None only if GET /x-medkit-watchdog carries no `detectors.node_death`
+        # block at all - the ONLY condition allowed to skip the comparison, kept for
+        # structural symmetry with `_poll_stable_tracked_count`'s own "stable at None"
+        # contract, not because it is expected here. With the detector registered, `before`
+        # is populated and the comparison below always runs: checking `before is not None`
+        # alone (not also `after is not None`) is what makes a status block that vanishes or
+        # loses its shape MID-scenario fail loudly instead of being discarded along with the
+        # genuinely-inapplicable case.
         if before is not None:
             self.assertTrue(
                 after_stable,
@@ -1176,8 +1174,9 @@ class TestNodeDeathBareNameCollision(unittest.TestCase):
 class TestNodeDeathFastTickFloor(unittest.TestCase):
     """A very short tick_interval_ms, with the node continuously present, raises nothing.
 
-    Narrower than this row's own name suggests, and deliberately so - see below.
-    CANNOT DISCRIMINATE YET: see TestNodeDeathDeactivatedNotDead's own note.
+    Narrower than this row's own name suggests, and deliberately so - see below. Absence
+    alone cannot distinguish a detector that is correctly silent here from one that raises
+    nothing at all - see TestNodeDeathDeactivatedNotDead's own note.
 
     What this scenario does NOT prove: that the documented miss_grace floor (config sweep
     C1's own concern) is what stands between a fast tick and a false raise. The row exists
@@ -1205,21 +1204,18 @@ class TestNodeDeathFastTickFloor(unittest.TestCase):
     genuinely alive via a DIRECT service call that bypasses the gateway entirely while
     GET /apps still reports it absent.
 
-    Not implemented. Three reasons, not one: (1) it is a real race, not a guaranteed
-    sequence - "deterministic" has to mean reliable across CI hardware, and nothing pins
-    how long DDS discovery takes to converge on the manually-respawned process relative to
-    the widened window, only that it is likely to fit; (2) winning the race would require
-    new subprocess-lifecycle code (resolving the demo executable's install path, building
-    its `--ros-args` remapping by hand, coverage-env parity with every other fixture in
-    this file, guaranteed cleanup on a failed assertion) whose own bugs could leak an
-    orphaned process - exactly what this package's own test discipline warns leaks into
-    the NEXT run as a false regression; (3) even a successful induction would not change
-    what this scenario can conclude: there is still no node_death detector to do the
-    counting the row is actually about, so the assertion at the end would still be the
-    same "no fault raised" that is trivially true either way - the win would be a
-    stronger PRECONDITION proof, not a stronger CONCLUSION, and slice 2 (which adds the
-    detector this row needs to mean anything) is a cheaper place to add that precondition
-    than retrofitting a timing-sensitive mechanism here first.
+    Not implemented. Two reasons: (1) it is a real race, not a guaranteed sequence -
+    "deterministic" has to mean reliable across CI hardware, and nothing pins how long DDS
+    discovery takes to converge on the manually-respawned process relative to the widened
+    window, only that it is likely to fit; (2) winning the race would require new
+    subprocess-lifecycle code (resolving the demo executable's install path, building its
+    `--ros-args` remapping by hand, coverage-env parity with every other fixture in this
+    file, guaranteed cleanup on a failed assertion) whose own bugs could leak an orphaned
+    process - exactly what this package's own test discipline warns leaks into the NEXT run
+    as a false regression. Forcing the precondition would exercise a real detector rather
+    than prove something trivially true either way, which is what makes the remaining cost
+    purely about race reliability and fixture risk, not about whether the result would mean
+    anything.
     """
 
     def test_fast_tick_alone_never_raises(self):
@@ -1249,8 +1245,8 @@ class TestNodeDeathRestartLoopOccurrences(unittest.TestCase):
 
     Each cycle: kill, wait for the fault to CONFIRM (a fresh occurrence), wait for the node
     to come back, THEN explicitly acknowledge it via DELETE
-    {SOURCE_ENTITY_PATH}/faults/{code} - R7's own mechanism and R7's own ordering ("node
-    returns... so close the cycle"): `~/clear_fault` IS the acknowledge, and a FAILED event
+    {SOURCE_ENTITY_PATH}/faults/{code} - the fault manager's own boundary between
+    occurrences: `~/clear_fault` IS the acknowledge, not a deletion, and a FAILED event
     reactivating a CLEARED record is what the fault manager counts as a new occurrence
     (`fault_storage.cpp`'s own comment: "a new outage cycle, not a continuation of the one
     that just cleared"). A level-triggered heal on return would NOT do this - reconfirming
@@ -1260,16 +1256,14 @@ class TestNodeDeathRestartLoopOccurrences(unittest.TestCase):
     of waiting for an organic heal.
 
     Deliberately does NOT assert the "more than one recording" half of this row. The
-    per-fault rosbag store on this branch enforces `fault_code` as UNIQUE
-    (`sqlite_fault_storage.cpp`'s `store_rosbag_file_locked`: "INSERT OR REPLACE INTO
-    rosbag_files ... (fault_code is UNIQUE)" - the SAME fault_code can hold at most one
-    recording ROW, structurally, and a re-confirm deletes the previous bag file from disk).
-    `snapshots.rosbag.max_bags_per_fault` - the config key that lifts this cap - does not
-    exist anywhere in this branch's source; it ships on GitHub PR 623 ("Keep more than one
-    rosbag per fault..."), open and unmerged into `main` as of this slice. Asserting a
-    recording count here would either assert something trivially true for the wrong reason
-    (no captures happen at all without a detector) or something structurally impossible to
-    ever pass before 623 lands - neither is written.
+    per-fault rosbag store enforces `fault_code` as UNIQUE (`sqlite_fault_storage.cpp`'s
+    `store_rosbag_file_locked`: "INSERT OR REPLACE INTO rosbag_files ... (fault_code is
+    UNIQUE)" - the SAME fault_code can hold at most one recording ROW, structurally, and a
+    re-confirm deletes the previous bag file from disk). No config key in the fault manager
+    lifts this cap today: recording more than one rosbag per fault_code needs the storage
+    schema itself to change. Asserting a recording count here would either assert something
+    trivially true for the wrong reason (no captures happen at all without a detector) or
+    something structurally impossible to ever pass - neither is written.
     """
 
     def test_five_kills_reach_occurrence_count_five(self, target_node):
@@ -1293,13 +1287,12 @@ class TestNodeDeathRestartLoopOccurrences(unittest.TestCase):
             )
 
             if cycle < RESTART_LOOP_OCCURRENCES_TARGET:
-                # Wait for the RETURN before acknowledging - R7's own ordering ("node
-                # returns... so close the cycle"), and not merely a style choice: clearing
-                # while the node is still absent leaves a window in which a live detector's
-                # own continued FAILED reports (the SAME departure, still being measured)
-                # would reactivate the just-cleared record too, one cycle early. Waiting
-                # for the return first means every reactivation this loop measures is
-                # attributable to the NEXT kill, not a race against this one's tail end.
+                # Wait for the RETURN before acknowledging - not merely a style choice:
+                # clearing while the node is still absent leaves a window in which a live
+                # detector's own continued FAILED reports (the SAME departure, still being
+                # measured) would reactivate the just-cleared record too, one cycle early.
+                # Waiting for the return first means every reactivation this loop measures
+                # is attributable to the NEXT kill, not a race against this one's tail end.
                 # app_id-scoped again, not just present: the respawned instance is a NEW
                 # process the detector has not read yet, and the next iteration is about
                 # to kill it - the same precondition the FIRST kill above needed.
@@ -1339,10 +1332,9 @@ class TestNodeDeathRestartRebaseline(unittest.TestCase):
     across the restart, proven as a SUSTAINED claim (assert_fault_persists_throughout),
     not a single sample that could just mean "not yet re-evaluated".
 
-    Reasoning, on file rather than assumed: this package's own design history (R7, cited
-    in this file's module docstring) settled that node_death has no forced state
-    transition - a violation's evidence closes only when the graph genuinely recovers, or
-    an operator explicitly acknowledges it. A gateway restart is neither: the node is
+    Reasoning, on file rather than assumed: node_death has no forced state transition - a
+    violation's evidence closes only when the graph genuinely recovers, or an operator
+    explicitly acknowledges it. A gateway restart is neither: the node is
     STILL gone, and the freshly-started detector process, having never observed it
     present in this lifetime, has nothing to report either way. Unlike
     lifecycle_expectation's require_active (an explicit, possibly-mistyped list that has

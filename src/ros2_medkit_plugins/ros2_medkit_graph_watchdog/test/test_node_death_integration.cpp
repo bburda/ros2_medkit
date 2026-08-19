@@ -367,8 +367,8 @@ TEST_F(NodeDeathIntegrationTest, IsOnlineFalseIsNeverTracked) {
 // status_json() exposes tracked_count on GET /x-medkit-watchdog (detectors.node_death) - the
 // field the ros2cli_ignored e2e row reads to prove tracked state does not grow across renamed-
 // node churn cycles. Without this override the field is simply absent (Detector's own default),
-// which that row's own comment treats as "no detector exists yet" and skips the comparison
-// rather than failing it - so this is required for that row to check anything at all.
+// which that row's own comment treats as a condition to skip the comparison under rather than
+// fail on - so this is required for that row to check anything at all.
 // =============================================================================================
 
 TEST_F(NodeDeathIntegrationTest, StatusJsonExposesTrackedCountMatchingTheTestSeam) {
@@ -544,7 +544,7 @@ TEST_F(NodeDeathIntegrationTest, N11_TrackedNodeCapBoundsUnsuppressedChurnAndKee
 // =============================================================================================
 
 TEST_F(NodeDeathIntegrationTest, CapC1_GraphLargerThanTheDefaultCapStillReportsADeathAmongItsPresentMajority) {
-  // Reproduces the exact sequence the panel found: at the shipped default tracked_node_cap
+  // Reproduces the sequence that exposes the defect: at the shipped default tracked_node_cap
   // (512), 513 armed nodes used to leave only one survivor once make_room() evicted every
   // present entry to admit the newcomer - and evicting a present entry can permanently lose
   // any death landing in the eviction window, because only ONLINE nodes re-enter `armed`.
@@ -555,7 +555,8 @@ TEST_F(NodeDeathIntegrationTest, CapC1_GraphLargerThanTheDefaultCapStillReportsA
   auto ctx = make_ctx(&gate);
 
   // 513 armed, present nodes - one more than the default cap - lexically ordered zero-padded
-  // ids so the very first admitted is also lexically first, matching the panel's own repro.
+  // ids so the very first admitted is also lexically first, reproducing the same eviction
+  // order the defect above depends on.
   std::vector<App> apps;
   apps.reserve(514);
   for (int i = 0; i < 513; ++i) {
@@ -584,10 +585,10 @@ TEST_F(NodeDeathIntegrationTest, CapC1_GraphLargerThanTheDefaultCapStillReportsA
 }
 
 TEST_F(NodeDeathIntegrationTest, CapC2_ChurnUnderCapPressureNeverFabricatesADeathBeforeMissGrace) {
-  // Reproduces the panel's exact sequence: at cap(2) with three entries carrying only one
-  // below-grace miss each, a make_room() that collapsed every non-idle entry used to fold all
-  // three into the collapsed count, raising GRAPH_NODE_DISAPPEARED before any of them had
-  // actually crossed miss_grace, and unhealably (their identities were erased).
+  // Reproduces the sequence that exposes the defect: at cap(2) with three entries carrying
+  // only one below-grace miss each, a make_room() that collapsed every non-idle entry used
+  // to fold all three into the collapsed count, raising GRAPH_NODE_DISAPPEARED before any
+  // of them had actually crossed miss_grace, and unhealably (their identities were erased).
   ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
   auto det = make_node_death();
   ASSERT_TRUE(det);
@@ -865,8 +866,9 @@ TEST_F(NodeDeathIntegrationTest, X2_TheFloorMakesAConfiguredMissGraceBehaveDiffe
 }
 
 // =============================================================================================
-// C2: malformed allowlist/suppress warn (R11's second change); an allowlist suppress does
-// not name warns AND does not suppress (R11's first change).
+// C2: malformed allowlist/suppress warn; an allowlist that `suppress` does not name has no
+// effect and says so at WARN severity - naming an entry on the allowlist is not, by itself,
+// a request to suppress it.
 // =============================================================================================
 
 TEST_F(NodeDeathIntegrationTest, C2_AllowlistWrongTopLevelTypeWarns) {
@@ -892,7 +894,8 @@ TEST_F(NodeDeathIntegrationTest, C2_UnknownSuppressEntryWarnsNamingIt) {
 TEST_F(NodeDeathIntegrationTest, C2_AllowlistNotNamedInSuppressWarnsAndDoesNotSuppress) {
   EXPECT_TRUE(configure_warns({{"allowlist", nlohmann::json::array({"/x"})}}, "inert"));
 
-  // Behavioural half of R11's first change: the source activated it anyway; this must not.
+  // Behavioural half of the above: an allowlist entry that `suppress` does not name must
+  // never actually suppress, whatever the ported source did.
   ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
   auto det = make_node_death();
   ASSERT_TRUE(det);

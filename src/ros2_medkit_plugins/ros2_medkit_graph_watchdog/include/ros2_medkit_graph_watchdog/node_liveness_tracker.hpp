@@ -74,7 +74,7 @@ struct NodeDeathReport {
 /// what bounds the map against exactly that growth.
 ///
 /// **What the cap bounds, and why it differs from its own past shape.** The unbounded
-/// growth an earlier review found is entirely in DEPARTED keys: a dead node's entry is never
+/// growth is entirely in DEPARTED keys: a dead node's entry is never
 /// reclaimed by anything but a durable suppressor, so unique dead identities accumulate for
 /// the life of the process. A PRESENT key does not have that problem - its count at any
 /// instant is bounded by the live graph, which is bounded by reality (a large single-robot

@@ -565,7 +565,7 @@ TEST_F(GraphWatchdogPluginTest, WatchdogStatusRouteReportsEntityLifecycleAndArme
   spin.join();
 }
 
-// H1 (cross-slice): the plugin injects its own prune_grace default only when the
+// The plugin injects its own prune_grace default only when the
 // per-detector key is ABSENT (see set_context()'s configure loop), so a PRESENT but
 // malformed detectors.node_death.prune_grace used to reach node_death's own configure()
 // unfiltered, which falls back to ITS OWN hardcoded default (60) rather than the plugin's.
