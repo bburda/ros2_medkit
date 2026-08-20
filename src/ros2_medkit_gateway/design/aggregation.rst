@@ -694,7 +694,15 @@ GETs ``/api/v1/health`` on its peer. If the health check fails, the peer is
 marked unhealthy and excluded from fan-out queries and entity fetching.
 
 When a peer recovers (health check succeeds again), it is automatically
-re-included.
+re-included: the next refresh fetches it like any other healthy peer, and since
+a retained declaration is replayed only for a peer that could not be read that
+cycle, the live answer replaces the retained one wholesale rather than being
+merged beside it. ``x-medkit.available`` therefore clears on that same refresh,
+and the entities the peer only discovered at runtime - dropped while it was
+silent - are merged again with it. ``x-medkit.is_online`` is read off the wire
+as the peer's own account of an App, not as a statement about the link, so an
+App on a gateway that has just restarted stays ``false`` for however many
+refreshes that gateway needs to relink its ROS graph, and then turns true.
 
 ``PeerClient::fetch_entities()`` reads a peer over several requests and either
 describes it whole or reports failure: a dead connection, a status a route has

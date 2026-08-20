@@ -465,6 +465,15 @@ What clients see then depends on the peer's health check:
   incomplete refresh is logged at ``WARN``. Availability is untouched - the
   peer can still be reached; this gateway merely failed to read all of it.
 
+A peer that starts answering again is read again on the next refresh, and a
+retained declaration is replayed only for a peer that could not be read - so
+the live answer replaces the retained one rather than being merged beside it.
+``x-medkit.available`` clears on that refresh, and the entities the peer only
+discovered at runtime, dropped while it was silent, are merged again with it.
+``x-medkit.is_online`` is the peer's own account of an App rather than a
+statement about the link, so after a gateway restart it stays ``false`` until
+that gateway has relinked its ROS graph.
+
 Two statuses are read rather than treated as failures:
 
 - ``404`` on a nested collection route means the peer runs a gateway version
