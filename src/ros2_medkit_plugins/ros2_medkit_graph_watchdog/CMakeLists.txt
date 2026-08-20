@@ -928,14 +928,37 @@ if(BUILD_TESTING)
   # test/e2e/test_presence_ownership_e2e.test.py's own module docstring for the three rows.
 
   # 60 (arming, app_id-scoped) + 30 (faults-live) + 30 (empty-label poll) + 30 (departure poll)
-  # + 90 (UNREADABLE raise poll, kUnmeasuredHoldTicks is 60 fixed ticks plus the absence grace)
-  # + 20 (absence window, DISAPPEARED, SUSTAINED_WINDOW_SEC) = 260 internal - six independent
-  # budgets, not merged. Rounded to 360 to also cover the launch's own teardown for TWO
-  # processes (sigterm 30 + sigkill 15 each, not fully serial).
-  medkit_add_launch_test(test_presence_ownership_e2e_unmeasured_not_owned
+  # + 60 (DISAPPEARED raise poll) + 90 (UNREADABLE raise poll, kUnmeasuredHoldTicks is 60 fixed
+  # ticks plus the absence grace) = 300 internal - six independent budgets, not merged. Rounded
+  # to 420 to also cover the launch's own teardown for TWO processes (sigterm 30 + sigkill 15
+  # each, not fully serial).
+  medkit_add_launch_test(test_presence_ownership_e2e_budget_spent_then_owned
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 420
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19540" "WATCHDOG_E2E_SCENARIO=budget_spent_then_owned"
+      "${_WATCHDOG_E2E_ENV}")
+
+  # The same shape in the SHIPPED configuration (no require_active at all), where node_death is
+  # the only detector that can report the death. 60 (arming, app_id-scoped) + 30 (faults-live) +
+  # 30 (empty-label poll) + 30 (departure poll) + 60 (DISAPPEARED raise poll) + 10 (silence
+  # window, UNREADABLE, SILENCE_WINDOW_SEC) = 220 internal. Rounded to 360 to also cover the
+  # launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_presence_ownership_e2e_no_require_active_still_owned
     test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 360
     LABELS "integration;e2e"
-    ENV "GATEWAY_TEST_PORT=19540" "WATCHDOG_E2E_SCENARIO=unmeasured_not_owned"
+    ENV "GATEWAY_TEST_PORT=19570" "WATCHDOG_E2E_SCENARIO=no_require_active_still_owned"
+      "${_WATCHDOG_E2E_ENV}")
+
+  # The reverse transition on a live node: measured "active", then its lifecycle services are
+  # dropped, then it is killed. Uses droppable_lifecycle_node.cpp, the only fixture that can
+  # take a node from measured to unmeasured without killing it. 60 (arming, app_id-scoped) + 30
+  # (faults-live) + 30 (active-label poll) + 30 (SetParameters call) + 30 (null-label poll) + 30
+  # (departure poll) + 60 (DISAPPEARED raise poll) = 270 internal. Rounded to 360 to also cover
+  # the launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_presence_ownership_e2e_measured_then_unmeasured
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 360
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19580" "WATCHDOG_E2E_SCENARIO=measured_then_unmeasured"
       "${_WATCHDOG_E2E_ENV}")
 
   # 60 (arming, app_id-scoped) + 30 (faults-live) + 30 (empty-label poll) + 30 (SetParameters

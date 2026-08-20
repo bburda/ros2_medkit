@@ -56,9 +56,10 @@ struct NodeDeathReport {
 /// Each call to update() is handed two sets over the SAME key space:
 ///   present - every key visible in this tick's graph snapshot (the liveness signal)
 ///   armed   - the subset whose departure the reliability gate says this detector OWNS: it
-///             allows a raise for them AND their lifecycle state is positively known not to
-///             be a managed-non-active one (ReliabilityGate::allows_presence_ownership), so
-///             a managed node nobody has ever measured is deliberately not in this set
+///             allows a raise for them AND their lifecycle state is either known not to be a
+///             managed-non-active one or has been asked for as often as it ever will be
+///             (ReliabilityGate::allows_presence_ownership), so a managed node whose state
+///             is unread but still being asked for is deliberately not in this set
 ///
 /// A key becomes TRACKED (added to `known_`) the first time it is armed, and stays tracked
 /// from then on regardless of its later arm state - so a node that is present but not

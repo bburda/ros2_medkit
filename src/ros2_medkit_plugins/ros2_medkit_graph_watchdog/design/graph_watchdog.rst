@@ -88,9 +88,10 @@ Reliability core
     as permission on purpose, since gating on it would silence every detector
     for a node whose lifecycle service is broken. Only a KNOWN non-active label
     suppresses. ``allows_presence_ownership()`` asks the STRICTER question the
-    presence class needs (state positively known not to be a managed-non-active
-    one) without changing that permissive answer - see the ``node_death``
-    section.
+    presence class needs, without changing that permissive answer: state known
+    not to be a managed-non-active one, OR asked for as often as it ever will be
+    (``measurement_pending()``, which reads the per-node GetState re-seed budget
+    charged only for reads that actually ran) - see the ``node_death`` section.
 
     Those subscriptions follow the private-callback-group rule described in the
     plugin shell bullet above: created on the shared gateway node, but in the
@@ -1095,17 +1096,18 @@ let a SUSTAINED absence mature an unconfirmed (below-``grace``) streak into a co
 enough to cross ``grace`` while present, would ever be reported at all. Where this detector
 can independently report the same departure - which needs the presence detector to have OWNED
 the node at least once, since it only ever tracks an App the reliability gate has admitted for
-ownership, and ownership needs a MANAGED node's lifecycle state positively known to read
-``active`` - that absence-alone maturity is gone:
+ownership, and ownership needs a MANAGED node's lifecycle state known to read ``active`` or
+asked for as often as it ever will be, plus the node being online - that absence-alone maturity
+is gone:
 absence CONTINUES a violation that has already matured past ``grace`` (the fault stays
 raised, still naming the node), but no longer CREATES one that has not. A node that was
 briefly non-active and then died is reported as gone (``GRAPH_NODE_DISAPPEARED``) rather
 than also acquiring an inactive fault born from ticks gathered while nobody could observe
 it. A ``require_active`` node that never reaches ``active`` is never owned, is never tracked
-here, and its departure can never raise ``GRAPH_NODE_DISAPPEARED``; the same holds for a
-managed node whose ``GetState`` has never answered. For those, ``lifecycle_expectation`` keeps
-the older behaviour: absence still matures a below-``grace`` streak, because it is
-structurally the only detector that will ever get to report them. See
+here, and its departure can never raise ``GRAPH_NODE_DISAPPEARED``; the same holds for an app
+that is not online. For those, ``lifecycle_expectation`` keeps the older behaviour: absence
+still matures a below-``grace`` streak, because it is structurally the only detector that will
+ever get to report them. See
 ``lifecycle_expectation``'s own "Absence continues the last CORROBORATED observation, it never
 erases" section above for the mechanism this rests on.
 
@@ -1227,16 +1229,20 @@ plus the suppression chain the detector shares no code with any sibling for:
    ``GRAPH_NODE_INACTIVE`` alone instead - node_death cannot track a node the gate never
    admitted for ownership, so absence has to mature it here - a large ``miss_grace`` delays
    but does not swallow the report, and a restarted gateway's warmup window never produces a
-   spurious PASSED); and ``test/e2e/test_presence_ownership_e2e.test.py`` (three scenarios
-   against the fixture whose ``GetState`` never answers, so the unmeasured state is permanent
-   rather than the race the boundary file's B6 row has to live with: a managed node nobody
-   ever measured, killed, is reported by ``GRAPH_NODE_UNREADABLE`` and never by
-   ``GRAPH_NODE_DISAPPEARED``; the SAME node told to start answering, measured ``active``,
-   then killed, IS reported by ``GRAPH_NODE_DISAPPEARED``, so the refusal follows current
-   knowledge rather than excluding managed nodes wholesale; and with such a node in the graph
-   ``GRAPH_PARAM_DRIFT`` still names it - the one leg of the three that passes through the
-   app-keyed gate at all - while the topic-keyed ``GRAPH_QOS_MISMATCH`` and ``GRAPH_ORPHAN``
-   still report too).
+   spurious PASSED); and ``test/e2e/test_presence_ownership_e2e.test.py`` (five scenarios
+   against the fixture whose ``GetState`` never answers, so the unread state is permanent
+   rather than the race the boundary file's B6 row has to live with: a managed node the
+   watcher asked and could not read, killed, raises BOTH ``GRAPH_NODE_DISAPPEARED`` and
+   ``GRAPH_NODE_UNREADABLE``; the same death with no ``require_active`` entry anywhere - the
+   shipped default, where nothing else is watching at all - still raises
+   ``GRAPH_NODE_DISAPPEARED``, and that pair also rules out an implementation deciding
+   ownership from ``require_active`` membership; the SAME node told to start answering,
+   measured ``active``, then killed, IS reported too, under the identical configuration as
+   the first row so the only variable is the lifecycle state; a node measured ``active`` that
+   then LOSES its lifecycle services and is killed is still reported; and with an unmeasured
+   managed node in the graph ``GRAPH_PARAM_DRIFT`` still names it - the one leg of the three
+   that passes through the app-keyed gate at all - while the topic-keyed
+   ``GRAPH_QOS_MISMATCH`` and ``GRAPH_ORPHAN`` still report too).
 
 
 Status

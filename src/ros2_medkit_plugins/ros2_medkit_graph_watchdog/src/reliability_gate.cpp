@@ -79,14 +79,25 @@ bool ReliabilityGate::allows_presence_ownership(const std::string & source_id) c
   }
   // Read without gate_mutex_, for the same reason allows_raise() takes none: lifecycle_ is
   // separately self-synchronized, and both run on the tick thread, sequentially after update().
-  //
-  // nullopt is no managed record at all - a plain node, whose departure the presence detector
-  // owns outright. An EMPTY label is a managed node that was asked and never answered, which is
-  // ignorance rather than a state: node_ok() deliberately reads it as permission (see its own
-  // comment on why every detector would otherwise be silenced for such a node), and permission
-  // is not knowledge. Only "active" says the presence detector can rely on what it sees.
+  // Two reads rather than one combined lock: the only transition either can observe mid-call is
+  // an empty label becoming a real one, and both orderings of that give the same answer here.
   const auto label = lifecycle_.state_of(source_id);
-  return !label.has_value() || *label == "active";
+  if (!label.has_value()) {
+    return true;  // no managed record: a plain node, and its death is nobody else's to report
+  }
+  if (label->empty()) {
+    // Ignorance, and it is BOUNDED. While the watcher still has GetState attempts to spend, a
+    // measurement may be one tick away and taking ownership now would race it - that race is
+    // how a node that turns out to be merely inactive ends up latched here for good. Once the
+    // budget is spent nothing will ever measure this node again, and the only other detector
+    // that could report its departure looks at nothing unless an operator named it in
+    // `require_active`, which defaults to empty. Refusing past that point is not a handover,
+    // it is a node whose death nobody reports.
+    return !lifecycle_.measurement_pending(source_id);
+  }
+  // A measured non-active node is the lifecycle detector's business, and allows_raise() has
+  // already refused it anyway.
+  return *label == "active";
 }
 
 nlohmann::json ReliabilityGate::status_json() const {
@@ -127,8 +138,14 @@ void ReliabilityGate::reset() {
   lifecycle_.reset();
 }
 
-void ReliabilityGate::set_lifecycle_state_for_test(const std::string & app_id, const std::string & label) {
-  lifecycle_.set_state_for_test(app_id, label);
+void ReliabilityGate::set_lifecycle_state_for_test(const std::string & app_id, const std::string & label,
+                                                   int reseeds_remaining) {
+  lifecycle_.set_state_for_test(app_id, label, reseeds_remaining);
+}
+
+int ReliabilityGate::lifecycle_reseeds_remaining_for_test(const std::string & app_id) const {
+  std::lock_guard<std::mutex> lock(gate_mutex_);
+  return lifecycle_.reseeds_remaining_for_test(app_id);
 }
 
 void ReliabilityGate::set_departed_lifecycle_state_for_test(const std::string & fqn, const std::string & label,

@@ -137,15 +137,16 @@ struct LifecycleMatch {
   std::string entry;  ///< the require_active entry that matched
   std::string fqn;    ///< the node's stable App::effective_fqn()
   std::optional<std::string> state;
-  /// Whether the presence detector will OWN this node's departure - the same predicate
-  /// node_death's tracking decision uses before it will ever track a key
-  /// (NodeLivenessTracker: "a key becomes TRACKED the first time it is armed, and stays
-  /// tracked from then on"). That predicate is narrower than "may raise": it needs the
-  /// node's lifecycle state positively KNOWN not to be a managed-non-active one, so a
-  /// managed node whose state has never been measured answers false here even though the
-  /// gate would permit it to raise. Read off the gate by the caller, not re-derived here:
-  /// it composes warmup with the lifecycle watcher's record, neither of which this header
-  /// has access to or may reimplement. Defaults true - the narrower of the two behaviours
+  /// Whether the presence detector will OWN this node's departure. Narrower than "may
+  /// raise": it needs the node's lifecycle state either known not to be a managed-non-active
+  /// one or asked for as often as it ever will be, so a managed node whose state has not
+  /// been read YET answers false here even though the gate would permit it to raise - and
+  /// answers true again once the watcher has stopped asking, since nothing else would report
+  /// that node at all. It also carries the caller's own online check, because node_death
+  /// skips an app that is not online before it consults the gate. Read off the gate and the
+  /// snapshot by the caller, not re-derived here: it composes warmup, the lifecycle watcher's
+  /// record and its re-seed budget, none of which this header has access to or may
+  /// reimplement. Defaults true - the narrower of the two behaviours
   /// NodeState::ever_armed then selects between - so a caller that does not wire this
   /// through keeps the already-shipped absence handling rather than silently gaining a new
   /// reporting path.
@@ -341,9 +342,10 @@ struct LifecycleExpectationReport {
 ///   ownership at least once, so one that never reached that bar is structurally invisible
 ///   to the presence detector no matter what happens to it afterwards. Two shapes reach
 ///   that bar and fail it: a `require_active` entry that comes up `unconfigured` and is
-///   killed before its own `grace` elapses, and a managed node whose lifecycle state was
-///   never measured at all, which the gate would permit to raise but whose departure no
-///   detector can reliably attribute. Holding
+///   killed before its own `grace` elapses, and a node that is not online, which node_death
+///   skips before it ever asks the gate. A managed node whose state is merely UNREAD is not
+///   one of them for long: the gate withholds ownership only while it is still asking, and
+///   hands the node back once it has stopped. Holding
 ///   this streak too would mean nothing in the plugin ever reports the departure. This
 ///   keeps the same bound a still-climbing UNMEASURED clock already has regardless of
 ///   arming (see "Bounded by evidence, not by age" below): the streak matures within

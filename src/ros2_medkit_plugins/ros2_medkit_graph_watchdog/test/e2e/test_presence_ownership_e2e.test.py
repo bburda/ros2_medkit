@@ -29,21 +29,38 @@ and shut on an idle one. This file makes that window permanent by using the fixt
 GetState never answers at all, and adds the discriminating other half: the same fixture, told to
 start answering, must end up owned by the presence detector after all.
 
-Runs as THREE separate CTest targets (see CMakeLists.txt). WATCHDOG_E2E_SCENARIO selects which
+Ignorance is BOUNDED, and that bound is what these scenarios are about. Presence ownership is
+withheld only while the ignorance can still resolve: LifecycleWatcher charges its GetState
+re-seed budget per node and only for a read that actually ran, so an empty label with attempts
+left is "we have not finished asking" and an empty label with the budget spent is "we asked and
+failed". Refusing ownership past that point is not a handover, it is a silence - nothing else
+will ever measure the node, and `lifecycle_expectation` returns early unless an operator named
+it in `require_active`, which defaults to empty.
+
+Runs as FIVE separate CTest targets (see CMakeLists.txt). WATCHDOG_E2E_SCENARIO selects which
 launch and which assertions run:
 
-- "unmeasured_not_owned": the fixture is never told to answer, so its lifecycle label stays ""
-  for its whole life, and it is killed. GRAPH_NODE_UNREADABLE raises and names it (the positive
-  control: the detector stack is alive, the node was matched, and its departure was processed),
-  and GRAPH_NODE_DISAPPEARED must never appear - node_death cannot own a node whose state it has
-  never once measured. The absence window opens AFTER the positive control has already come
-  back, so an implementation that does own it has had many times the configured miss grace to
-  raise, and node_death's own fault does not heal on its own while the node stays gone.
-- "answered_then_owned": the same fixture, unmeasured across the whole warmup (proven from the
-  status route, not assumed), is then told to answer via its `start_answering` parameter. Once
-  the label reads "active" the node is killed, and GRAPH_NODE_DISAPPEARED MUST raise naming it.
-  This is what stops the fix being "never own a managed node": ownership follows the current
-  knowledge, and a node that becomes measurable becomes owned.
+- "budget_spent_then_owned": the fixture is never told to answer, so its label stays "" for its
+  whole life; it is killed once the watcher has spent every GetState attempt it will ever make.
+  GRAPH_NODE_DISAPPEARED must raise and name it, and GRAPH_NODE_UNREADABLE must raise too - both
+  are true at once, and neither excuses the other. `require_active` names the node here.
+- "no_require_active_still_owned": the same fixture and the same kill, with NO `require_active`
+  entry anywhere in the configuration - the SHIPPED default. Nothing but node_death can report
+  this death, so GRAPH_NODE_DISAPPEARED must raise and name it. Paired with the row above, it
+  also rules out an implementation that decides ownership from `require_active` membership
+  rather than from lifecycle knowledge: the two rows differ in exactly that configuration and
+  expect the same answer.
+- "answered_then_owned": the same fixture under the SAME configuration as
+  "budget_spent_then_owned" (`require_active` names it), unmeasured across the whole warmup
+  (proven from the status route, not assumed), then told to answer via its `start_answering`
+  parameter. Once the label reads "active" the node is killed, and GRAPH_NODE_DISAPPEARED must
+  raise naming it. The only variable against its sibling is what the node's lifecycle state
+  turned out to be.
+- "measured_then_unmeasured": the reverse transition, on a live node, followed by its departure.
+  `droppable_lifecycle_node` answers "active" (measured, and owned), then stops advertising its
+  lifecycle services on command - the watcher drops the record and the status route reports
+  `lifecycle: null` - and only then is it killed. GRAPH_NODE_DISAPPEARED must still raise: a
+  node whose measurement goes away does not stop being the presence detector's.
 - "gate_unaffected": nothing is killed. With the same unmeasured managed node in the graph, the
   three other detectors must still report. GRAPH_PARAM_DRIFT is the discriminating leg - it is
   the only one of the three whose raise passes through the app-keyed gate at all
@@ -57,7 +74,7 @@ launch and which assertions run:
 
 ### Which arming gate
 
-Every scenario here gates on `app_id=unreadable_lifecycle`, the node it perturbs. That works
+Every scenario here gates on the `app_id` of the node it perturbs. That works
 precisely because of the behaviour under test: LifecycleWatcher::node_ok() treats an unread
 label as ok, so the gate does reach the per-entity "armed" state for this fixture even while
 nothing has ever been measured. A scenario whose target never becomes per-entity armed (a node
@@ -160,11 +177,10 @@ RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # sizes for the identical hold at a comparable cadence.
 UNREADABLE_RAISE_TIMEOUT_SEC = 90.0 * TIME_SCALE
 
-# How long GRAPH_NODE_DISAPPEARED is watched for after the departure has already been reported by
-# another detector. Many times MISS_GRACE's own 3400 ms nominal window, and node_death's fault
-# does not heal while the node stays gone, so a raise that happened at any point after the kill
-# is still standing when this window opens.
-SUSTAINED_WINDOW_SEC = 20.0
+# How long a code that must NOT appear is watched for, once the code that must appear already
+# has. Not a give-up bound and deliberately not scaled: it is a window in which every poll has
+# to answer 200 and carry no such fault.
+SILENCE_WINDOW_SEC = 10.0
 
 # The QoS leg's mismatched pair. The fixture publishes ~/transition_event with no deadline (the
 # most permissive offer); a subscriber that REQUESTS a finite deadline is RxO-incompatible with
@@ -173,12 +189,37 @@ SUSTAINED_WINDOW_SEC = 20.0
 QOS_TOPIC = f'/{UNREADABLE_NODE}/transition_event'
 QOS_SUB_DEADLINE_SEC = 0.1
 
+# The "measured_then_unmeasured" fixture: a plain rclcpp::Node that looks managed, answers
+# get_state with a chosen label, and destroys both lifecycle services when `drop_services` is
+# set - see test/e2e/droppable_lifecycle_node.cpp. It is the only fixture in this package that
+# can take a node from MEASURED to UNMEASURED without killing it.
+DROPPABLE_NODE = 'presence_ownership_droppable'
+DROP_PARAM = 'drop_services'
+
 # The orphan leg's near-miss pair: one publisher-only topic and one subscriber-only topic, same
 # type, same namespace, leaf edit distance 1. Both endpoints belong to this test process; the
 # detector keys its finding on the TOPIC, so there is no way to make either of them the
 # fixture's own (its only non-system topic already carries endpoints on both sides).
 ORPHAN_TYPO_TOPIC = f'/{UNREADABLE_NODE}/scam'
 ORPHAN_TARGET_TOPIC = f'/{UNREADABLE_NODE}/scan'
+
+
+def _droppable_node_action():
+    """Build the droppable fixture as a launch action with a PID handle the test can signal.
+
+    Answers "active" from the start, so the node is MEASURED - and therefore owned by the
+    presence detector - before anything is done to it.
+    """
+    return launch_ros.actions.Node(
+        package='ros2_medkit_graph_watchdog',
+        executable='droppable_lifecycle_node',
+        name=DROPPABLE_NODE,
+        output='screen',
+        parameters=[{'state_label': 'active'}],
+        additional_env=get_coverage_env('ros2_medkit_graph_watchdog'),
+        sigterm_timeout='30',
+        sigkill_timeout='15',
+    )
 
 
 def _unreadable_node_action():
@@ -208,13 +249,18 @@ def generate_test_description():
         f'{_NODE_DEATH_PREFIX}.miss_grace': MISS_GRACE,
     }
 
-    if SCENARIO == 'unmeasured_not_owned':
-        # require_active is what makes lifecycle_expectation look at this node at all, and its
-        # GRAPH_NODE_UNREADABLE is this scenario's positive control.
+    if SCENARIO in ('budget_spent_then_owned', 'answered_then_owned'):
+        # The SAME configuration for both, deliberately: require_active names the fixture in
+        # each, so the only thing that differs between the two rows is what the node's
+        # lifecycle state turned out to be. It also makes GRAPH_NODE_UNREADABLE available as
+        # this row's corroboration that lifecycle_expectation is watching the same node.
         detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [UNREADABLE_NODE]
-    elif SCENARIO == 'answered_then_owned':
-        # No require_active: node_death is zero-config and this row is entirely about it, so
-        # leaving lifecycle_expectation with nothing to watch keeps the fault surface clean.
+    elif SCENARIO == 'no_require_active_still_owned':
+        # Deliberately nothing: require_active defaults to empty, which is the shipped
+        # configuration, and in it lifecycle_expectation returns before it looks at anything.
+        pass
+    elif SCENARIO == 'measured_then_unmeasured':
+        # node_death is zero-config, and this row is entirely about it.
         pass
     elif SCENARIO == 'gate_unaffected':
         # `baseline: false` plus one absolute `expect` pin: the pin fires on a STATIC graph, with
@@ -233,7 +279,8 @@ def generate_test_description():
         port=PORT,
     )
 
-    target = _unreadable_node_action()
+    target = (_droppable_node_action() if SCENARIO == 'measured_then_unmeasured'
+              else _unreadable_node_action())
     launch_description.add_action(TimerAction(period=2.0, actions=[target]))
     context['target_node'] = target
     return launch_description, context
@@ -326,19 +373,22 @@ def _set_bool_parameter(client_node, service_name, param_name, value, timeout=30
     return bool(result.results[0].successful)
 
 
-class TestUnmeasuredNodeIsNotOwnedByPresence(unittest.TestCase):
-    """A managed node whose state was never measured departs: UNREADABLE, never DISAPPEARED.
+class TestBudgetSpentThenOwned(unittest.TestCase):
+    """A managed node the watcher asked and could not read is the presence detector's.
 
-    node_death may only report a node it can reliably observe, and it decides that from the
-    reliability gate. The gate's per-entity answer is deliberately permissive about a lifecycle
-    label that has never been read - every other detector depends on that, or a node whose
-    GetState never answers would have every fault suppressed forever - so tracking cannot be
-    admitted on that answer alone. Reading it as ownership took the departure away from the one
-    detector that could still report it and gave it to one that structurally cannot.
+    The gate's raise permission is deliberately permissive for an unread label - every other
+    detector depends on that, or a node whose lifecycle service is broken would have every
+    fault suppressed - so ownership cannot be admitted on that answer alone. But refusing it
+    forever is not a handover either: once LifecycleWatcher has spent the GetState attempts it
+    charges per node, nothing will ever measure this node again, and the only detector that
+    could report its departure instead is `lifecycle_expectation`, which looks at nothing
+    unless an operator named it in `require_active`.
 
-    Both halves are checked: GRAPH_NODE_UNREADABLE must raise and name the node (the departure
-    was seen, by a live stack, for the node this row is about), and GRAPH_NODE_DISAPPEARED must
-    stay absent for a window many times the configured miss grace.
+    So the answer is bounded: withheld while the ignorance can still resolve, taken once it
+    cannot. Here `require_active` DOES name the node, so both codes are available and both must
+    appear - GRAPH_NODE_DISAPPEARED because the node died and nobody else can say so, and
+    GRAPH_NODE_UNREADABLE because its lifecycle promise was never verified. Neither excuses the
+    other.
     """
 
     @classmethod
@@ -349,7 +399,7 @@ class TestUnmeasuredNodeIsNotOwnedByPresence(unittest.TestCase):
     def tearDownClass(cls):
         rclpy.shutdown()
 
-    def test_unmeasured_departure_is_lifecycles_and_never_presences(self, target_node):
+    def test_settled_ignorance_is_reported_by_presence_and_by_lifecycle(self, target_node):
         self.assertTrue(
             wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=UNREADABLE_NODE),
             f'graph_watchdog never reported {UNREADABLE_NODE} armed - the permissive gate answer '
@@ -369,37 +419,106 @@ class TestUnmeasuredNodeIsNotOwnedByPresence(unittest.TestCase):
             f'{UNREADABLE_NODE} is unmeasured but NOT armed, so node_death would decline it for '
             'the warmup reason instead of the ownership reason this row is about')
 
+        # The budget is spent within a handful of ticks of discovery (kReseedAttempts issued
+        # reads, each cut off by the reader's own timeout), and everything above has already
+        # cost far more than that. Killing here therefore lands in the SETTLED half of the
+        # bound, which is what this row is about.
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
             _poll_apps_absent(PORT, UNREADABLE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{UNREADABLE_NODE} never left GET /apps after SIGTERM')
 
-        # Positive control, and it runs FIRST on purpose: an absence proves nothing about a
-        # stack that stopped reporting, and this shows the detectors processed THIS departure.
-        # Whichever way the timing falls, the window below still catches a wrong owner: it is
-        # 20 s of continuous polling against a 3.4 s nominal miss grace, so a raise either
-        # happens inside it or is already standing when it opens - node_death's fault does not
-        # heal while the node stays gone.
+        fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(
+                f'{FAULT_CODE_DISAPPEARED} never raised for {UNREADABLE_NODE} - the watcher had '
+                'already asked for its state as often as it ever will, so withholding ownership '
+                'here leaves the death to a detector that only ever looks at require_active '
+                'entries')
+        self.assertIn(UNREADABLE_NODE, fault.get('description', ''))
+
+        # The other code, and it is not an alternative to the one above: the node also never
+        # kept the lifecycle promise an operator wrote down for it.
         found, description = poll_fault_describing(
             PORT, FAULT_CODE_UNREADABLE, [UNREADABLE_NODE],
             timeout=UNREADABLE_RAISE_TIMEOUT_SEC)
         self.assertTrue(
             found,
-            f'{FAULT_CODE_UNREADABLE} never raised naming {UNREADABLE_NODE} - the lifecycle '
-            f'promise this node never kept went unreported (last description: {description!r})')
+            f'{FAULT_CODE_UNREADABLE} never raised naming {UNREADABLE_NODE} - the presence code '
+            'raising must not have cost the lifecycle code its own report '
+            f'(last description: {description!r})')
 
+
+class TestNoRequireActiveStillOwned(unittest.TestCase):
+    """The same death in the SHIPPED configuration, where nothing else is watching at all.
+
+    `require_active` defaults to empty and `lifecycle_expectation` returns before it looks at
+    anything, so in this launch node_death is the only detector that can report this node's
+    departure. A predicate that refuses a managed node whose state it could never read produces
+    a deterministic silence here - strictly worse than the racy one the bound exists to close,
+    because no configuration and no timing makes it come back.
+
+    Its pairing with the sibling row is what rules out an implementation deciding ownership
+    from `require_active` membership: the two rows differ in exactly that key and expect the
+    same answer.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rclpy.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        rclpy.shutdown()
+
+    def test_a_node_nobody_watches_is_still_reported_when_it_dies(self, target_node):
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=UNREADABLE_NODE),
+            f'graph_watchdog never reported {UNREADABLE_NODE} armed')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        entity = _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC)
+        self.assertIsNotNone(
+            entity,
+            f'{UNREADABLE_NODE} never appeared with an EMPTY lifecycle label, so this row is not '
+            'about an unmeasured managed node at all')
+        self.assertTrue(entity.get('armed'))
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, UNREADABLE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{UNREADABLE_NODE} never left GET /apps after SIGTERM')
+
+        fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(
+                f'{FAULT_CODE_DISAPPEARED} never raised for {UNREADABLE_NODE} - with no '
+                'require_active entry anywhere, this death was reported by nobody at all')
+        self.assertIn(UNREADABLE_NODE, fault.get('description', ''))
+
+        # And nothing else picked it up, which is the point of the row: in this configuration
+        # the lifecycle codes are structurally unreachable, so the presence code standing alone
+        # is the whole of the operator's warning.
         assert_fault_absent_throughout(
-            self, PORT, FAULT_CODE_DISAPPEARED, SUSTAINED_WINDOW_SEC)
+            self, PORT, FAULT_CODE_UNREADABLE, SILENCE_WINDOW_SEC)
 
 
 class TestMeasuredNodeIsOwnedByPresence(unittest.TestCase):
     """The same fixture, told to answer: once its state IS known, node_death owns its departure.
 
-    The discriminating half. Refusing ownership for every managed node would satisfy the sibling
-    scenario just as well, and would silently disable GRAPH_NODE_DISAPPEARED for every real
-    lifecycle node on the graph. Ownership follows the CURRENT knowledge: the fixture is
-    unmeasured across the whole warmup (proven from the status route before anything else
-    happens), then answers, then dies, and the presence code must report it.
+    Runs under the SAME configuration as "budget_spent_then_owned" - `require_active` names the
+    fixture in both - so the only variable between the two rows is what the node's lifecycle
+    state turned out to be. Refusing ownership for every managed node, or granting it to
+    everything, is ruled out by the pair rather than by either row alone: this one is measured
+    "active" and must be reported by the presence code, its sibling is never measured at all and
+    must be too, and B6 in test_node_death_boundary_e2e.test.py is measured NOT-active and must
+    not be.
+
+    The node is unmeasured across the whole warmup first (proven from the status route before
+    anything else happens), then answers, then dies, so what this row exercises is a CHANGE in
+    knowledge rather than a node that started out measurable.
     """
 
     @classmethod
@@ -454,6 +573,72 @@ class TestMeasuredNodeIsOwnedByPresence(unittest.TestCase):
                 "lifecycle state WAS measured active before it died is the presence detector's "
                 'to report, and refusing every managed node would look exactly like this')
         self.assertIn(UNREADABLE_NODE, fault.get('description', ''))
+
+
+class TestMeasuredThenUnmeasured(unittest.TestCase):
+    """A node whose MEASUREMENT goes away, on a live node, and then it dies.
+
+    The reverse of the sibling rows, and the direction an injected label cannot reach: this
+    fixture is measured "active" first - so the presence detector owns it outright - and then
+    stops advertising its lifecycle services, which makes the watcher drop the record
+    altogether. The status route reports `lifecycle: null` afterwards, the same value a node
+    that never had a lifecycle reports, and that is the state the node is in when it is killed.
+
+    GRAPH_NODE_DISAPPEARED must still raise. Ownership is latched from the fact the gate gave
+    while the node was measurable, and a node with no managed record is owned outright anyway,
+    so both routes to the answer agree here. What the row rules out is an implementation that
+    re-derives ownership from whatever the watcher happens to say at the moment of death and
+    finds nothing to go on.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rclpy.init()
+        cls._client_node = Node('presence_ownership_drop_client')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._client_node.destroy_node()
+        rclpy.shutdown()
+
+    def test_a_node_that_stops_being_measurable_is_still_owned(self, target_node):
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=DROPPABLE_NODE),
+            f'graph_watchdog never reported {DROPPABLE_NODE} armed')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        self.assertIsNotNone(
+            _poll_watchdog_entity(PORT, DROPPABLE_NODE, 'active', timeout=LABEL_TIMEOUT_SEC),
+            f'{DROPPABLE_NODE} never reported an "active" lifecycle label, so the measurement '
+            'this row is about losing was never made in the first place')
+
+        self.assertTrue(
+            _set_bool_parameter(
+                type(self)._client_node, f'/{DROPPABLE_NODE}/set_parameters',
+                DROP_PARAM, True, timeout=PARAM_SET_TIMEOUT_SEC),
+            f'setting {DROP_PARAM}:=true on /{DROPPABLE_NODE}/set_parameters never succeeded - '
+            'the node never stopped looking like a managed lifecycle node')
+
+        self.assertIsNotNone(
+            _poll_watchdog_entity(PORT, DROPPABLE_NODE, None, timeout=LABEL_TIMEOUT_SEC),
+            f'{DROPPABLE_NODE} still carries a lifecycle label after its services were dropped - '
+            'the watcher never let go of the record, so the transition this row needs did not '
+            'happen')
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, DROPPABLE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{DROPPABLE_NODE} never left GET /apps after SIGTERM')
+
+        fault = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(
+                f'{FAULT_CODE_DISAPPEARED} never raised for {DROPPABLE_NODE} - a node that was '
+                'measured active and then lost its lifecycle interface is still the presence '
+                "detector's to report")
+        self.assertIn(DROPPABLE_NODE, fault.get('description', ''))
 
 
 class TestGateStaysPermissiveForTheOtherDetectors(unittest.TestCase):
@@ -547,8 +732,10 @@ class TestGateStaysPermissiveForTheOtherDetectors(unittest.TestCase):
 # one case, and a missing result is a real failure rather than an expected line of output - see
 # the sibling e2e files' identical rationale.
 _SCENARIO_CASES = {
-    'unmeasured_not_owned': 'TestUnmeasuredNodeIsNotOwnedByPresence',
+    'budget_spent_then_owned': 'TestBudgetSpentThenOwned',
+    'no_require_active_still_owned': 'TestNoRequireActiveStillOwned',
     'answered_then_owned': 'TestMeasuredNodeIsOwnedByPresence',
+    'measured_then_unmeasured': 'TestMeasuredThenUnmeasured',
     'gate_unaffected': 'TestGateStaysPermissiveForTheOtherDetectors',
 }
 if SCENARIO not in _SCENARIO_CASES:

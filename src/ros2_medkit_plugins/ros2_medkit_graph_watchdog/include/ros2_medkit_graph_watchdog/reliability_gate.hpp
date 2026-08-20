@@ -55,19 +55,24 @@ class ReliabilityGate {
   /// and lifecycle-ok; unknown entities fall back to the global warmup window.
   bool allows_raise(const std::string & source_id) const;
 
-  /// True if the PRESENCE detector (node_death) will own this source's departure: it is
-  /// allowed to raise AND its lifecycle state is positively known not to be a
-  /// managed-non-active one - either there is no managed record for it at all, or the
-  /// record reads "active".
+  /// True if the PRESENCE detector (node_death) will own this source's departure. It is
+  /// allowed to raise AND one of these holds:
   ///
-  /// Strictly narrower than allows_raise(), and deliberately so. allows_raise() answers
-  /// "may this entity raise", and for a managed node whose label has never been read it
-  /// answers yes, because gating every detector on an unread label would silence a node
-  /// whose GetState never answers (see LifecycleWatcher::node_ok()). Ownership is a
-  /// different question and needs KNOWLEDGE rather than permission: an empty label is
-  /// ignorance, not a state, so it answers no here. Callers that latch this answer keep a
-  /// node armed while active and later deactivated - the latch, not this predicate, is
-  /// what carries that.
+  ///   - there is no managed record for it at all (a plain node)
+  ///   - the record reads "active"
+  ///   - the record carries no label and the watcher has spent every GetState attempt it
+  ///     will ever make on it (LifecycleWatcher::measurement_pending)
+  ///
+  /// Narrower than allows_raise(), and deliberately so. allows_raise() answers "may this
+  /// entity raise", and for a managed node whose label has never been read it answers yes,
+  /// because gating every detector on an unread label would silence a node whose GetState
+  /// never answers (see LifecycleWatcher::node_ok()). Ownership needs KNOWLEDGE rather than
+  /// permission, so an unread label answers no here - but only while that ignorance can
+  /// still resolve. Withholding it forever is not a handover: `lifecycle_expectation` is
+  /// the only other detector that could report such a node's departure, and it looks at
+  /// nothing unless an operator named the node in `require_active`, which defaults to
+  /// empty. Callers that latch this answer keep a node armed while active and later
+  /// deactivated - the latch, not this predicate, is what carries that.
   bool allows_presence_ownership(const std::string & source_id) const;
 
   /// Raw lifecycle state label for `app_id` (delegates to the internal
@@ -94,8 +99,17 @@ class ReliabilityGate {
 
   /// Test seam: inject a lifecycle state label for `app_id` so a test can drive the
   /// composed warmup + lifecycle path (an armed entity whose lifecycle is non-active)
-  /// through allows_raise()/status_json() without a live managed node.
-  void set_lifecycle_state_for_test(const std::string & app_id, const std::string & label);
+  /// through allows_raise()/status_json() without a live managed node. `reseeds_remaining`
+  /// stages the OTHER half of an unmeasured node's state (see
+  /// LifecycleWatcher::measurement_pending): the default is what a freshly discovered node
+  /// carries, and 0 is the settled form.
+  void set_lifecycle_state_for_test(const std::string & app_id, const std::string & label,
+                                    int reseeds_remaining = LifecycleWatcher::kReseedAttempts);
+
+  /// Test seam: GetState re-seed budget the internal LifecycleWatcher has left for
+  /// `app_id`, or -1 if it is not tracked. Lets a test tie the ownership answer to the
+  /// budget actually running out rather than to a tick count that happens to correlate.
+  int lifecycle_reseeds_remaining_for_test(const std::string & app_id) const;
 
   /// Test-only seam: inject a departed-lifecycle entry directly (delegates to the
   /// internal LifecycleWatcher) so a suppressor unit test can drive

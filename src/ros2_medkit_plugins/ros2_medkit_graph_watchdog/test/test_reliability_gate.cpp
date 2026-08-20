@@ -28,6 +28,7 @@
 using ros2_medkit_gateway::App;
 using ros2_medkit_gateway::IntrospectionInput;
 using ros2_medkit_gateway::ServiceInfo;
+using ros2_medkit_graph_watchdog::LifecycleWatcher;
 using ros2_medkit_graph_watchdog::presence_ownership_allows;
 using ros2_medkit_graph_watchdog::reliability_allows;
 using ros2_medkit_graph_watchdog::ReliabilityGate;
@@ -73,6 +74,17 @@ class ReliabilityGateTest : public ::testing::Test {
 
     IntrospectionInput in;
     in.apps.push_back(app);
+    return in;
+  }
+  /// One snapshot carrying a PLAIN app and a managed-looking one, so a single status_json()
+  /// payload has to distinguish them. Built as one snapshot rather than two updates because
+  /// the claim is about telling the two apart in the SAME payload.
+  static IntrospectionInput mixed_snap(const std::string & plain_id, const std::string & managed_id) {
+    auto in = managed_snap(managed_id);
+    App plain;
+    plain.id = plain_id;
+    plain.bound_fqn = plain_id;
+    in.apps.push_back(plain);
     return in;
   }
   /// The (armed, lifecycle) pair status_json() reports for `id`, or nullopt when the entity
@@ -178,6 +190,9 @@ TEST_F(ReliabilityGateTest, UnmeasuredManagedNodeIsArmedButNotOwnedByPresence) {
   ReliabilityGate g(3, node_.get(), &mtx_);
   g.update(managed_snap("/unmeasured"), 5);
   g.update(managed_snap("/unmeasured"), 8);  // 3 elapsed -> armed
+  // Freshly discovered and unanswered: an empty label with the watcher's attempts still to
+  // spend. The settled form of the same label is a different answer - see the sweep below.
+  g.set_lifecycle_state_for_test("/unmeasured", "", LifecycleWatcher::kReseedAttempts);
 
   ASSERT_TRUE(g.allows_raise("/unmeasured"))
       << "the gate's permissive answer for an unread label is deliberate and must not change: "
@@ -198,8 +213,15 @@ TEST_F(ReliabilityGateTest, UnmeasuredManagedNodeIsArmedButNotOwnedByPresence) {
 
 // Every state the watcher can report about an app, each one its own case. A state the
 // predicate treats specially and no test sets is a gap, so the sweep is exhaustive by
-// construction: no managed record at all, an empty label, and the four primary labels a
-// lifecycle node can sit in.
+// construction: no managed record at all, an empty label in BOTH of its forms, and the four
+// primary labels a lifecycle node can sit in.
+//
+// The empty label is two cases, not one, and that is the whole of the bound: while the
+// watcher still has GetState attempts to spend the ignorance can still resolve, and taking
+// ownership then would race a measurement that may be one tick away. Once the budget is
+// spent nothing will ever measure the node again, and refusing ownership there hands the
+// departure to a detector that only looks at nodes an operator named in `require_active` -
+// so a node nobody named is reported by nobody at all.
 TEST_F(ReliabilityGateTest, PresenceOwnershipSweepsEveryLifecycleStateTheWatcherCanReport) {
   ReliabilityGate g(3, node_.get(), &mtx_);
   g.update(snap({"/plain", "/m"}), 5);
@@ -211,22 +233,81 @@ TEST_F(ReliabilityGateTest, PresenceOwnershipSweepsEveryLifecycleStateTheWatcher
 
   struct Case {
     const char * label;
+    int reseeds_remaining;
     bool owned;
   };
-  // "active" is the ONE label that says the presence detector may own this node. Every other
-  // label is a managed-non-active state the gate itself already refuses; the empty label is
-  // the case the gate does NOT refuse, which is why it has to be refused here.
-  const Case cases[] = {
-      {"", false}, {"active", true}, {"inactive", false}, {"unconfigured", false}, {"finalized", false}};
+  const Case cases[] = {{"", LifecycleWatcher::kReseedAttempts, false},
+                        {"", 0, true},
+                        {"active", 0, true},
+                        {"inactive", LifecycleWatcher::kReseedAttempts, false},
+                        {"unconfigured", LifecycleWatcher::kReseedAttempts, false},
+                        {"finalized", LifecycleWatcher::kReseedAttempts, false}};
   for (const auto & c : cases) {
-    g.set_lifecycle_state_for_test("/m", c.label);
-    EXPECT_EQ(g.allows_presence_ownership("/m"), c.owned) << "lifecycle label '" << c.label << "'";
+    g.set_lifecycle_state_for_test("/m", c.label, c.reseeds_remaining);
+    EXPECT_EQ(g.allows_presence_ownership("/m"), c.owned)
+        << "lifecycle label '" << c.label << "' with " << c.reseeds_remaining << " re-seed attempt(s) left";
     const auto pair = armed_and_lifecycle(g, "/m");
     ASSERT_TRUE(pair.has_value());
     EXPECT_TRUE(pair->first) << "warmup is elapsed for the whole sweep, so `armed` must not move "
                                 "with the label - only ownership does";
     EXPECT_EQ(pair->second, nlohmann::json(c.label));
   }
+}
+
+// The instrument the whole e2e suite reads has to tell the two apart on the wire, not only
+// through lifecycle_state_of(): a status_json() that serialised "no managed record" and
+// "asked, never answered" identically would satisfy every ownership case above while making
+// every e2e assertion on the pair meaningless. One payload, both entities, opposite values.
+TEST_F(ReliabilityGateTest, StatusJsonSerialisesNoRecordAndAnUnreadLabelDifferently) {
+  ReliabilityGate g(3, node_.get(), &mtx_);
+  g.update(mixed_snap("/plain", "/managed"), 5);
+  g.update(mixed_snap("/plain", "/managed"), 8);
+
+  const auto plain = armed_and_lifecycle(g, "/plain");
+  ASSERT_TRUE(plain.has_value()) << "the gate never reported the plain entity at all";
+  EXPECT_EQ(plain->second, nlohmann::json(nullptr))
+      << "a node with no managed record must serialise as null, not as an empty string";
+
+  const auto managed = armed_and_lifecycle(g, "/managed");
+  ASSERT_TRUE(managed.has_value()) << "the gate never reported the managed entity at all";
+  EXPECT_EQ(managed->second, nlohmann::json(""))
+      << "a tracked node whose GetState never answered must serialise as \"\" - asked, and still "
+         "waiting - which is a different fact from having no lifecycle at all";
+}
+
+// The bound, driven by the REAL watcher over a real graph rather than an injected budget:
+// the same node is refused while the watcher still has attempts to spend and owned once it
+// has spent them. Nothing here sets a label; the only thing that changes across the loop is
+// how many GetState calls have actually been issued and failed.
+TEST_F(ReliabilityGateTest, UnansweredManagedNodeIsOwnedOnlyOnceTheReseedBudgetIsSpent) {
+  ReliabilityGate g(3, node_.get(), &mtx_);
+  g.update(managed_snap("/unanswered"), 5);
+  g.update(managed_snap("/unanswered"), 8);  // 3 elapsed -> armed
+  ASSERT_TRUE(g.allows_raise("/unanswered"));
+  ASSERT_EQ(g.lifecycle_state_of("/unanswered"), std::optional<std::string>(""))
+      << "the fixture must be TRACKED with an unread label, or this test measures nothing";
+
+  // Bounded: kReseedAttempts issued reads, plus a margin for a tick whose blocking budget
+  // cut the job before it ran (that tick is deliberately not charged - see update()).
+  const int kMaxTicks = LifecycleWatcher::kReseedAttempts + 6;
+  bool spent = false;
+  for (int i = 0; i < kMaxTicks && !spent; ++i) {
+    const int left = g.lifecycle_reseeds_remaining_for_test("/unanswered");
+    ASSERT_GE(left, 0) << "the entry stopped being tracked mid-test";
+    if (left > 0) {
+      EXPECT_FALSE(g.allows_presence_ownership("/unanswered"))
+          << "still " << left << " re-seed attempt(s) left, so the ignorance can still resolve";
+    } else {
+      spent = true;
+      break;
+    }
+    g.update(managed_snap("/unanswered"), static_cast<uint64_t>(9 + i));
+  }
+  ASSERT_TRUE(spent) << "the re-seed budget never ran out in " << kMaxTicks
+                     << " ticks, so the settled half of this claim was never reached";
+  EXPECT_TRUE(g.allows_presence_ownership("/unanswered"))
+      << "the watcher has asked and failed every time it ever will; refusing ownership here "
+         "leaves this node's death to a detector that only looks at `require_active` entries";
 }
 
 // Not a node that starts one way and stays there: a label ARRIVES on a node that had none,
@@ -239,14 +320,22 @@ TEST_F(ReliabilityGateTest, PresenceOwnershipFollowsALabelThatArrivesAndVanishes
   g.update(managed_snap("/flip"), 5);
   g.update(managed_snap("/flip"), 8);  // armed, still unmeasured
   ASSERT_TRUE(g.allows_raise("/flip"));
+  g.set_lifecycle_state_for_test("/flip", "", LifecycleWatcher::kReseedAttempts);
   EXPECT_FALSE(g.allows_presence_ownership("/flip"));
 
   g.set_lifecycle_state_for_test("/flip", "active");  // a transition_event finally arrives
   EXPECT_TRUE(g.allows_presence_ownership("/flip"));
 
-  g.set_lifecycle_state_for_test("/flip", "");  // re-bound to a binding that answers nothing
+  // Re-bound to a binding that answers nothing: the entry is re-seeded from scratch, so the
+  // knowledge is gone AND the budget is back - transient ignorance again, not settled.
+  g.set_lifecycle_state_for_test("/flip", "", LifecycleWatcher::kReseedAttempts);
   EXPECT_FALSE(g.allows_presence_ownership("/flip"));
   EXPECT_TRUE(g.allows_raise("/flip")) << "the permissive answer is unchanged by any of this";
+
+  // The same empty label with the budget spent is the opposite answer. The label alone
+  // cannot decide this, which is exactly why the predicate reads both.
+  g.set_lifecycle_state_for_test("/flip", "", 0);
+  EXPECT_TRUE(g.allows_presence_ownership("/flip"));
 
   g.set_lifecycle_state_for_test("/flip", "active");
   EXPECT_TRUE(g.allows_presence_ownership("/flip"));
@@ -277,6 +366,7 @@ TEST_F(ReliabilityGateTest, PresenceOwnershipFreeFunctionMirrorsTheGate) {
   g.update(managed_snap("/mirror"), 5);
   EXPECT_FALSE(presence_ownership_allows(&g, "/mirror"));  // not armed yet
   g.update(managed_snap("/mirror"), 8);                    // armed, still unmeasured
+  g.set_lifecycle_state_for_test("/mirror", "", LifecycleWatcher::kReseedAttempts);
   EXPECT_FALSE(presence_ownership_allows(&g, "/mirror"));
   g.set_lifecycle_state_for_test("/mirror", "active");
   EXPECT_TRUE(presence_ownership_allows(&g, "/mirror"));
