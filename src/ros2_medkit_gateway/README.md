@@ -394,11 +394,22 @@ absent. The peer's last complete declaration stands for another cycle. Two statu
 carry a meaning of their own and are read instead: a `404` on a nested
 collection route means the peer runs a gateway that predates that route, so
 those members are omitted, the rest of the peer merges normally and the absent
-routes are logged once per refresh; a `504 not-responding` on a Component's
-detail is the peer saying it holds that id and whoever contributes it has gone
-quiet, which is what an aggregating peer answers for a declaration it is
-retaining, so the Component is kept as its list named it and marked
-`x-medkit.available: false`.
+routes are logged once per refresh; a `504 not-responding` on any route hanging
+off an entity - its detail, or one of its nested collections - is the peer
+saying it holds that id and whoever contributes it has gone quiet, which is what
+an aggregating peer answers for a declaration it is retaining, so the entity is
+kept as its list named it and marked `x-medkit.available: false`. A nested
+collection answering that way costs only the members that route carries; read as
+a failed request it would discard the whole peer, so one unreachable member
+anywhere behind it would freeze this gateway's view of that peer. A `504`
+without `not-responding` says nothing about an entity and still drops the
+refresh.
+
+`x-medkit.available` is read back off a peer's response with a default of
+`true`, since it is emitted only when false. Beyond one hop that is the only
+thing carrying the fact: an App also has `is_online`, a Component has nothing
+else, so without it the head of a three-gateway chain reports a leaf behind a
+dead gateway as reachable.
 
 When a peer stops answering, the entities it declared in its manifest are
 retained and marked unavailable (`x-medkit.available: false`,

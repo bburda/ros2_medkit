@@ -163,12 +163,6 @@ class AggregationManager {
   size_t healthy_peer_count() const;
 
   /**
-   * @brief Fetch entities from all healthy peers and merge them
-   * @return Merged PeerEntities from all reachable peers
-   */
-  PeerEntities fetch_all_peer_entities();
-
-  /**
    * @brief Fetch entities from all healthy peers, merge with local entities, and build routing table
    *
    * Snapshots peer shared_ptrs under lock, releases before network I/O. The

@@ -187,6 +187,11 @@ Component parse_component(const nlohmann::json & j) {
     if (xm.contains("identity") && xm["identity"].is_object()) {
       comp.identity = AssetIdentity::from_json(xm["identity"]);
     }
+    // A peer emits `available` only to say false, so absence is the peer
+    // stating the entity is reachable and the default has to be true. A
+    // Component carries no second signal - an App has `is_online` - so this is
+    // the only way an unreachable one stays unreachable past another hop.
+    comp.available = xm.value("available", true);
   }
   if (j.contains("translationId")) {
     comp.translation_id = j["translationId"].get<std::string>();
@@ -321,6 +326,11 @@ App parse_app(const nlohmann::json & j) {
     }
     app.source = xm.value("source", "");
     app.is_online = xm.value("is_online", false);
+    // Emitted only to say false, so absence means reachable. Read back for the
+    // same reason `is_online` is: a leaf that went quiet several hops away is
+    // described by the gateway that still holds its declaration, and that
+    // description is the only account of it this gateway can get.
+    app.available = xm.value("available", true);
     if (app.description.empty()) {
       app.description = xm.value("description", "");
     }
@@ -369,6 +379,13 @@ enum class RouteKind {
   /// ``/apps/{id}/operations``. A gateway old enough not to have the route answers
   /// 404, and aggregation has to keep working across that version boundary, so a
   /// 404 here means "not offered" rather than "could not be read".
+  ///
+  /// It also carries ``504 not-responding``, and for the same reason the detail
+  /// of an addressable entity does: the route hangs off an entity, and a peer
+  /// holding a declaration for a gateway that went quiet answers 504 on every
+  /// route of that entity, this one included. Read as a hole in the picture it
+  /// would abort the whole fetch, and one unreachable member anywhere behind a
+  /// peer would freeze this gateway's view of everything that peer holds.
   kNestedCollection,
   /// The detail of an entity that carries availability of its own (a Component).
   /// ``504 not-responding`` is the peer describing that entity as unreachable -
@@ -428,7 +445,8 @@ SubResponse read_sub_response(const httplib::Result & result, const std::string 
     out.kind = SubResponse::Kind::kRouteAbsent;
     return out;
   }
-  if (result->status == 504 && kind == RouteKind::kAddressableDetail && says_not_responding(result->body)) {
+  if (result->status == 504 && says_not_responding(result->body) &&
+      (kind == RouteKind::kAddressableDetail || kind == RouteKind::kNestedCollection)) {
     out.kind = SubResponse::Kind::kEntityUnreachable;
     return out;
   }
@@ -567,6 +585,12 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
         note_absent_route("/areas/{id}/subareas");
         continue;
       }
+      if (sub.kind == SubResponse::Kind::kEntityUnreachable) {
+        // The peer holds this Area's id but the gateway contributing it is
+        // silent, so its members are out of reach. That is one Area's worth of
+        // detail missing, not a failed read of the peer.
+        continue;
+      }
       auto subareas = parse_collection<Area>(sub.body, parse_area);
       for (auto & subarea : subareas) {
         if (!is_valid_entity_id(subarea.id)) {
@@ -634,6 +658,11 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
       }
       if (sub.kind == SubResponse::Kind::kRouteAbsent) {
         note_absent_route("/components/{id}/subcomponents");
+        continue;
+      }
+      if (sub.kind == SubResponse::Kind::kEntityUnreachable) {
+        // Same as for subareas: the parent is retained and unreachable, so what
+        // it contains cannot be read. The parent itself already carries that.
         continue;
       }
       auto subcomps = parse_collection<Component>(sub.body, parse_component);
@@ -719,6 +748,12 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
       }
       if (ops.kind == SubResponse::Kind::kRouteAbsent) {
         note_absent_route("/apps/{id}/operations");
+        continue;
+      }
+      if (ops.kind == SubResponse::Kind::kEntityUnreachable) {
+        // The App is retained and its gateway is silent, so the peer answers
+        // for it rather than proxying. It keeps the operations the peer already
+        // reported; there is nothing further to read.
         continue;
       }
       parse_operations_into(ops.body, app);
@@ -836,8 +871,14 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   // The x-medkit header allowlist must match headers the gateway actually produces.
   // Currently the only x-medkit HTTP header is X-Medkit-Local-Only (fault_handlers.cpp).
   // Update this list when adding new x-medkit HTTP response headers.
-  static const std::set<std::string> allowed_headers = {"content-type", "etag", "cache-control", "last-modified",
-                                                        "x-medkit-local-only"};
+  //
+  // `location` is what a 201 or 202 hands the client to address the resource it
+  // just created. The peer builds it from the request it received, so it names
+  // the member's own route - a path this gateway resolves to the same member,
+  // and the only address of a resource that lives on the other side. Dropping it
+  // leaves the client a status with nothing to follow.
+  static const std::set<std::string> allowed_headers = {"content-type",  "etag",     "cache-control",
+                                                        "last-modified", "location", "x-medkit-local-only"};
 
   res.status = result->status;
   res.body = result->body;

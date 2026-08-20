@@ -27,6 +27,8 @@ Validates the extended aggregation model end-to-end:
   plus "peer:peer_b"; each hop surfaces only its direct upstream.
 - ``/health.warnings`` is an empty array when there are no deployment
   anomalies.
+- Killing ``peer_C`` leaves its declared entities in the primary's tree
+  marked unavailable, two hops from where they were declared.
 
 DDS isolation uses three distinct domain IDs so that the gateways cannot
 discover each other's nodes via ROS 2 graph introspection - the only
@@ -34,6 +36,7 @@ channel is HTTP aggregation.
 """
 
 import os
+import signal
 import tempfile
 import textwrap
 import time
@@ -325,6 +328,85 @@ class TestDaisyChainAggregation(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         contributors = r.json().get('x-medkit', {}).get('contributors', [])
         self.assertIn('local', contributors)
+
+    # --- Unreachability across two hops ----------------------------------
+    #
+    # Named to sort last in the class: it kills the tail of the chain, and
+    # every case above needs all three gateways answering.
+
+    @staticmethod
+    def _primary_app(app_id):
+        """One App as the head of the chain currently lists it, or None."""
+        response = requests.get(f'{PRIMARY_URL}/apps', timeout=10)
+        if response.status_code != 200:
+            return None
+        for item in response.json().get('items', []):
+            if item.get('id') == app_id:
+                return item
+        return None
+
+    @staticmethod
+    def _primary_subcomponent(parent_id, subcomponent_id):
+        """One subcomponent as the head of the chain currently lists it."""
+        response = requests.get(
+            f'{PRIMARY_URL}/components/{parent_id}/subcomponents', timeout=10)
+        if response.status_code != 200:
+            return None
+        for item in response.json().get('items', []):
+            if item.get('id') == subcomponent_id:
+                return item
+        return None
+
+    def test_z_a_dead_tail_is_unreachable_at_the_head_of_the_chain(self, peer_c):
+        """Unreachability is a fact about an entity, not about one link.
+
+        peer_B holds peer_C's declaration and marks it unavailable when peer_C
+        stops answering. The primary is a hop further out and never talks to
+        peer_C at all, so the only thing that can tell it is peer_B's answer -
+        which it has to read back. Asserted on the flag rather than on a status
+        code, because an entity reported as reachable is a plausible-looking
+        200 built from a stale picture, and both entity kinds are checked: an
+        App also carries ``is_online``, a Component carries nothing else.
+        """
+        comp_before = self._primary_subcomponent('robot-x', 'ecu-c')
+        self.assertIsNotNone(
+            comp_before, 'ecu-c was never merged two hops out; nothing to test')
+        self.assertNotEqual(
+            comp_before.get('x-medkit', {}).get('available'), False,
+            f'ecu-c was already unavailable before peer_C was killed: {comp_before}')
+        app_before = self._primary_app('ecu-c-app')
+        self.assertIsNotNone(
+            app_before, 'ecu-c-app was never merged two hops out; nothing to test')
+        self.assertNotEqual(
+            app_before.get('x-medkit', {}).get('available'), False,
+            f'ecu-c-app was already unavailable before peer_C was killed: {app_before}')
+
+        os.kill(peer_c.process_details['pid'], signal.SIGTERM)
+
+        # Two refreshes have to land in sequence - peer_B notices, then the
+        # primary reads what peer_B now says - so the window is wider than the
+        # single-hop case. It is still a small multiple of refresh_interval_ms
+        # (1000 ms for a test gateway), not a wait for something unbounded.
+        deadline = time.monotonic() + 45.0
+        comp = app = None
+        while time.monotonic() < deadline:
+            comp = self._primary_subcomponent('robot-x', 'ecu-c')
+            app = self._primary_app('ecu-c-app')
+            if (comp is not None and comp.get('x-medkit', {}).get('available') is False
+                    and app is not None and app.get('x-medkit', {}).get('available') is False):
+                break
+            time.sleep(0.5)
+
+        self.assertIsNotNone(
+            comp, 'ecu-c vanished from the head of the chain instead of being retained')
+        self.assertIs(
+            comp.get('x-medkit', {}).get('available'), False,
+            f'a Component behind a dead gateway is reported reachable: {comp}')
+        self.assertIsNotNone(
+            app, 'ecu-c-app vanished from the head of the chain instead of being retained')
+        self.assertIs(
+            app.get('x-medkit', {}).get('available'), False,
+            f'an App behind a dead gateway is reported reachable: {app}')
 
 
 @launch_testing.post_shutdown_test()

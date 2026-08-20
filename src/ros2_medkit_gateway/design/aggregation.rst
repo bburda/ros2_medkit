@@ -31,7 +31,7 @@ not need to know which gateway owns which entity.
 
    package "Primary Gateway" {
        class AggregationManager {
-           + fetch_all_peer_entities()
+           + fetch_and_merge_peer_entities()
            + fan_out_get()
            + forward_request()
            + check_all_health()
@@ -489,6 +489,25 @@ Answering that from the aggregator's own goal tracking returns an empty
 collection for goals that exist, which reads as "this operation has never been
 run".
 
+Every verb that takes one of those execution ids back resolves it the same way,
+for the same reason - ``GET`` for its status, ``PUT`` to apply a capability and
+``DELETE`` to cancel:
+
+.. code-block:: text
+
+   GET /api/v1/functions/vehicle_health/operations/peer_long_calibration:long_calibration/executions/{exec}
+     -> GET /api/v1/apps/peer_long_calibration/operations/long_calibration/executions/{exec}
+
+An id that does not resolve to exactly one owned operation is left to the local
+path, whose key is the execution id alone: resolving is how the owning gateway
+is found, not a second place for these routes to refuse a request. So a
+locally-owned execution is answered here exactly as before, and an id naming no
+goal gets the same ``404`` it always did.
+
+The peer's ``Location`` header is carried back through the forward, because it
+names the member's own route - a path the aggregator resolves to the same
+member - and it is the only address of a resource that lives on the other side.
+
 The member's own gateway is the only one that can answer: the ROS service, the
 topic and the parameter behind the id exist on its graph and nowhere else. What
 this gateway holds for a peer-owned member is a declaration, which is why the
@@ -649,10 +668,28 @@ their own: a ``404`` on a nested collection route (``/subareas``,
 ``/subcomponents``, an app's ``/operations``) identifies a peer running a
 gateway that predates the route and is reported in
 ``PeerEntities::absent_routes`` for the caller to log; a ``504`` with error code
-``not-responding`` on a Component's detail is the peer reporting that the
-gateway contributing that Component has gone quiet - what a middle gateway in a
-chain answers for a declaration it is retaining - so the Component is kept as
-the list named it and marked unavailable.
+``not-responding`` on any route hanging off an entity - its detail, or one of
+its nested collections - is the peer reporting that the gateway contributing
+that entity has gone quiet, which is what a middle gateway in a chain answers
+for a declaration it is retaining. The entity is kept as the list named it and
+marked unavailable, and a nested collection answering that way costs the members
+that route carries and nothing else. Read as a failed request instead, one
+unreachable member anywhere behind a peer would discard that peer's whole
+picture on every refresh, and the aggregator would go on serving its last
+pre-failure view indefinitely. A ``504`` that does not carry
+``not-responding`` says nothing about an entity and still fails the fetch.
+
+Availability travels the same way in the other direction. ``x-medkit.available``
+is emitted only when false, so absence means reachable, and both
+``parse_component`` and ``parse_app`` read it back with a default of ``true``.
+Without that, a chain of three gateways loses the fact at the second hop: an App
+still carries ``is_online``, but a Component has no other signal, and the head of
+the chain would report an unreachable leaf as reachable. Local retention only
+ever sets the flag false and never back to true, so a peer's own statement that
+something it holds is unreachable survives being replayed, and where the marking
+does apply over a peer's ``available`` it is because the peer itself stopped
+answering - the stronger statement, since everything it holds sits behind the
+link that is down.
 ``AggregationManager`` never records a failed fetch as the peer's declaration,
 so the last complete one survives; it re-checks that peer's health to decide
 whether to replay it marked unavailable (health check failed) or exactly as it

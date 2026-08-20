@@ -326,35 +326,6 @@ size_t AggregationManager::healthy_peer_count() const {
   return count;
 }
 
-PeerEntities AggregationManager::fetch_all_peer_entities() {
-  // Snapshot healthy peers under lock, release before network I/O.
-  std::vector<std::shared_ptr<PeerClient>> snapshot;
-  {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    for (const auto & peer : peers_) {
-      if (peer->is_healthy()) {
-        snapshot.push_back(peer);
-      }
-    }
-  }
-
-  PeerEntities merged;
-  for (auto & peer : snapshot) {
-    auto result = peer->fetch_entities();
-    if (!result.has_value()) {
-      continue;
-    }
-
-    const auto & entities = result.value();
-    merged.areas.insert(merged.areas.end(), entities.areas.begin(), entities.areas.end());
-    merged.components.insert(merged.components.end(), entities.components.begin(), entities.components.end());
-    merged.apps.insert(merged.apps.end(), entities.apps.begin(), entities.apps.end());
-    merged.functions.insert(merged.functions.end(), entities.functions.begin(), entities.functions.end());
-  }
-
-  return merged;
-}
-
 namespace {
 
 /// True for an entity a peer said it had DECLARED, rather than discovered from
@@ -398,6 +369,12 @@ std::vector<Entity> declared_only(const std::vector<Entity> & src) {
 }
 
 /// Mark every addressable entity of a replayed declaration unreachable.
+///
+/// The marking is one-way: it only ever sets the flag false, never back to
+/// true. So an entity a peer itself reported as unreachable keeps that from its
+/// own account, and where the marking does apply over a peer's `available` it
+/// is because the peer stopped answering - which is the stronger statement,
+/// since everything it holds sits behind the link that is down.
 template <class Entity>
 void mark_all_unreachable(std::vector<Entity> & entities) {
   for (auto & entity : entities) {
