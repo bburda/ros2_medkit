@@ -123,6 +123,8 @@ class MockPeerServer {
     thread_ = std::thread([this]() {
       server_->listen_after_bind();
     });
+    // stop() only interrupts a server that is already listening.
+    server_->wait_until_ready();
     return port_;
   }
 
