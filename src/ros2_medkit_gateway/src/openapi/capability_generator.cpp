@@ -16,12 +16,14 @@
 
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "openapi_spec_builder.hpp"
 #include "path_builder.hpp"
 
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/http/member_qualified_id.hpp"
 #include "ros2_medkit_gateway/core/models/entity_capabilities.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
@@ -238,6 +240,20 @@ nlohmann::json CapabilityGenerator::generate_resource_collection(const ResolvedP
   std::string collection_path = entity_path + "/" + resolved.resource_collection;
   const auto & cache = node_.get_thread_safe_cache();
 
+  // The documented id of an item has to be the id the collection emits, or the
+  // spec describes a request the gateway then refuses. Both use the same rule:
+  // an id that more than one item carries is qualified with its owning member,
+  // an id that names one thing is left bare. What the generator cannot see is
+  // a peer contributing a second item under the same id - it reads the local
+  // cache only, and there is no peer view here to consult.
+  const auto qualified_item_id = [](const std::string & item_id, size_t provider_count,
+                                    const std::string & owner) -> std::string {
+    if (provider_count < 2 || owner.empty()) {
+      return item_id;
+    }
+    return http::make_member_qualified_id(owner, item_id);
+  };
+
   if (resolved.resource_collection == "data") {
     auto data = cache.get_entity_data(resolved.entity_id);
     paths[collection_path] = path_builder.build_data_collection(entity_path, data.topics);
@@ -258,12 +274,30 @@ nlohmann::json CapabilityGenerator::generate_resource_collection(const ResolvedP
       ops = cache.get_function_operations(resolved.entity_id);
     }
     paths[collection_path] = path_builder.build_operations_collection(entity_path, ops);
+
+    // Short names are not unique across members, and two of them produced the
+    // same key here, so one item's documentation silently replaced the other's.
+    std::unordered_map<std::string, size_t> short_name_counts;
     for (const auto & svc : ops.services) {
-      std::string item_path = collection_path + "/" + svc.name;
+      ++short_name_counts[svc.name];
+    }
+    for (const auto & action : ops.actions) {
+      ++short_name_counts[action.name];
+    }
+    const auto owner_of = [&ops](const std::string & full_path) -> std::string {
+      auto owner = ops.owner_by_path.find(full_path);
+      return owner != ops.owner_by_path.end() ? owner->second : std::string{};
+    };
+
+    for (const auto & svc : ops.services) {
+      std::string item_path =
+          collection_path + "/" + qualified_item_id(svc.name, short_name_counts[svc.name], owner_of(svc.full_path));
       paths[item_path] = path_builder.build_operation_item(entity_path, svc);
     }
     for (const auto & action : ops.actions) {
-      std::string item_path = collection_path + "/" + action.name;
+      std::string item_path =
+          collection_path + "/" +
+          qualified_item_id(action.name, short_name_counts[action.name], owner_of(action.full_path));
       paths[item_path] = path_builder.build_operation_item(entity_path, action);
     }
   } else if (resolved.resource_collection == "configurations") {
@@ -351,9 +385,22 @@ nlohmann::json CapabilityGenerator::generate_specific_resource(const ResolvedPat
       ops = cache.get_function_operations(resolved.entity_id);
     }
 
+    // The requested id may name its owning member, which is how the collection
+    // addresses an operation short name that more than one member exposes.
+    // Matching the bare half alone would document one member's operation under
+    // the other member's id.
+    auto requested = http::parse_member_qualified_id(resolved.resource_id, ops.is_aggregated);
+    const auto owned_by_requested = [&ops, &requested](const std::string & full_path) {
+      if (!requested.has_member) {
+        return true;
+      }
+      auto owner = ops.owner_by_path.find(full_path);
+      return owner != ops.owner_by_path.end() && owner->second == requested.member_id;
+    };
+
     bool found = false;
     for (const auto & svc : ops.services) {
-      if (svc.name == resolved.resource_id) {
+      if (svc.name == requested.item_id && owned_by_requested(svc.full_path)) {
         paths[resource_path] = path_builder.build_operation_item(entity_path, svc);
         found = true;
         break;
@@ -361,7 +408,7 @@ nlohmann::json CapabilityGenerator::generate_specific_resource(const ResolvedPat
     }
     if (!found) {
       for (const auto & action : ops.actions) {
-        if (action.name == resolved.resource_id) {
+        if (action.name == requested.item_id && owned_by_requested(action.full_path)) {
           paths[resource_path] = path_builder.build_operation_item(entity_path, action);
           found = true;
           break;

@@ -385,6 +385,21 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     component.actions = {ActionInfo{"long_calibration", "/powertrain/engine/long_calibration",
                                     "example_interfaces/action/Fibonacci", std::nullopt}};
 
+    // A second member of the same area exposing `calibrate` at a different ROS
+    // path. Deduplication keys on the full path, so both survive the area-level
+    // walk and the short name - which is the wire id - stops naming one of
+    // them. That is the ambiguity the qualified form exists for, and it needs
+    // two members to exist at all.
+    Component gearbox;
+    gearbox.id = "gearbox";
+    gearbox.name = "Gearbox";
+    gearbox.namespace_path = "/powertrain/gearbox";
+    gearbox.fqn = "/powertrain/gearbox";
+    gearbox.area = "powertrain";
+    gearbox.source = "manifest";
+    gearbox.services = {
+        ServiceInfo{"calibrate", "/powertrain/gearbox/calibrate", "std_srvs/srv/Trigger", std::nullopt}};
+
     // The area the component sits in. The operation routes are registered for
     // all four entity types and create_execution rejects a collection /
     // entity-type mismatch, so exercising a non-component collection needs a
@@ -396,7 +411,7 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     area.source = "manifest";
 
     auto & cache = const_cast<ThreadSafeEntityCache &>(gateway_node_->get_thread_safe_cache());
-    cache.update_all({area}, {component}, {}, {});
+    cache.update_all({area}, {component, gearbox}, {}, {});
   }
 
   /// Drive `create_execution` and assert the typed response carries the async
@@ -598,6 +613,93 @@ TEST_F(OperationHandlersFixtureTest, CreateExecutionLocationExtendsTheRequestedC
   });
   ASSERT_NE(location, headers.end()) << "202 must carry a Location header";
   EXPECT_EQ(location->second, requested_path + "/" + async_ptr->id);
+}
+
+// Qualification follows ambiguity, so one collection must show both halves at
+// once: the id two members share is qualified, the id only one member has is
+// not. Asserting only the qualified half would pass a rule that renamed
+// everything, which is what breaks every client sending the bare short name.
+TEST_F(OperationHandlersFixtureTest, OnlyAnAmbiguousOperationIdIsQualified) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations", R"(/api/v1/areas/([^/]+)/operations)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_operations(typed);
+  ASSERT_TRUE(result.has_value());
+
+  std::multiset<std::string> ids;
+  for (const auto & item : result->items) {
+    ids.insert(item.id);
+  }
+  EXPECT_EQ(ids.count("engine:calibrate"), 1u);
+  EXPECT_EQ(ids.count("gearbox:calibrate"), 1u);
+  EXPECT_EQ(ids.count("calibrate"), 0u) << "a bare id survived alongside the qualified ones";
+  EXPECT_EQ(ids.count("long_calibration"), 1u) << "a single-provider id was qualified";
+  EXPECT_EQ(ids.count("engine:long_calibration"), 0u);
+}
+
+// The bare id names two operations, so executing it would run whichever member
+// was walked first and never say which.
+TEST_F(OperationHandlersFixtureTest, CreateExecutionRefusesAnAmbiguousBareId) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/calibrate/executions",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+  dto::ExecutionCreateRequest body;
+  body.parameters = json::object();
+
+  auto result = handlers_->create_execution(typed, body);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 400);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_INVALID_REQUEST);
+  EXPECT_NE(result.error().message.find("member"), std::string::npos);
+  ASSERT_TRUE(result.error().params.contains("member_ids"));
+  EXPECT_EQ(result.error().params["member_ids"].size(), 2u);
+}
+
+// An id that names nothing is a miss, not an invitation to qualify a typo.
+TEST_F(OperationHandlersFixtureTest, CreateExecutionUnknownBareIdIsNotFound) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/does_not_exist/executions",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+  dto::ExecutionCreateRequest body;
+  body.parameters = json::object();
+
+  auto result = handlers_->create_execution(typed, body);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 404);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_OPERATION_NOT_FOUND);
+}
+
+// The member half has to name a member of THIS entity; a leaf that exists
+// elsewhere in the tree is a miss, not a fallback to the first match.
+TEST_F(OperationHandlersFixtureTest, GetOperationRejectsAnIdNamingAForeignMember) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/chassis:calibrate",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+))");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->get_operation(typed);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 404);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_RESOURCE_NOT_FOUND);
+}
+
+// A qualified id selects among the same-named copies, and the response echoes
+// the id that was asked for so a caller can keep using it.
+TEST_F(OperationHandlersFixtureTest, GetOperationResolvesAQualifiedIdToItsMember) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/gearbox:calibrate",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+))");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->get_operation(typed);
+
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  EXPECT_EQ(result->item.id, "gearbox:calibrate");
+  EXPECT_EQ(result->item.name, "calibrate");
+  ASSERT_TRUE(result->item.x_medkit.has_value());
+  ASSERT_TRUE(result->item.x_medkit->ros2.has_value());
+  EXPECT_EQ(result->item.x_medkit->ros2->service, "/powertrain/gearbox/calibrate");
 }
 
 TEST_F(OperationHandlersFixtureTest, UpdateExecutionStopReturnsAcceptedAndLocation) {

@@ -493,8 +493,12 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
               {"component_id", "The component identifier"},
               {"app_id", "The app identifier"},
               {"function_id", "The function identifier"},
-              {"data_id", "The data item identifier (ROS 2 topic name)"},
-              {"operation_id", "The operation identifier"},
+              {"data_id",
+               "The data item identifier (ROS 2 topic name), or 'member_id:topic' when more than one member of "
+               "the entity contributes an item under that name"},
+              {"operation_id",
+               "The operation identifier (service or action short name), or 'member_id:operation' when more than "
+               "one member of the entity exposes that name"},
               {"execution_id", "The execution identifier"},
               {"config_id", "The configuration parameter identifier (ROS 2 parameter name)"},
               {"fault_code", "The fault code identifier"},

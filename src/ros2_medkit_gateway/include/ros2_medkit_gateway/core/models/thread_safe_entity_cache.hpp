@@ -59,8 +59,20 @@ struct TopicData {
 struct AggregatedData {
   std::vector<TopicData> topics;
   std::vector<std::string> source_ids;  ///< Entity IDs that contributed
-  std::string aggregation_level;        ///< "app" | "component" | "area" | "function"
-  bool is_aggregated{false};            ///< true if collected from sub-entities
+  /// Contributing members per topic name, for the items in `topics`.
+  ///
+  /// `source_ids` says which members contributed something; it does not say
+  /// which member contributed WHICH item, and a caller holding one item id
+  /// cannot recover the owner from it. A grouping that lists an item it cannot
+  /// then address is the defect this exists to close.
+  ///
+  /// A list rather than one id, because a topic legitimately has more than one
+  /// contributor: a topic published by one member and subscribed by another is
+  /// merged into a single item with direction "both", so recording only the
+  /// first would name a publisher for an item a subscriber also owns.
+  std::unordered_map<std::string, std::vector<std::string>> owners_by_topic;
+  std::string aggregation_level;  ///< "app" | "component" | "area" | "function"
+  bool is_aggregated{false};      ///< true if collected from sub-entities
 
   bool empty() const {
     return topics.empty();
@@ -77,8 +89,17 @@ struct AggregatedOperations {
   std::vector<ServiceInfo> services;
   std::vector<ActionInfo> actions;
   std::vector<std::string> source_ids;  ///< Entity IDs that contributed
-  std::string aggregation_level;        ///< "app" | "component" | "area" | "function"
-  bool is_aggregated{false};            ///< true if collected from sub-entities
+  /// Owning member per full ROS path, for the items in `services`/`actions`.
+  ///
+  /// See AggregatedData::owner_by_topic for why the collection-level
+  /// `source_ids` is not enough. Keyed by full path, matching the existing
+  /// deduplication: two members exposing the same full path are one item with
+  /// one owner, while two members exposing the same SHORT name at different
+  /// paths stay two items with an owner each - which is what lets a caller see
+  /// that the short name, the id the HTTP API uses, is ambiguous.
+  std::unordered_map<std::string, std::string> owner_by_path;
+  std::string aggregation_level;  ///< "app" | "component" | "area" | "function"
+  bool is_aggregated{false};      ///< true if collected from sub-entities
 
   bool empty() const {
     return services.empty() && actions.empty();
@@ -329,6 +350,25 @@ class ThreadSafeEntityCache {
    */
   std::vector<std::string> get_subareas(const std::string & area_id) const;
 
+  /// Entity ids that contribute the resources of `entity_id`.
+  ///
+  /// A grouping entity - an Area, a Function, or a Component with children -
+  /// has no resources of its own beyond what its members provide, so resolving
+  /// an item to its owner and listing the grouping's items must walk the same
+  /// graph. This is that walk, and it is the only one: the per-collection walks
+  /// that predate it disagree about subareas, about Function hosts that are
+  /// Components, and about whether a parent Component has children at all.
+  ///
+  /// A Component is included in its own member list because, unlike an Area or
+  /// a Function, it can expose services and actions directly.
+  ///
+  /// An App is a leaf and returns just itself, so a caller does not have to
+  /// special-case the non-grouping kinds.
+  ///
+  /// Cycles in the parent graph terminate: parents are only checked for
+  /// existence when a manifest is validated, not for acyclicity.
+  std::vector<std::string> get_members(SovdEntityType type, const std::string & entity_id) const;
+
   // =========================================================================
   // Aggregation methods (uses relationship indexes)
   // =========================================================================
@@ -522,9 +562,11 @@ class ThreadSafeEntityCache {
 
   // Relationship indexes (parent ID -> child slot ids)
   FlatHashMap<std::string, std::vector<uint32_t>> component_to_apps_;
+  FlatHashMap<std::string, std::vector<uint32_t>> component_to_subcomponents_;
   FlatHashMap<std::string, std::vector<uint32_t>> area_to_components_;
   FlatHashMap<std::string, std::vector<uint32_t>> area_to_subareas_;
   FlatHashMap<std::string, std::vector<uint32_t>> function_to_apps_;
+  FlatHashMap<std::string, std::vector<uint32_t>> function_to_components_;
 
   // Operation index (operation full_path -> owning entity)
   FlatHashMap<std::string, EntityRef> operation_index_;

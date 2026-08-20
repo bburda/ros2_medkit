@@ -14,8 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -743,6 +745,128 @@ TEST_F(DataAggregationTest, UnknownEntityReturnsEmptyData) {
   EXPECT_TRUE(result.topics.empty());
   EXPECT_TRUE(result.source_ids.empty());
   EXPECT_TRUE(result.aggregation_level.empty());
+}
+
+// =============================================================================
+// Member resolution
+//
+// A grouping entity - an Area, a Function, or a Component with children - owns
+// no resources beyond what its members provide. Resolving an item to its owner
+// and listing the grouping's items therefore have to walk the same graph, or
+// the gateway advertises what it will not serve. These cases pin that one walk.
+// =============================================================================
+
+class MemberResolutionTest : public ::testing::Test {
+ protected:
+  /// Members compared as a set: the walk fixes no order and no caller needs one.
+  static std::vector<std::string> sorted(std::vector<std::string> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+  }
+
+  ThreadSafeEntityCache cache_;
+};
+
+TEST_F(MemberResolutionTest, AreaMembersAreItsComponentsAndTheirApps) {
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  std::vector<Component> components{
+      make_component("primary-ecu", "Primary", "vehicle"),
+      make_component("secondary-ecu", "Secondary", "vehicle"),
+  };
+  std::vector<App> apps{
+      make_app("temp_sensor", "Temp", "primary-ecu"),
+      make_app("pressure_sensor", "Pressure", "secondary-ecu"),
+  };
+  cache_.update_all(areas, components, apps, {});
+
+  EXPECT_EQ(sorted(cache_.get_members(SovdEntityType::AREA, "vehicle")),
+            sorted({"primary-ecu", "secondary-ecu", "temp_sensor", "pressure_sensor"}));
+}
+
+TEST_F(MemberResolutionTest, AreaMembersDescendIntoSubareas) {
+  // The operations walk that predates this one stops at the area's own
+  // components, so a subarea's apps were invisible to any caller that asked the
+  // parent area what it contains.
+  Area parent = make_area("vehicle", "Vehicle");
+  Area child = make_area("powertrain", "Powertrain");
+  child.parent_area_id = "vehicle";
+
+  std::vector<Component> components{make_component("engine-ecu", "Engine", "powertrain")};
+  std::vector<App> apps{make_app("rpm_sensor", "RPM", "engine-ecu")};
+  cache_.update_all({parent, child}, components, apps, {});
+
+  EXPECT_EQ(sorted(cache_.get_members(SovdEntityType::AREA, "vehicle")), sorted({"engine-ecu", "rpm_sensor"}));
+}
+
+TEST_F(MemberResolutionTest, FunctionMembersIncludeHostsThatAreComponents) {
+  // A Function host id may name an App or a Component. Only the App half was
+  // indexed, and a Component host was dropped without a word, so a Function
+  // hosting a Component reported none of that Component's resources.
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  std::vector<Component> components{make_component("brake-ecu", "Brake", "vehicle")};
+  std::vector<App> apps{
+      make_app("actuator", "Actuator", "brake-ecu"),
+      make_app("temp_sensor", "Temp", "brake-ecu"),
+  };
+
+  Function func;
+  func.id = "vehicle_health";
+  func.hosts = {"temp_sensor", "brake-ecu"};
+  cache_.update_all(areas, components, apps, {func});
+
+  const auto members = sorted(cache_.get_members(SovdEntityType::FUNCTION, "vehicle_health"));
+  for (const char * expected : {"actuator", "brake-ecu", "temp_sensor"}) {
+    EXPECT_NE(std::find(members.begin(), members.end(), expected), members.end())
+        << "function member missing: " << expected;
+  }
+}
+
+TEST_F(MemberResolutionTest, ComponentIsAMemberOfItselfAndCarriesItsChildren) {
+  // Two things this pins. A Component is its own member because, unlike an Area
+  // or a Function, it can expose services and actions directly - the operations
+  // aggregation already counts those before its apps. And a parent Component's
+  // children were not reachable from the cache at all before: nothing indexed
+  // that direction.
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  Component parent = make_component("vehicle-ecu", "Vehicle ECU", "vehicle");
+  parent.services = {make_service("reset", "/vehicle/reset")};
+  Component child = make_component("brake-ecu", "Brake ECU", "vehicle");
+  child.parent_component_id = "vehicle-ecu";
+
+  std::vector<App> apps{make_app("actuator", "Actuator", "brake-ecu")};
+  cache_.update_all(areas, {parent, child}, apps, {});
+
+  EXPECT_EQ(sorted(cache_.get_members(SovdEntityType::COMPONENT, "vehicle-ecu")),
+            sorted({"vehicle-ecu", "brake-ecu", "actuator"}));
+}
+
+TEST_F(MemberResolutionTest, ComponentParentCycleTerminates) {
+  // Parent-component cycles are representable: the manifest validator checks
+  // only that a parent exists, not that the graph is acyclic, and the
+  // aggregation classifier handles cycles explicitly because they occur. A walk
+  // without a visited set would not return.
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  Component first = make_component("ecu-a", "A", "vehicle");
+  first.parent_component_id = "ecu-b";
+  Component second = make_component("ecu-b", "B", "vehicle");
+  second.parent_component_id = "ecu-a";
+  cache_.update_all(areas, {first, second}, {}, {});
+
+  EXPECT_EQ(sorted(cache_.get_members(SovdEntityType::COMPONENT, "ecu-a")), sorted({"ecu-a", "ecu-b"}));
+}
+
+TEST_F(MemberResolutionTest, LeafReturnsOnlyItself) {
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  std::vector<Component> components{make_component("primary-ecu", "Primary", "vehicle")};
+  std::vector<App> apps{make_app("temp_sensor", "Temp", "primary-ecu")};
+  cache_.update_all(areas, components, apps, {});
+
+  EXPECT_EQ(cache_.get_members(SovdEntityType::APP, "temp_sensor"), std::vector<std::string>{"temp_sensor"});
+}
+
+TEST_F(MemberResolutionTest, UnknownGroupingHasNoMembers) {
+  cache_.update_all({}, {}, {}, {});
+  EXPECT_TRUE(cache_.get_members(SovdEntityType::AREA, "nope").empty());
 }
 
 int main(int argc, char ** argv) {

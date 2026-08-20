@@ -14,9 +14,11 @@
 
 #include "ros2_medkit_gateway/core/http/handlers/operation_handlers.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -28,6 +30,7 @@
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/http/member_qualified_id.hpp"
 #include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/providers/operation_provider.hpp"
@@ -121,6 +124,107 @@ tl::expected<EntityOpsLookup, ErrorInfo> resolve_entity_operations(const ThreadS
       return tl::make_unexpected(make_error(404, ERR_ENTITY_NOT_FOUND, "Entity type does not support operations",
                                             json{{"entity_id", entity_id}}));
   }
+}
+
+/// True when `member_id` is one of the members that contributed to `ops`.
+///
+/// `source_ids` also carries the aggregating entity's own id, which is
+/// harmless here: an id naming the entity itself resolves against exactly the
+/// operations the entity contributed under its own name.
+bool names_a_member(const AggregatedOperations & ops, const std::string & member_id) {
+  return std::find(ops.source_ids.begin(), ops.source_ids.end(), member_id) != ops.source_ids.end();
+}
+
+/// The operation an item id resolves to inside one entity's operations.
+struct ResolvedOperation {
+  std::optional<ServiceInfo> service;
+  std::optional<ActionInfo> action;
+
+  bool found() const {
+    return service.has_value() || action.has_value();
+  }
+};
+
+/// Resolve `parsed` against the entity's operations.
+///
+/// A member half selects among same-named operations using the owner recorded
+/// per full ROS path. A bare id keeps the first match, which is the only thing
+/// it can mean when it is unique and the only thing this gateway did before.
+ResolvedOperation resolve_operation(const AggregatedOperations & ops, const http::MemberQualifiedId & parsed) {
+  const auto owned_by_target = [&ops, &parsed](const std::string & full_path) {
+    if (!parsed.has_member) {
+      return true;
+    }
+    auto owner = ops.owner_by_path.find(full_path);
+    return owner != ops.owner_by_path.end() && owner->second == parsed.member_id;
+  };
+
+  ResolvedOperation resolved;
+  for (const auto & svc : ops.services) {
+    if (svc.name == parsed.item_id && owned_by_target(svc.full_path)) {
+      resolved.service = svc;
+      return resolved;
+    }
+  }
+  for (const auto & act : ops.actions) {
+    if (act.name == parsed.item_id && owned_by_target(act.full_path)) {
+      resolved.action = act;
+      return resolved;
+    }
+  }
+  return resolved;
+}
+
+/// Members of `ops` that expose `short_name`, in collection order.
+///
+/// More than one means the bare id names more than one operation. Keyed on the
+/// short name because that is the wire id; the full ROS paths differ, which is
+/// exactly why the short name stops identifying one of them.
+std::vector<std::string> local_providers_of(const AggregatedOperations & ops, const std::string & short_name) {
+  std::vector<std::string> providers;
+  const auto record = [&ops, &providers](const std::string & full_path) {
+    auto owner = ops.owner_by_path.find(full_path);
+    providers.push_back(owner != ops.owner_by_path.end() ? owner->second : std::string{});
+  };
+  for (const auto & svc : ops.services) {
+    if (svc.name == short_name) {
+      record(svc.full_path);
+    }
+  }
+  for (const auto & act : ops.actions) {
+    if (act.name == short_name) {
+      record(act.full_path);
+    }
+  }
+  return providers;
+}
+
+/// The error for a member that is in the tree but whose gateway is silent.
+///
+/// A retained member is kept precisely so that the answer to a request does not
+/// change when a link drops: the item is still addressable, and asking for it
+/// says why it cannot be served right now. The alternatives are what this
+/// replaces - quietly running a different member's operation, or a 200 with
+/// nothing in it. `not-responding` is the SOVD code for "no response from the
+/// underlying entity", which is exactly the situation.
+std::optional<ErrorInfo> member_unavailable_error(const ThreadSafeEntityCache & cache, const std::string & entity_id,
+                                                  const std::string & member_id, const std::string & operation_id) {
+  bool unavailable = false;
+  if (auto app = cache.get_app(member_id)) {
+    unavailable = !app->available;
+  } else if (auto component = cache.get_component(member_id)) {
+    unavailable = !component->available;
+  }
+  if (!unavailable) {
+    return std::nullopt;
+  }
+  return make_error(504, ERR_NOT_RESPONDING, "Member '" + member_id + "' is not available",
+                    json{{"details",
+                          "The gateway contributing this member is not answering; it is retained from its "
+                          "last known declaration"},
+                         {"entity_id", entity_id},
+                         {"operation_id", operation_id},
+                         {"member_id", member_id}});
 }
 
 /// Convert a ROS 2 action goal status into the SOVD `ExecutionStatus` enum
@@ -374,22 +478,53 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
   auto data_access_mgr = ctx_.node()->get_data_access_manager();
   auto type_introspection = data_access_mgr->get_type_introspection();
 
+  // A peer's declared operations live in this cache so that ambiguity can be
+  // decided without asking anyone at request time. They are not listed from
+  // here: the gateway that owns an operation is the one that reports it, and
+  // this walk runs even when the caller asked for no fan-out at all.
+  const auto contributed_by_peer = [&cache](const std::string & member_id) {
+    static constexpr std::string_view kPeerPrefix = "peer:";
+    if (auto app = cache.get_app(member_id)) {
+      return app->source.rfind(kPeerPrefix, 0) == 0;
+    }
+    if (auto component = cache.get_component(member_id)) {
+      return component->source.rfind(kPeerPrefix, 0) == 0;
+    }
+    return false;
+  };
+  const auto owner_is_remote = [&ops, &contributed_by_peer](const std::string & full_path) {
+    auto owner = ops.owner_by_path.find(full_path);
+    return owner != ops.owner_by_path.end() && contributed_by_peer(owner->second);
+  };
+
   for (const auto & svc : ops.services) {
+    if (owner_is_remote(svc.full_path)) {
+      continue;
+    }
     dto::OperationItem item;
     item.id = svc.name;
     item.name = svc.name;
     item.proximity_proof_required = false;
     item.asynchronous_execution = false;
     item.x_medkit = build_service_xmedkit(svc, entity_id, type_introspection);
+    if (auto owner = ops.owner_by_path.find(svc.full_path); owner != ops.owner_by_path.end() && ops.is_aggregated) {
+      item.x_medkit->member_ids = std::vector<std::string>{owner->second};
+    }
     collection.items.push_back(std::move(item));
   }
   for (const auto & act : ops.actions) {
+    if (owner_is_remote(act.full_path)) {
+      continue;
+    }
     dto::OperationItem item;
     item.id = act.name;
     item.name = act.name;
     item.proximity_proof_required = false;
     item.asynchronous_execution = true;
     item.x_medkit = build_action_xmedkit(act, entity_id, type_introspection);
+    if (auto owner = ops.owner_by_path.find(act.full_path); owner != ops.owner_by_path.end() && ops.is_aggregated) {
+      item.x_medkit->member_ids = std::vector<std::string>{owner->second};
+    }
     collection.items.push_back(std::move(item));
   }
 
@@ -408,6 +543,16 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
   for (auto & item : fan_out.items) {
     collection.items.push_back(std::move(item));
   }
+
+  // Two members exposing one short name are two items with one id, and the
+  // merged collection is the first place that is visible: each gateway holds
+  // one `calibrate` and considers it unique. An id only one item carries is
+  // left alone - it already names one thing, and rewriting it would break
+  // every client that sends the bare name.
+  http::qualify_ambiguous_ids(collection.items, [](const dto::OperationItem & item) {
+    return item.x_medkit.has_value() && item.x_medkit->member_ids.has_value() ? &*item.x_medkit->member_ids : nullptr;
+  });
+
   if (fan_out.partial || !fan_out.dropped_items.empty()) {
     dto::XMedkitCollection xm;
     if (fan_out.partial) {
@@ -479,23 +624,18 @@ http::Result<dto::OperationDetail> OperationHandlers::get_operation(const http::
   }
   const auto & ops = lookup->ops;
 
-  std::optional<ServiceInfo> service_info;
-  std::optional<ActionInfo> action_info;
-  for (const auto & svc : ops.services) {
-    if (svc.name == operation_id) {
-      service_info = svc;
-      break;
-    }
+  // A qualified id is accepted wherever the entity has members to name. A bare
+  // id keeps resolving to the first match, so every client that sends the
+  // short name - and the OpenAPI document this gateway generates - still work.
+  auto parsed = http::parse_member_qualified_id(operation_id, ops.is_aggregated);
+  if (parsed.has_member && !names_a_member(ops, parsed.member_id)) {
+    return tl::make_unexpected(
+        make_error(404, ERR_RESOURCE_NOT_FOUND, "Member not found in entity",
+                   json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"member_id", parsed.member_id}}));
   }
-  if (!service_info.has_value()) {
-    for (const auto & act : ops.actions) {
-      if (act.name == operation_id) {
-        action_info = act;
-        break;
-      }
-    }
-  }
-  if (!service_info.has_value() && !action_info.has_value()) {
+
+  auto resolved = resolve_operation(ops, parsed);
+  if (!resolved.found()) {
     return tl::make_unexpected(make_error(404, ERR_OPERATION_NOT_FOUND, "Operation not found",
                                           json{{"entity_id", entity_id}, {"operation_id", operation_id}}));
   }
@@ -504,18 +644,19 @@ http::Result<dto::OperationDetail> OperationHandlers::get_operation(const http::
   auto type_introspection = data_access_mgr->get_type_introspection();
 
   dto::OperationDetail detail;
-  if (service_info.has_value()) {
-    detail.item.id = service_info->name;
-    detail.item.name = service_info->name;
+  // The id echoes what was requested, so a caller that took a qualified id out
+  // of the collection sees the same id come back and can keep using it.
+  detail.item.id = operation_id;
+  if (resolved.service.has_value()) {
+    detail.item.name = resolved.service->name;
     detail.item.proximity_proof_required = false;
     detail.item.asynchronous_execution = false;
-    detail.item.x_medkit = build_service_xmedkit(*service_info, entity_id, type_introspection);
+    detail.item.x_medkit = build_service_xmedkit(*resolved.service, entity_id, type_introspection);
   } else {
-    detail.item.id = action_info->name;
-    detail.item.name = action_info->name;
+    detail.item.name = resolved.action->name;
     detail.item.proximity_proof_required = false;
     detail.item.asynchronous_execution = true;
-    detail.item.x_medkit = build_action_xmedkit(*action_info, entity_id, type_introspection);
+    detail.item.x_medkit = build_action_xmedkit(*resolved.action, entity_id, type_introspection);
   }
   return detail;
 }
@@ -609,26 +750,51 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
   const auto & ops = lookup->ops;
   const std::string id_field = (lookup->entity_type == "app") ? "app_id" : "component_id";
 
-  std::optional<ServiceInfo> service_info;
-  std::optional<ActionInfo> action_info;
-  for (const auto & svc : ops.services) {
-    if (svc.name == operation_id) {
-      service_info = svc;
-      break;
-    }
+  auto parsed = http::parse_member_qualified_id(operation_id, ops.is_aggregated);
+  if (parsed.has_member && !names_a_member(ops, parsed.member_id)) {
+    return tl::make_unexpected(
+        make_error(404, ERR_RESOURCE_NOT_FOUND, "Member not found in entity",
+                   json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"member_id", parsed.member_id}}));
   }
-  if (!service_info.has_value()) {
-    for (const auto & act : ops.actions) {
-      if (act.name == operation_id) {
-        action_info = act;
-        break;
-      }
-    }
-  }
-  if (!service_info.has_value() && !action_info.has_value()) {
+
+  auto resolved = resolve_operation(ops, parsed);
+  if (!resolved.found()) {
     return tl::make_unexpected(make_error(404, ERR_OPERATION_NOT_FOUND, "Operation not found",
                                           json{{"entity_id", entity_id}, {"operation_id", operation_id}}));
   }
+
+  // A bare id that names more than one operation runs whichever member was
+  // walked first, and the caller never learns which. That is the one case the
+  // bare form cannot carry, so it is the one case that is refused - an id that
+  // names a single operation still executes, which is what every current
+  // client sends. An id that names nothing was already answered as not found
+  // above: telling a caller to qualify a typo would not help them.
+  if (!parsed.has_member) {
+    const std::vector<std::string> providers = local_providers_of(ops, operation_id);
+    if (providers.size() > 1) {
+      return tl::make_unexpected(
+          make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: more than one member provides it",
+                     json{{"details", "Use format 'member_id:operation_id' to name the member that runs it"},
+                          {"entity_id", entity_id},
+                          {"operation_id", operation_id},
+                          {"member_ids", providers}}));
+    }
+  }
+
+  // Whoever ends up owning the resolved operation must actually be reachable.
+  {
+    const std::string & full_path =
+        resolved.service.has_value() ? resolved.service->full_path : resolved.action->full_path;
+    auto owner = ops.owner_by_path.find(full_path);
+    if (owner != ops.owner_by_path.end()) {
+      if (auto err = member_unavailable_error(cache, entity_id, owner->second, operation_id)) {
+        return tl::make_unexpected(*err);
+      }
+    }
+  }
+
+  const std::optional<ServiceInfo> & service_info = resolved.service;
+  const std::optional<ActionInfo> & action_info = resolved.action;
 
   auto * operation_mgr = ctx_.node()->get_operation_manager();
 

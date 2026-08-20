@@ -32,6 +32,7 @@
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/http/member_qualified_id.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/providers/data_provider.hpp"
 #include "ros2_medkit_gateway/dto/json_reader.hpp"
@@ -87,6 +88,86 @@ tl::expected<std::string, ErrorInfo> read_topic_id(const http::TypedRequest & re
   return tl::make_unexpected(make_error(400, ERR_INVALID_REQUEST, "Invalid request"));
 }
 
+/// A data item is addressed by its full ROS topic path; the leading slash is
+/// optional on the wire because the route captures a percent-decoded segment.
+std::string to_full_topic_path(const std::string & topic_name) {
+  if (topic_name.empty() || topic_name.front() == '/') {
+    return topic_name;
+  }
+  return "/" + topic_name;
+}
+
+/// What one addressed data item resolves to: the ROS topic to act on, and the
+/// id to echo back to the caller.
+struct AddressedDataItem {
+  std::string full_topic_path;
+  std::string item_id;
+};
+
+/// Resolve the id in the route against the entity, for reads and writes alike.
+///
+/// A qualified id is answered exactly, because the member set and what each
+/// member contributes are both known here: an id naming an unknown member, or
+/// an item that member does not provide, is a miss. Without that check the
+/// gateway samples the local graph, finds nothing, and returns 200 with an
+/// empty body and status `metadata_only` - a typo reported as success.
+///
+/// A ROS topic name cannot contain a colon, so one in the id can only be the
+/// member separator. Building the member set is not free, so the cache is only
+/// consulted for an id that carries one; a bare id addresses a topic path,
+/// which names one topic on its own and keeps its existing behaviour.
+tl::expected<AddressedDataItem, ErrorInfo>
+address_data_item(const ThreadSafeEntityCache & cache, const std::string & entity_id, const std::string & topic_name) {
+  AddressedDataItem addressed;
+  addressed.full_topic_path = to_full_topic_path(topic_name);
+  addressed.item_id = addressed.full_topic_path;
+
+  if (topic_name.find(':') == std::string::npos) {
+    return addressed;
+  }
+
+  auto aggregated = cache.get_entity_data(entity_id);
+  auto parsed = http::parse_member_qualified_id(topic_name, aggregated.is_aggregated);
+  if (!parsed.has_member) {
+    return addressed;
+  }
+
+  if (std::find(aggregated.source_ids.begin(), aggregated.source_ids.end(), parsed.member_id) ==
+      aggregated.source_ids.end()) {
+    return tl::make_unexpected(
+        make_error(404, ERR_RESOURCE_NOT_FOUND, "Member not found in entity",
+                   json{{"entity_id", entity_id}, {"id", topic_name}, {"member_id", parsed.member_id}}));
+  }
+
+  // A member retained while its gateway is silent stays addressable and says
+  // why it cannot answer, rather than falling through to a sample of the local
+  // graph that comes back empty and reads as success.
+  if (auto app = cache.get_app(parsed.member_id); app && !app->available) {
+    return tl::make_unexpected(
+        make_error(504, ERR_NOT_RESPONDING, "Member '" + parsed.member_id + "' is not available",
+                   json{{"details",
+                         "The gateway contributing this member is not answering; it is retained from its "
+                         "last known declaration"},
+                        {"entity_id", entity_id},
+                        {"id", topic_name},
+                        {"member_id", parsed.member_id}}));
+  }
+
+  addressed.full_topic_path = to_full_topic_path(parsed.item_id);
+  auto owners = aggregated.owners_by_topic.find(addressed.full_topic_path);
+  if (owners == aggregated.owners_by_topic.end() ||
+      std::find(owners->second.begin(), owners->second.end(), parsed.member_id) == owners->second.end()) {
+    return tl::make_unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "Data item not provided by member",
+                                          json{{"entity_id", entity_id},
+                                               {"id", topic_name},
+                                               {"member_id", parsed.member_id},
+                                               {"topic_name", addressed.full_topic_path}}));
+  }
+
+  addressed.item_id = http::make_member_qualified_id(parsed.member_id, addressed.full_topic_path);
+  return addressed;
+}
+
 /// Build the typed x-medkit per-item payload for the list endpoint.
 dto::XMedkitDataItem build_list_item_xmedkit(const std::string & topic_name, const std::string & direction,
                                              const std::string & topic_type,
@@ -127,11 +208,15 @@ void apply_fan_out_observability(dto::DataListXMedkit & xm, const FanOutResult<d
 
 /// Build a `DataValue` whose `content` matches the wire shape produced by the
 /// legacy `handle_get_data_item` (top-level `id`, `data`, `x-medkit`).
-dto::DataValue build_read_response(const std::string & full_topic_path, const TopicSampleResult & sample,
-                                   const std::string & entity_id,
+/// `item_id` is the id the caller addressed - a qualified id when it named a
+/// member, the topic path otherwise - and is echoed so a caller can keep using
+/// the id it read out of the collection. `full_topic_path` is the ROS topic
+/// that was actually sampled.
+dto::DataValue build_read_response(const std::string & item_id, const std::string & full_topic_path,
+                                   const TopicSampleResult & sample, const std::string & entity_id,
                                    ros2_medkit_serialization::TypeIntrospection * type_introspection) {
   json response;
-  response["id"] = full_topic_path;
+  response["id"] = item_id;
   if (sample.has_data && sample.data) {
     response["data"] = *sample.data;
   } else {
@@ -170,10 +255,11 @@ dto::DataValue build_read_response(const std::string & full_topic_path, const To
 /// Build a `DataValue` whose `content` matches the wire shape produced by the
 /// legacy `handle_put_data_item` write echo (top-level `id`, `data`,
 /// `x-medkit`).
-dto::DataValue build_write_response(const std::string & full_topic_path, const std::string & msg_type,
-                                    const std::string & entity_id, const json & data, const json & publish_result) {
+dto::DataValue build_write_response(const std::string & item_id, const std::string & full_topic_path,
+                                    const std::string & msg_type, const std::string & entity_id, const json & data,
+                                    const json & publish_result) {
   json response;
-  response["id"] = full_topic_path;
+  response["id"] = item_id;
   response["data"] = data;  // Echo back the written data
 
   dto::XMedkitDataItem xm;
@@ -286,6 +372,13 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
       di.category = "currentData";
       const std::string topic_type = cache.get_topic_type(topic.name);
       di.x_medkit = build_list_item_xmedkit(topic.name, topic.direction, topic_type, type_introspection);
+      // Attribute the item to the members that contribute it. Only a grouping
+      // has members to name; on a leaf the entity is the sole contributor and
+      // the field stays absent rather than repeating the entity id.
+      if (auto owners = aggregated.owners_by_topic.find(topic.name);
+          owners != aggregated.owners_by_topic.end() && aggregated.is_aggregated) {
+        di.x_medkit->member_ids = owners->second;
+      }
       response.items.push_back(std::move(di));
     }
 
@@ -306,6 +399,15 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
     for (auto & item : fan_out.items) {
       response.items.push_back(std::move(item));
     }
+
+    // A topic path names one topic however many members publish and subscribe
+    // to it - those merge into a single item, whose contributors are already
+    // named in member_ids - so nothing here is qualified in the ordinary case.
+    // Two gateways each contributing an item under one path is the case that
+    // is genuinely ambiguous, and it is the case this catches.
+    http::qualify_ambiguous_ids(response.items, [](const dto::DataItem & item) {
+      return item.x_medkit.has_value() && item.x_medkit->member_ids.has_value() ? &*item.x_medkit->member_ids : nullptr;
+    });
 
     dto::DataListXMedkit xm;
     xm.entity_id = entity_id;
@@ -383,13 +485,11 @@ http::Result<dto::DataValue> DataHandlers::get_data_item(const http::TypedReques
   }
 
   try {
-    // Determine the full ROS topic path.
-    std::string full_topic_path;
-    if (topic_name.empty() || topic_name[0] == '/') {
-      full_topic_path = topic_name;
-    } else {
-      full_topic_path = "/" + topic_name;
+    auto addressed = address_data_item(ctx_.node()->get_thread_safe_cache(), entity_id, topic_name);
+    if (!addressed) {
+      return tl::make_unexpected(addressed.error());
     }
+    const std::string & full_topic_path = addressed->full_topic_path;
 
     // Sampling goes through the pool-backed TopicDataProvider (issue #375 race
     // fix). The provider is configured in main() before serving traffic.
@@ -417,7 +517,7 @@ http::Result<dto::DataValue> DataHandlers::get_data_item(const http::TypedReques
     }
 
     auto type_introspection = data_access_mgr->get_type_introspection();
-    return build_read_response(full_topic_path, *r, entity_id, type_introspection);
+    return build_read_response(addressed->item_id, full_topic_path, *r, entity_id, type_introspection);
   } catch (const TopicNotAvailableException & e) {
     RCLCPP_DEBUG(HandlerContext::logger(), "Topic not available for entity '%s', topic '%s': %s", entity_id.c_str(),
                  topic_name.c_str(), e.what());
@@ -560,16 +660,17 @@ http::Result<dto::DataValue> DataHandlers::put_data_item(const http::TypedReques
                      json{{"details", "Message type should be in format: package/msg/Type"}, {"type", msg_type}}));
     }
 
-    // Build full topic path (mirror GET logic: only prefix '/' when needed).
-    std::string full_topic_path = topic_name;
-    if (!full_topic_path.empty() && full_topic_path.front() != '/') {
-      full_topic_path = "/" + full_topic_path;
+    // A write addresses the same item a read does, so it resolves the same way.
+    auto addressed = address_data_item(ctx_.node()->get_thread_safe_cache(), entity_id, topic_name);
+    if (!addressed) {
+      return tl::make_unexpected(addressed.error());
     }
+    const std::string & full_topic_path = addressed->full_topic_path;
 
     // Publish data using DataAccessManager.
     auto data_access_mgr = ctx_.node()->get_data_access_manager();
     json publish_result = data_access_mgr->publish_to_topic(full_topic_path, msg_type, data);
-    return build_write_response(full_topic_path, msg_type, entity_id, data, publish_result);
+    return build_write_response(addressed->item_id, full_topic_path, msg_type, entity_id, data, publish_result);
   } catch (const std::exception & e) {
     RCLCPP_ERROR(HandlerContext::logger(), "Error in put_data_item for entity '%s', topic '%s': %s", entity_id.c_str(),
                  topic_name.c_str(), e.what());
