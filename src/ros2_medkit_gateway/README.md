@@ -257,6 +257,57 @@ curl http://localhost:8080/api/v1/areas/nonexistent/components
 - Hierarchical navigation (select area → view its components)
 - Area-specific health checks
 
+### Item Ids and Their Providers
+
+An entity that draws items from members - an Area, a Function, or a Component
+with hosted apps - names the contributing members of every listed item in
+`x-medkit.member_ids`.
+
+Ids stay bare. An item id is the ROS name its member uses: the topic path for
+`/data`, the service or action short name for `/operations`. That does not
+change with aggregation, which is the ordinary case - in runtime discovery
+every App hangs off the single host Component.
+
+An id is qualified only when it is ambiguous, meaning more than one item in the
+merged collection carries it:
+
+```
+<member_id>:<item_id>
+```
+
+Ambiguity is decided after the peer fan-out, since neither gateway can see the
+collision alone. Two members exposing the operation short name `calibrate` at
+different ROS paths are two items with one id, so both are qualified. A topic
+path names one topic however many members publish and subscribe to it, so it
+stays bare and lists its contributors in `member_ids`; it is qualified only if
+two gateways each contribute an item under that path.
+
+- A bare id that names one item works on every route, which is what the web UI,
+  the Foxglove panel, the MCP tools and the generated OpenAPI document all send.
+- `POST /{entity}/operations/{id}/executions` with a bare id several members
+  provide is `400 invalid-request`, naming the qualified form and the members.
+- A qualified id is accepted on single-item routes; an unknown member half, or
+  an item half that member does not provide, is `404` - which is what tells an
+  absent item apart from one that exists and carries no data.
+- `GET` of a bare id stays permissive and returns the first match.
+
+Ambiguity is decided from the declared tree, which includes a peer's declared
+operations held locally. The answer therefore does not change with who is
+reachable, costs no network call, and cannot be altered by a client-supplied
+header.
+
+When a peer stops answering, the entities it declared in its manifest are
+retained and marked unavailable (`x-medkit.available: false`,
+`x-medkit.is_online: false`); the ones it only discovered at runtime disappear.
+A request addressed to a retained entity answers `504 not-responding` naming
+the member, instead of being forwarded to the silent peer as a `502`. `/health`
+still reports the peer itself as `offline` - entity availability and peer
+health are separate questions.
+
+`/configurations` predates this rule and keeps its own: on a multi-node entity
+every parameter id is `<app_id>:<param_name>`, a bare id is refused on write,
+and items carry `x-medkit.source` rather than `member_ids`.
+
 ### Component Data Read Endpoints
 
 #### GET /api/v1/components/{component_id}/data

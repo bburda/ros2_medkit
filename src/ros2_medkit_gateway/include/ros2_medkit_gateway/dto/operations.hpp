@@ -54,13 +54,23 @@ struct XMedkitOperationItem {
   std::optional<std::string> entity_id;
   std::optional<std::string> source;
   std::optional<nlohmann::json> type_info;  // free-form: dynamic ROS IDL schemas
+  /// Members of the grouping that contribute this item.
+  ///
+  /// Absent on a leaf entity, where the entity is the only contributor.
+  /// A list rather than one id because an item can genuinely have several:
+  /// a topic published by one member and subscribed by another is merged
+  /// into a single item, and two members can expose the same operation
+  /// short name. More than one entry is what makes the bare item id
+  /// ambiguous for addressing.
+  std::optional<std::vector<std::string>> member_ids;
 };
 
 template <>
 inline constexpr auto dto_fields<XMedkitOperationItem> =
     std::make_tuple(field("ros2", &XMedkitOperationItem::ros2), field("entity_id", &XMedkitOperationItem::entity_id),
                     field("source", &XMedkitOperationItem::source),
-                    field("type_info", &XMedkitOperationItem::type_info));
+                    field("type_info", &XMedkitOperationItem::type_info),
+                    field("member_ids", &XMedkitOperationItem::member_ids));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitOperationItem> = "XMedkitOperationItem";

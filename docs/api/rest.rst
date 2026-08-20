@@ -608,10 +608,100 @@ Functions
       supported, and the vendor resource ``/x-medkit-graph`` exposes a function-scoped
       graph snapshot. See :ref:`sovd-compliance` for details.
 
+.. _member-qualified-ids:
+
+Item Ids and Their Providers
+----------------------------
+
+An entity that draws its items from members - an Area, a Function, or a
+Component with hosted apps - lists what its members provide. Each listed item
+carries the members that contribute it in ``x-medkit.member_ids``, so a caller
+can always see where an item came from.
+
+**Ids stay bare.** An item id is the ROS name the member itself uses: the topic
+path for ``/data``, the service or action short name for ``/operations``. This
+is the ordinary case and it does not change with aggregation - in runtime
+discovery every App hangs off the single host Component, so almost every entity
+draws from members.
+
+**Except when the id is ambiguous.** When more than one item in the merged
+collection carries the same id, each of those copies is addressed with the
+member that owns it::
+
+   <member_id>:<item_id>
+
+The split is on the first colon: an entity id is restricted to alphanumerics,
+underscore and hyphen and so never contains one, while an item name can.
+
+Ambiguity is decided on the merged collection, after peer fan-out, because that
+is where it becomes visible - two gateways each holding one ``calibrate`` both
+consider it unique. In practice:
+
+- ``/operations`` - two members exposing one short name at different ROS paths
+  are two items with one id, so both are qualified
+  (``primary_calibration:calibrate``, ``peer_calibration:calibrate``).
+- ``/data`` - a topic path names one topic however many members publish and
+  subscribe to it; those merge into a single item, so the bare path is kept and
+  every contributor is named in ``member_ids``. A path is qualified only when
+  two gateways each contribute an item under it.
+
+What this means for a request:
+
+- A bare id that names one item works, on every route. Every client that sends
+  the ROS short name keeps working, and it is what the generated OpenAPI
+  document describes.
+- ``POST /{entity}/operations/{id}/executions`` with a bare id that more than
+  one member provides is refused with ``400 invalid-request``, naming the
+  qualified form and listing the members in ``parameters.member_ids``. Running
+  whichever member was walked first without saying which one ran is the defect
+  this removes.
+- A qualified id is accepted on the single-item routes. A member half that
+  names no member of the entity is ``404``, and so is an item half that member
+  does not provide - which is what tells an absent item apart from an item that
+  exists and currently carries no data.
+- Reads are permissive: ``GET`` of a bare id returns the first match rather
+  than refusing, which is the behaviour every existing client depends on.
+
+Ambiguity is a property of the declared tree, not of who is reachable right
+now. A peer's declared operations are held locally, so the same request gets
+the same answer whether or not that peer is currently answering, and deciding
+it costs no network call. It cannot be changed by anything a client sends.
+
+.. _retained-entities:
+
+Entities of a Silent Peer
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a peer stops answering, the entities it **declared in its manifest** are
+retained and marked unavailable; the ones it merely discovered from its live
+ROS graph disappear, because nothing can observe that graph any more. A
+retained entity:
+
+- stays listed and stays addressable, so the tree does not change shape when a
+  link drops;
+- reports ``x-medkit.available: false`` and ``x-medkit.is_online: false``;
+- answers any request addressed to it with ``504`` and the SOVD standard code
+  ``not-responding``, naming the member - rather than being forwarded to the
+  silent peer and surfacing as a ``502``, or falling through to a local read
+  that returns ``200`` with an empty body.
+
+``/health`` is unchanged: the peer itself is listed there with
+``status: "offline"``. Availability of an entity and health of a peer are
+separate questions and are reported separately.
+
+.. note::
+
+   ``/configurations`` predates this rule and keeps its own: on an entity whose
+   parameters come from more than one node, **every** parameter id is
+   ``<app_id>:<param_name>``, and a bare id is refused on write. Its items carry
+   ``x-medkit.source`` (a single app id), not ``member_ids``. See
+   :ref:`configuration-endpoints`.
+
 Data Endpoints
 --------------
 
-Read and publish data from ROS 2 topics.
+Read and publish data from ROS 2 topics. Item ids follow
+:ref:`member-qualified-ids`.
 
 ``GET /api/v1/components/{id}/data``
    Read all topic data from an entity.
@@ -664,7 +754,9 @@ Read and publish data from ROS 2 topics.
 Operations Endpoints
 --------------------
 
-Execute ROS 2 services and actions.
+Execute ROS 2 services and actions. Operation ids follow
+:ref:`member-qualified-ids`: a short name that only one member exposes is used
+bare, and one that several expose is addressed ``<member_id>:<operation>``.
 
 List Operations
 ~~~~~~~~~~~~~~~
@@ -904,10 +996,21 @@ Request Transition
 
       curl -X PUT http://localhost:8080/api/v1/apps/temp_sensor/status/restart
 
+.. _configuration-endpoints:
+
 Configurations Endpoints
 ------------------------
 
 Manage ROS 2 node parameters.
+
+.. note::
+
+   Parameter ids do not follow :ref:`member-qualified-ids`. On an entity backed
+   by more than one node every parameter id is ``<app_id>:<param_name>``,
+   whether or not that name is ambiguous, and a bare id is refused on ``PUT``
+   and ``DELETE`` with ``400 invalid-request``. ``GET`` accepts the bare form
+   and returns the first node that answers. Items carry the owning app in
+   ``x-medkit.source``.
 
 ``GET /api/v1/components/{id}/configurations``
    List all parameters for an entity.

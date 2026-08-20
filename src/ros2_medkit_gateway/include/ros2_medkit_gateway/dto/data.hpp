@@ -69,16 +69,24 @@ struct XMedkitDataItem {
   std::optional<std::int64_t> timestamp;         // sample timestamp in ns (read responses)
   std::optional<std::int64_t> publisher_count;   // publisher count at sample time (read responses)
   std::optional<std::int64_t> subscriber_count;  // subscriber count at sample time (read responses)
+  /// Members of the grouping that contribute this item.
+  ///
+  /// Absent on a leaf entity, where the entity is the only contributor.
+  /// A list rather than one id because an item can genuinely have several:
+  /// a topic published by one member and subscribed by another is merged
+  /// into a single item, and two members can expose the same operation
+  /// short name. More than one entry is what makes the bare item id
+  /// ambiguous for addressing.
+  std::optional<std::vector<std::string>> member_ids;
 };
 
 template <>
-inline constexpr auto dto_fields<XMedkitDataItem> =
-    std::make_tuple(field("ros2", &XMedkitDataItem::ros2), field("type_info", &XMedkitDataItem::type_info),
-                    field("entity_id", &XMedkitDataItem::entity_id), field("status", &XMedkitDataItem::status),
-                    field("publisher_created", &XMedkitDataItem::publisher_created),
-                    field("timestamp", &XMedkitDataItem::timestamp),
-                    field("publisher_count", &XMedkitDataItem::publisher_count),
-                    field("subscriber_count", &XMedkitDataItem::subscriber_count));
+inline constexpr auto dto_fields<XMedkitDataItem> = std::make_tuple(
+    field("ros2", &XMedkitDataItem::ros2), field("type_info", &XMedkitDataItem::type_info),
+    field("entity_id", &XMedkitDataItem::entity_id), field("status", &XMedkitDataItem::status),
+    field("publisher_created", &XMedkitDataItem::publisher_created), field("timestamp", &XMedkitDataItem::timestamp),
+    field("publisher_count", &XMedkitDataItem::publisher_count),
+    field("subscriber_count", &XMedkitDataItem::subscriber_count), field("member_ids", &XMedkitDataItem::member_ids));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitDataItem> = "XMedkitDataItem";

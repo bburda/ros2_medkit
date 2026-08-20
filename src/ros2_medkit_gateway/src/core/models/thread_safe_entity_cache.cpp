@@ -15,8 +15,10 @@
 #include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <mutex>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 
 namespace ros2_medkit_gateway {
@@ -118,9 +120,9 @@ bool ThreadSafeEntityCache::patch_map(FlatHashMap<std::string, std::string> & ma
 void ThreadSafeEntityCache::refresh_grew() {
   const bool any_grew = areas_.grew() || components_.grew() || apps_.grew() || functions_.grew() ||
                         area_index_.grew() || component_index_.grew() || app_index_.grew() || function_index_.grew() ||
-                        component_to_apps_.grew() || area_to_components_.grew() || area_to_subareas_.grew() ||
-                        function_to_apps_.grew() || operation_index_.grew() || topic_type_cache_.grew() ||
-                        node_to_app_.grew();
+                        component_to_apps_.grew() || component_to_subcomponents_.grew() || area_to_components_.grew() ||
+                        area_to_subareas_.grew() || function_to_apps_.grew() || function_to_components_.grew() ||
+                        operation_index_.grew() || topic_type_cache_.grew() || node_to_app_.grew();
   if (any_grew) {
     grew_ = true;
     ++overflow_count_;
@@ -135,9 +137,11 @@ void ThreadSafeEntityCache::refresh_grew() {
   app_index_.clear_grew();
   function_index_.clear_grew();
   component_to_apps_.clear_grew();
+  component_to_subcomponents_.clear_grew();
   area_to_components_.clear_grew();
   area_to_subareas_.clear_grew();
   function_to_apps_.clear_grew();
+  function_to_components_.clear_grew();
   operation_index_.clear_grew();
   topic_type_cache_.clear_grew();
   node_to_app_.clear_grew();
@@ -172,9 +176,11 @@ void ThreadSafeEntityCache::reserve(size_t capacity) {
   function_index_.reserve(capacity);
 
   component_to_apps_.reserve(capacity);
+  component_to_subcomponents_.reserve(capacity);
   area_to_components_.reserve(capacity);
   area_to_subareas_.reserve(capacity);
   function_to_apps_.reserve(capacity);
+  function_to_components_.reserve(capacity);
 
   operation_index_.reserve(capacity);
   topic_type_cache_.reserve(capacity);
@@ -958,9 +964,11 @@ uint64_t ThreadSafeEntityCache::generation() const {
 
 void ThreadSafeEntityCache::rebuild_relationship_indexes() {
   component_to_apps_.reset();
+  component_to_subcomponents_.reset();
   area_to_components_.reset();
   area_to_subareas_.reset();
   function_to_apps_.reset();
+  function_to_components_.reset();
 
   // Build component_to_apps from apps' component_id
   apps_.for_each_live([&](uint32_t slot, const App & app) {
@@ -976,6 +984,19 @@ void ThreadSafeEntityCache::rebuild_relationship_indexes() {
     }
   });
 
+  // Build component_to_subcomponents from components' parent_component_id.
+  //
+  // Nothing indexed this direction before, so a hierarchical parent Component
+  // could not have its children enumerated from the cache at all: the only
+  // child lookups were linear scans in the discovery layer. Member resolution
+  // needs it, because a parent Component is a grouping whose resources come
+  // from its children.
+  components_.for_each_live([&](uint32_t slot, const Component & comp) {
+    if (!comp.parent_component_id.empty()) {
+      component_to_subcomponents_.get_or_create(comp.parent_component_id).push_back(slot);
+    }
+  });
+
   // Build area_to_subareas from areas' parent_area_id
   areas_.for_each_live([&](uint32_t slot, const Area & area) {
     if (!area.parent_area_id.empty()) {
@@ -983,17 +1004,128 @@ void ThreadSafeEntityCache::rebuild_relationship_indexes() {
     }
   });
 
-  // Build function_to_apps (functions have a hosts field which is a vector of app IDs).
-  // Function.hosts may also name Components - host ids that do not resolve to an
-  // app are silently dropped (preserving the original behaviour).
+  // Build function_to_apps and function_to_components from Function::hosts.
+  //
+  // `hosts` may name either an App or a Component. Only the App half was
+  // indexed, and a host id that resolved to a Component was dropped without a
+  // word, so a Function hosting a Component reported none of that Component's
+  // resources. Both halves are indexed now; a host id that resolves to neither
+  // is still skipped, because there is nothing to point at.
   functions_.for_each_live([&](uint32_t, const Function & func) {
-    for (const auto & app_id : func.hosts) {
-      const uint32_t * app_slot = app_index_.find(app_id);
+    for (const auto & host_id : func.hosts) {
+      const uint32_t * app_slot = app_index_.find(host_id);
       if (app_slot && apps_.is_live(*app_slot)) {
         function_to_apps_.get_or_create(func.id).push_back(*app_slot);
+        continue;
+      }
+      const uint32_t * comp_slot = component_index_.find(host_id);
+      if (comp_slot && components_.is_live(*comp_slot)) {
+        function_to_components_.get_or_create(func.id).push_back(*comp_slot);
       }
     }
   });
+}
+
+std::vector<std::string> ThreadSafeEntityCache::get_members(SovdEntityType type, const std::string & entity_id) const {
+  std::shared_lock lock(mutex_);
+  std::vector<std::string> members;
+  std::unordered_set<std::string> seen;
+
+  // One traversal for every grouping kind. Before this there were several, and
+  // they disagreed: Area operations did not descend into subareas, Function
+  // walks dropped Component hosts, and a parent Component had no walk at all.
+  // A caller that resolves an item to a member and a caller that lists the
+  // grouping's items have to agree, or the aggregator advertises what it will
+  // not serve.
+  //
+  // `seen` is not defensive bookkeeping. Component-parent cycles are known to
+  // occur - the aggregation classifier handles them explicitly - and the
+  // manifest validator only checks that a parent exists, not that the graph is
+  // acyclic.
+  const auto add = [&](const std::string & id) {
+    if (!id.empty() && seen.insert(id).second) {
+      members.push_back(id);
+    }
+  };
+
+  // Declared before the recursive lambdas that call each other.
+  std::function<void(const std::string &)> collect_component;
+  std::function<void(const std::string &)> collect_area;
+
+  collect_component = [&](const std::string & component_id) {
+    add(component_id);
+    if (const std::vector<uint32_t> * app_slots = component_to_apps_.find(component_id)) {
+      for (uint32_t slot : *app_slots) {
+        if (apps_.is_live(slot)) {
+          add(apps_[slot].id);
+        }
+      }
+    }
+    if (const std::vector<uint32_t> * child_slots = component_to_subcomponents_.find(component_id)) {
+      for (uint32_t slot : *child_slots) {
+        if (components_.is_live(slot) && !seen.count(components_[slot].id)) {
+          collect_component(components_[slot].id);
+        }
+      }
+    }
+  };
+
+  collect_area = [&](const std::string & area_id) {
+    if (const std::vector<uint32_t> * comp_slots = area_to_components_.find(area_id)) {
+      for (uint32_t slot : *comp_slots) {
+        if (components_.is_live(slot)) {
+          collect_component(components_[slot].id);
+        }
+      }
+    }
+    if (const std::vector<uint32_t> * sub_slots = area_to_subareas_.find(area_id)) {
+      for (uint32_t slot : *sub_slots) {
+        if (areas_.is_live(slot) && seen.insert("area:" + areas_[slot].id).second) {
+          collect_area(areas_[slot].id);
+        }
+      }
+    }
+  };
+
+  switch (type) {
+    case SovdEntityType::AREA:
+      seen.insert("area:" + entity_id);
+      collect_area(entity_id);
+      break;
+    case SovdEntityType::COMPONENT:
+      // The Component itself is a member: unlike an Area or a Function it can
+      // own services and actions of its own, and the operations aggregation
+      // already counts those before its Apps.
+      collect_component(entity_id);
+      break;
+    case SovdEntityType::FUNCTION:
+      if (const std::vector<uint32_t> * app_slots = function_to_apps_.find(entity_id)) {
+        for (uint32_t slot : *app_slots) {
+          if (apps_.is_live(slot)) {
+            add(apps_[slot].id);
+          }
+        }
+      }
+      if (const std::vector<uint32_t> * comp_slots = function_to_components_.find(entity_id)) {
+        for (uint32_t slot : *comp_slots) {
+          if (components_.is_live(slot)) {
+            collect_component(components_[slot].id);
+          }
+        }
+      }
+      break;
+    case SovdEntityType::APP:
+    case SovdEntityType::SERVER:
+    case SovdEntityType::UNKNOWN:
+      // A leaf is its own only member, so a caller that resolves an item
+      // against one needs no traversal and no special case of its own. Listed
+      // rather than defaulted because the build treats an unhandled enumerator
+      // as an error, which is what makes a new entity type surface here.
+      add(entity_id);
+      break;
+  }
+
+  return members;
 }
 
 void ThreadSafeEntityCache::rebuild_operation_index() {
@@ -1037,11 +1169,13 @@ void ThreadSafeEntityCache::collect_operations_from_apps(const std::vector<uint3
     for (const auto & svc : app.services) {
       if (seen_paths.insert(svc.full_path).second) {
         result.services.push_back(svc);
+        result.owner_by_path.emplace(svc.full_path, app.id);
       }
     }
     for (const auto & act : app.actions) {
       if (seen_paths.insert(act.full_path).second) {
         result.actions.push_back(act);
+        result.owner_by_path.emplace(act.full_path, app.id);
       }
     }
   }
@@ -1060,11 +1194,13 @@ void ThreadSafeEntityCache::collect_operations_from_component(uint32_t comp_slot
   for (const auto & svc : comp.services) {
     if (seen_paths.insert(svc.full_path).second) {
       result.services.push_back(svc);
+      result.owner_by_path.emplace(svc.full_path, comp.id);
     }
   }
   for (const auto & act : comp.actions) {
     if (seen_paths.insert(act.full_path).second) {
       result.actions.push_back(act);
+      result.owner_by_path.emplace(act.full_path, comp.id);
     }
   }
 }
@@ -1240,8 +1376,19 @@ void ThreadSafeEntityCache::collect_topics_from_app(uint32_t app_slot, std::unor
   const auto & app = apps_[app_slot];
   result.source_ids.push_back(app.id);
 
+  // Record this app against every topic it touches, whichever side it is on.
+  // A topic seen from both sides stays one item, so its owner list is what
+  // tells a caller that addressing it names more than one member.
+  const auto attribute = [&result, &app](const std::string & topic) {
+    auto & owners = result.owners_by_topic[topic];
+    if (std::find(owners.begin(), owners.end(), app.id) == owners.end()) {
+      owners.push_back(app.id);
+    }
+  };
+
   // Publishers
   for (const auto & topic : app.topics.publishes) {
+    attribute(topic);
     auto [_, inserted] = seen_topics.insert(topic);
     if (inserted) {
       result.topics.push_back({topic, "", "publish"});
@@ -1258,6 +1405,7 @@ void ThreadSafeEntityCache::collect_topics_from_app(uint32_t app_slot, std::unor
 
   // Subscribers
   for (const auto & topic : app.topics.subscribes) {
+    attribute(topic);
     auto [_, inserted] = seen_topics.insert(topic);
     if (inserted) {
       result.topics.push_back({topic, "", "subscribe"});
