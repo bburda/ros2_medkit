@@ -301,13 +301,29 @@ class AggregationManager {
   AggregationConfig config_;
   rclcpp::Logger logger_;
   size_t static_peer_count_{0};  ///< Number of statically configured peers (not subject to max_discovered_peers)
-  /// Record what `peer_name` declared, so it can be replayed while that peer is
-  /// silent. Stored already marked unavailable - it is only ever read back on
-  /// the path where the peer did not answer.
+  /// Whether a peer whose picture could not be refreshed can still be reached.
+  ///
+  /// `available:false` is the answer to "can a request get there", so it is
+  /// earned by a failed health check alone. A refresh that came back
+  /// incomplete from a peer that is still answering says nothing about
+  /// reachability - it says this gateway could not read the whole picture.
+  enum class Reachability {
+    kReachable,
+    kUnreachable,
+  };
+
+  /// Record what `peer_name` declared, so it can be replayed while that peer
+  /// cannot be described. Stored as the peer reported it; the unavailable
+  /// marking belongs to the replay, which is where reachability is known.
+  ///
+  /// Only ever called for a fetch that described the whole peer: a partial
+  /// picture recorded here would overwrite the last complete one and outlive
+  /// the cycle that failed to read it.
   void remember_declaration(const std::string & peer_name, const PeerEntities & entities);
 
   /// The retained declaration for `peer_name`, empty if none was ever recorded.
-  PeerEntities replay_declaration(const std::string & peer_name) const;
+  /// Marked unavailable when `reachability` says the peer cannot be reached.
+  PeerEntities replay_declaration(const std::string & peer_name, Reachability reachability) const;
 
   mutable std::shared_mutex mutex_;  // Declared before data it protects (destruction order)
   std::vector<std::shared_ptr<PeerClient>> peers_;
@@ -318,8 +334,9 @@ class AggregationManager {
   /// A tree that changes shape because a link went down cannot be reasoned
   /// about: the same request gets a different answer depending on who happens
   /// to be reachable. What a peer DECLARED is a property of its configuration
-  /// and does not stop being true when it stops replying, so it is retained and
-  /// marked unavailable. What a peer merely DISCOVERED at runtime is a property
+  /// and does not stop being true when it stops replying, so it is retained -
+  /// marked unavailable while the peer cannot be reached, and exactly as last
+  /// read while it can. What a peer merely DISCOVERED at runtime is a property
   /// of a live graph this gateway can no longer observe, so it is allowed to
   /// disappear.
   std::unordered_map<std::string, PeerEntities> retained_peer_entities_;

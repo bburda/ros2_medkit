@@ -358,6 +358,98 @@ Function parse_function(const nlohmann::json & j) {
   return func;
 }
 
+/**
+ * @brief What a non-200 on a sub-request means, which depends on the route.
+ */
+enum class RouteKind {
+  /// A top-level collection: ``/areas``, ``/components``, ``/apps``,
+  /// ``/functions``. Every peer serves these, so nothing but 200 describes one.
+  kCollection,
+  /// A nested collection: ``/areas/{id}/subareas``, ``/components/{id}/subcomponents``,
+  /// ``/apps/{id}/operations``. A gateway old enough not to have the route answers
+  /// 404, and aggregation has to keep working across that version boundary, so a
+  /// 404 here means "not offered" rather than "could not be read".
+  kNestedCollection,
+  /// The detail of an entity that carries availability of its own (a Component).
+  /// ``504 not-responding`` is the peer describing that entity as unreachable -
+  /// a statement about the entity, which an aggregating peer makes whenever it
+  /// is itself holding a declaration for a gateway that went quiet. It is
+  /// carried, not read as a hole in the picture.
+  kAddressableDetail,
+  /// The detail of a grouping entity (a Function). It has no availability of its
+  /// own to carry, and its members are named nowhere else, so nothing but 200
+  /// describes it.
+  kGroupingDetail,
+};
+
+/**
+ * @brief What one sub-request issued while describing a peer produced.
+ */
+struct SubResponse {
+  enum class Kind {
+    kBody,               ///< `body` holds the parsed response
+    kRouteAbsent,        ///< the peer does not offer this route; carry on without it
+    kEntityUnreachable,  ///< the peer named this entity and says it cannot be reached
+    kIncomplete,         ///< part of the picture could not be read; `error` says why
+  };
+
+  Kind kind{Kind::kIncomplete};
+  nlohmann::json body;
+  std::string error;
+};
+
+/**
+ * @brief True for a SOVD error body carrying the ``not-responding`` code.
+ */
+bool says_not_responding(const std::string & body) {
+  if (body.size() > MAX_PEER_RESPONSE_SIZE) {
+    return false;
+  }
+  auto parsed = nlohmann::json::parse(body, nullptr, false);
+  return !parsed.is_discarded() && parsed.is_object() && parsed.value("error_code", "") == ERR_NOT_RESPONDING;
+}
+
+/**
+ * @brief Classify one sub-request of a peer fetch.
+ *
+ * @param result httplib result for the call
+ * @param peer_name Peer the call was made against, for the error text
+ * @param path Route that was called, for the error text
+ * @param kind What a non-200 means on this route
+ */
+SubResponse read_sub_response(const httplib::Result & result, const std::string & peer_name, const std::string & path,
+                              RouteKind kind) {
+  SubResponse out;
+  if (!result) {
+    out.error = "Failed to connect to peer '" + peer_name + "' for " + path;
+    return out;
+  }
+  if (result->status == 404 && kind == RouteKind::kNestedCollection) {
+    out.kind = SubResponse::Kind::kRouteAbsent;
+    return out;
+  }
+  if (result->status == 504 && kind == RouteKind::kAddressableDetail && says_not_responding(result->body)) {
+    out.kind = SubResponse::Kind::kEntityUnreachable;
+    return out;
+  }
+  if (result->status != 200) {
+    out.error = "Peer '" + peer_name + "' returned status " + std::to_string(result->status) + " for " + path;
+    return out;
+  }
+  if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
+    out.error = "Response from peer '" + peer_name + "' for " + path + " exceeds size limit";
+    return out;
+  }
+  auto parsed = nlohmann::json::parse(result->body, nullptr, false);
+  if (parsed.is_discarded()) {
+    out.error = "Invalid JSON from peer '" + peer_name + "' for " + path;
+    return out;
+  }
+  out.kind = SubResponse::Kind::kBody;
+  out.body = std::move(parsed);
+  return out;
+}
+
 }  // namespace
 
 PeerClient::PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth)
@@ -427,24 +519,24 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
   PeerEntities entities;
   const std::string peer_source = "peer:" + name_;
 
+  // A route the peer does not offer is a property of the peer, not of the
+  // entity that happened to hit it first, so it is recorded once however many
+  // entities ask for it.
+  auto note_absent_route = [&entities](const std::string & route) {
+    if (std::find(entities.absent_routes.begin(), entities.absent_routes.end(), route) ==
+        entities.absent_routes.end()) {
+      entities.absent_routes.push_back(route);
+    }
+  };
+
   // Fetch areas
   {
-    auto result = cli.Get(std::string(API_PREFIX) + "/areas");
-    if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
+    auto response =
+        read_sub_response(cli.Get(std::string(API_PREFIX) + "/areas"), name_, "/areas", RouteKind::kCollection);
+    if (response.kind != SubResponse::Kind::kBody) {
+      return tl::unexpected<std::string>(response.error);
     }
-    if (result->status != 200) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for /areas");
-    }
-    if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' for /areas exceeds size limit");
-    }
-    auto response_json = nlohmann::json::parse(result->body, nullptr, false);
-    if (response_json.is_discarded()) {
-      return tl::unexpected<std::string>("Invalid JSON from peer '" + name_ + "' for /areas");
-    }
-    entities.areas = parse_collection<Area>(response_json, parse_area);
+    entities.areas = parse_collection<Area>(response.body, parse_area);
     // Validate entity IDs and enforce per-collection limit
     entities.areas.erase(std::remove_if(entities.areas.begin(), entities.areas.end(),
                                         [](const Area & a) {
@@ -465,20 +557,24 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
     // (which can invalidate references if the vector reallocates).
     std::vector<Area> all_subareas;
     for (const auto & area : entities.areas) {
-      auto sub_result = cli.Get(std::string(API_PREFIX) + "/areas/" + area.id + "/subareas");
-      if (sub_result && sub_result->status == 200 && sub_result->body.size() <= MAX_PEER_RESPONSE_SIZE) {
-        auto sub_json = nlohmann::json::parse(sub_result->body, nullptr, false);
-        if (!sub_json.is_discarded()) {
-          auto subareas = parse_collection<Area>(sub_json, parse_area);
-          for (auto & sub : subareas) {
-            if (!is_valid_entity_id(sub.id)) {
-              continue;
-            }
-            sub.declared_source = sub.source;
-            sub.source = peer_source;
-            all_subareas.push_back(std::move(sub));
-          }
+      const std::string route = "/areas/" + area.id + "/subareas";
+      auto sub =
+          read_sub_response(cli.Get(std::string(API_PREFIX) + route), name_, route, RouteKind::kNestedCollection);
+      if (sub.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(sub.error);
+      }
+      if (sub.kind == SubResponse::Kind::kRouteAbsent) {
+        note_absent_route("/areas/{id}/subareas");
+        continue;
+      }
+      auto subareas = parse_collection<Area>(sub.body, parse_area);
+      for (auto & subarea : subareas) {
+        if (!is_valid_entity_id(subarea.id)) {
+          continue;
         }
+        subarea.declared_source = subarea.source;
+        subarea.source = peer_source;
+        all_subareas.push_back(std::move(subarea));
       }
     }
     entities.areas.insert(entities.areas.end(), std::make_move_iterator(all_subareas.begin()),
@@ -487,23 +583,13 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
 
   // Fetch components (list then detail per entity for full relationship data)
   {
-    auto result = cli.Get(std::string(API_PREFIX) + "/components");
-    if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
-    }
-    if (result->status != 200) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for /components");
-    }
-    if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' for /components exceeds size limit");
-    }
-    auto response_json = nlohmann::json::parse(result->body, nullptr, false);
-    if (response_json.is_discarded()) {
-      return tl::unexpected<std::string>("Invalid JSON from peer '" + name_ + "' for /components");
+    auto response = read_sub_response(cli.Get(std::string(API_PREFIX) + "/components"), name_, "/components",
+                                      RouteKind::kCollection);
+    if (response.kind != SubResponse::Kind::kBody) {
+      return tl::unexpected<std::string>(response.error);
     }
     // Parse IDs from list, then fetch detail per entity for relationships
-    auto comp_list = parse_collection<Component>(response_json, parse_component);
+    auto comp_list = parse_collection<Component>(response.body, parse_component);
     // Validate entity IDs and enforce per-collection limit
     comp_list.erase(std::remove_if(comp_list.begin(), comp_list.end(),
                                    [](const Component & c) {
@@ -514,13 +600,23 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
       return tl::unexpected<std::string>("Peer '" + name_ + "' returned " + std::to_string(comp_list.size()) +
                                          " components (max " + std::to_string(MAX_ENTITIES_PER_COLLECTION) + ")");
     }
+    // The detail response carries the relationships (parent, dependencies,
+    // identity) the list omits, so a Component built from the list alone is a
+    // Component asserted to have none.
     for (auto & comp : comp_list) {
-      auto detail = cli.Get(std::string(API_PREFIX) + "/components/" + comp.id);
-      if (detail && detail->status == 200) {
-        auto detail_json = nlohmann::json::parse(detail->body, nullptr, false);
-        if (!detail_json.is_discarded()) {
-          comp = parse_component(detail_json);
-        }
+      const std::string route = "/components/" + comp.id;
+      auto detail =
+          read_sub_response(cli.Get(std::string(API_PREFIX) + route), name_, route, RouteKind::kAddressableDetail);
+      if (detail.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(detail.error);
+      }
+      if (detail.kind == SubResponse::Kind::kBody) {
+        comp = parse_component(detail.body);
+      } else {
+        // The peer holds this Component's id but cannot describe it: whoever
+        // contributes it has gone quiet. What the list gave is everything the
+        // peer can still say, and the availability is what it is saying.
+        comp.available = false;
       }
       comp.declared_source = comp.source;
       comp.source = peer_source;
@@ -530,28 +626,40 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
     // (which can invalidate references if the vector reallocates).
     std::vector<Component> all_subcomps;
     for (const auto & comp : comp_list) {
-      auto sub_result = cli.Get(std::string(API_PREFIX) + "/components/" + comp.id + "/subcomponents");
-      if (sub_result && sub_result->status == 200 && sub_result->body.size() <= MAX_PEER_RESPONSE_SIZE) {
-        auto sub_json = nlohmann::json::parse(sub_result->body, nullptr, false);
-        if (!sub_json.is_discarded()) {
-          auto subcomps = parse_collection<Component>(sub_json, parse_component);
-          for (auto & sub : subcomps) {
-            if (!is_valid_entity_id(sub.id)) {
-              continue;
-            }
-            // Fetch detail for each subcomponent to get full relationships
-            auto detail = cli.Get(std::string(API_PREFIX) + "/components/" + sub.id);
-            if (detail && detail->status == 200) {
-              auto detail_json = nlohmann::json::parse(detail->body, nullptr, false);
-              if (!detail_json.is_discarded()) {
-                sub = parse_component(detail_json);
-              }
-            }
-            sub.declared_source = sub.source;
-            sub.source = peer_source;
-            all_subcomps.push_back(std::move(sub));
-          }
+      const std::string route = "/components/" + comp.id + "/subcomponents";
+      auto sub =
+          read_sub_response(cli.Get(std::string(API_PREFIX) + route), name_, route, RouteKind::kNestedCollection);
+      if (sub.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(sub.error);
+      }
+      if (sub.kind == SubResponse::Kind::kRouteAbsent) {
+        note_absent_route("/components/{id}/subcomponents");
+        continue;
+      }
+      auto subcomps = parse_collection<Component>(sub.body, parse_component);
+      for (auto & subcomp : subcomps) {
+        if (!is_valid_entity_id(subcomp.id)) {
+          continue;
         }
+        // Fetch detail for each subcomponent to get full relationships
+        const std::string detail_route = "/components/" + subcomp.id;
+        auto detail = read_sub_response(cli.Get(std::string(API_PREFIX) + detail_route), name_, detail_route,
+                                        RouteKind::kAddressableDetail);
+        if (detail.kind == SubResponse::Kind::kIncomplete) {
+          return tl::unexpected<std::string>(detail.error);
+        }
+        if (detail.kind == SubResponse::Kind::kBody) {
+          subcomp = parse_component(detail.body);
+        } else {
+          subcomp.available = false;
+          // The route this id came from is itself the statement that `comp` is
+          // its parent, so the tree keeps its shape even though the entity's
+          // own description is out of reach.
+          subcomp.parent_component_id = comp.id;
+        }
+        subcomp.declared_source = subcomp.source;
+        subcomp.source = peer_source;
+        all_subcomps.push_back(std::move(subcomp));
       }
     }
     comp_list.insert(comp_list.end(), std::make_move_iterator(all_subcomps.begin()),
@@ -562,22 +670,12 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
 
   // Fetch apps
   {
-    auto result = cli.Get(std::string(API_PREFIX) + "/apps");
-    if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
+    auto response =
+        read_sub_response(cli.Get(std::string(API_PREFIX) + "/apps"), name_, "/apps", RouteKind::kCollection);
+    if (response.kind != SubResponse::Kind::kBody) {
+      return tl::unexpected<std::string>(response.error);
     }
-    if (result->status != 200) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for /apps");
-    }
-    if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' for /apps exceeds size limit");
-    }
-    auto response_json = nlohmann::json::parse(result->body, nullptr, false);
-    if (response_json.is_discarded()) {
-      return tl::unexpected<std::string>("Invalid JSON from peer '" + name_ + "' for /apps");
-    }
-    entities.apps = parse_collection<App>(response_json, parse_app);
+    entities.apps = parse_collection<App>(response.body, parse_app);
     // Validate entity IDs and enforce per-collection limit
     entities.apps.erase(std::remove_if(entities.apps.begin(), entities.apps.end(),
                                        [](const App & a) {
@@ -613,37 +711,29 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
     // hop that answers for it. It is also what makes this terminate.
     for (auto & app : entities.apps) {
       httplib::Headers no_fan_out{{"X-Medkit-No-Fan-Out", "1"}};
-      auto ops_result = cli.Get(std::string(API_PREFIX) + "/apps/" + app.id + "/operations", no_fan_out);
-      if (!ops_result || ops_result->status != 200 || ops_result->body.size() > MAX_PEER_RESPONSE_SIZE) {
+      const std::string route = "/apps/" + app.id + "/operations";
+      auto ops = read_sub_response(cli.Get(std::string(API_PREFIX) + route, no_fan_out), name_, route,
+                                   RouteKind::kNestedCollection);
+      if (ops.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(ops.error);
+      }
+      if (ops.kind == SubResponse::Kind::kRouteAbsent) {
+        note_absent_route("/apps/{id}/operations");
         continue;
       }
-      auto ops_json = nlohmann::json::parse(ops_result->body, nullptr, false);
-      if (ops_json.is_discarded()) {
-        continue;
-      }
-      parse_operations_into(ops_json, app);
+      parse_operations_into(ops.body, app);
     }
   }
 
   // Fetch functions (list then detail per entity for hosts data)
   {
-    auto result = cli.Get(std::string(API_PREFIX) + "/functions");
-    if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
-    }
-    if (result->status != 200) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for /functions");
-    }
-    if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' for /functions exceeds size limit");
-    }
-    auto response_json = nlohmann::json::parse(result->body, nullptr, false);
-    if (response_json.is_discarded()) {
-      return tl::unexpected<std::string>("Invalid JSON from peer '" + name_ + "' for /functions");
+    auto response =
+        read_sub_response(cli.Get(std::string(API_PREFIX) + "/functions"), name_, "/functions", RouteKind::kCollection);
+    if (response.kind != SubResponse::Kind::kBody) {
+      return tl::unexpected<std::string>(response.error);
     }
     // Parse IDs from list, then fetch detail per entity for hosts
-    auto func_list = parse_collection<Function>(response_json, parse_function);
+    auto func_list = parse_collection<Function>(response.body, parse_function);
     // Validate entity IDs and enforce per-collection limit
     func_list.erase(std::remove_if(func_list.begin(), func_list.end(),
                                    [](const Function & f) {
@@ -654,14 +744,17 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
       return tl::unexpected<std::string>("Peer '" + name_ + "' returned " + std::to_string(func_list.size()) +
                                          " functions (max " + std::to_string(MAX_ENTITIES_PER_COLLECTION) + ")");
     }
+    // A Function's hosts live only in its detail response: the list carries
+    // none. A Function built from the list alone is a Function asserted to
+    // group nothing, which is a statement the peer never made.
     for (auto & func : func_list) {
-      auto detail = cli.Get(std::string(API_PREFIX) + "/functions/" + func.id);
-      if (detail && detail->status == 200) {
-        auto detail_json = nlohmann::json::parse(detail->body, nullptr, false);
-        if (!detail_json.is_discarded()) {
-          func = parse_function(detail_json);
-        }
+      const std::string route = "/functions/" + func.id;
+      auto detail =
+          read_sub_response(cli.Get(std::string(API_PREFIX) + route), name_, route, RouteKind::kGroupingDetail);
+      if (detail.kind != SubResponse::Kind::kBody) {
+        return tl::unexpected<std::string>(detail.error);
       }
+      func = parse_function(detail.body);
       func.declared_source = func.source;
       func.source = peer_source;
     }

@@ -389,6 +389,39 @@ action. Individual entity requests for remote entities (e.g.,
 ``GET /api/v1/apps/{id}``) return ``502 Bad Gateway`` if the owning peer
 is unreachable.
 
+Peer Refresh Completeness
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A cache refresh reads a peer over several requests: the four entity lists, the
+nested ``subareas`` and ``subcomponents`` collections, the per-entity detail
+that carries a Component's relationships and a Function's hosts, and each app's
+``operations``. If any of them cannot be read - connection failure, a status
+the route has no other meaning for, an oversized body, unparsable JSON - the
+refresh for that peer is discarded whole. A partial picture is never published
+as a complete one, and the peer's last complete declaration is left in place.
+
+What clients see then depends on the peer's health check:
+
+- Health check fails: the retained declaration is served with
+  ``x-medkit.available: false`` (and ``x-medkit.is_online: false`` for Apps),
+  because a request addressed there cannot arrive.
+- Health check passes: the retained declaration is served unchanged and the
+  incomplete refresh is logged at ``WARN``. Availability is untouched - the
+  peer can still be reached; this gateway merely failed to read all of it.
+
+Two statuses are read rather than treated as failures:
+
+- ``404`` on a nested collection route means the peer runs a gateway version
+  that does not expose the route. Those members are omitted, the rest of the
+  peer merges normally, and the absent routes are logged once per refresh at
+  ``WARN``.
+- ``504`` with error code ``not-responding`` on a Component's detail means the
+  peer holds that id and the gateway contributing it has gone quiet - the
+  answer an aggregating peer gives for a declaration it is retaining. In a
+  chain topology this is how the far end reports a dead leaf, so the Component
+  is kept as the peer's list named it and marked
+  ``x-medkit.available: false``.
+
 .. _aggregation-breaking-changes:
 
 Breaking Changes (Entity Model Simplification)

@@ -296,9 +296,28 @@ operations held locally. The answer therefore does not change with who is
 reachable, costs no network call, and cannot be altered by a client-supplied
 header.
 
+A refresh describes a peer or it does not. Reading one takes several requests -
+the four entity lists, the nested `subareas` and `subcomponents` collections,
+the per-entity detail that carries a Component's relationships and a Function's
+hosts, and each app's `operations` - and if any of them cannot be read, the
+whole refresh is dropped instead of published with the missing branch silently
+absent. The peer's last complete declaration stands for another cycle. Two statuses
+carry a meaning of their own and are read instead: a `404` on a nested
+collection route means the peer runs a gateway that predates that route, so
+those members are omitted, the rest of the peer merges normally and the absent
+routes are logged once per refresh; a `504 not-responding` on a Component's
+detail is the peer saying it holds that id and whoever contributes it has gone
+quiet, which is what an aggregating peer answers for a declaration it is
+retaining, so the Component is kept as its list named it and marked
+`x-medkit.available: false`.
+
 When a peer stops answering, the entities it declared in its manifest are
 retained and marked unavailable (`x-medkit.available: false`,
 `x-medkit.is_online: false`); the ones it only discovered at runtime disappear.
+`available: false` answers "can a request get there", so it is earned by a
+failed health check alone - a peer that still answers `/health` keeps its
+entities as they were last read even when a refresh against it came back
+incomplete.
 A retained member keeps the operations it last reported: they stay listed on the
 aggregating entity marked `x-medkit.available: false`, and still count towards
 ambiguity, so a qualified id never degrades back to a bare one that execution
