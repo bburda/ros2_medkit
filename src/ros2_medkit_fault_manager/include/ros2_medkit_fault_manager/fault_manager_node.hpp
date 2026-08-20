@@ -219,6 +219,7 @@ class FaultManagerNode : public rclcpp::Node {
   /// committed fault-state change (the fault store is a separate DB); it is not
   /// atomicity.
   bool audit_fail_closed_{false};
+
   std::atomic<uint64_t> audit_dropped_writes_{0};  ///< Count of audit appends that failed (lost rows)
   std::atomic<bool> audit_healthy_{true};          ///< Cleared on the first failed audit append
 
