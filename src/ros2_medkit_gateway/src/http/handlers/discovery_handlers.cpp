@@ -51,6 +51,16 @@ void set_x_medkit_external(dto::XMedkitApp & x_medkit, const std::optional<bool>
   }
 }
 
+/// Emit the x-medkit `available` flag only when the entity cannot be reached,
+/// so an absent field means reachable. Carried by the entities a request can be
+/// addressed to; a grouping entity is a view over members and has no
+/// availability of its own.
+void set_x_medkit_available(dto::XMedkitComponent & x_medkit, bool available) {
+  if (!available) {
+    x_medkit.available = false;
+  }
+}
+
 /// Check if a capability name is already present in the capabilities array
 bool has_capability(const json & capabilities, const std::string & name) {
   for (const auto & cap : capabilities) {
@@ -371,6 +381,7 @@ DiscoveryHandlers::get_area_components(const http::TypedRequest & req) {
         }
 
         dto::XMedkitComponent x_medkit_comp;
+        set_x_medkit_available(x_medkit_comp, component.available);
         if (!component.source.empty()) {
           x_medkit_comp.source = component.source;
         }
@@ -526,6 +537,7 @@ DiscoveryHandlers::get_area_contains(const http::TypedRequest & req) {
       item.type = "component";
 
       dto::XMedkitComponent x_medkit_comp;
+      set_x_medkit_available(x_medkit_comp, comp.available);
       if (!comp.source.empty()) {
         x_medkit_comp.source = comp.source;
       }
@@ -588,6 +600,7 @@ DiscoveryHandlers::get_components(const http::TypedRequest & req) {
       }
 
       dto::XMedkitComponent x_medkit_comp;
+      set_x_medkit_available(x_medkit_comp, component.available);
       if (!component.source.empty()) {
         x_medkit_comp.source = component.source;
       }
@@ -698,6 +711,7 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     detail.links = links.build();
 
     dto::XMedkitComponent x_medkit_comp;
+    set_x_medkit_available(x_medkit_comp, comp.available);
     if (!comp.source.empty()) {
       x_medkit_comp.source = comp.source;
     }
@@ -810,6 +824,7 @@ DiscoveryHandlers::get_subcomponents(const http::TypedRequest & req) {
       item.type = "component";
 
       dto::XMedkitComponent x_medkit_comp;
+      set_x_medkit_available(x_medkit_comp, sub.available);
       if (!sub.source.empty()) {
         x_medkit_comp.source = sub.source;
       }
@@ -885,6 +900,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_component
 
       dto::XMedkitApp x_medkit_app;
       x_medkit_app.is_online = app.is_online;
+      // Emitted only when false: an absent field means reachable.
+      if (!app.available) {
+        x_medkit_app.available = false;
+      }
       if (!app.source.empty()) {
         x_medkit_app.source = app.source;
       }
@@ -955,6 +974,7 @@ DiscoveryHandlers::get_component_depends_on(const http::TypedRequest & req) {
         item.name = dep_opt->name.empty() ? dep_id : dep_opt->name;
 
         dto::XMedkitComponent x_medkit_comp;
+        set_x_medkit_available(x_medkit_comp, dep_opt->available);
         if (!dep_opt->source.empty()) {
           x_medkit_comp.source = dep_opt->source;
         }
@@ -1018,6 +1038,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_apps(cons
         x_medkit_app.source = app.source;
       }
       x_medkit_app.is_online = app.is_online;
+      // Emitted only when false: an absent field means reachable.
+      if (!app.available) {
+        x_medkit_app.available = false;
+      }
       if (!app.component_id.empty()) {
         x_medkit_app.component_id = app.component_id;
       }
@@ -1155,6 +1179,10 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
       x_medkit_app.source = app.source;
     }
     x_medkit_app.is_online = app.is_online;
+    // Emitted only when false: an absent field means reachable.
+    if (!app.available) {
+      x_medkit_app.available = false;
+    }
     if (app.bound_fqn) {
       dto::XMedkitRos2 ros2;
       ros2.node = *app.bound_fqn;
@@ -1226,6 +1254,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_app_depen
           x_medkit_app.source = dep_opt->source;
         }
         x_medkit_app.is_online = dep_opt->is_online;
+        // Emitted only when false: an absent field means reachable.
+        if (!dep_opt->available) {
+          x_medkit_app.available = false;
+        }
         set_x_medkit_external(x_medkit_app, dep_opt->external);
         item.x_medkit = x_medkit_app;
       } else {
@@ -1607,6 +1639,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_function_
 
         dto::XMedkitApp x_medkit_app;
         x_medkit_app.is_online = app_opt->is_online;
+        // Emitted only when false: an absent field means reachable.
+        if (!app_opt->available) {
+          x_medkit_app.available = false;
+        }
         if (!app_opt->source.empty()) {
           x_medkit_app.source = app_opt->source;
         }

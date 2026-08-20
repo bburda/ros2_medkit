@@ -299,8 +299,12 @@ header.
 When a peer stops answering, the entities it declared in its manifest are
 retained and marked unavailable (`x-medkit.available: false`,
 `x-medkit.is_online: false`); the ones it only discovered at runtime disappear.
-A request addressed to a retained entity answers `504 not-responding` naming
-the member, instead of being forwarded to the silent peer as a `502`. `/health`
+A retained member keeps the operations it last reported: they stay listed on the
+aggregating entity marked `x-medkit.available: false`, and still count towards
+ambiguity, so a qualified id never degrades back to a bare one that execution
+would refuse. A request addressed to a retained entity answers
+`504 not-responding` naming the member, instead of being forwarded to the silent
+peer as a `502`. `/health`
 still reports the peer itself as `offline` - entity availability and peer
 health are separate questions.
 

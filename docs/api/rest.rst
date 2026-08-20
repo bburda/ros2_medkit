@@ -680,6 +680,12 @@ retained entity:
 - stays listed and stays addressable, so the tree does not change shape when a
   link drops;
 - reports ``x-medkit.available: false`` and ``x-medkit.is_online: false``;
+- keeps the operations it last reported. They stay listed on the aggregating
+  entity, each marked ``x-medkit.available: false``, and they still count
+  towards ambiguity - so an id that two members provide stays qualified and its
+  bare form stays refused whether or not either member is answering. A response
+  that suppressed fan-out (``X-Medkit-No-Fan-Out``) omits peer-owned items,
+  because the peers were never asked, but still qualifies what it does list;
 - answers any request addressed to it with ``504`` and the SOVD standard code
   ``not-responding``, naming the member - rather than being forwarded to the
   silent peer and surfacing as a ``502``, or falling through to a local read

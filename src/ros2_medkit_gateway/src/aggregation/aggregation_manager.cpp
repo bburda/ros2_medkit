@@ -355,6 +355,72 @@ PeerEntities AggregationManager::fetch_all_peer_entities() {
   return merged;
 }
 
+namespace {
+
+/// True for an entity a peer said it had DECLARED, rather than discovered from
+/// its live ROS graph. Only a declaration outlives the link that reported it:
+/// runtime discovery describes a graph this gateway can no longer observe once
+/// the peer stops answering, so it is not ours to keep asserting.
+template <class Entity>
+bool is_declared(const Entity & entity) {
+  return entity.declared_source == "manifest";
+}
+
+/// Availability belongs to an entity a request can be addressed to. A grouping
+/// entity has none of its own: it is a view over its members, and the members
+/// carry the flag, so retaining one says nothing about what can be reached.
+void mark_unreachable(Area &) {
+}
+void mark_unreachable(Function &) {
+}
+void mark_unreachable(App & app) {
+  app.available = false;
+}
+void mark_unreachable(Component & component) {
+  component.available = false;
+}
+
+/// The declared entities of `src`, with the addressable ones marked unreachable.
+template <class Entity>
+std::vector<Entity> declared_only(const std::vector<Entity> & src) {
+  std::vector<Entity> kept;
+  for (const auto & entity : src) {
+    if (!is_declared(entity)) {
+      continue;
+    }
+    kept.push_back(entity);
+    mark_unreachable(kept.back());
+  }
+  return kept;
+}
+
+}  // namespace
+
+void AggregationManager::remember_declaration(const std::string & peer_name, const PeerEntities & entities) {
+  PeerEntities declared;
+  declared.areas = declared_only(entities.areas);
+  declared.components = declared_only(entities.components);
+  declared.apps = declared_only(entities.apps);
+  declared.functions = declared_only(entities.functions);
+
+  // A retained App is not observably running: the graph it was bound to is on
+  // the other side of a link that is down. `is_online` is the field every
+  // consumer already reads for that, so it carries the news rather than a
+  // second flag they would each have to learn.
+  for (auto & app : declared.apps) {
+    app.is_online = false;
+  }
+
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  retained_peer_entities_[peer_name] = std::move(declared);
+}
+
+PeerEntities AggregationManager::replay_declaration(const std::string & peer_name) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = retained_peer_entities_.find(peer_name);
+  return it == retained_peer_entities_.end() ? PeerEntities{} : it->second;
+}
+
 AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_entities(
     const std::vector<Area> & local_areas, const std::vector<Component> & local_components,
     const std::vector<App> & local_apps, const std::vector<Function> & local_functions, size_t max_entities_per_peer,
@@ -384,11 +450,14 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
   // shared_ptr copies keep PeerClients alive even if remove_discovered_peer()
   // erases them from peers_ concurrently.
   std::vector<std::shared_ptr<PeerClient>> snapshot;
+  std::vector<std::string> silent_peers;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     for (const auto & peer : peers_) {
       if (peer->is_healthy()) {
         snapshot.push_back(peer);
+      } else {
+        silent_peers.push_back(peer->name());
       }
     }
   }
@@ -437,15 +506,42 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
   std::vector<PeerClaim> peer_component_claims;
 
   // Collect results and merge sequentially (merge order must be deterministic)
+  std::vector<PeerFetchResult> to_merge;
+  to_merge.reserve(futures.size() + silent_peers.size());
   for (auto & f : futures) {
     auto pfr = f.get();
     if (!pfr.success) {
       if (logger) {
         RCLCPP_WARN(*logger, "Failed to fetch entities from peer '%s': %s", pfr.peer_name.c_str(), pfr.error.c_str());
       }
+      silent_peers.push_back(pfr.peer_name);
       continue;
     }
+    remember_declaration(pfr.peer_name, pfr.entities);
+    to_merge.push_back(std::move(pfr));
+  }
 
+  // A peer that did not answer still contributes what it declared, marked
+  // unavailable. Merged after the peers that did answer, so a live declaration
+  // always wins over a retained one carrying the same id.
+  for (const auto & peer_name : silent_peers) {
+    auto retained = replay_declaration(peer_name);
+    if (retained.areas.empty() && retained.components.empty() && retained.apps.empty() && retained.functions.empty()) {
+      continue;
+    }
+    if (logger) {
+      RCLCPP_INFO(*logger, "Peer '%s' not answering; retaining %zu declared entities as unavailable", peer_name.c_str(),
+                  retained.areas.size() + retained.components.size() + retained.apps.size() +
+                      retained.functions.size());
+    }
+    PeerFetchResult replayed;
+    replayed.peer_name = peer_name;
+    replayed.success = true;
+    replayed.entities = std::move(retained);
+    to_merge.push_back(std::move(replayed));
+  }
+
+  for (auto & pfr : to_merge) {
     PeerClaim claim;
     claim.peer_name = pfr.peer_name;
     for (const auto & c : pfr.entities.components) {

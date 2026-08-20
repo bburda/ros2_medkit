@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -478,10 +479,18 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
   auto data_access_mgr = ctx_.node()->get_data_access_manager();
   auto type_introspection = data_access_mgr->get_type_introspection();
 
-  // A peer's declared operations live in this cache so that ambiguity can be
-  // decided without asking anyone at request time. They are not listed from
-  // here: the gateway that owns an operation is the one that reports it, and
-  // this walk runs even when the caller asked for no fan-out at all.
+  // How many members the DECLARED tree says provide each short name. This is
+  // the same count `create_execution` refuses on, and it is read here so the
+  // listing and the execution cannot disagree: an id the tree calls ambiguous
+  // is never offered bare, wherever the copy came from.
+  std::unordered_map<std::string, size_t> declared_providers;
+  for (const auto & svc : ops.services) {
+    ++declared_providers[svc.name];
+  }
+  for (const auto & act : ops.actions) {
+    ++declared_providers[act.name];
+  }
+
   const auto contributed_by_peer = [&cache](const std::string & member_id) {
     static constexpr std::string_view kPeerPrefix = "peer:";
     if (auto app = cache.get_app(member_id)) {
@@ -497,35 +506,56 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
     return owner != ops.owner_by_path.end() && contributed_by_peer(owner->second);
   };
 
-  for (const auto & svc : ops.services) {
-    if (owner_is_remote(svc.full_path)) {
-      continue;
+  // Qualify from the declared tree rather than by counting copies in this
+  // response. A response can be short a copy - the caller suppressed fan-out,
+  // or a peer did not answer - and counting copies would then hand back a bare
+  // id that the execution refuses.
+  const auto qualify_from_declared_tree = [&declared_providers](dto::OperationItem & item) {
+    if (item.id != item.name) {
+      return;  // already qualified, by us or by the peer that sent it
     }
+    auto count = declared_providers.find(item.name);
+    if (count == declared_providers.end() || count->second < 2) {
+      return;
+    }
+    if (!item.x_medkit.has_value() || !item.x_medkit->member_ids.has_value() ||
+        item.x_medkit->member_ids->size() != 1) {
+      return;
+    }
+    item.id = http::make_member_qualified_id(item.x_medkit->member_ids->front(), item.name);
+  };
+
+  const auto build_item = [&](const auto & op, bool asynchronous) {
     dto::OperationItem item;
-    item.id = svc.name;
-    item.name = svc.name;
+    item.id = op.name;
+    item.name = op.name;
     item.proximity_proof_required = false;
-    item.asynchronous_execution = false;
-    item.x_medkit = build_service_xmedkit(svc, entity_id, type_introspection);
-    if (auto owner = ops.owner_by_path.find(svc.full_path); owner != ops.owner_by_path.end() && ops.is_aggregated) {
+    item.asynchronous_execution = asynchronous;
+    if constexpr (std::is_same_v<std::decay_t<decltype(op)>, ServiceInfo>) {
+      item.x_medkit = build_service_xmedkit(op, entity_id, type_introspection);
+    } else {
+      item.x_medkit = build_action_xmedkit(op, entity_id, type_introspection);
+    }
+    if (auto owner = ops.owner_by_path.find(op.full_path); owner != ops.owner_by_path.end() && ops.is_aggregated) {
       item.x_medkit->member_ids = std::vector<std::string>{owner->second};
     }
-    collection.items.push_back(std::move(item));
+    qualify_from_declared_tree(item);
+    return item;
+  };
+
+  // A peer's operations are held here so ambiguity can be decided without
+  // asking anyone. They are not reported from this walk while the peer is
+  // reachable - the gateway that owns an operation is the one that reports it -
+  // so they are set aside and only fall back into the list below, when the
+  // fan-out that should have carried them did not.
+  std::vector<dto::OperationItem> retained_from_peers;
+  for (const auto & svc : ops.services) {
+    auto item = build_item(svc, false);
+    (owner_is_remote(svc.full_path) ? retained_from_peers : collection.items).push_back(std::move(item));
   }
   for (const auto & act : ops.actions) {
-    if (owner_is_remote(act.full_path)) {
-      continue;
-    }
-    dto::OperationItem item;
-    item.id = act.name;
-    item.name = act.name;
-    item.proximity_proof_required = false;
-    item.asynchronous_execution = true;
-    item.x_medkit = build_action_xmedkit(act, entity_id, type_introspection);
-    if (auto owner = ops.owner_by_path.find(act.full_path); owner != ops.owner_by_path.end() && ops.is_aggregated) {
-      item.x_medkit->member_ids = std::vector<std::string>{owner->second};
-    }
-    collection.items.push_back(std::move(item));
+    auto item = build_item(act, true);
+    (owner_is_remote(act.full_path) ? retained_from_peers : collection.items).push_back(std::move(item));
   }
 
   // Typed fan-out for the operations list. Replacement for the legacy raw-JSON
@@ -539,16 +569,42 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   const auto & raw_req = req.raw_for_framework();
 #pragma GCC diagnostic pop
+  // Two different reasons a peer's copy can be missing, and they are not the
+  // same answer. The caller asking for no fan-out means the peers were never
+  // consulted, and reporting their items anyway is what turns a bidirectionally
+  // peered pair into a bounce. A fan-out that ran and came back without them
+  // means the peer is not answering, and the tree still knows what it declared.
+  const bool fan_out_suppressed = raw_req.has_header("X-Medkit-No-Fan-Out");
   auto fan_out = fan_out_collection<dto::OperationItem>(ctx_.aggregation_manager(), raw_req);
+  std::unordered_set<std::string> paths_from_peers;
   for (auto & item : fan_out.items) {
+    if (item.x_medkit.has_value() && item.x_medkit->ros2.has_value()) {
+      const auto & ros2 = *item.x_medkit->ros2;
+      auto path = ros2.service.value_or(ros2.action.value_or(std::string{}));
+      if (!path.empty()) {
+        paths_from_peers.insert(std::move(path));
+      }
+    }
+    qualify_from_declared_tree(item);
     collection.items.push_back(std::move(item));
   }
 
-  // Two members exposing one short name are two items with one id, and the
-  // merged collection is the first place that is visible: each gateway holds
-  // one `calibrate` and considers it unique. An id only one item carries is
-  // left alone - it already names one thing, and rewriting it would break
-  // every client that sends the bare name.
+  if (!fan_out_suppressed) {
+    for (auto & item : retained_from_peers) {
+      const auto & ros2 = *item.x_medkit->ros2;
+      auto path = ros2.service.value_or(ros2.action.value_or(std::string{}));
+      if (!path.empty() && paths_from_peers.count(path) > 0u) {
+        continue;  // the owner answered for itself, which is the better copy
+      }
+      item.x_medkit->available = false;
+      collection.items.push_back(std::move(item));
+    }
+  }
+
+  // Catches ambiguity the declared tree has not seen: a copy that only reached
+  // this gateway through the fan-out, from a member whose operations are not in
+  // the local cache yet. An id only one item carries is left alone - it already
+  // names one thing, and rewriting it would break every client sending it.
   http::qualify_ambiguous_ids(collection.items, [](const dto::OperationItem & item) {
     return item.x_medkit.has_value() && item.x_medkit->member_ids.has_value() ? &*item.x_medkit->member_ids : nullptr;
   });

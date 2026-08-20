@@ -300,10 +300,29 @@ class AggregationManager {
  private:
   AggregationConfig config_;
   rclcpp::Logger logger_;
-  size_t static_peer_count_{0};      ///< Number of statically configured peers (not subject to max_discovered_peers)
+  size_t static_peer_count_{0};  ///< Number of statically configured peers (not subject to max_discovered_peers)
+  /// Record what `peer_name` declared, so it can be replayed while that peer is
+  /// silent. Stored already marked unavailable - it is only ever read back on
+  /// the path where the peer did not answer.
+  void remember_declaration(const std::string & peer_name, const PeerEntities & entities);
+
+  /// The retained declaration for `peer_name`, empty if none was ever recorded.
+  PeerEntities replay_declaration(const std::string & peer_name) const;
+
   mutable std::shared_mutex mutex_;  // Declared before data it protects (destruction order)
   std::vector<std::shared_ptr<PeerClient>> peers_;
   std::unordered_map<std::string, std::string> routing_table_;
+  /// Last known manifest-declared entities per peer name, replayed while that
+  /// peer is not answering.
+  ///
+  /// A tree that changes shape because a link went down cannot be reasoned
+  /// about: the same request gets a different answer depending on who happens
+  /// to be reachable. What a peer DECLARED is a property of its configuration
+  /// and does not stop being true when it stops replying, so it is retained and
+  /// marked unavailable. What a peer merely DISCOVERED at runtime is a property
+  /// of a live graph this gateway can no longer observe, so it is allowed to
+  /// disappear.
+  std::unordered_map<std::string, PeerEntities> retained_peer_entities_;
   std::unordered_map<std::string, std::vector<std::string>> peer_contributors_by_entity_;
   std::vector<LeafCollisionWarning> leaf_warnings_;
 

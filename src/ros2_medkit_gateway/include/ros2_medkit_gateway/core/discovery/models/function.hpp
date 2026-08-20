@@ -50,6 +50,13 @@ struct Function {
   // === Discovery metadata ===
   std::string source = "manifest";        ///< Discovery source: manifest or runtime
   std::vector<std::string> contributors;  ///< Aggregation provenance: "local" and/or "peer:<name>"
+  /// What the contributing gateway itself called this entity: "manifest",
+  /// "runtime", "node" or "topic". `source` is overwritten with `peer:<name>`
+  /// on arrival, because the identity-merge precedence keys on it, so the
+  /// origin would otherwise be lost - and the origin is what decides whether
+  /// the entity is retained when its peer stops answering. Empty for entities
+  /// this gateway discovered itself.
+  std::string declared_source;
 
   // === Serialization methods ===
 
@@ -74,7 +81,7 @@ struct Function {
 inline bool operator==(const Function & a, const Function & b) {
   return a.id == b.id && a.name == b.name && a.translation_id == b.translation_id && a.description == b.description &&
          a.tags == b.tags && a.hosts == b.hosts && a.depends_on == b.depends_on && a.source == b.source &&
-         a.contributors == b.contributors;
+         a.contributors == b.contributors && a.declared_source == b.declared_source;
 }
 inline bool operator!=(const Function & a, const Function & b) {
   return !(a == b);

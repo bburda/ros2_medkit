@@ -126,6 +126,8 @@ struct XMedkitComponent {
   std::optional<nlohmann::json> identity;
   std::optional<bool> missing;   // broken reference sentinel
   std::optional<bool> external;  // non-ROS external asset classification (#516)
+  // Emitted only when false; an absent field means reachable.
+  std::optional<bool> available;
 };
 
 template <>
@@ -136,7 +138,7 @@ inline constexpr auto dto_fields<XMedkitComponent> = std::make_tuple(
     field("variant", &XMedkitComponent::variant), field("description", &XMedkitComponent::description),
     field("contributors", &XMedkitComponent::contributors), field("capabilities", &XMedkitComponent::capabilities),
     field("identity", &XMedkitComponent::identity), field("missing", &XMedkitComponent::missing),
-    field("external", &XMedkitComponent::external));
+    field("external", &XMedkitComponent::external), field("available", &XMedkitComponent::available));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitComponent> = "XMedkitComponent";
@@ -164,6 +166,10 @@ struct XMedkitApp {
   std::optional<std::vector<std::string>> contributors;
   std::optional<bool> missing;   // broken reference sentinel
   std::optional<bool> external;  // non-ROS external asset classification (#516/#517)
+  /// Absent while the entity is reachable. False marks an entity retained from
+  /// a peer's last known declaration while that peer is not answering, so a
+  /// client can tell "declared but unreachable" from "gone".
+  std::optional<bool> available;
 };
 
 template <>
@@ -171,7 +177,7 @@ inline constexpr auto dto_fields<XMedkitApp> =
     std::make_tuple(field("ros2", &XMedkitApp::ros2), field("source", &XMedkitApp::source),
                     field("is_online", &XMedkitApp::is_online), field("component_id", &XMedkitApp::component_id),
                     field("contributors", &XMedkitApp::contributors), field("missing", &XMedkitApp::missing),
-                    field("external", &XMedkitApp::external));
+                    field("external", &XMedkitApp::external), field("available", &XMedkitApp::available));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitApp> = "XMedkitApp";
