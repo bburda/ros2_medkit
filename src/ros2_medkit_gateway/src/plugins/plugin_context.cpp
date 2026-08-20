@@ -297,12 +297,16 @@ class GatewayPluginContext : public RosPluginContext {
     return response;
   }
 
+  /// A plugin sampler is sampled with no way of saying that it narrows its
+  /// payload to the resource named by its second argument, so it is registered
+  /// as streaming its collection whole. A subscription URI naming a single item
+  /// of that collection is then refused rather than answered with everything.
   void register_sampler(
       const std::string & collection,
-      const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> & fn,
-      bool honours_resource_path) override {
+      const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> & fn)
+      override {
     if (sampler_registry_) {
-      sampler_registry_->register_sampler(collection, fn, /*is_builtin=*/false, honours_resource_path);
+      sampler_registry_->register_sampler(collection, fn, /*is_builtin=*/false, /*honours_resource_path=*/false);
     }
   }
 

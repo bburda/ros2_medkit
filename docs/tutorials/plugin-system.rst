@@ -295,8 +295,7 @@ providing access to gateway data and utilities:
 - ``acquire_lock()`` / ``release_lock()`` - acquire and release entity locks with optional scope and TTL
 - ``get_entity_snapshot()`` - returns an ``IntrospectionInput`` populated from the current entity cache
 - ``list_all_faults()`` - returns JSON object with a ``"faults"`` array containing all active faults across all entities
-- ``register_sampler(collection, fn, honours_resource_path = false)`` - registers a cyclic
-  subscription sampler for a custom collection name
+- ``register_sampler(collection, fn)`` - registers a cyclic subscription sampler for a custom collection name
 
 .. code-block:: cpp
 
@@ -334,18 +333,16 @@ and reflects the state of the gateway's thread-safe entity cache.
 ``list_all_faults()`` is useful for plugins that need cross-entity fault visibility (e.g.
 mapping fault codes to topics). Returns ``{}`` if the fault manager is unavailable.
 
-``register_sampler(collection, fn, honours_resource_path)`` wires a sampler into the
-``ResourceSamplerRegistry`` so that cyclic subscriptions created for ``collection``
-(e.g. ``"x-medkit-metrics"``) call ``fn(entity_id, resource_path)`` on each tick. The
-function must return ``tl::expected<nlohmann::json, std::string>``. See
-`Cyclic Subscription Extensions`_ for the lower-level registry API.
+``register_sampler(collection, fn)`` wires a sampler into the ``ResourceSamplerRegistry``
+so that cyclic subscriptions created for ``collection`` (e.g. ``"x-medkit-metrics"``)
+call ``fn(entity_id, resource_path)`` on each tick. The function must return
+``tl::expected<nlohmann::json, std::string>``. See `Cyclic Subscription Extensions`_
+for the lower-level registry API.
 
-``honours_resource_path`` defaults to ``false`` and states whether ``fn`` narrows its
-payload to the one resource named by ``resource_path``. Leave it ``false`` for a sampler
-that ignores that argument: the gateway then refuses a subscription whose resource URI
-names a single item of the collection with 400 ``x-medkit-invalid-resource-uri``, instead
-of accepting it and streaming the whole collection on every tick. Set it to ``true`` only
-when ``fn`` actually reads ``resource_path``.
+A sampler registered through the plugin context streams its whole collection on every
+tick. A subscription whose resource URI names a single item of that collection is
+refused with 400 ``x-medkit-invalid-resource-uri`` rather than accepted and answered
+with everything, so the URI must end at the collection.
 
 .. note::
 
@@ -412,7 +409,7 @@ all entities. Returns an empty object if the fault manager is unavailable:
      // Process each fault
    }
 
-**register_sampler(collection, fn, honours_resource_path = false)**
+**register_sampler(collection, fn)**
 
 Registers a cyclic subscription sampler for a custom collection name. Once
 registered, clients can create cyclic subscriptions on that collection for any
@@ -427,21 +424,6 @@ entity:
        if (!data) return tl::make_unexpected("no data for: " + entity_id);
        return *data;
      });
-
-The sampler above ignores ``resource_path`` and so answers with the whole
-collection; leaving ``honours_resource_path`` at its ``false`` default is what
-makes the gateway refuse ``/x-medkit-metrics/{item}`` instead of streaming
-everything in response to it. A sampler that does read ``resource_path`` passes
-``true``:
-
-.. code-block:: cpp
-
-   ctx_->register_sampler("x-medkit-metrics",
-     [this](const std::string& entity_id, const std::string& resource_path)
-         -> tl::expected<nlohmann::json, std::string> {
-       return collect_one_metric(entity_id, resource_path);
-     },
-     /*honours_resource_path=*/true);
 
 This is a convenience wrapper around the lower-level ``ResourceSamplerRegistry``
 API described in `Cyclic Subscription Extensions`_.
@@ -492,8 +474,7 @@ and transport providers during ``set_context()``.
 
 **Resource Samplers** provide the data for a collection when sampled by a subscription.
 Built-in samplers (``data``, ``faults``, ``configurations``, ``logs``, ``updates``) are
-registered by the gateway during startup. Of these only ``data`` and ``updates`` narrow
-their payload to a named resource; the rest stream their whole collection. Custom samplers are registered via ``ResourceSamplerRegistry``
+registered by the gateway during startup. Custom samplers are registered via ``ResourceSamplerRegistry``
 on the ``GatewayNode``:
 
 .. code-block:: cpp
@@ -503,14 +484,10 @@ on the ``GatewayNode``:
      [this](const std::string& entity_id, const std::string& resource_path)
        -> tl::expected<nlohmann::json, std::string> {
        return get_metrics(entity_id, resource_path);
-     },
-     /*is_builtin=*/false, /*honours_resource_path=*/true);
+     });
 
 Once registered, clients can create cyclic subscriptions on the ``x-medkit-metrics``
-collection for any entity. The trailing ``honours_resource_path`` argument declares
-that the sampler narrows its payload to the resource named in the subscription URI;
-without it the gateway refuses such a URI with 400, because a sampler that ignores
-``resource_path`` would answer a request for one item with the whole collection.
+collection for any entity.
 
 **Transport Providers** deliver subscription data via alternative protocols (beyond
 the built-in SSE transport). Register via ``TransportRegistry`` on the ``GatewayNode``:

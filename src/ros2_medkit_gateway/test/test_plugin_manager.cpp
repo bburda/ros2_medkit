@@ -19,8 +19,10 @@
 #include <chrono>
 #include <thread>
 
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/http/handlers/cyclic_subscription_handlers.hpp"
 #include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 
 using namespace ros2_medkit_gateway;
@@ -233,8 +235,7 @@ class MockThrowOnShutdown : public GatewayPlugin {
 /// so a dangling registration after teardown would be a use-after-free.
 class MockSamplerPlugin : public GatewayPlugin {
  public:
-  explicit MockSamplerPlugin(std::string collection, bool honours_resource_path = false)
-    : collection_(std::move(collection)), honours_resource_path_(honours_resource_path) {
+  explicit MockSamplerPlugin(std::string collection) : collection_(std::move(collection)) {
   }
   std::string name() const override {
     return "sampler_plugin";
@@ -242,17 +243,14 @@ class MockSamplerPlugin : public GatewayPlugin {
   void configure(const json & /*cfg*/) override {
   }
   void set_context(PluginContext & context) override {
-    context.register_sampler(
-        collection_,
-        [this](const std::string &, const std::string &) -> tl::expected<json, std::string> {
-          return json{{"plugin", name()}};
-        },
-        honours_resource_path_);
+    context.register_sampler(collection_,
+                             [this](const std::string &, const std::string &) -> tl::expected<json, std::string> {
+                               return json{{"plugin", name()}};
+                             });
   }
 
  private:
   std::string collection_;
-  bool honours_resource_path_;
 };
 
 /// Same sampler-registering behavior as MockSamplerPlugin, but also throws
@@ -453,22 +451,41 @@ TEST(PluginManagerTest, ShutdownAllRemovesPluginSamplers) {
   EXPECT_FALSE(sampler_registry.has_sampler("x-mock-shutdown-sampler"));
 }
 
-TEST(PluginManagerTest, PluginResourcePathDeclarationReachesRegistry) {
+/// A plugin registers a sampler through PluginContext, which carries no way of
+/// saying that the sampler narrows its payload to a named resource. Such a
+/// sampler therefore streams its whole collection, and a subscription URI
+/// naming a single item of that collection is refused rather than accepted and
+/// answered with everything on every tick.
+TEST(PluginManagerTest, PluginSamplerRefusesAResourcePath) {
   ResourceSamplerRegistry sampler_registry;
   TransportRegistry transport_registry;
   PluginManager mgr;
   mgr.set_registries(sampler_registry, transport_registry);
-  mgr.add_plugin(std::make_unique<MockSamplerPlugin>("x-mock-whole-collection"));
-  mgr.add_plugin(std::make_unique<MockSamplerPlugin>("x-mock-per-item", /*honours_resource_path=*/true));
+  mgr.add_plugin(std::make_unique<MockSamplerPlugin>("x-mock-metrics"));
   mgr.configure_plugins();
 
   auto ctx = make_gateway_plugin_context(nullptr, nullptr, &sampler_registry);
   mgr.set_context(*ctx);
 
-  ASSERT_TRUE(sampler_registry.has_sampler("x-mock-whole-collection"));
-  ASSERT_TRUE(sampler_registry.has_sampler("x-mock-per-item"));
-  EXPECT_FALSE(sampler_registry.honours_resource_path("x-mock-whole-collection"));
-  EXPECT_TRUE(sampler_registry.honours_resource_path("x-mock-per-item"));
+  ASSERT_TRUE(sampler_registry.has_sampler("x-mock-metrics"));
+
+  const std::string item_uri = "/api/v1/apps/node1/x-mock-metrics/cpu_usage";
+  auto item_parsed = handlers::CyclicSubscriptionHandlers::parse_resource_uri(item_uri);
+  ASSERT_TRUE(item_parsed.has_value());
+  auto item_result =
+      handlers::CyclicSubscriptionHandlers::validate_resource_path_support(sampler_registry, *item_parsed, item_uri);
+  ASSERT_FALSE(item_result.has_value());
+  EXPECT_EQ(item_result.error().http_status, 400);
+  EXPECT_EQ(item_result.error().code, ERR_X_MEDKIT_INVALID_RESOURCE_URI);
+  EXPECT_EQ(item_result.error().params["collection"], "x-mock-metrics");
+
+  // The collection URI is the one form such a sampler can answer.
+  const std::string collection_uri = "/api/v1/apps/node1/x-mock-metrics";
+  auto collection_parsed = handlers::CyclicSubscriptionHandlers::parse_resource_uri(collection_uri);
+  ASSERT_TRUE(collection_parsed.has_value());
+  EXPECT_TRUE(handlers::CyclicSubscriptionHandlers::validate_resource_path_support(sampler_registry, *collection_parsed,
+                                                                                   collection_uri)
+                  .has_value());
 }
 
 TEST(PluginManagerTest, BuiltinSamplerSurvivesPluginDisable) {

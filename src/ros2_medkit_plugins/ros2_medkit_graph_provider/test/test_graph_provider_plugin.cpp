@@ -345,10 +345,9 @@ class FakePluginContext : public RosPluginContext {
 
   void register_sampler(
       const std::string & collection,
-      const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> & fn,
-      bool honours_resource_path) override {
+      const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> & fn)
+      override {
     registered_samplers_[collection] = fn;
-    sampler_honours_resource_path_[collection] = honours_resource_path;
   }
 
   ResourceChangeNotifier * get_resource_change_notifier() override {
@@ -371,7 +370,6 @@ class FakePluginContext : public RosPluginContext {
   std::unordered_map<std::string,
                      std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)>>
       registered_samplers_;
-  std::unordered_map<std::string, bool> sampler_honours_resource_path_;
 };
 
 class LocalHttpServer {
@@ -1650,19 +1648,6 @@ TEST(GraphProviderPluginRouteTest, RegistersSamplerForCyclicSubscriptions) {
   auto result = ctx.registered_samplers_["x-medkit-graph"]("f1", "");
   ASSERT_TRUE(result.has_value());
   ASSERT_TRUE(result->contains("x-medkit-graph"));
-}
-
-// The sampler builds one document for the whole function and ignores its
-// resource_path argument, so it must register as not honouring a resource
-// path - the gateway refuses a per-item subscription URI on that basis.
-TEST(GraphProviderPluginRouteTest, SamplerDeclaresItDoesNotHonourResourcePath) {
-  GraphProviderPlugin plugin;
-  FakePluginContext ctx({{"f1", PluginEntityInfo{SovdEntityType::FUNCTION, "f1", "", ""}}});
-  plugin.configure({});
-  plugin.set_context(ctx);
-
-  ASSERT_EQ(ctx.sampler_honours_resource_path_.count("x-medkit-graph"), 1u);
-  EXPECT_FALSE(ctx.sampler_honours_resource_path_["x-medkit-graph"]);
 }
 
 TEST(GraphProviderPluginRouteTest, AppliesConfigFromConfigure) {
