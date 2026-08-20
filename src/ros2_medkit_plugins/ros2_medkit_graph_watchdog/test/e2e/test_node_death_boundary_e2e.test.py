@@ -276,11 +276,11 @@ C4_TARGET_NAMESPACE = '/powertrain/engine'
 # applies to miss_grace and prune_grace alike), chosen only to sit unambiguously outside
 # C4_EARLY_WINDOW_SEC below - 500 ticks at TICK_INTERVAL_MS is 100s, four times that window.
 C4_MISS_GRACE_LARGE = 500
-# Long enough that a near-floor config (this suite's own MISS_GRACE=20/4000ms convention - see
-# B5_MISS_GRACE, D2_MISS_GRACE) would already have raised by the time this window ends, so
-# staying silent through it is evidence the large value is actually GOVERNING behaviour, not
-# merely accepted and ignored; short enough to sit comfortably inside C4_MISS_GRACE_LARGE's own
-# ~100s nominal grace.
+# Long enough that a near-floor config would already have raised several times over by the time
+# this window ends - the near-floor graces in this package run 16 to 20 ticks, 3.4s to 4.2s
+# nominal at TICK_INTERVAL_MS, see B5_MISS_GRACE and D2_MISS_GRACE - so staying silent through it
+# is evidence the large value is actually GOVERNING behaviour, not merely accepted and ignored;
+# short enough to sit comfortably inside C4_MISS_GRACE_LARGE's own ~100s nominal grace.
 C4_EARLY_WINDOW_SEC = 25.0
 # Measured from the END of C4_EARLY_WINDOW_SEC, not from the kill: comfortably covers the
 # remaining ~75s to C4_MISS_GRACE_LARGE's own nominal grace-crossing point plus reporting

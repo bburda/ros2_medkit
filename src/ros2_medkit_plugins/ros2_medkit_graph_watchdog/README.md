@@ -1542,7 +1542,7 @@ genuine new occurrence, with its own `occurrence_count` and its own capture.
      never called dead; a `_ros2cli_*`-prefixed node is never tracked, checked against
      ros2cli's own naming constant; a bare-name collision names only the node that actually
      exited; a fast tick alone, nothing else perturbing the graph, raises nothing; a
-     five-cycle restart loop, acknowledged between cycles, reaches `occurrence_count: 5`;
+     three-cycle restart loop, acknowledged between cycles, reaches `occurrence_count: 3`;
      and a fault confirmed before a gateway restart stays CONFIRMED across it.
    - `test/e2e/test_node_death_suppression_e2e.test.py` (five scenarios): the allowlist
      suppresses the node it names; the SAME allowlist left unnamed in `suppress` is inert,

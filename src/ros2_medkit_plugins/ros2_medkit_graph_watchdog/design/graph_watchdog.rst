@@ -1185,7 +1185,7 @@ plus the suppression chain the detector shares no code with any sibling for:
    stack: ``test/e2e/test_node_death_e2e.test.py`` (ten scenarios covering the raise/clear
    round trip, no-heal-standalone, the lifecycle-deactivate/manifest-never-online/ros2cli
    non-cases, a bare-name collision naming only the node that exited, a fast tick alone
-   raising nothing, a five-cycle restart loop reaching ``occurrence_count: 5``, and a
+   raising nothing, a three-cycle restart loop reaching ``occurrence_count: 3``, and a
    fault surviving a gateway restart); ``test/e2e/test_node_death_suppression_e2e.test.py``
    (five scenarios covering the allowlist, its inertness when unnamed in ``suppress``, the
    clean-shutdown/still-active contrast, opt-in suppression, and pruning without a false
