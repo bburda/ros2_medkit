@@ -170,6 +170,15 @@ for the startup reclassification of HEALED faults. Per-topic snapshots are dropp
 default, because they belong to the one confirmed occurrence rather than to the series; set
 `snapshots.retain_on_clear` to keep them as well.
 
+With `snapshots.retain_on_clear` on, `~/get_fault` keeps serving the freeze-frame alongside the
+retained snapshots, because it records the most recent confirmation while the snapshots may belong
+to earlier ones. `~/get_snapshots` returns one entry per topic and serves the newest capture of
+that topic, whichever storage backend is in use.
+
+The bound is **per fault code, not per database**. Fault codes are unbounded in cardinality, so a
+reporter emitting a stream of distinct codes still grows the table; the bound caps what any single
+code costs, not the total.
+
 Retention is **bounded per fault code** by `near_miss.max_per_fault` (default 200), evicting the
 **oldest** entries first. That is deliberately the opposite of the snapshot limit's keep-earliest
 rule: a series frozen at boot says nothing about whether the rate is changing. Set it to 0 for
