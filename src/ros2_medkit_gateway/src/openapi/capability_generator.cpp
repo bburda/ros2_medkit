@@ -24,6 +24,7 @@
 
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
 #include "ros2_medkit_gateway/core/http/member_qualified_id.hpp"
+#include "ros2_medkit_gateway/core/http/operation_item_id.hpp"
 #include "ros2_medkit_gateway/core/models/entity_capabilities.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
@@ -275,8 +276,11 @@ nlohmann::json CapabilityGenerator::generate_resource_collection(const ResolvedP
     }
     paths[collection_path] = path_builder.build_operations_collection(entity_path, ops);
 
-    // Short names are not unique across members, and two of them produced the
-    // same key here, so one item's documentation silently replaced the other's.
+    // A path key that two operations produce documents one of them and drops
+    // the other, so the id here has to be the id the collection emits - both
+    // halves of it. `short_name_counts` decides the member half; a short name
+    // one provider carries twice takes the ROS path as its item half, because
+    // the member half is that same provider for both copies.
     std::unordered_map<std::string, size_t> short_name_counts;
     for (const auto & svc : ops.services) {
       ++short_name_counts[svc.name];
@@ -288,16 +292,18 @@ nlohmann::json CapabilityGenerator::generate_resource_collection(const ResolvedP
       auto owner = ops.owner_by_path.find(full_path);
       return owner != ops.owner_by_path.end() ? owner->second : std::string{};
     };
+    const auto addressed_by_path = http::operation_paths_addressed_by_path(ops);
+    const auto operation_id_of = [&](const std::string & name, const std::string & full_path) {
+      return qualified_item_id(http::operation_item_half(name, full_path, addressed_by_path), short_name_counts[name],
+                               owner_of(full_path));
+    };
 
     for (const auto & svc : ops.services) {
-      std::string item_path =
-          collection_path + "/" + qualified_item_id(svc.name, short_name_counts[svc.name], owner_of(svc.full_path));
+      std::string item_path = collection_path + "/" + operation_id_of(svc.name, svc.full_path);
       paths[item_path] = path_builder.build_operation_item(entity_path, svc);
     }
     for (const auto & action : ops.actions) {
-      std::string item_path =
-          collection_path + "/" +
-          qualified_item_id(action.name, short_name_counts[action.name], owner_of(action.full_path));
+      std::string item_path = collection_path + "/" + operation_id_of(action.name, action.full_path);
       paths[item_path] = path_builder.build_operation_item(entity_path, action);
     }
   } else if (resolved.resource_collection == "configurations") {

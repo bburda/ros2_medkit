@@ -63,6 +63,12 @@ R3  A leaf-owned item provided by MORE THAN ONE leaf is addressed
     App hangs off the one host Component, so "aggregating" is the ordinary
     entity, and qualifying everything there would change the ids of the most
     used entity in the product and refuse requests every current client sends.
+    Where ONE leaf provides two operations under one short name - the wire id
+    is the last segment of the ROS path, so `left/calibrate` and
+    `right/calibrate` are two operations called `calibrate` - the leaf half
+    names that same leaf twice and separates nothing. Those take the ROS path,
+    leading slash stripped, as their item half: "robot/left/calibrate" on the
+    leaf itself and "<leaf>:robot/left/calibrate" on an aggregate.
 R4  A bare id is refused only when it is ambiguous, and the refusal names the
     form to use. An unambiguous bare id keeps working.
 R5  A compound id reaches its leaf, local or on a peer, and returns that leaf's
@@ -126,7 +132,7 @@ PEER_DOMAIN_ID = get_test_domain_id(1)
 # exist for. With the same namespace on both sides the full paths are identical
 # and the local walk simply deduplicates the peer's copy away, which builds a
 # dedup collapse rather than the ambiguity.
-PRIMARY_NODES = ['temp_sensor', 'calibration', 'rpm_sensor']
+PRIMARY_NODES = ['temp_sensor', 'calibration', 'dual_calibration', 'rpm_sensor']
 PEER_NODES = ['pressure_sensor', 'actuator']
 PEER_CALIBRATION_NAMESPACE = '/chassis/brakes'
 
@@ -140,6 +146,17 @@ COLLIDING_LEAF = 'shared_sensor'
 # thing that separates the two copies, which is what makes this the parameter
 # the configuration cases below address.
 CALIBRATION_PARAM = 'calibration_offset'
+
+# One node exposing `left/calibrate` and `right/calibrate` under its own
+# namespace: two operations, one short name, one provider. The short name is the
+# wire id, and the member half names `dual_calibration` for both copies, so the
+# ROS path is the only thing left that tells them apart. It lives outside
+# `/powertrain/engine` so this collision stays independent of the one between
+# the two calibration Apps.
+DUAL_APP = 'dual_calibration'
+DUAL_NAMESPACE = '/testrig/dual'
+DUAL_LEFT_ID = 'testrig/dual/left/calibrate'
+DUAL_RIGHT_ID = 'testrig/dual/right/calibrate'
 
 MERGED_AREA = 'vehicle'
 MERGED_FUNCTION = 'vehicle_health'
@@ -176,6 +193,12 @@ apps:
     ros_binding:
       node_name: calibration
       namespace: /powertrain/engine
+  - id: {DUAL_APP}
+    name: "Dual Calibration Service"
+    is_located_on: {PARENT_COMPONENT}
+    ros_binding:
+      node_name: dual_calibration
+      namespace: {DUAL_NAMESPACE}
   - id: {COLLIDING_LEAF}
     name: "Shared Sensor (primary)"
     is_located_on: {PARENT_COMPONENT}
@@ -334,7 +357,8 @@ class GroupingAggregationTest(unittest.TestCase):
         # completes while the local ROS graph is still binding Apps to nodes, so
         # a collection read between those two moments is legitimately empty and
         # would fail every rule below for a reason unrelated to the rule.
-        cls._wait_for_apps(PRIMARY_URL, {'temp_sensor', 'primary_calibration'}, 'primary')
+        cls._wait_for_apps(
+            PRIMARY_URL, {'temp_sensor', 'primary_calibration', DUAL_APP}, 'primary')
         cls._wait_for_apps(PEER_URL, {'pressure_sensor', 'peer_calibration'}, 'peer')
         cls._wait_until_merged()
 
@@ -390,6 +414,34 @@ class GroupingAggregationTest(unittest.TestCase):
         response = requests.get(f'{PRIMARY_URL}/{entity_path}/{collection}', timeout=10)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json().get('items', [])
+
+    @staticmethod
+    def _run_operation(entity_path, operation_id):
+        """POST one execution of `operation_id` on the aggregating gateway."""
+        return requests.post(
+            f'{PRIMARY_URL}/{entity_path}/operations/'
+            f'{quote(operation_id, safe="")}/executions',
+            json={},
+            timeout=15,
+        )
+
+    def _assert_side_ran(self, response, side, operation_id):
+        """Assert the service the id names is the one that answered.
+
+        Both sides return 200, so the status says only that something ran. The
+        message each service builds names itself, which is the only thing on the
+        wire that distinguishes a resolved id from one that fell through to
+        whichever operation was walked first.
+        """
+        self.assertEqual(response.status_code, 200, response.text)
+        parameters = response.json().get('parameters')
+        self.assertIsInstance(
+            parameters, dict, f'no service response came back: {response.text}')
+        self.assertIs(parameters.get('success'), True, parameters)
+        self.assertEqual(
+            parameters.get('message'), f'{side} side calibrated',
+            f'{operation_id!r} reached the wrong service: {parameters}',
+        )
 
     @staticmethod
     def _set_offset(base_url, app_id, value):
@@ -570,6 +622,246 @@ class GroupingAggregationTest(unittest.TestCase):
             body.get('message', '') + ' ' + str(body.get('parameters', {}))
         ).lower()
         self.assertIn('member', message, f'refusal does not name the qualified form: {body}')
+
+    # ---------------------------------------------------------------------- R3
+    # ONE LEAF, ONE SHORT NAME, TWO ROS PATHS.
+    #
+    # The member half separates copies that belong to different leaves. Where
+    # one leaf holds both copies it names that leaf twice and separates nothing,
+    # so the item half has to be the ROS path instead.
+
+    def test_a_leaf_naming_two_operations_alike_is_addressable_on_the_leaf(self):
+        """R3 on the leaf, where there is no member half at all.
+
+        `left/calibrate` and `right/calibrate` are two services whose wire id -
+        the last segment of the ROS path - is `calibrate` for both. Offering
+        that id twice hands a client a name that cannot mean one thing, and
+        execution can then only refuse it, so the collection would be
+        advertising something unreachable.
+        """
+        items = self._items(f'apps/{DUAL_APP}', 'operations')
+        ids = [item.get('id') for item in items]
+
+        self.assertEqual(ids.count(DUAL_LEFT_ID), 1, f'ids were {ids}')
+        self.assertEqual(ids.count(DUAL_RIGHT_ID), 1, f'ids were {ids}')
+        self.assertEqual(
+            ids.count('calibrate'), 0,
+            f'an id naming two operations of one leaf was offered: {ids}',
+        )
+
+        for operation_id, side in ((DUAL_LEFT_ID, 'left'), (DUAL_RIGHT_ID, 'right')):
+            with self.subTest(operation=operation_id):
+                self._assert_side_ran(
+                    self._run_operation(f'apps/{DUAL_APP}', operation_id), side, operation_id)
+
+        # The detail route resolves the same id to the same operation, so a
+        # client that reads an item before running it is looking at what it will
+        # get.
+        detail = requests.get(
+            f'{PRIMARY_URL}/apps/{DUAL_APP}/operations/{quote(DUAL_LEFT_ID, safe="")}',
+            timeout=10,
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(
+            detail.json().get('item', {}).get('x-medkit', {}).get('ros2', {}).get('service'),
+            f'/{DUAL_LEFT_ID}',
+            f'the detail route resolved the id to another service: {detail.text}',
+        )
+
+    def test_a_leaf_naming_two_operations_alike_is_refused_by_the_short_name(self):
+        """R4 for the same collision: the bare short name still names two things.
+
+        It is no longer offered, and a client holding an older copy of it has to
+        be told what to send instead. The remedy is asserted as ids that run,
+        not as words in a sentence: a message can be reworded into saying
+        nothing while every assertion about a word in it still passes.
+        """
+        response = self._run_operation(f'apps/{DUAL_APP}', 'calibrate')
+        self.assertEqual(response.status_code, 400, response.text)
+        body = response.json()
+        parameters = body.get('parameters', {})
+
+        self.assertEqual(
+            sorted(parameters.get('ros2_paths', [])),
+            [f'/{DUAL_LEFT_ID}', f'/{DUAL_RIGHT_ID}'],
+            f'the refusal does not say what collided: {body}',
+        )
+
+        addressable = parameters.get('operation_ids')
+        self.assertIsInstance(
+            addressable, list, f'the refusal offers no id to send instead: {body}')
+        self.assertEqual(
+            sorted(addressable), sorted([DUAL_LEFT_ID, DUAL_RIGHT_ID]),
+            f'the refusal does not hand back the ids that work: {body}',
+        )
+        offered = {item.get('id') for item in self._items(f'apps/{DUAL_APP}', 'operations')}
+        self.assertTrue(
+            set(addressable) <= offered,
+            f'the refusal names ids the collection does not offer: '
+            f'{sorted(addressable)} against {sorted(offered)}',
+        )
+
+        # Taken straight out of the refusal it runs, so the remedy is usable
+        # rather than merely described.
+        for operation_id in addressable:
+            with self.subTest(operation=operation_id):
+                side = 'left' if operation_id == DUAL_LEFT_ID else 'right'
+                self._assert_side_ran(
+                    self._run_operation(f'apps/{DUAL_APP}', operation_id), side, operation_id)
+
+        # The sentence a human reads names the one thing a client gets wrong.
+        self.assertIn(
+            'without its leading slash',
+            str(parameters.get('details', '')),
+            f'the refusal does not say how the path is written: {body}',
+        )
+
+        # The same refusal on an aggregate has to carry the leaf half as well,
+        # or the id it hands back is one the aggregate does not accept.
+        through_aggregate = self._run_operation(
+            f'components/{PARENT_COMPONENT}', f'{DUAL_APP}:calibrate')
+        self.assertEqual(through_aggregate.status_code, 400, through_aggregate.text)
+        aggregate_ids = through_aggregate.json().get('parameters', {}).get('operation_ids')
+        self.assertEqual(
+            sorted(aggregate_ids or []),
+            sorted([f'{DUAL_APP}:{DUAL_LEFT_ID}', f'{DUAL_APP}:{DUAL_RIGHT_ID}']),
+            f'the aggregate refusal hands back ids it would refuse: {through_aggregate.text}',
+        )
+        self._assert_side_ran(
+            self._run_operation(f'components/{PARENT_COMPONENT}', aggregate_ids[0]),
+            'left' if aggregate_ids[0].endswith(DUAL_LEFT_ID) else 'right',
+            aggregate_ids[0],
+        )
+
+    def test_a_leaf_naming_two_operations_alike_is_addressable_on_an_aggregate(self):
+        """R3 on an aggregate, where both halves of the id are in play.
+
+        The leaf half still says who runs it - the aggregate holds nothing
+        itself - and the ROS path says which of that leaf's two operations is
+        meant. Both are asserted, and the run is checked on the response body
+        because both services answer 200.
+        """
+        items = self._items(f'components/{PARENT_COMPONENT}', 'operations')
+        ids = [item.get('id') for item in items]
+        left = f'{DUAL_APP}:{DUAL_LEFT_ID}'
+        right = f'{DUAL_APP}:{DUAL_RIGHT_ID}'
+
+        self.assertEqual(ids.count(left), 1, f'ids were {ids}')
+        self.assertEqual(ids.count(right), 1, f'ids were {ids}')
+        self.assertEqual(
+            ids.count(f'{DUAL_APP}:calibrate'), 0,
+            f'a leaf-qualified id still named two operations: {ids}',
+        )
+
+        for item in items:
+            if item.get('id') in (left, right):
+                self.assertEqual(
+                    item.get('x-medkit', {}).get('member_ids'), [DUAL_APP],
+                    f"{item.get('id')!r} does not name the leaf that runs it: {item}",
+                )
+
+        for operation_id, side in ((left, 'left'), (right, 'right')):
+            with self.subTest(operation=operation_id):
+                self._assert_side_ran(
+                    self._run_operation(f'components/{PARENT_COMPONENT}', operation_id),
+                    side, operation_id)
+
+    def test_the_capability_description_documents_both_alike_operations(self):
+        """The generated spec has to describe the ids the collection offers.
+
+        The per-entity capability description keys its paths by operation id, so
+        two operations that produce one key document one of them and drop the
+        other without a word - the same "the listing does not match what can be
+        run" failure, one surface up, and the one a generated client is built
+        from.
+        """
+        for entity_path, prefix in (
+            (f'apps/{DUAL_APP}', ''),
+            (f'components/{PARENT_COMPONENT}', f'{DUAL_APP}:'),
+        ):
+            with self.subTest(entity=entity_path):
+                response = requests.get(
+                    f'{PRIMARY_URL}/{entity_path}/operations/docs', timeout=10)
+                self.assertEqual(response.status_code, 200, response.text)
+                documented = set(response.json().get('paths', {}))
+                for operation_id in (DUAL_LEFT_ID, DUAL_RIGHT_ID):
+                    self.assertIn(
+                        f'/{entity_path}/operations/{prefix}{operation_id}', documented,
+                        f'{operation_id!r} is not documented: {sorted(documented)}',
+                    )
+
+    def test_a_short_name_one_leaf_carries_once_keeps_the_id_it_has_today(self):
+        """The regression guard, and it matters more than the case above.
+
+        Every current client and the generated OpenAPI document send the bare
+        short name, or the leaf-qualified form where several leaves expose it.
+        Neither may move because some OTHER operation somewhere collided: an id
+        is decided by its own provider's use of its own short name.
+        """
+        ids = [item.get('id') for item in self._items('apps/primary_calibration', 'operations')]
+        self.assertIn(
+            'calibrate', ids, f'a short name only one leaf carries was rewritten: {ids}')
+
+        response = self._run_operation('apps/primary_calibration', 'calibrate')
+        self.assertEqual(response.status_code, 200, response.text)
+        parameters = response.json().get('parameters')
+        self.assertIsInstance(parameters, dict, response.text)
+        self.assertIs(parameters.get('success'), True, parameters)
+        self.assertIn(
+            'Engine calibrated', parameters.get('message', ''),
+            f'the bare id reached something else: {parameters}',
+        )
+
+        merged = [
+            item.get('id')
+            for item in self._items(f'functions/{MERGED_FUNCTION}', 'operations')
+        ]
+        self.assertIn(
+            'primary_calibration:calibrate', merged,
+            f'a leaf-qualified id gained a path half it does not need: {merged}',
+        )
+        run = self._run_operation(f'functions/{MERGED_FUNCTION}', 'primary_calibration:calibrate')
+        self.assertEqual(run.status_code, 200, run.text)
+        self.assertIs(
+            run.json().get('parameters', {}).get('success'), True, run.text)
+
+    def test_a_path_shaped_id_that_names_no_operation_is_refused(self):
+        """R5 for the path form: a path is an address, not a wildcard.
+
+        Asserted beside a sibling path that DOES resolve, because "404 for
+        everything path-shaped" would satisfy the first half on its own and
+        would mean the form works nowhere.
+        """
+        missing = 'testrig/dual/middle/calibrate'
+
+        response = self._run_operation(f'apps/{DUAL_APP}', missing)
+        self.assertEqual(response.status_code, 404, response.text)
+        body = response.json()
+        self.assertEqual(body.get('error_code'), 'operation-not-found', body)
+        self.assertEqual(body.get('parameters', {}).get('operation_id'), missing, body)
+
+        detail = requests.get(
+            f'{PRIMARY_URL}/apps/{DUAL_APP}/operations/{quote(missing, safe="")}', timeout=10)
+        self.assertEqual(detail.status_code, 404, detail.text)
+
+        present = requests.get(
+            f'{PRIMARY_URL}/apps/{DUAL_APP}/operations/{quote(DUAL_LEFT_ID, safe="")}',
+            timeout=10,
+        )
+        self.assertEqual(
+            present.status_code, 200,
+            f'the sibling that exists is refused too, so nothing is addressable: {present.text}',
+        )
+
+        # And through the aggregate, where the leaf half is right and only the
+        # path is wrong.
+        through_aggregate = self._run_operation(
+            f'components/{PARENT_COMPONENT}', f'{DUAL_APP}:{missing}')
+        self.assertEqual(through_aggregate.status_code, 404, through_aggregate.text)
+        self.assertEqual(
+            through_aggregate.json().get('error_code'), 'operation-not-found',
+            through_aggregate.text,
+        )
 
     # ---------------------------------------------------------------------- R4
 

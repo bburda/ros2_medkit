@@ -657,16 +657,6 @@ void RESTServer::setup_routes() {
         .description(std::string("Lists all ROS 2 services and actions available on this ") + et.singular + ".")
         .operation_id(std::string("list") + capitalize(et.singular) + "Operations");
 
-    reg.get<dto::OperationDetail>(entity_path + "/operations/{operation_id}",
-                                  [this](http::TypedRequest req) -> http::Result<dto::OperationDetail> {
-                                    return operation_handlers_->get_operation(req);
-                                  })
-        .tag("Operations")
-        .summary(std::string("Get operation details for ") + et.singular)
-        .description(std::string("Returns operation details including request/response schema for this ") +
-                     et.singular + ".")
-        .operation_id(std::string("get") + capitalize(et.singular) + "Operation");
-
     // Execution endpoints
     reg.post_alternates<dto::ExecutionCreateRequest, dto::OperationExecutionResult, dto::ExecutionCreateAsync>(
            entity_path + "/operations/{operation_id}/executions",
@@ -740,6 +730,20 @@ void RESTServer::setup_routes() {
         .response(504, "No cancel response in time - outcome unknown (not-responding)",
                   nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
         .operation_id(std::string("cancel") + capitalize(et.singular) + "Execution");
+
+    // Operation item, registered after its own sub-resources. {operation_id}
+    // spans segments, so this pattern also matches an executions URI; the
+    // router takes the first route that matches, and the specific ones have to
+    // be reachable.
+    reg.get<dto::OperationDetail>(entity_path + "/operations/{operation_id}",
+                                  [this](http::TypedRequest req) -> http::Result<dto::OperationDetail> {
+                                    return operation_handlers_->get_operation(req);
+                                  })
+        .tag("Operations")
+        .summary(std::string("Get operation details for ") + et.singular)
+        .description(std::string("Returns operation details including request/response schema for this ") +
+                     et.singular + ".")
+        .operation_id(std::string("get") + capitalize(et.singular) + "Operation");
 
     // --- Configurations ---
     //

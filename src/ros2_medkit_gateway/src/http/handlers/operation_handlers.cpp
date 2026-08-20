@@ -32,6 +32,7 @@
 #include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
 #include "ros2_medkit_gateway/core/http/member_qualified_id.hpp"
+#include "ros2_medkit_gateway/core/http/operation_item_id.hpp"
 #include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/providers/operation_provider.hpp"
@@ -149,8 +150,9 @@ struct ResolvedOperation {
 /// Resolve `parsed` against the entity's operations.
 ///
 /// A member half selects among same-named operations using the owner recorded
-/// per full ROS path. A bare id keeps the first match, which is the only thing
-/// it can mean when it is unique and the only thing this gateway did before.
+/// per full ROS path, and an item half that is a ROS path selects one outright.
+/// A bare short name keeps the first match, which is the only thing it can mean
+/// when it is unique and the only thing this gateway did before.
 ResolvedOperation resolve_operation(const AggregatedOperations & ops, const http::MemberQualifiedId & parsed) {
   const auto owned_by_target = [&ops, &parsed](const std::string & full_path) {
     if (!parsed.has_member) {
@@ -162,13 +164,13 @@ ResolvedOperation resolve_operation(const AggregatedOperations & ops, const http
 
   ResolvedOperation resolved;
   for (const auto & svc : ops.services) {
-    if (svc.name == parsed.item_id && owned_by_target(svc.full_path)) {
+    if (http::operation_item_id_names(svc.name, svc.full_path, parsed.item_id) && owned_by_target(svc.full_path)) {
       resolved.service = svc;
       return resolved;
     }
   }
   for (const auto & act : ops.actions) {
-    if (act.name == parsed.item_id && owned_by_target(act.full_path)) {
+    if (http::operation_item_id_names(act.name, act.full_path, parsed.item_id) && owned_by_target(act.full_path)) {
       resolved.action = act;
       return resolved;
     }
@@ -200,12 +202,12 @@ std::vector<OperationMatch> matching_operations(const AggregatedOperations & ops
     matches.push_back(OperationMatch{full_path, member});
   };
   for (const auto & svc : ops.services) {
-    if (svc.name == parsed.item_id) {
+    if (http::operation_item_id_names(svc.name, svc.full_path, parsed.item_id)) {
       record(svc.full_path);
     }
   }
   for (const auto & act : ops.actions) {
-    if (act.name == parsed.item_id) {
+    if (http::operation_item_id_names(act.name, act.full_path, parsed.item_id)) {
       record(act.full_path);
     }
   }
@@ -495,8 +497,8 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
   auto data_access_mgr = ctx_.node()->get_data_access_manager();
   auto type_introspection = data_access_mgr->get_type_introspection();
 
-  // How many members the DECLARED tree says provide each short name. This is
-  // the same count `create_execution` refuses on, and it is read here so the
+  // How many operations the DECLARED tree carries under each short name. This
+  // is the same count `create_execution` refuses on, and it is read here so the
   // listing and the execution cannot disagree: an id the tree calls ambiguous
   // is never offered bare, wherever the copy came from.
   std::unordered_map<std::string, size_t> declared_providers;
@@ -506,6 +508,11 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
   for (const auto & act : ops.actions) {
     ++declared_providers[act.name];
   }
+
+  // The paths whose short name one provider carries twice. Their item half is
+  // the path, because the member half they would otherwise be told apart by is
+  // the same member for both.
+  const std::unordered_set<std::string> path_addressed = http::operation_paths_addressed_by_path(ops);
 
   const auto contributed_by_peer = [&cache](const std::string & member_id) {
     static constexpr std::string_view kPeerPrefix = "peer:";
@@ -522,13 +529,28 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
     return owner != ops.owner_by_path.end() && contributed_by_peer(owner->second);
   };
 
+  // The ROS path an item names, in the form an id carries it. Empty when the
+  // item names no path, which is what a peer's malformed item looks like.
+  const auto path_half_of = [](const dto::OperationItem & item) -> std::string {
+    if (!item.x_medkit.has_value() || !item.x_medkit->ros2.has_value()) {
+      return {};
+    }
+    const auto & ros2 = *item.x_medkit->ros2;
+    return http::path_item_id(ros2.service.value_or(ros2.action.value_or(std::string{})));
+  };
+
   // Qualify from the declared tree rather than by counting copies in this
   // response. A response can be short a copy - the caller suppressed fan-out,
   // or a peer did not answer - and counting copies would then hand back a bare
   // id that the execution refuses.
-  const auto qualify_from_declared_tree = [&declared_providers](dto::OperationItem & item) {
-    if (item.id != item.name) {
-      return;  // already qualified, by us or by the peer that sent it
+  //
+  // The member half goes in front of whichever item half the id already
+  // carries, short name or path, so an item this gateway addressed by path is
+  // still addressed to the member that owns it.
+  const auto qualify_from_declared_tree = [&declared_providers, &path_half_of](dto::OperationItem & item) {
+    const std::string path_half = path_half_of(item);
+    if (item.id != item.name && (path_half.empty() || item.id != path_half)) {
+      return;  // already carries a member half, from us or from the peer that sent it
     }
     auto count = declared_providers.find(item.name);
     if (count == declared_providers.end() || count->second < 2) {
@@ -538,12 +560,12 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
         item.x_medkit->member_ids->size() != 1) {
       return;
     }
-    item.id = http::make_member_qualified_id(item.x_medkit->member_ids->front(), item.name);
+    item.id = http::make_member_qualified_id(item.x_medkit->member_ids->front(), item.id);
   };
 
   const auto build_item = [&](const auto & op, bool asynchronous) {
     dto::OperationItem item;
-    item.id = op.name;
+    item.id = http::operation_item_half(op.name, op.full_path, path_addressed);
     item.name = op.name;
     item.proximity_proof_required = false;
     item.asynchronous_execution = asynchronous;
@@ -853,9 +875,8 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
   //
   // The qualified form is checked too. Naming the member narrows the set, but
   // one member that uses the same short name at two ROS paths is still not
-  // identified by it - and for those two the member half has nothing left to
-  // add, so the caller is told what collided rather than handed a remedy that
-  // cannot work.
+  // identified by it - there the item half has to be the ROS path, which is the
+  // form the collection offers for exactly those copies.
   const std::vector<OperationMatch> matches = matching_operations(ops, parsed);
   if (matches.size() > 1) {
     std::vector<std::string> paths;
@@ -868,14 +889,29 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
     if (!members.empty()) {
       params["member_ids"] = members;
     }
+    // The ids that DO address the operations this one collided with, built by
+    // the rule the collection lists them under. A refusal that only describes
+    // the form leaves the caller to re-derive it, and a caller that derives it
+    // differently is refused again for a reason the answer already knew.
+    const auto addressed_by_path = http::operation_paths_addressed_by_path(ops);
+    std::vector<std::string> addressable;
+    addressable.reserve(matches.size());
+    for (const auto & match : matches) {
+      std::string item = http::operation_item_half(parsed.item_id, match.full_path, addressed_by_path);
+      if (ops.is_aggregated && !match.member_id.empty()) {
+        item = http::make_member_qualified_id(match.member_id, item);
+      }
+      addressable.push_back(std::move(item));
+    }
+    params["operation_ids"] = addressable;
     if (members.size() > 1) {
       params["details"] = "Use format 'member_id:operation_id' to name the member that runs it";
       return tl::make_unexpected(
           make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: more than one member provides it", params));
     }
     params["details"] =
-        "One provider exposes this short name at more than one ROS path, so naming the member "
-        "cannot separate them";
+        "One provider exposes this short name at more than one ROS path; address the one you mean by that "
+        "path, without its leading slash";
     return tl::make_unexpected(
         make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: it names more than one operation", params));
   }

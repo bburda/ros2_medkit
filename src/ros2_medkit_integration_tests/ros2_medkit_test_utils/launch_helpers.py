@@ -55,6 +55,10 @@ DEMO_NODE_REGISTRY = {
     'controller': ('demo_light_controller', 'controller', '/body/lights'),
     # Operations (services / actions)
     'calibration': ('demo_calibration_service', 'calibration', '/powertrain/engine'),
+    # Two services under one node whose ROS paths differ only above the last
+    # segment, so one provider carries the operation short name `calibrate`
+    # twice. Its own namespace keeps that collision away from `calibration`.
+    'dual_calibration': ('demo_dual_calibration_service', 'dual_calibration', '/testrig/dual'),
     'long_calibration': ('demo_long_calibration_action', 'long_calibration', '/powertrain/engine'),
     # Lifecycle demo (stays unconfigured by default; auto_activate:=true activates it)
     'managed_lifecycle': ('managed_lifecycle', 'managed_lifecycle', ''),

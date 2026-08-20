@@ -645,6 +645,20 @@ consider it unique. In practice:
   every contributor is named in ``member_ids``. A path is qualified only when
   two gateways each contribute an item under it.
 
+**When one member carries the short name twice.** An operation's wire id is the
+last segment of its ROS path, so ``left/calibrate`` and ``right/calibrate`` on
+one node are two operations called ``calibrate``. The member half names that
+same member for both copies and separates nothing, so those items take the ROS
+path, leading slash stripped, as their item half::
+
+   robot/left/calibrate                       # on the App itself
+   primary_calibration:robot/left/calibrate   # on an entity that aggregates it
+
+The form is decided per provider: a short name its own provider carries once
+keeps that short name, whatever another provider does with the same name. The
+split at the first colon is unchanged, because a ROS path carries no colon, and
+the path form is the one ``/data`` already uses for a topic.
+
 What this means for a request:
 
 - A bare id that names one item works, on every route. Every client that sends
@@ -654,7 +668,11 @@ What this means for a request:
   one member provides is refused with ``400 invalid-request``, naming the
   qualified form and listing the members in ``parameters.member_ids``. Running
   whichever member was walked first without saying which one ran is the defect
-  this removes.
+  this removes. A short name that ONE member carries at two ROS paths is
+  refused the same way, listing those paths in ``parameters.ros2_paths``.
+  Either refusal carries ``parameters.operation_ids``: the ids that do address
+  what collided, as the collection lists them, so the client sends one back
+  rather than deriving it.
 - A qualified id is accepted on the single-item routes. A member half that
   names no member of the entity is ``404``, and so is an item half that member
   does not provide - which is what tells an absent item apart from an item that
@@ -816,7 +834,9 @@ Operations Endpoints
 
 Execute ROS 2 services and actions. Operation ids follow
 :ref:`member-qualified-ids`: a short name that only one member exposes is used
-bare, and one that several expose is addressed ``<member_id>:<operation>``.
+bare, one that several expose is addressed ``<member_id>:<operation>``, and one
+that a single member exposes at two ROS paths is addressed by the path itself,
+without its leading slash.
 
 List Operations
 ~~~~~~~~~~~~~~~
