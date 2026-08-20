@@ -127,7 +127,11 @@ from harness import (  # noqa: E402, I100
     watchdog_detector_status,
 )
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
+from ros2_medkit_test_utils.constants import (  # noqa: E402
+    ALLOWED_EXIT_CODES,
+    get_test_port,
+    get_time_scale,
+)
 from ros2_medkit_test_utils.coverage import get_coverage_env  # noqa: E402
 
 # No default on purpose - see harness-consuming siblings' identical rationale: a default makes
@@ -153,10 +157,21 @@ TARGET_NODE = 'calibration'
 TARGET_EXECUTABLE = 'demo_calibration_service'
 TARGET_NAMESPACE = '/powertrain/engine'
 
-ARM_TIMEOUT_SEC = 60.0
-FAULTS_LIVE_TIMEOUT_SEC = 30.0
-DEPARTURE_TIMEOUT_SEC = 30.0
-RAISE_TIMEOUT_SEC = 60.0
+# The budgets below are scaled by MEDKIT_TEST_TIME_SCALE, which the sanitizer jobs set to the
+# same factor they apply to every declared CTest timeout. A deadline asserted INSIDE a test is
+# invisible to that rewrite, so an instrumented graph that takes longer to forget a departed
+# node blows a budget here and the failure reads as a detector that never reported - the exact
+# red this suite exists to produce for a real defect. Unset elsewhere, so the normal jobs keep
+# the tight budgets that give these assertions their falsifying edge.
+#
+# Poll intervals, enforced respawn delays and the sustained-observation windows are NOT scaled.
+# Those are not give-up bounds: stretching a window a scenario watches for silence buys no
+# confidence and spends the whole package's test budget to do it.
+TIME_SCALE = get_time_scale()
+ARM_TIMEOUT_SEC = 60.0 * TIME_SCALE
+FAULTS_LIVE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # How long an absent or a persisting fault is watched for. Short (well under a minute) because
 # every window here is measured from the arming gate, not process start, so bringup cannot eat
 # it - matching test_node_death_e2e.test.py's SUSTAINED_WINDOW_SEC.
@@ -165,7 +180,7 @@ SUSTAINED_WINDOW_SEC = 20.0
 # Config parsing happens at plugin set_context() time, at process start - well before the demo
 # node and fault_manager even come up (create_watchdog_test_launch's own demo_delay) - so this
 # only needs to be generous against process-startup jitter, not against anything downstream.
-WARNING_TIMEOUT_SEC = 30.0
+WARNING_TIMEOUT_SEC = 30.0 * TIME_SCALE
 
 # Matches a single stderr line that names BOTH "allowlist" and "suppress" - the two config
 # keys an inert allowlist is about - at WARN severity, not the bare substring "allowlist",
@@ -208,7 +223,7 @@ SECOND_NAMESPACE = '/powertrain/unsuppressed'
 # against that residual lag, not against anything this scenario's own cycle does. Mirrors
 # test_node_death_e2e.test.py's identical STABLE_TRACKED_COUNT_TIMEOUT_SEC, same detector, same
 # hazard.
-STABLE_TRACKED_COUNT_TIMEOUT_SEC = 40.0
+STABLE_TRACKED_COUNT_TIMEOUT_SEC = 40.0 * TIME_SCALE
 
 
 def _target_node_action():

@@ -171,7 +171,11 @@ from harness import (  # noqa: E402, I100
     wait_until_watchdog_armed,
 )
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
+from ros2_medkit_test_utils.constants import (  # noqa: E402
+    ALLOWED_EXIT_CODES,
+    get_test_port,
+    get_time_scale,
+)
 from ros2_medkit_test_utils.coverage import get_coverage_env  # noqa: E402
 from ros2_medkit_test_utils.launch_helpers import DEMO_NODE_REGISTRY  # noqa: E402
 
@@ -243,12 +247,23 @@ B5_MISS_GRACE = 16
 # by 1200 ms - worst-case observed window 12500 - 1100 = 11400 ms, 3.35x the nominal grace.
 B5_RESPAWN_DELAY_SEC = 12.5
 
-ARM_TIMEOUT_SEC = 60.0
-FAULTS_LIVE_TIMEOUT_SEC = 30.0
-PRESENCE_TIMEOUT_SEC = 30.0
-DEPARTURE_TIMEOUT_SEC = 30.0
-RAISE_TIMEOUT_SEC = 60.0
-CLEAR_TIMEOUT_SEC = 60.0
+# The budgets below are scaled by MEDKIT_TEST_TIME_SCALE, which the sanitizer jobs set to the
+# same factor they apply to every declared CTest timeout. A deadline asserted INSIDE a test is
+# invisible to that rewrite, so an instrumented graph that takes longer to forget a departed
+# node blows a budget here and the failure reads as a detector that never reported - the exact
+# red this suite exists to produce for a real defect. Unset elsewhere, so the normal jobs keep
+# the tight budgets that give these assertions their falsifying edge.
+#
+# Poll intervals, enforced respawn delays and the sustained-observation windows are NOT scaled.
+# Those are not give-up bounds: stretching a window a scenario watches for silence buys no
+# confidence and spends the whole package's test budget to do it.
+TIME_SCALE = get_time_scale()
+ARM_TIMEOUT_SEC = 60.0 * TIME_SCALE
+FAULTS_LIVE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+PRESENCE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
+CLEAR_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # How long an absent or a persisting fault is watched for - measured from the arming gate, not
 # process start, so bringup cannot eat it. Matches test_node_death_e2e.test.py's identical
 # constant.
@@ -285,7 +300,7 @@ C4_EARLY_WINDOW_SEC = 25.0
 # Measured from the END of C4_EARLY_WINDOW_SEC, not from the kill: comfortably covers the
 # remaining ~75s to C4_MISS_GRACE_LARGE's own nominal grace-crossing point plus reporting
 # latency.
-C4_LATE_RAISE_TIMEOUT_SEC = 100.0
+C4_LATE_RAISE_TIMEOUT_SEC = 100.0 * TIME_SCALE
 
 # ---- "d2_ungated_clear" scenario's own fixtures -------------------------------------------------
 D2_TARGET_NODE = 'calibration'
