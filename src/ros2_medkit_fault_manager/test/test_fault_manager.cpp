@@ -2470,6 +2470,129 @@ TEST(FaultAuditFailClosedTest, FailClosedAbortsAndFlags) {
   remove_audit_files(audit_path);
 }
 
+// --- InMemoryFaultStorage snapshot retention tests ---
+
+static void store_two_snapshots(InMemoryFaultStorage & storage, const std::string & fault_code) {
+  for (int i = 0; i < 2; ++i) {
+    ros2_medkit_fault_manager::SnapshotData snapshot;
+    snapshot.fault_code = fault_code;
+    snapshot.topic = "/test/topic" + std::to_string(i);
+    snapshot.message_type = "std_msgs/msg/String";
+    snapshot.data = R"({"data": "value"})";
+    snapshot.captured_at_ns = 1000 + i;
+    storage.store_snapshot(snapshot);
+  }
+}
+
+TEST(InMemorySnapshotRetentionTest, RetainedOnClearWhenConfigured) {
+  InMemoryFaultStorage storage;
+  storage.set_retain_snapshots_on_clear(true);
+
+  storage.report_fault_event("SNAPSHOT_RETAIN_TEST", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR,
+                             "fault with evidence", "/test_node", rclcpp::Time(1000), default_config());
+  store_two_snapshots(storage, "SNAPSHOT_RETAIN_TEST");
+  ASSERT_EQ(storage.get_snapshots("SNAPSHOT_RETAIN_TEST").size(), 2u);
+
+  ASSERT_TRUE(storage.clear_fault("SNAPSHOT_RETAIN_TEST"));
+
+  EXPECT_EQ(storage.get_snapshots("SNAPSHOT_RETAIN_TEST").size(), 2u);
+}
+
+TEST(InMemorySnapshotRetentionTest, DeletedOnClearByDefault) {
+  InMemoryFaultStorage storage;
+
+  storage.report_fault_event("SNAPSHOT_DROP_TEST", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR,
+                             "fault with evidence", "/test_node", rclcpp::Time(1000), default_config());
+  store_two_snapshots(storage, "SNAPSHOT_DROP_TEST");
+
+  ASSERT_TRUE(storage.clear_fault("SNAPSHOT_DROP_TEST"));
+
+  EXPECT_TRUE(storage.get_snapshots("SNAPSHOT_DROP_TEST").empty());
+}
+
+TEST(InMemorySnapshotRetentionTest, HealedReclassificationDropsSnapshotsByDefault) {
+  // The SQLite backend drops snapshots here; a backend that kept them would answer a snapshot
+  // query differently for the same sequence of calls.
+  InMemoryFaultStorage storage;
+  DebounceConfig config;
+  config.healing_enabled = true;
+  config.healing_threshold = 1;
+
+  storage.report_fault_event("SNAPSHOT_DROP_TEST", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR,
+                             "fault with evidence", "/test_node", rclcpp::Time(1000), config);
+  store_two_snapshots(storage, "SNAPSHOT_DROP_TEST");
+  for (int i = 1; i <= 2; ++i) {
+    storage.report_fault_event("SNAPSHOT_DROP_TEST", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_ERROR, "",
+                               "/test_node", rclcpp::Time(1000 + i), config);
+  }
+  auto healed = storage.get_fault("SNAPSHOT_DROP_TEST");
+  ASSERT_TRUE(healed.has_value());
+  ASSERT_EQ(healed->status, Fault::STATUS_HEALED) << "test setup: the fault must be latched HEALED";
+
+  ASSERT_EQ(storage.reclassify_healed_as_cleared().size(), 1u);
+
+  EXPECT_TRUE(storage.get_snapshots("SNAPSHOT_DROP_TEST").empty());
+}
+
+TEST(InMemorySnapshotRetentionTest, HealedReclassificationKeepsSnapshotsWhenConfigured) {
+  InMemoryFaultStorage storage;
+  storage.set_retain_snapshots_on_clear(true);
+  DebounceConfig config;
+  config.healing_enabled = true;
+  config.healing_threshold = 1;
+
+  storage.report_fault_event("SNAPSHOT_RETAIN_TEST", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR,
+                             "fault with evidence", "/test_node", rclcpp::Time(1000), config);
+  store_two_snapshots(storage, "SNAPSHOT_RETAIN_TEST");
+  for (int i = 1; i <= 2; ++i) {
+    storage.report_fault_event("SNAPSHOT_RETAIN_TEST", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_ERROR, "",
+                               "/test_node", rclcpp::Time(1000 + i), config);
+  }
+  ASSERT_EQ(storage.reclassify_healed_as_cleared().size(), 1u);
+
+  EXPECT_EQ(storage.get_snapshots("SNAPSHOT_RETAIN_TEST").size(), 2u);
+}
+
+TEST(InMemorySnapshotRetentionTest, HealedReclassificationLeavesOtherFaultsSnapshotsAlone) {
+  InMemoryFaultStorage storage;
+  DebounceConfig healing;
+  healing.healing_enabled = true;
+  healing.healing_threshold = 1;
+
+  storage.report_fault_event("HEALED_FAULT", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "fault",
+                             "/test_node", rclcpp::Time(1000), healing);
+  store_two_snapshots(storage, "HEALED_FAULT");
+  for (int i = 1; i <= 2; ++i) {
+    storage.report_fault_event("HEALED_FAULT", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_ERROR, "",
+                               "/test_node", rclcpp::Time(1000 + i), healing);
+  }
+
+  storage.report_fault_event("ACTIVE_FAULT", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "fault",
+                             "/test_node", rclcpp::Time(1000), default_config());
+  store_two_snapshots(storage, "ACTIVE_FAULT");
+
+  ASSERT_EQ(storage.reclassify_healed_as_cleared().size(), 1u);
+
+  EXPECT_TRUE(storage.get_snapshots("HEALED_FAULT").empty());
+  EXPECT_EQ(storage.get_snapshots("ACTIVE_FAULT").size(), 2u) << "reclassification touched an unrelated fault";
+}
+
+TEST(InMemorySnapshotRetentionTest, RetentionIsPerFaultCodeNotGlobal) {
+  InMemoryFaultStorage storage;
+  storage.set_retain_snapshots_on_clear(true);
+
+  for (const auto & code : {"FAULT_A", "FAULT_B"}) {
+    storage.report_fault_event(code, ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "fault", "/test_node",
+                               rclcpp::Time(1000), default_config());
+    store_two_snapshots(storage, code);
+  }
+
+  ASSERT_TRUE(storage.clear_fault("FAULT_A"));
+
+  EXPECT_EQ(storage.get_snapshots("FAULT_A").size(), 2u);
+  EXPECT_EQ(storage.get_snapshots("FAULT_B").size(), 2u);
+}
+
 // --- InMemoryFaultStorage near-miss series tests ---
 //
 // The in-memory backend must keep the same near-miss contract as SQLite: appended per
@@ -2623,6 +2746,23 @@ TEST(InMemoryNearMissTest, ApplyingSmallerBoundTrimsExistingSeries) {
   ASSERT_EQ(series.size(), 2u);
   EXPECT_EQ(series[0].debounce_counter, -4);
   EXPECT_EQ(series[1].debounce_counter, -5);
+}
+
+TEST(InMemoryNearMissTest, ApplyingBoundReportsHowManyEntriesItDropped) {
+  InMemoryFaultStorage storage;
+  DebounceConfig config = near_miss_config();
+  config.confirmation_threshold = -20;
+  storage.set_max_near_misses_per_fault(0);
+
+  for (int i = 0; i < 5; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", near_miss_time(i), config);
+    storage.report_fault_event("MOTOR_OVERHEAT", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "temperature rising", "/powertrain/motor", near_miss_time(i), config);
+  }
+
+  EXPECT_EQ(storage.set_max_near_misses_per_fault(2), 6u);
+  EXPECT_EQ(storage.set_max_near_misses_per_fault(2), 0u);
 }
 
 TEST(InMemoryNearMissTest, EmptyForUnknownFault) {

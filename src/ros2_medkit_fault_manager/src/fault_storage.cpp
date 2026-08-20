@@ -510,24 +510,27 @@ void InMemoryFaultStorage::record_near_miss(const FaultState & state, const Debo
   }
 }
 
-void InMemoryFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
+size_t InMemoryFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
   max_near_misses_per_fault_ = max_count;
 
   if (max_count == 0) {
-    return;  // Unlimited
+    return 0;  // Unlimited
   }
 
   // Apply the bound to what is already stored, so a series built under a larger bound does not
   // stay over the new one until the next near miss for that code happens to arrive.
   using DiffType = std::vector<NearMissRecord>::difference_type;
+  size_t evicted = 0;
   for (auto & [code, series] : near_misses_) {
     (void)code;
     if (series.size() > max_count) {
-      const auto excess = static_cast<DiffType>(series.size() - max_count);
-      series.erase(series.begin(), series.begin() + excess);
+      const size_t excess = series.size() - max_count;
+      series.erase(series.begin(), series.begin() + static_cast<DiffType>(excess));
+      evicted += excess;
     }
   }
+  return evicted;
 }
 
 std::vector<NearMissRecord> InMemoryFaultStorage::get_near_misses(const std::string & fault_code) const {
@@ -848,6 +851,19 @@ std::vector<std::string> InMemoryFaultStorage::reclassify_healed_as_cleared() {
       reclassified.push_back(code);
     }
   }
+
+  // Reclassified rows must match CLEARED semantics, snapshots included - the SQLite backend drops
+  // them here, and a backend that kept them would answer a snapshot query differently for the
+  // same sequence of calls. The near-miss series is retained, as it is on clear_fault.
+  if (!retain_snapshots_on_clear_ && !reclassified.empty()) {
+    const std::set<std::string> affected(reclassified.begin(), reclassified.end());
+    snapshots_.erase(std::remove_if(snapshots_.begin(), snapshots_.end(),
+                                    [&affected](const SnapshotData & s) {
+                                      return affected.count(s.fault_code) > 0;
+                                    }),
+                     snapshots_.end());
+  }
+
   return reclassified;
 }
 

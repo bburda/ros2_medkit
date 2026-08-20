@@ -212,8 +212,15 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   // acknowledgement is a separate question from how many sets are kept.
   storage_->set_retain_snapshots_on_clear(retain_snapshots_on_clear);
 
-  // Apply near-miss retention bound to storage (0 = unlimited)
-  storage_->set_max_near_misses_per_fault(static_cast<size_t>(max_near_misses));
+  // Apply near-miss retention bound to storage (0 = unlimited). Applying it also trims a series
+  // that a previous run left over the bound, which deletes history for good, so say when it does.
+  const size_t evicted_near_misses = storage_->set_max_near_misses_per_fault(static_cast<size_t>(max_near_misses));
+  if (evicted_near_misses > 0) {
+    RCLCPP_WARN(get_logger(),
+                "near_miss.max_per_fault=%ld dropped %zu stored near-miss entries that exceeded the bound. "
+                "Raise the bound or set it to 0 before restarting if that history was needed.",
+                max_near_misses, evicted_near_misses);
+  }
 
   // Create event publisher for SSE streaming
   event_publisher_ = create_publisher<ros2_medkit_msgs::msg::FaultEvent>("~/events", rclcpp::QoS(100).reliable());
