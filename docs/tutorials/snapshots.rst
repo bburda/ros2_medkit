@@ -512,6 +512,17 @@ Rosbag Configuration Options
        deleted when this limit is exceeded. A recording shared by a burst of
        faults counts once towards the total, and eviction removes a whole
        burst's bag at a time.
+   * - ``snapshots.rosbag.max_bags_per_fault``
+     - ``1``
+     - Recordings kept per fault code; ``0`` means unlimited. Past the cap the
+       fault's oldest recording is dropped, and a bag is deleted only once no
+       fault still references it (a burst shares one recording). ``1`` is the
+       historical behaviour - each re-confirmation replaces the previous bag;
+       ``3`` is a good starting point for an intermittent fault you are
+       chasing. This is a fairness knob rather than a depth knob:
+       ``max_total_storage_mb`` is the real disk bound, and a high value lets
+       one flapping fault consume the budget and evict every other fault's
+       recording.
 
 Bursts and the Window Boundary
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -706,7 +717,8 @@ Rosbag files are downloaded via SOVD bulk-data endpoints.
 One item per **recording**, not per fault. A burst of correlated faults shares a
 single recording and appears once, with every fault it covers listed in
 ``x-medkit.fault_codes``. A fault that confirmed several times contributes one
-item per recording it kept (see ``max_bags_per_fault`` below).
+item per recording it kept (see ``max_bags_per_fault`` in the configuration
+table above).
 
 **Response:**
 
