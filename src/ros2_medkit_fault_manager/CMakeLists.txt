@@ -173,31 +173,31 @@ if(BUILD_TESTING)
     DESTINATION share/${PROJECT_NAME}
   )
 
-  medkit_add_launch_test(test_integration test/test_integration.test.py TIMEOUT 60
+  medkit_add_launch_test(test_integration test/integration/test_integration.test.py TIMEOUT 60
     LABELS "integration")
 
-  medkit_add_launch_test(test_rosbag_integration test/test_rosbag_integration.test.py TIMEOUT 90
+  medkit_add_launch_test(test_rosbag_integration test/integration/test_rosbag_integration.test.py TIMEOUT 90
     LABELS "integration")
 
   # Launches without snapshots.rosbag.format, so the parameter default (mcap)
   # is what is under test rather than an operator's explicit choice.
-  medkit_add_launch_test(test_rosbag_default_format test/test_rosbag_default_format.test.py TIMEOUT 90
+  medkit_add_launch_test(test_rosbag_default_format test/integration/test_rosbag_default_format.test.py TIMEOUT 90
     LABELS "integration")
 
-  medkit_add_launch_test(test_entity_thresholds_integration test/test_entity_thresholds_integration.test.py
+  medkit_add_launch_test(test_entity_thresholds_integration test/integration/test_entity_thresholds_integration.test.py
     TIMEOUT 60 LABELS "integration")
 
-  medkit_add_launch_test(test_rosbag_entity_scope test/test_rosbag_entity_scope.test.py TIMEOUT 120
+  medkit_add_launch_test(test_rosbag_entity_scope test/integration/test_rosbag_entity_scope.test.py TIMEOUT 120
     LABELS "integration")
 
   # Parametrized over both storage formats (sqlite3 + mcap), so the launch
   # runs twice inside one ctest invocation.
-  medkit_add_launch_test(test_rosbag_boundary test/test_rosbag_boundary.test.py TIMEOUT 240
+  medkit_add_launch_test(test_rosbag_boundary test/integration/test_rosbag_boundary.test.py TIMEOUT 240
     LABELS "integration")
 
   # Drives the DEFAULT "entity" topic mode, where a boundary recording carries a
   # filter, over two full post-fault windows plus discovery.
-  medkit_add_launch_test(test_rosbag_boundary_scope test/test_rosbag_boundary_scope.test.py TIMEOUT 180
+  medkit_add_launch_test(test_rosbag_boundary_scope test/integration/test_rosbag_boundary_scope.test.py TIMEOUT 180
     LABELS "integration")
 
   # CaptureThreadPool unit tests
