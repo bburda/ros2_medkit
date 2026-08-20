@@ -678,8 +678,33 @@ What this means for a request:
   does not provide - which is what tells an absent item apart from an item that
   exists and currently carries no data. A member half followed by nothing names
   no item and is ``404`` as well.
-- Reads are permissive: ``GET`` of a bare id returns the first match rather
-  than refusing, which is the behaviour every existing client depends on.
+- ``GET /{entity}/operations/{id}`` and
+  ``GET /{entity}/operations/{id}/executions`` refuse exactly what the execution
+  refuses, with the same body. Reading an operation under an id that names
+  several of them would describe one without saying which, and the same id is a
+  ``400`` the moment the caller runs it. The collection never offers such an id,
+  so only a stale one arrives, and it leaves with ``parameters.operation_ids``.
+  An unambiguous bare id reads and lists exactly as before.
+
+Listing the Executions of an Operation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``GET /{entity}/operations/{id}/executions`` resolves ``{id}`` by the rule
+above, so a member-qualified id and a ROS-path id both work, and the answer has
+three distinct forms:
+
+- an **action** returns the goals it holds, newest first;
+- a **service** returns ``200`` with an empty ``items`` array. A service call
+  completes inside its own ``POST`` and leaves no execution resource, so its
+  collection exists and is permanently empty. Whether an operation can ever have
+  executions is read from ``asynchronous_execution`` on the operation itself;
+- an id that names **no operation** is ``404 operation-not-found``, and an
+  unknown member half is ``404 resource-not-found`` naming that half - so a typo
+  is never answered as an operation that simply has not been run.
+
+Goals live on the gateway that sent them, so an id naming a peer-owned member is
+dispatched to that member's own route exactly as the ``POST`` was. A goal
+started through an aggregating entity is therefore listed through it too.
 
 Where a Member-Qualified Request is Served
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -933,7 +958,9 @@ Execute Operations
       }
 
 ``GET /api/v1/components/{id}/operations/{operation_id}/executions``
-   List all executions for an operation.
+   List all executions for an operation. Actions return their goals; a service
+   returns an empty ``items`` array, because a service call leaves no execution
+   resource behind. An id naming no operation is ``404``.
 
 ``GET /api/v1/components/{id}/operations/{operation_id}/executions/{execution_id}``
    Get execution status and result.

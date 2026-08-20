@@ -229,6 +229,58 @@ std::vector<std::string> distinct_members(const std::vector<OperationMatch> & ma
   return members;
 }
 
+/// The refusal `parsed` earns on this entity, or nothing when it names at most
+/// one operation.
+///
+/// One construction for every route that resolves an operation id. A route that
+/// accepted an id another route refuses would serve one of several operations
+/// without ever saying which, and two separately built messages for the same
+/// collision drift apart, so the caller is told a different remedy depending on
+/// which verb it used.
+///
+/// `parameters.operation_ids` carries the ids that DO address what collided,
+/// built by the rule the collection lists them under, so a caller sends one of
+/// them back instead of deriving the form itself.
+std::optional<ErrorInfo> refuse_if_ambiguous(const AggregatedOperations & ops, const http::MemberQualifiedId & parsed,
+                                             const std::string & entity_id, const std::string & operation_id) {
+  const std::vector<OperationMatch> matches = matching_operations(ops, parsed);
+  if (matches.size() < 2) {
+    return std::nullopt;
+  }
+
+  std::vector<std::string> paths;
+  paths.reserve(matches.size());
+  for (const auto & match : matches) {
+    paths.push_back(match.full_path);
+  }
+  const std::vector<std::string> members = distinct_members(matches);
+  json params{{"entity_id", entity_id}, {"operation_id", operation_id}, {"ros2_paths", paths}};
+  if (!members.empty()) {
+    params["member_ids"] = members;
+  }
+
+  const auto addressed_by_path = http::operation_paths_addressed_by_path(ops);
+  std::vector<std::string> addressable;
+  addressable.reserve(matches.size());
+  for (const auto & match : matches) {
+    std::string item = http::operation_item_half(parsed.item_id, match.full_path, addressed_by_path);
+    if (ops.is_aggregated && !match.member_id.empty()) {
+      item = http::make_member_qualified_id(match.member_id, item);
+    }
+    addressable.push_back(std::move(item));
+  }
+  params["operation_ids"] = addressable;
+
+  if (members.size() > 1) {
+    params["details"] = "Use format 'member_id:operation_id' to name the member that runs it";
+    return make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: more than one member provides it", params);
+  }
+  params["details"] =
+      "One provider exposes this short name at more than one ROS path; address the one you mean by that "
+      "path, without its leading slash";
+  return make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: it names more than one operation", params);
+}
+
 /// True for a member that is in the tree but whose gateway is silent.
 ///
 /// A retained member is kept precisely so that the answer to a request does not
@@ -734,6 +786,15 @@ http::Result<dto::OperationDetail> OperationHandlers::get_operation(const http::
                                           json{{"entity_id", entity_id}, {"operation_id", operation_id}}));
   }
 
+  // A read refuses exactly what an execution refuses. Describing one of several
+  // operations under an id that names them all tells the caller it holds an
+  // address it does not hold, and the next thing it does with that id is run
+  // it - where the same id is a 400. The collection no longer offers such an
+  // id, so only a stale one arrives here, and it leaves with the ids that work.
+  if (auto ambiguous = refuse_if_ambiguous(ops, parsed, entity_id, operation_id); ambiguous.has_value()) {
+    return tl::make_unexpected(std::move(*ambiguous));
+  }
+
   auto data_access_mgr = ctx_.node()->get_data_access_manager();
   auto type_introspection = data_access_mgr->get_type_introspection();
 
@@ -877,43 +938,8 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
   // one member that uses the same short name at two ROS paths is still not
   // identified by it - there the item half has to be the ROS path, which is the
   // form the collection offers for exactly those copies.
-  const std::vector<OperationMatch> matches = matching_operations(ops, parsed);
-  if (matches.size() > 1) {
-    std::vector<std::string> paths;
-    paths.reserve(matches.size());
-    for (const auto & match : matches) {
-      paths.push_back(match.full_path);
-    }
-    const std::vector<std::string> members = distinct_members(matches);
-    json params{{"entity_id", entity_id}, {"operation_id", operation_id}, {"ros2_paths", paths}};
-    if (!members.empty()) {
-      params["member_ids"] = members;
-    }
-    // The ids that DO address the operations this one collided with, built by
-    // the rule the collection lists them under. A refusal that only describes
-    // the form leaves the caller to re-derive it, and a caller that derives it
-    // differently is refused again for a reason the answer already knew.
-    const auto addressed_by_path = http::operation_paths_addressed_by_path(ops);
-    std::vector<std::string> addressable;
-    addressable.reserve(matches.size());
-    for (const auto & match : matches) {
-      std::string item = http::operation_item_half(parsed.item_id, match.full_path, addressed_by_path);
-      if (ops.is_aggregated && !match.member_id.empty()) {
-        item = http::make_member_qualified_id(match.member_id, item);
-      }
-      addressable.push_back(std::move(item));
-    }
-    params["operation_ids"] = addressable;
-    if (members.size() > 1) {
-      params["details"] = "Use format 'member_id:operation_id' to name the member that runs it";
-      return tl::make_unexpected(
-          make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: more than one member provides it", params));
-    }
-    params["details"] =
-        "One provider exposes this short name at more than one ROS path; address the one you mean by that "
-        "path, without its leading slash";
-    return tl::make_unexpected(
-        make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: it names more than one operation", params));
+  if (auto ambiguous = refuse_if_ambiguous(ops, parsed, entity_id, operation_id); ambiguous.has_value()) {
+    return tl::make_unexpected(std::move(*ambiguous));
   }
 
   // Whoever ends up owning the resolved operation must be reachable, and must
@@ -1033,48 +1059,104 @@ http::Result<dto::Collection<dto::ExecutionId>> OperationHandlers::list_executio
   }
   const std::string operation_id = *op_id_result;
 
-  if (auto vr = ctx_.validate_entity_id(entity_id); !vr) {
-    return tl::make_unexpected(make_error(400, ERR_INVALID_PARAMETER, "Invalid entity ID",
-                                          json{{"details", vr.error()}, {"entity_id", entity_id}}));
+  auto entity_result = ctx_.validate_entity_for_route(req, entity_id);
+  if (!entity_result) {
+    return tl::make_unexpected(flatten_validator_error(entity_result.error()));
+  }
+  const auto entity_info = *entity_result;
+
+  // Typed Collection<ExecutionId>; the wire shape is `{"items": [{"id": "..."}]}`
+  // per JsonWriter<Collection<ExecutionId>>::write.
+  dto::Collection<dto::ExecutionId> collection;
+
+  // A plugin operation runs to completion inside execute_operation, so nothing
+  // is ever tracked for it and the collection is empty by construction. The
+  // provider still decides whether the operation exists at all, so a typo is a
+  // miss here and not an empty success.
+  if (entity_info.is_plugin) {
+    auto * pmgr = ctx_.node()->get_plugin_manager();
+    auto * op_prov = pmgr ? pmgr->get_operation_provider_for_entity(entity_id) : nullptr;
+    if (op_prov == nullptr) {
+      return tl::make_unexpected(
+          make_error(404, ERR_OPERATION_NOT_FOUND, "No operation provider for plugin entity '" + entity_id + "'"));
+    }
+    try {
+      auto result = op_prov->get_operation(entity_id, operation_id);
+      if (!result) {
+        return tl::make_unexpected(make_provider_error(result.error(), entity_id, operation_id));
+      }
+      return collection;
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(HandlerContext::logger(), "Plugin OperationProvider threw for entity '%s': %s", entity_id.c_str(),
+                   e.what());
+      return tl::make_unexpected(make_plugin_error(500, "Plugin threw exception", json{{"entity_id", entity_id}}));
+    } catch (...) {
+      RCLCPP_ERROR(HandlerContext::logger(), "Plugin OperationProvider threw unknown exception for entity '%s'",
+                   entity_id.c_str());
+      return tl::make_unexpected(
+          make_plugin_error(500, "Plugin threw unknown exception", json{{"entity_id", entity_id}}));
+    }
   }
 
   const auto & cache = ctx_.node()->get_thread_safe_cache();
-  std::string namespace_path;
-  bool entity_found = false;
-
-  if (auto component = cache.get_component(entity_id)) {
-    namespace_path = component->namespace_path;
-    entity_found = true;
+  auto lookup = resolve_entity_operations(cache, entity_info.sovd_type(), entity_id);
+  if (!lookup) {
+    return tl::make_unexpected(lookup.error());
   }
-  if (!entity_found) {
-    if (auto app = cache.get_app(entity_id)) {
-      for (const auto & act : app->actions) {
-        if (act.name == operation_id) {
-          namespace_path = act.full_path.substr(0, act.full_path.rfind('/'));
-          entity_found = true;
-          break;
-        }
-      }
+  const auto & ops = lookup->ops;
+
+  // The executions of an operation are addressed by the id that addresses the
+  // operation, resolved by the one rule the collection lists it under. Deriving
+  // a ROS path by joining the entity's namespace to the id instead names a path
+  // no member need have: an id can carry a member half or be a ROS path, and a
+  // member's namespace is its own, not the aggregate's.
+  auto parsed = http::parse_member_qualified_id(operation_id, ops.is_aggregated);
+  if (parsed.has_member && !names_a_member(ops, parsed.member_id)) {
+    return tl::make_unexpected(
+        make_error(404, ERR_RESOURCE_NOT_FOUND, "Member not found in entity",
+                   json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"member_id", parsed.member_id}}));
+  }
+
+  auto resolved = resolve_operation(ops, parsed);
+  if (!resolved.found()) {
+    return tl::make_unexpected(make_error(404, ERR_OPERATION_NOT_FOUND, "Operation not found",
+                                          json{{"entity_id", entity_id}, {"operation_id", operation_id}}));
+  }
+
+  if (auto ambiguous = refuse_if_ambiguous(ops, parsed, entity_id, operation_id); ambiguous.has_value()) {
+    return tl::make_unexpected(std::move(*ambiguous));
+  }
+
+  // The goals of an operation live on the gateway that sent them, which is the
+  // one that owns the member - the same gateway POST reached to create them.
+  // Answering from the local tracking map instead reports an empty collection
+  // for goals that exist.
+  const std::string & full_path =
+      resolved.service.has_value() ? resolved.service->full_path : resolved.action->full_path;
+  if (auto owner = ops.owner_by_path.find(full_path); owner != ops.owner_by_path.end()) {
+    auto dispatch = ctx_.dispatch_to_member(req, owner->second, "operations/" + parsed.item_id + "/executions",
+                                            json{{"entity_id", entity_id}, {"operation_id", operation_id}});
+    if (!dispatch) {
+      return tl::make_unexpected(dispatch.error());
+    }
+    if (*dispatch == MemberDispatch::kForwarded) {
+      return tl::make_unexpected(HandlerContext::forwarded_sentinel_error());
     }
   }
-  if (!entity_found) {
-    return tl::make_unexpected(
-        make_error(404, ERR_ENTITY_NOT_FOUND, "Entity not found", json{{"entity_id", entity_id}}));
-  }
 
-  const std::string action_path = namespace_path + "/" + operation_id;
-  auto * operation_mgr = ctx_.node()->get_operation_manager();
-  auto goals = operation_mgr->get_goals_for_action(action_path);
-
-  // Typed Collection<ExecutionId> - replaces the legacy ad-hoc
-  // `{"items": [{"id": "..."}]}` JSON literal. The wire shape is identical
-  // (per JsonWriter<Collection<ExecutionId>>::write) but the per-item schema
-  // is now enforced by JsonReader<ExecutionId> on round-trip.
-  dto::Collection<dto::ExecutionId> collection;
-  for (const auto & goal : goals) {
-    dto::ExecutionId item;
-    item.id = goal.goal_id;
-    collection.items.push_back(std::move(item));
+  // Only an action produces an execution resource: a service call returns its
+  // result inside the POST and leaves nothing to address afterwards. Its
+  // executions collection therefore exists and is empty, which is a different
+  // answer from the 404 an id naming no operation gets above - and the two have
+  // to stay different, because a client reading a collection of executions
+  // cannot otherwise tell a synchronous operation from a mistyped id.
+  if (resolved.action.has_value()) {
+    auto * operation_mgr = ctx_.node()->get_operation_manager();
+    for (const auto & goal : operation_mgr->get_goals_for_action(resolved.action->full_path)) {
+      dto::ExecutionId item;
+      item.id = goal.goal_id;
+      collection.items.push_back(std::move(item));
+    }
   }
   return collection;
 }

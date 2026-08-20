@@ -132,9 +132,22 @@ PEER_DOMAIN_ID = get_test_domain_id(1)
 # exist for. With the same namespace on both sides the full paths are identical
 # and the local walk simply deduplicates the peer's copy away, which builds a
 # dedup collapse rather than the ambiguity.
-PRIMARY_NODES = ['temp_sensor', 'calibration', 'dual_calibration', 'rpm_sensor']
+PRIMARY_NODES = [
+    'temp_sensor', 'calibration', 'dual_calibration', 'rpm_sensor', 'long_calibration',
+]
 PEER_NODES = ['pressure_sensor', 'actuator']
 PEER_CALIBRATION_NAMESPACE = '/chassis/brakes'
+
+# An action on each side, because only an action leaves an execution behind: a
+# service answers inside its own call, so a topology of services alone cannot
+# show whether listing executions reaches the gateway that holds the goals. The
+# peer's copy runs in the peer's namespace for the same reason its calibration
+# service does - identical full paths would deduplicate into one item and the
+# member half would have nothing to separate.
+PRIMARY_LONG_APP = 'primary_long_calibration'
+PEER_LONG_APP = 'peer_long_calibration'
+LONG_OPERATION = 'long_calibration'
+PEER_LONG_NAMESPACE = '/chassis/brakes'
 
 # Declared with the SAME id on both gateways. Apps are renamed on collision,
 # Components are not, so this is the case that shows whether leaf identity
@@ -157,6 +170,12 @@ DUAL_APP = 'dual_calibration'
 DUAL_NAMESPACE = '/testrig/dual'
 DUAL_LEFT_ID = 'testrig/dual/left/calibrate'
 DUAL_RIGHT_ID = 'testrig/dual/right/calibrate'
+
+# The same collision on the action side. A service has no executions at all, so
+# the path form can only be shown to select the operation it names - rather than
+# merely to resolve - where the two copies hold goals that differ.
+DUAL_LEFT_SWEEP_ID = 'testrig/dual/left/sweep'
+DUAL_RIGHT_SWEEP_ID = 'testrig/dual/right/sweep'
 
 MERGED_AREA = 'vehicle'
 MERGED_FUNCTION = 'vehicle_health'
@@ -199,6 +218,12 @@ apps:
     ros_binding:
       node_name: dual_calibration
       namespace: {DUAL_NAMESPACE}
+  - id: {PRIMARY_LONG_APP}
+    name: "Primary Long Calibration"
+    is_located_on: {PARENT_COMPONENT}
+    ros_binding:
+      node_name: long_calibration
+      namespace: /powertrain/engine
   - id: {COLLIDING_LEAF}
     name: "Shared Sensor (primary)"
     is_located_on: {PARENT_COMPONENT}
@@ -212,6 +237,7 @@ functions:
     hosted_by:
       - temp_sensor
       - primary_calibration
+      - {PRIMARY_LONG_APP}
       - {COLLIDING_LEAF}
 """
 
@@ -255,6 +281,12 @@ apps:
     ros_binding:
       node_name: calibration
       namespace: {PEER_CALIBRATION_NAMESPACE}
+  - id: {PEER_LONG_APP}
+    name: "Peer Long Calibration"
+    is_located_on: {PEER_SUBCOMPONENT}
+    ros_binding:
+      node_name: long_calibration
+      namespace: {PEER_LONG_NAMESPACE}
   - id: {COLLIDING_LEAF}
     name: "Shared Sensor (peer)"
     is_located_on: {PEER_SUBCOMPONENT}
@@ -268,6 +300,7 @@ functions:
     hosted_by:
       - pressure_sensor
       - peer_calibration
+      - {PEER_LONG_APP}
       - {COLLIDING_LEAF}
 """
 
@@ -327,6 +360,14 @@ def generate_test_description():
                 output='screen',
                 additional_env=peer_domain_env,
             )]
+            + [launch_ros.actions.Node(
+                package='ros2_medkit_integration_tests',
+                executable='demo_long_calibration_action',
+                name='long_calibration',
+                namespace=PEER_LONG_NAMESPACE,
+                output='screen',
+                additional_env=peer_domain_env,
+            )]
             + [
                 create_fault_manager_node(rosbag_enabled=False),
                 create_fault_manager_node(rosbag_enabled=False, extra_env=peer_domain_env),
@@ -358,8 +399,11 @@ class GroupingAggregationTest(unittest.TestCase):
         # a collection read between those two moments is legitimately empty and
         # would fail every rule below for a reason unrelated to the rule.
         cls._wait_for_apps(
-            PRIMARY_URL, {'temp_sensor', 'primary_calibration', DUAL_APP}, 'primary')
-        cls._wait_for_apps(PEER_URL, {'pressure_sensor', 'peer_calibration'}, 'peer')
+            PRIMARY_URL,
+            {'temp_sensor', 'primary_calibration', DUAL_APP, PRIMARY_LONG_APP},
+            'primary')
+        cls._wait_for_apps(
+            PEER_URL, {'pressure_sensor', 'peer_calibration', PEER_LONG_APP}, 'peer')
         cls._wait_until_merged()
 
     @classmethod
@@ -424,6 +468,59 @@ class GroupingAggregationTest(unittest.TestCase):
             json={},
             timeout=15,
         )
+
+    @staticmethod
+    def _executions_url(entity_path, operation_id, base_url=PRIMARY_URL):
+        return (f'{base_url}/{entity_path}/operations/'
+                f'{quote(operation_id, safe="")}/executions')
+
+    def _wait_for_operation(self, entity_path, operation_id, timeout=60.0):
+        """Block until `operation_id` is listed AND carries its ROS type.
+
+        An operation appears in the collection before the gateway has resolved
+        the interface type behind it, and a goal sent in that window is refused
+        for a reason that has nothing to do with the id under test.
+        """
+        deadline = time.monotonic() + timeout
+        seen = []
+        while time.monotonic() < deadline:
+            response = requests.get(
+                f'{PRIMARY_URL}/{entity_path}/operations', timeout=10)
+            if response.status_code == 200:
+                seen = []
+                for item in response.json().get('items', []):
+                    seen.append(item.get('id'))
+                    if item.get('id') != operation_id:
+                        continue
+                    ros2 = item.get('x-medkit', {}).get('ros2', {})
+                    if ros2.get('type'):
+                        return
+            time.sleep(0.5)
+        raise AssertionError(
+            f'{entity_path}: {operation_id!r} not usable within {timeout}s; offered {seen}')
+
+    def _start_goal(self, entity_path, operation_id, order=30):
+        """Send one action goal and return the execution id it was given."""
+        response = requests.post(
+            self._executions_url(entity_path, operation_id),
+            json={'parameters': {'order': order}},
+            timeout=20,
+        )
+        self.assertEqual(
+            response.status_code, 202,
+            f'{operation_id!r} on {entity_path} did not start: {response.text}')
+        execution_id = response.json().get('id')
+        self.assertTrue(execution_id, response.text)
+        return execution_id
+
+    def _execution_ids(self, entity_path, operation_id, base_url=PRIMARY_URL):
+        """Read the ids in the executions collection of one operation."""
+        response = requests.get(
+            self._executions_url(entity_path, operation_id, base_url), timeout=20)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertIn('items', body, response.text)
+        return [item.get('id') for item in body['items']]
 
     def _assert_side_ran(self, response, side, operation_id):
         """Assert the service the id names is the one that answered.
@@ -862,6 +959,289 @@ class GroupingAggregationTest(unittest.TestCase):
             through_aggregate.json().get('error_code'), 'operation-not-found',
             through_aggregate.text,
         )
+
+    # ---------------------------------------------------------------------- R5
+    # LISTING THE EXECUTIONS OF AN OPERATION.
+    #
+    # An execution exists only for an action: a service answers inside its own
+    # call and leaves nothing behind. So the collection has three distinct
+    # answers, and a client has to be able to tell them apart - the goals of an
+    # action, the empty collection of a service, and the refusal of an id that
+    # names no operation at all.
+
+    def test_a_started_goal_is_listed_under_the_id_that_started_it(self):
+        """The goals an aggregate reports are the ones that exist.
+
+        Asserted by the id that came back from starting it, not by the status:
+        a listing that resolves nothing answers 200 with an empty array, and
+        that is indistinguishable from a working listing of an action nobody
+        has run. The second half pins that the listing is per operation - a
+        collection that reported every goal the gateway tracks would satisfy
+        the first half on its own.
+        """
+        entity_path = f'functions/{MERGED_FUNCTION}'
+        local_id = f'{PRIMARY_LONG_APP}:{LONG_OPERATION}'
+        peer_id = f'{PEER_LONG_APP}:{LONG_OPERATION}'
+        self._wait_for_operation(entity_path, local_id)
+        self._wait_for_operation(entity_path, peer_id)
+
+        execution_id = self._start_goal(entity_path, local_id)
+
+        listed = self._execution_ids(entity_path, local_id)
+        self.assertIn(
+            execution_id, listed,
+            f'the goal that was just started is not among {listed}')
+
+        other = self._execution_ids(entity_path, peer_id)
+        self.assertNotIn(
+            execution_id, other,
+            f'a goal of {local_id!r} is reported under {peer_id!r}: {other}',
+        )
+
+    def test_a_goal_started_on_a_peer_owned_member_is_listed_through_the_aggregate(self):
+        """R5 for the goals themselves: they live where they were sent.
+
+        The POST is dispatched to the member's own gateway, so the goal is on
+        the peer and this gateway tracks nothing for it. A listing answered from
+        the local tracking map returns an empty array with status 200, which is
+        exactly the false success this asserts against - so the peer is asked
+        directly as well, proving the goal the aggregate reported is the one
+        that actually exists over there.
+        """
+        entity_path = f'functions/{MERGED_FUNCTION}'
+        peer_id = f'{PEER_LONG_APP}:{LONG_OPERATION}'
+        self._wait_for_operation(entity_path, peer_id)
+
+        execution_id = self._start_goal(entity_path, peer_id)
+
+        on_the_peer = self._execution_ids(
+            f'apps/{PEER_LONG_APP}', LONG_OPERATION, base_url=PEER_URL)
+        self.assertIn(
+            execution_id, on_the_peer,
+            f'the goal was not started on the peer at all: {on_the_peer}')
+
+        through_aggregate = self._execution_ids(entity_path, peer_id)
+        self.assertIn(
+            execution_id, through_aggregate,
+            f'the aggregate answered from its own tracking map: {through_aggregate}',
+        )
+
+        # The member's own route on THIS gateway names an entity the peer owns
+        # wholesale, so the whole request belongs on the peer.
+        forwarded = self._execution_ids(f'apps/{PEER_LONG_APP}', LONG_OPERATION)
+        self.assertIn(
+            execution_id, forwarded,
+            f'a peer-owned entity was answered locally: {forwarded}')
+
+        local_id = f'{PRIMARY_LONG_APP}:{LONG_OPERATION}'
+        here = self._execution_ids(entity_path, local_id)
+        self.assertNotIn(
+            execution_id, here,
+            f"a peer's goal is reported under the local member: {here}")
+
+    def test_a_service_operation_has_an_empty_execution_collection_not_a_miss(self):
+        """R6 for executions: present-but-empty is not the same as absent.
+
+        A service runs to completion inside the POST, so its executions
+        collection exists and is empty - forever. An id that names no operation
+        does not exist at all. Answering both the same way tells a client its
+        typo worked, and answering the service with `entity-not-found` names the
+        wrong thing entirely: the entity is right there.
+        """
+        entity_path = f'functions/{MERGED_FUNCTION}'
+        service_id = 'primary_calibration:calibrate'
+
+        response = requests.get(
+            self._executions_url(entity_path, service_id), timeout=20)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json().get('items'), [],
+            f'a synchronous operation reported executions: {response.text}')
+
+        for missing, label in (
+            ('primary_calibration:no_such_operation', 'a member that exists'),
+            ('no_such_operation', 'no member half at all'),
+        ):
+            with self.subTest(operation=missing):
+                refused = requests.get(
+                    self._executions_url(entity_path, missing), timeout=20)
+                self.assertEqual(
+                    refused.status_code, 404,
+                    f'{label}: {missing!r} answered {refused.status_code}: {refused.text}')
+                body = refused.json()
+                self.assertEqual(
+                    body.get('error_code'), 'operation-not-found',
+                    f'the refusal blames the entity rather than the id: {body}')
+                self.assertEqual(
+                    body.get('parameters', {}).get('operation_id'), missing, body)
+
+        # A member half naming no member of this entity is wrong in a different
+        # place, and the refusal has to say which half - otherwise a mistyped
+        # member reads the same as a member whose operation is missing.
+        unknown_member = requests.get(
+            self._executions_url(entity_path, f'no_such_member:{LONG_OPERATION}'), timeout=20)
+        self.assertEqual(unknown_member.status_code, 404, unknown_member.text)
+        body = unknown_member.json()
+        self.assertEqual(body.get('error_code'), 'resource-not-found', body)
+        self.assertEqual(
+            body.get('parameters', {}).get('member_id'), 'no_such_member',
+            f'the refusal does not name the member half that was wrong: {body}')
+
+    def test_a_path_shaped_id_lists_the_goals_of_the_operation_it_names(self):
+        """R3 and R5 together, for the id form that has no member half to use.
+
+        `left/sweep` and `right/sweep` are one provider's two actions under one
+        short name. Both sides are driven and each list is checked for its OWN
+        goal AND against the other's, because a resolver that always picked the
+        first match would list the left goal under both ids and every
+        single-sided assertion would still pass.
+        """
+        entity_path = f'apps/{DUAL_APP}'
+        self._wait_for_operation(entity_path, DUAL_LEFT_SWEEP_ID)
+        self._wait_for_operation(entity_path, DUAL_RIGHT_SWEEP_ID)
+
+        left_goal = self._start_goal(entity_path, DUAL_LEFT_SWEEP_ID)
+        right_goal = self._start_goal(entity_path, DUAL_RIGHT_SWEEP_ID)
+        self.assertNotEqual(left_goal, right_goal)
+
+        left_listed = self._execution_ids(entity_path, DUAL_LEFT_SWEEP_ID)
+        right_listed = self._execution_ids(entity_path, DUAL_RIGHT_SWEEP_ID)
+        self.assertIn(left_goal, left_listed, left_listed)
+        self.assertNotIn(
+            right_goal, left_listed,
+            f'the left list carries the right goal: {left_listed}')
+        self.assertIn(right_goal, right_listed, right_listed)
+        self.assertNotIn(
+            left_goal, right_listed,
+            f'the right list carries the left goal: {right_listed}')
+
+        # The bare short name names both, so listing it names neither, and the
+        # refusal hands back the ids that do work.
+        bare = requests.get(self._executions_url(entity_path, 'sweep'), timeout=20)
+        self.assertEqual(bare.status_code, 400, bare.text)
+        self.assertEqual(
+            sorted(bare.json().get('parameters', {}).get('operation_ids') or []),
+            sorted([DUAL_LEFT_SWEEP_ID, DUAL_RIGHT_SWEEP_ID]),
+            f'the refusal does not hand back the ids that work: {bare.text}',
+        )
+
+        # And through an aggregate, where the member half and the path half are
+        # both in play.
+        aggregate_left = f'{DUAL_APP}:{DUAL_LEFT_SWEEP_ID}'
+        through_aggregate = self._execution_ids(
+            f'components/{PARENT_COMPONENT}', aggregate_left)
+        self.assertIn(
+            left_goal, through_aggregate,
+            f'{aggregate_left!r} lost the goal it names: {through_aggregate}')
+
+    def test_reading_an_id_that_names_two_operations_is_refused(self):
+        """R4 on the read, which is the half that was still permissive.
+
+        Returning the first match hands the caller one of several operations and
+        never says which - and the very next thing it does with that id, running
+        it, is a 400. The remedy is asserted as an id that reads, not as words
+        in a sentence.
+        """
+        cases = (
+            # one provider, one short name, two ROS paths
+            (f'apps/{DUAL_APP}', 'calibrate', [DUAL_LEFT_ID, DUAL_RIGHT_ID]),
+            (f'components/{PARENT_COMPONENT}', f'{DUAL_APP}:calibrate',
+             [f'{DUAL_APP}:{DUAL_LEFT_ID}', f'{DUAL_APP}:{DUAL_RIGHT_ID}']),
+            # two members, one short name
+            (f'functions/{MERGED_FUNCTION}', 'calibrate',
+             ['primary_calibration:calibrate', 'peer_calibration:calibrate']),
+        )
+        for entity_path, operation_id, expected in cases:
+            with self.subTest(entity=entity_path, operation=operation_id):
+                refused = requests.get(
+                    f'{PRIMARY_URL}/{entity_path}/operations/'
+                    f'{quote(operation_id, safe="")}',
+                    timeout=20,
+                )
+                self.assertEqual(
+                    refused.status_code, 400,
+                    f'a read resolved an id that names two operations: {refused.text}')
+                body = refused.json()
+                self.assertEqual(body.get('error_code'), 'invalid-request', body)
+                offered = body.get('parameters', {}).get('operation_ids')
+                self.assertEqual(
+                    sorted(offered or []), sorted(expected),
+                    f'the refusal does not name the ids that work: {body}')
+
+                # Taken straight out of the refusal it reads, so the remedy is
+                # usable rather than merely described.
+                detail = requests.get(
+                    f'{PRIMARY_URL}/{entity_path}/operations/'
+                    f'{quote(offered[0], safe="")}',
+                    timeout=20,
+                )
+                self.assertEqual(
+                    detail.status_code, 200,
+                    f'{offered[0]!r} came out of the refusal and is refused too: '
+                    f'{detail.text}')
+                self.assertEqual(detail.json().get('item', {}).get('id'), offered[0], detail.text)
+
+    def test_an_unambiguous_bare_id_still_reads_and_lists(self):
+        """The regression guard, and it matters more than the refusal above.
+
+        Every current client, the web UI, the Foxglove panel, the MCP tools and
+        the generated OpenAPI document send the bare short name. An id its own
+        provider carries once must read and list exactly as it did, whatever
+        some other provider does with the same name.
+        """
+        detail = requests.get(
+            f'{PRIMARY_URL}/apps/primary_calibration/operations/calibrate', timeout=20)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        item = detail.json().get('item', {})
+        self.assertEqual(item.get('id'), 'calibrate', detail.text)
+        self.assertEqual(
+            item.get('x-medkit', {}).get('ros2', {}).get('service'),
+            '/powertrain/engine/calibrate', detail.text,
+        )
+
+        self.assertEqual(
+            self._execution_ids('apps/primary_calibration', 'calibrate'), [],
+            'a service reported executions',
+        )
+
+        entity_path = f'apps/{PRIMARY_LONG_APP}'
+        self._wait_for_operation(entity_path, LONG_OPERATION)
+        execution_id = self._start_goal(entity_path, LONG_OPERATION)
+        listed = self._execution_ids(entity_path, LONG_OPERATION)
+        self.assertIn(
+            execution_id, listed,
+            f'a bare id started a goal it then could not list: {listed}')
+
+    def test_the_executions_route_validates_the_entity_like_its_siblings(self):
+        """The executions collection is a route on an entity, not a free path.
+
+        Every other operations route settles the entity first: the id has to
+        name an entity of the type the route is registered for, and an entity a
+        peer owns wholesale belongs on that peer. Reading the entity straight
+        out of the cache instead answers a Component asked for on the apps route
+        as though the route said nothing, and never forwards.
+        """
+        # An id that IS unambiguous on that Component, so the only thing left to
+        # refuse it for is the collection it was asked on. A colliding id would
+        # answer 400 either way and prove nothing.
+        wrong_type = requests.get(
+            self._executions_url(
+                f'apps/{PARENT_COMPONENT}', 'primary_calibration:calibrate'),
+            timeout=20,
+        )
+        self.assertEqual(
+            wrong_type.status_code, 400,
+            f'a Component was served on the apps route: {wrong_type.text}')
+        body = wrong_type.json()
+        self.assertEqual(body.get('error_code'), 'invalid-parameter', body)
+        self.assertEqual(
+            body.get('parameters', {}).get('actual_type'), 'Component',
+            f'the refusal is not about the route the entity was asked on: {body}')
+
+        absent = requests.get(
+            self._executions_url('functions/no_such_entity', 'calibrate'), timeout=20)
+        self.assertEqual(absent.status_code, 404, absent.text)
+        self.assertEqual(absent.json().get('error_code'), 'entity-not-found', absent.text)
 
     # ---------------------------------------------------------------------- R4
 

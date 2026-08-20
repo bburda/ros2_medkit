@@ -52,7 +52,7 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 - `GET /api/v1/components/{component_id}/operations` - List all services and actions for a component
 - `GET /api/v1/components/{component_id}/operations/{operation_id}` - Get operation details
 - `POST /api/v1/components/{component_id}/operations/{operation_id}/executions` - Execute operation (call service or send action goal)
-- `GET /api/v1/components/{component_id}/operations/{operation_id}/executions` - List all executions for an operation
+- `GET /api/v1/components/{component_id}/operations/{operation_id}/executions` - List all executions for an operation (empty for a service, which leaves no execution resource)
 - `GET /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}` - Get execution status
 - `DELETE /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}` - Cancel action execution
 
@@ -309,7 +309,17 @@ unchanged - a ROS path carries no colon.
   item half that member does not provide, or a member half followed by nothing,
   is `404` - which is what tells an absent item apart from one that exists and
   carries no data.
-- `GET` of a bare id stays permissive and returns the first match.
+- `GET /{entity}/operations/{id}` and `GET /{entity}/operations/{id}/executions`
+  refuse exactly what the execution refuses, with the same body. An unambiguous
+  bare id reads and lists unchanged.
+
+`GET /{entity}/operations/{id}/executions` resolves the id by the same rule, so
+a member-qualified id and a ROS-path id both work, and has three distinct
+answers: an action returns its goals, a service returns `200` with an empty
+`items` array (a service call completes inside its `POST` and leaves no
+execution resource), and an id naming no operation is `404`. Goals live on the
+gateway that sent them, so an id naming a peer-owned member is dispatched to
+that member's own route exactly as the `POST` was.
 
 A member-qualified request is served by the gateway that owns that member, on
 the member's own entity route. An aggregating entity holds nothing itself and
