@@ -106,6 +106,13 @@ void qualify_ambiguous_ids(std::vector<Item> & items, MemberIdsOf member_ids_of)
     if (members == nullptr || members->size() != 1) {
       continue;
     }
+    // An id already addressed to this member is left alone. Prefixing it again
+    // yields a form whose first colon splits off the member twice, which names
+    // nothing - and it happens whenever one member exposes the same short name
+    // more than once, because both copies then carry the same qualified id.
+    if (item.id.rfind(members->front() + ":", 0) == 0) {
+      continue;
+    }
     item.id = make_member_qualified_id(members->front(), item.id);
   }
 }
