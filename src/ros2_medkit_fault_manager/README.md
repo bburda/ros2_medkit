@@ -143,13 +143,19 @@ direction (the fault receding), so they are not near misses.
 
 The series is **append-only**: one entry per qualifying report, holding the timestamp, the counter
 value after the report, the confirmation threshold it was measured against, the severity and the
-reporting source. Nothing is updated in place, so "this code approached confirmation five times
-this hour" stays answerable.
+reporting source. Every field describes that one report, so a series spanning a threshold change
+or a new reporting source stays readable. Nothing is updated in place, so "this code approached
+confirmation five times this hour" stays answerable.
+
+Entries are kept and evicted in **arrival order**, not by their timestamps. Reporters carry their
+own clocks, so a report can arrive carrying a timestamp behind one already stored; ordering the
+series by timestamp would let such a report evict itself on arrival.
 
 It is **retained across `~/clear_fault`**. Clearing acknowledges one fault cycle; how often a code
 approaches confirmation spans cycles, and once deleted it cannot be reconstructed. The same holds
-for the startup reclassification of HEALED faults. Per-topic snapshots are still dropped on clear -
-they belong to the one confirmed occurrence, not to the series.
+for the startup reclassification of HEALED faults. Per-topic snapshots are dropped on clear by
+default, because they belong to the one confirmed occurrence rather than to the series; set
+`snapshots.retain_on_clear` to keep them as well.
 
 Retention is **bounded per fault code** by `near_miss.max_per_fault` (default 200), evicting the
 **oldest** entries first. That is deliberately the opposite of the snapshot limit's keep-earliest

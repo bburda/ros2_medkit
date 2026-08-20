@@ -2553,6 +2553,78 @@ TEST(InMemoryNearMissTest, PassedReportIsNotANearMiss) {
   EXPECT_EQ(storage.get_near_misses("PUMP_PRESSURE_LOW").size(), 2u);
 }
 
+TEST(InMemoryNearMissTest, SeriesSurvivesHealedReclassification) {
+  InMemoryFaultStorage storage;
+  DebounceConfig config = near_miss_config();
+  config.healing_enabled = true;
+  config.healing_threshold = 1;
+
+  storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                             "pressure dipping", "/hydraulics/pump", near_miss_time(0), config);
+  for (int i = 1; i <= 2; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN, "",
+                               "/hydraulics/pump", near_miss_time(i), config);
+  }
+  auto healed = storage.get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(healed.has_value());
+  ASSERT_EQ(healed->status, Fault::STATUS_HEALED) << "test setup: the fault must be latched HEALED";
+  ASSERT_EQ(storage.get_near_misses("PUMP_PRESSURE_LOW").size(), 1u);
+
+  ASSERT_EQ(storage.reclassify_healed_as_cleared().size(), 1u);
+
+  EXPECT_EQ(storage.get_near_misses("PUMP_PRESSURE_LOW").size(), 1u);
+}
+
+TEST(InMemoryNearMissTest, BoundIsPerFaultCode) {
+  InMemoryFaultStorage storage;
+  DebounceConfig config = near_miss_config();
+  config.confirmation_threshold = -20;
+  storage.set_max_near_misses_per_fault(2);
+
+  for (int i = 0; i < 3; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", near_miss_time(i), config);
+    storage.report_fault_event("MOTOR_OVERHEAT", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "temperature rising", "/powertrain/motor", near_miss_time(i), config);
+  }
+
+  EXPECT_EQ(storage.get_near_misses("PUMP_PRESSURE_LOW").size(), 2u);
+  EXPECT_EQ(storage.get_near_misses("MOTOR_OVERHEAT").size(), 2u);
+}
+
+TEST(InMemoryNearMissTest, BoundZeroIsUnlimited) {
+  InMemoryFaultStorage storage;
+  DebounceConfig config = near_miss_config();
+  config.confirmation_threshold = -200;
+  storage.set_max_near_misses_per_fault(0);
+
+  for (int i = 0; i < 150; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", near_miss_time(i), config);
+  }
+
+  EXPECT_EQ(storage.get_near_misses("PUMP_PRESSURE_LOW").size(), 150u);
+}
+
+TEST(InMemoryNearMissTest, ApplyingSmallerBoundTrimsExistingSeries) {
+  InMemoryFaultStorage storage;
+  DebounceConfig config = near_miss_config();
+  config.confirmation_threshold = -20;
+  storage.set_max_near_misses_per_fault(0);
+
+  for (int i = 0; i < 5; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", near_miss_time(i), config);
+  }
+
+  storage.set_max_near_misses_per_fault(2);
+
+  auto series = storage.get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 2u);
+  EXPECT_EQ(series[0].debounce_counter, -4);
+  EXPECT_EQ(series[1].debounce_counter, -5);
+}
+
 TEST(InMemoryNearMissTest, EmptyForUnknownFault) {
   InMemoryFaultStorage storage;
   EXPECT_TRUE(storage.get_near_misses("NEVER_REPORTED").empty());

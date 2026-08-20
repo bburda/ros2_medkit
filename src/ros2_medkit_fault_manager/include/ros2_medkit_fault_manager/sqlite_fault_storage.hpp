@@ -134,6 +134,12 @@ class SqliteFaultStorage : public FaultStorage {
   /// still says nobody holds it.
   std::vector<std::string> store_rosbag_file_locked(const RosbagFileInfo & info);
 
+  /// report_fault_event body without taking mutex_ or opening a transaction. Caller holds mutex_
+  /// and wraps the call, so the fault row and any near-miss row commit together.
+  bool report_fault_event_locked(const std::string & fault_code, uint8_t event_type, uint8_t severity,
+                                 const std::string & description, const std::string & source_id,
+                                 const rclcpp::Time & timestamp, const DebounceConfig & config);
+
   /// Append one entry to the near-miss series and evict the oldest entries beyond
   /// max_near_misses_per_fault_. Caller holds mutex_ and has already written the fault row.
   /// @param fault_code The fault code that nearly confirmed
