@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
 
@@ -77,6 +78,9 @@ class SqliteFaultStorage : public FaultStorage {
   void store_freeze_frame(const FreezeFrameData & frame) override;
   std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const override;
 
+  void set_max_near_misses_per_fault(size_t max_count) override;
+  std::vector<NearMissRecord> get_near_misses(const std::string & fault_code) const override;
+
   void store_rosbag_file(const RosbagFileInfo & info) override;
   void store_rosbag_files(const std::vector<RosbagFileInfo> & infos) override;
   std::optional<RosbagFileInfo> get_rosbag_file(const std::string & fault_code) const override;
@@ -130,6 +134,17 @@ class SqliteFaultStorage : public FaultStorage {
   /// still says nobody holds it.
   std::vector<std::string> store_rosbag_file_locked(const RosbagFileInfo & info);
 
+  /// Append one entry to the near-miss series and evict the oldest entries beyond
+  /// max_near_misses_per_fault_. Caller holds mutex_ and has already written the fault row.
+  /// @param fault_code The fault code that nearly confirmed
+  /// @param occurred_at_ns Timestamp of the report
+  /// @param debounce_counter Counter value after the report
+  /// @param config Debounce config the report was evaluated against
+  /// @param severity Severity carried by the report
+  /// @param source_id Reporting source
+  void record_near_miss_locked(const std::string & fault_code, int64_t occurred_at_ns, int32_t debounce_counter,
+                               const DebounceConfig & config, uint8_t severity, const std::string & source_id);
+
   /// Run a plain SQL statement or throw with the SQLite error. Caller holds mutex_.
   void exec_or_throw(const char * sql);
 
@@ -143,7 +158,8 @@ class SqliteFaultStorage : public FaultStorage {
   sqlite3 * db_{nullptr};
   mutable std::mutex mutex_;
   DebounceConfig config_;
-  size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
+  size_t max_snapshots_per_fault_{0};    ///< 0 = unlimited
+  size_t max_near_misses_per_fault_{0};  ///< 0 = unlimited
   bool retain_snapshots_on_clear_{false};
   /// Defaults to 1, the pre-#620 behaviour: a new recording replaces the old one.
   /// 0 = unlimited, bounded only by max_total_storage_mb.

@@ -64,6 +64,10 @@ std::string compute_debounce_status(int32_t counter, const std::string & current
   return current_status;  // counter == 0 keeps the current status (avoids flapping at the boundary)
 }
 
+bool is_near_miss(bool is_failed_event, const std::string & resulting_status) {
+  return is_failed_event && resulting_status != ros2_medkit_msgs::msg::Fault::STATUS_CONFIRMED;
+}
+
 bool sanitize_debounce_config(DebounceConfig & config) {
   bool valid = true;
   if (config.confirmation_threshold >= 0) {
@@ -148,6 +152,10 @@ bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, ui
       update_status(state, config);
     }
 
+    if (is_near_miss(true, state.status)) {
+      record_near_miss(state, config, severity, source_id, timestamp);
+    }
+
     faults_.emplace(fault_code, std::move(state));
     return true;
   }
@@ -182,6 +190,9 @@ bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, ui
       state.status = ros2_medkit_msgs::msg::Fault::STATUS_CONFIRMED;
     } else {
       update_status(state, config);
+    }
+    if (is_near_miss(true, state.status)) {
+      record_near_miss(state, config, severity, source_id, timestamp);
     }
     return true;  // Reactivation treated as new occurrence for event publishing
   }
@@ -231,6 +242,10 @@ bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, ui
 
   // Update status based on debounce counter
   update_status(state, config);
+
+  if (is_near_miss(is_failed, state.status)) {
+    record_near_miss(state, config, severity, source_id, timestamp);
+  }
 
   return false;
 }
@@ -470,6 +485,41 @@ std::optional<FreezeFrameData> InMemoryFaultStorage::get_freeze_frame(const std:
   auto it = freeze_frames_.find(fault_code);
   if (it == freeze_frames_.end()) {
     return std::nullopt;
+  }
+  return it->second;
+}
+
+void InMemoryFaultStorage::record_near_miss(const FaultState & state, const DebounceConfig & config, uint8_t severity,
+                                            const std::string & source_id, const rclcpp::Time & timestamp) {
+  auto & series = near_misses_[state.fault_code];
+
+  NearMissRecord record;
+  record.fault_code = state.fault_code;
+  record.occurred_at_ns = timestamp.nanoseconds();
+  record.debounce_counter = state.debounce_counter;
+  record.confirmation_threshold = config.confirmation_threshold;
+  record.severity = severity;
+  record.source_id = source_id;
+  series.push_back(std::move(record));
+
+  // Evict oldest-first: a series frozen at boot says nothing about a trend.
+  if (max_near_misses_per_fault_ > 0 && series.size() > max_near_misses_per_fault_) {
+    using DiffType = std::vector<NearMissRecord>::difference_type;
+    const auto excess = static_cast<DiffType>(series.size() - max_near_misses_per_fault_);
+    series.erase(series.begin(), series.begin() + excess);
+  }
+}
+
+void InMemoryFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  max_near_misses_per_fault_ = max_count;
+}
+
+std::vector<NearMissRecord> InMemoryFaultStorage::get_near_misses(const std::string & fault_code) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = near_misses_.find(fault_code);
+  if (it == near_misses_.end()) {
+    return {};
   }
   return it->second;
 }

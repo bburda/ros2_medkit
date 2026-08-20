@@ -266,6 +266,30 @@ void SqliteFaultStorage::initialize_schema() {
     }
   }
 
+  // Create near_misses table: append-only series of FAILED reports that moved the debounce
+  // counter without confirming the fault. One row per qualifying report, never updated in
+  // place, and NOT removed on clear_fault - acknowledging a fault cycle must not erase how
+  // often that code approached confirmation. Bounded per fault code by the caller-supplied
+  // limit, evicting the oldest rows first.
+  const char * create_near_misses_table_sql = R"(
+    CREATE TABLE IF NOT EXISTS near_misses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fault_code TEXT NOT NULL,
+      occurred_at_ns INTEGER NOT NULL,
+      debounce_counter INTEGER NOT NULL,
+      confirmation_threshold INTEGER NOT NULL,
+      severity INTEGER NOT NULL,
+      source_id TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_near_misses_fault_code ON near_misses(fault_code, occurred_at_ns, id);
+  )";
+
+  if (sqlite3_exec(db_, create_near_misses_table_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = err_msg ? err_msg : "Unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create near_misses table: " + error);
+  }
+
   // Create rosbag_files table. One row = one LINK (a fault claiming a recording):
   // several faults of a burst link to one bag, and one fault links to several bags
   // over time. Bytes belong to file_path, not to the row.
@@ -734,6 +758,10 @@ bool SqliteFaultStorage::report_fault_event(const std::string & fault_code, uint
       if (update_stmt.step() != SQLITE_DONE) {
         throw std::runtime_error(std::string("Failed to update fault: ") + sqlite3_errmsg(db_));
       }
+
+      if (is_near_miss(true, new_status)) {
+        record_near_miss_locked(fault_code, timestamp_ns, debounce_counter, config, severity, source_id);
+      }
     } else {
       // PASSED event - increment towards healing, clamped to the thresholds.
       debounce_counter = clamp_debounce_counter(debounce_counter + 1, config);
@@ -795,6 +823,10 @@ bool SqliteFaultStorage::report_fault_event(const std::string & fault_code, uint
 
   if (insert_stmt.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to insert fault: ") + sqlite3_errmsg(db_));
+  }
+
+  if (is_near_miss(true, initial_status)) {
+    record_near_miss_locked(fault_code, timestamp_ns, initial_counter, config, severity, source_id);
   }
 
   return true;  // New fault created
@@ -903,6 +935,10 @@ std::optional<ros2_medkit_msgs::msg::Fault> SqliteFaultStorage::get_fault(const 
 
 bool SqliteFaultStorage::clear_fault(const std::string & fault_code) {
   std::lock_guard<std::mutex> lock(mutex_);
+
+  // The near_misses rows for this code are deliberately left alone. Clearing acknowledges one
+  // fault cycle; the record of how often the code approached confirmation spans cycles and
+  // cannot be reconstructed once deleted.
 
   // Delete associated snapshots when fault is cleared
   // Acknowledging a fault drops its value snapshots, unless a history was asked
@@ -1205,6 +1241,72 @@ std::optional<FreezeFrameData> SqliteFaultStorage::get_freeze_frame(const std::s
   frame.data = stmt.column_text(1);
   frame.captured_at_ns = stmt.column_int64(2);
   return frame;
+}
+
+void SqliteFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  max_near_misses_per_fault_ = max_count;
+}
+
+void SqliteFaultStorage::record_near_miss_locked(const std::string & fault_code, int64_t occurred_at_ns,
+                                                 int32_t debounce_counter, const DebounceConfig & config,
+                                                 uint8_t severity, const std::string & source_id) {
+  SqliteStatement insert_stmt(db_,
+                              "INSERT INTO near_misses (fault_code, occurred_at_ns, debounce_counter, "
+                              "confirmation_threshold, severity, source_id) VALUES (?, ?, ?, ?, ?, ?)");
+  insert_stmt.bind_text(1, fault_code);
+  insert_stmt.bind_int64(2, occurred_at_ns);
+  insert_stmt.bind_int(3, debounce_counter);
+  insert_stmt.bind_int(4, config.confirmation_threshold);
+  insert_stmt.bind_int(5, static_cast<int>(severity));
+  insert_stmt.bind_text(6, source_id);
+
+  if (insert_stmt.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to store near miss: ") + sqlite3_errmsg(db_));
+  }
+
+  if (max_near_misses_per_fault_ == 0) {
+    return;  // Unlimited
+  }
+
+  // Evict oldest-first, keeping the newest max_near_misses_per_fault_ rows. Newest-first is the
+  // deliberate opposite of the snapshot limit's keep-earliest rule: a series frozen at boot
+  // answers nothing about whether the rate of near misses is changing.
+  SqliteStatement trim_stmt(db_,
+                            "DELETE FROM near_misses WHERE fault_code = ?1 AND id NOT IN "
+                            "(SELECT id FROM near_misses WHERE fault_code = ?1 "
+                            "ORDER BY occurred_at_ns DESC, id DESC LIMIT ?2)");
+  trim_stmt.bind_text(1, fault_code);
+  trim_stmt.bind_int64(2, static_cast<int64_t>(max_near_misses_per_fault_));
+
+  if (trim_stmt.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to trim near-miss series: ") + sqlite3_errmsg(db_));
+  }
+}
+
+std::vector<NearMissRecord> SqliteFaultStorage::get_near_misses(const std::string & fault_code) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::vector<NearMissRecord> result;
+
+  SqliteStatement stmt(db_,
+                       "SELECT fault_code, occurred_at_ns, debounce_counter, confirmation_threshold, "
+                       "severity, source_id FROM near_misses WHERE fault_code = ? "
+                       "ORDER BY occurred_at_ns ASC, id ASC");
+  stmt.bind_text(1, fault_code);
+
+  while (stmt.step() == SQLITE_ROW) {
+    NearMissRecord record;
+    record.fault_code = stmt.column_text(0);
+    record.occurred_at_ns = stmt.column_int64(1);
+    record.debounce_counter = stmt.column_int(2);
+    record.confirmation_threshold = stmt.column_int(3);
+    record.severity = static_cast<uint8_t>(stmt.column_int(4));
+    record.source_id = stmt.column_text(5);
+    result.push_back(std::move(record));
+  }
+
+  return result;
 }
 
 void SqliteFaultStorage::exec_or_throw(const char * sql) {

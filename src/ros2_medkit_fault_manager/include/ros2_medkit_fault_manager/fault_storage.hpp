@@ -74,6 +74,14 @@ int32_t clamp_debounce_counter(int32_t counter, const DebounceConfig & config);
 /// callers handle that. This is the single source of truth shared by both storage backends.
 std::string compute_debounce_status(int32_t counter, const std::string & current_status, const DebounceConfig & config);
 
+/// Whether a just-applied report counts as a near miss: a FAILED report that moved the debounce
+/// counter without leaving the fault CONFIRMED - the fault nearly happened. PASSED reports move the
+/// counter in the healing direction (the fault receding), so they never qualify. Single source of
+/// truth shared by both storage backends.
+/// @param is_failed_event Whether the report was FAILED (as opposed to PASSED)
+/// @param resulting_status The fault status after the report was applied
+bool is_near_miss(bool is_failed_event, const std::string & resulting_status);
+
 /// Validate a (merged) debounce config in place, enforcing confirmation_threshold < 0 <= healing_threshold
 /// (healing_threshold == 0 means heal on a single PASSED event). Offending fields are reset to safe
 /// defaults (-1 / 3). Returns true if the config was already valid.
@@ -139,6 +147,28 @@ struct FreezeFrameData {
 /// off the wire with its own copy of this rule; keep the two in step.
 std::string rosbag_recording_id(const std::string & file_path);
 
+/// One entry of the near-miss series for a fault code.
+///
+/// A near miss is a FAILED report that moved the debounce counter WITHOUT the fault
+/// ending up CONFIRMED - the fault nearly happened. PASSED reports move the counter
+/// too, but in the healing direction (the fault receding), so they are not near misses.
+/// This is the debounce sense of the term and is unrelated to any scoring sense used
+/// elsewhere in the product.
+///
+/// The series is append-only: one entry per qualifying report, never updated in place,
+/// and RETAINED across clear_fault, because acknowledging a fault cycle must not erase
+/// the record of how often that code approached confirmation. It is bounded per fault
+/// code (see set_max_near_misses_per_fault) and evicts the OLDEST entries first, so a
+/// long-running appliance keeps the recent series rather than freezing it at boot.
+struct NearMissRecord {
+  std::string fault_code;
+  int64_t occurred_at_ns{0};          ///< Timestamp of the report that moved the counter
+  int32_t debounce_counter{0};        ///< Counter value AFTER this report
+  int32_t confirmation_threshold{0};  ///< Counter value that would have confirmed the fault
+  uint8_t severity{0};                ///< Severity carried by the report
+  std::string source_id;              ///< Reporting source
+};
+
 /// One row = one LINK: a fault claiming a recording. Several faults of a burst link to
 /// one recording (same file_path, same recording_id), and one fault can link to several
 /// recordings over time. Bytes are owned by file_path, not by the row: a bag is unlinked
@@ -191,7 +221,9 @@ class FaultStorage {
   /// @return The fault if found, nullopt otherwise
   virtual std::optional<ros2_medkit_msgs::msg::Fault> get_fault(const std::string & fault_code) const = 0;
 
-  /// Clear a fault by fault_code (manual acknowledgment)
+  /// Clear a fault by fault_code (manual acknowledgment). Drops the fault's per-topic snapshots;
+  /// the freeze-frame and the near-miss series are RETAINED, because they outlive a single fault
+  /// cycle and cannot be reconstructed afterwards.
   /// @param fault_code The fault code to clear
   /// @return true if fault was found and cleared, false if not found
   virtual bool clear_fault(const std::string & fault_code) = 0;
@@ -294,6 +326,17 @@ class FaultStorage {
   /// @return The freeze-frame if one was captured, nullopt otherwise (including fault
   ///         codes with no capture configured, which never get a row)
   virtual std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const = 0;
+
+  /// Set the maximum number of near-miss entries retained per fault code.
+  /// Entries beyond the bound are evicted oldest-first. 0 = unlimited (unbounded growth).
+  virtual void set_max_near_misses_per_fault(size_t /*max_count*/) {
+  }
+
+  /// Get the near-miss series for a fault code, oldest entry first.
+  /// The series survives clear_fault; an unknown or never-near-missed code returns empty.
+  /// @param fault_code The fault code to look up
+  /// @return The retained near-miss entries in chronological order
+  virtual std::vector<NearMissRecord> get_near_misses(const std::string & fault_code) const = 0;
 
   /// Store rosbag file metadata for a fault
   /// @param info The rosbag file info to store (replaces any existing entry for fault_code)
@@ -438,6 +481,10 @@ class InMemoryFaultStorage : public FaultStorage {
   std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const override;
 
   void set_max_rosbags_per_fault(size_t max_count) override;
+
+  void set_max_near_misses_per_fault(size_t max_count) override;
+  std::vector<NearMissRecord> get_near_misses(const std::string & fault_code) const override;
+
   void store_rosbag_file(const RosbagFileInfo & info) override;
   /// All-or-nothing, as the base class requires: the batch is built beside the live
   /// map and swapped in, so a throw leaves the store exactly as it was.
@@ -456,6 +503,11 @@ class InMemoryFaultStorage : public FaultStorage {
  private:
   /// Update fault status based on debounce counter and given config
   void update_status(FaultState & state, const DebounceConfig & config);
+
+  /// Append one entry to the near-miss series for @p state and evict the oldest entries beyond
+  /// max_near_misses_per_fault_. Caller holds mutex_ and has already applied the report to @p state.
+  void record_near_miss(const FaultState & state, const DebounceConfig & config, uint8_t severity,
+                        const std::string & source_id, const rclcpp::Time & timestamp);
 
   /// Whether a fault other than @p fault_code still references @p file_path.
   /// One recording can back several faults of the same burst, so the bag must
@@ -487,9 +539,11 @@ class InMemoryFaultStorage : public FaultStorage {
   /// A backend constructed directly (tests, embedders) therefore behaves exactly as
   /// it always did until someone opts into a history. 0 = unlimited.
   size_t max_rosbags_per_fault_{1};
+  std::map<std::string, std::vector<NearMissRecord>> near_misses_;  ///< fault_code -> series (retained across clear)
   DebounceConfig config_;
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
   bool retain_snapshots_on_clear_{false};
+  size_t max_near_misses_per_fault_{0};  ///< 0 = unlimited
 };
 
 }  // namespace ros2_medkit_fault_manager

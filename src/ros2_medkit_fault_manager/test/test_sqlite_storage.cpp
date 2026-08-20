@@ -1799,6 +1799,302 @@ TEST_F(SqliteFaultStorageTest, SnapshotLimitPerFaultNotGlobal) {
   EXPECT_EQ(storage_->get_snapshots("FAULT_B").size(), 1u);
 }
 
+// --- Near-miss series ---
+//
+// A near miss is a FAILED report that moved the debounce counter without the fault ending up
+// CONFIRMED. The series is append-only and must survive clear_fault, because acknowledging a
+// fault cycle must not erase how often that code approached confirmation.
+
+/// Debounce config that takes four FAILED reports to confirm, leaving three near misses first.
+static DebounceConfig four_strike_config() {
+  DebounceConfig config;
+  config.confirmation_threshold = -4;
+  config.critical_immediate_confirm = false;
+  return config;
+}
+
+/// Deterministic timestamps 1 ms apart, so series ordering is checkable.
+static rclcpp::Time nth_report_time(int index) {
+  constexpr int64_t kBaseNs = 1700000000000000000LL;
+  return rclcpp::Time(kBaseNs + static_cast<int64_t>(index) * 1000000LL);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissSeriesIsAppendedNotOverwritten) {
+  const auto config = four_strike_config();
+
+  for (int i = 0; i < 3; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+
+  auto fault = storage_->get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(fault.has_value());
+  ASSERT_NE(fault->status, Fault::STATUS_CONFIRMED) << "test setup: these reports must not confirm";
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 3u) << "each near miss must append an entry, not overwrite the last";
+  EXPECT_EQ(series[0].debounce_counter, -1);
+  EXPECT_EQ(series[1].debounce_counter, -2);
+  EXPECT_EQ(series[2].debounce_counter, -3);
+  EXPECT_EQ(series[0].confirmation_threshold, -4);
+  EXPECT_EQ(series[0].fault_code, "PUMP_PRESSURE_LOW");
+  EXPECT_EQ(series[0].source_id, "/hydraulics/pump");
+  EXPECT_EQ(series[0].severity, Fault::SEVERITY_WARN);
+  EXPECT_EQ(series[0].occurred_at_ns, nth_report_time(0).nanoseconds());
+  EXPECT_LT(series[0].occurred_at_ns, series[2].occurred_at_ns);
+}
+
+TEST_F(SqliteFaultStorageTest, ConfirmingReportIsNotANearMiss) {
+  const auto config = four_strike_config();
+
+  for (int i = 0; i < 4; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+
+  auto fault = storage_->get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(fault.has_value());
+  ASSERT_EQ(fault->status, Fault::STATUS_CONFIRMED);
+
+  // The fourth report is the fault happening, not nearly happening.
+  EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 3u);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissSeriesSurvivesClearFault) {
+  const auto config = four_strike_config();
+
+  for (int i = 0; i < 4; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+  ASSERT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 3u);
+
+  ASSERT_TRUE(storage_->clear_fault("PUMP_PRESSURE_LOW"));
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 3u) << "acknowledging the fault destroyed the near-miss record";
+  EXPECT_EQ(series[0].debounce_counter, -1);
+  EXPECT_EQ(series[2].debounce_counter, -3);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissSeriesContinuesAcrossReactivation) {
+  const auto config = four_strike_config();
+
+  for (int i = 0; i < 4; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+  ASSERT_TRUE(storage_->clear_fault("PUMP_PRESSURE_LOW"));
+
+  // A new outage cycle starts: the reactivating report resets the counter to -1 without confirming.
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping again", "/hydraulics/pump", nth_report_time(10), config);
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 4u) << "the series must span fault cycles, one entry per occurrence";
+  EXPECT_EQ(series[3].debounce_counter, -1);
+  EXPECT_EQ(series[3].occurred_at_ns, nth_report_time(10).nanoseconds());
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissSeriesSurvivesReopen) {
+  const auto config = four_strike_config();
+
+  for (int i = 0; i < 3; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+  ASSERT_TRUE(storage_->clear_fault("PUMP_PRESSURE_LOW"));
+
+  storage_.reset();
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 3u) << "the series must outlive the process, not just the fault cycle";
+  EXPECT_EQ(series[0].debounce_counter, -1);
+  EXPECT_EQ(series[2].debounce_counter, -3);
+}
+
+TEST_F(SqliteFaultStorageTest, PassedReportIsNotANearMiss) {
+  const auto config = four_strike_config();
+
+  for (int i = 0; i < 2; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+  ASSERT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 2u);
+
+  // A PASSED report moves the counter in the healing direction: the fault receding, not nearing.
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN, "",
+                               "/hydraulics/pump", nth_report_time(2), config);
+
+  EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 2u);
+}
+
+TEST_F(SqliteFaultStorageTest, CriticalImmediateConfirmIsNotANearMiss) {
+  DebounceConfig config = four_strike_config();
+  config.critical_immediate_confirm = true;
+
+  storage_->report_fault_event("BATTERY_THERMAL_RUNAWAY", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_CRITICAL,
+                               "cell over temperature", "/power/bms", nth_report_time(0), config);
+
+  auto fault = storage_->get_fault("BATTERY_THERMAL_RUNAWAY");
+  ASSERT_TRUE(fault.has_value());
+  ASSERT_EQ(fault->status, Fault::STATUS_CONFIRMED);
+  EXPECT_TRUE(storage_->get_near_misses("BATTERY_THERMAL_RUNAWAY").empty());
+}
+
+TEST_F(SqliteFaultStorageTest, ImmediateConfirmThresholdRecordsNoNearMiss) {
+  // Endpoint of the documented range: confirmation_threshold = -1 confirms on the first report,
+  // so a fault under this config never has a near miss to record.
+  const auto config = default_config();
+
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR,
+                               "pressure lost", "/hydraulics/pump", nth_report_time(0), config);
+
+  auto fault = storage_->get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(fault.has_value());
+  ASSERT_EQ(fault->status, Fault::STATUS_CONFIRMED);
+  EXPECT_TRUE(storage_->get_near_misses("PUMP_PRESSURE_LOW").empty());
+}
+
+TEST_F(SqliteFaultStorageTest, FailedReportUnderHealedLatchIsNearMiss) {
+  DebounceConfig config = four_strike_config();
+  config.healing_enabled = true;
+  config.healing_threshold = 1;
+
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(0), config);
+  ASSERT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 1u);
+
+  for (int i = 1; i <= 2; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN, "",
+                                 "/hydraulics/pump", nth_report_time(i), config);
+  }
+  auto healed = storage_->get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(healed.has_value());
+  ASSERT_EQ(healed->status, Fault::STATUS_HEALED) << "test setup: the fault must be latched HEALED";
+
+  // The latch keeps the status at HEALED, but the counter moved toward confirmation: a near miss.
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(3), config);
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 2u);
+  EXPECT_EQ(series[1].debounce_counter, 0);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissSeriesBoundedKeepingNewest) {
+  DebounceConfig config = four_strike_config();
+  config.confirmation_threshold = -20;
+  storage_->set_max_near_misses_per_fault(3);
+
+  for (int i = 0; i < 5; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 3u);
+  // Oldest-first eviction: a series frozen at boot would say nothing about a trend.
+  EXPECT_EQ(series[0].debounce_counter, -3);
+  EXPECT_EQ(series[1].debounce_counter, -4);
+  EXPECT_EQ(series[2].debounce_counter, -5);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissBoundOfOneKeepsLatestOnly) {
+  DebounceConfig config = four_strike_config();
+  config.confirmation_threshold = -20;
+  storage_->set_max_near_misses_per_fault(1);
+
+  for (int i = 0; i < 4; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 1u);
+  EXPECT_EQ(series[0].debounce_counter, -4);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissBoundIsPerFaultCode) {
+  DebounceConfig config = four_strike_config();
+  config.confirmation_threshold = -20;
+  storage_->set_max_near_misses_per_fault(2);
+
+  for (int i = 0; i < 3; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+    storage_->report_fault_event("MOTOR_OVERHEAT", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "temperature rising", "/powertrain/motor", nth_report_time(i), config);
+  }
+
+  EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 2u);
+  EXPECT_EQ(storage_->get_near_misses("MOTOR_OVERHEAT").size(), 2u);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissBoundZeroIsUnlimited) {
+  DebounceConfig config = four_strike_config();
+  config.confirmation_threshold = -200;
+  storage_->set_max_near_misses_per_fault(0);
+
+  for (int i = 0; i < 150; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+
+  EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 150u);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissTableCreatedOnDatabaseFromOlderBuild) {
+  // The appliances this matters for already have a faults.db written by a build with no
+  // near_misses table. Opening one must add the table, not fail and not skip recording.
+  const auto config = four_strike_config();
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(0), config);
+  storage_.reset();
+
+  {
+    sqlite3 * raw = nullptr;
+    ASSERT_EQ(sqlite3_open(temp_db_path_.string().c_str(), &raw), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(raw, "DROP TABLE near_misses", nullptr, nullptr, nullptr), SQLITE_OK);
+    sqlite3_close(raw);
+  }
+
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+  EXPECT_TRUE(storage_->get_near_misses("PUMP_PRESSURE_LOW").empty());
+
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(1), config);
+  EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 1u);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissSeriesSurvivesHealedReclassification) {
+  // Startup reclassification is the other place that drops a fault's captured data; it must
+  // leave the series alone for the same reason clear_fault does.
+  DebounceConfig config = four_strike_config();
+  config.healing_enabled = true;
+  config.healing_threshold = 1;
+
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(0), config);
+  for (int i = 1; i <= 2; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN, "",
+                                 "/hydraulics/pump", nth_report_time(i), config);
+  }
+  auto healed = storage_->get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(healed.has_value());
+  ASSERT_EQ(healed->status, Fault::STATUS_HEALED) << "test setup: the fault must be latched HEALED";
+  ASSERT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 1u);
+
+  ASSERT_EQ(storage_->reclassify_healed_as_cleared().size(), 1u);
+
+  EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 1u);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissSeriesEmptyForUnknownFault) {
+  EXPECT_TRUE(storage_->get_near_misses("NEVER_REPORTED").empty());
+}
+
 int main(int argc, char ** argv) {
   rclcpp::init(argc, argv);
   ::testing::InitGoogleTest(&argc, argv);

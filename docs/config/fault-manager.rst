@@ -75,6 +75,45 @@ The fault manager uses AUTOSAR DEM-style debounce filtering to prevent fault fla
    For immediate fault confirmation (no debounce), set ``confirmation_threshold: 0``.
    Faults with ``SEVERITY_CRITICAL`` always bypass debounce regardless of this setting.
 
+Near-Miss Retention
+~~~~~~~~~~~~~~~~~~~
+
+A **near miss** is a FAILED report that moved the debounce counter without the fault ending up
+CONFIRMED - the fault nearly happened. PASSED reports move the counter in the healing direction
+(the fault receding) and are not near misses.
+
+The fault manager appends one entry per near miss to a per-fault-code series, holding the
+timestamp, the counter value after the report, the confirmation threshold, the severity and the
+reporting source. The series is **retained when the fault is cleared**, because acknowledging one
+fault cycle must not erase how often that code approached confirmation across cycles.
+
+.. code-block:: yaml
+
+   fault_manager:
+     ros__parameters:
+       near_miss:
+         max_per_fault: 200                # Entries kept per fault code (0 = unlimited)
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 12 58
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``near_miss.max_per_fault``
+     - ``200``
+     - Near-miss entries retained per fault code. When the bound is reached the **oldest**
+       entries are evicted - the opposite of ``snapshots.max_per_fault``, which keeps the
+       earliest, because a series frozen at boot says nothing about whether the rate of near
+       misses is changing. Set to 0 for unlimited, accepting growth with the reporting rate.
+
+.. note::
+
+   The series lives in the ``near_misses`` table of the fault database and is read through the
+   storage API (``FaultStorage::get_near_misses``). A database written by an earlier build gains
+   the table on first open. There is no service or REST surface for it yet.
+
 Per-Entity Thresholds
 ~~~~~~~~~~~~~~~~~~~~~
 

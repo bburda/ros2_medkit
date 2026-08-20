@@ -10,6 +10,12 @@ fault_manager:
     # debounce disabled). Set to N to require N reports before CONFIRMED.
     confirmation_threshold: -1
 
+    # Near-miss series: one appended entry per FAILED report that moved the
+    # debounce counter without confirming. Retained across clear_fault, bounded
+    # per fault code, oldest evicted first. 0 = unlimited (grows with the
+    # reporting rate).
+    # near_miss.max_per_fault: 200
+
     # Healing OFF by default: a recovery signal (e.g. action SUCCEEDED) does not
     # auto-clear the fault until this is enabled.
     healing_enabled: false
