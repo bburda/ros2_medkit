@@ -513,6 +513,24 @@ marked unhealthy and excluded from fan-out queries and entity fetching.
 When a peer recovers (health check succeeds again), it is automatically
 re-included.
 
+``PeerClient::fetch_entities()`` reads a peer over several requests and either
+describes it whole or reports failure: a dead connection, a status a route has
+no other meaning for, an oversized body or unparsable JSON on any of them fails
+the fetch, because a picture missing a branch is indistinguishable on the wire
+from a peer that does not have that branch. Two statuses carry a meaning of
+their own: a ``404`` on a nested collection route (``/subareas``,
+``/subcomponents``, an app's ``/operations``) identifies a peer running a
+gateway that predates the route and is reported in
+``PeerEntities::absent_routes`` for the caller to log; a ``504`` with error code
+``not-responding`` on a Component's detail is the peer reporting that the
+gateway contributing that Component has gone quiet - what a middle gateway in a
+chain answers for a declaration it is retaining - so the Component is kept as
+the list named it and marked unavailable.
+``AggregationManager`` never records a failed fetch as the peer's declaration,
+so the last complete one survives; it re-checks that peer's health to decide
+whether to replay it marked unavailable (health check failed) or exactly as it
+was last read (health check still passes).
+
 The aggregator also publishes its own ``/health`` response with two
 additional fields when aggregation is enabled (x-medkit extensions on our
 own endpoint, outside the SOVD core contract):

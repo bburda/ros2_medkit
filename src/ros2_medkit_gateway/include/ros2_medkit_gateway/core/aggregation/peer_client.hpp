@@ -40,6 +40,15 @@ struct PeerEntities {
   std::vector<Component> components;
   std::vector<App> apps;
   std::vector<Function> functions;
+
+  /// Nested collection routes this peer does not offer, as route templates
+  /// (e.g. ``/components/{id}/subcomponents``), each recorded once.
+  ///
+  /// A peer running an older gateway answers 404 for a route that did not
+  /// exist yet. That is a version boundary, not a read failure, so the fetch
+  /// carries on without those members and names the routes here for the
+  /// caller to report.
+  std::vector<std::string> absent_routes;
 };
 
 /**
@@ -84,7 +93,25 @@ class PeerClient {
    * @brief Fetch all entity collections from the peer
    *
    * GETs /api/v1/areas, /api/v1/components, /api/v1/apps, /api/v1/functions
-   * and parses the items[] arrays. Each entity's source is set to "peer:<name>".
+   * and parses the items[] arrays, then the nested routes that carry structure
+   * the lists omit: subareas, subcomponents, per-entity detail (the only source
+   * of a Component's relationships and a Function's hosts) and per-app
+   * operations. Each entity's source is set to "peer:<name>".
+   *
+   * The result describes the peer or it does not. Any sub-request that could
+   * not be read - a dead connection, a non-200 the route has no other meaning
+   * for, an oversized body, unparsable JSON - fails the whole fetch, because a
+   * picture missing a branch is indistinguishable on the wire from a peer that
+   * does not have that branch. Two statuses do carry a meaning of their own and
+   * are read rather than failed:
+   *
+   * - 404 on a nested collection route: the peer predates the route. Those
+   *   members are omitted and the route is named in
+   *   PeerEntities::absent_routes.
+   * - `504 not-responding` on a Component detail: the peer holds that id and
+   *   says whoever contributes it has gone quiet, which is what an aggregating
+   *   peer answers for a declaration it is retaining. The Component is kept as
+   *   its list named it, marked unavailable.
    *
    * @return PeerEntities on success, error message on failure
    */

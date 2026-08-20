@@ -369,29 +369,40 @@ bool is_declared(const Entity & entity) {
 /// Availability belongs to an entity a request can be addressed to. A grouping
 /// entity has none of its own: it is a view over its members, and the members
 /// carry the flag, so retaining one says nothing about what can be reached.
-void mark_unreachable(Area &) {
+void mark_unreachable(Area & /*area*/) {
 }
-void mark_unreachable(Function &) {
+void mark_unreachable(Function & /*function*/) {
 }
 void mark_unreachable(App & app) {
   app.available = false;
+  // A retained App is not observably running: the graph it was bound to is on
+  // the other side of a link that is down. `is_online` is the field every
+  // consumer already reads for that, so it carries the news rather than a
+  // second flag they would each have to learn.
+  app.is_online = false;
 }
 void mark_unreachable(Component & component) {
   component.available = false;
 }
 
-/// The declared entities of `src`, with the addressable ones marked unreachable.
+/// The declared entities of `src`, as the peer reported them.
 template <class Entity>
 std::vector<Entity> declared_only(const std::vector<Entity> & src) {
   std::vector<Entity> kept;
   for (const auto & entity : src) {
-    if (!is_declared(entity)) {
-      continue;
+    if (is_declared(entity)) {
+      kept.push_back(entity);
     }
-    kept.push_back(entity);
-    mark_unreachable(kept.back());
   }
   return kept;
+}
+
+/// Mark every addressable entity of a replayed declaration unreachable.
+template <class Entity>
+void mark_all_unreachable(std::vector<Entity> & entities) {
+  for (auto & entity : entities) {
+    mark_unreachable(entity);
+  }
 }
 
 }  // namespace
@@ -403,22 +414,28 @@ void AggregationManager::remember_declaration(const std::string & peer_name, con
   declared.apps = declared_only(entities.apps);
   declared.functions = declared_only(entities.functions);
 
-  // A retained App is not observably running: the graph it was bound to is on
-  // the other side of a link that is down. `is_online` is the field every
-  // consumer already reads for that, so it carries the news rather than a
-  // second flag they would each have to learn.
-  for (auto & app : declared.apps) {
-    app.is_online = false;
-  }
-
   std::unique_lock<std::shared_mutex> lock(mutex_);
   retained_peer_entities_[peer_name] = std::move(declared);
 }
 
-PeerEntities AggregationManager::replay_declaration(const std::string & peer_name) const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  auto it = retained_peer_entities_.find(peer_name);
-  return it == retained_peer_entities_.end() ? PeerEntities{} : it->second;
+PeerEntities AggregationManager::replay_declaration(const std::string & peer_name, Reachability reachability) const {
+  PeerEntities replayed;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = retained_peer_entities_.find(peer_name);
+    if (it == retained_peer_entities_.end()) {
+      return replayed;
+    }
+    replayed = it->second;
+  }
+
+  if (reachability == Reachability::kUnreachable) {
+    mark_all_unreachable(replayed.areas);
+    mark_all_unreachable(replayed.components);
+    mark_all_unreachable(replayed.apps);
+    mark_all_unreachable(replayed.functions);
+  }
+  return replayed;
 }
 
 AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_entities(
@@ -450,14 +467,21 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
   // shared_ptr copies keep PeerClients alive even if remove_discovered_peer()
   // erases them from peers_ concurrently.
   std::vector<std::shared_ptr<PeerClient>> snapshot;
-  std::vector<std::string> silent_peers;
+
+  // A peer this cycle could not describe, and whether it can still be reached.
+  struct UnreadPeer {
+    std::string name;
+    Reachability reachability{Reachability::kUnreachable};
+    std::string reason;
+  };
+  std::vector<UnreadPeer> unread_peers;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     for (const auto & peer : peers_) {
       if (peer->is_healthy()) {
         snapshot.push_back(peer);
       } else {
-        silent_peers.push_back(peer->name());
+        unread_peers.push_back({peer->name(), Reachability::kUnreachable, "not answering"});
       }
     }
   }
@@ -467,6 +491,10 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
     std::string peer_name;
     bool success{false};
     std::string error;
+    /// Reachability as of the health check taken after a failed fetch, which is
+    /// what separates a peer that died mid-refresh from one that is answering
+    /// but could not be read in full.
+    Reachability reachability{Reachability::kReachable};
     PeerEntities entities;
   };
 
@@ -479,19 +507,27 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
       PeerFetchResult pfr;
       pfr.peer_name = peer->name();
 
+      // Re-checking health only on the failure path answers the one question the
+      // caller needs and costs nothing on the path that succeeded: the flag from
+      // before the fetch cannot tell a peer that has since died from one that is
+      // still there and merely could not be read.
+      auto fetch_failed = [&pfr, &peer](std::string reason) {
+        pfr.success = false;
+        pfr.error = std::move(reason);
+        peer->check_health();
+        pfr.reachability = peer->is_healthy() ? Reachability::kReachable : Reachability::kUnreachable;
+        return pfr;
+      };
+
       auto result = peer->fetch_entities();
       if (!result.has_value()) {
-        pfr.success = false;
-        pfr.error = result.error();
-        return pfr;
+        return fetch_failed(result.error());
       }
 
       size_t total = result->areas.size() + result->components.size() + result->apps.size() + result->functions.size();
       if (total > max_entities_per_peer) {
-        pfr.success = false;
-        pfr.error = "returned " + std::to_string(total) + " entities (max " + std::to_string(max_entities_per_peer) +
-                    "), skipping";
-        return pfr;
+        return fetch_failed("returned " + std::to_string(total) + " entities (max " +
+                            std::to_string(max_entities_per_peer) + "), skipping");
       }
 
       pfr.success = true;
@@ -507,35 +543,54 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
 
   // Collect results and merge sequentially (merge order must be deterministic)
   std::vector<PeerFetchResult> to_merge;
-  to_merge.reserve(futures.size() + silent_peers.size());
+  to_merge.reserve(futures.size() + unread_peers.size());
   for (auto & f : futures) {
     auto pfr = f.get();
     if (!pfr.success) {
+      // The last complete declaration is not replaced by a picture with holes
+      // in it: `remember_declaration` overwrites, so recording a partial fetch
+      // would outlive the cycle that failed and be replayed as the peer's own
+      // account of itself.
       if (logger) {
         RCLCPP_WARN(*logger, "Failed to fetch entities from peer '%s': %s", pfr.peer_name.c_str(), pfr.error.c_str());
       }
-      silent_peers.push_back(pfr.peer_name);
+      unread_peers.push_back({pfr.peer_name, pfr.reachability,
+                              pfr.reachability == Reachability::kReachable ? "refresh incomplete" : "not answering"});
       continue;
+    }
+    if (logger && !pfr.entities.absent_routes.empty()) {
+      std::string routes;
+      for (const auto & route : pfr.entities.absent_routes) {
+        routes += routes.empty() ? route : ", " + route;
+      }
+      RCLCPP_WARN(*logger, "Peer '%s' does not expose %s; aggregating without the members those routes carry",
+                  pfr.peer_name.c_str(), routes.c_str());
     }
     remember_declaration(pfr.peer_name, pfr.entities);
     to_merge.push_back(std::move(pfr));
   }
 
-  // A peer that did not answer still contributes what it declared, marked
-  // unavailable. Merged after the peers that did answer, so a live declaration
-  // always wins over a retained one carrying the same id.
-  for (const auto & peer_name : silent_peers) {
-    auto retained = replay_declaration(peer_name);
+  // A peer this cycle could not describe still contributes what it declared.
+  // Merged after the peers that did answer, so a live declaration always wins
+  // over a retained one carrying the same id.
+  for (const auto & peer : unread_peers) {
+    auto retained = replay_declaration(peer.name, peer.reachability);
     if (retained.areas.empty() && retained.components.empty() && retained.apps.empty() && retained.functions.empty()) {
       continue;
     }
     if (logger) {
-      RCLCPP_INFO(*logger, "Peer '%s' not answering; retaining %zu declared entities as unavailable", peer_name.c_str(),
-                  retained.areas.size() + retained.components.size() + retained.apps.size() +
-                      retained.functions.size());
+      const size_t count =
+          retained.areas.size() + retained.components.size() + retained.apps.size() + retained.functions.size();
+      if (peer.reachability == Reachability::kUnreachable) {
+        RCLCPP_INFO(*logger, "Peer '%s' %s; retaining %zu declared entities as unavailable", peer.name.c_str(),
+                    peer.reason.c_str(), count);
+      } else {
+        RCLCPP_WARN(*logger, "Peer '%s' %s; it is still reachable, so its %zu declared entities stand as last read",
+                    peer.name.c_str(), peer.reason.c_str(), count);
+      }
     }
     PeerFetchResult replayed;
-    replayed.peer_name = peer_name;
+    replayed.peer_name = peer.name;
     replayed.success = true;
     replayed.entities = std::move(retained);
     to_merge.push_back(std::move(replayed));

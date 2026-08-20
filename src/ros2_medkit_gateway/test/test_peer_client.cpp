@@ -187,6 +187,10 @@ TEST(PeerClientHappyPath, fetch_entities_parses_collections) {
   svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
     res.set_content(R"({"items":[{"id":"ecu_1","name":"ECU 1"}]})", "application/json");
   });
+  // A peer that names a Component in its list describes it on the detail route.
+  svr.Get(R"(/api/v1/components/ecu_1)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu_1","name":"ECU 1"})", "application/json");
+  });
   svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
     res.set_content(R"({"items":[{"id":"nav","name":"Navigation"}]})", "application/json");
   });
@@ -290,9 +294,16 @@ TEST(PeerClientHappyPath, fetch_entities_parses_relationship_fields) {
   svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
     res.set_content(
         R"({"items":[
-          {"id":"autonomous-navigation","name":"Autonomous Navigation",
-           "x-medkit":{"hosts":["lidar-driver","path-planner"],"source":"manifest"}}
+          {"id":"autonomous-navigation","name":"Autonomous Navigation","x-medkit":{"source":"manifest"}}
         ]})",
+        "application/json");
+  });
+  // hosts are carried by the detail route only, which is where a real gateway
+  // puts them.
+  svr.Get(R"(/api/v1/functions/autonomous-navigation)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(
+        R"({"id":"autonomous-navigation","name":"Autonomous Navigation",
+            "x-medkit":{"hosts":["lidar-driver","path-planner"],"source":"manifest"}})",
         "application/json");
   });
 

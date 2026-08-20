@@ -16,6 +16,7 @@
 #include <httplib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <future>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -732,6 +733,8 @@ class MockPeerServer {
   // Non-copyable, non-movable
   MockPeerServer(const MockPeerServer &) = delete;
   MockPeerServer & operator=(const MockPeerServer &) = delete;
+  MockPeerServer(MockPeerServer &&) = delete;
+  MockPeerServer & operator=(MockPeerServer &&) = delete;
 
   httplib::Server & server() {
     if (!server_) {
@@ -1040,6 +1043,438 @@ TEST(AggregationManager, fetch_and_merge_remaps_function_hosts_after_app_collisi
   // "lidar_driver" should be unchanged (no collision for that app)
   bool has_lidar = std::find(hosts.begin(), hosts.end(), "lidar_driver") != hosts.end();
   EXPECT_TRUE(has_lidar) << "Function hosts should still contain 'lidar_driver'";
+}
+
+TEST(AggregationManager, a_function_whose_members_could_not_be_read_is_not_published_memberless) {
+  // A Function's `hosts` live only in its detail response: the list endpoint
+  // carries none. So a detail request that does not answer leaves the fetch
+  // holding a Function it cannot describe. Publishing it anyway asserts the
+  // Function has no members, which is a statement the peer never made, and
+  // retention then keeps that statement after the peer is gone.
+  MockPeerServer mock;
+
+  mock.server().Get("/api/v1/health", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"status":"healthy"})", "application/json");
+  });
+  mock.server().Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  mock.server().Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  mock.server().Get(R"(/api/v1/components/([^/]+)/subcomponents)",
+                    [](const httplib::Request &, httplib::Response & res) {
+                      res.set_content(R"({"items":[]})", "application/json");
+                    });
+  mock.server().Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    nlohmann::json items = nlohmann::json::array();
+    items.push_back({{"id", "brake_monitor"}, {"name", "Brake Monitor"}});
+    res.set_content(nlohmann::json({{"items", items}}).dump(), "application/json");
+  });
+
+  // The list names the Function, exactly as a real gateway does: no hosts.
+  mock.server().Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    nlohmann::json items = nlohmann::json::array();
+    items.push_back({{"id", "vehicle_health"}, {"name", "Vehicle Health"}});
+    res.set_content(nlohmann::json({{"items", items}}).dump(), "application/json");
+  });
+  // The detail, which is the only source of members, does not answer.
+  mock.server().Get(R"(/api/v1/functions/([^/]+))", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 500;
+  });
+
+  AggregationConfig config;
+  config.enabled = true;
+  AggregationConfig::PeerConfig peer;
+  peer.name = "brake_ecu";
+  const int port = mock.start();
+  peer.url = "http://127.0.0.1:" + std::to_string(port);
+  config.peers.push_back(peer);
+
+  AggregationManager manager(config);
+  manager.check_all_health();
+  auto result = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+
+  auto it = std::find_if(result.functions.begin(), result.functions.end(), [](const Function & f) {
+    return f.id == "vehicle_health";
+  });
+  if (it != result.functions.end()) {
+    EXPECT_FALSE(it->hosts.empty())
+        << "a Function was published with no members after the only request that reports them failed";
+  }
+}
+
+// =============================================================================
+// A refresh describes the peer or it does not
+// =============================================================================
+
+namespace {
+
+/// Switches that stop one of a peer's routes from answering, so a test can flip
+/// exactly one thing between two refreshes of the same peer.
+struct PeerFaults {
+  std::atomic<bool> subareas_fail{false};
+  std::atomic<bool> subcomponent_detail_fails{false};
+  std::atomic<bool> function_detail_fails{false};
+};
+
+/// A peer whose picture is complete, with the structure its list endpoints omit
+/// living where a real gateway puts it: subareas and subcomponents behind their
+/// nested routes, a Component's relationships and a Function's hosts behind the
+/// per-entity detail. Everything is manifest-declared, so it is retained when
+/// the peer stops being readable.
+void install_complete_peer(httplib::Server & svr, PeerFaults & faults) {
+  svr.Get("/api/v1/health", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"status":"healthy"})", "application/json");
+  });
+
+  svr.Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"vehicle","name":"Vehicle","x-medkit":{"source":"manifest"}}]})",
+                    "application/json");
+  });
+  svr.Get(R"(/api/v1/areas/([^/]+)/subareas)", [&faults](const httplib::Request & req, httplib::Response & res) {
+    if (faults.subareas_fail.load()) {
+      res.status = 500;
+      return;
+    }
+    if (req.matches[1].str() == "vehicle") {
+      res.set_content(R"({"items":[{"id":"sensors","name":"Sensors","x-medkit":{"source":"manifest"}}]})",
+                      "application/json");
+      return;
+    }
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"robot_alpha","name":"Robot Alpha","x-medkit":{"source":"manifest"}}]})",
+                    "application/json");
+  });
+  // The nested list carries ids and names, as the gateway's own collection
+  // responses do; the relationships are only in the detail below.
+  svr.Get(R"(/api/v1/components/([^/]+)/subcomponents)", [](const httplib::Request & req, httplib::Response & res) {
+    if (req.matches[1].str() == "robot_alpha") {
+      res.set_content(R"({"items":[{"id":"perception_ecu","name":"Perception ECU","x-medkit":{"source":"manifest"}}]})",
+                      "application/json");
+      return;
+    }
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get(R"(/api/v1/components/([^/]+))", [&faults](const httplib::Request & req, httplib::Response & res) {
+    if (req.matches[1].str() != "perception_ecu") {
+      res.set_content(R"({"id":"robot_alpha","name":"Robot Alpha","x-medkit":{"source":"manifest"}})",
+                      "application/json");
+      return;
+    }
+    if (faults.subcomponent_detail_fails.load()) {
+      res.status = 500;
+      return;
+    }
+    res.set_content(R"({"id":"perception_ecu","name":"Perception ECU","x-medkit":{"source":"manifest",)"
+                    R"("parentComponentId":"robot_alpha","dependsOn":["compute_unit"]}})",
+                    "application/json");
+  });
+
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"brake_monitor","name":"Brake Monitor",)"
+                    R"("x-medkit":{"source":"manifest","is_online":true}}]})",
+                    "application/json");
+  });
+  svr.Get(R"(/api/v1/apps/([^/]+)/operations)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+
+  svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"vehicle_health","name":"Vehicle Health"}]})", "application/json");
+  });
+  svr.Get(R"(/api/v1/functions/([^/]+))", [&faults](const httplib::Request &, httplib::Response & res) {
+    if (faults.function_detail_fails.load()) {
+      res.status = 500;
+      return;
+    }
+    res.set_content(R"({"id":"vehicle_health","name":"Vehicle Health",)"
+                    R"("x-medkit":{"source":"manifest","hosts":["brake_monitor"]}})",
+                    "application/json");
+  });
+}
+
+/// The entity carrying `id`, or nullptr. Order within a merged collection is
+/// not part of any promise, so tests look entities up rather than index them.
+template <class Entity>
+const Entity * find_entity(const std::vector<Entity> & entities, const std::string & id) {
+  for (const auto & entity : entities) {
+    if (entity.id == id) {
+      return &entity;
+    }
+  }
+  return nullptr;
+}
+
+AggregationConfig config_for(const std::string & peer_name, int port) {
+  AggregationConfig config;
+  config.enabled = true;
+  config.timeout_ms = 2000;
+  AggregationConfig::PeerConfig peer;
+  peer.name = peer_name;
+  peer.url = "http://127.0.0.1:" + std::to_string(port);
+  config.peers.push_back(peer);
+  return config;
+}
+
+}  // namespace
+
+TEST(AggregationManager, a_subarea_branch_that_could_not_be_read_is_not_dropped_silently) {
+  // The list endpoint filters subareas out, so the nested route is the only
+  // place they are named. A refresh that cannot read it holds an area tree one
+  // branch short of what the peer described.
+  PeerFaults faults;
+  MockPeerServer mock;
+  install_complete_peer(mock.server(), faults);
+  const int port = mock.start();
+
+  AggregationManager manager(config_for("zone_peer", port));
+  manager.check_all_health();
+  ASSERT_EQ(manager.healthy_peer_count(), 1u);
+
+  auto complete = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+  ASSERT_NE(find_entity(complete.areas, "vehicle"), nullptr);
+  ASSERT_NE(find_entity(complete.areas, "sensors"), nullptr) << "the mock never served the subarea branch";
+
+  faults.subareas_fail.store(true);
+  auto partial = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+
+  EXPECT_EQ(find_entity(partial.areas, "vehicle") != nullptr, find_entity(partial.areas, "sensors") != nullptr)
+      << "the area tree kept a parent and lost its branch: a client sees a shape the peer never described";
+}
+
+TEST(AggregationManager, a_subcomponent_whose_detail_could_not_be_read_is_not_published_without_relationships) {
+  // A Component's parent and dependencies live in its detail response. Built
+  // from the nested list alone it is a Component asserted to have neither.
+  PeerFaults faults;
+  MockPeerServer mock;
+  install_complete_peer(mock.server(), faults);
+  const int port = mock.start();
+
+  AggregationManager manager(config_for("ecu_peer", port));
+  manager.check_all_health();
+  ASSERT_EQ(manager.healthy_peer_count(), 1u);
+
+  auto complete = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+  const Component * described = find_entity(complete.components, "perception_ecu");
+  ASSERT_NE(described, nullptr);
+  ASSERT_EQ(described->parent_component_id, "robot_alpha") << "the mock never served the relationships";
+  ASSERT_EQ(described->depends_on.size(), 1u);
+
+  faults.subcomponent_detail_fails.store(true);
+  auto partial = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+
+  const Component * kept = find_entity(partial.components, "perception_ecu");
+  ASSERT_NE(kept, nullptr) << "a declared subcomponent vanished while its peer still declares it";
+  EXPECT_EQ(kept->parent_component_id, "robot_alpha")
+      << "a subcomponent was published with its relationships stripped after the only request that reports them "
+         "failed";
+  EXPECT_EQ(kept->depends_on.size(), 1u);
+}
+
+TEST(AggregationManager, a_peer_that_does_not_offer_the_nested_routes_still_aggregates) {
+  // A gateway older than the nested collection routes answers 404 for them.
+  // That is a version boundary, not a failed read: everything else the peer
+  // says still stands, and aggregation across the boundary keeps working.
+  MockPeerServer mock;
+  mock.server().Get("/api/v1/health", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"status":"healthy"})", "application/json");
+  });
+  mock.server().Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"zone_a","name":"Zone A"}]})", "application/json");
+  });
+  mock.server().Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"ecu_1","name":"ECU 1"}]})", "application/json");
+  });
+  mock.server().Get(R"(/api/v1/components/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
+    res.set_content(nlohmann::json({{"id", req.matches[1].str()}, {"name", "ECU 1"}}).dump(), "application/json");
+  });
+  mock.server().Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"nav","name":"Navigation"}]})", "application/json");
+  });
+  mock.server().Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"drive","name":"Drive"}]})", "application/json");
+  });
+  mock.server().Get(R"(/api/v1/functions/([^/]+))", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"drive","name":"Drive","x-medkit":{"hosts":["nav"]}})", "application/json");
+  });
+  // /areas/{id}/subareas, /components/{id}/subcomponents and
+  // /apps/{id}/operations are deliberately absent: this peer predates them.
+  const int port = mock.start();
+
+  AggregationManager manager(config_for("old_peer", port));
+  manager.check_all_health();
+  ASSERT_EQ(manager.healthy_peer_count(), 1u);
+
+  auto result = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+
+  EXPECT_NE(find_entity(result.areas, "zone_a"), nullptr) << "an absent nested route swallowed the whole peer";
+  EXPECT_NE(find_entity(result.components, "ecu_1"), nullptr);
+  EXPECT_NE(find_entity(result.apps, "nav"), nullptr);
+  const Function * function = find_entity(result.functions, "drive");
+  ASSERT_NE(function, nullptr);
+  EXPECT_EQ(function->hosts.size(), 1u);
+}
+
+TEST(AggregationManager, a_peer_reporting_one_entity_as_not_responding_still_describes_the_rest_of_itself) {
+  // What a middle gateway in a chain answers once its own leaf goes quiet: it
+  // still lists the leaf's declared Component but answers `504 not-responding`
+  // for the detail. That names the entity and reports it unreachable, so it is
+  // read as such - the middle gateway is healthy and everything else it says
+  // still stands.
+  MockPeerServer mock;
+  mock.server().Get("/api/v1/health", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"status":"healthy"})", "application/json");
+  });
+  mock.server().Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  mock.server().Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"ecu_b","name":"ECU B","x-medkit":{"source":"manifest"}},)"
+                    R"({"id":"ecu_c","name":"ECU C","x-medkit":{"source":"manifest"}}]})",
+                    "application/json");
+  });
+  mock.server().Get(R"(/api/v1/components/([^/]+)/subcomponents)",
+                    [](const httplib::Request &, httplib::Response & res) {
+                      res.set_content(R"({"items":[]})", "application/json");
+                    });
+  mock.server().Get(R"(/api/v1/components/([^/]+))", [](const httplib::Request & req, httplib::Response & res) {
+    if (req.matches[1].str() == "ecu_c") {
+      res.status = 504;
+      res.set_content(R"({"error_code":"not-responding","message":"Member 'ecu_c' is not available",)"
+                      R"("parameters":{"entity_id":"ecu_c"}})",
+                      "application/json");
+      return;
+    }
+    res.set_content(R"({"id":"ecu_b","name":"ECU B","x-medkit":{"source":"manifest","dependsOn":["compute_unit"]}})",
+                    "application/json");
+  });
+  mock.server().Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"brake_monitor","name":"Brake Monitor"}]})", "application/json");
+  });
+  mock.server().Get(R"(/api/v1/apps/([^/]+)/operations)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  mock.server().Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  const int port = mock.start();
+
+  AggregationManager manager(config_for("middle_gateway", port));
+  manager.check_all_health();
+  ASSERT_EQ(manager.healthy_peer_count(), 1u);
+
+  auto result = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+
+  const Component * own = find_entity(result.components, "ecu_b");
+  ASSERT_NE(own, nullptr) << "one entity the peer could not describe swallowed everything else it said";
+  EXPECT_EQ(own->depends_on.size(), 1u);
+  EXPECT_TRUE(own->available);
+  EXPECT_NE(find_entity(result.apps, "brake_monitor"), nullptr);
+
+  const Component * far = find_entity(result.components, "ecu_c");
+  ASSERT_NE(far, nullptr) << "the peer still names this Component, so it is not absent";
+  EXPECT_FALSE(far->available) << "the peer said this Component cannot be reached and that is not carried";
+}
+
+TEST(AggregationManager, an_incomplete_refresh_does_not_replace_the_declaration_a_silent_peer_is_remembered_by) {
+  // The user-visible bug: one failed detail request overwrites the last good
+  // declaration with a memberless one, and retention then serves that forever.
+  PeerFaults faults;
+  {
+    MockPeerServer mock;
+    install_complete_peer(mock.server(), faults);
+    const int port = mock.start();
+
+    AggregationManager manager(config_for("brake_ecu", port));
+    manager.check_all_health();
+    ASSERT_EQ(manager.healthy_peer_count(), 1u);
+
+    auto complete = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+    const Function * described = find_entity(complete.functions, "vehicle_health");
+    ASSERT_NE(described, nullptr);
+    ASSERT_EQ(described->hosts.size(), 1u) << "the mock never served the Function's members";
+
+    // One refresh in the middle cannot read the members.
+    faults.function_detail_fails.store(true);
+    manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+
+    // Then the peer goes away for good and only the retained picture is left.
+    mock.server().stop();
+    manager.check_all_health();
+    ASSERT_EQ(manager.healthy_peer_count(), 0u);
+
+    auto silent = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+    const Function * retained = find_entity(silent.functions, "vehicle_health");
+    ASSERT_NE(retained, nullptr) << "a declared Function vanished when its peer went quiet";
+    ASSERT_EQ(retained->hosts.size(), 1u)
+        << "the retained Function lost its members: an incomplete refresh became the record of what the peer "
+           "declared";
+    EXPECT_EQ(retained->hosts[0], "brake_monitor");
+  }
+}
+
+TEST(AggregationManager, an_incomplete_refresh_from_a_reachable_peer_does_not_report_its_entities_unavailable) {
+  // `available:false` answers "can a request get there". A peer whose health
+  // check passes can be reached; failing to read one of its routes says
+  // something about this refresh, not about the peer.
+  PeerFaults faults;
+  MockPeerServer mock;
+  install_complete_peer(mock.server(), faults);
+  const int port = mock.start();
+
+  AggregationManager manager(config_for("live_peer", port));
+  manager.check_all_health();
+  ASSERT_EQ(manager.healthy_peer_count(), 1u);
+
+  auto complete = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+  const App * live = find_entity(complete.apps, "brake_monitor");
+  ASSERT_NE(live, nullptr);
+  ASSERT_TRUE(live->available);
+  ASSERT_TRUE(live->is_online);
+
+  faults.function_detail_fails.store(true);
+  auto incomplete = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+
+  const App * kept = find_entity(incomplete.apps, "brake_monitor");
+  ASSERT_NE(kept, nullptr);
+  EXPECT_TRUE(kept->available)
+      << "a peer that answers its health check was reported unreachable because one of its routes could not be read";
+  EXPECT_TRUE(kept->is_online) << "a running app was reported offline by a refresh that never asked about it";
+  EXPECT_EQ(manager.healthy_peer_count(), 1u) << "the peer was still answering; it must not be counted as silent";
+}
+
+TEST(AggregationManager, a_peer_that_dies_mid_refresh_reports_its_entities_unavailable) {
+  // The other half of the same rule, taken where it is actually decided: the
+  // health check that gates a refresh is taken before it, so a peer that dies
+  // after it passes is inside the refresh and the failed fetch is the first
+  // this gateway hears of it. Availability has to follow the peer as it is
+  // now, not the flag from before.
+  PeerFaults faults;
+  {
+    MockPeerServer mock;
+    install_complete_peer(mock.server(), faults);
+    const int port = mock.start();
+
+    AggregationManager manager(config_for("dying_peer", port));
+    manager.check_all_health();
+    ASSERT_EQ(manager.healthy_peer_count(), 1u);
+
+    auto complete = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+    ASSERT_NE(find_entity(complete.apps, "brake_monitor"), nullptr);
+
+    mock.server().stop();
+    ASSERT_EQ(manager.healthy_peer_count(), 1u) << "the refresh must start out believing the peer is there";
+
+    auto silent = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+    const App * retained = find_entity(silent.apps, "brake_monitor");
+    ASSERT_NE(retained, nullptr) << "a declared entity vanished when its peer went quiet";
+    EXPECT_FALSE(retained->available) << "a peer that stopped answering during the refresh was reported reachable";
+    EXPECT_FALSE(retained->is_online) << "a retained app is not observably running";
+  }
 }
 
 // =============================================================================
