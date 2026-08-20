@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -98,14 +99,59 @@ std::string to_full_topic_path(const std::string & topic_name) {
 }
 
 /// What one addressed data item resolves to: the ROS topic to act on, the id to
-/// echo back to the caller, the member the id named, and whether this gateway's
-/// own walk records that member as a provider of the topic.
+/// echo back to the caller, the member the id named, whether this gateway's own
+/// walk records that member as a provider of the topic, and the member the tree
+/// dispatches the request through when the id named none.
 struct AddressedDataItem {
   std::string full_topic_path;
   std::string item_id;
   std::string member_id;                 ///< Empty when the id carried no member half.
   bool provided_by_named_member{false};  ///< Meaningful only when member_id is set.
+  std::string owner_member_id;           ///< The member a bare id is dispatched through; empty means serve here.
 };
+
+/// The member a BARE id is dispatched through, or empty when this gateway is the
+/// one that serves it.
+///
+/// A topic with a single provider keeps its bare id in the collection -
+/// qualification follows ambiguity, not aggregation - so the bare form is the id
+/// a client is handed back, and it has to reach the gateway that has the topic.
+/// That is what the owners record makes possible, exactly as
+/// `AggregatedOperations::owner_by_path` makes a bare operation id routable.
+///
+/// What is settled here is WHERE, and the owner COUNT does not settle it: a
+/// topic is one topic on one ROS graph, and its owners are the members that
+/// touch it, not several copies of it. Two members of one gateway publishing and
+/// subscribing to a topic name one place between them, and either of them
+/// addresses it there. So the declarations decide:
+///
+///   * an owner this gateway runs - the topic is on this graph, serve it here;
+///   * every owner on one peer - the topic is on that peer, and any of its
+///     members reaches it;
+///   * owners spread across gateways - the bare id names no single place, and
+///     the local walk answers, which is what it has always done.
+///
+/// A leaf has no members at all: it is its own sole contributor, and there is
+/// nothing to hand the request to.
+std::string serving_member_for_topic(const ThreadSafeEntityCache & cache, const AggregatedData & aggregated,
+                                     const std::string & full_topic_path) {
+  if (!aggregated.is_aggregated) {
+    return {};
+  }
+  auto owners = aggregated.owners_by_topic.find(full_topic_path);
+  if (owners == aggregated.owners_by_topic.end() || owners->second.empty()) {
+    return {};
+  }
+  std::string peer;
+  for (const auto & owner : owners->second) {
+    const std::string owner_peer = peer_source_of_member(cache, owner);
+    if (owner_peer.empty() || (!peer.empty() && owner_peer != peer)) {
+      return {};
+    }
+    peer = owner_peer;
+  }
+  return owners->second.front();
+}
 
 /// Resolve the id in the route against the entity, for reads and writes alike.
 ///
@@ -114,28 +160,39 @@ struct AddressedDataItem {
 /// gateway samples the local graph, finds nothing, and returns 200 with an empty
 /// body and status `metadata_only` - a typo reported as success.
 ///
-/// Whether the named member provides the item is REPORTED, not decided: the
-/// answer comes from this gateway's own walk, which holds no topics for a member
-/// another gateway runs, so acting on it here would turn every peer-owned item
-/// into a miss. The caller resolves ownership first and only then reads the flag.
+/// Whether the named member provides the item is REPORTED, not decided: this
+/// gateway's walk holds a member another gateway runs only as that gateway last
+/// reported it, so a member whose report has not arrived yet would have every
+/// one of its items read as a miss. The caller settles ownership first - a
+/// member another gateway runs is answered by that gateway - and only reads the
+/// flag for a member it serves itself.
 ///
 /// A ROS topic name cannot contain a colon, so one in the id can only be the
-/// member separator. Building the member set is not free, so the cache is only
-/// consulted for an id that carries one; a bare id addresses a topic path,
-/// which names one topic on its own and keeps its existing behaviour.
-tl::expected<AddressedDataItem, ErrorInfo>
-address_data_item(const ThreadSafeEntityCache & cache, const std::string & entity_id, const std::string & topic_name) {
+/// member separator. A bare id addresses a topic path, which names one topic on
+/// its own; it still has an owner, and `resolve_owner` says whether finding it
+/// can change where the request is served. Walking the entity is not free, so a
+/// gateway with no peers - where every member is served here anyway - skips it.
+tl::expected<AddressedDataItem, ErrorInfo> address_data_item(const ThreadSafeEntityCache & cache,
+                                                             const std::string & entity_id,
+                                                             const std::string & topic_name, bool resolve_owner) {
   AddressedDataItem addressed;
   addressed.full_topic_path = to_full_topic_path(topic_name);
   addressed.item_id = addressed.full_topic_path;
 
   if (topic_name.find(':') == std::string::npos) {
+    if (resolve_owner) {
+      addressed.owner_member_id =
+          serving_member_for_topic(cache, cache.get_entity_data(entity_id), addressed.full_topic_path);
+    }
     return addressed;
   }
 
   auto aggregated = cache.get_entity_data(entity_id);
   auto parsed = http::parse_member_qualified_id(topic_name, aggregated.is_aggregated);
   if (!parsed.has_member) {
+    if (resolve_owner) {
+      addressed.owner_member_id = serving_member_for_topic(cache, aggregated, addressed.full_topic_path);
+    }
     return addressed;
   }
 
@@ -182,12 +239,19 @@ std::string member_data_resource_path(const std::string & full_topic_path) {
 /// Returns the answer the handler must return - including the sentinel that says
 /// the owning peer has already committed the wire - or nullopt when this gateway
 /// serves the item itself. The "member does not provide it" refusal is decided
-/// here rather than while addressing, because it rests on the local walk, which
-/// says nothing about a member another gateway runs.
+/// here rather than while addressing, because it rests on the local walk, and
+/// the walk only describes a member another gateway runs as well as that
+/// gateway's last report did.
+///
+/// An id that named a member is served by that member. An id that named none is
+/// served by the member the tree says owns the topic, so the bare form a
+/// single-provider item is listed under reaches the same gateway the qualified
+/// form does. Where neither applies the entity serves it itself.
 std::optional<ErrorInfo> dispatch_data_item(const HandlerContext & ctx, const http::TypedRequest & req,
                                             const std::string & entity_id, const std::string & topic_name,
                                             const AddressedDataItem & addressed) {
-  auto dispatch = ctx.dispatch_to_member(req, addressed.member_id, member_data_resource_path(addressed.full_topic_path),
+  const std::string & serving_member = addressed.member_id.empty() ? addressed.owner_member_id : addressed.member_id;
+  auto dispatch = ctx.dispatch_to_member(req, serving_member, member_data_resource_path(addressed.full_topic_path),
                                          json{{"entity_id", entity_id}, {"id", topic_name}});
   if (!dispatch) {
     return dispatch.error();
@@ -401,7 +465,28 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
     auto data_access_mgr = ctx_.node()->get_data_access_manager();
     auto type_introspection = data_access_mgr->get_type_introspection();
 
+    // True for a topic every one of whose providers is a member another gateway
+    // runs. The owners are a list because a topic can be published by one member
+    // and subscribed by another, and a single local provider is enough to make
+    // this gateway's walk the account of the item - so it is "all", not "any".
+    const auto served_only_by_peers = [&aggregated, &cache](const std::string & topic_name) {
+      auto owners = aggregated.owners_by_topic.find(topic_name);
+      if (owners == aggregated.owners_by_topic.end() || owners->second.empty()) {
+        return false;
+      }
+      return std::all_of(owners->second.begin(), owners->second.end(), [&cache](const std::string & member_id) {
+        return member_is_peer_contributed(cache, member_id);
+      });
+    };
+
     dto::Collection<dto::DataItem, dto::DataListXMedkit> response;
+    // A peer's topics are held here so ownership can be settled without asking
+    // anyone. They are not reported from this walk while the peer is reachable -
+    // the gateway that owns an item is the one that reports it, and its copy
+    // carries the message type and the sample metadata this one cannot - so they
+    // are set aside and only fall back into the list below, when the fan-out
+    // that should have carried them did not.
+    std::vector<dto::DataItem> retained_from_peers;
     for (const auto & topic : aggregated.topics) {
       dto::DataItem di;
       di.id = topic.name;
@@ -416,7 +501,7 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
           owners != aggregated.owners_by_topic.end() && aggregated.is_aggregated) {
         di.x_medkit->member_ids = owners->second;
       }
-      response.items.push_back(std::move(di));
+      (served_only_by_peers(topic.name) ? retained_from_peers : response.items).push_back(std::move(di));
     }
 
     // Typed fan-out for the data list. Replaces the legacy raw-JSON
@@ -432,15 +517,32 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     const auto & raw_req = req.raw_for_framework();
 #pragma GCC diagnostic pop
+    // Two different reasons a peer's copy can be missing, and they are not the
+    // same answer. The caller asking for no fan-out means the peers were never
+    // consulted, and reporting their items anyway is what turns a
+    // bidirectionally peered pair into a bounce. A fan-out that ran and came
+    // back without them means the peer is not answering, and the tree still
+    // knows what it declared.
+    const bool fan_out_suppressed = raw_req.has_header("X-Medkit-No-Fan-Out");
     auto * agg = ctx_.aggregation_manager();
     auto fan_out = fan_out_collection<dto::DataItem>(agg, raw_req);
 
+    // The ROS topic an item names. Empty when the item names none, which is
+    // what a peer's malformed item - or a plugin's data point - looks like.
+    const auto topic_of = [](const dto::DataItem & item) -> std::string {
+      if (!item.x_medkit.has_value() || !item.x_medkit->ros2.has_value()) {
+        return {};
+      }
+      return item.x_medkit->ros2->topic.value_or(std::string{});
+    };
+
     // A peer names its members as its own tree names them, and an App whose id
     // collided with a local one was merged under `<peer>__<id>` - so the name
-    // the peer sends names the LOCAL leaf here. A merged App carries no topics,
-    // so this attribution is the only account of who owns a peer's item, and a
-    // client that builds `<member>:<topic>` out of it addresses a member that
-    // does not publish that topic at all.
+    // the peer sends names the LOCAL leaf here. Re-emitted verbatim it
+    // attributes the peer's topic to a member that does not publish it, and
+    // every id built from that attribution - by this gateway or by a client
+    // reading the list - is resolved against the wrong member.
+    std::unordered_set<std::string> topics_from_peers;
     for (size_t index = 0; index < fan_out.items.size(); ++index) {
       auto & item = fan_out.items[index];
       const std::string peer_name = index < fan_out.item_peers.size() ? fan_out.item_peers[index] : std::string{};
@@ -449,7 +551,42 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
           member_id = agg->local_member_id(peer_name, member_id);
         }
       }
+      if (auto topic = topic_of(item); !topic.empty()) {
+        topics_from_peers.insert(std::move(topic));
+      }
       response.items.push_back(std::move(item));
+    }
+
+    // The full ROS topic path is the key, because that is what makes two copies
+    // one item: the wire id is that same path, and a topic is held once per ROS
+    // graph, so a path arriving from the owner and a path held here from its
+    // declaration describe the same topic. Without it both are listed, and the
+    // duplicate ids are then qualified into two items that address one topic.
+    if (!fan_out_suppressed) {
+      for (auto & item : retained_from_peers) {
+        const std::string topic = topic_of(item);
+        if (!topic.empty() && topics_from_peers.count(topic) > 0u) {
+          continue;  // the owner answered for itself, which is the better copy
+        }
+        // `available` is a statement about the MEMBER, not about the fan-out:
+        // false means the gateway that owns the item is not answering, so a
+        // request for it cannot be served. A fan-out reaching this gateway with
+        // nothing for this topic says nothing on its own - it also never ran
+        // when no peer contributes this entity. The member's own reachability
+        // is what a request for the item will meet, and it is the same reading
+        // `dispatch_to_member` acts on, so the listing and the read cannot
+        // disagree.
+        if (auto owners = aggregated.owners_by_topic.find(topic); owners != aggregated.owners_by_topic.end()) {
+          const bool any_unreachable =
+              std::any_of(owners->second.begin(), owners->second.end(), [this](const std::string & member_id) {
+                return !ctx_.is_entity_available(member_id);
+              });
+          if (any_unreachable) {
+            item.x_medkit->available = false;
+          }
+        }
+        response.items.push_back(std::move(item));
+      }
     }
 
     // A topic path names one topic however many members publish and subscribe
@@ -537,7 +674,8 @@ http::Result<dto::DataValue> DataHandlers::get_data_item(const http::TypedReques
   }
 
   try {
-    auto addressed = address_data_item(ctx_.node()->get_thread_safe_cache(), entity_id, topic_name);
+    auto addressed = address_data_item(ctx_.node()->get_thread_safe_cache(), entity_id, topic_name,
+                                       ctx_.aggregation_manager() != nullptr);
     if (!addressed) {
       return tl::make_unexpected(addressed.error());
     }
@@ -719,7 +857,8 @@ http::Result<dto::DataValue> DataHandlers::put_data_item(const http::TypedReques
     // A write addresses the same item a read does, so it resolves the same way -
     // including which gateway publishes it. Publishing here for a member another
     // gateway runs would create a publisher on a graph that member is not on.
-    auto addressed = address_data_item(ctx_.node()->get_thread_safe_cache(), entity_id, topic_name);
+    auto addressed = address_data_item(ctx_.node()->get_thread_safe_cache(), entity_id, topic_name,
+                                       ctx_.aggregation_manager() != nullptr);
     if (!addressed) {
       return tl::make_unexpected(addressed.error());
     }

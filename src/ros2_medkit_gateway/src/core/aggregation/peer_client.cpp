@@ -282,6 +282,47 @@ void parse_operations_into(const nlohmann::json & j, App & app) {
 }
 
 /**
+ * @brief Read a peer's data collection into the App's topics.
+ *
+ * A data item names its ROS topic by full path in ``x-medkit.ros2.topic``. An
+ * item without one describes something that is not a topic - a plugin's data
+ * point, for instance - and carries nothing this gateway can address as one, so
+ * it is skipped rather than recorded under its wire id.
+ *
+ * ``direction`` decides which side of the topic the App is on, and only the
+ * three values a gateway emits are accepted. An item that says anything else
+ * leaves the App unattributed for that topic instead of being recorded as a
+ * publisher it may not be: the ownership built out of these lists is what a
+ * bare item id is dispatched by, and a guess there sends a read to a gateway
+ * that does not have the topic.
+ */
+void parse_data_items_into(const nlohmann::json & j, App & app) {
+  if (!j.contains("items") || !j["items"].is_array()) {
+    return;
+  }
+  for (const auto & item : j["items"]) {
+    if (!item.is_object() || !item.contains("x-medkit") || !item["x-medkit"].is_object()) {
+      continue;
+    }
+    const auto & xm = item["x-medkit"];
+    if (!xm.contains("ros2") || !xm["ros2"].is_object()) {
+      continue;
+    }
+    const std::string topic = xm["ros2"].value("topic", "");
+    const std::string direction = xm["ros2"].value("direction", "");
+    if (topic.empty()) {
+      continue;
+    }
+    if (direction == "publish" || direction == "both") {
+      app.topics.publishes.push_back(topic);
+    }
+    if (direction == "subscribe" || direction == "both") {
+      app.topics.subscribes.push_back(topic);
+    }
+  }
+}
+
+/**
  * @brief Parse an App from JSON.
  *
  * The app-to-component binding is recovered from SOVD's standard
@@ -728,35 +769,52 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
                                        }),
                         entities.apps.end());
 
-    // Fetch each app's operations. An operation is never declared in a
-    // manifest - it is discovered from the ROS graph - so the only record of
-    // what a peer's app exposes is what the peer reports. Without it the
-    // aggregator cannot tell that two members share an operation short name
-    // except by asking at request time, and an answer that depends on who is
-    // reachable is not an answer a client can rely on.
+    // Fetch each app's operations and data. Neither is ever declared in a
+    // manifest - both are discovered from the ROS graph - so the only record of
+    // what a peer's app exposes is what the peer reports. Without the
+    // operations the aggregator cannot tell that two members share an operation
+    // short name except by asking at request time, and an answer that depends
+    // on who is reachable is not an answer a client can rely on. Without the
+    // topics it holds no record of which member owns one, so an item id that
+    // names no member - the form a topic with a single provider is listed under
+    // - cannot be routed to the gateway that has the topic.
     //
     // `X-Medkit-No-Fan-Out` keeps the peer from re-asking ITS peers: each
     // gateway reports what it holds, and the hop that owns the entity is the
     // hop that answers for it. It is also what makes this terminate.
+    //
+    // A route that is absent or answers for an unreachable entity is skipped on
+    // its own, never for the app: the two collections are read independently
+    // and one missing must not cost the other.
     for (auto & app : entities.apps) {
-      httplib::Headers no_fan_out{{"X-Medkit-No-Fan-Out", "1"}};
-      const std::string route = "/apps/" + app.id + "/operations";
-      auto ops = read_sub_response(cli.Get(std::string(API_PREFIX) + route, no_fan_out), name_, route,
+      const httplib::Headers no_fan_out{{"X-Medkit-No-Fan-Out", "1"}};
+
+      const std::string ops_route = "/apps/" + app.id + "/operations";
+      auto ops = read_sub_response(cli.Get(std::string(API_PREFIX) + ops_route, no_fan_out), name_, ops_route,
                                    RouteKind::kNestedCollection);
       if (ops.kind == SubResponse::Kind::kIncomplete) {
         return tl::unexpected<std::string>(ops.error);
       }
       if (ops.kind == SubResponse::Kind::kRouteAbsent) {
         note_absent_route("/apps/{id}/operations");
-        continue;
+      } else if (ops.kind == SubResponse::Kind::kBody) {
+        parse_operations_into(ops.body, app);
       }
-      if (ops.kind == SubResponse::Kind::kEntityUnreachable) {
-        // The App is retained and its gateway is silent, so the peer answers
-        // for it rather than proxying. It keeps the operations the peer already
-        // reported; there is nothing further to read.
-        continue;
+      // kEntityUnreachable: the App is retained and its gateway is silent, so
+      // the peer answers for it rather than proxying. It keeps what the peer
+      // already reported; there is nothing further to read.
+
+      const std::string data_route = "/apps/" + app.id + "/data";
+      auto data = read_sub_response(cli.Get(std::string(API_PREFIX) + data_route, no_fan_out), name_, data_route,
+                                    RouteKind::kNestedCollection);
+      if (data.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(data.error);
       }
-      parse_operations_into(ops.body, app);
+      if (data.kind == SubResponse::Kind::kRouteAbsent) {
+        note_absent_route("/apps/{id}/data");
+      } else if (data.kind == SubResponse::Kind::kBody) {
+        parse_data_items_into(data.body, app);
+      }
     }
   }
 

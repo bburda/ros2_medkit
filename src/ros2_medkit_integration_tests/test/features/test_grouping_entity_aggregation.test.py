@@ -183,6 +183,20 @@ SHARED_OPERATION = 'calibrate'
 PRIMARY_RPM_APP = 'rpm_sensor'
 PEER_ACTUATOR_APP = 'brake_actuator'
 
+# A topic that exists only on the PEER's ROS graph, and the member the merged
+# tree hands a request for it to. Both peer members touch it - the sensor
+# publishes it and the actuator publishes its own copy under the same path - so
+# it is one topic with two providers on ONE gateway, which is where the bare id
+# has to land. Its wire id stays bare: two members of the same gateway are not
+# two copies to tell apart.
+PEER_ONLY_TOPIC = '/chassis/brakes/pressure'
+PEER_ONLY_TOPIC_APP = 'pressure_sensor'
+
+# The same shape on this gateway's own graph, for the half of the rule that says
+# a locally owned topic keeps being served here.
+LOCAL_ONLY_TOPIC = '/powertrain/engine/temperature'
+LOCAL_ONLY_TOPIC_APP = 'temp_sensor'
+
 # Declared by the calibration demo node, so BOTH `primary_calibration` and
 # `peer_calibration` expose it under one name. A member-qualified id is the only
 # thing that separates the two copies, which is what makes this the parameter
@@ -466,6 +480,7 @@ class GroupingAggregationTest(unittest.TestCase):
             {'pressure_sensor', 'peer_calibration', PEER_LONG_APP, COLLIDING_LEAF},
             'peer')
         cls._wait_until_merged()
+        cls._wait_for_peer_topic_ownership()
 
     @classmethod
     def _wait_for_apps(cls, base_url, required, label):
@@ -490,6 +505,37 @@ class GroupingAggregationTest(unittest.TestCase):
                 pass
             time.sleep(1.0)
         raise AssertionError(f'{label}: {required} not online within 60s')
+
+    @classmethod
+    def _wait_for_peer_topic_ownership(cls):
+        """Block until a peer's topics have reached this gateway's merged tree.
+
+        A peer's topics are read over HTTP, one poll behind whatever the peer's
+        own graph looked like when it answered, so an App can be online on the
+        peer and merged here before the report that names its topics has
+        arrived. Until it does, a bare id for one of those topics resolves to no
+        owner and is sampled from the local graph.
+
+        Best effort, and deliberately so: this absorbs a polling delay, it does
+        not assert a contract. Raising here would make every case below report
+        as a setUpClass error, hiding which of them the answer was actually
+        wrong for.
+        """
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(
+                    f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+                    f'{quote(PEER_ONLY_TOPIC.lstrip("/"), safe="")}',
+                    timeout=10,
+                )
+                if (response.status_code == 200
+                        and response.json().get('x-medkit', {}).get('entity_id')
+                        == PEER_ONLY_TOPIC_APP):
+                    return
+            except requests.RequestException:
+                pass
+            time.sleep(0.5)
 
     @classmethod
     def _wait_until_merged(cls):
@@ -1745,6 +1791,247 @@ class GroupingAggregationTest(unittest.TestCase):
             f'a locally owned member was not served here: {body}',
         )
 
+    def test_a_bare_data_id_the_list_offers_reaches_its_peer_owned_member(self):
+        """R4 for the id a single-provider topic is actually listed under.
+
+        The compound form is not the only form a client is handed. A topic one
+        gateway provides keeps its bare id - qualification follows ambiguity -
+        so the bare id IS the address, and it has to reach the gateway that has
+        the topic. Served here it samples a graph the topic is not on and comes
+        back 404 topic-unavailable, with the member and its gateway both
+        healthy.
+
+        The id is taken from the collection rather than written out, because the
+        agreement between the list and the read is what is under test.
+        """
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'data')
+        offered = [
+            item for item in items
+            if item.get('x-medkit', {}).get('ros2', {}).get('topic') == PEER_ONLY_TOPIC
+        ]
+        self.assertEqual(
+            len(offered), 1,
+            f'{PEER_ONLY_TOPIC} is not offered exactly once: '
+            f'{[item.get("id") for item in items]}',
+        )
+        item_id = offered[0]['id']
+        self.assertNotIn(
+            ':', item_id,
+            f'a topic only one gateway provides was qualified: {item_id!r}',
+        )
+
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/{quote(item_id, safe="")}',
+            timeout=15,
+        )
+        self.assertNotEqual(
+            response.status_code, 404,
+            f'the bare id the list offers was refused as an unknown topic: {response.text}',
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(
+            body.get('x-medkit', {}).get('status'), 'data',
+            f'the id the list offers read nothing: {body}',
+        )
+        self.assertTrue(body.get('data'), 'the peer member returned an empty payload')
+
+        # And it is THAT member's item, not merely some 200. Compared against
+        # the peer's own answer for the same topic, so a read that fell back to
+        # a local member cannot satisfy it and neither can an empty envelope.
+        direct = requests.get(
+            f'{PEER_URL}/apps/{PEER_ONLY_TOPIC_APP}/data'
+            f'/{quote(PEER_ONLY_TOPIC.lstrip("/"), safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(direct.status_code, 200, direct.text)
+        direct_body = direct.json()
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('topic'), PEER_ONLY_TOPIC,
+            f'the answer names a topic the member does not publish: {body}',
+        )
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('type'),
+            direct_body.get('x-medkit', {}).get('ros2', {}).get('type'),
+            f'the answer is not the message the member publishes: {body}',
+        )
+        self.assertEqual(
+            sorted(body['data'].keys()), sorted(direct_body['data'].keys()),
+            f"the payload is not shaped like the member's own: {body}",
+        )
+        # Which gateway served it is the only thing separating a real answer
+        # from a plausible one: served here the entity named would be the
+        # aggregating Function, which is also what a local sample of a topic
+        # this gateway cannot see would carry.
+        self.assertEqual(
+            body.get('x-medkit', {}).get('entity_id'), PEER_ONLY_TOPIC_APP,
+            f'the aggregating entity answered for a member it does not run: {body}',
+        )
+
+    def test_a_peer_owned_topic_is_offered_exactly_once(self):
+        """The duplicate a merged App carrying topics makes possible.
+
+        The list is assembled from two places that now both know the peer's
+        topics: this gateway's own walk over the merged tree, and the fan-out to
+        the gateway that owns them. Without a key the two copies are both
+        emitted, and because they then share an id each is qualified with its
+        member - so one topic is offered under two ids, neither of them the bare
+        one a client already sends. Counted per copy, not set-ified, because a
+        set hides exactly the duplicate this case exists to catch.
+        """
+        # The Function and the Area, because those are the two aggregating kinds
+        # that reach the peer's member: the parent Component draws only from the
+        # apps located on itself, and the peer's are located on its
+        # subcomponent.
+        for entity_path in (
+            f'functions/{MERGED_FUNCTION}',
+            f'areas/{MERGED_AREA}',
+        ):
+            with self.subTest(entity=entity_path):
+                items = self._items(entity_path, 'data')
+                copies = [
+                    item for item in items
+                    if item.get('x-medkit', {}).get('ros2', {}).get('topic') == PEER_ONLY_TOPIC
+                ]
+                self.assertEqual(
+                    len(copies), 1,
+                    f'{PEER_ONLY_TOPIC} is listed {len(copies)} times: '
+                    f'{[item.get("id") for item in items]}',
+                )
+                self.assertNotIn(
+                    ':', copies[0].get('id', ''),
+                    f'the surviving copy was qualified, so the bare id the '
+                    f'collection promised is gone: {copies[0]}',
+                )
+
+    def test_a_bare_data_id_of_a_local_member_is_still_served_here(self):
+        """R4 in the other direction: resolving owners must not export the local half.
+
+        A topic this gateway's own member provides is on this gateway's graph,
+        and nothing about reading it may change. The value is asserted against
+        the member's own App route on THIS gateway, and the serving entity is
+        read as well - a dispatch that handed a local topic to a peer would
+        answer 404 or 504 there rather than fail visibly here.
+        """
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'data')
+        offered = [
+            item for item in items
+            if item.get('x-medkit', {}).get('ros2', {}).get('topic') == LOCAL_ONLY_TOPIC
+        ]
+        self.assertEqual(
+            len(offered), 1,
+            f'{LOCAL_ONLY_TOPIC} is not offered exactly once: '
+            f'{[item.get("id") for item in items]}',
+        )
+        item_id = offered[0]['id']
+        self.assertNotIn(':', item_id, f'a locally owned topic was qualified: {item_id!r}')
+
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/{quote(item_id, safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(
+            body.get('x-medkit', {}).get('status'), 'data',
+            f'a locally owned topic read nothing: {body}',
+        )
+        self.assertTrue(body.get('data'), 'the local member returned an empty payload')
+
+        direct = requests.get(
+            f'{PRIMARY_URL}/apps/{LOCAL_ONLY_TOPIC_APP}/data'
+            f'/{quote(LOCAL_ONLY_TOPIC.lstrip("/"), safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(direct.status_code, 200, direct.text)
+        direct_body = direct.json()
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('type'),
+            direct_body.get('x-medkit', {}).get('ros2', {}).get('type'),
+            f'the answer is not the message the local member publishes: {body}',
+        )
+        self.assertEqual(
+            sorted(body['data'].keys()), sorted(direct_body['data'].keys()),
+            f"the payload is not shaped like the local member's own: {body}",
+        )
+        self.assertEqual(
+            body.get('x-medkit', {}).get('entity_id'), MERGED_FUNCTION,
+            f'a locally owned topic was not served here: {body}',
+        )
+
+    def test_a_bare_data_id_naming_no_topic_is_answered_here_and_empty(self):
+        """R6, and the guard against resolving an owner for a name nobody owns.
+
+        An id no member provides has no owner, so there is nothing to dispatch
+        it to and this gateway answers. What it answers is a metadata-only
+        reading with no payload - the sampler reports a topic it cannot find as
+        one nobody is publishing - which is what makes it distinguishable from
+        an id that exists, and that pair is asserted together here rather than
+        as a status on its own.
+
+        The serving entity is asserted because the failure this guards is
+        specific: an owner resolved for a name nobody owns forwards a typo to a
+        peer, and the answer then comes back naming that peer's member.
+        """
+        missing = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote("chassis/brakes/no_such_reading", safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(missing.status_code, 200, missing.text)
+        missing_body = missing.json()
+        self.assertEqual(
+            missing_body.get('x-medkit', {}).get('status'), 'metadata_only',
+            f'a topic no member provides reported data: {missing_body}',
+        )
+        self.assertFalse(
+            missing_body.get('data'),
+            f'a topic no member provides came back with a payload: {missing_body}',
+        )
+        self.assertEqual(
+            missing_body.get('x-medkit', {}).get('entity_id'), MERGED_FUNCTION,
+            f'an id nobody owns was dispatched to a member: {missing_body}',
+        )
+
+        present = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote(PEER_ONLY_TOPIC.lstrip("/"), safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(present.status_code, 200, present.text)
+        self.assertEqual(
+            present.json().get('x-medkit', {}).get('status'), 'data',
+            f'an id that exists is not distinguishable from one that does not: '
+            f'{present.text}',
+        )
+
+    def test_a_suppressed_data_response_omits_the_peers_topics(self):
+        """The loop-suppression guard on ``/data``, for the reason it was written.
+
+        Suppression means the peers were never asked. Reporting their topics
+        anyway - out of the copies this gateway holds from their last report -
+        is what turns a bidirectionally peered pair into a bounce, because the
+        header exists precisely to make one hop terminal. The peer's topic is
+        addressed by name rather than by counting items, so a response that
+        merely got shorter cannot pass this.
+        """
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data',
+            headers={'X-Medkit-No-Fan-Out': '1'},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        items = response.json().get('items', [])
+        topics = [item.get('x-medkit', {}).get('ros2', {}).get('topic') for item in items]
+        self.assertNotIn(
+            PEER_ONLY_TOPIC, topics,
+            f'a suppressed response reported a peer-owned topic: {topics}',
+        )
+        self.assertIn(
+            LOCAL_ONLY_TOPIC, topics,
+            f"suppression dropped this gateway's own topics too: {topics}",
+        )
+
     def test_a_compound_operation_id_runs_on_the_members_gateway(self):
         """R4 for an operation, asserted on the result rather than the status.
 
@@ -2554,6 +2841,78 @@ class GroupingAggregationTest(unittest.TestCase):
         self.assertIn('peer_calibration', body.get('message', ''), body)
         self.assertEqual(
             body.get('parameters', {}).get('member_id'), 'peer_calibration', body)
+
+    def test_z6c_a_bare_data_id_of_a_silent_peer_owned_member_says_not_responding(self):
+        """R10 for the bare form of the dispatch path, for the reason z6a exists.
+
+        A bare id resolves its owner from the tree, and the tree keeps a
+        declared member after its gateway stops answering - so the id still
+        resolves, and the answer is that the member cannot be reached. The two
+        wrong answers are both plausible: forwarding to a socket that is gone
+        gives 502, which says THIS gateway broke, and dropping the owner gives a
+        local sample of a topic that is not on this graph, which is a 200 with
+        an empty body. Both are asserted against explicitly, because a bare
+        `assertEqual(504)` reads the same whichever one arrives.
+        """
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote(PEER_ONLY_TOPIC.lstrip("/"), safe="")}',
+            timeout=15,
+        )
+        self.assertNotEqual(
+            response.status_code, 502,
+            f'a silent peer was forwarded to instead of answered for: {response.text}',
+        )
+        self.assertNotEqual(
+            response.status_code, 200,
+            f'a topic on a silent gateway was sampled here and reported as read: '
+            f'{response.text}',
+        )
+        self.assertEqual(response.status_code, 504, response.text)
+        body = response.json()
+        self.assertEqual(body.get('error_code'), 'not-responding', body)
+        self.assertEqual(
+            body.get('parameters', {}).get('member_id'), PEER_ONLY_TOPIC_APP, body)
+
+    def test_z6d_a_retained_member_keeps_the_topics_it_reported(self):
+        """R10 for ``/data``, and the reason the retained copy is kept at all.
+
+        A topic the tree only knows from a peer's report is held here so that
+        ownership can be settled without asking anyone. While the peer answers
+        the owner's own copy is the one listed - it carries the message type and
+        the sample metadata this gateway has no way to produce - so the held copy
+        is emitted only once the fan-out has come back without it. Dropped
+        instead, the collection would lose a member's items the moment a link
+        went down, which is the shape change retention exists to prevent.
+
+        Counted per copy, because "still listed" and "listed once" are different
+        claims and both have to hold.
+        """
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'data')
+        copies = [
+            item for item in items
+            if item.get('x-medkit', {}).get('ros2', {}).get('topic') == PEER_ONLY_TOPIC
+        ]
+        self.assertEqual(
+            len(copies), 1,
+            f'a retained member forgot the topic it last reported, or reported it '
+            f'twice: {[item.get("id") for item in items]}',
+        )
+        # And the retained copy says it cannot be served, so a client can tell
+        # "declared, unreachable" from "publishing right now".
+        self.assertIs(
+            copies[0].get('x-medkit', {}).get('available'), False,
+            f'the retained topic does not report itself unavailable: {copies[0]}',
+        )
+        local = [
+            item for item in items
+            if item.get('x-medkit', {}).get('ros2', {}).get('topic') == LOCAL_ONLY_TOPIC
+        ]
+        self.assertEqual(len(local), 1, f'the local half vanished: {local}')
+        self.assertNotEqual(
+            local[0].get('x-medkit', {}).get('available'), False,
+            f'a locally owned topic was marked unavailable: {local[0]}',
+        )
 
     def test_z7_suppression_omits_the_peer_without_losing_ambiguity(self):
         """The loop-suppression guard, checked for the reason it was written.

@@ -436,6 +436,28 @@ member:
    PUT  /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
      -> PUT  /api/v1/apps/peer_calibration/configurations/calibration_offset (on the peer)
 
+An id with no member half is the same question asked differently, and it has to
+have the same answer. Qualification follows ambiguity, so an item a single member
+provides keeps its bare id, and that bare id is what the collection hands a
+client - it has to reach the owner too, or the most ordinary item in an
+aggregating entity is the one that cannot be read. Each collection recovers the
+owner from what the tree already records:
+``AggregatedOperations::owner_by_path`` maps a ROS path to the member that owns
+the operation, and ``AggregatedData::owners_by_topic`` maps a topic path to the
+members that provide it. The dispatch is then identical:
+
+.. code-block:: text
+
+   GET  /api/v1/functions/vehicle_health/data/chassis%2Fbrakes%2Fpressure
+     -> GET  /api/v1/apps/pressure_sensor/data/chassis/brakes/pressure       (on the peer)
+
+A topic differs from an operation in having a LIST of owners, because one topic
+that a member publishes and another subscribes to is one item. That list settles
+where, not how many: an owner this gateway runs means the topic is on this graph
+and is sampled here; owners all on one peer mean the topic is on that peer, and
+any one of them addresses it there; owners spread across gateways mean the bare
+id names no single place, and the local graph answers it as it always did.
+
 A member half a peer supplied is read through the collision rename before it
 means anything here. A peer describes its own tree in its own names, and an App
 whose id collided with a local one was merged under ``<peer>__<id>``, so the
@@ -525,9 +547,11 @@ The member's own gateway is the only one that can answer: the ROS service, the
 topic and the parameter behind the id exist on its graph and nowhere else. What
 this gateway holds for a peer-owned member is a declaration, which is why the
 local walk's record of "does this member provide this item" is consulted only
-once the member is known to be served here - on a peer-owned member it holds no
-topics at all, and no node FQN to ask for a parameter, so every one of them
-would be a miss.
+once the member is known to be served here. What that declaration carries is
+whatever the peer last reported - the topics and operations it has, and no node
+FQN to ask for a parameter - so a member whose report has not arrived yet, or
+whose parameters were never in it, would have every one of its items read as a
+miss.
 
 The order inside ``dispatch_to_member`` is load-bearing:
 
@@ -678,7 +702,8 @@ no other meaning for, an oversized body or unparsable JSON on any of them fails
 the fetch, because a picture missing a branch is indistinguishable on the wire
 from a peer that does not have that branch. Two statuses carry a meaning of
 their own: a ``404`` on a nested collection route (``/subareas``,
-``/subcomponents``, an app's ``/operations``) identifies a peer running a
+``/subcomponents``, an app's ``/operations`` or ``/data``) identifies a peer
+running a
 gateway that predates the route and is reported in
 ``PeerEntities::absent_routes`` for the caller to log; a ``504`` with error code
 ``not-responding`` on any route hanging off an entity - its detail, or one of
@@ -691,6 +716,21 @@ unreachable member anywhere behind a peer would discard that peer's whole
 picture on every refresh, and the aggregator would go on serving its last
 pre-failure view indefinitely. A ``504`` that does not carry
 ``not-responding`` says nothing about an entity and still fails the fetch.
+
+Two of those requests are made per App: its ``/operations`` and its ``/data``.
+Neither collection is ever declared in a manifest - both are discovered from the
+ROS graph - so what the peer reports on those routes is the only record of them
+this gateway can have, and both records are what addressing is built on. Without
+the operations, ambiguity between two members sharing an operation short name
+could only be settled by asking at request time, and an answer that depends on
+who is reachable is not one a client can rely on. Without the topics, nothing
+here maps a peer's topic to the member that provides it, so the bare path a
+single-provider topic is listed under resolves to no owner, is served from the
+local graph, and is refused as an unknown topic while the member and its gateway
+are both healthy. Both requests carry ``X-Medkit-No-Fan-Out``, which keeps the
+peer from re-asking ITS peers: each gateway reports what it holds, the hop that
+owns an entity is the hop that answers for it, and that is also what makes the
+walk terminate.
 
 Availability travels the same way in the other direction. ``x-medkit.available``
 is emitted only when false, so absence means reachable, and both
@@ -709,9 +749,10 @@ whether to replay it marked unavailable (health check failed) or exactly as it
 was last read (health check still passes).
 
 The same field on a listed ITEM answers for that item's member and for nothing
-else. ``/operations`` holds back the copies its declared tree carries for
-peer-owned members and offers them only when the fan-out did not bring the
-owner's own copy, and whether such a copy is marked unavailable is decided from
+else. ``/operations`` and ``/data`` hold back the copies their declared tree
+carries for peer-owned members and offer them only when the fan-out did not bring
+the owner's own copy - keyed on the full ROS path, which is what makes two copies
+one item - and whether such a copy is marked unavailable is decided from
 the member's reachability - the same reading ``dispatch_to_member`` acts on, so
 the listing and the request cannot disagree. A fan-out that produced nothing is
 not evidence on its own: it also never runs when no peer contributes the entity,

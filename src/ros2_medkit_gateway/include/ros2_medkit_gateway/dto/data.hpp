@@ -59,6 +59,11 @@ namespace dto {
 //   timestamp        - sample timestamp in nanoseconds since epoch (int64)
 //   publisher_count  - number of publishers on the topic at sample time (int64)
 //   subscriber_count - number of subscribers on the topic at sample time (int64)
+//
+// Additional keys on an aggregating entity's list items:
+//   member_ids - the members of the grouping that provide the topic
+//   available  - present only as false, marking an item whose provider is not
+//                answering; absent means it can be served
 // =============================================================================
 struct XMedkitDataItem {
   std::optional<XMedkitRos2> ros2;
@@ -78,15 +83,21 @@ struct XMedkitDataItem {
   /// short name. More than one entry is what makes the bare item id
   /// ambiguous for addressing.
   std::optional<std::vector<std::string>> member_ids;
+  /// Absent while the item can be served. False marks an item listed from a
+  /// retained declaration because the member that owns it is not answering -
+  /// the item is still part of the tree, and still addressable.
+  std::optional<bool> available;
 };
 
 template <>
-inline constexpr auto dto_fields<XMedkitDataItem> = std::make_tuple(
-    field("ros2", &XMedkitDataItem::ros2), field("type_info", &XMedkitDataItem::type_info),
-    field("entity_id", &XMedkitDataItem::entity_id), field("status", &XMedkitDataItem::status),
-    field("publisher_created", &XMedkitDataItem::publisher_created), field("timestamp", &XMedkitDataItem::timestamp),
-    field("publisher_count", &XMedkitDataItem::publisher_count),
-    field("subscriber_count", &XMedkitDataItem::subscriber_count), field("member_ids", &XMedkitDataItem::member_ids));
+inline constexpr auto dto_fields<XMedkitDataItem> =
+    std::make_tuple(field("ros2", &XMedkitDataItem::ros2), field("type_info", &XMedkitDataItem::type_info),
+                    field("entity_id", &XMedkitDataItem::entity_id), field("status", &XMedkitDataItem::status),
+                    field("publisher_created", &XMedkitDataItem::publisher_created),
+                    field("timestamp", &XMedkitDataItem::timestamp),
+                    field("publisher_count", &XMedkitDataItem::publisher_count),
+                    field("subscriber_count", &XMedkitDataItem::subscriber_count),
+                    field("member_ids", &XMedkitDataItem::member_ids), field("available", &XMedkitDataItem::available));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitDataItem> = "XMedkitDataItem";
