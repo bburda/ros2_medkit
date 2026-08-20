@@ -279,7 +279,8 @@ void SqliteFaultStorage::initialize_schema() {
       debounce_counter INTEGER NOT NULL,
       confirmation_threshold INTEGER NOT NULL,
       severity INTEGER NOT NULL,
-      source_id TEXT NOT NULL
+      source_id TEXT NOT NULL,
+      resulting_status TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_near_misses_fault_code ON near_misses(fault_code, id);
   )";
@@ -288,6 +289,27 @@ void SqliteFaultStorage::initialize_schema() {
     std::string error = err_msg ? err_msg : "Unknown error";
     sqlite3_free(err_msg);
     throw std::runtime_error("Failed to create near_misses table: " + error);
+  }
+
+  // Migration: rows written before resulting_status existed keep their data; the column arrives
+  // empty, which consumers read as "latch state not recorded".
+  {
+    bool has_resulting_status = false;
+    SqliteStatement info(db_, "PRAGMA table_info(near_misses)");
+    while (info.step() == SQLITE_ROW) {
+      if (info.column_text(1) == "resulting_status") {
+        has_resulting_status = true;
+        break;
+      }
+    }
+    if (!has_resulting_status) {
+      if (sqlite3_exec(db_, "ALTER TABLE near_misses ADD COLUMN resulting_status TEXT NOT NULL DEFAULT ''", nullptr,
+                       nullptr, &err_msg) != SQLITE_OK) {
+        std::string error = err_msg ? err_msg : "Unknown error";
+        sqlite3_free(err_msg);
+        throw std::runtime_error("Failed to add resulting_status column: " + error);
+      }
+    }
   }
 
   // Create rosbag_files table. One row = one LINK (a fault claiming a recording):
@@ -788,7 +810,7 @@ bool SqliteFaultStorage::report_fault_event_locked(const std::string & fault_cod
       }
 
       if (is_near_miss(true, new_status)) {
-        record_near_miss_locked(fault_code, timestamp_ns, debounce_counter, config, severity, source_id);
+        record_near_miss_locked(fault_code, timestamp_ns, debounce_counter, config, severity, source_id, new_status);
       }
     } else {
       // PASSED event - increment towards healing, clamped to the thresholds.
@@ -854,7 +876,7 @@ bool SqliteFaultStorage::report_fault_event_locked(const std::string & fault_cod
   }
 
   if (is_near_miss(true, initial_status)) {
-    record_near_miss_locked(fault_code, timestamp_ns, initial_counter, config, severity, source_id);
+    record_near_miss_locked(fault_code, timestamp_ns, initial_counter, config, severity, source_id, initial_status);
   }
 
   return true;  // New fault created
@@ -1304,16 +1326,19 @@ size_t SqliteFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
 
 void SqliteFaultStorage::record_near_miss_locked(const std::string & fault_code, int64_t occurred_at_ns,
                                                  int32_t debounce_counter, const DebounceConfig & config,
-                                                 uint8_t severity, const std::string & source_id) {
+                                                 uint8_t severity, const std::string & source_id,
+                                                 const std::string & resulting_status) {
   SqliteStatement insert_stmt(db_,
                               "INSERT INTO near_misses (fault_code, occurred_at_ns, debounce_counter, "
-                              "confirmation_threshold, severity, source_id) VALUES (?, ?, ?, ?, ?, ?)");
+                              "confirmation_threshold, severity, source_id, resulting_status) "
+                              "VALUES (?, ?, ?, ?, ?, ?, ?)");
   insert_stmt.bind_text(1, fault_code);
   insert_stmt.bind_int64(2, occurred_at_ns);
   insert_stmt.bind_int(3, debounce_counter);
   insert_stmt.bind_int(4, config.confirmation_threshold);
   insert_stmt.bind_int(5, static_cast<int>(severity));
   insert_stmt.bind_text(6, source_id);
+  insert_stmt.bind_text(7, resulting_status);
 
   if (insert_stmt.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to store near miss: ") + sqlite3_errmsg(db_));
@@ -1351,7 +1376,7 @@ std::vector<NearMissRecord> SqliteFaultStorage::get_near_misses(const std::strin
 
   SqliteStatement stmt(db_,
                        "SELECT fault_code, occurred_at_ns, debounce_counter, confirmation_threshold, "
-                       "severity, source_id FROM near_misses WHERE fault_code = ? "
+                       "severity, source_id, resulting_status FROM near_misses WHERE fault_code = ? "
                        "ORDER BY id ASC");
   stmt.bind_text(1, fault_code);
 
@@ -1363,6 +1388,7 @@ std::vector<NearMissRecord> SqliteFaultStorage::get_near_misses(const std::strin
     record.confirmation_threshold = stmt.column_int(3);
     record.severity = static_cast<uint8_t>(stmt.column_int(4));
     record.source_id = stmt.column_text(5);
+    record.resulting_status = stmt.column_text(6);
     result.push_back(std::move(record));
   }
 

@@ -2765,6 +2765,32 @@ TEST(InMemoryNearMissTest, ApplyingBoundReportsHowManyEntriesItDropped) {
   EXPECT_EQ(storage.set_max_near_misses_per_fault(2), 0u);
 }
 
+TEST(InMemoryNearMissTest, EntriesCarryTheResultingStatus) {
+  InMemoryFaultStorage storage;
+  DebounceConfig config = near_miss_config();
+  config.healing_enabled = true;
+  config.healing_threshold = 2;
+
+  storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                             "pressure dipping", "/hydraulics/pump", near_miss_time(0), config);
+  for (int i = 1; i <= 3; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN, "",
+                               "/hydraulics/pump", near_miss_time(i), config);
+  }
+  auto healed = storage.get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(healed.has_value());
+  ASSERT_EQ(healed->status, Fault::STATUS_HEALED) << "test setup: the fault must be latched HEALED";
+
+  storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                             "pressure dipping", "/hydraulics/pump", near_miss_time(4), config);
+
+  auto series = storage.get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 2u);
+  EXPECT_EQ(series[0].resulting_status, Fault::STATUS_PREFAILED);
+  EXPECT_EQ(series[1].resulting_status, Fault::STATUS_HEALED)
+      << "a report under the HEALED latch must not read as a fresh approach";
+}
+
 TEST(InMemoryNearMissTest, EmptyForUnknownFault) {
   InMemoryFaultStorage storage;
   EXPECT_TRUE(storage.get_near_misses("NEVER_REPORTED").empty());

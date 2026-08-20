@@ -142,10 +142,23 @@ to any scoring sense used elsewhere. PASSED reports move the counter too, but in
 direction (the fault receding), so they are not near misses.
 
 The series is **append-only**: one entry per qualifying report, holding the timestamp, the counter
-value after the report, the confirmation threshold it was measured against, the severity and the
-reporting source. Every field describes that one report, so a series spanning a threshold change
+value after the report, the confirmation threshold it was measured against, the severity, the
+reporting source, and the fault status the report left behind. Every field describes that one report, so a series spanning a threshold change
 or a new reporting source stays readable. Nothing is updated in place, so "this code approached
 confirmation five times this hour" stays answerable.
+
+Read `resulting_status` before counting entries. The HEALED latch holds the status the whole way
+from the healing threshold down to the confirmation threshold, so every report on the way back
+into a fault that **does** confirm also moves the counter without confirming, and lands in the
+series. Entries with `PREFAILED` are approaches from a resting state; entries with `HEALED` are a
+counter walking back down under the latch. Without the field the two cannot be told apart, and
+"how often did this code approach confirmation without becoming a fault" is not answerable.
+`resulting_status` is never `CONFIRMED` - that is what makes a report a near miss. It is empty for
+rows written before the field existed.
+
+With per-entity thresholds the recorded `confirmation_threshold` is the one belonging to the
+**reporting source**, while the debounce counter is shared by every source of that fault code. It
+is therefore not by itself the distance to confirmation for the fault as a whole.
 
 Entries are kept and evicted in **arrival order**, not by their timestamps. Reporters carry their
 own clocks, so a report can arrive carrying a timestamp behind one already stored; ordering the

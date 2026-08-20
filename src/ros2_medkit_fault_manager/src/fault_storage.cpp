@@ -500,6 +500,7 @@ void InMemoryFaultStorage::record_near_miss(const FaultState & state, const Debo
   record.confirmation_threshold = config.confirmation_threshold;
   record.severity = severity;
   record.source_id = source_id;
+  record.resulting_status = state.status;
   series.push_back(std::move(record));
 
   // Evict oldest-first: a series frozen at boot says nothing about a trend.

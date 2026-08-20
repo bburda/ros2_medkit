@@ -2245,6 +2245,91 @@ TEST_F(SqliteFaultStorageTest, PassedReportOnUnknownFaultWritesNothing) {
   EXPECT_TRUE(storage_->get_near_misses("NEVER_REPORTED").empty());
 }
 
+TEST_F(SqliteFaultStorageTest, NearMissSeparatesApproachFromRampBackIntoAFault) {
+  // The HEALED latch holds the status all the way down to confirmation, so every FAILED report on
+  // the way back into a fault that DOES confirm looks like an approach. resulting_status is what
+  // tells the two apart afterwards.
+  DebounceConfig config = four_strike_config();
+  config.healing_enabled = true;
+  config.healing_threshold = 2;
+
+  // An approach that recedes: counter moves, nothing is latched.
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(0), config);
+  for (int i = 1; i <= 3; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN, "",
+                                 "/hydraulics/pump", nth_report_time(i), config);
+  }
+  auto healed = storage_->get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(healed.has_value());
+  ASSERT_EQ(healed->status, Fault::STATUS_HEALED) << "test setup: the fault must be latched HEALED";
+
+  // The ramp back down: the latch keeps reporting HEALED until the fault actually confirms.
+  // From the healing threshold (+2) it takes six FAILED reports to reach the confirmation
+  // threshold (-4).
+  for (int i = 4; i <= 9; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+  auto confirmed = storage_->get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(confirmed.has_value());
+  ASSERT_EQ(confirmed->status, Fault::STATUS_CONFIRMED) << "test setup: the ramp must end in a real fault";
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_FALSE(series.empty());
+  EXPECT_EQ(series[0].resulting_status, Fault::STATUS_PREFAILED) << "the first report was a genuine approach";
+
+  size_t approaches = 0;
+  for (const auto & entry : series) {
+    EXPECT_NE(entry.resulting_status, Fault::STATUS_CONFIRMED) << "a confirmed report is not a near miss";
+    if (entry.resulting_status == Fault::STATUS_PREFAILED) {
+      ++approaches;
+    }
+  }
+  EXPECT_EQ(approaches, 1u) << "the ramp into a real fault must not read as an approach that receded";
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissResultingStatusSurvivesReopen) {
+  const auto config = four_strike_config();
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(0), config);
+
+  storage_.reset();
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 1u);
+  EXPECT_EQ(series[0].resulting_status, Fault::STATUS_PREFAILED);
+}
+
+TEST_F(SqliteFaultStorageTest, NearMissResultingStatusColumnAddedToOlderTable) {
+  // A database written by an earlier build of this branch has the table without the column.
+  const auto config = four_strike_config();
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(0), config);
+  storage_.reset();
+
+  {
+    sqlite3 * raw = nullptr;
+    ASSERT_EQ(sqlite3_open(temp_db_path_.string().c_str(), &raw), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(raw, "ALTER TABLE near_misses DROP COLUMN resulting_status", nullptr, nullptr, nullptr),
+              SQLITE_OK);
+    sqlite3_close(raw);
+  }
+
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  auto series = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 1u) << "the migration must keep the rows it already had";
+  EXPECT_TRUE(series[0].resulting_status.empty()) << "an unrecorded latch state reads as empty, not as a status";
+
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(1), config);
+  auto extended = storage_->get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(extended.size(), 2u);
+  EXPECT_EQ(extended[1].resulting_status, Fault::STATUS_PREFAILED);
+}
+
 TEST_F(SqliteFaultStorageTest, NearMissSeriesEmptyForUnknownFault) {
   EXPECT_TRUE(storage_->get_near_misses("NEVER_REPORTED").empty());
 }

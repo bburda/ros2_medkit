@@ -162,11 +162,23 @@ std::string rosbag_recording_id(const std::string & file_path);
 /// long-running appliance keeps the recent series rather than freezing it at boot.
 struct NearMissRecord {
   std::string fault_code;
-  int64_t occurred_at_ns{0};          ///< Timestamp of the report that moved the counter
-  int32_t debounce_counter{0};        ///< Counter value AFTER this report
-  int32_t confirmation_threshold{0};  ///< Counter value that would have confirmed the fault
-  uint8_t severity{0};                ///< Severity carried by the report
-  std::string source_id;              ///< Reporting source
+  int64_t occurred_at_ns{0};    ///< Timestamp of the report that moved the counter
+  int32_t debounce_counter{0};  ///< Counter value AFTER this report
+
+  /// Confirmation threshold the report was evaluated against. With per-entity overrides this is
+  /// the threshold of the REPORTING SOURCE, while the counter is shared by every source of the
+  /// code, so it is not by itself the distance to confirmation for the fault as a whole.
+  int32_t confirmation_threshold{0};
+
+  uint8_t severity{0};    ///< Severity carried by the report
+  std::string source_id;  ///< Reporting source
+
+  /// Fault status after the report was applied. Never CONFIRMED - that is what makes the report a
+  /// near miss. It separates a counter climbing from a resting state (PREFAILED) from one walking
+  /// back down under the HEALED latch, which is on its way to a fault that does confirm. Without
+  /// it the two are indistinguishable and the series cannot answer how often the code approached
+  /// confirmation WITHOUT becoming a fault.
+  std::string resulting_status;
 };
 
 /// One row = one LINK: a fault claiming a recording. Several faults of a burst link to

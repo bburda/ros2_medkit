@@ -148,8 +148,10 @@ class SqliteFaultStorage : public FaultStorage {
   /// @param config Debounce config the report was evaluated against
   /// @param severity Severity carried by the report
   /// @param source_id Reporting source
+  /// @param resulting_status Fault status after the report was applied
   void record_near_miss_locked(const std::string & fault_code, int64_t occurred_at_ns, int32_t debounce_counter,
-                               const DebounceConfig & config, uint8_t severity, const std::string & source_id);
+                               const DebounceConfig & config, uint8_t severity, const std::string & source_id,
+                               const std::string & resulting_status);
 
   /// Run a plain SQL statement or throw with the SQLite error. Caller holds mutex_.
   void exec_or_throw(const char * sql);
