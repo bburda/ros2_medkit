@@ -746,6 +746,28 @@ before. This applies to ``GET`` and ``PUT`` of a single ``/data`` item, to
 ``POST`` of an ``/operations`` execution, and to ``GET``, ``PUT`` and
 ``DELETE`` of a single ``/configurations`` item.
 
+**An id needs no member half to reach its owner.** A ``/data`` item one member
+provides keeps its bare id - qualification follows ambiguity, not aggregation -
+so the bare topic path is the id the collection hands back, and it is dispatched
+by the member the tree records as providing that topic:
+
+.. code-block:: text
+
+   GET /api/v1/functions/vehicle_health/data/chassis%2Fbrakes%2Fpressure
+
+is answered, when every member providing ``/chassis/brakes/pressure`` belongs to
+one peer, by
+
+.. code-block:: text
+
+   GET /api/v1/apps/pressure_sensor/data/chassis/brakes/pressure
+
+on that peer. A topic a member this gateway runs provides is sampled here,
+unchanged; a topic whose providers are spread across gateways names no single
+place, and the local graph answers it as before. ``/operations`` resolves a bare
+id the same way - the operation is resolved first, and the member owning its ROS
+path is where the execution is sent.
+
 ``/configurations`` keeps its own id scheme, ``<app_id>:<param_name>``, and the
 member half is the app id. Because nothing on the owning gateway is aggregating,
 the parameter is addressed there by its bare name:

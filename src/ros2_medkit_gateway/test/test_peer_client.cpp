@@ -15,8 +15,10 @@
 #include <gtest/gtest.h>
 #include <httplib.h>
 
+#include <algorithm>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <vector>
 
 #include "ros2_medkit_gateway/core/aggregation/entity_merger.hpp"
 #include "ros2_medkit_gateway/core/aggregation/peer_client.hpp"
@@ -1232,4 +1234,146 @@ TEST(PeerClientAvailability, a_504_that_is_not_a_statement_about_an_entity_still
   PeerClient client(running.url(), "peer_b", 5000);
   auto result = client.fetch_entities();
   EXPECT_FALSE(result.has_value()) << "a gateway timeout was read as a statement that an entity is unreachable";
+}
+
+// =============================================================================
+// A peer's topics
+//
+// An App's topics are discovered from the ROS graph, never declared, so what the
+// peer reports on its own data route is the only record of them this gateway can
+// have. Without it nothing here maps a peer's topic to the member that owns it,
+// and the id a single-provider topic is listed under - the bare path - is
+// unroutable.
+// =============================================================================
+
+TEST(PeerClientTopics, a_peers_topics_are_read_into_the_merged_app) {
+  httplib::Server svr;
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"nav","name":"Navigation"}]})", "application/json");
+  });
+  svr.Get("/api/v1/apps/nav/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/apps/nav/data", [](const httplib::Request & req, httplib::Response & res) {
+    // The peer must not re-ask ITS peers, or a bidirectionally peered pair bounces.
+    EXPECT_EQ(req.get_header_value("X-Medkit-No-Fan-Out"), "1");
+    res.set_content(
+        R"({"items":[
+          {"id":"/nav/pose","name":"/nav/pose","x-medkit":{"ros2":{"topic":"/nav/pose","direction":"publish"}}},
+          {"id":"/nav/goal","name":"/nav/goal","x-medkit":{"ros2":{"topic":"/nav/goal","direction":"subscribe"}}},
+          {"id":"/nav/odom","name":"/nav/odom","x-medkit":{"ros2":{"topic":"/nav/odom","direction":"both"}}}
+        ]})",
+        "application/json");
+  });
+  svr.Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << result.error();
+
+  ASSERT_EQ(result->apps.size(), 1u);
+  const auto & app = result->apps[0];
+  EXPECT_EQ(app.topics.publishes, (std::vector<std::string>{"/nav/pose", "/nav/odom"}));
+  EXPECT_EQ(app.topics.subscribes, (std::vector<std::string>{"/nav/goal", "/nav/odom"}));
+}
+
+TEST(PeerClientTopics, an_item_that_does_not_describe_a_topic_is_not_recorded_as_one) {
+  httplib::Server svr;
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"plc","name":"PLC bridge"}]})", "application/json");
+  });
+  svr.Get("/api/v1/apps/plc/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  // A plugin's data point carries no ROS metadata at all, and a topic with no
+  // direction says nothing about which side the App is on. Recorded anyway, each
+  // would attribute a topic to a member that may not have it, and a bare id
+  // built on that attribution is dispatched to the wrong gateway.
+  svr.Get("/api/v1/apps/plc/data", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(
+        R"({"items":[
+          {"id":"tank_level","name":"tank_level","category":"currentData"},
+          {"id":"valve","name":"valve","x-medkit":{"source":"opcua"}},
+          {"id":"pump","name":"pump","x-medkit":{"ros2":{"type":"std_msgs/msg/Float32"}}},
+          {"id":"/plc/raw","name":"/plc/raw","x-medkit":{"ros2":{"topic":"/plc/raw"}}},
+          {"id":"/plc/aux","name":"/plc/aux","x-medkit":{"ros2":{"topic":"/plc/aux","direction":"sideways"}}}
+        ]})",
+        "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << result.error();
+
+  ASSERT_EQ(result->apps.size(), 1u);
+  EXPECT_TRUE(result->apps[0].topics.publishes.empty())
+      << "an item that names no ROS topic was recorded as a published one";
+  EXPECT_TRUE(result->apps[0].topics.subscribes.empty())
+      << "an item that names no ROS topic was recorded as a subscribed one";
+}
+
+TEST(PeerClientTopics, a_peer_without_the_data_route_still_describes_its_apps) {
+  httplib::Server svr;
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"nav","name":"Navigation"}]})", "application/json");
+  });
+  // A gateway old enough not to serve the data route answers 404. Aggregation
+  // works across that version boundary: the App is described by everything else
+  // the peer does offer, and the missing route is reported rather than fatal.
+  svr.Get("/api/v1/apps/nav/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"name":"calibrate","x-medkit":{"ros2":{"service":"/nav/calibrate"}}}]})",
+                    "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << "an absent data route discarded the peer's picture: " << result.error();
+
+  ASSERT_EQ(result->apps.size(), 1u);
+  EXPECT_EQ(result->apps[0].services.size(), 1u) << "the operations route was skipped along with the data route";
+  EXPECT_TRUE(result->apps[0].topics.publishes.empty());
+  EXPECT_NE(std::find(result->absent_routes.begin(), result->absent_routes.end(), "/apps/{id}/data"),
+            result->absent_routes.end())
+      << "the missing route was not reported";
+}
+
+TEST(PeerClientTopics, a_data_route_that_says_not_responding_does_not_abort_the_fetch) {
+  httplib::Server svr;
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"app-quiet","name":"app-quiet","x-medkit":{"available":false}}]})",
+                    "application/json");
+  });
+  svr.Get("/api/v1/apps/app-quiet/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(not_responding_body("app-quiet"), "application/json");
+  });
+  // Every route of a retained member answers 504 not-responding, the data route
+  // included. Read as a failed request it would discard the peer's whole picture.
+  svr.Get("/api/v1/apps/app-quiet/data", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(not_responding_body("app-quiet"), "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << "one unreachable member discarded the peer's whole picture: " << result.error();
+
+  ASSERT_EQ(result->apps.size(), 1u);
+  EXPECT_FALSE(result->apps[0].available);
+  EXPECT_TRUE(result->apps[0].topics.publishes.empty());
 }

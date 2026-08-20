@@ -18,7 +18,6 @@
 #include <cctype>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -607,19 +606,9 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
   // the same member for both.
   const std::unordered_set<std::string> path_addressed = http::operation_paths_addressed_by_path(ops);
 
-  const auto contributed_by_peer = [&cache](const std::string & member_id) {
-    static constexpr std::string_view kPeerPrefix = "peer:";
-    if (auto app = cache.get_app(member_id)) {
-      return app->source.rfind(kPeerPrefix, 0) == 0;
-    }
-    if (auto component = cache.get_component(member_id)) {
-      return component->source.rfind(kPeerPrefix, 0) == 0;
-    }
-    return false;
-  };
-  const auto owner_is_remote = [&ops, &contributed_by_peer](const std::string & full_path) {
+  const auto owner_is_remote = [&ops, &cache](const std::string & full_path) {
     auto owner = ops.owner_by_path.find(full_path);
-    return owner != ops.owner_by_path.end() && contributed_by_peer(owner->second);
+    return owner != ops.owner_by_path.end() && member_is_peer_contributed(cache, owner->second);
   };
 
   // The ROS path an item names, in the form an id carries it. Empty when the
