@@ -21,6 +21,7 @@
 #include <cinttypes>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <sstream>
 
@@ -1076,10 +1077,14 @@ void FaultManagerNode::handle_get_fault(const std::shared_ptr<ros2_medkit_msgs::
     response->environment_data.snapshots.push_back(snapshot);
   }
 
-  // Per-topic snapshots are deleted on clear_fault, but the compact freeze-frame row is
-  // retained. When no snapshots remain, serve the retained frame so the confirmed-state
-  // record stays observable after acknowledgement.
-  if (stored_snapshots.empty()) {
+  // Per-topic snapshots are deleted on clear_fault unless snapshots.retain_on_clear is set, but
+  // the compact freeze-frame row is retained either way. When no snapshots remain, serve the
+  // retained frame so the confirmed-state record stays observable after acknowledgement.
+  //
+  // With retention on, snapshots never run out, so "none left" would never fire and the frame -
+  // which is the state at the MOST RECENT confirmation - would stay hidden behind snapshots of
+  // earlier occurrences. Serve it in that case too.
+  if (stored_snapshots.empty() || storage_->retains_snapshots_on_clear()) {
     auto frame = storage_->get_freeze_frame(request->fault_code);
     if (frame) {
       ros2_medkit_msgs::msg::Snapshot snapshot;
@@ -1405,9 +1410,20 @@ void FaultManagerNode::handle_get_snapshots(
     result["captured_at"] = static_cast<double>(latest_captured_at) / 1e9;
   }
 
-  // Build topics object
+  // Build topics object. One topic can carry several snapshots - re-confirmations within a cycle,
+  // and every earlier occurrence once snapshots.retain_on_clear keeps them - and only one of them
+  // fits the topic's key. Keep the newest, tracked explicitly: the backends return these in
+  // opposite orders, so relying on the last write to win serves the oldest value from SQLite and
+  // the newest from memory, both under the latest captured_at.
   nlohmann::json topics_json = nlohmann::json::object();
+  std::map<std::string, int64_t> newest_per_topic;
   for (const auto & snapshot : snapshots) {
+    auto seen = newest_per_topic.find(snapshot.topic);
+    if (seen != newest_per_topic.end() && seen->second >= snapshot.captured_at_ns) {
+      continue;
+    }
+    newest_per_topic[snapshot.topic] = snapshot.captured_at_ns;
+
     nlohmann::json topic_entry;
     topic_entry["message_type"] = snapshot.message_type;
 

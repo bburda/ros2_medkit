@@ -38,6 +38,7 @@
 #include "ros2_medkit_msgs/msg/snapshot.hpp"
 #include "ros2_medkit_msgs/srv/clear_fault.hpp"
 #include "ros2_medkit_msgs/srv/get_fault.hpp"
+#include "ros2_medkit_msgs/srv/get_snapshots.hpp"
 #include "ros2_medkit_msgs/srv/list_faults_for_entity.hpp"
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
 
@@ -2856,6 +2857,136 @@ TEST(StorageBackendParityTest, MixedEntityThresholdsProduceTheSameSeries) {
 TEST(InMemoryNearMissTest, EmptyForUnknownFault) {
   InMemoryFaultStorage storage;
   EXPECT_TRUE(storage.get_near_misses("NEVER_REPORTED").empty());
+}
+
+// --- Snapshot read path with retention enabled ---
+//
+// Driven through the real services, because both defects are in how the node builds the response,
+// not in what storage returns.
+
+class SnapshotReadPathTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    const auto suffix = std::to_string(dist(gen));
+    db_path_ = std::filesystem::temp_directory_path() / ("test_snapshot_read_" + suffix + ".db");
+    const std::string ns = "/test_snapshot_read_" + suffix;
+
+    rclcpp::NodeOptions fm_options;
+    fm_options.parameter_overrides({
+        {"storage_type", "sqlite"},
+        {"database_path", db_path_.string()},
+        {"snapshots.retain_on_clear", true},
+        {"snapshots.enabled", false},
+    });
+    fm_options.arguments({"--ros-args", "-r", "__ns:=" + ns});
+    fault_manager_ = std::make_shared<FaultManagerNode>(fm_options);
+
+    rclcpp::NodeOptions test_options;
+    test_options.arguments({"--ros-args", "-r", "__ns:=" + ns});
+    test_node_ = std::make_shared<rclcpp::Node>("test_snapshot_reader", test_options);
+
+    get_snapshots_client_ =
+        test_node_->create_client<ros2_medkit_msgs::srv::GetSnapshots>(ns + "/fault_manager/get_snapshots");
+    get_fault_client_ = test_node_->create_client<GetFault>(ns + "/fault_manager/get_fault");
+    ASSERT_TRUE(get_snapshots_client_->wait_for_service(std::chrono::seconds(5)));
+    ASSERT_TRUE(get_fault_client_->wait_for_service(std::chrono::seconds(5)));
+  }
+
+  void TearDown() override {
+    get_snapshots_client_.reset();
+    get_fault_client_.reset();
+    test_node_.reset();
+    fault_manager_.reset();
+    std::filesystem::remove(db_path_);
+    std::filesystem::remove(db_path_.string() + "-wal");
+    std::filesystem::remove(db_path_.string() + "-shm");
+  }
+
+  /// Spin both nodes until @p future resolves, or fail.
+  template <typename FutureT>
+  bool spin_until_ready(FutureT & future, std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < timeout) {
+      rclcpp::spin_some(fault_manager_);
+      rclcpp::spin_some(test_node_);
+      if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+  }
+
+  void store_snapshot(const std::string & fault_code, const std::string & topic, const std::string & data,
+                      int64_t captured_at_ns) {
+    ros2_medkit_fault_manager::SnapshotData snapshot;
+    snapshot.fault_code = fault_code;
+    snapshot.topic = topic;
+    snapshot.message_type = "std_msgs/msg/String";
+    snapshot.data = data;
+    snapshot.captured_at_ns = captured_at_ns;
+    fault_manager_->get_storage_for_test().store_snapshot(snapshot);
+  }
+
+  std::filesystem::path db_path_;
+  std::shared_ptr<FaultManagerNode> fault_manager_;
+  std::shared_ptr<rclcpp::Node> test_node_;
+  rclcpp::Client<ros2_medkit_msgs::srv::GetSnapshots>::SharedPtr get_snapshots_client_;
+  rclcpp::Client<GetFault>::SharedPtr get_fault_client_;
+};
+
+TEST_F(SnapshotReadPathTest, NewestSnapshotOfATopicWins) {
+  auto & storage = fault_manager_->get_storage_for_test();
+  storage.report_fault_event("PLC_PRESSURE_HIGH", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR,
+                             "pressure high", "/plc", rclcpp::Time(1000), DebounceConfig{});
+  store_snapshot("PLC_PRESSURE_HIGH", "/plc/pressure", R"({"data":"old"})", 1000);
+  store_snapshot("PLC_PRESSURE_HIGH", "/plc/pressure", R"({"data":"new"})", 5000);
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::GetSnapshots::Request>();
+  request->fault_code = "PLC_PRESSURE_HIGH";
+  auto future = get_snapshots_client_->async_send_request(request);
+  ASSERT_TRUE(spin_until_ready(future));
+
+  auto response = future.get();
+  ASSERT_TRUE(response->success);
+  const auto payload = nlohmann::json::parse(response->data);
+  ASSERT_TRUE(payload.contains("topics"));
+  ASSERT_TRUE(payload["topics"].contains("/plc/pressure"));
+  EXPECT_EQ(payload["topics"]["/plc/pressure"]["data"]["data"], "new")
+      << "captured_at reports the newest snapshot, so the data under it must be the newest too";
+}
+
+TEST_F(SnapshotReadPathTest, FreezeFrameStaysVisibleBehindRetainedSnapshots) {
+  auto & storage = fault_manager_->get_storage_for_test();
+  storage.report_fault_event("PLC_PRESSURE_HIGH", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR,
+                             "pressure high", "/plc", rclcpp::Time(1000), DebounceConfig{});
+  store_snapshot("PLC_PRESSURE_HIGH", "/plc/pressure", R"({"data":"from an earlier occurrence"})", 1000);
+
+  ros2_medkit_fault_manager::FreezeFrameData frame;
+  frame.fault_code = "PLC_PRESSURE_HIGH";
+  frame.data = R"({"/plc/pressure":{"data":"latest confirmation"}})";
+  frame.captured_at_ns = 9000;
+  storage.store_freeze_frame(frame);
+
+  auto request = std::make_shared<GetFault::Request>();
+  request->fault_code = "PLC_PRESSURE_HIGH";
+  auto future = get_fault_client_->async_send_request(request);
+  ASSERT_TRUE(spin_until_ready(future));
+
+  auto response = future.get();
+  ASSERT_TRUE(response->success);
+
+  bool frame_served = false;
+  for (const auto & snapshot : response->environment_data.snapshots) {
+    if (snapshot.name == "freeze_frame") {
+      frame_served = true;
+      EXPECT_EQ(snapshot.data, frame.data);
+    }
+  }
+  EXPECT_TRUE(frame_served) << "retained snapshots must not hide the most recent freeze-frame";
 }
 
 int main(int argc, char ** argv) {
