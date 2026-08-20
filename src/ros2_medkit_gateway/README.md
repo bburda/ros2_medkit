@@ -348,7 +348,23 @@ PUT /api/v1/apps/peer_calibration/configurations/calibration_offset
 and the write lands on the ROS node that declares the parameter. The
 `GET /{entity}/configurations` listing is unchanged - peer parameters reach it
 through the collection fan-out, and the ids it offers are the ids the
-single-item routes accept. Reachability is settled first, so a
+single-item routes accept.
+
+The member half is recognised when the text before the first colon names a
+member of the addressed entity. How many ROS nodes this gateway resolves for the
+entity does not enter into it: a member another gateway runs reports no ROS
+binding here, so an entity whose members are all peer-owned resolves none and an
+entity running one node of its own can still have peer-owned members beside it.
+Both take the same id form as an entity with several local nodes, and neither
+changes the ids the listing offers. A prefix naming no member is part of the
+parameter name.
+
+`DELETE /{entity}/configurations` resets the nodes this gateway runs, so a
+member another gateway runs is not reset by it. That is reported rather than
+implied: `207` instead of `204`, with the member named and the gateway that owns
+it named with it.
+
+Reachability is settled first, so a
 member whose gateway has gone silent answers `504 not-responding` instead of a
 `502` from a connection that could not be made. `X-Medkit-No-Fan-Out` bounds the
 collection fan-out and does not change where a member-qualified request is
@@ -392,7 +408,10 @@ health are separate questions.
 
 `/configurations` predates this rule and keeps its own: on a multi-node entity
 every parameter id is `<app_id>:<param_name>`, a bare id is refused on write,
-and items carry `x-medkit.source` rather than `member_ids`.
+and items carry `x-medkit.source` rather than `member_ids`. The node count
+decides which ids the listing offers; which ids it accepts is decided by the
+member set, so the qualified form works on an entity whose members are all
+peer-owned too.
 
 ### Component Data Read Endpoints
 

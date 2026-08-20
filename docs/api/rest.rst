@@ -724,6 +724,18 @@ declares the parameter. ``GET /{entity}/configurations`` is unaffected: peer
 parameters reach that listing through the collection fan-out, and the ids it
 offers are the ids the single-item routes accept.
 
+A member half is recognised when the text before the first colon names a member
+of the addressed entity. How many ROS nodes this gateway resolves for that
+entity does not enter into it, because a member another gateway runs reports no
+ROS binding here and so resolves none: an aggregating entity whose members are
+all peer-owned resolves nothing at all, and one that resolves a single local
+node can still have peer-owned members beside it. Both take
+``<app_id>:<param_name>`` exactly as an entity with several local nodes does.
+
+A prefix naming no member is part of the parameter name, which is what keeps a
+parameter whose own name contains a colon addressable, and an entity's own id is
+never read as a member half of itself.
+
 Reachability is decided before anything is forwarded. A member retained while
 its gateway is silent answers ``504 not-responding`` naming the member (see
 :ref:`retained-entities`) rather than a ``502`` from a connection that could not
@@ -772,8 +784,10 @@ separate questions and are reported separately.
    ``/configurations`` predates this rule and keeps its own: on an entity whose
    parameters come from more than one node, **every** parameter id is
    ``<app_id>:<param_name>``, and a bare id is refused on write. Its items carry
-   ``x-medkit.source`` (a single app id), not ``member_ids``. See
-   :ref:`configuration-endpoints`.
+   ``x-medkit.source`` (a single app id), not ``member_ids``. The node count
+   decides which ids the listing OFFERS; which ids it ACCEPTS is decided by the
+   member set, so the qualified form works on an entity whose members are all
+   peer-owned too. See :ref:`configuration-endpoints`.
 
 Data Endpoints
 --------------
@@ -1095,7 +1109,10 @@ Manage ROS 2 node parameters.
    The ``<app_id>`` half is a member id, so ``GET``, ``PUT`` and ``DELETE`` of a
    qualified id are served by the gateway that owns that app, on its own
    ``/apps/{app_id}/configurations/{param_name}`` route. See
-   :ref:`member-qualified-ids` for the dispatch and its ``504`` case.
+   :ref:`member-qualified-ids` for the dispatch and its ``504`` case. The
+   qualified form is accepted on any entity that has the named member, including
+   one whose members are all peer-owned and one that runs a single node of its
+   own - the ids the listing offers are unchanged in either case.
 
 ``GET /api/v1/components/{id}/configurations``
    List all parameters for an entity.
@@ -1147,6 +1164,39 @@ Manage ROS 2 node parameters.
 
 ``DELETE /api/v1/components/{id}/configurations``
    Reset all parameters to default values.
+
+   - **204:** every member of the entity was reset
+   - **207:** some were not, and the body names each one
+
+   This gateway resets a parameter by calling the parameter service on its own
+   ROS graph, so a member another gateway runs is not reset by this request. Such
+   a member is listed in the ``207`` body with ``success: false`` and an error
+   naming the gateway that owns it, so a caller is never told a reset covered
+   parameters it did not reach. Reset it on that gateway, through the member's
+   own ``/apps/{app_id}/configurations`` route.
+
+   .. code-block:: json
+
+      {
+        "entity_id": "vehicle_health",
+        "results": [
+          {
+            "node": "/powertrain/engine/calibration",
+            "app_id": "primary_calibration",
+            "success": true,
+            "details": {"reset_count": 2, "failed_count": 0}
+          },
+          {
+            "app_id": "peer_calibration",
+            "success": false,
+            "error": "Not reset here: 'peer_calibration' is owned by gateway 'secondary_gateway'. Reset it on that gateway, through its own /apps/peer_calibration/configurations route."
+          }
+        ]
+      }
+
+   ``details`` carries the per-parameter outcome of the nodes this gateway did
+   reset, including on an entry that failed - a partial reset names the
+   parameters it could not restore.
 
 Resource Locking
 ----------------
