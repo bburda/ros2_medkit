@@ -281,6 +281,7 @@ if(BUILD_TESTING)
   set(_MEDKIT_TEST_TIMEOUT_OVERRIDES
     test_rosbag_boundary_download 180
     test_rosbag_history_download 180
+    test_grouping_entity_aggregation 300
     test_graph_provider_greenwave 300
     test_graph_provider_stale 300
     test_graph_provider_sse 300)
