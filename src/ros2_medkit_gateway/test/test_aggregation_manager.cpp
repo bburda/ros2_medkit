@@ -735,6 +735,10 @@ class MockPeerServer {
     thread_ = std::thread([this]() {
       server_->listen_after_bind();
     });
+    // stop() only interrupts a server that is already listening. Returning
+    // before that leaves a teardown able to run first, and the listen then
+    // never ends.
+    server_->wait_until_ready();
     return port_;
   }
 

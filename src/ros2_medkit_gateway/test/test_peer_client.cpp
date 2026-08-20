@@ -148,6 +148,8 @@ TEST(PeerClientHappyPath, health_check_marks_healthy) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   EXPECT_FALSE(client.is_healthy());
@@ -170,6 +172,8 @@ TEST(PeerClientHappyPath, health_check_unhealthy_on_500) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   client.check_health();
@@ -203,6 +207,8 @@ TEST(PeerClientHappyPath, fetch_entities_parses_collections) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   auto result = client.fetch_entities();
@@ -312,6 +318,8 @@ TEST(PeerClientHappyPath, fetch_entities_parses_relationship_fields) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_ecu", 5000);
   auto result = client.fetch_entities();
@@ -393,6 +401,8 @@ TEST(PeerClientHappyPath, fetch_entities_parses_is_located_on_without_vendor_ext
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_sovd", 5000);
   auto result = client.fetch_entities();
@@ -451,6 +461,8 @@ TEST(PeerClientHappyPath, fetch_entities_rejects_malicious_component_id_in_locat
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_hostile", 5000);
   auto result = client.fetch_entities();
@@ -501,6 +513,8 @@ TEST(PeerClientHappyPath, fetch_entities_parses_vendor_only_component_id_fallbac
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_vendor", 5000);
   auto result = client.fetch_entities();
@@ -531,6 +545,8 @@ TEST(PeerClientHappyPath, forward_request_proxies_response_with_auth) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   // forward_auth=true: Authorization header should be forwarded
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000, true);
@@ -566,6 +582,8 @@ TEST(PeerClientHappyPath, forward_request_does_not_forward_auth_by_default) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   // forward_auth=false (default): Authorization header should NOT be forwarded
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
@@ -603,6 +621,8 @@ TEST(PeerClientHappyPath, forward_filters_response_headers) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
 
@@ -640,6 +660,8 @@ TEST(PeerClientHappyPath, forward_and_get_json_returns_parsed_json) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   auto result = client.forward_and_get_json("GET", "/api/v1/components/ecu/data");
@@ -667,6 +689,8 @@ TEST(PeerClientHappyPath, forward_and_get_json_with_auth_header_when_enabled) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   // forward_auth=true: auth header should be sent
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000, true);
@@ -692,6 +716,8 @@ TEST(PeerClientHappyPath, forward_and_get_json_does_not_forward_auth_by_default)
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   // forward_auth=false (default): auth header should NOT be sent
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
@@ -715,6 +741,8 @@ TEST(PeerClientHappyPath, forward_and_get_json_error_on_non_2xx) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   auto result = client.forward_and_get_json("GET", "/api/v1/missing");
@@ -742,6 +770,8 @@ TEST(PeerClientHappyPath, forward_request_rejects_oversized_response) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "big_peer", 10000);
 
@@ -779,6 +809,8 @@ TEST(PeerClientHappyPath, forward_and_get_json_rejects_oversized_response) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "big_peer", 10000);
   auto result = client.forward_and_get_json("GET", "/api/v1/components/big/data");
@@ -805,6 +837,8 @@ TEST(PeerClientHappyPath, forward_post_request) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
 
@@ -879,6 +913,8 @@ TEST(PeerClientHappyPath, fetch_entities_skips_entities_with_invalid_ids) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "malicious_peer", 5000);
   auto result = client.fetch_entities();
@@ -917,6 +953,8 @@ TEST(PeerClientHappyPath, fetch_entities_rejects_collection_exceeding_limit) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "oversized_peer", 5000);
   auto result = client.fetch_entities();
@@ -972,6 +1010,8 @@ TEST(PeerClientHappyPath, asset_identity_survives_fetch_and_merge) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_plc", 5000);
   auto result = client.fetch_entities();
@@ -1055,6 +1095,8 @@ class ScopedServer {
     thread_ = std::thread([this]() {
       svr_.listen_after_bind();
     });
+    // stop() only interrupts a server that is already listening.
+    svr_.wait_until_ready();
   }
 
   ~ScopedServer() {

@@ -394,7 +394,9 @@ class LocalHttpServer {
     thread_ = std::thread([&server]() {
       server.listen_after_bind();
     });
-    std::this_thread::sleep_for(50ms);
+    // stop() only interrupts a server that is already listening, so a teardown
+    // that runs first would leave the listen with nothing to end it.
+    server.wait_until_ready();
   }
 
   void stop() {
