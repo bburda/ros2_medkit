@@ -185,6 +185,19 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
     max_snapshots = 0;
   }
 
+  // Near-miss retention. The series is what any later look at "how often did this code approach
+  // confirmation" reads, so it is bounded rather than unlimited by default: an appliance runs for
+  // weeks and the rows are cheap but not free. 0 means unlimited and lets the file grow with the
+  // reporting rate. declare_parameter<int64_t> deliberately: <int> narrows silently, and a
+  // negative value cast to size_t becomes SIZE_MAX, which would remove the bound entirely.
+  constexpr int64_t kDefaultMaxNearMissesPerFault = 200;
+  auto max_near_misses = declare_parameter<int64_t>("near_miss.max_per_fault", kDefaultMaxNearMissesPerFault);
+  if (max_near_misses < 0) {
+    RCLCPP_WARN(get_logger(), "near_miss.max_per_fault must be >= 0, got %ld. Using default %ld.", max_near_misses,
+                kDefaultMaxNearMissesPerFault);
+    max_near_misses = kDefaultMaxNearMissesPerFault;
+  }
+
   // Create storage backend
   storage_ = create_storage();
 
@@ -198,6 +211,9 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   // Independent of the cap: max_per_fault 0 means unlimited, and retention across
   // acknowledgement is a separate question from how many sets are kept.
   storage_->set_retain_snapshots_on_clear(retain_snapshots_on_clear);
+
+  // Apply near-miss retention bound to storage (0 = unlimited)
+  storage_->set_max_near_misses_per_fault(static_cast<size_t>(max_near_misses));
 
   // Create event publisher for SSE streaming
   event_publisher_ = create_publisher<ros2_medkit_msgs::msg::FaultEvent>("~/events", rclcpp::QoS(100).reliable());

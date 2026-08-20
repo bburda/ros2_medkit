@@ -52,6 +52,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 - **Persistent storage**: SQLite backend ensures faults survive node restarts
 - **Debounce filtering** (optional): AUTOSAR DEM-style counter-based fault confirmation with per-entity threshold overrides
 - **Snapshot capture**: Captures topic data when faults are confirmed for debugging (snapshots are deleted when fault is cleared)
+- **Near-miss series**: Appends one entry per FAILED report that moved the debounce counter without confirming, bounded per fault code and retained when the fault is cleared
 - **Freeze-frame retention**: One compact JSON freeze-frame per fault code, retained across `clear_fault` (see below)
 - **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear
 - **Tamper-evident audit log** (optional): Append-only, hash-chained record of fault state transitions for verifiable history
@@ -67,6 +68,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 | `healing_threshold` | int | `3` | Counter value at which faults are healed |
 | `auto_confirm_after_sec` | double | `0.0` | Auto-confirm PREFAILED faults after timeout (0 = disabled) |
 | `entity_thresholds.config_file` | string | `""` | Path to YAML file with per-entity debounce threshold overrides |
+| `near_miss.max_per_fault` | int | `200` | Near-miss entries retained per fault code, oldest evicted first (0 = unlimited) |
 
 ### Snapshot Parameters
 
@@ -131,6 +133,33 @@ format used by black-box capture (`snapshots.rosbag.format`, see Rosbag Capture 
 **SQLite (default)**: Faults are persisted to disk and survive node restarts. Uses WAL mode for optimal performance.
 
 **Memory**: Faults are stored in memory only. Useful for testing or when persistence is not required.
+
+## Near-Miss Series
+
+A **near miss** is a FAILED report that moved the debounce counter without the fault ending up
+CONFIRMED - the fault nearly happened. This is the debounce sense of the term and is unrelated
+to any scoring sense used elsewhere. PASSED reports move the counter too, but in the healing
+direction (the fault receding), so they are not near misses.
+
+The series is **append-only**: one entry per qualifying report, holding the timestamp, the counter
+value after the report, the confirmation threshold it was measured against, the severity and the
+reporting source. Nothing is updated in place, so "this code approached confirmation five times
+this hour" stays answerable.
+
+It is **retained across `~/clear_fault`**. Clearing acknowledges one fault cycle; how often a code
+approaches confirmation spans cycles, and once deleted it cannot be reconstructed. The same holds
+for the startup reclassification of HEALED faults. Per-topic snapshots are still dropped on clear -
+they belong to the one confirmed occurrence, not to the series.
+
+Retention is **bounded per fault code** by `near_miss.max_per_fault` (default 200), evicting the
+**oldest** entries first. That is deliberately the opposite of the snapshot limit's keep-earliest
+rule: a series frozen at boot says nothing about whether the rate is changing. Set it to 0 for
+unlimited, accepting that the database then grows with the reporting rate.
+
+The series lives in the `near_misses` table of the fault database and is read through the storage
+API (`FaultStorage::get_near_misses`). A database written by an earlier build gains the table on
+first open. **There is no service or REST surface for it yet** - reading it means going through the
+storage API or the database file.
 
 ## Advanced: Tamper-Evident Audit Log
 

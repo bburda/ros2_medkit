@@ -946,6 +946,72 @@ TEST(FaultManagerNodeParameterTest, ClampsInvalidCaptureParams) {
   EXPECT_EQ(node->capture_queue_full_policy_for_test(), ros2_medkit_fault_manager::QueueFullPolicy::kRejectNewest);
 }
 
+/// Drive @p count FAILED reports that move the debounce counter without confirming.
+/// The threshold sits far below any count used here, so no report in the run confirms the fault.
+static void drive_near_misses(ros2_medkit_fault_manager::FaultStorage & storage, int count) {
+  DebounceConfig config;
+  config.confirmation_threshold = -1000;
+  config.critical_immediate_confirm = false;
+  constexpr int64_t kBaseNs = 1700000000000000000LL;
+
+  for (int i = 0; i < count; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump",
+                               rclcpp::Time(kBaseNs + static_cast<int64_t>(i) * 1000000LL), config);
+  }
+}
+
+TEST(FaultManagerNodeParameterTest, AppliesNearMissRetentionBound) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+      {"storage_type", "memory"},
+      {"near_miss.max_per_fault", 4},
+  });
+  auto node = std::make_shared<FaultManagerNode>(options);
+
+  drive_near_misses(node->get_storage_for_test(), 10);
+
+  EXPECT_EQ(node->get_storage().get_near_misses("PUMP_PRESSURE_LOW").size(), 4u);
+}
+
+TEST(FaultManagerNodeParameterTest, NearMissRetentionDefaultsToBounded) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({{"storage_type", "memory"}});
+  auto node = std::make_shared<FaultManagerNode>(options);
+
+  drive_near_misses(node->get_storage_for_test(), 205);
+
+  // The documented default is 200 per fault code, and it must be in force without configuration.
+  EXPECT_EQ(node->get_storage().get_near_misses("PUMP_PRESSURE_LOW").size(), 200u);
+}
+
+TEST(FaultManagerNodeParameterTest, NegativeNearMissBoundFallsBackToDefault) {
+  // A negative value cast straight to size_t becomes SIZE_MAX, silently removing the bound.
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+      {"storage_type", "memory"},
+      {"near_miss.max_per_fault", -5},
+  });
+  auto node = std::make_shared<FaultManagerNode>(options);
+
+  drive_near_misses(node->get_storage_for_test(), 205);
+
+  EXPECT_EQ(node->get_storage().get_near_misses("PUMP_PRESSURE_LOW").size(), 200u);
+}
+
+TEST(FaultManagerNodeParameterTest, ZeroNearMissBoundIsUnlimited) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+      {"storage_type", "memory"},
+      {"near_miss.max_per_fault", 0},
+  });
+  auto node = std::make_shared<FaultManagerNode>(options);
+
+  drive_near_misses(node->get_storage_for_test(), 205);
+
+  EXPECT_EQ(node->get_storage().get_near_misses("PUMP_PRESSURE_LOW").size(), 205u);
+}
+
 TEST(FaultManagerNodeParameterTest, ParsesDropOldestPolicy) {
   rclcpp::NodeOptions options;
   options.parameter_overrides({
@@ -2402,6 +2468,94 @@ TEST(FaultAuditFailClosedTest, FailClosedAbortsAndFlags) {
     EXPECT_FALSE(node->audit_healthy());
   }
   remove_audit_files(audit_path);
+}
+
+// --- InMemoryFaultStorage near-miss series tests ---
+//
+// The in-memory backend must keep the same near-miss contract as SQLite: appended per
+// qualifying report, bounded oldest-first, retained across clear_fault.
+
+/// Debounce config that takes four FAILED reports to confirm, leaving three near misses first.
+static DebounceConfig near_miss_config() {
+  DebounceConfig config;
+  config.confirmation_threshold = -4;
+  config.critical_immediate_confirm = false;
+  return config;
+}
+
+static rclcpp::Time near_miss_time(int index) {
+  constexpr int64_t kBaseNs = 1700000000000000000LL;
+  return rclcpp::Time(kBaseNs + static_cast<int64_t>(index) * 1000000LL);
+}
+
+TEST(InMemoryNearMissTest, SeriesIsAppendedAndSurvivesClear) {
+  InMemoryFaultStorage storage;
+  const auto config = near_miss_config();
+
+  for (int i = 0; i < 3; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", near_miss_time(i), config);
+  }
+
+  auto series = storage.get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 3u);
+  EXPECT_EQ(series[0].debounce_counter, -1);
+  EXPECT_EQ(series[2].debounce_counter, -3);
+  EXPECT_EQ(series[0].confirmation_threshold, -4);
+
+  ASSERT_TRUE(storage.clear_fault("PUMP_PRESSURE_LOW"));
+  EXPECT_EQ(storage.get_near_misses("PUMP_PRESSURE_LOW").size(), 3u);
+}
+
+TEST(InMemoryNearMissTest, ConfirmingReportIsNotANearMiss) {
+  InMemoryFaultStorage storage;
+  const auto config = near_miss_config();
+
+  for (int i = 0; i < 4; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", near_miss_time(i), config);
+  }
+
+  auto fault = storage.get_fault("PUMP_PRESSURE_LOW");
+  ASSERT_TRUE(fault.has_value());
+  ASSERT_EQ(fault->status, Fault::STATUS_CONFIRMED);
+  EXPECT_EQ(storage.get_near_misses("PUMP_PRESSURE_LOW").size(), 3u);
+}
+
+TEST(InMemoryNearMissTest, SeriesBoundedKeepingNewest) {
+  InMemoryFaultStorage storage;
+  DebounceConfig config = near_miss_config();
+  config.confirmation_threshold = -20;
+  storage.set_max_near_misses_per_fault(3);
+
+  for (int i = 0; i < 5; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", near_miss_time(i), config);
+  }
+
+  auto series = storage.get_near_misses("PUMP_PRESSURE_LOW");
+  ASSERT_EQ(series.size(), 3u);
+  EXPECT_EQ(series[0].debounce_counter, -3);
+  EXPECT_EQ(series[2].debounce_counter, -5);
+}
+
+TEST(InMemoryNearMissTest, PassedReportIsNotANearMiss) {
+  InMemoryFaultStorage storage;
+  const auto config = near_miss_config();
+
+  for (int i = 0; i < 2; ++i) {
+    storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", near_miss_time(i), config);
+  }
+  storage.report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN, "",
+                             "/hydraulics/pump", near_miss_time(2), config);
+
+  EXPECT_EQ(storage.get_near_misses("PUMP_PRESSURE_LOW").size(), 2u);
+}
+
+TEST(InMemoryNearMissTest, EmptyForUnknownFault) {
+  InMemoryFaultStorage storage;
+  EXPECT_TRUE(storage.get_near_misses("NEVER_REPORTED").empty());
 }
 
 int main(int argc, char ** argv) {
