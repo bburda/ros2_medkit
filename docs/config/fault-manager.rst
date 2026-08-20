@@ -83,8 +83,16 @@ CONFIRMED - the fault nearly happened. PASSED reports move the counter in the he
 (the fault receding) and are not near misses.
 
 The fault manager appends one entry per near miss to a per-fault-code series, holding the
-timestamp, the counter value after the report, the confirmation threshold, the severity and the
-reporting source. The series is **retained when the fault is cleared**, because acknowledging one
+timestamp, the counter value after the report, the confirmation threshold, the severity, the
+reporting source and the fault status the report left behind.
+
+The status matters when reading the series. The HEALED latch holds the status all the way from the
+healing threshold down to the confirmation threshold, so reports on the way back into a fault that
+does confirm are also near misses by the definition above. Entries recording ``PREFAILED`` are
+approaches from a resting state; entries recording ``HEALED`` are a counter walking back down under
+the latch. The recorded confirmation threshold belongs to the reporting source, while the counter
+is shared by all sources of that fault code, so with per-entity thresholds it is not on its own the
+distance to confirmation. The series is **retained when the fault is cleared**, because acknowledging one
 fault cycle must not erase how often that code approached confirmation across cycles.
 
 .. code-block:: yaml
