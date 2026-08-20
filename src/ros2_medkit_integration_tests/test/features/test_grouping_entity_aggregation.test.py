@@ -678,6 +678,32 @@ class GroupingAggregationTest(unittest.TestCase):
                 return item
         return None
 
+    def test_y_every_id_the_list_offers_runs_while_every_member_answers(self):
+        """The same agreement as z6, but with nothing broken.
+
+        z6 walks the list after the peer has been killed, so a peer-owned id is
+        allowed to answer 504 and the case cannot tell a working dispatch from a
+        missing one. Here every member is reachable, so the only honest answer
+        is that the operation ran.
+        """
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'operations')
+        offered = [item.get('id') for item in items if item.get('id', '').endswith('calibrate')]
+        self.assertTrue(offered, 'the list offered no calibrate operation to check')
+
+        for operation_id in offered:
+            with self.subTest(operation=operation_id):
+                response = requests.post(
+                    f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/operations/'
+                    f'{quote(operation_id, safe="")}/executions',
+                    json={},
+                    timeout=15,
+                )
+                self.assertIn(
+                    response.status_code, (200, 202),
+                    f'every member answers, yet executing the offered id '
+                    f'{operation_id!r} returned {response.status_code}: {response.text}',
+                )
+
     def test_z1_a_declared_entity_survives_its_peer_going_silent(self, peer_gateway):
         """R10: what a peer DECLARED does not stop being true when it goes quiet.
 
@@ -908,10 +934,10 @@ class GroupingAggregationTest(unittest.TestCase):
                     json={},
                     timeout=15,
                 )
-                self.assertNotEqual(
-                    response.status_code, 400,
-                    f'the list offers {operation_id!r} but executing it is '
-                    f'refused: {response.text}',
+                self.assertIn(
+                    response.status_code, (200, 202, 504),
+                    f'the list offers {operation_id!r} but executing it answered '
+                    f'{response.status_code}: {response.text}',
                 )
 
     def test_z7_suppression_omits_the_peer_without_losing_ambiguity(self):

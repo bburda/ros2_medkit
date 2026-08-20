@@ -48,6 +48,10 @@ namespace dto {
 //                 services; goal/result/feedback for actions); kept as
 //                 nlohmann::json because the structure is runtime-determined
 //                 by type introspection and cannot be statically typed
+//   member_ids  - the members of an aggregating entity that provide this
+//                 operation; absent on an entity that exposes its own
+//   available   - present only as false, marking an item whose provider is not
+//                 answering; absent means it can be served
 // =============================================================================
 struct XMedkitOperationItem {
   std::optional<XMedkitRos2> ros2;
@@ -112,7 +116,9 @@ inline constexpr std::string_view dto_name<XMedkitOperationExecution> = "XMedkit
 //   proximity_proof_required - bool (required, always false for ROS 2)
 //   asynchronous_execution - bool (required; false for services, true for actions)
 //   x-medkit               - typed vendor extension; carries ros2.{service|action,
-//                            type,kind}, entity_id, source, and optional type_info
+//                            type,kind}, entity_id, source, optional type_info,
+//                            and, on an aggregating entity, member_ids plus
+//                            available
 // =============================================================================
 struct OperationItem {
   std::string id;

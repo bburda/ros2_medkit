@@ -176,28 +176,55 @@ ResolvedOperation resolve_operation(const AggregatedOperations & ops, const http
   return resolved;
 }
 
-/// Members of `ops` that expose `short_name`, in collection order.
-///
-/// More than one means the bare id names more than one operation. Keyed on the
-/// short name because that is the wire id; the full ROS paths differ, which is
-/// exactly why the short name stops identifying one of them.
-std::vector<std::string> local_providers_of(const AggregatedOperations & ops, const std::string & short_name) {
-  std::vector<std::string> providers;
-  const auto record = [&ops, &providers](const std::string & full_path) {
+/// One operation `parsed` names: its ROS path, and the member that owns it if
+/// the entity has members at all.
+struct OperationMatch {
+  std::string full_path;
+  std::string member_id;  ///< empty when the entity exposes its operations directly
+};
+
+/// Everything `parsed` names, in collection order, using the same predicate
+/// `resolve_operation` walks - so what is counted here is exactly what would
+/// have been run. More than one match means the id does not identify an
+/// operation, whether the extra copies belong to different members or to one
+/// member that uses the same short name at two ROS paths.
+std::vector<OperationMatch> matching_operations(const AggregatedOperations & ops,
+                                                const http::MemberQualifiedId & parsed) {
+  std::vector<OperationMatch> matches;
+  const auto record = [&ops, &parsed, &matches](const std::string & full_path) {
     auto owner = ops.owner_by_path.find(full_path);
-    providers.push_back(owner != ops.owner_by_path.end() ? owner->second : std::string{});
+    const std::string member = owner != ops.owner_by_path.end() ? owner->second : std::string{};
+    if (parsed.has_member && member != parsed.member_id) {
+      return;
+    }
+    matches.push_back(OperationMatch{full_path, member});
   };
   for (const auto & svc : ops.services) {
-    if (svc.name == short_name) {
+    if (svc.name == parsed.item_id) {
       record(svc.full_path);
     }
   }
   for (const auto & act : ops.actions) {
-    if (act.name == short_name) {
+    if (act.name == parsed.item_id) {
       record(act.full_path);
     }
   }
-  return providers;
+  return matches;
+}
+
+/// The distinct members among `matches`, dropping the empty owner an entity
+/// that exposes its own operations reports.
+std::vector<std::string> distinct_members(const std::vector<OperationMatch> & matches) {
+  std::vector<std::string> members;
+  for (const auto & match : matches) {
+    if (match.member_id.empty()) {
+      continue;
+    }
+    if (std::find(members.begin(), members.end(), match.member_id) == members.end()) {
+      members.push_back(match.member_id);
+    }
+  }
+  return members;
 }
 
 /// The error for a member that is in the tree but whose gateway is silent.
@@ -208,15 +235,19 @@ std::vector<std::string> local_providers_of(const AggregatedOperations & ops, co
 /// replaces - quietly running a different member's operation, or a 200 with
 /// nothing in it. `not-responding` is the SOVD code for "no response from the
 /// underlying entity", which is exactly the situation.
+bool member_is_unreachable(const ThreadSafeEntityCache & cache, const std::string & member_id) {
+  if (auto app = cache.get_app(member_id)) {
+    return !app->available;
+  }
+  if (auto component = cache.get_component(member_id)) {
+    return !component->available;
+  }
+  return false;
+}
+
 std::optional<ErrorInfo> member_unavailable_error(const ThreadSafeEntityCache & cache, const std::string & entity_id,
                                                   const std::string & member_id, const std::string & operation_id) {
-  bool unavailable = false;
-  if (auto app = cache.get_app(member_id)) {
-    unavailable = !app->available;
-  } else if (auto component = cache.get_component(member_id)) {
-    unavailable = !component->available;
-  }
-  if (!unavailable) {
+  if (!member_is_unreachable(cache, member_id)) {
     return std::nullopt;
   }
   return make_error(504, ERR_NOT_RESPONDING, "Member '" + member_id + "' is not available",
@@ -714,6 +745,17 @@ http::Result<dto::OperationDetail> OperationHandlers::get_operation(const http::
     detail.item.asynchronous_execution = true;
     detail.item.x_medkit = build_action_xmedkit(*resolved.action, entity_id, type_introspection);
   }
+
+  // A retained member's operation is still described, because the description
+  // is what was retained - but it says it cannot be served, so a client reading
+  // the item on its own learns what the collection already told it, instead of
+  // an absent field that means the opposite.
+  const std::string & full_path =
+      resolved.service.has_value() ? resolved.service->full_path : resolved.action->full_path;
+  if (auto owner = ops.owner_by_path.find(full_path);
+      owner != ops.owner_by_path.end() && member_is_unreachable(cache, owner->second)) {
+    detail.item.x_medkit->available = false;
+  }
   return detail;
 }
 
@@ -819,22 +861,38 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
                                           json{{"entity_id", entity_id}, {"operation_id", operation_id}}));
   }
 
-  // A bare id that names more than one operation runs whichever member was
-  // walked first, and the caller never learns which. That is the one case the
-  // bare form cannot carry, so it is the one case that is refused - an id that
-  // names a single operation still executes, which is what every current
-  // client sends. An id that names nothing was already answered as not found
-  // above: telling a caller to qualify a typo would not help them.
-  if (!parsed.has_member) {
-    const std::vector<std::string> providers = local_providers_of(ops, operation_id);
-    if (providers.size() > 1) {
-      return tl::make_unexpected(
-          make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: more than one member provides it",
-                     json{{"details", "Use format 'member_id:operation_id' to name the member that runs it"},
-                          {"entity_id", entity_id},
-                          {"operation_id", operation_id},
-                          {"member_ids", providers}}));
+  // An id that names more than one operation would run whichever was walked
+  // first, and the caller would never learn which. An id that names a single
+  // operation still executes, which is what every current client sends, and an
+  // id that names nothing was already answered as not found above.
+  //
+  // The qualified form is checked too. Naming the member narrows the set, but
+  // one member that uses the same short name at two ROS paths is still not
+  // identified by it - and for those two the member half has nothing left to
+  // add, so the caller is told what collided rather than handed a remedy that
+  // cannot work.
+  const std::vector<OperationMatch> matches = matching_operations(ops, parsed);
+  if (matches.size() > 1) {
+    std::vector<std::string> paths;
+    paths.reserve(matches.size());
+    for (const auto & match : matches) {
+      paths.push_back(match.full_path);
     }
+    const std::vector<std::string> members = distinct_members(matches);
+    json params{{"entity_id", entity_id}, {"operation_id", operation_id}, {"ros2_paths", paths}};
+    if (!members.empty()) {
+      params["member_ids"] = members;
+    }
+    if (members.size() > 1) {
+      params["details"] = "Use format 'member_id:operation_id' to name the member that runs it";
+      return tl::make_unexpected(
+          make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: more than one member provides it", params));
+    }
+    params["details"] =
+        "One provider exposes this short name at more than one ROS path, so naming the member "
+        "cannot separate them";
+    return tl::make_unexpected(
+        make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: it names more than one operation", params));
   }
 
   // Whoever ends up owning the resolved operation must actually be reachable.
