@@ -642,6 +642,25 @@ bool SqliteFaultStorage::report_fault_event(const std::string & fault_code, uint
                                             const rclcpp::Time & timestamp, const DebounceConfig & config) {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  // The fault row and the near-miss row have to land together. Written as separate autocommit
+  // statements, a failure on the second would leave the debounce counter already advanced, so the
+  // caller's retry would advance it a second time and the near miss it retried for would still be
+  // missing from the series.
+  exec_or_throw("BEGIN IMMEDIATE");
+  try {
+    const bool is_new_occurrence =
+        report_fault_event_locked(fault_code, event_type, severity, description, source_id, timestamp, config);
+    exec_or_throw("COMMIT");
+    return is_new_occurrence;
+  } catch (...) {
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
+  }
+}
+
+bool SqliteFaultStorage::report_fault_event_locked(const std::string & fault_code, uint8_t event_type, uint8_t severity,
+                                                   const std::string & description, const std::string & source_id,
+                                                   const rclcpp::Time & timestamp, const DebounceConfig & config) {
   int64_t timestamp_ns = timestamp.nanoseconds();
   const bool is_failed = (event_type == EventType::EVENT_FAILED);
 
@@ -1246,6 +1265,24 @@ std::optional<FreezeFrameData> SqliteFaultStorage::get_freeze_frame(const std::s
 void SqliteFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
   max_near_misses_per_fault_ = max_count;
+
+  if (max_count == 0) {
+    return;  // Unlimited
+  }
+
+  // Apply the bound to what is already in the database. Without this, a database that grew under
+  // a larger bound (or none) stays over the new bound until each fault code happens to record
+  // another near miss - and a code that never does keeps its rows for good.
+  SqliteStatement trim_stmt(db_,
+                            "DELETE FROM near_misses WHERE id IN ("
+                            "SELECT id FROM (SELECT id, ROW_NUMBER() OVER "
+                            "(PARTITION BY fault_code ORDER BY id DESC) AS rn FROM near_misses) "
+                            "WHERE rn > ?)");
+  trim_stmt.bind_int64(1, static_cast<int64_t>(max_count));
+
+  if (trim_stmt.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to apply near-miss bound: ") + sqlite3_errmsg(db_));
+  }
 }
 
 void SqliteFaultStorage::record_near_miss_locked(const std::string & fault_code, int64_t occurred_at_ns,
@@ -1272,10 +1309,15 @@ void SqliteFaultStorage::record_near_miss_locked(const std::string & fault_code,
   // Evict oldest-first, keeping the newest max_near_misses_per_fault_ rows. Newest-first is the
   // deliberate opposite of the snapshot limit's keep-earliest rule: a series frozen at boot
   // answers nothing about whether the rate of near misses is changing.
+  //
+  // "Oldest" means earliest ARRIVAL (id), not earliest occurred_at_ns. Reporters carry their own
+  // clocks, so a report can arrive with a timestamp behind one already stored; ordering eviction
+  // by timestamp would then drop the row that was just appended and make the two backends, which
+  // append in arrival order, disagree on the same input.
   SqliteStatement trim_stmt(db_,
                             "DELETE FROM near_misses WHERE fault_code = ?1 AND id NOT IN "
                             "(SELECT id FROM near_misses WHERE fault_code = ?1 "
-                            "ORDER BY occurred_at_ns DESC, id DESC LIMIT ?2)");
+                            "ORDER BY id DESC LIMIT ?2)");
   trim_stmt.bind_text(1, fault_code);
   trim_stmt.bind_int64(2, static_cast<int64_t>(max_near_misses_per_fault_));
 
@@ -1292,7 +1334,7 @@ std::vector<NearMissRecord> SqliteFaultStorage::get_near_misses(const std::strin
   SqliteStatement stmt(db_,
                        "SELECT fault_code, occurred_at_ns, debounce_counter, confirmation_threshold, "
                        "severity, source_id FROM near_misses WHERE fault_code = ? "
-                       "ORDER BY occurred_at_ns ASC, id ASC");
+                       "ORDER BY id ASC");
   stmt.bind_text(1, fault_code);
 
   while (stmt.step() == SQLITE_ROW) {

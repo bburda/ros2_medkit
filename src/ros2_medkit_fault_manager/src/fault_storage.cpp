@@ -513,6 +513,21 @@ void InMemoryFaultStorage::record_near_miss(const FaultState & state, const Debo
 void InMemoryFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
   max_near_misses_per_fault_ = max_count;
+
+  if (max_count == 0) {
+    return;  // Unlimited
+  }
+
+  // Apply the bound to what is already stored, so a series built under a larger bound does not
+  // stay over the new one until the next near miss for that code happens to arrive.
+  using DiffType = std::vector<NearMissRecord>::difference_type;
+  for (auto & [code, series] : near_misses_) {
+    (void)code;
+    if (series.size() > max_count) {
+      const auto excess = static_cast<DiffType>(series.size() - max_count);
+      series.erase(series.begin(), series.begin() + excess);
+    }
+  }
 }
 
 std::vector<NearMissRecord> InMemoryFaultStorage::get_near_misses(const std::string & fault_code) const {
