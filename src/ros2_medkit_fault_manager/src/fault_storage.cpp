@@ -197,6 +197,13 @@ bool InMemoryFaultStorage::report_fault_event(const std::string & fault_code, ui
     return true;  // Reactivation treated as new occurrence for event publishing
   }
 
+  // Bring a counter left outside this config's band back into range before applying the report.
+  // Per-entity threshold overrides mean two sources of the same fault code can be evaluated
+  // against different bands, so a stored value clamped to one source's ceiling can sit above
+  // another's. The SQLite backend clamps on read for the same reason, and the two backends have to
+  // agree on the counter they record and on the status it produces.
+  state.debounce_counter = clamp_debounce_counter(state.debounce_counter, config);
+
   if (is_failed) {
     // last_occurred tracks occurrences only. A PASSED event is the fault ENDING, not
     // occurring; bumping it there makes a long-stale CONFIRMED fault look freshly
