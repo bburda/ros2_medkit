@@ -281,7 +281,7 @@ void SqliteFaultStorage::initialize_schema() {
       severity INTEGER NOT NULL,
       source_id TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_near_misses_fault_code ON near_misses(fault_code, occurred_at_ns, id);
+    CREATE INDEX IF NOT EXISTS idx_near_misses_fault_code ON near_misses(fault_code, id);
   )";
 
   if (sqlite3_exec(db_, create_near_misses_table_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
@@ -642,10 +642,19 @@ bool SqliteFaultStorage::report_fault_event(const std::string & fault_code, uint
                                             const rclcpp::Time & timestamp, const DebounceConfig & config) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // The fault row and the near-miss row have to land together. Written as separate autocommit
-  // statements, a failure on the second would leave the debounce counter already advanced, so the
-  // caller's retry would advance it a second time and the near miss it retried for would still be
-  // missing from the series.
+  // Only a FAILED report can write two rows, and only those two have to land together: written as
+  // separate autocommit statements, a failure on the second would leave the debounce counter
+  // already advanced, so the caller's retry would advance it a second time and the near miss it
+  // retried for would still be missing from the series.
+  //
+  // A PASSED report writes one row at most and never appends a near miss, so it keeps the plain
+  // autocommit path. BEGIN IMMEDIATE takes the writer lock up front, which would make a heal
+  // heartbeat - including one that turns out to write nothing at all - contend for that lock and
+  // fail with SQLITE_BUSY where before it could not.
+  if (event_type != EventType::EVENT_FAILED) {
+    return report_fault_event_locked(fault_code, event_type, severity, description, source_id, timestamp, config);
+  }
+
   exec_or_throw("BEGIN IMMEDIATE");
   try {
     const bool is_new_occurrence =
@@ -1262,12 +1271,15 @@ std::optional<FreezeFrameData> SqliteFaultStorage::get_freeze_frame(const std::s
   return frame;
 }
 
-void SqliteFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
+size_t SqliteFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
   max_near_misses_per_fault_ = max_count;
 
-  if (max_count == 0) {
-    return;  // Unlimited
+  // 0 and any bound past what SQLite can hold both mean "keep everything". Binding SIZE_MAX
+  // straight into an int64 makes it -1, and every row then compares as beyond the bound, so the
+  // idiomatic spelling of "no limit" would empty the table.
+  if (max_count == 0 || max_count > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return 0;  // Unlimited
   }
 
   // Apply the bound to what is already in the database. Without this, a database that grew under
@@ -1283,6 +1295,11 @@ void SqliteFaultStorage::set_max_near_misses_per_fault(size_t max_count) {
   if (trim_stmt.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to apply near-miss bound: ") + sqlite3_errmsg(db_));
   }
+
+  // Returned rather than logged: the storage layer has no logger, and a bound applied by mistake
+  // deletes history that cannot be recovered, so the caller has to be able to report it.
+  const int changed = sqlite3_changes(db_);
+  return changed > 0 ? static_cast<size_t>(changed) : 0;
 }
 
 void SqliteFaultStorage::record_near_miss_locked(const std::string & fault_code, int64_t occurred_at_ns,
@@ -1302,7 +1319,8 @@ void SqliteFaultStorage::record_near_miss_locked(const std::string & fault_code,
     throw std::runtime_error(std::string("Failed to store near miss: ") + sqlite3_errmsg(db_));
   }
 
-  if (max_near_misses_per_fault_ == 0) {
+  if (max_near_misses_per_fault_ == 0 ||
+      max_near_misses_per_fault_ > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
     return;  // Unlimited
   }
 

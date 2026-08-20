@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <set>
@@ -2196,6 +2197,52 @@ TEST_F(SqliteFaultStorageTest, ApplyingUnlimitedBoundKeepsExistingSeries) {
   storage_->set_max_near_misses_per_fault(0);
 
   EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 4u);
+}
+
+TEST_F(SqliteFaultStorageTest, UnlimitedBoundSpeltAsSizeMaxKeepsTheSeries) {
+  // SIZE_MAX is the idiomatic spelling of "no limit". Bound straight into an int64 it becomes -1,
+  // and every row then compares as beyond the bound, which would empty the table.
+  DebounceConfig config = four_strike_config();
+  config.confirmation_threshold = -20;
+
+  for (int i = 0; i < 3; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+  }
+
+  EXPECT_EQ(storage_->set_max_near_misses_per_fault(std::numeric_limits<size_t>::max()), 0u);
+  EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 3u);
+
+  storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                               "pressure dipping", "/hydraulics/pump", nth_report_time(3), config);
+  EXPECT_EQ(storage_->get_near_misses("PUMP_PRESSURE_LOW").size(), 4u);
+}
+
+TEST_F(SqliteFaultStorageTest, ApplyingBoundReportsHowManyEntriesItDropped) {
+  DebounceConfig config = four_strike_config();
+  config.confirmation_threshold = -20;
+  storage_->set_max_near_misses_per_fault(0);
+
+  for (int i = 0; i < 5; ++i) {
+    storage_->report_fault_event("PUMP_PRESSURE_LOW", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "pressure dipping", "/hydraulics/pump", nth_report_time(i), config);
+    storage_->report_fault_event("MOTOR_OVERHEAT", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN,
+                                 "temperature rising", "/powertrain/motor", nth_report_time(i), config);
+  }
+
+  // Two codes, five entries each, bound of 2: three dropped per code.
+  EXPECT_EQ(storage_->set_max_near_misses_per_fault(2), 6u);
+  // Applying the same bound again has nothing left to drop.
+  EXPECT_EQ(storage_->set_max_near_misses_per_fault(2), 0u);
+}
+
+TEST_F(SqliteFaultStorageTest, PassedReportOnUnknownFaultWritesNothing) {
+  // A heal heartbeat for a fault that does not exist must stay a read: it writes no row and must
+  // not take the writer lock on the way to finding that out.
+  EXPECT_FALSE(storage_->report_fault_event("NEVER_REPORTED", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN,
+                                            "", "/test_node", nth_report_time(0), default_config()));
+  EXPECT_EQ(storage_->size(), 0u);
+  EXPECT_TRUE(storage_->get_near_misses("NEVER_REPORTED").empty());
 }
 
 TEST_F(SqliteFaultStorageTest, NearMissSeriesEmptyForUnknownFault) {

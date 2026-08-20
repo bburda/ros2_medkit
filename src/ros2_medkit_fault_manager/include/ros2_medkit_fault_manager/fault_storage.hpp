@@ -328,8 +328,16 @@ class FaultStorage {
   virtual std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const = 0;
 
   /// Set the maximum number of near-miss entries retained per fault code.
-  /// Entries beyond the bound are evicted oldest-first. 0 = unlimited (unbounded growth).
-  virtual void set_max_near_misses_per_fault(size_t /*max_count*/) {
+  ///
+  /// Entries beyond the bound are evicted oldest-first, including entries already stored when the
+  /// bound is applied. 0 means unlimited, and so does any bound larger than the storage backend
+  /// can express.
+  ///
+  /// @return How many already-stored entries this call evicted. A bound applied by mistake
+  ///         deletes history that cannot be recovered, and the storage layer has no logger, so
+  ///         the caller is the one that can report it.
+  virtual size_t set_max_near_misses_per_fault(size_t /*max_count*/) {
+    return 0;
   }
 
   /// Get the near-miss series for a fault code, oldest entry first.
@@ -482,7 +490,7 @@ class InMemoryFaultStorage : public FaultStorage {
 
   void set_max_rosbags_per_fault(size_t max_count) override;
 
-  void set_max_near_misses_per_fault(size_t max_count) override;
+  size_t set_max_near_misses_per_fault(size_t max_count) override;
   std::vector<NearMissRecord> get_near_misses(const std::string & fault_code) const override;
 
   void store_rosbag_file(const RosbagFileInfo & info) override;

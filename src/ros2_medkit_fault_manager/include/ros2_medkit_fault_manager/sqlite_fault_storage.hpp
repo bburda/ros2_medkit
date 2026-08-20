@@ -78,7 +78,7 @@ class SqliteFaultStorage : public FaultStorage {
   void store_freeze_frame(const FreezeFrameData & frame) override;
   std::optional<FreezeFrameData> get_freeze_frame(const std::string & fault_code) const override;
 
-  void set_max_near_misses_per_fault(size_t max_count) override;
+  size_t set_max_near_misses_per_fault(size_t max_count) override;
   std::vector<NearMissRecord> get_near_misses(const std::string & fault_code) const override;
 
   void store_rosbag_file(const RosbagFileInfo & info) override;
