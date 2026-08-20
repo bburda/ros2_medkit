@@ -233,7 +233,8 @@ class MockThrowOnShutdown : public GatewayPlugin {
 /// so a dangling registration after teardown would be a use-after-free.
 class MockSamplerPlugin : public GatewayPlugin {
  public:
-  explicit MockSamplerPlugin(std::string collection) : collection_(std::move(collection)) {
+  explicit MockSamplerPlugin(std::string collection, bool honours_resource_path = false)
+    : collection_(std::move(collection)), honours_resource_path_(honours_resource_path) {
   }
   std::string name() const override {
     return "sampler_plugin";
@@ -241,14 +242,17 @@ class MockSamplerPlugin : public GatewayPlugin {
   void configure(const json & /*cfg*/) override {
   }
   void set_context(PluginContext & context) override {
-    context.register_sampler(collection_,
-                             [this](const std::string &, const std::string &) -> tl::expected<json, std::string> {
-                               return json{{"plugin", name()}};
-                             });
+    context.register_sampler(
+        collection_,
+        [this](const std::string &, const std::string &) -> tl::expected<json, std::string> {
+          return json{{"plugin", name()}};
+        },
+        honours_resource_path_);
   }
 
  private:
   std::string collection_;
+  bool honours_resource_path_;
 };
 
 /// Same sampler-registering behavior as MockSamplerPlugin, but also throws
@@ -447,6 +451,24 @@ TEST(PluginManagerTest, ShutdownAllRemovesPluginSamplers) {
   mgr.shutdown_all();
 
   EXPECT_FALSE(sampler_registry.has_sampler("x-mock-shutdown-sampler"));
+}
+
+TEST(PluginManagerTest, PluginResourcePathDeclarationReachesRegistry) {
+  ResourceSamplerRegistry sampler_registry;
+  TransportRegistry transport_registry;
+  PluginManager mgr;
+  mgr.set_registries(sampler_registry, transport_registry);
+  mgr.add_plugin(std::make_unique<MockSamplerPlugin>("x-mock-whole-collection"));
+  mgr.add_plugin(std::make_unique<MockSamplerPlugin>("x-mock-per-item", /*honours_resource_path=*/true));
+  mgr.configure_plugins();
+
+  auto ctx = make_gateway_plugin_context(nullptr, nullptr, &sampler_registry);
+  mgr.set_context(*ctx);
+
+  ASSERT_TRUE(sampler_registry.has_sampler("x-mock-whole-collection"));
+  ASSERT_TRUE(sampler_registry.has_sampler("x-mock-per-item"));
+  EXPECT_FALSE(sampler_registry.honours_resource_path("x-mock-whole-collection"));
+  EXPECT_TRUE(sampler_registry.honours_resource_path("x-mock-per-item"));
 }
 
 TEST(PluginManagerTest, BuiltinSamplerSurvivesPluginDisable) {

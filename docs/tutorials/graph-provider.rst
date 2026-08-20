@@ -317,6 +317,10 @@ resource, so a client can receive periodic graph snapshots over Server-Sent
 Events instead of polling. See :doc:`/api/rest` for the general
 cyclic-subscription API; the graph-specific parts are below.
 
+Each tick carries the whole graph document for the function. The resource URI
+must therefore end at ``x-medkit-graph`` - appending a path below it is refused
+with 400.
+
 Create the subscription:
 
 .. code-block:: bash

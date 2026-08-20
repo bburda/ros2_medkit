@@ -1924,11 +1924,17 @@ Subscriptions are temporary - they do not survive server restart.
 
 **Supported collections:**
 
-- ``data`` - Topic data (requires a resource path, e.g. ``/data/temperature``)
-- ``faults`` - Fault list (resource path optional, e.g. ``/faults`` or ``/faults/fault_001``)
-- ``configurations`` - Parameter values (resource path optional)
-- ``logs`` - Application log entries from ``/rosout``
-- ``x-*`` - Vendor extensions (e.g. ``x-medkit-graph``)
+- ``data`` - Topic data. Requires a resource path naming the topic, e.g. ``/data/temperature``
+- ``faults`` - Fault list. Streamed as a whole; no resource path
+- ``configurations`` - Parameter values. Streamed as a whole; no resource path
+- ``logs`` - Application log entries from ``/rosout``. Streamed as a whole; no resource path
+- ``x-*`` - Vendor extensions (e.g. ``x-medkit-graph``). Streamed as a whole unless the
+  plugin registering the sampler declares that it narrows its payload to a named resource
+
+A collection that is streamed as a whole delivers every item of that collection on
+every tick. A resource URI naming a single item of such a collection is refused with
+400 ``x-medkit-invalid-resource-uri`` rather than accepted and answered with the whole
+collection.
 
 **Interval values:**
 
@@ -1956,7 +1962,8 @@ Subscriptions are temporary - they do not survive server restart.
 
    - ``resource`` (string, required): Full SOVD resource URI to observe
      (e.g. ``/api/v1/apps/{id}/data/{topic}``, ``/api/v1/apps/{id}/faults``,
-     ``/api/v1/functions/{id}/x-medkit-graph``)
+     ``/api/v1/functions/{id}/x-medkit-graph``). The URI ends at the collection
+     unless that collection's sampler narrows its payload to a named resource
    - ``protocol`` (string, optional): Transport protocol. Only ``"sse"`` supported. Default: ``"sse"``
    - ``interval`` (string, required): One of ``fast``, ``normal``, ``slow``
    - ``duration`` (integer, required): Subscription lifetime in seconds.
@@ -1965,7 +1972,9 @@ Subscriptions are temporary - they do not survive server restart.
    **Error responses:**
 
    - **400** ``invalid-parameter`` - Invalid interval, duration <= 0, or duration exceeds max
-   - **400** ``x-medkit-invalid-resource-uri`` - Malformed resource URI or path traversal
+   - **400** ``x-medkit-invalid-resource-uri`` - Malformed resource URI, path traversal,
+     ``data`` without a topic path, or a resource path on a collection that is streamed
+     as a whole
    - **400** ``x-medkit-entity-mismatch`` - Resource URI references different entity than route
    - **400** ``x-medkit-collection-not-supported`` - Entity doesn't support the collection
    - **400** ``x-medkit-collection-not-available`` - No data provider registered for collection

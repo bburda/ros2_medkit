@@ -299,10 +299,10 @@ class GatewayPluginContext : public RosPluginContext {
 
   void register_sampler(
       const std::string & collection,
-      const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> & fn)
-      override {
+      const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> & fn,
+      bool honours_resource_path) override {
     if (sampler_registry_) {
-      sampler_registry_->register_sampler(collection, fn);
+      sampler_registry_->register_sampler(collection, fn, /*is_builtin=*/false, honours_resource_path);
     }
   }
 

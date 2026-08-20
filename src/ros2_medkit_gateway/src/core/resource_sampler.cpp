@@ -19,7 +19,8 @@
 
 namespace ros2_medkit_gateway {
 
-void ResourceSamplerRegistry::register_sampler(const std::string & collection, ResourceSamplerFn fn, bool is_builtin) {
+void ResourceSamplerRegistry::register_sampler(const std::string & collection, ResourceSamplerFn fn, bool is_builtin,
+                                               bool honours_resource_path) {
   std::unique_lock lock(mutex_);
 
   if (!is_builtin) {
@@ -48,7 +49,7 @@ void ResourceSamplerRegistry::register_sampler(const std::string & collection, R
     return fn(entity_id, resource_path);
   };
 
-  samplers_[collection] = Entry{std::move(wrapped), is_builtin, std::move(control)};
+  samplers_[collection] = Entry{std::move(wrapped), is_builtin, honours_resource_path, std::move(control)};
 }
 
 std::optional<ResourceSamplerFn> ResourceSamplerRegistry::get_sampler(const std::string & collection) const {
@@ -63,6 +64,12 @@ std::optional<ResourceSamplerFn> ResourceSamplerRegistry::get_sampler(const std:
 bool ResourceSamplerRegistry::has_sampler(const std::string & collection) const {
   std::shared_lock lock(mutex_);
   return samplers_.count(collection) > 0;
+}
+
+bool ResourceSamplerRegistry::honours_resource_path(const std::string & collection) const {
+  std::shared_lock lock(mutex_);
+  auto it = samplers_.find(collection);
+  return it != samplers_.end() && it->second.honours_resource_path;
 }
 
 void ResourceSamplerRegistry::remove_sampler(const std::string & collection) {

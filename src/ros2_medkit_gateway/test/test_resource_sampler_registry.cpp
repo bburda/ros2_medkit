@@ -338,3 +338,86 @@ TEST(ResourceSamplerRegistryTest, RemoveSamplerBlocksUntilInFlightCallCompletes)
   invoker.join();
   EXPECT_TRUE(invocation_succeeded);
 }
+
+// --- resource-path support declaration ---
+
+TEST(ResourceSamplerRegistryTest, UndeclaredSamplerDoesNotHonourResourcePath) {
+  ResourceSamplerRegistry registry;
+  registry.register_sampler("x-medkit-metrics",
+                            [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+                              return nlohmann::json{{"cpu", 42}};
+                            });
+
+  EXPECT_FALSE(registry.honours_resource_path("x-medkit-metrics"));
+}
+
+TEST(ResourceSamplerRegistryTest, DeclaredSamplerHonoursResourcePath) {
+  ResourceSamplerRegistry registry;
+  registry.register_sampler(
+      "x-medkit-metrics",
+      [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+        return nlohmann::json{{"cpu", 42}};
+      },
+      /*is_builtin=*/false, /*honours_resource_path=*/true);
+
+  EXPECT_TRUE(registry.honours_resource_path("x-medkit-metrics"));
+}
+
+TEST(ResourceSamplerRegistryTest, BuiltinSamplerCanHonourResourcePath) {
+  ResourceSamplerRegistry registry;
+  registry.register_sampler(
+      "data",
+      [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+        return nlohmann::json{{"value", 1}};
+      },
+      /*is_builtin=*/true, /*honours_resource_path=*/true);
+  registry.register_sampler(
+      "configurations",
+      [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+        return nlohmann::json{{"items", nlohmann::json::array()}};
+      },
+      /*is_builtin=*/true);
+
+  EXPECT_TRUE(registry.honours_resource_path("data"));
+  EXPECT_FALSE(registry.honours_resource_path("configurations"));
+}
+
+TEST(ResourceSamplerRegistryTest, UnregisteredCollectionDoesNotHonourResourcePath) {
+  ResourceSamplerRegistry registry;
+  EXPECT_FALSE(registry.honours_resource_path("nonexistent"));
+}
+
+TEST(ResourceSamplerRegistryTest, ReregisteringBuiltinReplacesResourcePathDeclaration) {
+  ResourceSamplerRegistry registry;
+  registry.register_sampler(
+      "data",
+      [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+        return nlohmann::json{{"version", 1}};
+      },
+      /*is_builtin=*/true, /*honours_resource_path=*/true);
+  ASSERT_TRUE(registry.honours_resource_path("data"));
+
+  registry.register_sampler(
+      "data",
+      [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+        return nlohmann::json{{"version", 2}};
+      },
+      /*is_builtin=*/true);
+
+  EXPECT_FALSE(registry.honours_resource_path("data"));
+}
+
+TEST(ResourceSamplerRegistryTest, RemovedSamplerNoLongerHonoursResourcePath) {
+  ResourceSamplerRegistry registry;
+  registry.register_sampler(
+      "x-medkit-metrics",
+      [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+        return nlohmann::json{{"cpu", 42}};
+      },
+      /*is_builtin=*/false, /*honours_resource_path=*/true);
+  ASSERT_TRUE(registry.honours_resource_path("x-medkit-metrics"));
+
+  registry.remove_sampler("x-medkit-metrics");
+
+  EXPECT_FALSE(registry.honours_resource_path("x-medkit-metrics"));
+}

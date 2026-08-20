@@ -72,9 +72,23 @@ using ResourceSamplerFn = std::function<tl::expected<nlohmann::json, std::string
 /// collections) for its duration.
 class ResourceSamplerRegistry {
  public:
-  void register_sampler(const std::string & collection, ResourceSamplerFn fn, bool is_builtin = false);
+  /// Register a sampler for `collection`.
+  ///
+  /// `honours_resource_path` states that `fn` narrows its payload to the one
+  /// resource named by its `resource_path` argument. A sampler that ignores
+  /// that argument answers with its whole collection on every tick and must
+  /// leave the flag false: the subscription layer then refuses a resource URI
+  /// naming a single item of that collection, rather than accepting the
+  /// request and streaming something wider than was asked for.
+  void register_sampler(const std::string & collection, ResourceSamplerFn fn, bool is_builtin = false,
+                        bool honours_resource_path = false);
   std::optional<ResourceSamplerFn> get_sampler(const std::string & collection) const;
   bool has_sampler(const std::string & collection) const;
+
+  /// Whether the sampler registered for `collection` narrows its payload to
+  /// the resource named by a resource path. False for a collection with no
+  /// sampler, and for any sampler registered without declaring it.
+  bool honours_resource_path(const std::string & collection) const;
 
   /// Remove a previously registered sampler. A no-op if the collection was
   /// never registered, or if it was registered with `is_builtin = true` -
@@ -124,6 +138,9 @@ class ResourceSamplerRegistry {
     /// exactly what `get_sampler()` copies out.
     ResourceSamplerFn fn;
     bool is_builtin;
+    /// See `register_sampler`. The subscription layer reads this to decide
+    /// whether a resource URI may name a single item of this collection.
+    bool honours_resource_path;
     /// Shared with every copy of `fn` handed out via `get_sampler()`. See
     /// `ControlBlock` and the class comment.
     std::shared_ptr<ControlBlock> control;

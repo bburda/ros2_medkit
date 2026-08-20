@@ -157,7 +157,8 @@ class FakePluginContext : public RosPluginContext {
   void register_sampler(
       const std::string & /*topic*/,
       const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> &
-      /*sampler*/) override {
+      /*sampler*/,
+      bool /*honours_resource_path*/) override {
   }
   ResourceChangeNotifier * get_resource_change_notifier() override {
     return nullptr;

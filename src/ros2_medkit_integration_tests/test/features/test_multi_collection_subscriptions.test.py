@@ -18,7 +18,8 @@
 Validates that cyclic subscriptions can be created for data, faults,
 and configurations collections, and that error cases (unsupported
 collection, invalid URI, entity mismatch, unsupported protocol,
-path traversal) return 400.
+path traversal, resource path on a collection that is streamed whole)
+return 400.
 
 """
 
@@ -273,6 +274,66 @@ class TestMultiCollectionSubscriptions(GatewayTestCase):
                 self.assertIn('severity', entry)
                 self.assertIn('message', entry)
 
+    def _collect_sse_events(self, event_source, wanted=2, timeout=15):
+        """Open the SSE stream and return up to `wanted` parsed events."""
+        events_url = (
+            f'{self.BASE_URL}{event_source.removeprefix(API_BASE_PATH)}'
+        )
+        received = []
+        stop_event = threading.Event()
+
+        def collect():
+            try:
+                with requests.get(
+                    events_url, stream=True, timeout=timeout,
+                ) as resp:
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if stop_event.is_set():
+                            break
+                        if line and line.startswith('data: '):
+                            received.append(json.loads(line[6:]))
+                            if len(received) >= wanted:
+                                stop_event.set()
+                                break
+            except requests.exceptions.RequestException:
+                pass
+
+        thread = threading.Thread(target=collect, daemon=True)
+        thread.start()
+        stop_event.wait(timeout=timeout)
+        thread.join(timeout=5)
+        return received
+
+    def test_configurations_subscription_streams_whole_collection(self):
+        """Configurations without a resource path is accepted and streams.
+
+        The gateway refuses a configurations URI that names a single
+        parameter because the sampler answers with the whole collection.
+        This pins the other side of that contract: the collection URI is
+        still accepted and still delivers parameter items on the stream.
+
+        @verifies REQ_INTEROP_089
+        @verifies REQ_INTEROP_090
+        """
+        resource = f'/api/v1/apps/{self.app_id}/configurations'
+        r = self._create_subscription(resource, interval='fast', duration=30)
+        self.assertEqual(r.status_code, 201, f'Create failed: {r.text}')
+
+        data = r.json()
+        self.addCleanup(self._delete_subscription, data['id'])
+
+        events = self._collect_sse_events(data['event_source'])
+        self.assertGreaterEqual(
+            len(events), 1,
+            f'Expected at least 1 SSE configurations event, got {len(events)}',
+        )
+        for event in events:
+            self.assertIn('payload', event)
+            self.assertIn(
+                'items', event['payload'],
+                'Configurations payload must have items array',
+            )
+
     # ===================================================================
     # CRUD operations: list, get, update, delete
     # ===================================================================
@@ -409,6 +470,55 @@ class TestMultiCollectionSubscriptions(GatewayTestCase):
         resource = f'/api/v1/apps/{self.app_id}/data/../../../etc/passwd'
         r = self._create_subscription(resource)
         self.assertEqual(r.status_code, 400)
+
+    def _assert_resource_path_refused(self, collection, resource_path):
+        """Assert a resource path on a whole-collection stream is refused."""
+        resource = (
+            f'/api/v1/apps/{self.app_id}/{collection}/{resource_path}'
+        )
+        r = self._create_subscription(resource)
+        self.assertEqual(
+            r.status_code, 400,
+            f'Expected 400 for {resource}, got {r.status_code}: {r.text}',
+        )
+        body = r.json()
+        self.assertEqual(body['error_code'], 'vendor-error')
+        self.assertEqual(
+            body['vendor_code'], 'x-medkit-invalid-resource-uri',
+        )
+        self.assertIn(
+            collection, body['message'],
+            'Refusal must name the collection it applies to',
+        )
+        self.assertIn(
+            'streamed as a whole', body['message'],
+            'Refusal must say the collection is streamed whole',
+        )
+        self.assertEqual(body['parameters']['collection'], collection)
+
+    def test_configurations_with_resource_path_returns_400(self):
+        """A single-parameter configurations URI is refused, not widened."""
+        self._assert_resource_path_refused('configurations', 'use_sim_time')
+
+    def test_faults_with_resource_path_returns_400(self):
+        """A single-fault URI is refused, not widened to the fault list."""
+        self._assert_resource_path_refused('faults', 'fault_001')
+
+    def test_logs_with_resource_path_returns_400(self):
+        """A single-log-entry URI is refused, not widened to the log list."""
+        self._assert_resource_path_refused('logs', 'entry_7')
+
+    def test_data_without_resource_path_returns_400(self):
+        """Data without a topic is still refused - the sampler needs one."""
+        resource = f'/api/v1/apps/{self.app_id}/data'
+        r = self._create_subscription(resource)
+        self.assertEqual(r.status_code, 400, f'Got {r.status_code}: {r.text}')
+        body = r.json()
+        self.assertEqual(body['error_code'], 'vendor-error')
+        self.assertEqual(
+            body['vendor_code'], 'x-medkit-invalid-resource-uri',
+        )
+        self.assertIn('requires a resource path', body['message'])
 
 
 @launch_testing.post_shutdown_test()
