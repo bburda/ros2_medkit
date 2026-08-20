@@ -320,16 +320,19 @@ class LifecycleExpectationDetector : public Detector {
         if (state.has_value()) {
           entry_has_managed_match.insert(id);
         }
-        // Whether the gate currently allows a fault to be raised for this SAME app.id - the
-        // exact predicate node_death's own presence detector uses to decide whether it will
-        // ever be able to track this node at all (reliability_allows(), see
+        // Whether the presence detector will OWN this node's departure, for this SAME
+        // app.id - the exact predicate node_death's tracking decision uses (see
         // node_death_detector.cpp's identical call). Reading it here, from the one gate both
         // detectors share on the same tick, is what makes "armed" trustworthy rather than a
         // guess: it is not derived from this node's own lifecycle label, it IS the fact the
         // presence detector would itself consult if asked right now. The tracker needs it to
         // tell a node the presence detector could someday report from one it structurally
-        // never can - see LifecycleExpectationTracker's own class doc.
-        const bool armed = reliability_allows(ctx.gate, app.id);
+        // never can - see LifecycleExpectationTracker's own class doc. Deliberately NOT
+        // reliability_allows(): that one is permissive about a managed node whose lifecycle
+        // label has never been read, and a node nobody has ever measured is precisely one
+        // the presence detector cannot own, so taking its permission for ownership would
+        // switch this detector's absence path off for the node that needs it most.
+        const bool armed = presence_ownership_allows(ctx.gate, app.id);
         // One match per (entry, node): the tracker keys violations by NODE, so two
         // namesakes are both reported instead of one silently replacing the other.
         matches.push_back(LifecycleMatch{id, fqn, state, armed});

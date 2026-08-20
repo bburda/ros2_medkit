@@ -93,10 +93,14 @@ bool is_ros2cli_node(const std::string & fqn) {
 /// still alive; only its ROS 2 lifecycle state changed), so that is never mistaken for
 /// death either - lifecycle state is lifecycle_expectation's concern, not this one's.
 ///
-/// A key is tracked - and so can ever be reported dead - only once it has been armed by
-/// the reliability gate at least once. A manifest App that never comes online starts
-/// `is_online=false` and so is never armed, so it can never be falsely called dead; a node
-/// still inside its warmup window gets the same protection.
+/// A key is tracked - and so can ever be reported dead - only once the reliability gate has
+/// said this detector OWNS its departure, which needs it armed AND its lifecycle state
+/// positively known not to be a managed-non-active one. A manifest App that never comes
+/// online starts `is_online=false` and so is never armed, so it can never be falsely called
+/// dead; a node still inside its warmup window gets the same protection; and a MANAGED node
+/// whose GetState has never answered is left to lifecycle_expectation, which is the only
+/// detector that can still report it (the gate itself stays permissive about an unread label
+/// - see LifecycleWatcher::node_ok() - so this decision is made here, not there).
 ///
 /// Composable/component nodes hosted in one process die together: if the container
 /// process dies, every node it hosted vanishes from the snapshot on the same tick, and all
@@ -268,7 +272,14 @@ class NodeDeathDetector : public Detector {
         continue;
       }
       present.insert(key);
-      if (reliability_allows(ctx.gate, app.id)) {  // the gate is keyed by App::id
+      // Tracking follows OWNERSHIP rather than permission, and the two are not the same
+      // question: the gate answers "may this entity raise" permissively for a managed node
+      // whose lifecycle label has never been read, and a key admitted on that answer is
+      // tracked for the rest of its life. This detector can only report a node it can
+      // reliably observe, so it asks the stricter predicate instead - a managed node whose
+      // state is unknown belongs to lifecycle_expectation's absence path, which is the only
+      // detector that can still report it. The gate is keyed by App::id.
+      if (presence_ownership_allows(ctx.gate, app.id)) {
         armed.insert(key);
       }
       // Capture the allowlist's id-form verdict WHILE the entity is still present and

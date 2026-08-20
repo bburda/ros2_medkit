@@ -30,9 +30,12 @@ namespace ros2_medkit_graph_watchdog {
 
 /// Central gate composing per-entity warmup (WarmupTracker) with ROS lifecycle state
 /// (LifecycleWatcher). An entity is allowed to raise a fault once it has been armed
-/// (continuously present for warmup_cycles ticks) and its lifecycle state (if managed)
-/// is "active". Unknown source_ids (e.g. topics, not tracked apps) fall back to a
-/// global bringup grace period keyed off the first tick the graph was non-empty.
+/// (continuously present for warmup_cycles ticks) and its lifecycle state is not a KNOWN
+/// non-active one: a managed node whose GetState has never answered still passes, because
+/// gating on an unread label would silence every detector for it (LifecycleWatcher::node_ok()).
+/// Unknown source_ids (e.g. topics, not tracked apps) fall back to a global bringup grace
+/// period keyed off the first tick the graph was non-empty. allows_presence_ownership() below
+/// asks the narrower question the presence class needs, without moving this one.
 class ReliabilityGate {
  public:
   ReliabilityGate(int warmup_cycles, rclcpp::Node * gateway_node, std::mutex * node_mutex,
@@ -51,6 +54,21 @@ class ReliabilityGate {
   /// True if `source_id` is allowed to raise a fault: known entities must be armed
   /// and lifecycle-ok; unknown entities fall back to the global warmup window.
   bool allows_raise(const std::string & source_id) const;
+
+  /// True if the PRESENCE detector (node_death) will own this source's departure: it is
+  /// allowed to raise AND its lifecycle state is positively known not to be a
+  /// managed-non-active one - either there is no managed record for it at all, or the
+  /// record reads "active".
+  ///
+  /// Strictly narrower than allows_raise(), and deliberately so. allows_raise() answers
+  /// "may this entity raise", and for a managed node whose label has never been read it
+  /// answers yes, because gating every detector on an unread label would silence a node
+  /// whose GetState never answers (see LifecycleWatcher::node_ok()). Ownership is a
+  /// different question and needs KNOWLEDGE rather than permission: an empty label is
+  /// ignorance, not a state, so it answers no here. Callers that latch this answer keep a
+  /// node armed while active and later deactivated - the latch, not this predicate, is
+  /// what carries that.
+  bool allows_presence_ownership(const std::string & source_id) const;
 
   /// Raw lifecycle state label for `app_id` (delegates to the internal
   /// LifecycleWatcher), or nullopt if `app_id` is not a tracked managed lifecycle

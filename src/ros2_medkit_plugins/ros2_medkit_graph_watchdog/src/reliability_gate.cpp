@@ -73,6 +73,22 @@ bool ReliabilityGate::allows_raise(const std::string & source_id) const {
   return (last_tick_ - graph_first_tick_) >= static_cast<uint64_t>(warmup_cycles_);
 }
 
+bool ReliabilityGate::allows_presence_ownership(const std::string & source_id) const {
+  if (!allows_raise(source_id)) {
+    return false;
+  }
+  // Read without gate_mutex_, for the same reason allows_raise() takes none: lifecycle_ is
+  // separately self-synchronized, and both run on the tick thread, sequentially after update().
+  //
+  // nullopt is no managed record at all - a plain node, whose departure the presence detector
+  // owns outright. An EMPTY label is a managed node that was asked and never answered, which is
+  // ignorance rather than a state: node_ok() deliberately reads it as permission (see its own
+  // comment on why every detector would otherwise be silenced for such a node), and permission
+  // is not knowledge. Only "active" says the presence detector can rely on what it sees.
+  const auto label = lifecycle_.state_of(source_id);
+  return !label.has_value() || *label == "active";
+}
+
 nlohmann::json ReliabilityGate::status_json() const {
   // Reader side of gate_mutex_ (see update()). Held across the lifecycle_ reads too - they
   // take the lifecycle SharedState mutex (order gate_mutex_ -> lifecycle mutex, never the
@@ -122,6 +138,10 @@ void ReliabilityGate::set_departed_lifecycle_state_for_test(const std::string & 
 
 bool reliability_allows(const ReliabilityGate * gate, const std::string & source_id) {
   return gate == nullptr || gate->allows_raise(source_id);
+}
+
+bool presence_ownership_allows(const ReliabilityGate * gate, const std::string & source_id) {
+  return gate == nullptr || gate->allows_presence_ownership(source_id);
 }
 
 }  // namespace ros2_medkit_graph_watchdog
