@@ -63,14 +63,17 @@ struct XMedkitOperationItem {
   /// short name. More than one entry is what makes the bare item id
   /// ambiguous for addressing.
   std::optional<std::vector<std::string>> member_ids;
+  /// Absent while the item can be served. False marks an item listed from a
+  /// retained declaration because the member that owns it is not answering -
+  /// the item is still part of the tree, and still counts towards ambiguity.
+  std::optional<bool> available;
 };
 
 template <>
-inline constexpr auto dto_fields<XMedkitOperationItem> =
-    std::make_tuple(field("ros2", &XMedkitOperationItem::ros2), field("entity_id", &XMedkitOperationItem::entity_id),
-                    field("source", &XMedkitOperationItem::source),
-                    field("type_info", &XMedkitOperationItem::type_info),
-                    field("member_ids", &XMedkitOperationItem::member_ids));
+inline constexpr auto dto_fields<XMedkitOperationItem> = std::make_tuple(
+    field("ros2", &XMedkitOperationItem::ros2), field("entity_id", &XMedkitOperationItem::entity_id),
+    field("source", &XMedkitOperationItem::source), field("type_info", &XMedkitOperationItem::type_info),
+    field("member_ids", &XMedkitOperationItem::member_ids), field("available", &XMedkitOperationItem::available));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitOperationItem> = "XMedkitOperationItem";

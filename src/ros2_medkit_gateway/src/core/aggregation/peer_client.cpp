@@ -226,6 +226,57 @@ std::string component_id_from_located_on(const std::string & uri) {
 }
 
 /**
+ * @brief Read a peer's `/operations` collection into an App's service/action lists.
+ *
+ * The wire id is not used as the name: on the peer it is already qualified when
+ * that peer saw a collision among its own members, and the qualifier is the
+ * peer's business, not ours. `name` is always the bare short name, which is what
+ * ambiguity is keyed on, and the full ROS path comes from x-medkit.ros2 so two
+ * same-named operations stay distinguishable.
+ */
+void parse_operations_into(const nlohmann::json & j, App & app) {
+  if (!j.contains("items") || !j["items"].is_array()) {
+    return;
+  }
+  for (const auto & item : j["items"]) {
+    if (!item.is_object()) {
+      continue;
+    }
+    const std::string name = item.value("name", "");
+    if (name.empty()) {
+      continue;
+    }
+    std::string full_path;
+    std::string type;
+    bool is_action = item.value("asynchronous_execution", false);
+    if (item.contains("x-medkit") && item["x-medkit"].is_object()) {
+      const auto & xm = item["x-medkit"];
+      if (xm.contains("ros2") && xm["ros2"].is_object()) {
+        const auto & ros2 = xm["ros2"];
+        type = ros2.value("type", "");
+        full_path = ros2.value("service", "");
+        if (full_path.empty()) {
+          full_path = ros2.value("action", "");
+          is_action = is_action || !full_path.empty();
+        }
+        const std::string kind = ros2.value("kind", "");
+        if (!kind.empty()) {
+          is_action = kind == "action";
+        }
+      }
+    }
+    if (full_path.empty()) {
+      continue;
+    }
+    if (is_action) {
+      app.actions.push_back(ActionInfo{name, full_path, type, std::nullopt});
+    } else {
+      app.services.push_back(ServiceInfo{name, full_path, type, std::nullopt});
+    }
+  }
+}
+
+/**
  * @brief Parse an App from JSON.
  *
  * The app-to-component binding is recovered from SOVD's standard
@@ -405,6 +456,7 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
                                          " areas (max " + std::to_string(MAX_ENTITIES_PER_COLLECTION) + ")");
     }
     for (auto & area : entities.areas) {
+      area.declared_source = area.source;
       area.source = peer_source;
     }
 
@@ -422,6 +474,7 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
             if (!is_valid_entity_id(sub.id)) {
               continue;
             }
+            sub.declared_source = sub.source;
             sub.source = peer_source;
             all_subareas.push_back(std::move(sub));
           }
@@ -469,6 +522,7 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
           comp = parse_component(detail_json);
         }
       }
+      comp.declared_source = comp.source;
       comp.source = peer_source;
     }
     // Fetch subcomponents for each top-level component (list endpoint filters them out).
@@ -493,6 +547,7 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
                 sub = parse_component(detail_json);
               }
             }
+            sub.declared_source = sub.source;
             sub.source = peer_source;
             all_subcomps.push_back(std::move(sub));
           }
@@ -534,6 +589,7 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
                                          " apps (max " + std::to_string(MAX_ENTITIES_PER_COLLECTION) + ")");
     }
     for (auto & app : entities.apps) {
+      app.declared_source = app.source;
       app.source = peer_source;
     }
     // Filter ROS 2 internal nodes (underscore prefix convention) at source.
@@ -544,6 +600,29 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
                                          return !app.id.empty() && app.id[0] == '_';
                                        }),
                         entities.apps.end());
+
+    // Fetch each app's operations. An operation is never declared in a
+    // manifest - it is discovered from the ROS graph - so the only record of
+    // what a peer's app exposes is what the peer reports. Without it the
+    // aggregator cannot tell that two members share an operation short name
+    // except by asking at request time, and an answer that depends on who is
+    // reachable is not an answer a client can rely on.
+    //
+    // `X-Medkit-No-Fan-Out` keeps the peer from re-asking ITS peers: each
+    // gateway reports what it holds, and the hop that owns the entity is the
+    // hop that answers for it. It is also what makes this terminate.
+    for (auto & app : entities.apps) {
+      httplib::Headers no_fan_out{{"X-Medkit-No-Fan-Out", "1"}};
+      auto ops_result = cli.Get(std::string(API_PREFIX) + "/apps/" + app.id + "/operations", no_fan_out);
+      if (!ops_result || ops_result->status != 200 || ops_result->body.size() > MAX_PEER_RESPONSE_SIZE) {
+        continue;
+      }
+      auto ops_json = nlohmann::json::parse(ops_result->body, nullptr, false);
+      if (ops_json.is_discarded()) {
+        continue;
+      }
+      parse_operations_into(ops_json, app);
+    }
   }
 
   // Fetch functions (list then detail per entity for hosts data)
@@ -583,6 +662,7 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
           func = parse_function(detail_json);
         }
       }
+      func.declared_source = func.source;
       func.source = peer_source;
     }
     entities.functions = std::move(func_list);

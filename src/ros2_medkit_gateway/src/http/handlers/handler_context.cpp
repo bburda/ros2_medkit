@@ -313,6 +313,23 @@ http::ValidatorResult<EntityInfo> HandlerContext::validate_entity_for_route(cons
   // aggregation) the forwarding path returns Forwarded without mutating any
   // wire - the framework guarantees a sink whenever aggregation is active.
   if (entity_info.is_remote && aggregation_mgr_) {
+    // A retained entity is one its peer declared and is no longer answering
+    // for. Forwarding to that peer produces a connection failure dressed as a
+    // 502, which says the gateway had a problem rather than that the thing
+    // asked for is not reachable. The retained declaration is exactly the
+    // information needed to answer properly, so answer here.
+    if (!is_entity_available(entity_id)) {
+      ErrorInfo err;
+      err.code = ERR_NOT_RESPONDING;
+      err.message = "Member '" + entity_id + "' is not available";
+      err.http_status = 504;
+      err.params = json{{"entity_id", entity_id},
+                        {"peer", entity_info.peer_name},
+                        {"details",
+                         "The gateway contributing this entity is not answering; it is retained from its "
+                         "last known declaration"}};
+      return tl::unexpected(ErrorVariant{std::move(err)});
+    }
     if (tl_forward_response != nullptr) {
       aggregation_mgr_->forward_request(entity_info.peer_name, raw_req, *tl_forward_response);
     }
@@ -320,6 +337,20 @@ http::ValidatorResult<EntityInfo> HandlerContext::validate_entity_for_route(cons
   }
 
   return entity_info;
+}
+
+/// False when the entity is present only because its peer's declaration is
+/// being retained. An entity this gateway has never heard of is not "not
+/// available" - it is absent, and the caller already got a 404 for it.
+bool HandlerContext::is_entity_available(const std::string & entity_id) const {
+  const auto & cache = node_->get_thread_safe_cache();
+  if (auto app = cache.get_app(entity_id)) {
+    return app->available;
+  }
+  if (auto component = cache.get_component(entity_id)) {
+    return component->available;
+  }
+  return true;
 }
 
 void HandlerContext::set_cors_headers(httplib::Response & res, const std::string & origin) const {

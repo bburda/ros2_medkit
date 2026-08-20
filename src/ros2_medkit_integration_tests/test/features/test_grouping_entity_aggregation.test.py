@@ -74,9 +74,16 @@ R7  A Component both sides contribute to aggregates. Routing it wholesale to
     one peer would discard the other half, which is what happens today.
 R8  A lock on a leaf is honoured by a request dispatched through an aggregate.
 R9  Peered gateways terminate.
+R10 A manifest-declared entity outlives the link that reported it: it stays in
+    the tree, keeps the items it last reported, and says it cannot be reached.
+    A runtime-discovered one vanishes, because it describes a graph this
+    gateway can no longer observe. Availability belongs to what a request can
+    be addressed to - an App or a Component. A grouping entity is a view over
+    members and carries none of its own; a client asks the members.
 """
 
 import os
+import signal
 import tempfile
 import time
 import unittest
@@ -183,7 +190,10 @@ metadata:
   name: "Secondary ECU"
   version: "1.0.0"
 config:
-  unmanifested_nodes: ignore
+  # The peer exposes what it did not declare, so that its half of the tree has
+  # both origins in it. Retention keeps the declared ones and drops these, and
+  # a topology where everything is declared cannot show the difference.
+  unmanifested_nodes: warn
 areas:
   - id: {MERGED_AREA}
     name: "Vehicle"
@@ -586,4 +596,354 @@ class GroupingAggregationTest(unittest.TestCase):
         self.assertNotIn(
             'peer_calibration', members,
             'suppression header ignored, so a peered pair would not terminate',
+        )
+
+    # ------------------------------------------------------------------ R10
+    # A PEER THAT STOPS ANSWERING.
+    #
+    # Everything above runs against a live pair. These run after it, because
+    # unittest orders methods alphabetically within a class and these are the
+    # only ones prefixed `test_z`. The peer is killed exactly once, by the
+    # first of them, and the rest read the aggregator afterwards.
+    #
+    # The suite has never taken a peer down before, which is why "the entities
+    # simply vanish" survived so long: every case measured a healthy pair, and
+    # a tree that changes shape when a link drops looks identical to a tree
+    # that never had the entity.
+
+    #: Seconds the aggregator took to notice, filled in by the first case.
+    _noticed_after_s = None
+    #: Ids the PEER called runtime-discovered, captured before it was killed.
+    _peer_runtime_ids = None
+    #: Ids the PEER called manifest-declared, captured before it was killed.
+    _peer_declared_ids = None
+
+    @staticmethod
+    def _peer_ids_by_declared_source():
+        """Ask the PEER which of its entities are manifest- and which runtime-declared.
+
+        The aggregator overwrites `source` with `peer:<name>` on arrival, so
+        the peer's own answer is the only place the distinction is visible.
+        Both collections are read: this topology manifests every app, so the
+        runtime half of the split lives among the components.
+        """
+        by_source = {}
+
+        def record(collection, item):
+            source = item.get('x-medkit', {}).get('source', '')
+            by_source.setdefault(source, []).append((collection, item.get('id')))
+
+        for collection in ('apps', 'components'):
+            response = requests.get(f'{PEER_URL}/{collection}', timeout=10)
+            response.raise_for_status()
+            for item in response.json().get('items', []):
+                record(collection, item)
+                if collection != 'components':
+                    continue
+                # A subcomponent is not in the flat list, and this topology puts
+                # the peer's leaf Component exactly there.
+                nested = requests.get(
+                    f"{PEER_URL}/components/{item.get('id')}/subcomponents", timeout=10)
+                if nested.status_code != 200:
+                    continue
+                for sub in nested.json().get('items', []):
+                    record('components', sub)
+        return by_source
+
+    @staticmethod
+    def _primary_entity(collection, entity_id):
+        """One entity as the PRIMARY currently sees it, or None."""
+        response = requests.get(f'{PRIMARY_URL}/{collection}', timeout=10)
+        if response.status_code != 200:
+            return None
+        for item in response.json().get('items', []):
+            if item.get('id') == entity_id:
+                return item
+        return None
+
+    @classmethod
+    def _primary_app(cls, app_id):
+        """One app as the PRIMARY currently sees it, or None."""
+        return cls._primary_entity('apps', app_id)
+
+    @staticmethod
+    def _primary_subcomponent(parent_id, subcomponent_id):
+        """One subcomponent as the PRIMARY currently sees it, or None."""
+        response = requests.get(
+            f'{PRIMARY_URL}/components/{parent_id}/subcomponents', timeout=10)
+        if response.status_code != 200:
+            return None
+        for item in response.json().get('items', []):
+            if item.get('id') == subcomponent_id:
+                return item
+        return None
+
+    def test_z1_a_declared_entity_survives_its_peer_going_silent(self, peer_gateway):
+        """R10: what a peer DECLARED does not stop being true when it goes quiet.
+
+        Retention is what makes every later rule stable. Without it the merged
+        set is rebuilt from healthy peers only, so an entity - and the
+        ambiguity it takes part in - disappears the moment a link drops.
+        """
+        cls = type(self)
+        by_source = self._peer_ids_by_declared_source()
+        cls._peer_declared_ids = by_source.get('manifest', [])
+        # Anything the peer did not call "manifest" it worked out for itself.
+        cls._peer_runtime_ids = [
+            entry
+            for source, entries in by_source.items() if source != 'manifest'
+            for entry in entries
+        ]
+        self.assertIn(
+            ('apps', 'peer_calibration'), cls._peer_declared_ids,
+            f'the peer does not consider peer_calibration manifest-declared: {by_source}',
+        )
+
+        before = self._primary_app('peer_calibration')
+        self.assertIsNotNone(before, 'peer_calibration was not merged while the peer was up')
+        self.assertNotEqual(
+            before.get('x-medkit', {}).get('available'), False,
+            'peer_calibration was already marked unavailable before the peer was killed',
+        )
+
+        pid = peer_gateway.process_details['pid']
+        os.kill(pid, signal.SIGKILL)
+
+        deadline = time.monotonic() + 60.0
+        started = time.monotonic()
+        observed = None
+        while time.monotonic() < deadline:
+            observed = self._primary_app('peer_calibration')
+            if observed is not None and observed.get('x-medkit', {}).get('available') is False:
+                cls._noticed_after_s = time.monotonic() - started
+                break
+            time.sleep(0.25)
+
+        self.assertIsNotNone(observed, 'peer_calibration vanished when its peer went silent')
+        x_medkit = observed.get('x-medkit', {})
+        self.assertIs(
+            x_medkit.get('available'), False,
+            f'a declared entity did not report itself unavailable within 60s: {observed}',
+        )
+        self.assertIs(
+            x_medkit.get('is_online'), False,
+            f'a retained app still claims to be running: {observed}',
+        )
+        # Detection is bounded by one discovery refresh (refresh_interval_ms,
+        # 1000 ms for a test gateway) plus the failed fetch, because the health
+        # check runs inside the refresh. Reported so a regression that pushes it
+        # towards the 30 s production default is visible rather than merely slow.
+        print(f'[retention] aggregator noticed the peer was gone in {cls._noticed_after_s:.1f}s')
+        self.assertLess(
+            cls._noticed_after_s, 30.0,
+            f'took {cls._noticed_after_s:.1f}s to notice a dead peer',
+        )
+
+    def test_z2_a_runtime_discovered_peer_entity_is_not_retained(self):
+        """R10, the other half: a live graph nobody can observe is not retained.
+
+        Keeping a runtime-discovered entity would assert something this
+        gateway can no longer see.
+        """
+        cls = type(self)
+        self.assertTrue(
+            cls._peer_runtime_ids,
+            'the peer declared everything it exposes, so this case would prove nothing',
+        )
+        for collection, entity_id in cls._peer_runtime_ids:
+            self.assertIsNone(
+                self._primary_entity(collection, entity_id),
+                f'{collection}/{entity_id} was runtime-discovered on the peer '
+                'and must not be retained',
+            )
+
+    def test_z2a_availability_is_carried_by_what_a_request_can_reach(self):
+        """R10: a Component answers for its reachability; a grouping has none.
+
+        The peer's subcomponent is a real thing behind a link that is down, so
+        it reports itself unreachable. The parent Component is declared on both
+        sides and this gateway still serves its half, so it stays reachable. An
+        Area and a Function are views over members: there is nothing to reach,
+        so they carry no availability at all and a client must ask the members.
+        """
+        cls = type(self)
+        self.assertIn(
+            ('components', PEER_SUBCOMPONENT), cls._peer_declared_ids,
+            f'the peer does not consider {PEER_SUBCOMPONENT} manifest-declared: '
+            f'{cls._peer_declared_ids}',
+        )
+
+        retained = self._primary_subcomponent(PARENT_COMPONENT, PEER_SUBCOMPONENT)
+        self.assertIsNotNone(
+            retained, f'{PEER_SUBCOMPONENT} vanished when its peer went silent')
+        self.assertIs(
+            retained.get('x-medkit', {}).get('available'), False,
+            f'a retained Component does not report itself unreachable: {retained}',
+        )
+
+        parent = self._primary_entity('components', PARENT_COMPONENT)
+        self.assertIsNotNone(
+            parent, f'{PARENT_COMPONENT} is declared here too and must remain')
+        self.assertNotEqual(
+            parent.get('x-medkit', {}).get('available'), False,
+            f'a Component this gateway still serves was marked unreachable: {parent}',
+        )
+
+        for collection, entity_id in (
+            ('areas', MERGED_AREA),
+            ('functions', MERGED_FUNCTION),
+        ):
+            with self.subTest(entity=f'{collection}/{entity_id}'):
+                grouping = self._primary_entity(collection, entity_id)
+                self.assertIsNotNone(grouping, f'{collection}/{entity_id} vanished')
+                # Read the block rather than defaulting it: "no available key"
+                # is only evidence if there is a block that could have held one.
+                self.assertIn(
+                    'x-medkit', grouping,
+                    f'{collection}/{entity_id} carries no x-medkit block, so this '
+                    f'case would prove nothing: {grouping}',
+                )
+                self.assertNotIn(
+                    'available', grouping['x-medkit'],
+                    f'{collection}/{entity_id} groups members and has no '
+                    f'availability of its own: {grouping}',
+                )
+
+    def test_z3_a_request_to_a_retained_entity_says_it_is_unavailable(self):
+        """R10: an unreachable member is answered, not proxied into a 502.
+
+        The body is asserted, not just the status: the failure this branch
+        exists to remove is a success shape with nothing in it, and a bare
+        status check passes straight over that.
+        """
+        response = requests.get(f'{PRIMARY_URL}/apps/peer_calibration', timeout=15)
+        self.assertEqual(
+            response.status_code, 504,
+            f'expected 504 for a retained member, got {response.status_code}: {response.text}',
+        )
+        body = response.json()
+        self.assertEqual(body.get('error_code'), 'not-responding', body)
+        self.assertIn('peer_calibration', body.get('message', ''), body)
+        self.assertEqual(body.get('parameters', {}).get('entity_id'), 'peer_calibration', body)
+
+    def test_z4_a_retained_member_keeps_the_operations_it_reported(self):
+        """R10: unreachable, not amnesiac.
+
+        What the member exposed is part of what it declared. Forgetting it
+        would make the tree change shape on a link drop all over again, one
+        level down.
+        """
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'operations')
+        ids = [item.get('id') for item in items]
+
+        # Counted, not merely present. A list that shrinks to one qualified
+        # entry satisfies "the id is still qualified" and "the bare form is
+        # still refused" while the client's view has quietly lost a member,
+        # which is the failure this whole rule exists to make impossible.
+        self.assertEqual(
+            ids.count('primary_calibration:calibrate'), 1, f'ids were {ids}',
+        )
+        self.assertEqual(
+            ids.count('peer_calibration:calibrate'), 1,
+            f'a retained member forgot the operation it last reported: {ids}',
+        )
+        self.assertEqual(
+            ids.count('calibrate'), 0,
+            f'a bare id reappeared once a member became unreachable: {ids}',
+        )
+
+        # And the retained copy says it cannot be served, so a client can tell
+        # "declared, unreachable" from "ready to run".
+        by_id = {item.get('id'): item for item in items}
+        self.assertIs(
+            by_id['peer_calibration:calibrate'].get('x-medkit', {}).get('available'), False,
+            'the retained operation does not report itself unavailable',
+        )
+        self.assertNotEqual(
+            by_id['primary_calibration:calibrate'].get('x-medkit', {}).get('available'), False,
+            'the local operation was marked unavailable',
+        )
+
+    def test_z5_ambiguity_does_not_move_when_a_peer_goes_silent(self):
+        """R10, and the reason retention matters at all.
+
+        Ambiguity is a property of the declared tree. If it tracked
+        reachability instead, this same request would be refused while the
+        peer answers and would quietly run the local member once it stopped -
+        the same request, two different answers, decided by a link.
+        """
+        response = requests.post(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/operations/calibrate/executions',
+            json={},
+            timeout=15,
+        )
+        self.assertEqual(
+            response.status_code, 400,
+            f'a bare ambiguous id stopped being refused once the peer went quiet: {response.text}',
+        )
+        body = response.json()
+        message = (body.get('message', '') + ' ' + str(body.get('parameters', {}))).lower()
+        self.assertIn('member', message, body)
+
+    def test_z6_every_id_the_list_offers_is_executable(self):
+        """The forward half of list/execution agreement.
+
+        z4 and z5 together cover the other half - a refused id is not offered.
+        This walks what the list actually offers and drives each one, because
+        an agreement checked in one direction only is how the list came to
+        advertise a bare id that execution refused.
+
+        `not 400` is the property, not `200`: a member whose gateway is silent
+        answers 504, which reports reachability rather than rejecting the id.
+        """
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'operations')
+        offered = [item.get('id') for item in items if item.get('id', '').endswith('calibrate')]
+        self.assertTrue(offered, 'the list offered no calibrate operation to check')
+
+        for operation_id in offered:
+            with self.subTest(operation=operation_id):
+                response = requests.post(
+                    f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/operations/'
+                    f'{quote(operation_id, safe="")}/executions',
+                    json={},
+                    timeout=15,
+                )
+                self.assertNotEqual(
+                    response.status_code, 400,
+                    f'the list offers {operation_id!r} but executing it is '
+                    f'refused: {response.text}',
+                )
+
+    def test_z7_suppression_omits_the_peer_without_losing_ambiguity(self):
+        """The loop-suppression guard, checked for the reason it was written.
+
+        Suppression means the peers were never asked, so their items are not
+        reported - that is what stops a bidirectionally peered pair bouncing a
+        request. It does not mean the tree forgot they exist: the id stays
+        qualified, so this response never offers a bare id that execution
+        refuses either.
+        """
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/operations',
+            headers={'X-Medkit-No-Fan-Out': '1'},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200)
+        items = response.json().get('items', [])
+        ids = [item.get('id') for item in items]
+
+        members = set()
+        for item in items:
+            members.update(item.get('x-medkit', {}).get('member_ids') or [])
+        self.assertNotIn(
+            'peer_calibration', members,
+            f'a suppressed response reported a peer-owned member: {ids}',
+        )
+        self.assertEqual(
+            ids.count('primary_calibration:calibrate'), 1,
+            f'suppression dropped the qualification along with the peer: {ids}',
+        )
+        self.assertEqual(
+            ids.count('calibrate'), 0,
+            f'a suppressed response offered a bare id that execution refuses: {ids}',
         )

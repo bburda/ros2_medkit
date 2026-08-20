@@ -1609,3 +1609,113 @@ TEST(AggregationManager, forward_accepts_api_v1_path) {
   // Should get 502 (peer unreachable), not 400 (path rejected)
   EXPECT_EQ(res.status, 502);
 }
+
+// A tree that changes shape when a link drops cannot be reasoned about: the
+// same request gets a different answer depending on who happens to be
+// reachable. What a peer DECLARED stays true while it is silent; what it merely
+// discovered from a live graph does not, because nothing can observe that graph
+// any more. These two tests pin both halves of that split.
+namespace {
+
+/// Mock peer serving one manifest-declared app and one runtime-discovered app.
+void install_two_origin_apps(httplib::Server & svr) {
+  svr.Get("/api/v1/health", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"status":"healthy"})", "application/json");
+  });
+  svr.Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get(R"(/api/v1/areas/([^/]+)/subareas)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    nlohmann::json items = nlohmann::json::array();
+    items.push_back({{"id", "declared_app"}, {"name", "Declared"}, {"x-medkit", {{"source", "manifest"}}}});
+    items.push_back({{"id", "discovered_app"}, {"name", "Discovered"}, {"x-medkit", {{"source", "runtime"}}}});
+    res.set_content(nlohmann::json({{"items", items}}).dump(), "application/json");
+  });
+  svr.Get(R"(/api/v1/apps/([^/]+)/operations)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+}
+
+const App * find_app(const std::vector<App> & apps, const std::string & id) {
+  for (const auto & app : apps) {
+    if (app.id == id) {
+      return &app;
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST(AggregationManager, retains_declared_peer_entities_when_the_peer_goes_silent) {
+  AggregationConfig config;
+  config.enabled = true;
+  config.timeout_ms = 1000;
+  AggregationConfig::PeerConfig peer;
+  peer.name = "silent_peer";
+
+  int port = 0;
+  {
+    MockPeerServer mock;
+    install_two_origin_apps(mock.server());
+    port = mock.start();
+    peer.url = "http://127.0.0.1:" + std::to_string(port);
+    config.peers.push_back(peer);
+
+    AggregationManager manager(config);
+    manager.check_all_health();
+    ASSERT_EQ(manager.healthy_peer_count(), 1u);
+
+    auto live = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+    const App * declared = find_app(live.apps, "declared_app");
+    const App * discovered = find_app(live.apps, "discovered_app");
+    ASSERT_NE(declared, nullptr);
+    ASSERT_NE(discovered, nullptr);
+    EXPECT_EQ(declared->declared_source, "manifest") << "the peer's own origin was overwritten by peer:<name>";
+    EXPECT_TRUE(declared->available);
+    EXPECT_TRUE(discovered->available);
+
+    // The peer stops answering: health goes false and the fetch fails.
+    mock.server().stop();
+    manager.check_all_health();
+    ASSERT_EQ(manager.healthy_peer_count(), 0u);
+
+    auto silent = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+    const App * retained = find_app(silent.apps, "declared_app");
+    ASSERT_NE(retained, nullptr) << "a declared entity vanished when its peer went quiet";
+    EXPECT_FALSE(retained->available) << "a retained entity must say it cannot be reached";
+    EXPECT_FALSE(retained->is_online) << "a retained app is not observably running";
+    EXPECT_EQ(find_app(silent.apps, "discovered_app"), nullptr)
+        << "a runtime-discovered entity describes a graph this gateway can no longer observe";
+  }
+}
+
+TEST(AggregationManager, retains_nothing_for_a_peer_that_never_answered) {
+  // Never reachable means nothing was ever declared to us, so there is nothing
+  // to keep asserting - the entity is absent, not unavailable.
+  AggregationConfig config;
+  config.enabled = true;
+  config.timeout_ms = 200;
+  AggregationConfig::PeerConfig peer;
+  peer.url = "http://127.0.0.1:1";  // nothing listens here
+  peer.name = "never_up";
+  config.peers.push_back(peer);
+
+  AggregationManager manager(config);
+  manager.check_all_health();
+  ASSERT_EQ(manager.healthy_peer_count(), 0u);
+
+  auto result = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
+  EXPECT_TRUE(result.apps.empty());
+  EXPECT_TRUE(result.components.empty());
+  EXPECT_TRUE(result.routing_table.empty());
+}

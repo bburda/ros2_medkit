@@ -133,6 +133,17 @@ struct App {
   std::string source = "manifest";        ///< "manifest" or "runtime"
   std::string original_id;                ///< Pre-rename ID when collision-prefixed by aggregation
   std::vector<std::string> contributors;  ///< Aggregation provenance: "local" and/or "peer:<name>"
+  /// What the contributing gateway itself called this entity: "manifest",
+  /// "runtime", "node" or "topic". `source` is overwritten with `peer:<name>`
+  /// on arrival, because the identity-merge precedence keys on it, so the
+  /// origin would otherwise be lost - and the origin is what decides whether
+  /// the entity is retained when its peer stops answering. Empty for entities
+  /// this gateway discovered itself.
+  std::string declared_source;
+  /// False while the peer contributing this entity is not answering and the
+  /// entity is being retained from its last known declaration. A retained
+  /// entity stays addressable and reports why it cannot be reached.
+  bool available{true};
 
   // === Serialization methods ===
 
@@ -159,7 +170,8 @@ inline bool operator==(const App & a, const App & b) {
          a.tags == b.tags && a.component_id == b.component_id && a.depends_on == b.depends_on &&
          a.ros_binding == b.ros_binding && a.bound_fqn == b.bound_fqn && a.is_online == b.is_online &&
          a.external == b.external && a.topics == b.topics && a.services == b.services && a.actions == b.actions &&
-         a.source == b.source && a.original_id == b.original_id && a.contributors == b.contributors;
+         a.source == b.source && a.original_id == b.original_id && a.contributors == b.contributors &&
+         a.declared_source == b.declared_source && a.available == b.available;
 }
 inline bool operator!=(const App & a, const App & b) {
   return !(a == b);

@@ -47,11 +47,22 @@ struct Component {
   std::string parent_component_id;        ///< Parent component ID for sub-components
   std::vector<std::string> depends_on;    ///< Component IDs this component depends on
   std::vector<std::string> contributors;  ///< Aggregation provenance: "local" and/or "peer:<name>"
-  std::vector<ServiceInfo> services;      ///< Services exposed by this component
-  std::vector<ActionInfo> actions;        ///< Actions exposed by this component
-  ComponentTopics topics;                 ///< Topics this component publishes/subscribes
-  std::optional<json> host_metadata;      ///< Host system metadata (for runtime default component)
-  AssetIdentity identity;                 ///< Asset-identity nameplate (merged across sources, per-field provenance)
+  /// What the contributing gateway itself called this entity: "manifest",
+  /// "runtime", "node" or "topic". `source` is overwritten with `peer:<name>`
+  /// on arrival, because the identity-merge precedence keys on it, so the
+  /// origin would otherwise be lost - and the origin is what decides whether
+  /// the entity is retained when its peer stops answering. Empty for entities
+  /// this gateway discovered itself.
+  std::string declared_source;
+  /// False while the peer contributing this entity is not answering and the
+  /// entity is being retained from its last known declaration. A retained
+  /// entity stays addressable and reports why it cannot be reached.
+  bool available{true};
+  std::vector<ServiceInfo> services;  ///< Services exposed by this component
+  std::vector<ActionInfo> actions;    ///< Actions exposed by this component
+  ComponentTopics topics;             ///< Topics this component publishes/subscribes
+  std::optional<json> host_metadata;  ///< Host system metadata (for runtime default component)
+  AssetIdentity identity;             ///< Asset-identity nameplate (merged across sources, per-field provenance)
 
   /// Tri-state: nullopt = no layer classified this component, true = non-ROS
   /// external asset (PLC/fieldbus/device), false = explicitly a ROS component.
@@ -195,7 +206,7 @@ inline bool operator==(const Component & a, const Component & b) {
          a.parent_component_id == b.parent_component_id && a.depends_on == b.depends_on &&
          a.contributors == b.contributors && a.services == b.services && a.actions == b.actions &&
          a.topics == b.topics && a.host_metadata == b.host_metadata && a.identity == b.identity &&
-         a.external == b.external;
+         a.external == b.external && a.declared_source == b.declared_source && a.available == b.available;
 }
 inline bool operator!=(const Component & a, const Component & b) {
   return !(a == b);

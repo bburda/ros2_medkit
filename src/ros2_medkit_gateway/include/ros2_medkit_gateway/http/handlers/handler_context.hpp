@@ -290,6 +290,10 @@ class HandlerContext {
    * @param res HTTP response
    * @param origin Origin header value
    */
+  /// False when the entity is only present because a peer's declaration is
+  /// being retained while that peer is silent.
+  bool is_entity_available(const std::string & entity_id) const;
+
   void set_cors_headers(httplib::Response & res, const std::string & origin) const;
 
   /**
