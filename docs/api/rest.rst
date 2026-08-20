@@ -2538,6 +2538,17 @@ immediately after a restart nothing has been discovered yet, and an entity that
 has merely not been reported yet has not disappeared. A restored trigger whose
 entity never appears stays listed and can be deleted through the API.
 
+A restored ``data`` trigger re-resolves its topic from the entity cache rather
+than from the topic name it was stored with, and that attempt is governed by
+the same rule as the record: while the entity has never been discovered the
+attempt keeps running and never gives up, so a trigger whose entity takes
+minutes to appear still subscribes and still fires. The gateway logs a warning
+naming the trigger once the entity has been missing for longer than the
+resolution budget, so an entity that never appears is visible rather than
+silent. Once the entity has been discovered, the budget applies as usual and a
+resource path that still cannot be resolved to a topic is given up on with a
+warning naming the trigger.
+
 Fault Triggers (threshold rules)
 --------------------------------
 
