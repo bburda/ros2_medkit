@@ -14,6 +14,10 @@ on:
     # Daily at 05:00 UTC. One hour after the OPC-UA nightly so the two do not
     # contend for runners.
     - cron: '0 5 * * *'
+  # On demand. The workflow does not run on pull requests, so a branch that
+  # touches the RoboStack build or the packages it compiles has no other way
+  # to exercise this suite before it reaches main.
+  workflow_dispatch:
 
 jobs:
   pixi-build:
