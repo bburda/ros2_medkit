@@ -233,6 +233,7 @@ if(BUILD_TESTING)
     test_cross_ecu_fanout
     test_daisy_chain_aggregation
     test_grouping_entity_aggregation
+    test_aggregate_lock_identity
     test_leaf_collision_aggregation
     test_startup_param_clamp_warnings)
   set(_MULTI_GATEWAY_DOMAINS 4)

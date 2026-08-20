@@ -73,6 +73,8 @@ R6  An item no leaf provides is refused, and is distinguishable from an item
 R7  A Component both sides contribute to aggregates. Routing it wholesale to
     one peer would discard the other half, which is what happens today.
 R8  A lock on a leaf is honoured by a request dispatched through an aggregate.
+    Verified in test_aggregate_lock_identity, which needs a second gateway
+    holding the lock and so cannot share this topology.
 R9  Peered gateways terminate.
 R10 A manifest-declared entity outlives the link that reported it: it stays in
     the tree, keeps the items it last reported, and says it cannot be reached.
