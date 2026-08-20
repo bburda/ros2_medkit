@@ -73,6 +73,33 @@ bool ReliabilityGate::allows_raise(const std::string & source_id) const {
   return (last_tick_ - graph_first_tick_) >= static_cast<uint64_t>(warmup_cycles_);
 }
 
+bool ReliabilityGate::allows_presence_ownership(const std::string & source_id) const {
+  if (!allows_raise(source_id)) {
+    return false;
+  }
+  // Read without gate_mutex_, for the same reason allows_raise() takes none: lifecycle_ is
+  // separately self-synchronized, and both run on the tick thread, sequentially after update().
+  // Two reads rather than one combined lock: the only transition either can observe mid-call is
+  // an empty label becoming a real one, and both orderings of that give the same answer here.
+  const auto label = lifecycle_.state_of(source_id);
+  if (!label.has_value()) {
+    return true;  // no managed record: a plain node, and its death is nobody else's to report
+  }
+  if (label->empty()) {
+    // Ignorance, and it is BOUNDED. While the watcher still has GetState attempts to spend, a
+    // measurement may be one tick away and taking ownership now would race it - that race is
+    // how a node that turns out to be merely inactive ends up latched here for good. Once the
+    // budget is spent nothing will ever measure this node again, and the only other detector
+    // that could report its departure looks at nothing unless an operator named it in
+    // `require_active`, which defaults to empty. Refusing past that point is not a handover,
+    // it is a node whose death nobody reports.
+    return !lifecycle_.measurement_pending(source_id);
+  }
+  // A measured non-active node is the lifecycle detector's business, and allows_raise() has
+  // already refused it anyway.
+  return *label == "active";
+}
+
 nlohmann::json ReliabilityGate::status_json() const {
   // Reader side of gate_mutex_ (see update()). Held across the lifecycle_ reads too - they
   // take the lifecycle SharedState mutex (order gate_mutex_ -> lifecycle mutex, never the
@@ -111,8 +138,14 @@ void ReliabilityGate::reset() {
   lifecycle_.reset();
 }
 
-void ReliabilityGate::set_lifecycle_state_for_test(const std::string & app_id, const std::string & label) {
-  lifecycle_.set_state_for_test(app_id, label);
+void ReliabilityGate::set_lifecycle_state_for_test(const std::string & app_id, const std::string & label,
+                                                   int reseeds_remaining) {
+  lifecycle_.set_state_for_test(app_id, label, reseeds_remaining);
+}
+
+int ReliabilityGate::lifecycle_reseeds_remaining_for_test(const std::string & app_id) const {
+  std::lock_guard<std::mutex> lock(gate_mutex_);
+  return lifecycle_.reseeds_remaining_for_test(app_id);
 }
 
 void ReliabilityGate::set_departed_lifecycle_state_for_test(const std::string & fqn, const std::string & label,
@@ -122,6 +155,10 @@ void ReliabilityGate::set_departed_lifecycle_state_for_test(const std::string & 
 
 bool reliability_allows(const ReliabilityGate * gate, const std::string & source_id) {
   return gate == nullptr || gate->allows_raise(source_id);
+}
+
+bool presence_ownership_allows(const ReliabilityGate * gate, const std::string & source_id) {
+  return gate == nullptr || gate->allows_presence_ownership(source_id);
 }
 
 }  // namespace ros2_medkit_graph_watchdog

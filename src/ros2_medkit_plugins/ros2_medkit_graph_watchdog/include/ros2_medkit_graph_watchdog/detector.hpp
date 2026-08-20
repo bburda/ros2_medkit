@@ -46,6 +46,16 @@ class ReliabilityGate;  // defined in reliability_gate.hpp; only a pointer is st
 // gate is null (not yet wired) or the entity is armed + lifecycle-ok.
 bool reliability_allows(const ReliabilityGate * gate, const std::string & source_id);
 
+// The stricter sibling of reliability_allows(), same null-gate convention, also defined in
+// reliability_gate.cpp: true when the PRESENCE detector will own this entity's departure -
+// see ReliabilityGate::allows_presence_ownership(). Where reliability_allows() answers
+// "may this entity raise" and is permissive about a label that has never been read, this
+// answers "does node_death own this node's departure" and refuses that same ignorance
+// while it can still resolve. Once the watcher has spent its GetState budget on a node the
+// ignorance is settled, and the answer flips back to true: withholding it past that point
+// would leave the node's death to a detector that only looks at `require_active` entries.
+bool presence_ownership_allows(const ReliabilityGate * gate, const std::string & source_id);
+
 /// QoS for subscribing to /tf_static: publishers latch with transient-local
 /// durability, so a late subscriber must match it to receive the static transforms.
 inline rclcpp::QoS tf_static_qos() {

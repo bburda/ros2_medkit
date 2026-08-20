@@ -919,6 +919,67 @@ if(BUILD_TESTING)
     ENV "GATEWAY_TEST_PORT=19520" "WATCHDOG_E2E_SCENARIO=d2_ungated_clear"
       "${_WATCHDOG_E2E_ENV}")
 
+  # === presence-ownership e2e (launch_testing) ===
+  #
+  # Which detector owns the departure of a managed node whose lifecycle state was never
+  # measured. Uses unreadable_lifecycle_node.cpp (advertises get_state / change_state like a
+  # managed node, and never answers GetState until told to), so the unmeasured window is
+  # permanent rather than a race between the GetState seed and the warmup - see
+  # test/e2e/test_presence_ownership_e2e.test.py's own module docstring for the three rows.
+
+  # 60 (arming, app_id-scoped) + 30 (faults-live) + 30 (empty-label poll) + 30 (departure poll)
+  # + 60 (DISAPPEARED raise poll) + 90 (UNREADABLE raise poll, kUnmeasuredHoldTicks is 60 fixed
+  # ticks plus the absence grace) = 300 internal - six independent budgets, not merged. Rounded
+  # to 420 to also cover the launch's own teardown for TWO processes (sigterm 30 + sigkill 15
+  # each, not fully serial).
+  medkit_add_launch_test(test_presence_ownership_e2e_budget_spent_then_owned
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 420
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19540" "WATCHDOG_E2E_SCENARIO=budget_spent_then_owned"
+      "${_WATCHDOG_E2E_ENV}")
+
+  # The same shape in the SHIPPED configuration (no require_active at all), where node_death is
+  # the only detector that can report the death. 60 (arming, app_id-scoped) + 30 (faults-live) +
+  # 30 (empty-label poll) + 30 (departure poll) + 60 (DISAPPEARED raise poll) + 10 (silence
+  # window, UNREADABLE, SILENCE_WINDOW_SEC) = 220 internal. Rounded to 360 to also cover the
+  # launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_presence_ownership_e2e_no_require_active_still_owned
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 360
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19570" "WATCHDOG_E2E_SCENARIO=no_require_active_still_owned"
+      "${_WATCHDOG_E2E_ENV}")
+
+  # The reverse transition on a live node: measured "active", then its lifecycle services are
+  # dropped, then it is killed. Uses droppable_lifecycle_node.cpp, the only fixture that can
+  # take a node from measured to unmeasured without killing it. 60 (arming, app_id-scoped) + 30
+  # (faults-live) + 30 (active-label poll) + 30 (SetParameters call) + 30 (null-label poll) + 30
+  # (departure poll) + 60 (DISAPPEARED raise poll) = 270 internal. Rounded to 360 to also cover
+  # the launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_presence_ownership_e2e_measured_then_unmeasured
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 360
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19580" "WATCHDOG_E2E_SCENARIO=measured_then_unmeasured"
+      "${_WATCHDOG_E2E_ENV}")
+
+  # 60 (arming, app_id-scoped) + 30 (faults-live) + 30 (empty-label poll) + 30 (SetParameters
+  # call) + 30 (active-label poll) + 30 (departure poll) + 60 (DISAPPEARED raise poll) = 270
+  # internal. Rounded to 360 to also cover the launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_presence_ownership_e2e_answered_then_owned
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 360
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19550" "WATCHDOG_E2E_SCENARIO=answered_then_owned"
+      "${_WATCHDOG_E2E_ENV}")
+
+  # test_01: 60 (arming, app_id-scoped) + 30 (empty-label poll) + 60 (PARAM_DRIFT raise poll) =
+  # 150. test_02: 60 (QOS_MISMATCH raise poll). test_03: 60 (ORPHAN raise poll) - 270 internal
+  # across the three cases, not merged. Nothing is killed here, so the only teardown is the
+  # launch's own for TWO processes; rounded to 360 for the same margin as its siblings.
+  medkit_add_launch_test(test_presence_ownership_e2e_gate_unaffected
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 360
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19560" "WATCHDOG_E2E_SCENARIO=gate_unaffected"
+      "${_WATCHDOG_E2E_ENV}")
+
   ros2_medkit_relax_vendor_warnings()
 
 endif()

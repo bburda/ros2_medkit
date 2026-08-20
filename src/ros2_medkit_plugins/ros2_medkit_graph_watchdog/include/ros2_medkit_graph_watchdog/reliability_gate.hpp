@@ -30,9 +30,12 @@ namespace ros2_medkit_graph_watchdog {
 
 /// Central gate composing per-entity warmup (WarmupTracker) with ROS lifecycle state
 /// (LifecycleWatcher). An entity is allowed to raise a fault once it has been armed
-/// (continuously present for warmup_cycles ticks) and its lifecycle state (if managed)
-/// is "active". Unknown source_ids (e.g. topics, not tracked apps) fall back to a
-/// global bringup grace period keyed off the first tick the graph was non-empty.
+/// (continuously present for warmup_cycles ticks) and its lifecycle state is not a KNOWN
+/// non-active one: a managed node whose GetState has never answered still passes, because
+/// gating on an unread label would silence every detector for it (LifecycleWatcher::node_ok()).
+/// Unknown source_ids (e.g. topics, not tracked apps) fall back to a global bringup grace
+/// period keyed off the first tick the graph was non-empty. allows_presence_ownership() below
+/// asks the narrower question the presence class needs, without moving this one.
 class ReliabilityGate {
  public:
   ReliabilityGate(int warmup_cycles, rclcpp::Node * gateway_node, std::mutex * node_mutex,
@@ -51,6 +54,26 @@ class ReliabilityGate {
   /// True if `source_id` is allowed to raise a fault: known entities must be armed
   /// and lifecycle-ok; unknown entities fall back to the global warmup window.
   bool allows_raise(const std::string & source_id) const;
+
+  /// True if the PRESENCE detector (node_death) will own this source's departure. It is
+  /// allowed to raise AND one of these holds:
+  ///
+  ///   - there is no managed record for it at all (a plain node)
+  ///   - the record reads "active"
+  ///   - the record carries no label and the watcher has spent every GetState attempt it
+  ///     will ever make on it (LifecycleWatcher::measurement_pending)
+  ///
+  /// Narrower than allows_raise(), and deliberately so. allows_raise() answers "may this
+  /// entity raise", and for a managed node whose label has never been read it answers yes,
+  /// because gating every detector on an unread label would silence a node whose GetState
+  /// never answers (see LifecycleWatcher::node_ok()). Ownership needs KNOWLEDGE rather than
+  /// permission, so an unread label answers no here - but only while that ignorance can
+  /// still resolve. Withholding it forever is not a handover: `lifecycle_expectation` is
+  /// the only other detector that could report such a node's departure, and it looks at
+  /// nothing unless an operator named the node in `require_active`, which defaults to
+  /// empty. Callers that latch this answer keep a node armed while active and later
+  /// deactivated - the latch, not this predicate, is what carries that.
+  bool allows_presence_ownership(const std::string & source_id) const;
 
   /// Raw lifecycle state label for `app_id` (delegates to the internal
   /// LifecycleWatcher), or nullopt if `app_id` is not a tracked managed lifecycle
@@ -76,8 +99,17 @@ class ReliabilityGate {
 
   /// Test seam: inject a lifecycle state label for `app_id` so a test can drive the
   /// composed warmup + lifecycle path (an armed entity whose lifecycle is non-active)
-  /// through allows_raise()/status_json() without a live managed node.
-  void set_lifecycle_state_for_test(const std::string & app_id, const std::string & label);
+  /// through allows_raise()/status_json() without a live managed node. `reseeds_remaining`
+  /// stages the OTHER half of an unmeasured node's state (see
+  /// LifecycleWatcher::measurement_pending): the default is what a freshly discovered node
+  /// carries, and 0 is the settled form.
+  void set_lifecycle_state_for_test(const std::string & app_id, const std::string & label,
+                                    int reseeds_remaining = LifecycleWatcher::kReseedAttempts);
+
+  /// Test seam: GetState re-seed budget the internal LifecycleWatcher has left for
+  /// `app_id`, or -1 if it is not tracked. Lets a test tie the ownership answer to the
+  /// budget actually running out rather than to a tick count that happens to correlate.
+  int lifecycle_reseeds_remaining_for_test(const std::string & app_id) const;
 
   /// Test-only seam: inject a departed-lifecycle entry directly (delegates to the
   /// internal LifecycleWatcher) so a suppressor unit test can drive
