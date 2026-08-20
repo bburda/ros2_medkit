@@ -373,6 +373,35 @@ TEST_F(LifecycleWatcherTest, ReseedBudgetIsNotChargedForAJobTheTickBudgetSkipped
       << "; a job the per-tick budget skipped must keep its attempts";
 }
 
+// The sharp form of the claim above, and the one the whole presence-ownership bound rests on:
+// not "some job kept its attempts" but "exactly the read that RAN was charged". Two managed
+// nodes, neither answering: the first read overruns the 150ms per-tick budget on its own
+// (~500ms reader timeout), the loop breaks, and the second node is left queued and unread. Its
+// budget must be untouched, not merely non-zero. An aggregate over eight nodes cannot say that
+// - a loop that charged half its queue would still leave the total above the floor - and an
+// implementation that charged every SELECTED job would drain a node that was never asked
+// anything, which is precisely the fact the bound reads as "we asked and failed".
+TEST_F(LifecycleWatcherTest, OnlyTheJobWhoseReadRanIsChargedWhenTheTickBudgetCutsTheQueue) {
+  const std::vector<std::string> ids{"/q0", "/q1"};
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+
+  w.update(managed_nodes_snapshot(ids), /*tick=*/1);  // both new: subscribed, full budget
+  for (const auto & id : ids) {
+    ASSERT_EQ(w.reseeds_remaining_for_test(id), ros2_medkit_graph_watchdog::LifecycleWatcher::kReseedAttempts)
+        << id << " must start with the full self-heal budget";
+  }
+
+  w.update(managed_nodes_snapshot(ids), /*tick=*/2);  // both selected; only one read fits
+  const int spent0 =
+      ros2_medkit_graph_watchdog::LifecycleWatcher::kReseedAttempts - w.reseeds_remaining_for_test("/q0");
+  const int spent1 =
+      ros2_medkit_graph_watchdog::LifecycleWatcher::kReseedAttempts - w.reseeds_remaining_for_test("/q1");
+  EXPECT_EQ(spent0 + spent1, 1) << "exactly one GetState can have run inside the per-tick blocking "
+                                   "budget, so exactly one attempt may have been charged - "
+                                   "/q0 spent "
+                                << spent0 << ", /q1 spent " << spent1;
+}
+
 // fqn capture + departed-lifecycle retention: a tracked node's stable fqn
 // (App::effective_fqn(), captured at first sighting) is what departed_state_of() is
 // keyed by, and its last-known label stays retrievable through that fqn for exactly

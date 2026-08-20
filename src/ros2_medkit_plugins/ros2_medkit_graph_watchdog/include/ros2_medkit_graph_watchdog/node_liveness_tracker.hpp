@@ -58,14 +58,19 @@ struct NodeDeathReport {
 ///   armed   - the subset whose departure the reliability gate says this detector OWNS: it
 ///             allows a raise for them AND their lifecycle state is either known not to be a
 ///             managed-non-active one or has been asked for as often as it ever will be
-///             (ReliabilityGate::allows_presence_ownership), so a managed node whose state
-///             is unread but still being asked for is deliberately not in this set
+///             (ReliabilityGate::presence_ownership), so a managed node whose state is
+///             unread but still being asked for is deliberately not in this set
 ///
 /// A key becomes TRACKED (added to `known_`) the first time it is armed, and stays tracked
 /// from then on regardless of its later arm state - so a node that is present but not
 /// currently armed (still warming up, or lifecycle-inactive) is never mistaken for dead:
 /// presence alone keeps a tracked key's miss counter at zero. A key is reported dead once
 /// its consecutive-miss counter exceeds `miss_grace`.
+///
+/// That stickiness is the right default for a key admitted on knowledge, and the wrong one
+/// for a key admitted only because nothing was known about it - see PresenceOwnership.
+/// release() is how the caller undoes the second kind, and it is the caller's job to know
+/// which kind it granted: this class is handed sets, not grounds.
 ///
 /// update() never removes a key BY AGE. An unsuppressed, still-dead entry has to stay
 /// reported for as long as it is actually dead - the alternative is a detector that quietly
@@ -150,6 +155,22 @@ class NodeLivenessTracker {
 
   explicit NodeLivenessTracker(int miss_grace, int prune_ticks = kNoPrune, int tracked_key_cap = kDefaultTrackedKeyCap)
     : miss_grace_(miss_grace), prune_ticks_(prune_ticks), tracked_key_cap_(tracked_key_cap < 1 ? 1 : tracked_key_cap) {
+  }
+
+  /// Undo the admission of a key that is still PRESENT and whose ground for being tracked
+  /// has been withdrawn (a provisionally owned node whose lifecycle label finally arrived and
+  /// said the node belongs to another detector - see PresenceOwnership::kProvisional).
+  ///
+  /// Only ever call this for a key the caller can see in this tick's snapshot. A present key
+  /// carries `misses_ == 0`, so dropping it loses no evidence: it is exactly the state a key
+  /// would be in if it had never been admitted at all. Calling it for an ABSENT key would be
+  /// a different act entirely - erasing an in-flight or already-matured death - and this
+  /// class deliberately offers no way to do that by age (see the class doc); prune() is the
+  /// one path that reclaims a departed key, and it demands a durable suppressor's veto first.
+  void release(const std::string & key) {
+    known_.erase(key);
+    misses_.erase(key);
+    suppressed_streak_.erase(key);
   }
 
   NodeDeathReport update(const std::set<std::string> & present, const std::set<std::string> & armed) {

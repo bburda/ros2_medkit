@@ -938,6 +938,19 @@ if(BUILD_TESTING)
     ENV "GATEWAY_TEST_PORT=19540" "WATCHDOG_E2E_SCENARIO=budget_spent_then_owned"
       "${_WATCHDOG_E2E_ENV}")
 
+  # The two GROUNDS for ownership, and the only row here that asserts GRAPH_NODE_DISAPPEARED
+  # ABSENT: the fixture is left until its GetState budget is spent (provisional ownership),
+  # then told to announce "inactive", then killed. 60 (arming, app_id-scoped) + 30
+  # (faults-live) + 30 (unread-and-settled poll) + 30 (SetParameters call) + 30 (late-label
+  # poll) + 30 (departure poll) + 60 (INACTIVE raise poll) + 10 (silence window, DISAPPEARED,
+  # SILENCE_WINDOW_SEC) = 280 internal - eight independent budgets, not merged. Rounded to 420
+  # to also cover the launch's own teardown for TWO processes.
+  medkit_add_launch_test(test_presence_ownership_e2e_provisional_yields_to_a_real_label
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 420
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19590" "WATCHDOG_E2E_SCENARIO=provisional_yields_to_a_real_label"
+      "${_WATCHDOG_E2E_ENV}")
+
   # The same shape in the SHIPPED configuration (no require_active at all), where node_death is
   # the only detector that can report the death. 60 (arming, app_id-scoped) + 30 (faults-live) +
   # 30 (empty-label poll) + 30 (departure poll) + 60 (DISAPPEARED raise poll) + 10 (silence

@@ -114,7 +114,7 @@ class LifecycleWatcher {
   /// issue another GetState for it, so the label can only still change through a
   /// ~/transition_event the node may never publish. A caller deciding who OWNS such a
   /// node's departure must treat that as settled and take it, or the node is reported by
-  /// nobody - see ReliabilityGate::allows_presence_ownership().
+  /// nobody - see ReliabilityGate::presence_ownership().
   bool measurement_pending(const std::string & app_id) const;
   /// Last cached lifecycle label of a node that WAS tracked but is no longer present in
   /// the snapshot (departed within `departed_retention_ticks` ticks of "now"), keyed by

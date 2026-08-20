@@ -24,6 +24,7 @@
 
 #include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"  // IntrospectionInput
 #include "ros2_medkit_graph_watchdog/lifecycle_watcher.hpp"
+#include "ros2_medkit_graph_watchdog/presence_ownership.hpp"
 #include "ros2_medkit_graph_watchdog/warmup_tracker.hpp"
 
 namespace ros2_medkit_graph_watchdog {
@@ -34,8 +35,8 @@ namespace ros2_medkit_graph_watchdog {
 /// non-active one: a managed node whose GetState has never answered still passes, because
 /// gating on an unread label would silence every detector for it (LifecycleWatcher::node_ok()).
 /// Unknown source_ids (e.g. topics, not tracked apps) fall back to a global bringup grace
-/// period keyed off the first tick the graph was non-empty. allows_presence_ownership() below
-/// asks the narrower question the presence class needs, without moving this one.
+/// period keyed off the first tick the graph was non-empty. presence_ownership() below asks
+/// the narrower question the presence class needs, without moving this one.
 class ReliabilityGate {
  public:
   ReliabilityGate(int warmup_cycles, rclcpp::Node * gateway_node, std::mutex * node_mutex,
@@ -55,25 +56,29 @@ class ReliabilityGate {
   /// and lifecycle-ok; unknown entities fall back to the global warmup window.
   bool allows_raise(const std::string & source_id) const;
 
-  /// True if the PRESENCE detector (node_death) will own this source's departure. It is
-  /// allowed to raise AND one of these holds:
+  /// On what grounds the PRESENCE detector (node_death) owns this source's departure. The
+  /// entity must be allowed to raise at all, and then:
   ///
-  ///   - there is no managed record for it at all (a plain node)
-  ///   - the record reads "active"
-  ///   - the record carries no label and the watcher has spent every GetState attempt it
-  ///     will ever make on it (LifecycleWatcher::measurement_pending)
+  ///   - no managed record for it (a plain node)      -> kEarned
+  ///   - the record reads "active"                    -> kEarned
+  ///   - no label yet, GetState attempts still to run  -> kNone (we have not finished asking)
+  ///   - no label, every attempt spent                -> kProvisional (we asked and failed)
+  ///   - any other label                              -> kNone (measured non-active)
   ///
   /// Narrower than allows_raise(), and deliberately so. allows_raise() answers "may this
   /// entity raise", and for a managed node whose label has never been read it answers yes,
   /// because gating every detector on an unread label would silence a node whose GetState
-  /// never answers (see LifecycleWatcher::node_ok()). Ownership needs KNOWLEDGE rather than
-  /// permission, so an unread label answers no here - but only while that ignorance can
-  /// still resolve. Withholding it forever is not a handover: `lifecycle_expectation` is
-  /// the only other detector that could report such a node's departure, and it looks at
-  /// nothing unless an operator named the node in `require_active`, which defaults to
-  /// empty. Callers that latch this answer keep a node armed while active and later
-  /// deactivated - the latch, not this predicate, is what carries that.
-  bool allows_presence_ownership(const std::string & source_id) const;
+  /// never answers (see LifecycleWatcher::node_ok()). Ownership needs knowledge rather than
+  /// permission, so an unread label answers kNone while that ignorance can still resolve.
+  ///
+  /// It does NOT stay kNone forever: `lifecycle_expectation` is the only other detector that
+  /// could report such a node's departure, and it looks at nothing unless an operator named
+  /// the node in `require_active`, which defaults to empty. So once the watcher has stopped
+  /// asking, the answer becomes kProvisional - owned, because otherwise nobody reports this
+  /// death, and provisional, because the label may still arrive over ~/transition_event
+  /// (that subscription outlives the seed budget) and would then say the node was never
+  /// this detector's. See PresenceOwnership for what each caller owes the distinction.
+  PresenceOwnership presence_ownership(const std::string & source_id) const;
 
   /// Raw lifecycle state label for `app_id` (delegates to the internal
   /// LifecycleWatcher), or nullopt if `app_id` is not a tracked managed lifecycle

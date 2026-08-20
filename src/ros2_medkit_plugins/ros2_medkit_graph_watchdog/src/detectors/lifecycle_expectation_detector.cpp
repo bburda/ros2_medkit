@@ -328,22 +328,29 @@ class LifecycleExpectationDetector : public Detector {
         // will. Reading it from the one gate both detectors share on the same tick is what
         // makes "armed" trustworthy rather than a guess: it is not derived from this node's
         // own lifecycle label, it IS the fact the presence detector would itself consult if
-        // asked right now. The tracker needs it to
-        // tell a node the presence detector could someday report from one it structurally
-        // never can - see LifecycleExpectationTracker's own class doc. Deliberately NOT
-        // reliability_allows(): that one is permissive about a managed node whose lifecycle
-        // label has never been read, and a node nobody has ever measured is precisely one
-        // the presence detector cannot own, so taking its permission for ownership would
-        // switch this detector's absence path off for the node that needs it most.
-        // ANDed with is_online for the same reason the predicate is asked at all: this value
-        // stands for "the presence detector could report this node's departure", and
-        // node_death skips an app that is not online before it ever consults the gate. The
-        // gate has no notion of online-ness, so a manifest app whose node never started is
-        // armed, carries no lifecycle record, and would otherwise read as owned by a detector
-        // that will never look at it. The remaining filters node_death applies need no mirror
-        // here: a peer-aggregated app and one with no binding both have an empty fqn and are
-        // already skipped above.
-        const bool armed = app.is_online && presence_ownership_allows(ctx.gate, app.id);
+        // asked right now. The tracker needs it to tell a node the presence detector could
+        // someday report from one it structurally never can - see LifecycleExpectationTracker's
+        // own class doc. Deliberately NOT reliability_allows(): that one is permissive about a
+        // managed node whose lifecycle label has never been read, so taking its permission for
+        // ownership would switch this detector's absence path off for a node the presence class
+        // does not actually hold - either because the watcher has not finished asking about it,
+        // or because it asked, gave up, and then a label arrived and took the node back.
+        //
+        // kEarned only, and the two exclusions are for different reasons.
+        //
+        // A PROVISIONAL grant is deliberately not enough: the tracker latches this value for
+        // the node's whole life, and a provisional grant is the one node_death itself gives up
+        // the moment a real label arrives. Latching it here would leave this detector believing
+        // the presence class had a node it had already handed back - the same silence in the
+        // opposite direction.
+        //
+        // ANDed with is_online because node_death skips an app that is not online before it
+        // ever consults the gate, and the gate has no notion of online-ness: a manifest app
+        // whose node never started is armed, carries no lifecycle record, and would otherwise
+        // read as owned by a detector that will never look at it. The remaining filters
+        // node_death applies need no mirror here: a peer-aggregated app and one with no binding
+        // both have an empty fqn and are already skipped above.
+        const bool armed = app.is_online && presence_ownership(ctx.gate, app.id) == PresenceOwnership::kEarned;
         // One match per (entry, node): the tracker keys violations by NODE, so two
         // namesakes are both reported instead of one silently replacing the other.
         matches.push_back(LifecycleMatch{id, fqn, state, armed});

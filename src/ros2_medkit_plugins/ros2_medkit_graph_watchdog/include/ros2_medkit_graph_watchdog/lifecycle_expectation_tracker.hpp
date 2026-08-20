@@ -343,9 +343,10 @@ struct LifecycleExpectationReport {
 ///   to the presence detector no matter what happens to it afterwards. Two shapes reach
 ///   that bar and fail it: a `require_active` entry that comes up `unconfigured` and is
 ///   killed before its own `grace` elapses, and a node that is not online, which node_death
-///   skips before it ever asks the gate. A managed node whose state is merely UNREAD is not
-///   one of them for long: the gate withholds ownership only while it is still asking, and
-///   hands the node back once it has stopped. Holding
+///   skips before it ever asks the gate. A managed node whose state is merely UNREAD is a
+///   third, and a temporary one: the gate withholds ownership while it is still asking, then
+///   grants it PROVISIONALLY once it stops - and that grant is not latched here, because the
+///   presence detector itself gives it up the moment a real label arrives. Holding
 ///   this streak too would mean nothing in the plugin ever reports the departure. This
 ///   keeps the same bound a still-climbing UNMEASURED clock already has regardless of
 ///   arming (see "Bounded by evidence, not by age" below): the streak matures within
