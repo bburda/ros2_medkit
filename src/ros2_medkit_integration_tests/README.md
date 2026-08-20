@@ -76,6 +76,7 @@ ros2 launch ros2_medkit_integration_tests demo_nodes.launch.py
 | `controller` | `/body/lights` | Subscriber + Publisher | Light controller (command/status) |
 | `calibration` | `/powertrain/engine` | Service | Trigger-based calibration |
 | `long_calibration` | `/powertrain/engine` | Action | Fibonacci-based long-running action |
+| `dual_calibration` | `/testrig/dual` | Services + Actions | `left/calibrate` and `right/calibrate`, `left/sweep` and `right/sweep` - one provider carrying each operation short name twice, so the ROS path is the only id that separates the copies |
 
 ## Writing New Tests
 

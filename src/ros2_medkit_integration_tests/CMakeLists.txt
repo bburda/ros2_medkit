@@ -77,7 +77,7 @@ medkit_target_dependencies(demo_calibration_service rclcpp rcl_interfaces std_sr
 
 add_executable(demo_dual_calibration_service demo_nodes/dual_calibration_service.cpp)
 target_include_directories(demo_dual_calibration_service PRIVATE ${_demo_include_dir})
-medkit_target_dependencies(demo_dual_calibration_service rclcpp std_srvs)
+medkit_target_dependencies(demo_dual_calibration_service rclcpp rclcpp_action example_interfaces std_srvs)
 
 add_executable(demo_long_calibration_action demo_nodes/long_calibration_action.cpp)
 target_include_directories(demo_long_calibration_action PRIVATE ${_demo_include_dir})

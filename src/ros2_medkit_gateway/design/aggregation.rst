@@ -476,6 +476,19 @@ name:
    POST /api/v1/components/vehicle-ecu/operations/dual_calibration:testrig/dual/left/calibrate/executions
      -> POST /api/v1/apps/dual_calibration/operations/testrig/dual/left/calibrate/executions
 
+The executions of an operation are addressed the same way, and dispatched for
+the same reason. A goal lives on the gateway that sent it - the one the ``POST``
+was dispatched to - so listing it has to reach that gateway too:
+
+.. code-block:: text
+
+   GET /api/v1/functions/vehicle_health/operations/peer_long_calibration:long_calibration/executions
+     -> GET /api/v1/apps/peer_long_calibration/operations/long_calibration/executions
+
+Answering that from the aggregator's own goal tracking returns an empty
+collection for goals that exist, which reads as "this operation has never been
+run".
+
 The member's own gateway is the only one that can answer: the ROS service, the
 topic and the parameter behind the id exist on its graph and nowhere else. What
 this gateway holds for a peer-owned member is a declaration, which is why the
