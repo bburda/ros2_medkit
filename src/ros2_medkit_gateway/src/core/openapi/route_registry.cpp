@@ -502,7 +502,8 @@ nlohmann::json RouteRegistry::to_openapi_paths() const {
                "the entity contributes an item under that name"},
               {"operation_id",
                "The operation identifier (service or action short name), or 'member_id:operation' when more than "
-               "one member of the entity exposes that name"},
+               "one member of the entity exposes that name, or the ROS 2 path without its leading slash when one "
+               "provider exposes that short name at more than one path"},
               {"execution_id", "The execution identifier"},
               {"config_id", "The configuration parameter identifier (ROS 2 parameter name)"},
               {"fault_code", "The fault code identifier"},
