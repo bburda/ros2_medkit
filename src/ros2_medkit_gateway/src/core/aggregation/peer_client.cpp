@@ -790,6 +790,15 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   if (req.has_header("X-Medkit-No-Fan-Out")) {
     headers.emplace("X-Medkit-No-Fan-Out", "1");
   }
+  // The client's identity, which is what a lock is held against. The peer owns
+  // the entity, so the peer holds the lock and judges every request against the
+  // name it recorded; a request that arrives anonymous is a different caller
+  // than the one that took the lock, whoever sent it. It is not a credential -
+  // authority travels in Authorization, which is forwarded only when the
+  // deployment says the peer is trusted with it.
+  if (req.has_header("X-Client-Id")) {
+    headers.emplace("X-Client-Id", req.get_header_value("X-Client-Id"));
+  }
 
   httplib::Result result{nullptr, httplib::Error::Unknown};
   const std::string path = path_with_query(req);

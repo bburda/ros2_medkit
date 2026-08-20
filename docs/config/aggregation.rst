@@ -312,6 +312,16 @@ Combine static peers for known infrastructure with mDNS for dynamic discovery:
    configuration. See :ref:`Security Parameters <aggregation-security>`
    for details on securing peer communication.
 
+.. note::
+
+   ``X-Client-Id`` is always forwarded, and is not governed by
+   ``forward_auth``. It names the caller rather than granting it anything:
+   a lock on a peer-owned entity is held on the peer and judged there, so a
+   forwarded request that arrived without the name would be a different
+   caller than the one holding the lock. Authority still travels only in
+   ``Authorization``, which is forwarded when the deployment says the peer
+   is trusted with it.
+
 Secure Aggregation (TLS + Auth)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
