@@ -1058,8 +1058,17 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
           return cache.find_entity(entity_id).has_value();
         });
 
-    // Load persistent triggers
-    trigger_mgr_->load_persistent_triggers();
+    trigger_mgr_->set_warn_log_fn([this](const std::string & message) {
+      RCLCPP_WARN(get_logger(), "%s", message.c_str());
+    });
+    // Load persistent triggers. This is the only pass: a trigger the store
+    // holds but this call does not put back stays absent until the next
+    // restart, so the count is worth having in the log of every start that
+    // asked for a restore.
+    const size_t restored_triggers = trigger_mgr_->load_persistent_triggers();
+    if (trigger_config.on_restart_behavior == "restore") {
+      RCLCPP_INFO(get_logger(), "Restored %zu persistent trigger(s) from the trigger store", restored_triggers);
+    }
 
     // Wire notifier to managers so they emit events for trigger evaluation
     if (update_mgr_) {
@@ -1091,9 +1100,6 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
         }
       }
       return "";
-    });
-    trigger_mgr_->set_warn_log_fn([this](const std::string & message) {
-      RCLCPP_WARN(get_logger(), "%s", message.c_str());
     });
     // The deferred-resolution budget must outlive at least one full discovery
     // refresh: plugin-declared topics only reach the entity cache on a refresh

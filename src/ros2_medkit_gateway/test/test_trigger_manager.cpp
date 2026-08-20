@@ -1076,6 +1076,80 @@ TEST_F(TriggerManagerTest, Sweep_FreesCapacitySlots) {
   EXPECT_TRUE(after_sweep.has_value()) << "Should have capacity after sweep: " << after_sweep.error().message;
 }
 
+/// A gateway that has never seen an entity cannot conclude the entity is gone.
+/// Restore runs once, during construction, and the sweep runs from the first
+/// tick after that - long before DDS reports nodes that were already up. A
+/// sweep there would delete the trigger from the shared store for good.
+TEST(LoadPersistentTriggers, SweepKeepsRestoredTriggerBeforeItsEntityIsDiscovered) {
+  ResourceChangeNotifier notifier;
+  ConditionRegistry registry;
+  registry.register_condition("OnChange", std::make_shared<OnChangeEvaluator>());
+
+  SqliteTriggerStore store(":memory:");
+  ASSERT_TRUE(store.save(make_persistent_trigger("trig_7")).has_value());
+
+  TriggerConfig config;
+  config.max_triggers = 100;
+  config.on_restart_behavior = "restore";
+  TriggerManager manager(notifier, registry, store, config);
+  manager.load_persistent_triggers();
+  ASSERT_TRUE(manager.get("trig_7").has_value()) << "Trigger should have been restored";
+
+  // Discovery has not reported the entity yet - the state every restart passes
+  // through, for as long as DDS takes.
+  manager.set_entity_exists_fn([](const std::string & /*id*/, const std::string & /*entity_type*/) {
+    return false;
+  });
+  manager.sweep_orphaned_triggers();
+  manager.sweep_orphaned_triggers();
+
+  EXPECT_TRUE(manager.get("trig_7").has_value())
+      << "Restored trigger was swept before its entity had a chance to be discovered";
+  auto loaded = store.load_all();
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->size(), 1u) << "The store row must survive too - restore never runs again";
+
+  manager.shutdown();
+  notifier.shutdown();
+}
+
+/// The relaxation above is bounded by having seen the entity once: after that,
+/// a missing entity is a real orphan and the trigger goes, store row included.
+TEST(LoadPersistentTriggers, SweepRemovesRestoredTriggerAfterItsEntityIsDiscoveredAndLost) {
+  ResourceChangeNotifier notifier;
+  ConditionRegistry registry;
+  registry.register_condition("OnChange", std::make_shared<OnChangeEvaluator>());
+
+  SqliteTriggerStore store(":memory:");
+  ASSERT_TRUE(store.save(make_persistent_trigger("trig_8")).has_value());
+
+  TriggerConfig config;
+  config.max_triggers = 100;
+  config.on_restart_behavior = "restore";
+  TriggerManager manager(notifier, registry, store, config);
+  manager.load_persistent_triggers();
+  ASSERT_TRUE(manager.get("trig_8").has_value());
+
+  bool entity_present = true;
+  manager.set_entity_exists_fn([&entity_present](const std::string & /*id*/, const std::string & /*entity_type*/) {
+    return entity_present;
+  });
+
+  manager.sweep_orphaned_triggers();
+  ASSERT_TRUE(manager.get("trig_8").has_value()) << "A discovered entity is not an orphan";
+
+  entity_present = false;
+  manager.sweep_orphaned_triggers();
+
+  EXPECT_FALSE(manager.get("trig_8").has_value()) << "An entity that was discovered and then lost is an orphan";
+  auto loaded = store.load_all();
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_TRUE(loaded->empty()) << "Sweeping an orphan drops its store row as well";
+
+  manager.shutdown();
+  notifier.shutdown();
+}
+
 // ===========================================================================
 // Deferred topic resolution tests
 // ===========================================================================

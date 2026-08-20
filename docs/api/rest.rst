@@ -2513,6 +2513,16 @@ configuration:
 
 Non-persistent triggers are always cleared on restart.
 
+Restore happens once, while the gateway starts. The number of triggers it put
+back is logged, so a restart that restored fewer than expected is visible in
+the gateway log rather than only in a later 404.
+
+The gateway also removes triggers whose entity has left discovery. A restored
+trigger is exempt from that until its entity has been discovered at least once:
+immediately after a restart nothing has been discovered yet, and an entity that
+has merely not been reported yet has not disappeared. A restored trigger whose
+entity never appears stays listed and can be deleted through the API.
+
 Fault Triggers (threshold rules)
 --------------------------------
 

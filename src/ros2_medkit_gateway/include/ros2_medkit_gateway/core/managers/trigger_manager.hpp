@@ -142,7 +142,11 @@ class TriggerManager {
   void shutdown();
 
   /// Load persistent triggers from the store (on gateway restart).
-  void load_persistent_triggers();
+  ///
+  /// Runs once, while the gateway is being constructed, and returns how many
+  /// triggers it put back. Nothing retries it, so a trigger that is not
+  /// restored here is absent for the life of the process.
+  size_t load_persistent_triggers();
 
   // --- Hierarchy matching ---------------------------------------------------
 
@@ -199,6 +203,7 @@ class TriggerManager {
   ///   - `info.entity_id` and `info.entity_type` are immutable after creation
   ///     and safe to read without `mtx` (e.g. in matches_entity()).
   ///   - `active` is atomic and can be read/written without `mtx`.
+  ///   - `entity_seen` is atomic and can be read/written without `mtx`.
   struct TriggerState {
     TriggerInfo info;
     nlohmann::json previous_value;
@@ -206,6 +211,15 @@ class TriggerManager {
     std::mutex mtx;
     std::condition_variable cv;
     std::atomic<bool> active{true};
+    /// Whether this gateway has ever found the trigger's entity in discovery.
+    ///
+    /// The orphan sweep removes a trigger whose entity is missing, and for a
+    /// trigger created through the API the entity was validated to exist, so
+    /// missing can only mean gone: true is the right starting point. A trigger
+    /// restored from the store is the exception - the process that created it
+    /// is not this one, so until discovery reports the entity, missing means
+    /// "not discovered yet" and there is nothing to conclude.
+    std::atomic<bool> entity_seen{true};
     std::deque<nlohmann::json> pending_events;
     static constexpr size_t kMaxPendingEvents = 100;
     std::atomic<uint64_t> event_counter{0};
