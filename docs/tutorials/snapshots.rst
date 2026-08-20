@@ -31,8 +31,9 @@ configuration always overrides the zero-config fallback when present.
 
 .. note::
 
-   Snapshots are automatically deleted when a fault is cleared via the
+   By default, snapshots are deleted when a fault is cleared via the
    ``DELETE /api/v1/faults/{code}`` endpoint or ``~/clear_fault`` service.
+   Set ``snapshots.retain_on_clear: true`` to keep them across clears.
 
 Quick Start
 -----------
@@ -98,8 +99,19 @@ Configure snapshot capture via fault manager parameters:
        Prevents snapshot storms when a fault is reported repeatedly. Set to 0 to disable.
    * - ``snapshots.max_per_fault``
      - ``10``
-     - Maximum number of snapshots stored per fault code. When the limit is reached,
-       new snapshots for that fault are rejected. Set to 0 for unlimited.
+     - Maximum number of snapshot rows stored per fault code. One confirmation
+       writes one row per configured topic, and those rows are evicted together:
+       past the limit the OLDEST capture set is dropped whole. A capture larger
+       than the cap is kept anyway rather than torn, since half a freeze frame
+       is indistinguishable from topics that were silent. Set to 0 for
+       unlimited.
+   * - ``snapshots.retain_on_clear``
+     - ``false``
+     - Keep a fault's value snapshots when it is acknowledged. ``false`` is the
+       historical behaviour: clearing a fault deletes them. Turn it on together
+       with ``rosbag.max_bags_per_fault``, or acknowledging leaves the fault
+       holding recordings whose matching readings are gone. Independent of
+       ``max_per_fault``, which still bounds growth either way.
    * - ``snapshots.capture_pool_size``
      - ``2``
      - Max concurrent capture threads under a fault storm (>= 1). This parallelizes
@@ -348,7 +360,8 @@ Troubleshooting
 
 **Empty topics object in response**
 
-- The fault may have been cleared (snapshots are deleted on clear)
+- The fault may have been cleared (snapshots are deleted on clear unless
+  ``snapshots.retain_on_clear`` is enabled)
 - No topics were configured for this fault code
 - All configured topics timed out or exceeded size limit
 
@@ -498,7 +511,10 @@ Rosbag Configuration Options
      - ``true``
      - Automatically delete a fault's bag when it is cleared. A recording
        shared by a burst of faults is deleted when the last fault referencing
-       it clears. Set to ``false`` to retain bags for manual analysis.
+       it clears. Set to ``false`` to retain bags for manual analysis. Has no
+       effect once ``max_bags_per_fault`` is anything other than ``1``: a
+       history someone configured must not be what an acknowledgement takes
+       away, so the cap governs retention there instead.
    * - ``snapshots.rosbag.lazy_start``
      - ``false``
      - Controls when the ring buffer starts recording. See diagram below.
