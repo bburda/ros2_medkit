@@ -244,6 +244,15 @@ if(BUILD_TESTING)
     test_startup_param_clamp_warnings)
   set(_MULTI_GATEWAY_DOMAINS 4)
 
+  # Two-gateway tests that need the second gateway isolated from the first and
+  # ask for offset 1 only. Listed apart from the four-domain set above because
+  # a test holds every domain it is given for as long as it runs: asking for
+  # four where two are used takes two away from whatever the runner could
+  # otherwise have started alongside it.
+  set(_TWO_GATEWAY_TESTS
+    test_triggers_restore_before_discovery)
+  set(_TWO_GATEWAY_DOMAINS 2)
+
   # Tests whose polling budgets do not fit the glob's default timeout. Keyed by
   # test name; anything not listed takes the default for its glob.
   #
@@ -295,6 +304,8 @@ if(BUILD_TESTING)
     set(_test_domains 1)
     if(test_name IN_LIST _MULTI_GATEWAY_TESTS)
       set(_test_domains ${_MULTI_GATEWAY_DOMAINS})
+    elseif(test_name IN_LIST _TWO_GATEWAY_TESTS)
+      set(_test_domains ${_TWO_GATEWAY_DOMAINS})
     endif()
     set(_test_timeout 120)
     list(FIND _MEDKIT_TEST_TIMEOUT_OVERRIDES ${test_name} _test_timeout_idx)
@@ -324,6 +335,8 @@ if(BUILD_TESTING)
     set(_test_domains 1)
     if(test_name IN_LIST _MULTI_GATEWAY_TESTS)
       set(_test_domains ${_MULTI_GATEWAY_DOMAINS})
+    elseif(test_name IN_LIST _TWO_GATEWAY_TESTS)
+      set(_test_domains ${_TWO_GATEWAY_DOMAINS})
     endif()
     set(_test_timeout 300)
     list(FIND _MEDKIT_TEST_TIMEOUT_OVERRIDES ${test_name} _test_timeout_idx)

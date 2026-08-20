@@ -223,25 +223,50 @@ void TriggerManager::set_entity_exists_fn(EntityExistsFn fn) {
 }
 
 void TriggerManager::sweep_orphaned_triggers() {
-  // Phase 1: collect orphaned trigger IDs under lock
-  std::vector<std::string> orphaned;
+  // Phase 1: collect orphaned triggers under lock
+  std::vector<std::pair<std::string, std::string>> orphaned;  // trigger id, entity id
+  WarnLogFn warn_fn;
   {
     std::lock_guard<std::mutex> lock(triggers_mutex_);
     std::lock_guard<std::mutex> elock(entity_exists_mutex_);
     if (!entity_exists_fn_) {
       return;
     }
+    warn_fn = warn_log_fn_;
     for (const auto & [id, state] : triggers_) {
       // entity_id and entity_type are immutable after creation - safe to read without state->mtx
-      if (state->active.load() && !entity_exists_fn_(state->info.entity_id, state->info.entity_type)) {
-        orphaned.push_back(id);
+      if (!state->active.load()) {
+        continue;
       }
+      if (entity_exists_fn_(state->info.entity_id, state->info.entity_type)) {
+        state->entity_seen.store(true);
+        continue;
+      }
+      // An entity this gateway has never seen has not disappeared from its
+      // discovery, so a trigger on it is not orphaned - the sweep runs from
+      // the first tick after startup, long before DDS has reported nodes that
+      // were already running when the gateway came up. Sweeping it there would
+      // delete a restored persistent trigger from the shared store, and
+      // restore runs once per process, so nothing would ever bring it back.
+      if (!state->entity_seen.load()) {
+        continue;
+      }
+      orphaned.emplace_back(id, state->info.entity_id);
     }
   }
 
   // Phase 2: remove without holding triggers_mutex_ (remove() re-acquires it)
-  for (const auto & id : orphaned) {
-    remove(id);
+  for (const auto & entry : orphaned) {
+    remove(entry.first);
+  }
+
+  // A sweep deletes a persistent trigger from the store as well, so the
+  // operator loses it permanently. Name what went and why.
+  if (warn_fn) {
+    for (const auto & entry : orphaned) {
+      warn_fn("orphan sweep: removed trigger '" + entry.first + "' because entity '" + entry.second +
+              "' is not in the discovery cache.");
+    }
   }
 }
 
@@ -657,79 +682,124 @@ void TriggerManager::set_on_removed(OnRemovedCallback callback) {
 // Persistent trigger loading
 // ---------------------------------------------------------------------------
 
-void TriggerManager::load_persistent_triggers() {
+size_t TriggerManager::load_persistent_triggers() {
   if (config_.on_restart_behavior != "restore") {
-    return;
+    return 0;
+  }
+
+  // Collected under the lock, emitted after release: warn_log_fn_ is an
+  // arbitrary external callback and must not run under triggers_mutex_.
+  std::vector<std::string> warnings;
+  WarnLogFn warn_fn;
+  {
+    std::lock_guard<std::mutex> lock(triggers_mutex_);
+    warn_fn = warn_log_fn_;
   }
 
   auto load_result = store_.load_all();
   if (!load_result.has_value()) {
-    return;
+    // Restore runs once, during construction. A store that cannot be read
+    // therefore does not delay the operator's persistent triggers, it ends
+    // them: the REST API answers 404 for the life of the process, exactly as
+    // if they had never been created.
+    if (warn_fn) {
+      warn_fn("persistent trigger restore: reading the trigger store failed (" + load_result.error() +
+              "). No persistent trigger was restored, and restore is not retried, so they stay absent until this "
+              "gateway is restarted.");
+    }
+    return 0;
   }
 
-  std::lock_guard<std::mutex> lock(triggers_mutex_);
-  for (auto & info : load_result.value()) {
-    if (info.status != TriggerStatus::ACTIVE) {
-      continue;
-    }
+  size_t restored = 0;
+  {
+    std::lock_guard<std::mutex> lock(triggers_mutex_);
+    for (auto & info : load_result.value()) {
+      // A TERMINATED row is a trigger that already ran its course; the store
+      // keeps it as a record, and not restoring it is what TERMINATED means.
+      if (info.status != TriggerStatus::ACTIVE) {
+        continue;
+      }
 
-    // Check if expired
-    if (info.expires_at.has_value() && std::chrono::system_clock::now() >= info.expires_at.value()) {
-      nlohmann::json fields;
-      fields["status"] = "TERMINATED";
-      (void)store_.update(info.id, fields);
-      continue;
-    }
-
-    auto state = std::make_shared<TriggerState>();
-    state->info = std::move(info);
-
-    // Restore previous value state if available
-    auto state_result = store_.load_state(state->info.id);
-    if (state_result.has_value() && state_result.value().has_value()) {
-      state->previous_value = state_result.value().value();
-      state->has_previous_value = true;
-    }
-
-    // Update next_id_ to avoid collisions
-    // IDs are "trig_N" - extract N and ensure next_id_ is beyond it
-    auto underscore_pos = state->info.id.find('_');
-    if (underscore_pos != std::string::npos) {
-      try {
-        auto loaded_id = std::stoull(state->info.id.substr(underscore_pos + 1));
-        uint64_t current = next_id_.load();
-        while (current <= loaded_id && !next_id_.compare_exchange_weak(current, loaded_id + 1)) {
+      if (info.expires_at.has_value() && std::chrono::system_clock::now() >= info.expires_at.value()) {
+        // The operator created this one and it is not coming back. Say so once
+        // - the write-back below makes it TERMINATED, so the next restart
+        // takes the branch above instead.
+        warnings.push_back("persistent trigger restore: trigger '" + info.id + "' on entity '" + info.entity_id +
+                           "' expired while the gateway was down and was not restored.");
+        nlohmann::json fields;
+        fields["status"] = "TERMINATED";
+        auto update_result = store_.update(info.id, fields);
+        if (!update_result.has_value()) {
+          warnings.push_back("persistent trigger restore: marking expired trigger '" + info.id +
+                             "' TERMINATED in the store failed (" + update_result.error() +
+                             "). It stays ACTIVE on disk and is re-examined on every restart.");
         }
-      } catch (...) {
-        // Non-numeric suffix - skip ID adjustment
+        continue;
       }
-    }
 
-    add_to_dispatch_index(state->info.id, state->info.collection, state->info.entity_id);
+      auto state = std::make_shared<TriggerState>();
+      state->info = std::move(info);
+      // This process has never discovered the entity, so the orphan sweep must
+      // not read "missing from the cache" as "gone" until discovery has had
+      // its say.
+      state->entity_seen.store(false);
 
-    // Re-subscribe to topic for restored data triggers via the transport.
-    if (topic_transport_ && state->info.collection == "data" && !state->info.resolved_topic_name.empty()) {
-      const std::string trigger_id = state->info.id;
-      const std::string entity_id = state->info.entity_id;
-      const std::string resource_path = state->info.resource_path;
-      auto handle =
-          topic_transport_->subscribe(state->info.resolved_topic_name, /*msg_type=*/"",
-                                      [this, entity_id, resource_path](const nlohmann::json & sample) {
-                                        notifier_.notify("data", entity_id, resource_path, sample, ChangeType::UPDATED);
-                                      });
-      if (handle) {
-        topic_handles_[trigger_id] = std::move(handle);
-      } else {
-        // Subscribe failed during persistent-trigger restore (e.g. the
-        // topic disappeared between shutdown and restart, or rclcpp threw
-        // inside TriggerTopicSubscriber). Queue the trigger for retry on
-        // the next refresh tick instead of leaving it active-but-silent.
-        unresolved_data_triggers_.push_back({trigger_id, entity_id, resource_path, std::chrono::steady_clock::now()});
+      // Restore previous value state if available
+      auto state_result = store_.load_state(state->info.id);
+      if (state_result.has_value() && state_result.value().has_value()) {
+        state->previous_value = state_result.value().value();
+        state->has_previous_value = true;
       }
-    }
 
-    triggers_[state->info.id] = std::move(state);
+      // Update next_id_ to avoid collisions
+      // IDs are "trig_N" - extract N and ensure next_id_ is beyond it
+      auto underscore_pos = state->info.id.find('_');
+      if (underscore_pos != std::string::npos) {
+        try {
+          auto loaded_id = std::stoull(state->info.id.substr(underscore_pos + 1));
+          uint64_t current = next_id_.load();
+          while (current <= loaded_id && !next_id_.compare_exchange_weak(current, loaded_id + 1)) {
+          }
+        } catch (...) {
+          // Non-numeric suffix - skip ID adjustment
+        }
+      }
+
+      add_to_dispatch_index(state->info.id, state->info.collection, state->info.entity_id);
+
+      // Re-subscribe to topic for restored data triggers via the transport.
+      if (topic_transport_ && state->info.collection == "data" && !state->info.resolved_topic_name.empty()) {
+        const std::string trigger_id = state->info.id;
+        const std::string entity_id = state->info.entity_id;
+        const std::string resource_path = state->info.resource_path;
+        auto handle = topic_transport_->subscribe(state->info.resolved_topic_name, /*msg_type=*/"",
+                                                  [this, entity_id, resource_path](const nlohmann::json & sample) {
+                                                    notifier_.notify("data", entity_id, resource_path, sample,
+                                                                     ChangeType::UPDATED);
+                                                  });
+        if (handle) {
+          topic_handles_[trigger_id] = std::move(handle);
+        } else {
+          // Subscribe failed during persistent-trigger restore (e.g. the
+          // topic disappeared between shutdown and restart, or rclcpp threw
+          // inside TriggerTopicSubscriber). Queue the trigger for retry on
+          // the next refresh tick instead of leaving it active-but-silent.
+          unresolved_data_triggers_.push_back({trigger_id, entity_id, resource_path, std::chrono::steady_clock::now()});
+        }
+      }
+
+      triggers_[state->info.id] = std::move(state);
+      ++restored;
+    }
   }
+
+  if (warn_fn) {
+    for (const auto & w : warnings) {
+      warn_fn(w);
+    }
+  }
+
+  return restored;
 }
 
 // ---------------------------------------------------------------------------
