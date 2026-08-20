@@ -97,20 +97,27 @@ std::string to_full_topic_path(const std::string & topic_name) {
   return "/" + topic_name;
 }
 
-/// What one addressed data item resolves to: the ROS topic to act on, and the
-/// id to echo back to the caller.
+/// What one addressed data item resolves to: the ROS topic to act on, the id to
+/// echo back to the caller, the member the id named, and whether this gateway's
+/// own walk records that member as a provider of the topic.
 struct AddressedDataItem {
   std::string full_topic_path;
   std::string item_id;
+  std::string member_id;                 ///< Empty when the id carried no member half.
+  bool provided_by_named_member{false};  ///< Meaningful only when member_id is set.
 };
 
 /// Resolve the id in the route against the entity, for reads and writes alike.
 ///
-/// A qualified id is answered exactly, because the member set and what each
-/// member contributes are both known here: an id naming an unknown member, or
-/// an item that member does not provide, is a miss. Without that check the
-/// gateway samples the local graph, finds nothing, and returns 200 with an
-/// empty body and status `metadata_only` - a typo reported as success.
+/// A qualified id is answered exactly, because the member set is known here: an
+/// id naming a member the entity does not have is a miss. Without that check the
+/// gateway samples the local graph, finds nothing, and returns 200 with an empty
+/// body and status `metadata_only` - a typo reported as success.
+///
+/// Whether the named member provides the item is REPORTED, not decided: the
+/// answer comes from this gateway's own walk, which holds no topics for a member
+/// another gateway runs, so acting on it here would turn every peer-owned item
+/// into a miss. The caller resolves ownership first and only then reads the flag.
 ///
 /// A ROS topic name cannot contain a colon, so one in the id can only be the
 /// member separator. Building the member set is not free, so the cache is only
@@ -139,33 +146,63 @@ address_data_item(const ThreadSafeEntityCache & cache, const std::string & entit
                    json{{"entity_id", entity_id}, {"id", topic_name}, {"member_id", parsed.member_id}}));
   }
 
-  // A member retained while its gateway is silent stays addressable and says
-  // why it cannot answer, rather than falling through to a sample of the local
-  // graph that comes back empty and reads as success.
-  if (auto app = cache.get_app(parsed.member_id); app && !app->available) {
-    return tl::make_unexpected(
-        make_error(504, ERR_NOT_RESPONDING, "Member '" + parsed.member_id + "' is not available",
-                   json{{"details",
-                         "The gateway contributing this member is not answering; it is retained from its "
-                         "last known declaration"},
-                        {"entity_id", entity_id},
-                        {"id", topic_name},
-                        {"member_id", parsed.member_id}}));
+  // An id whose member half is followed by nothing names no item. Carried
+  // further it would address the member's data COLLECTION - the route that
+  // answers a request with one trailing slash fewer - and hand back a list to a
+  // caller that asked for a single value.
+  if (parsed.item_id.empty()) {
+    return tl::make_unexpected(make_error(
+        404, ERR_RESOURCE_NOT_FOUND, "Data item not provided by member",
+        json{{"entity_id", entity_id}, {"id", topic_name}, {"member_id", parsed.member_id}, {"topic_name", ""}}));
   }
 
+  addressed.member_id = parsed.member_id;
   addressed.full_topic_path = to_full_topic_path(parsed.item_id);
   auto owners = aggregated.owners_by_topic.find(addressed.full_topic_path);
-  if (owners == aggregated.owners_by_topic.end() ||
-      std::find(owners->second.begin(), owners->second.end(), parsed.member_id) == owners->second.end()) {
-    return tl::make_unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "Data item not provided by member",
-                                          json{{"entity_id", entity_id},
-                                               {"id", topic_name},
-                                               {"member_id", parsed.member_id},
-                                               {"topic_name", addressed.full_topic_path}}));
-  }
+  addressed.provided_by_named_member =
+      owners != aggregated.owners_by_topic.end() &&
+      std::find(owners->second.begin(), owners->second.end(), parsed.member_id) != owners->second.end();
 
   addressed.item_id = http::make_member_qualified_id(parsed.member_id, addressed.full_topic_path);
   return addressed;
+}
+
+/// The member's own data route for the topic an id addressed. A qualified id
+/// with an empty item half is refused before this point, so `full_topic_path`
+/// always opens with the slash `to_full_topic_path` guarantees and the
+/// concatenation carries exactly one separator.
+std::string member_data_resource_path(const std::string & full_topic_path) {
+  return "data" + full_topic_path;
+}
+
+/// Settle where an addressed data item is served, and hand the request over when
+/// that is another gateway. Reads and writes share it because they address the
+/// item identically and the owner of the topic is the same either way.
+///
+/// Returns the answer the handler must return - including the sentinel that says
+/// the owning peer has already committed the wire - or nullopt when this gateway
+/// serves the item itself. The "member does not provide it" refusal is decided
+/// here rather than while addressing, because it rests on the local walk, which
+/// says nothing about a member another gateway runs.
+std::optional<ErrorInfo> dispatch_data_item(const HandlerContext & ctx, const http::TypedRequest & req,
+                                            const std::string & entity_id, const std::string & topic_name,
+                                            const AddressedDataItem & addressed) {
+  auto dispatch = ctx.dispatch_to_member(req, addressed.member_id, member_data_resource_path(addressed.full_topic_path),
+                                         json{{"entity_id", entity_id}, {"id", topic_name}});
+  if (!dispatch) {
+    return dispatch.error();
+  }
+  if (*dispatch == MemberDispatch::kForwarded) {
+    return HandlerContext::forwarded_sentinel_error();
+  }
+  if (!addressed.member_id.empty() && !addressed.provided_by_named_member) {
+    return make_error(404, ERR_RESOURCE_NOT_FOUND, "Data item not provided by member",
+                      json{{"entity_id", entity_id},
+                           {"id", topic_name},
+                           {"member_id", addressed.member_id},
+                           {"topic_name", addressed.full_topic_path}});
+  }
+  return std::nullopt;
 }
 
 /// Build the typed x-medkit per-item payload for the list endpoint.
@@ -489,6 +526,10 @@ http::Result<dto::DataValue> DataHandlers::get_data_item(const http::TypedReques
     if (!addressed) {
       return tl::make_unexpected(addressed.error());
     }
+
+    if (auto answered = dispatch_data_item(ctx_, req, entity_id, topic_name, *addressed)) {
+      return tl::make_unexpected(*answered);
+    }
     const std::string & full_topic_path = addressed->full_topic_path;
 
     // Sampling goes through the pool-backed TopicDataProvider (issue #375 race
@@ -660,10 +701,16 @@ http::Result<dto::DataValue> DataHandlers::put_data_item(const http::TypedReques
                      json{{"details", "Message type should be in format: package/msg/Type"}, {"type", msg_type}}));
     }
 
-    // A write addresses the same item a read does, so it resolves the same way.
+    // A write addresses the same item a read does, so it resolves the same way -
+    // including which gateway publishes it. Publishing here for a member another
+    // gateway runs would create a publisher on a graph that member is not on.
     auto addressed = address_data_item(ctx_.node()->get_thread_safe_cache(), entity_id, topic_name);
     if (!addressed) {
       return tl::make_unexpected(addressed.error());
+    }
+
+    if (auto answered = dispatch_data_item(ctx_, req, entity_id, topic_name, *addressed)) {
+      return tl::make_unexpected(*answered);
     }
     const std::string & full_topic_path = addressed->full_topic_path;
 

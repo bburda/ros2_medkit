@@ -109,6 +109,22 @@ class AggregationManager;
 namespace handlers {
 
 /**
+ * @brief Where a request addressed to one member of an aggregating entity is
+ *        served.
+ *
+ * An aggregating entity - a merged Function, an Area, a Component with members -
+ * has no resources of its own; it lists what its members provide, under ids that
+ * name the member. Such an entity is deliberately absent from the routing table,
+ * because routing it whole to one peer would discard every member the other
+ * contributors hold. The member, however, has exactly one owner, and that owner
+ * is the only gateway whose ROS graph carries the topic or service behind the id.
+ */
+enum class MemberDispatch {
+  kServeLocally,  ///< This gateway owns the member; the handler continues.
+  kForwarded,     ///< The owning peer answered; the wire is committed.
+};
+
+/**
  * @brief Shared context for all HTTP handlers
  *
  * Provides access to gateway node, configuration, and common utilities
@@ -264,6 +280,38 @@ class HandlerContext {
    */
   http::ValidatorResult<EntityInfo> validate_entity_for_route(const http::TypedRequest & req,
                                                               const std::string & entity_id) const;
+
+  /**
+   * @brief Serve a member-qualified request on the gateway that owns the member.
+   *
+   * `validate_entity_for_route` routes a whole entity, which is the wrong unit
+   * for an aggregating one: the entity is a view whose members can sit on
+   * different gateways, so the routing table deliberately holds no entry for it
+   * and every request lands here. The member is the unit that has an owner, so
+   * the request is re-addressed to the member's own entity route - `/apps/{id}/...`
+   * or `/components/{id}/...` - on that owner. Anything the local walk knows about
+   * a member another gateway runs is at best a declaration; the topic and the
+   * service themselves only exist over there.
+   *
+   * Reachability is answered before anything is sent. A member retained while
+   * its gateway is silent is still in the tree and still addressable, and the
+   * honest answer is that it cannot be reached - forwarding to a dead peer would
+   * dress that up as a 502, which blames this gateway for a link that is down.
+   *
+   * @param req Typed request supplying method, headers, body and query.
+   * @param member_id Member the id named. Empty means the id named none.
+   * @param member_resource_path Path below the member entity, without a leading
+   *        slash (e.g. `data/chassis/brakes/pressure`,
+   *        `operations/calibrate/executions`).
+   * @param error_params Parameters to attach to the `not-responding` body so a
+   *        caller learns which request could not be served.
+   * @return kServeLocally when the handler must carry on, kForwarded when the
+   *         peer's response is already on the wire, or a 504 ErrorInfo when the
+   *         member's gateway is silent.
+   */
+  http::Result<MemberDispatch> dispatch_to_member(const http::TypedRequest & req, const std::string & member_id,
+                                                  const std::string & member_resource_path,
+                                                  nlohmann::json error_params) const;
 
   /**
    * @brief Build the framework-internal sentinel error that typed handlers

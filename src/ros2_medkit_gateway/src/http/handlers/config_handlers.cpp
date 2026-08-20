@@ -115,6 +115,36 @@ const NodeConfigInfo * find_node_for_app(const std::vector<NodeConfigInfo> & nod
   return nullptr;
 }
 
+/// Settle where a member-qualified configuration id is served, and hand the
+/// request over when that is another gateway. Reads, writes and resets share it
+/// because a parameter has exactly one owning node whatever the method is.
+///
+/// A parameter is owned by a ROS node, and the node behind a member another
+/// gateway runs is on a graph this one cannot see: the local walk records no
+/// FQN for it, so every method resolved here refuses an id that names it. The
+/// member, however, is an entity with an owner, and on that owner the parameter
+/// is addressed by its bare name under the member's own App or Component route -
+/// nothing over there is aggregating, so nothing over there qualifies the id.
+///
+/// Returns the answer the handler must return - including the sentinel that says
+/// the owning peer has already committed the wire - or nullopt when this gateway
+/// serves the parameter itself, which is every unprefixed id and every member
+/// this gateway owns. An unprefixed id carries no member half, and an empty
+/// member id is the case `dispatch_to_member` answers with kServeLocally.
+std::optional<ErrorInfo> dispatch_configuration(const HandlerContext & ctx, const http::TypedRequest & req,
+                                                const std::string & entity_id, const std::string & param_id,
+                                                const ParsedParamId & parsed) {
+  auto dispatch = ctx.dispatch_to_member(req, parsed.app_id, "configurations/" + parsed.param_name,
+                                         json{{"entity_id", entity_id}, {"id", param_id}});
+  if (!dispatch) {
+    return dispatch.error();
+  }
+  if (*dispatch == MemberDispatch::kForwarded) {
+    return HandlerContext::forwarded_sentinel_error();
+  }
+  return std::nullopt;
+}
+
 /// Build a typed `ErrorInfo` for a failed parameter operation. Mirrors the
 /// legacy `send_parameter_error` helper's wire shape (params: details +
 /// entity_id + id, message: "Failed to <op> parameter").
@@ -470,6 +500,10 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::get_configuration(cons
   auto * config_mgr = ctx_.node()->get_configuration_manager();
   auto parsed = parse_aggregated_param_id(param_id, agg_configs.is_aggregated);
 
+  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
+    return tl::unexpected(*answered);
+  }
+
   // If targeting a specific app in an aggregated entity, dispatch to that
   // app's node directly.
   if (parsed.has_prefix) {
@@ -592,6 +626,10 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::set_configuration(cons
     return make_read_value(entity_id, node_fqn, param_id, source_app, param_data);
   };
 
+  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
+    return tl::unexpected(*answered);
+  }
+
   if (parsed.has_prefix) {
     const auto * node_info = find_node_for_app(agg_configs.nodes, parsed.app_id);
     if (node_info == nullptr) {
@@ -663,6 +701,10 @@ http::Result<http::NoContent> ConfigHandlers::delete_configuration(const http::T
 
   auto * config_mgr = ctx_.node()->get_configuration_manager();
   auto parsed = parse_aggregated_param_id(param_id, agg_configs.is_aggregated);
+
+  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
+    return tl::unexpected(*answered);
+  }
 
   if (parsed.has_prefix) {
     const auto * node_info = find_node_for_app(agg_configs.nodes, parsed.app_id);

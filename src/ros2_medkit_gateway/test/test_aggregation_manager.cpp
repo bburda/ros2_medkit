@@ -846,6 +846,139 @@ static void install_entity_endpoints(httplib::Server & svr, size_t num_areas, si
 }
 
 // =============================================================================
+// Explicitly addressed forwarding (forward_request with a target path)
+// =============================================================================
+
+TEST(AggregationManager, forward_to_target_path_addresses_the_path_the_caller_chose) {
+  // An aggregating entity has no counterpart on the peer, so the request the
+  // client sent cannot be replayed there. Measured on the peer's own view of
+  // the request line, because a forward that quietly kept the incoming path
+  // would still answer 200 from whatever the peer happens to serve.
+  MockPeerServer mock;
+  std::string seen_path;
+  mock.server().Get(R"(/api/v1/(.+))", [&seen_path](const httplib::Request & req, httplib::Response & res) {
+    seen_path = req.path;
+    res.set_content(R"({"id":"served"})", "application/json");
+  });
+  int port = mock.start();
+
+  AggregationConfig config;
+  config.enabled = true;
+  config.timeout_ms = 5000;
+  AggregationConfig::PeerConfig peer;
+  peer.url = "http://127.0.0.1:" + std::to_string(port);
+  peer.name = "peer_0";
+  config.peers.push_back(peer);
+  AggregationManager manager(config);
+
+  httplib::Request req;
+  req.method = "GET";
+  req.path = "/api/v1/functions/vehicle_health/data/pressure_sensor:chassis/brakes/pressure";
+  httplib::Response res;
+
+  manager.forward_request("peer_0", req, res, "/api/v1/apps/pressure_sensor/data/chassis/brakes/pressure");
+
+  EXPECT_EQ(res.status, 200);
+  EXPECT_EQ(seen_path, "/api/v1/apps/pressure_sensor/data/chassis/brakes/pressure");
+}
+
+TEST(AggregationManager, forward_to_target_path_strips_the_peer_prefix_from_the_target) {
+  // A member renamed on collision is known to its own gateway by the original
+  // id, and the target path is built from the merged id, so the rewrite has to
+  // reach the path the caller supplied rather than the one the client sent.
+  MockPeerServer mock;
+  std::string seen_path;
+  mock.server().Get(R"(/api/v1/(.+))", [&seen_path](const httplib::Request & req, httplib::Response & res) {
+    seen_path = req.path;
+    res.set_content(R"({"id":"served"})", "application/json");
+  });
+  int port = mock.start();
+
+  AggregationConfig config;
+  config.enabled = true;
+  config.timeout_ms = 5000;
+  AggregationConfig::PeerConfig peer;
+  peer.url = "http://127.0.0.1:" + std::to_string(port);
+  peer.name = "peer_0";
+  config.peers.push_back(peer);
+  AggregationManager manager(config);
+
+  httplib::Request req;
+  req.method = "GET";
+  req.path = "/api/v1/functions/vehicle_health/data/peer_0__shared_sensor:chassis/brakes/pressure";
+  httplib::Response res;
+
+  manager.forward_request("peer_0", req, res, "/api/v1/apps/peer_0__shared_sensor/data/chassis/brakes/pressure");
+
+  EXPECT_EQ(res.status, 200);
+  EXPECT_EQ(seen_path, "/api/v1/apps/shared_sensor/data/chassis/brakes/pressure");
+}
+
+TEST(AggregationManager, forward_to_target_path_refuses_a_target_outside_the_api) {
+  // The target is assembled from client-supplied ids, so it is exactly as
+  // untrusted as the incoming path and gets the same SSRF guard. A guard that
+  // checked the incoming path instead would pass this, because the incoming
+  // path is a perfectly ordinary API path.
+  MockPeerServer mock;
+  std::atomic<bool> reached{false};
+  mock.server().Get(R"(/(.*))", [&reached](const httplib::Request &, httplib::Response & res) {
+    reached = true;
+    res.set_content("{}", "application/json");
+  });
+  int port = mock.start();
+
+  AggregationConfig config;
+  config.enabled = true;
+  config.timeout_ms = 5000;
+  AggregationConfig::PeerConfig peer;
+  peer.url = "http://127.0.0.1:" + std::to_string(port);
+  peer.name = "peer_0";
+  config.peers.push_back(peer);
+  AggregationManager manager(config);
+
+  httplib::Request req;
+  req.method = "GET";
+  req.path = "/api/v1/functions/vehicle_health/data/admin:x";
+  httplib::Response res;
+
+  manager.forward_request("peer_0", req, res, "/admin/shutdown");
+
+  EXPECT_EQ(res.status, 400);
+  EXPECT_FALSE(reached.load());
+}
+
+TEST(AggregationManager, forward_without_a_target_path_still_addresses_the_incoming_one) {
+  // The two-argument form is the whole-entity forward and must keep replaying
+  // the client's own path.
+  MockPeerServer mock;
+  std::string seen_path;
+  mock.server().Get(R"(/api/v1/(.+))", [&seen_path](const httplib::Request & req, httplib::Response & res) {
+    seen_path = req.path;
+    res.set_content(R"({"id":"served"})", "application/json");
+  });
+  int port = mock.start();
+
+  AggregationConfig config;
+  config.enabled = true;
+  config.timeout_ms = 5000;
+  AggregationConfig::PeerConfig peer;
+  peer.url = "http://127.0.0.1:" + std::to_string(port);
+  peer.name = "peer_0";
+  config.peers.push_back(peer);
+  AggregationManager manager(config);
+
+  httplib::Request req;
+  req.method = "GET";
+  req.path = "/api/v1/apps/camera_driver/data";
+  httplib::Response res;
+
+  manager.forward_request("peer_0", req, res);
+
+  EXPECT_EQ(res.status, 200);
+  EXPECT_EQ(seen_path, "/api/v1/apps/camera_driver/data");
+}
+
+// =============================================================================
 // max_entities_per_peer safety limit test
 // =============================================================================
 
