@@ -372,9 +372,13 @@ std::string RouteRegistry::to_regex_path(const std::string & openapi_path, const
   // Special cases:
   //   - {data_id} at the end of data paths -> (.+) (multi-segment, for slash-containing topic names)
   //   - {config_id} at the end of configuration paths -> (.+) (for slash-containing param names)
+  //   - {operation_id} anywhere -> (.+) (an operation is addressed by ROS path where one
+  //     provider carries its short name twice, and the executions sub-resources sit behind it)
   //   - All other {param} -> ([^/]+) (single segment)
   //
   // The "end of path" check ensures only the LAST param on data/config paths gets (.+).
+  // {operation_id} carries no such check because the sub-resource routes put it mid-path;
+  // the routes it can then swallow are registered ahead of it (see setup_routes).
 
   // Root path "/" -> just optional slash anchor (prefix already has the base path)
   if (openapi_path == "/") {
@@ -395,7 +399,7 @@ std::string RouteRegistry::to_regex_path(const std::string & openapi_path, const
       bool is_last = (close + 1 >= openapi_path.size());
 
       // Use (.+) for the final segment on data and configuration item paths
-      if (is_last && (param_name == "data_id" || param_name == "config_id")) {
+      if (param_name == "operation_id" || (is_last && (param_name == "data_id" || param_name == "config_id"))) {
         result += "(.+)";
       } else {
         result += "([^/]+)";

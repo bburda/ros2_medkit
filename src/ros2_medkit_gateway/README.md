@@ -282,10 +282,29 @@ path names one topic however many members publish and subscribe to it, so it
 stays bare and lists its contributors in `member_ids`; it is qualified only if
 two gateways each contribute an item under that path.
 
+An operation's short name is the last segment of its ROS path, so ONE member
+can carry it twice - `left/calibrate` and `right/calibrate` are two operations
+called `calibrate`. The member half names that member for both copies and
+separates nothing, so those items take the ROS path, leading slash stripped, as
+their item half:
+
+```
+robot/left/calibrate                       # on the App itself
+primary_calibration:robot/left/calibrate   # on an entity that aggregates it
+```
+
+The form is decided per provider: a short name that its own provider carries
+once keeps that short name, whatever any other provider does with it. `/data`
+already addresses its items by path, so the split at the first colon is
+unchanged - a ROS path carries no colon.
+
 - A bare id that names one item works on every route, which is what the web UI,
   the Foxglove panel, the MCP tools and the generated OpenAPI document all send.
 - `POST /{entity}/operations/{id}/executions` with a bare id several members
   provide is `400 invalid-request`, naming the qualified form and the members.
+  A short name one member carries twice is `400` too, naming the ROS paths that
+  collided. Either refusal carries `parameters.operation_ids`: the ids that do
+  address what collided, as the collection lists them.
 - A qualified id is accepted on single-item routes; an unknown member half, an
   item half that member does not provide, or a member half followed by nothing,
   is `404` - which is what tells an absent item apart from one that exists and

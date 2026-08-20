@@ -445,6 +445,18 @@ the member half is an entity id, and the item half is the id the member's own
 route uses. Nothing on the owning gateway is aggregating, so the item half is
 sent bare - a parameter as its plain name, a topic as its plain path.
 
+An operation's item half is its short name, except where the member carrying it
+exposes that short name at more than one ROS path. There the member half names
+one member for both copies and cannot separate them, so the item half is the
+ROS path with its leading slash stripped - and it stays that on the member's own
+route too, because the member has the same two operations under the same short
+name:
+
+.. code-block:: text
+
+   POST /api/v1/components/vehicle-ecu/operations/dual_calibration:testrig/dual/left/calibrate/executions
+     -> POST /api/v1/apps/dual_calibration/operations/testrig/dual/left/calibrate/executions
+
 The member's own gateway is the only one that can answer: the ROS service, the
 topic and the parameter behind the id exist on its graph and nowhere else. What
 this gateway holds for a peer-owned member is a declaration, which is why the

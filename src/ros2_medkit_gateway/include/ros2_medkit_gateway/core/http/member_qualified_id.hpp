@@ -40,6 +40,10 @@ namespace http {
  * subscribe to it: that is still one topic, merged into one item, and the bare
  * path addresses it exactly. It becomes ambiguous only if two gateways each
  * contribute an item under the same path.
+ *
+ * The member half separates copies that belong to DIFFERENT members. Where one
+ * member carries both copies it has nothing left to separate, and the item half
+ * carries the ROS path instead - see `path_item_id`.
  */
 struct MemberQualifiedId {
   std::string member_id;   ///< Owning member; empty when the id carries no member half.
@@ -78,6 +82,26 @@ inline std::string make_member_qualified_id(const std::string & member_id, const
 }
 
 /**
+ * @brief The item half that addresses an operation by its ROS path.
+ *
+ * An operation's short name is the last segment of its ROS path, so one
+ * provider can carry the same short name twice: `/robot/left/calibrate` and
+ * `/robot/right/calibrate` are two operations both named `calibrate`. The
+ * member half cannot tell those apart - it is the same member - while the path
+ * can, because a ROS graph holds each path once.
+ *
+ * The leading slash is dropped so the id reads as the sequence of segments the
+ * router carries, which is the form `/data` already uses for a topic. A short
+ * name never contains a slash, so a path item half can never be read as one.
+ *
+ * Splitting a member-qualified id still happens at the first colon: a ROS path
+ * carries no colon, so the member half stays the part before it.
+ */
+inline std::string path_item_id(const std::string & full_path) {
+  return (!full_path.empty() && full_path.front() == '/') ? full_path.substr(1) : full_path;
+}
+
+/**
  * @brief Rewrite the id of every item whose id another item in `items` shares.
  *
  * Runs on the merged collection - local items plus whatever the peer fan-out
@@ -108,8 +132,7 @@ void qualify_ambiguous_ids(std::vector<Item> & items, MemberIdsOf member_ids_of)
     }
     // An id already addressed to this member is left alone. Prefixing it again
     // yields a form whose first colon splits off the member twice, which names
-    // nothing - and it happens whenever one member exposes the same short name
-    // more than once, because both copies then carry the same qualified id.
+    // nothing.
     if (item.id.rfind(members->front() + ":", 0) == 0) {
       continue;
     }
