@@ -40,14 +40,7 @@ namespace ros2_medkit_gateway {
 ///       so a pre-compiled v6 `.so` is rejected. Out-of-tree plugins must be
 ///       recompiled against v7 headers; in-tree plugins that `return
 ///       PLUGIN_API_VERSION` pick up the bump automatically.
-/// - v8: PluginContext::register_sampler() takes a trailing
-///       `honours_resource_path` flag, defaulted to false, so a plugin can
-///       declare that its sampler narrows its payload to a named resource.
-///       Plugin SOURCE written against v7 compiles unchanged. The parameter
-///       sits in an existing vtable slot, so a pre-compiled v7 `.so` would
-///       call it with one argument missing; the loader's strict equality
-///       against this value is what keeps such a `.so` out.
-constexpr int PLUGIN_API_VERSION = 8;
+constexpr int PLUGIN_API_VERSION = 7;
 
 /// Log severity levels for plugin logging callback
 enum class PluginLogLevel { kInfo, kWarn, kError };

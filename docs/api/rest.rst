@@ -1928,8 +1928,7 @@ Subscriptions are temporary - they do not survive server restart.
 - ``faults`` - Fault list. Streamed as a whole; no resource path
 - ``configurations`` - Parameter values. Streamed as a whole; no resource path
 - ``logs`` - Application log entries from ``/rosout``. Streamed as a whole; no resource path
-- ``x-*`` - Vendor extensions (e.g. ``x-medkit-graph``). Streamed as a whole unless the
-  plugin registering the sampler declares that it narrows its payload to a named resource
+- ``x-*`` - Vendor extensions (e.g. ``x-medkit-graph``). Streamed as a whole; no resource path
 
 A collection that is streamed as a whole delivers every item of that collection on
 every tick. A resource URI naming a single item of such a collection is refused with
