@@ -659,6 +659,22 @@ keeps that short name, whatever another provider does with the same name. The
 split at the first colon is unchanged, because a ROS path carries no colon, and
 the path form is the one ``/data`` already uses for a topic.
 
+**A member half from a peer is read through the collision rename.** A peer names
+its own leaves as its own tree names them, and an App whose id collided with a
+local one is merged here under ``<peer>__<id>`` - so the name the peer sends
+names the LOCAL leaf. Items arriving through the peer fan-out are re-attributed
+to the id the merge gave their owner, both in ``x-medkit.member_ids`` and in the
+member half of the item id, so ``secondary_gateway__shared_sensor:calibrate``
+addresses the peer's copy and ``shared_sensor:calibrate`` the local one.
+
+**Availability on a listed item describes its member.** ``x-medkit.available``
+is emitted only as ``false``, and only when the gateway that owns the item is
+not answering; absence means the item can be served. An entity declared on this
+gateway alone can host a member another gateway runs - no peer contributes the
+entity, so its collection fan-out never runs - and that says nothing about the
+member. The item is listed as usual, and the request for it is dispatched to the
+member's own route.
+
 What this means for a request:
 
 - A bare id that names one item works, on every route. Every client that sends

@@ -432,8 +432,23 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     const auto & raw_req = req.raw_for_framework();
 #pragma GCC diagnostic pop
-    auto fan_out = fan_out_collection<dto::DataItem>(ctx_.aggregation_manager(), raw_req);
-    for (auto & item : fan_out.items) {
+    auto * agg = ctx_.aggregation_manager();
+    auto fan_out = fan_out_collection<dto::DataItem>(agg, raw_req);
+
+    // A peer names its members as its own tree names them, and an App whose id
+    // collided with a local one was merged under `<peer>__<id>` - so the name
+    // the peer sends names the LOCAL leaf here. A merged App carries no topics,
+    // so this attribution is the only account of who owns a peer's item, and a
+    // client that builds `<member>:<topic>` out of it addresses a member that
+    // does not publish that topic at all.
+    for (size_t index = 0; index < fan_out.items.size(); ++index) {
+      auto & item = fan_out.items[index];
+      const std::string peer_name = index < fan_out.item_peers.size() ? fan_out.item_peers[index] : std::string{};
+      if (agg != nullptr && !peer_name.empty() && item.x_medkit.has_value() && item.x_medkit->member_ids.has_value()) {
+        for (auto & member_id : *item.x_medkit->member_ids) {
+          member_id = agg->local_member_id(peer_name, member_id);
+        }
+      }
       response.items.push_back(std::move(item));
     }
 

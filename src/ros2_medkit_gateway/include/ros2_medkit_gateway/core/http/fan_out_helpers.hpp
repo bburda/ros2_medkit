@@ -160,6 +160,14 @@ template <class T>
 struct FanOutResult {
   /// Typed peer items that successfully parsed as `T`.
   std::vector<T> items;
+  /// Name of the peer that sent `items[i]`, same order and length as `items`.
+  ///
+  /// A peer names its own members, and a member this gateway renamed on
+  /// collision (`<peer>__<id>`) is called something else here, so an item can
+  /// only be re-addressed to the leaf that owns it once the sending peer is
+  /// known. Kept parallel rather than folded into `T` because `T` is the wire
+  /// DTO and provenance is not part of the wire shape.
+  std::vector<std::string> item_peers;
   /// True if at least one targeted peer failed.
   bool partial{false};
   /// Names of peers that failed (matches AggregationManager::FanOutResult.failed_peers).
@@ -185,10 +193,7 @@ struct FanOutResult {
 ///     raw JSON. Items that fail validation are dropped from `items` and
 ///     recorded in `dropped_items` with the JsonReader error message plus a
 ///     best-effort `source_id`. A WARN is logged for each drop.
-///   - the `peer` field on each DroppedItem is left empty in this commit
-///     because AggregationManager::fan_out_get coalesces all peer responses
-///     into one `merged_items` array without per-item provenance. Future work
-///     can thread per-peer attribution through if needed.
+///   - every item that parsed carries the peer it came from, in `item_peers`.
 template <class T>
 inline FanOutResult<T> fan_out_collection(AggregationManager * agg, const httplib::Request & req) {
   FanOutResult<T> result;
@@ -216,21 +221,25 @@ inline FanOutResult<T> fan_out_collection(AggregationManager * agg, const httpli
   auto fan_result = agg->fan_out_get(fan_path, req.get_header_value("Authorization"), target_peers);
 
   if (fan_result.merged_items.is_array()) {
-    for (const auto & item : fan_result.merged_items) {
+    for (size_t index = 0; index < fan_result.merged_items.size(); ++index) {
+      const auto & item = fan_result.merged_items[index];
+      // `item_peers` is built alongside `merged_items` and is the same length;
+      // the bound is checked so a shorter list degrades to an unattributed item
+      // rather than reading past the end.
+      const std::string peer_name = index < fan_result.item_peers.size() ? fan_result.item_peers[index] : std::string{};
       if (!item.is_object()) {
         continue;
       }
       auto parsed = dto::JsonReader<T>::read(item);
       if (parsed.has_value()) {
         result.items.push_back(std::move(parsed.value()));
+        result.item_peers.push_back(peer_name);
         continue;
       }
       dto::DroppedItem dropped;
-      // Best-effort peer URL: per-item provenance is not available from
-      // AggregationManager::fan_out_get today (it coalesces peer responses
-      // into a single merged array). Left empty intentionally; if a future
-      // commit threads per-peer attribution through, this is the place to
-      // populate it.
+      // The wire key is a peer URL and what the fan-out carries is a peer name,
+      // so the two are not interchangeable. Left empty rather than filled with
+      // the wrong kind of identifier.
       dropped.peer = "";
       // Best-effort source_id: scan a small set of common id keys.
       static constexpr std::array<std::string_view, 5> kIdKeys = {"id", "name", "fault_id", "data_id", "operation_id"};

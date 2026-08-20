@@ -693,6 +693,19 @@ std::optional<std::string> AggregationManager::find_peer_for_entity(const std::s
   return std::nullopt;
 }
 
+std::string AggregationManager::local_member_id(const std::string & peer_name, const std::string & member_id) const {
+  if (peer_name.empty() || member_id.empty()) {
+    return member_id;
+  }
+  const std::string prefixed = peer_name + EntityMerger::SEPARATOR + member_id;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = routing_table_.find(prefixed);
+  // The routing entry has to belong to THIS peer. Another peer can own an
+  // entity whose id happens to read like this peer's prefix, and answering with
+  // it would re-address the item to a gateway that never sent it.
+  return (it != routing_table_.end() && it->second == peer_name) ? prefixed : member_id;
+}
+
 void AggregationManager::update_peer_contributors(
     std::unordered_map<std::string, std::vector<std::string>> contributors) {
   // Drop entries with empty contributor lists - they would be indistinguishable
@@ -878,6 +891,7 @@ AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::stri
     }
     for (auto & item : pr.items) {
       fan_out_result.merged_items.push_back(std::move(item));
+      fan_out_result.item_peers.push_back(pr.peer_name);
     }
   }
 

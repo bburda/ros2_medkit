@@ -298,6 +298,21 @@ once keeps that short name, whatever any other provider does with it. `/data`
 already addresses its items by path, so the split at the first colon is
 unchanged - a ROS path carries no colon.
 
+A member half a peer supplied is read through the collision rename before it is
+used. A peer names its own leaves as its own tree names them, and an App whose
+id collided with a local one is merged here under `<peer>__<id>` - so the name
+the peer sends names the LOCAL leaf. Items that arrive through the peer fan-out
+are re-attributed to the id the merge gave their owner, in `member_ids` and in
+the member half of the id itself, so every id the collection offers addresses
+the copy it names.
+
+`x-medkit.available` on a listed item is a statement about its MEMBER: it
+appears, as `false`, only when the gateway that owns the item is not answering.
+An entity declared on this gateway alone can still host a member another gateway
+runs; no peer contributes the entity, so its collection fan-out never runs, and
+that says nothing about the member. Such an item is listed as usual and the
+request for it is dispatched to the member's own route.
+
 - A bare id that names one item works on every route, which is what the web UI,
   the Foxglove panel, the MCP tools and the generated OpenAPI document all send.
 - `POST /{entity}/operations/{id}/executions` with a bare id several members

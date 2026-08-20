@@ -158,6 +158,31 @@ PEER_LONG_NAMESPACE = '/chassis/brakes'
 # survives the merge - R1, the precondition for every addressing rule.
 COLLIDING_LEAF = 'shared_sensor'
 
+# The id the merge gives the peer's copy of the colliding leaf. Written out
+# rather than derived, because it is the string a client is handed and the
+# whole point of the rename is that it is stable and addressable.
+RENAMED_LEAF = f'secondary_gateway__{COLLIDING_LEAF}'
+
+# Each gateway backs its half of the colliding leaf with a node of its own,
+# under a namespace of its own so the two copies keep distinct ROS paths - the
+# same reason the two calibration nodes are placed apart. The node carries an
+# operation and a topic, which are the two collections whose wire ids are built
+# out of the leaf id, so the rename is exercised where it can go wrong.
+SHARED_LEAF_NODE = 'shared_leaf'
+PRIMARY_SHARED_NAMESPACE = '/powertrain/shared'
+PEER_SHARED_NAMESPACE = '/chassis/shared'
+PRIMARY_SHARED_SERVICE = f'{PRIMARY_SHARED_NAMESPACE}/calibrate'
+PEER_SHARED_SERVICE = f'{PEER_SHARED_NAMESPACE}/calibrate'
+PRIMARY_SHARED_TOPIC = f'{PRIMARY_SHARED_NAMESPACE}/reading'
+PEER_SHARED_TOPIC = f'{PEER_SHARED_NAMESPACE}/reading'
+SHARED_OPERATION = 'calibrate'
+
+# Members whose ids collide with nothing, one on each side. They put topics
+# into the merged Function that no addressing rule has to disambiguate, which
+# is what makes "an unambiguous id is left alone" checkable at all.
+PRIMARY_RPM_APP = 'rpm_sensor'
+PEER_ACTUATOR_APP = 'brake_actuator'
+
 # Declared by the calibration demo node, so BOTH `primary_calibration` and
 # `peer_calibration` expose it under one name. A member-qualified id is the only
 # thing that separates the two copies, which is what makes this the parameter
@@ -228,12 +253,18 @@ apps:
     ros_binding:
       node_name: long_calibration
       namespace: /powertrain/engine
-  - id: {COLLIDING_LEAF}
-    name: "Shared Sensor (primary)"
+  - id: {PRIMARY_RPM_APP}
+    name: "Engine RPM Sensor"
     is_located_on: {PARENT_COMPONENT}
     ros_binding:
       node_name: rpm_sensor
       namespace: /powertrain/engine
+  - id: {COLLIDING_LEAF}
+    name: "Shared Leaf (primary)"
+    is_located_on: {PARENT_COMPONENT}
+    ros_binding:
+      node_name: {SHARED_LEAF_NODE}
+      namespace: {PRIMARY_SHARED_NAMESPACE}
 functions:
   - id: {MERGED_FUNCTION}
     name: "Vehicle Health Monitoring"
@@ -242,6 +273,7 @@ functions:
       - temp_sensor
       - primary_calibration
       - {PRIMARY_LONG_APP}
+      - {PRIMARY_RPM_APP}
       - {COLLIDING_LEAF}
 """
 
@@ -291,12 +323,18 @@ apps:
     ros_binding:
       node_name: long_calibration
       namespace: {PEER_LONG_NAMESPACE}
-  - id: {COLLIDING_LEAF}
-    name: "Shared Sensor (peer)"
+  - id: {PEER_ACTUATOR_APP}
+    name: "Brake Actuator"
     is_located_on: {PEER_SUBCOMPONENT}
     ros_binding:
       node_name: actuator
       namespace: /chassis/brakes
+  - id: {COLLIDING_LEAF}
+    name: "Shared Leaf (peer)"
+    is_located_on: {PEER_SUBCOMPONENT}
+    ros_binding:
+      node_name: {SHARED_LEAF_NODE}
+      namespace: {PEER_SHARED_NAMESPACE}
 functions:
   - id: {MERGED_FUNCTION}
     name: "Vehicle Health Monitoring"
@@ -305,6 +343,7 @@ functions:
       - pressure_sensor
       - peer_calibration
       - {PEER_LONG_APP}
+      - {PEER_ACTUATOR_APP}
       - {COLLIDING_LEAF}
 """
 
@@ -372,6 +411,21 @@ def generate_test_description():
                 output='screen',
                 additional_env=peer_domain_env,
             )]
+            + [launch_ros.actions.Node(
+                package='ros2_medkit_integration_tests',
+                executable='demo_shared_leaf',
+                name=SHARED_LEAF_NODE,
+                namespace=PRIMARY_SHARED_NAMESPACE,
+                output='screen',
+            )]
+            + [launch_ros.actions.Node(
+                package='ros2_medkit_integration_tests',
+                executable='demo_shared_leaf',
+                name=SHARED_LEAF_NODE,
+                namespace=PEER_SHARED_NAMESPACE,
+                output='screen',
+                additional_env=peer_domain_env,
+            )]
             + [
                 create_fault_manager_node(rosbag_enabled=False),
                 create_fault_manager_node(rosbag_enabled=False, extra_env=peer_domain_env),
@@ -404,10 +458,13 @@ class GroupingAggregationTest(unittest.TestCase):
         # would fail every rule below for a reason unrelated to the rule.
         cls._wait_for_apps(
             PRIMARY_URL,
-            {'temp_sensor', 'primary_calibration', DUAL_APP, PRIMARY_LONG_APP},
+            {'temp_sensor', 'primary_calibration', DUAL_APP, PRIMARY_LONG_APP,
+             COLLIDING_LEAF},
             'primary')
         cls._wait_for_apps(
-            PEER_URL, {'pressure_sensor', 'peer_calibration', PEER_LONG_APP}, 'peer')
+            PEER_URL,
+            {'pressure_sensor', 'peer_calibration', PEER_LONG_APP, COLLIDING_LEAF},
+            'peer')
         cls._wait_until_merged()
 
     @classmethod
@@ -601,6 +658,131 @@ class GroupingAggregationTest(unittest.TestCase):
         for leaf_id in matching:
             detail = requests.get(f'{PRIMARY_URL}/apps/{leaf_id}', timeout=10)
             self.assertEqual(detail.status_code, 200, f'{leaf_id} is listed but not addressable')
+
+    def test_a_renamed_leaf_is_named_by_the_items_it_owns(self):
+        """R1 carried into the ids that address items, which is what it is for.
+
+        Both copies of the colliding leaf expose `calibrate`, so the merged
+        Function offers that short name twice and the member half is all that
+        separates the two. The peer calls its half `shared_sensor` because that
+        is what its own tree calls it, and here that name is the LOCAL leaf -
+        so an attribution passed through unchanged offers one id twice, and the
+        copy it resolves to is whichever the local walk holds. The peer's
+        operation is then not addressable through the aggregate at all.
+        """
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'operations')
+        by_path = {}
+        for item in items:
+            service = item.get('x-medkit', {}).get('ros2', {}).get('service')
+            if service in (PRIMARY_SHARED_SERVICE, PEER_SHARED_SERVICE):
+                by_path.setdefault(service, []).append(item)
+
+        offered_ids = [item.get('id') for item in items]
+        for path in (PRIMARY_SHARED_SERVICE, PEER_SHARED_SERVICE):
+            self.assertEqual(
+                len(by_path.get(path, [])), 1,
+                f'{path} is not offered exactly once: {offered_ids}',
+            )
+
+        local_item = by_path[PRIMARY_SHARED_SERVICE][0]
+        peer_item = by_path[PEER_SHARED_SERVICE][0]
+        self.assertEqual(
+            local_item.get('x-medkit', {}).get('member_ids'), [COLLIDING_LEAF],
+            f'the local half names something other than the local leaf: {local_item}',
+        )
+        self.assertEqual(
+            peer_item.get('x-medkit', {}).get('member_ids'), [RENAMED_LEAF],
+            f'the peer half is attributed to the local leaf: {peer_item}',
+        )
+        self.assertEqual(
+            local_item.get('id'), f'{COLLIDING_LEAF}:{SHARED_OPERATION}', local_item)
+        self.assertEqual(
+            peer_item.get('id'), f'{RENAMED_LEAF}:{SHARED_OPERATION}',
+            f'the peer half is offered under the local leaf id: {peer_item}',
+        )
+
+    def test_a_renamed_leafs_operation_runs_the_copy_the_id_names(self):
+        """The list and the execution have to agree about WHICH copy an id names.
+
+        The ids are taken from the collection rather than written out, because
+        the agreement is what is under test: an id nobody is offered proves
+        nothing. Both copies answer 200, so the status says only that something
+        ran - each node names itself in the response, and that is the only thing
+        on the wire separating the copy the id named from the copy the local
+        walk reaches first.
+        """
+        offered = {}
+        for item in self._items(f'functions/{MERGED_FUNCTION}', 'operations'):
+            service = item.get('x-medkit', {}).get('ros2', {}).get('service')
+            if service in (PRIMARY_SHARED_SERVICE, PEER_SHARED_SERVICE):
+                offered[service] = item.get('id')
+        self.assertEqual(
+            sorted(offered), sorted([PRIMARY_SHARED_SERVICE, PEER_SHARED_SERVICE]),
+            f'the collection does not offer both copies: {offered}',
+        )
+
+        for service_path, operation_id in sorted(offered.items()):
+            with self.subTest(operation=operation_id):
+                response = self._run_operation(
+                    f'functions/{MERGED_FUNCTION}', operation_id)
+                self.assertEqual(response.status_code, 200, response.text)
+                parameters = response.json().get('parameters')
+                self.assertIsInstance(
+                    parameters, dict, f'no service response came back: {response.text}')
+                self.assertIs(parameters.get('success'), True, parameters)
+                node_fqn = f"{service_path.rsplit('/', 1)[0]}/{SHARED_LEAF_NODE}"
+                self.assertEqual(
+                    parameters.get('message'), f'{node_fqn} calibrated',
+                    f'{operation_id!r} ran the other copy: {parameters}',
+                )
+
+    def test_a_renamed_leafs_data_reads_back_through_the_id_the_list_offers(self):
+        """R4 for data, driven from what the collection offers rather than by hand.
+
+        A merged App carries no topics of its own, so the attribution the peer
+        sends with an item is the ONLY account of who owns it - and the peer
+        names the leaf as its own tree does. A client that builds
+        `<member>:<topic>` out of that reaches a member which does not publish
+        the topic, and the read comes back empty rather than refused.
+        """
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'data')
+        peer_items = [
+            item for item in items
+            if item.get('x-medkit', {}).get('ros2', {}).get('topic') == PEER_SHARED_TOPIC
+        ]
+        self.assertEqual(
+            len(peer_items), 1,
+            f'the peer half of the colliding leaf offers no reading: '
+            f'{[item.get("id") for item in items]}',
+        )
+        members = peer_items[0].get('x-medkit', {}).get('member_ids')
+        self.assertEqual(
+            members, [RENAMED_LEAF],
+            f'the peer half is attributed to the local leaf: {peer_items[0]}',
+        )
+
+        item_id = f'{members[0]}:{PEER_SHARED_TOPIC.lstrip("/")}'
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/{quote(item_id, safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(
+            body.get('x-medkit', {}).get('status'), 'data',
+            f'the id the list offers read nothing: {body}',
+        )
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('topic'), PEER_SHARED_TOPIC,
+            f'the answer names a topic the member does not publish: {body}',
+        )
+        self.assertTrue(body.get('data'), 'the peer member returned an empty payload')
+        # The member's own gateway answered, which is the only place that topic
+        # exists. Served here the answer would name the aggregating entity.
+        self.assertEqual(
+            body.get('x-medkit', {}).get('entity_id'), COLLIDING_LEAF,
+            f'the aggregating entity answered for a member it does not run: {body}',
+        )
 
     # ---------------------------------------------------------------------- R7
 
@@ -1368,9 +1550,12 @@ class GroupingAggregationTest(unittest.TestCase):
             (f'apps/{DUAL_APP}', 'calibrate', [DUAL_LEFT_ID, DUAL_RIGHT_ID]),
             (f'components/{PARENT_COMPONENT}', f'{DUAL_APP}:calibrate',
              [f'{DUAL_APP}:{DUAL_LEFT_ID}', f'{DUAL_APP}:{DUAL_RIGHT_ID}']),
-            # two members, one short name
+            # several members, one short name - including the two halves of the
+            # colliding leaf, whose member half is the id the merge gave them
             (f'functions/{MERGED_FUNCTION}', 'calibrate',
-             ['primary_calibration:calibrate', 'peer_calibration:calibrate']),
+             ['primary_calibration:calibrate', 'peer_calibration:calibrate',
+              f'{COLLIDING_LEAF}:{SHARED_OPERATION}',
+              f'{RENAMED_LEAF}:{SHARED_OPERATION}']),
         )
         for entity_path, operation_id, expected in cases:
             with self.subTest(entity=entity_path, operation=operation_id):

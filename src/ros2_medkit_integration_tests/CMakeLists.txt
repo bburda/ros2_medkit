@@ -83,6 +83,10 @@ add_executable(demo_long_calibration_action demo_nodes/long_calibration_action.c
 target_include_directories(demo_long_calibration_action PRIVATE ${_demo_include_dir})
 medkit_target_dependencies(demo_long_calibration_action rclcpp rclcpp_action example_interfaces)
 
+add_executable(demo_shared_leaf demo_nodes/shared_leaf.cpp)
+target_include_directories(demo_shared_leaf PRIVATE ${_demo_include_dir})
+medkit_target_dependencies(demo_shared_leaf rclcpp std_msgs std_srvs)
+
 add_executable(demo_lidar_sensor demo_nodes/lidar_sensor.cpp)
 target_include_directories(demo_lidar_sensor PRIVATE ${_demo_include_dir})
 medkit_target_dependencies(demo_lidar_sensor rclcpp rcl_interfaces sensor_msgs std_srvs ros2_medkit_msgs)
@@ -120,6 +124,7 @@ install(TARGETS
   demo_calibration_service
   demo_dual_calibration_service
   demo_long_calibration_action
+  demo_shared_leaf
   demo_lidar_sensor
   demo_beacon_publisher
   demo_param_beacon_node
