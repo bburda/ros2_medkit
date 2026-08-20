@@ -73,9 +73,9 @@ bool ReliabilityGate::allows_raise(const std::string & source_id) const {
   return (last_tick_ - graph_first_tick_) >= static_cast<uint64_t>(warmup_cycles_);
 }
 
-bool ReliabilityGate::allows_presence_ownership(const std::string & source_id) const {
+PresenceOwnership ReliabilityGate::presence_ownership(const std::string & source_id) const {
   if (!allows_raise(source_id)) {
-    return false;
+    return PresenceOwnership::kNone;
   }
   // Read without gate_mutex_, for the same reason allows_raise() takes none: lifecycle_ is
   // separately self-synchronized, and both run on the tick thread, sequentially after update().
@@ -83,21 +83,20 @@ bool ReliabilityGate::allows_presence_ownership(const std::string & source_id) c
   // an empty label becoming a real one, and both orderings of that give the same answer here.
   const auto label = lifecycle_.state_of(source_id);
   if (!label.has_value()) {
-    return true;  // no managed record: a plain node, and its death is nobody else's to report
+    // No managed record: a plain node. Nothing about it can ever say it belonged elsewhere,
+    // so this is knowledge, not a gap in it.
+    return PresenceOwnership::kEarned;
   }
   if (label->empty()) {
-    // Ignorance, and it is BOUNDED. While the watcher still has GetState attempts to spend, a
-    // measurement may be one tick away and taking ownership now would race it - that race is
-    // how a node that turns out to be merely inactive ends up latched here for good. Once the
-    // budget is spent nothing will ever measure this node again, and the only other detector
-    // that could report its departure looks at nothing unless an operator named it in
-    // `require_active`, which defaults to empty. Refusing past that point is not a handover,
-    // it is a node whose death nobody reports.
-    return !lifecycle_.measurement_pending(source_id);
+    // Ignorance, and it is bounded. While the watcher still has GetState attempts to spend, a
+    // measurement may be one tick away and taking ownership now would race it. Once they are
+    // spent, nothing here will ASK again - but ~/transition_event is still subscribed and can
+    // still deliver a label, so the grant is provisional rather than final.
+    return lifecycle_.measurement_pending(source_id) ? PresenceOwnership::kNone : PresenceOwnership::kProvisional;
   }
   // A measured non-active node is the lifecycle detector's business, and allows_raise() has
   // already refused it anyway.
-  return *label == "active";
+  return *label == "active" ? PresenceOwnership::kEarned : PresenceOwnership::kNone;
 }
 
 nlohmann::json ReliabilityGate::status_json() const {
@@ -114,7 +113,12 @@ nlohmann::json ReliabilityGate::status_json() const {
                         {"first_seen_tick", entry.first_seen},
                         {"armed", armed},
                         {"state", suppressed ? "warming_up" : "armed"},
-                        {"lifecycle", lc.has_value() ? nlohmann::json(*lc) : nlohmann::json(nullptr)}});
+                        {"lifecycle", lc.has_value() ? nlohmann::json(*lc) : nlohmann::json(nullptr)},
+                        // The other half of an unread label, and the half no caller can infer
+                        // from elapsed time: whether the watcher still intends to ask. Without
+                        // it an operator (and a test) cannot tell a node that is about to be
+                        // measured from one that never will be - see measurement_pending().
+                        {"measurement_pending", lifecycle_.measurement_pending(id)}});
   }
   const bool global_armed = graph_seen_ && (last_tick_ - graph_first_tick_) >= static_cast<uint64_t>(warmup_cycles_);
   return {{"x-medkit-watchdog",
@@ -157,8 +161,12 @@ bool reliability_allows(const ReliabilityGate * gate, const std::string & source
   return gate == nullptr || gate->allows_raise(source_id);
 }
 
-bool presence_ownership_allows(const ReliabilityGate * gate, const std::string & source_id) {
-  return gate == nullptr || gate->allows_presence_ownership(source_id);
+PresenceOwnership presence_ownership(const ReliabilityGate * gate, const std::string & source_id) {
+  // A null gate is not yet wired (a bare-context test), and every other predicate here treats
+  // that as fully permissive. kEarned rather than kProvisional: there is no watcher to ever
+  // withdraw the grant, so a provisional answer would leave a caller waiting for news that
+  // cannot come.
+  return gate == nullptr ? PresenceOwnership::kEarned : gate->presence_ownership(source_id);
 }
 
 }  // namespace ros2_medkit_graph_watchdog

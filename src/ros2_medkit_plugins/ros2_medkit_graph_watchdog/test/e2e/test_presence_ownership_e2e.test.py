@@ -61,6 +61,15 @@ launch and which assertions run:
   lifecycle services on command - the watcher drops the record and the status route reports
   `lifecycle: null` - and only then is it killed. GRAPH_NODE_DISAPPEARED must still raise: a
   node whose measurement goes away does not stop being the presence detector's.
+- "provisional_yields_to_a_real_label": the row that separates the two GROUNDS for ownership.
+  The same never-answering fixture is left until its budget is spent, so the presence detector
+  owns it PROVISIONALLY, and only then is it told to announce "inactive" - the
+  ~/transition_event subscription outlives the seed budget, so a real label genuinely can still
+  arrive. Once the status route reports that label the node is killed. GRAPH_NODE_INACTIVE must
+  raise and name it, and GRAPH_NODE_DISAPPEARED must never appear: the only reason the presence
+  detector held this node was that nobody else could report it, and the label ends that. It is
+  also the one row that rejects a detector wired to the permissive `reliability_allows()`, which
+  admits the node during the unread window and, tracking being sticky, never lets go.
 - "gate_unaffected": nothing is killed. With the same unmeasured managed node in the graph, the
   three other detectors must still report. GRAPH_PARAM_DRIFT is the discriminating leg - it is
   the only one of the three whose raise passes through the app-keyed gate at all
@@ -129,6 +138,7 @@ SCENARIO = os.environ['WATCHDOG_E2E_SCENARIO']
 PORT = get_test_port()
 
 FAULT_CODE_DISAPPEARED = 'GRAPH_NODE_DISAPPEARED'
+FAULT_CODE_INACTIVE = 'GRAPH_NODE_INACTIVE'
 FAULT_CODE_UNREADABLE = 'GRAPH_NODE_UNREADABLE'
 FAULT_CODE_PARAM_DRIFT = 'GRAPH_PARAM_DRIFT'
 FAULT_CODE_QOS = 'GRAPH_QOS_MISMATCH'
@@ -196,6 +206,17 @@ QOS_SUB_DEADLINE_SEC = 0.1
 DROPPABLE_NODE = 'presence_ownership_droppable'
 DROP_PARAM = 'drop_services'
 
+# The label the never-answering fixture announces once it is told to answer. "inactive" is a
+# measured, NON-active state: it says the node was never the presence detector's, which is
+# exactly what a provisional grant has to yield to.
+TRANSITION_LABEL_PARAM = 'transition_label'
+LATE_LABEL = 'inactive'
+
+# lifecycle_expectation's own grace, in ticks, for the row where GRAPH_NODE_INACTIVE is the
+# positive control. Small so the violation confirms while the node is still present, which
+# keeps the row about ownership rather than about absence maturing a streak.
+LATE_LABEL_GRACE = 2
+
 # The orphan leg's near-miss pair: one publisher-only topic and one subscriber-only topic, same
 # type, same namespace, leaf edit distance 1. Both endpoints belong to this test process; the
 # detector keys its finding on the TOPIC, so there is no way to make either of them the
@@ -222,7 +243,7 @@ def _droppable_node_action():
     )
 
 
-def _unreadable_node_action():
+def _unreadable_node_action(transition_label=None):
     """Build the fixture as a launch action with a PID handle the test can signal.
 
     Uses DEMO_NODE_REGISTRY's own (executable, ros_name, namespace) triple so this stays in
@@ -230,11 +251,16 @@ def _unreadable_node_action():
     process directly and create_demo_nodes() hands back no PID.
     """
     executable, ros_name, namespace = DEMO_NODE_REGISTRY[UNREADABLE_NODE]
+    # Only passed when a scenario needs the fixture to announce something other than its
+    # default: every other row here depends on the default being what it always was.
+    parameters = ([{TRANSITION_LABEL_PARAM: transition_label}] if transition_label is not None
+                  else [])
     return launch_ros.actions.Node(
         package='ros2_medkit_integration_tests',
         executable=executable,
         name=ros_name,
         namespace=namespace,
+        parameters=parameters,
         output='screen',
         additional_env=get_coverage_env('ros2_medkit_integration_tests'),
         sigterm_timeout='30',
@@ -249,7 +275,13 @@ def generate_test_description():
         f'{_NODE_DEATH_PREFIX}.miss_grace': MISS_GRACE,
     }
 
-    if SCENARIO in ('budget_spent_then_owned', 'answered_then_owned'):
+    if SCENARIO == 'provisional_yields_to_a_real_label':
+        # require_active is what makes GRAPH_NODE_INACTIVE available as the positive control:
+        # the node has to be reported by SOMEBODY once the presence detector hands it back, or
+        # the row cannot tell a correct handover from a plain silence.
+        detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [UNREADABLE_NODE]
+        detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = LATE_LABEL_GRACE
+    elif SCENARIO in ('budget_spent_then_owned', 'answered_then_owned'):
         # The SAME configuration for both, deliberately: require_active names the fixture in
         # each, so the only thing that differs between the two rows is what the node's
         # lifecycle state turned out to be. It also makes GRAPH_NODE_UNREADABLE available as
@@ -279,14 +311,19 @@ def generate_test_description():
         port=PORT,
     )
 
-    target = (_droppable_node_action() if SCENARIO == 'measured_then_unmeasured'
-              else _unreadable_node_action())
+    if SCENARIO == 'measured_then_unmeasured':
+        target = _droppable_node_action()
+    elif SCENARIO == 'provisional_yields_to_a_real_label':
+        target = _unreadable_node_action(transition_label=LATE_LABEL)
+    else:
+        target = _unreadable_node_action()
     launch_description.add_action(TimerAction(period=2.0, actions=[target]))
     context['target_node'] = target
     return launch_description, context
 
 
-def _poll_watchdog_entity(port, app_id, lifecycle, timeout=30.0, interval=0.5):
+def _poll_watchdog_entity(port, app_id, lifecycle, timeout=30.0, interval=0.5,
+                          measurement_pending=None):
     """Poll GET /x-medkit-watchdog until `app_id` appears with this lifecycle label.
 
     The PAIR is the instrument these scenarios need, not `armed` on its own: `armed` reads the
@@ -294,6 +331,13 @@ def _poll_watchdog_entity(port, app_id, lifecycle, timeout=30.0, interval=0.5):
     claim is about telling those two apart. ``''`` is not "no data yet" - LifecycleWatcher seeds
     a TRACKED entry's label to ``''`` and only overwrites it once a real read succeeds, so it
     means "asked, and still waiting", while a node with no managed record at all reports null.
+
+    `measurement_pending`, when given, additionally requires the route's field of the same
+    name. An unread label alone does not say whether the watcher still intends to ask, and the
+    two answers put the node in opposite hands: still asking means the presence detector must
+    keep off it, finished asking means the presence detector is all it has. A row that turns on
+    that difference has to READ it rather than wait out an amount of time that looks about
+    right.
 
     Returns the matching entity dict, or ``None`` on timeout (after printing the last-seen
     payload, which is gone once the launch tears down).
@@ -310,13 +354,18 @@ def _poll_watchdog_entity(port, app_id, lifecycle, timeout=30.0, interval=0.5):
                 status = response.json().get('x-medkit-watchdog', {})
                 last_seen = str(status)
                 for entity in status.get('entities') or []:
-                    if entity.get('id') == app_id and entity.get('lifecycle') == lifecycle:
-                        return entity
+                    if entity.get('id') != app_id or entity.get('lifecycle') != lifecycle:
+                        continue
+                    if (measurement_pending is not None
+                            and entity.get('measurement_pending') is not measurement_pending):
+                        continue
+                    return entity
         except requests.exceptions.RequestException as exc:
             last_seen = f'GET /x-medkit-watchdog failed: {exc}'
         time.sleep(interval)
-    print(f'_poll_watchdog_entity(app_id={app_id!r}, lifecycle={lifecycle!r}) timed out after '
-          f'{timeout}s; last watchdog status: {last_seen}')
+    print(f'_poll_watchdog_entity(app_id={app_id!r}, lifecycle={lifecycle!r}, '
+          f'measurement_pending={measurement_pending!r}) timed out after {timeout}s; '
+          f'last watchdog status: {last_seen}')
     return None
 
 
@@ -380,9 +429,11 @@ class TestBudgetSpentThenOwned(unittest.TestCase):
     detector depends on that, or a node whose lifecycle service is broken would have every
     fault suppressed - so ownership cannot be admitted on that answer alone. But refusing it
     forever is not a handover either: once LifecycleWatcher has spent the GetState attempts it
-    charges per node, nothing will ever measure this node again, and the only detector that
-    could report its departure instead is `lifecycle_expectation`, which looks at nothing
-    unless an operator named it in `require_active`.
+    charges per node, nothing will ever ASK this node again, and the only detector that could
+    report its departure instead is `lifecycle_expectation`, which looks at nothing unless an
+    operator named it in `require_active`. (Asking is not the only channel: ~/transition_event
+    stays subscribed, so a label can still arrive unasked - which is what the sibling row
+    "provisional_yields_to_a_real_label" is about.)
 
     So the answer is bounded: withheld while the ignorance can still resolve, taken once it
     cannot. Here `require_active` DOES name the node, so both codes are available and both must
@@ -641,6 +692,86 @@ class TestMeasuredThenUnmeasured(unittest.TestCase):
         self.assertIn(DROPPABLE_NODE, fault.get('description', ''))
 
 
+class TestProvisionalOwnershipYieldsToARealLabel(unittest.TestCase):
+    """A provisional owner hands the node back the moment the graph says whose it is.
+
+    Ownership granted because the asking stopped is granted for one reason only: nobody else
+    can report this node. That reason is not permanent. LifecycleWatcher stops issuing GetState
+    when the re-seed budget runs out, but it never drops the ~/transition_event subscription, so
+    a real label can still arrive afterwards - and a label saying the node is inactive says the
+    node was lifecycle_expectation's all along.
+
+    Waiting for the budget alone would only DELAY the defect this slice exists to close: the
+    presence detector would latch the node during the unread window and still be holding it when
+    it died inactive. So the row drives the whole sequence - unread, budget spent, label arrives
+    non-active, node killed - and asserts the handover happened: GRAPH_NODE_INACTIVE names the
+    node, GRAPH_NODE_DISAPPEARED never appears.
+
+    This is also the row that rejects a detector wired to the permissive `reliability_allows()`
+    where `presence_ownership()` belongs: that predicate is TRUE for an unread label, tracking is
+    sticky, and the node would be reported dead here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rclpy.init()
+        cls._client_node = Node('presence_ownership_late_label_client')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._client_node.destroy_node()
+        rclpy.shutdown()
+
+    def test_a_late_non_active_label_takes_the_node_back(self, target_node):
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=UNREADABLE_NODE),
+            f'graph_watchdog never reported {UNREADABLE_NODE} armed')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        # The provisional grant, OBSERVED rather than waited out: an unread label whose
+        # measurement is no longer pending is exactly the state in which the presence detector
+        # takes the node for want of anyone else.
+        entity = _poll_watchdog_entity(
+            PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC, measurement_pending=False)
+        self.assertIsNotNone(
+            entity,
+            f'{UNREADABLE_NODE} never reached an unread label with the asking finished - without '
+            'that state there is no provisional grant for the label below to revoke')
+        self.assertTrue(entity.get('armed'))
+
+        self.assertTrue(
+            _set_bool_parameter(
+                type(self)._client_node, f'/{UNREADABLE_NODE}/set_parameters',
+                ANSWER_PARAM, True, timeout=PARAM_SET_TIMEOUT_SEC),
+            f'setting {ANSWER_PARAM}:=true on /{UNREADABLE_NODE}/set_parameters never succeeded - '
+            'the late label this row turns on never arrived')
+
+        self.assertIsNotNone(
+            _poll_watchdog_entity(PORT, UNREADABLE_NODE, LATE_LABEL, timeout=LABEL_TIMEOUT_SEC),
+            f'{UNREADABLE_NODE} never reported the "{LATE_LABEL}" label - the graph never said '
+            'whose node this is, so a presence report below would not be a defect')
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, UNREADABLE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{UNREADABLE_NODE} never left GET /apps after SIGTERM')
+
+        # The positive control, and it runs first: the node IS reported, by the detector the
+        # label handed it to. An absence assertion after a silent stack would prove nothing.
+        found, description = poll_fault_describing(
+            PORT, FAULT_CODE_INACTIVE, [UNREADABLE_NODE], timeout=RAISE_TIMEOUT_SEC)
+        self.assertTrue(
+            found,
+            f'{FAULT_CODE_INACTIVE} never raised naming {UNREADABLE_NODE} - the node the presence '
+            'detector handed back was then reported by nobody at all '
+            f'(last description: {description!r})')
+
+        assert_fault_absent_throughout(
+            self, PORT, FAULT_CODE_DISAPPEARED, SILENCE_WINDOW_SEC)
+
+
 class TestGateStaysPermissiveForTheOtherDetectors(unittest.TestCase):
     """The three other detectors still report in a graph carrying an unmeasured managed node.
 
@@ -732,6 +863,7 @@ class TestGateStaysPermissiveForTheOtherDetectors(unittest.TestCase):
 # one case, and a missing result is a real failure rather than an expected line of output - see
 # the sibling e2e files' identical rationale.
 _SCENARIO_CASES = {
+    'provisional_yields_to_a_real_label': 'TestProvisionalOwnershipYieldsToARealLabel',
     'budget_spent_then_owned': 'TestBudgetSpentThenOwned',
     'no_require_active_still_owned': 'TestNoRequireActiveStillOwned',
     'answered_then_owned': 'TestMeasuredNodeIsOwnedByPresence',

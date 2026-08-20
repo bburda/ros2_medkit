@@ -100,9 +100,12 @@ bool is_ros2cli_node(const std::string & fqn) {
 /// regardless, so it can never be falsely called dead; a node still inside its warmup window
 /// gets the same protection; and a MANAGED node whose state has not been read YET is left to
 /// lifecycle_expectation while the watcher still has GetState attempts to spend on it. Once
-/// those are spent the node comes back here, because nothing will ever measure it and
+/// those are spent the node comes back here, because nothing will ASK again and
 /// lifecycle_expectation looks at nothing unless an operator named it in `require_active`.
-/// The gate itself stays permissive about an unread label throughout (see
+/// That last admission is PROVISIONAL: the ~/transition_event subscription outlives the seed
+/// budget, so an unasked-for label can still arrive, and one that reads non-active means the
+/// node was never this detector's - it is released while still alive rather than reported dead
+/// afterwards. The gate itself stays permissive about an unread label throughout (see
 /// LifecycleWatcher::node_ok()), so this whole decision is made here, not there.
 ///
 /// Composable/component nodes hosted in one process die together: if the container
@@ -254,6 +257,7 @@ class NodeDeathDetector : public Detector {
 
     std::set<std::string> present;
     std::set<std::string> armed;
+    std::set<std::string> handed_back;  // provisionally admitted, and the ground has gone
     for (const auto & app : ctx.snapshot->apps) {
       // A peer-aggregated app carries no ROS binding of its own (PeerClient::parse_app
       // never reads x-medkit.ros2.node), so effective_fqn() is empty for every one of
@@ -282,8 +286,32 @@ class NodeDeathDetector : public Detector {
       // reliably observe, so it asks the stricter predicate instead - a managed node whose
       // state is still being asked for belongs to lifecycle_expectation's absence path until
       // the asking stops. The gate is keyed by App::id.
-      if (presence_ownership_allows(ctx.gate, app.id)) {
-        armed.insert(key);
+      // Tracking follows OWNERSHIP rather than permission, and the two are not the same
+      // question: the gate answers "may this entity raise" permissively for a managed node
+      // whose lifecycle label has never been read. What the gate returns here is the GROUND,
+      // and the ground decides whether admission is permanent. kEarned came from a
+      // measurement (or from a node with no lifecycle to measure) and is latched exactly as
+      // this detector has always latched an armed key. kProvisional came only from the
+      // watcher giving up on asking, so it holds only while that stays true: if a label
+      // arrives afterwards - the ~/transition_event subscription outlives the seed budget -
+      // the node turns out to have been another detector's all along, and it is handed back
+      // below rather than reported dead later. The gate is keyed by App::id.
+      switch (presence_ownership(ctx.gate, app.id)) {
+        case PresenceOwnership::kEarned:
+          earned_.insert(key);  // knowledge, once had, is never withdrawn
+          armed.insert(key);
+          break;
+        case PresenceOwnership::kProvisional:
+          armed.insert(key);
+          break;
+        case PresenceOwnership::kNone:
+          // Never earned, and no longer owned: hand it back while it is still alive. A key
+          // that WAS earned keeps its admission - a node that ran and then deactivated is
+          // still a death when it stops running.
+          if (earned_.count(key) == 0) {
+            handed_back.insert(key);
+          }
+          break;
       }
       // Capture the allowlist's id-form verdict WHILE the entity is still present and
       // app.id is in hand - suppresses() alone can never do this for a dead key, since by
@@ -298,6 +326,20 @@ class NodeDeathDetector : public Detector {
           id_allowlisted_.erase(key);
         }
       }
+    }
+
+    // Before update(), so a key handed back this tick cannot appear in this tick's report:
+    // the whole point is that it is not this detector's node, and a death it was never
+    // entitled to report must not be reported once on the way out either.
+    for (const auto & key : handed_back) {
+      tracker_.release(key);
+    }
+    // `earned_` is a fact about keys in the CURRENT graph, so it is pruned to them: a key
+    // that departs and later returns is a new incarnation, and it re-earns (or does not) from
+    // whatever the gate then says. Without the prune this would grow with identity churn for
+    // the life of the process, which is the growth the tracker's own cap exists to bound.
+    for (auto it = earned_.begin(); it != earned_.end();) {
+      it = present.count(*it) == 0 ? earned_.erase(it) : std::next(it);
     }
 
     auto report = tracker_.update(present, armed);
@@ -540,6 +582,10 @@ class NodeDeathDetector : public Detector {
   /// Refreshed every tick a key is present (see tick()); the value from its last live tick
   /// is what a dead key is judged by, since id is unavailable once the entity has left
   /// ctx.snapshot. Bounded to tracker_.known_keys() at the end of every tick.
+  /// Keys whose ownership the gate granted on kEarned grounds while they were present. Read
+  /// only by the hand-back branch in tick(), which is the one place the difference between the
+  /// two grounds decides anything. Pruned to the live graph every tick.
+  std::set<std::string> earned_;
   std::set<std::string> id_allowlisted_;
   /// Whether THIS detector instance has itself genuinely raised GRAPH_NODE_DISAPPEARED at
   /// least once - the ungated-clear guard. See tick()'s own comment for why this, and not

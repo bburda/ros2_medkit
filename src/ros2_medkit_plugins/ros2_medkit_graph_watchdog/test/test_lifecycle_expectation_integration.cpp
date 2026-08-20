@@ -4047,9 +4047,9 @@ TEST_F(LifecycleExpectationIntegrationTest, OfflineAppIsNeverTreatedAsOwnedByThe
   // the gate's ownership answer is TRUE for an app node_death has already skipped.
   ASSERT_TRUE(gate.allows_raise("a")) << "the app was never armed, so the latch window this test "
                                          "is about was never open";
-  ASSERT_TRUE(gate.allows_presence_ownership("a"))
-      << "the gate must still say it OWNS an app with no lifecycle record - if it did not, this "
-         "test would pass for a reason that has nothing to do with is_online";
+  ASSERT_EQ(gate.presence_ownership("a"), ros2_medkit_graph_watchdog::PresenceOwnership::kEarned)
+      << "the gate must still say it OWNS an app with no lifecycle record, and own it OUTRIGHT - "
+         "if it did not, this test would pass for a reason that has nothing to do with is_online";
   det->tick(ctx);
 
   gate.set_lifecycle_state_for_test("a", "inactive");

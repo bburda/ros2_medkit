@@ -87,11 +87,14 @@ Reliability core
     never answered: its label stays empty, and ``node_ok`` reads an unread label
     as permission on purpose, since gating on it would silence every detector
     for a node whose lifecycle service is broken. Only a KNOWN non-active label
-    suppresses. ``allows_presence_ownership()`` asks the STRICTER question the
-    presence class needs, without changing that permissive answer: state known
-    not to be a managed-non-active one, OR asked for as often as it ever will be
-    (``measurement_pending()``, which reads the per-node GetState re-seed budget
-    charged only for reads that actually ran) - see the ``node_death`` section.
+    suppresses. ``presence_ownership()`` asks the STRICTER question the presence
+    class needs, without changing that permissive answer, and answers it with a
+    GROUND rather than a boolean: EARNED for a state read as ``active`` or for a
+    node with no lifecycle at all, PROVISIONAL for one whose state was asked for
+    as often as it ever will be and never came (``measurement_pending()``, which
+    reads the per-node GetState re-seed budget charged only for reads that
+    actually ran), and neither while the asking is still going on. Only the first
+    is permanent - see the ``node_death`` section.
 
     Those subscriptions follow the private-callback-group rule described in the
     plugin shell bullet above: created on the shared gateway node, but in the
@@ -482,15 +485,15 @@ alternating ``(INACTIVE, ABSENT x N)`` would otherwise never accumulate ``grace`
 Where the presence class CAN also report the same departure, it no longer does:
 ``GRAPH_NODE_DISAPPEARED`` (this package's own ``node_death`` detector) independently
 reports it, whether or not the node was ever measured not-active first. But ``node_death``
-only ever tracks an App once the reliability gate says it OWNS that App's departure, and
-ownership needs the node's lifecycle state positively KNOWN not to be a managed-non-active one
-(``ReliabilityGate::allows_presence_ownership()``: no managed record at all, or a record
-reading ``active``) - so a ``require_active`` node that never reaches ``active`` is never
-tracked by ``node_death``, and neither is a managed node whose ``GetState`` has never
-answered. The gate would permit that second one to RAISE - ``LifecycleWatcher::node_ok()``
-treats an unread label as permission, deliberately, or a broken lifecycle service would
-silence ``qos_mismatch``, ``orphan`` and ``param_drift`` too - but permission is not
-knowledge, and its departure can never raise ``GRAPH_NODE_DISAPPEARED``, whatever kills it. So
+only ever tracks an App once the reliability gate says it OWNS that App's departure, on one of
+the two grounds ``ReliabilityGate::presence_ownership()`` distinguishes - so a ``require_active``
+node that never reaches ``active`` is never tracked by ``node_death``, and neither is a managed
+node whose ``GetState`` has not answered while the watcher is still asking. The gate would
+permit that second one to RAISE - ``LifecycleWatcher::node_ok()`` treats an unread label as
+permission, deliberately, or a broken lifecycle service would silence ``qos_mismatch``,
+``orphan`` and ``param_drift`` too - but permission is not knowledge. Once the asking stops the
+node IS tracked, provisionally, and a label arriving afterwards over ``~/transition_event`` and
+reading non-active takes it straight back out again. So
 the split is on whether the presence detector EVER owned the node - a fact read from the
 reliability gate itself, not guessed from the observed label: once owned, a below-``grace``
 streak that goes absent is simply HELD rather than matured on the strength of the absence
@@ -958,21 +961,37 @@ tracking them would collapse an entire peer fleet onto one ``""`` key. A
 ``_ros2cli_<pid>`` node - rcl's own hidden-node naming convention for every ``ros2`` CLI
 invocation, matched structurally rather than guessed at - is excluded too, or every CLI
 invocation would accumulate one permanently "dead" entry for the life of the gateway. An
-App that never comes online is never armed and so is never admitted to tracking in the
-first place - the identical protection a node still inside ``warmup_cycles`` gets. A MANAGED
-App whose lifecycle state was never measured is excluded too, and for a different reason: the
-gate's raise permission for it is deliberately PERMISSIVE (an unread label must not silence
-``qos_mismatch``, ``orphan`` or ``param_drift``), but this detector reports an ABSENCE and
-cannot attribute the departure of a node whose state nothing ever read - so tracking asks
-``allows_presence_ownership()``, which needs the state positively known not to be a
-managed-non-active one, and leaves such a node to ``lifecycle_expectation``. What that does
-NOT close: an App counts as managed only once the snapshot shows it advertising a
-``GetState``-typed service, and until then it is indistinguishable from a plain node, so a
+App that never comes online is skipped by the ``is_online`` filter above and so is never
+admitted to tracking in the first place - the identical protection a node still inside
+``warmup_cycles`` gets. A MANAGED App whose lifecycle state has not been read YET is excluded
+too, and for a different reason: the gate's raise permission for it is deliberately PERMISSIVE
+(an unread label must not silence ``qos_mismatch``, ``orphan`` or ``param_drift``), but this
+detector reports an ABSENCE and cannot attribute the departure of a node whose state nothing
+has read - so tracking asks ``presence_ownership()`` instead.
+
+That exclusion is BOUNDED, and the readmission that follows it is PROVISIONAL. The watcher
+charges a GetState re-seed budget per node and charges it only for a read that actually ran, so
+an empty label with attempts left is "we have not finished asking" and an empty label with none
+left is "we asked and failed". Past that point the node is admitted here after all - nothing
+will ASK again, and ``lifecycle_expectation`` returns before it looks at anything unless an
+operator named the node in ``require_active``, which defaults to empty, so refusing forever
+would mean a whole class of deaths reported by nobody. But asking is not the only channel: the
+``~/transition_event`` subscription is created independently of the seed budget and is never
+torn down when it runs out, so a label can still arrive unasked. One that reads non-active says
+the node was ``lifecycle_expectation``'s all along, and this detector releases the key while the
+node is still alive rather than reporting a death it was never entitled to. Ownership EARNED
+from a measurement is not released that way: a node that ran and then deactivated is still a
+death when it stops running. Stickiness is earned by knowledge, never by ignorance.
+
+What that does NOT close: an App counts as managed only once the snapshot shows it advertising
+a ``GetState``-typed service, and until then it is indistinguishable from a plain node, so a
 managed node whose services have not yet been discovered can still be taken for one. That
 window is bounded by the arming warmup, which already needs several consecutive ticks of
-presence, and node and services come from the same introspection sweep; the window this DOES
-close is the unbounded one, a managed node whose state stays unmeasured for as long as its
-``GetState`` goes unanswered. Once
+presence, and node and services come from the same introspection sweep. Nor does anything here
+close the case of a node that appears, lives fewer than ``warmup_cycles`` ticks and vanishes:
+the gate has always required completed warmup before it arms anything, so such a node is owned
+by nobody and reported by nobody. That is the bringup-quiesce trade-off working as designed,
+not a gap this boundary introduces. Once
 tracked, though, a node's continued life-or-death judgement rests on PRESENCE alone, not
 on staying armed: a tracked node that later goes lifecycle-inactive is not thereby
 mistaken for dead. Composable/component nodes hosted in one process die together - if the
@@ -1229,7 +1248,7 @@ plus the suppression chain the detector shares no code with any sibling for:
    ``GRAPH_NODE_INACTIVE`` alone instead - node_death cannot track a node the gate never
    admitted for ownership, so absence has to mature it here - a large ``miss_grace`` delays
    but does not swallow the report, and a restarted gateway's warmup window never produces a
-   spurious PASSED); and ``test/e2e/test_presence_ownership_e2e.test.py`` (five scenarios
+   spurious PASSED); and ``test/e2e/test_presence_ownership_e2e.test.py`` (six scenarios
    against the fixture whose ``GetState`` never answers, so the unread state is permanent
    rather than the race the boundary file's B6 row has to live with: a managed node the
    watcher asked and could not read, killed, raises BOTH ``GRAPH_NODE_DISAPPEARED`` and
@@ -1242,7 +1261,11 @@ plus the suppression chain the detector shares no code with any sibling for:
    then LOSES its lifecycle services and is killed is still reported; and with an unmeasured
    managed node in the graph ``GRAPH_PARAM_DRIFT`` still names it - the one leg of the three
    that passes through the app-keyed gate at all - while the topic-keyed
-   ``GRAPH_QOS_MISMATCH`` and ``GRAPH_ORPHAN`` still report too).
+   ``GRAPH_QOS_MISMATCH`` and ``GRAPH_ORPHAN`` still report too; and the one row that asserts
+   an ABSENCE, where the same never-answering node is owned provisionally, then announces
+   ``inactive`` over ~/transition_event, then dies: ``GRAPH_NODE_INACTIVE`` names it and
+   ``GRAPH_NODE_DISAPPEARED`` never appears, which is also what rejects a detector wired to
+   the permissive ``reliability_allows()``).
 
 
 Status
