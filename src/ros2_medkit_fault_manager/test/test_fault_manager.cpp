@@ -2791,6 +2791,68 @@ TEST(InMemoryNearMissTest, EntriesCarryTheResultingStatus) {
       << "a report under the HEALED latch must not read as a fresh approach";
 }
 
+/// Run one identical report sequence against both backends and return their near-miss series.
+/// Per-entity threshold overrides mean two reports for the SAME fault code can carry different
+/// DebounceConfig values, which is the only way a stored counter ends up outside the band the next
+/// report is evaluated against.
+TEST(StorageBackendParityTest, MixedEntityThresholdsProduceTheSameSeries) {
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<uint64_t> dist;
+  const auto db_path =
+      std::filesystem::temp_directory_path() / ("test_backend_parity_" + std::to_string(dist(gen)) + ".db");
+
+  DebounceConfig wide;  // the band the counter is driven up in
+  wide.confirmation_threshold = -4;
+  wide.healing_threshold = 6;
+  wide.critical_immediate_confirm = false;
+
+  DebounceConfig narrow;  // a second source, with a lower ceiling
+  narrow.confirmation_threshold = -4;
+  narrow.healing_threshold = 3;
+  narrow.critical_immediate_confirm = false;
+
+  auto drive = [&](ros2_medkit_fault_manager::FaultStorage & storage) {
+    storage.report_fault_event("SHARED_CODE", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN, "dip",
+                               "/wide_source", rclcpp::Time(1000), wide);
+    for (int i = 1; i <= 7; ++i) {
+      storage.report_fault_event("SHARED_CODE", ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_WARN, "",
+                                 "/wide_source", rclcpp::Time(1000 + i), wide);
+    }
+    storage.report_fault_event("SHARED_CODE", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_WARN, "dip",
+                               "/narrow_source", rclcpp::Time(2000), narrow);
+  };
+
+  InMemoryFaultStorage memory;
+  drive(memory);
+  const auto memory_series = memory.get_near_misses("SHARED_CODE");
+  const auto memory_fault = memory.get_fault("SHARED_CODE");
+
+  std::vector<ros2_medkit_fault_manager::NearMissRecord> sqlite_series;
+  std::optional<Fault> sqlite_fault;
+  {
+    ros2_medkit_fault_manager::SqliteFaultStorage sqlite(db_path.string());
+    drive(sqlite);
+    sqlite_series = sqlite.get_near_misses("SHARED_CODE");
+    sqlite_fault = sqlite.get_fault("SHARED_CODE");
+  }
+  std::filesystem::remove(db_path);
+  std::filesystem::remove(db_path.string() + "-wal");
+  std::filesystem::remove(db_path.string() + "-shm");
+
+  ASSERT_TRUE(memory_fault.has_value());
+  ASSERT_TRUE(sqlite_fault.has_value());
+  EXPECT_EQ(memory_fault->status, sqlite_fault->status);
+
+  ASSERT_EQ(memory_series.size(), sqlite_series.size());
+  for (size_t i = 0; i < memory_series.size(); ++i) {
+    EXPECT_EQ(memory_series[i].debounce_counter, sqlite_series[i].debounce_counter)
+        << "backends disagree on the counter recorded for entry " << i;
+    EXPECT_EQ(memory_series[i].resulting_status, sqlite_series[i].resulting_status)
+        << "backends disagree on the status recorded for entry " << i;
+  }
+}
+
 TEST(InMemoryNearMissTest, EmptyForUnknownFault) {
   InMemoryFaultStorage storage;
   EXPECT_TRUE(storage.get_near_misses("NEVER_REPORTED").empty());
