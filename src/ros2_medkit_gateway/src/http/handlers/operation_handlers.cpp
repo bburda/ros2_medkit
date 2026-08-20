@@ -281,6 +281,47 @@ std::optional<ErrorInfo> refuse_if_ambiguous(const AggregatedOperations & ops, c
   return make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: it names more than one operation", params);
 }
 
+/// Settle which gateway holds the execution this request addresses.
+///
+/// An execution lives on the gateway that started it, which is the gateway that
+/// owns the member behind the operation id - the same one POST was dispatched
+/// to. The operation id is in the route, so the owner is resolvable by the rule
+/// the executions collection already resolves it by, and the three follow-up
+/// verbs reach the goals the collection hands out.
+///
+/// An id this gateway cannot resolve to exactly one owned operation is left to
+/// the local path: the execution id is the key there, and the answer it gives
+/// for an id naming no goal is the answer this route already owes. Resolving is
+/// how the owner is found, never a second place for the route to refuse.
+http::Result<MemberDispatch> dispatch_execution_to_owner(const HandlerContext & ctx, const http::TypedRequest & req,
+                                                         const std::string & entity_id,
+                                                         const std::string & operation_id,
+                                                         const std::string & execution_id) {
+  const auto entity_info = ctx.get_entity_info(entity_id);
+  const auto & cache = ctx.node()->get_thread_safe_cache();
+  auto lookup = resolve_entity_operations(cache, entity_info.sovd_type(), entity_id);
+  if (!lookup) {
+    return MemberDispatch::kServeLocally;
+  }
+  const auto & ops = lookup->ops;
+
+  auto parsed = http::parse_member_qualified_id(operation_id, ops.is_aggregated);
+  auto resolved = resolve_operation(ops, parsed);
+  if (!resolved.found() || refuse_if_ambiguous(ops, parsed, entity_id, operation_id).has_value()) {
+    return MemberDispatch::kServeLocally;
+  }
+
+  const std::string & full_path =
+      resolved.service.has_value() ? resolved.service->full_path : resolved.action->full_path;
+  auto owner = ops.owner_by_path.find(full_path);
+  if (owner == ops.owner_by_path.end()) {
+    return MemberDispatch::kServeLocally;
+  }
+  return ctx.dispatch_to_member(
+      req, owner->second, "operations/" + parsed.item_id + "/executions/" + execution_id,
+      json{{"entity_id", entity_id}, {"operation_id", operation_id}, {"execution_id", execution_id}});
+}
+
 /// True for a member that is in the tree but whose gateway is silent.
 ///
 /// A retained member is kept precisely so that the answer to a request does not
@@ -1189,6 +1230,16 @@ http::Result<dto::OperationExecution> OperationHandlers::get_execution(const htt
                                           json{{"details", vr.error()}, {"entity_id", entity_id}}));
   }
 
+  {
+    auto dispatch = dispatch_execution_to_owner(ctx_, req, entity_id, operation_id, execution_id);
+    if (!dispatch) {
+      return tl::make_unexpected(dispatch.error());
+    }
+    if (*dispatch == MemberDispatch::kForwarded) {
+      return tl::make_unexpected(HandlerContext::forwarded_sentinel_error());
+    }
+  }
+
   auto * operation_mgr = ctx_.node()->get_operation_manager();
   auto goal_info = operation_mgr->get_tracked_goal(execution_id);
   if (!goal_info.has_value()) {
@@ -1253,6 +1304,16 @@ http::Result<http::NoContent> OperationHandlers::cancel_execution(const http::Ty
     return tl::make_unexpected(lock_err.error());
   }
 
+  {
+    auto dispatch = dispatch_execution_to_owner(ctx_, req, entity_id, operation_id, execution_id);
+    if (!dispatch) {
+      return tl::make_unexpected(dispatch.error());
+    }
+    if (*dispatch == MemberDispatch::kForwarded) {
+      return tl::make_unexpected(HandlerContext::forwarded_sentinel_error());
+    }
+  }
+
   auto * operation_mgr = ctx_.node()->get_operation_manager();
   auto goal_info = operation_mgr->get_tracked_goal(execution_id);
   if (!goal_info.has_value()) {
@@ -1311,6 +1372,16 @@ OperationHandlers::update_execution(const http::TypedRequest & req, const dto::E
   const auto entity_info = ctx_.get_entity_info(entity_id);
   if (auto lock_err = ctx_.validate_lock_access(req, entity_info, "operations"); !lock_err) {
     return tl::make_unexpected(lock_err.error());
+  }
+
+  {
+    auto dispatch = dispatch_execution_to_owner(ctx_, req, entity_id, operation_id, execution_id);
+    if (!dispatch) {
+      return tl::make_unexpected(dispatch.error());
+    }
+    if (*dispatch == MemberDispatch::kForwarded) {
+      return tl::make_unexpected(HandlerContext::forwarded_sentinel_error());
+    }
   }
 
   const std::string capability = body.capability;

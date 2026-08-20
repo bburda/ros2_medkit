@@ -147,6 +147,10 @@ PEER_CALIBRATION_NAMESPACE = '/chassis/brakes'
 PRIMARY_LONG_APP = 'primary_long_calibration'
 PEER_LONG_APP = 'peer_long_calibration'
 LONG_OPERATION = 'long_calibration'
+# Calibration steps for a goal a case means to stop rather than watch finish.
+# The demo action server runs one goal at a time at 2 Hz, so a long goal left
+# behind by one case is a wait every later case pays.
+SHORT_GOAL_ORDER = 6
 PEER_LONG_NAMESPACE = '/chassis/brakes'
 
 # Declared with the SAME id on both gateways. Apps are renamed on collision,
@@ -1038,6 +1042,223 @@ class GroupingAggregationTest(unittest.TestCase):
         self.assertNotIn(
             execution_id, here,
             f"a peer's goal is reported under the local member: {here}")
+
+    # ---------------------------------------------------------------- R5b
+    # ADDRESSING ONE EXECUTION.
+    #
+    # The collection hands out ids. Every verb that takes one back has to
+    # resolve it the same way the collection did, or the aggregate offers
+    # addresses its own siblings answer 404 for.
+
+    def _one_execution_url(self, entity_path, operation_id, execution_id, base_url=PRIMARY_URL):
+        return (f'{self._executions_url(entity_path, operation_id, base_url)}'
+                f'/{quote(execution_id, safe="")}')
+
+    def _wait_for_action_server_free(self, entity_path, operation_id, base_url, timeout=30.0):
+        """Block until nothing is running on the operation's action server.
+
+        The demo action server runs one goal at a time: its accept callback
+        joins the previous execution thread before starting the next, so a goal
+        an earlier case left running blocks every request to that server for as
+        long as it lasts - the cancels this section is about included. Read
+        through the member's own route so the wait never depends on the
+        addressing path under test.
+        """
+        deadline = time.monotonic() + timeout
+        running = None
+        while time.monotonic() < deadline:
+            running = []
+            for execution_id in self._execution_ids(entity_path, operation_id, base_url):
+                response = requests.get(
+                    self._one_execution_url(entity_path, operation_id, execution_id, base_url),
+                    timeout=10)
+                if response.status_code == 200 and response.json().get('status') == 'running':
+                    running.append(execution_id)
+            if not running:
+                return
+            time.sleep(0.5)
+        raise AssertionError(
+            f'{operation_id!r} on {entity_path} still has {running} running after {timeout}s')
+
+    def _peer_action_server_free(self):
+        self._wait_for_action_server_free(
+            f'apps/{PEER_LONG_APP}', LONG_OPERATION, PEER_URL)
+
+    def _local_action_server_free(self):
+        self._wait_for_action_server_free(
+            f'apps/{PRIMARY_LONG_APP}', LONG_OPERATION, PRIMARY_URL)
+
+    def _wait_until_executing(self, execution_url, timeout=15.0):
+        """Block until the action server has picked the goal up.
+
+        A goal is addressable the moment it is accepted, but in that window the
+        server has not started it, and a cancel sent there stays outstanding
+        until it does - long enough for the aggregate's forward to time out and
+        report a broken link instead of the answer. ``ros2_status`` is the field
+        that separates accepted from executing; the SOVD ``status`` calls both
+        "running".
+        """
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            response = requests.get(execution_url, timeout=10)
+            if response.status_code == 200:
+                last = response.json()
+                if last.get('x-medkit', {}).get('ros2_status') == 'executing':
+                    return last
+            time.sleep(0.1)
+        raise AssertionError(
+            f'{execution_url} never reported itself executing within {timeout}s; last read {last}')
+
+    def test_a_peer_owned_execution_is_readable_through_the_aggregate(self):
+        """R5b for GET: the id the collection offered resolves through it.
+
+        The goal lives on the peer, so this gateway tracks nothing for it.
+        Asserted on the body rather than on 200 alone, and against what the
+        peer itself answers for the same id: the failure mode being excluded
+        is a plausible-looking status built somewhere other than where the
+        goal is.
+        """
+        entity_path = f'functions/{MERGED_FUNCTION}'
+        peer_id = f'{PEER_LONG_APP}:{LONG_OPERATION}'
+        self._wait_for_operation(entity_path, peer_id)
+        self._peer_action_server_free()
+        execution_id = self._start_goal(entity_path, peer_id, order=SHORT_GOAL_ORDER)
+
+        through_aggregate = requests.get(
+            self._one_execution_url(entity_path, peer_id, execution_id), timeout=20)
+        self.assertEqual(
+            through_aggregate.status_code, 200,
+            f'an id the executions collection offers is unreadable through it: '
+            f'{through_aggregate.text}')
+        body = through_aggregate.json()
+        x_medkit = body.get('x-medkit', {})
+        self.assertEqual(x_medkit.get('goal_id'), execution_id, body)
+
+        on_the_peer = requests.get(
+            self._one_execution_url(
+                f'apps/{PEER_LONG_APP}', LONG_OPERATION, execution_id, base_url=PEER_URL),
+            timeout=20)
+        self.assertEqual(on_the_peer.status_code, 200, on_the_peer.text)
+        peer_x_medkit = on_the_peer.json().get('x-medkit', {})
+        # The ROS action path is the member's own and is not derivable from the
+        # aggregate's namespace, so matching it is what says the answer came
+        # from the gateway that holds the goal.
+        self.assertEqual(
+            x_medkit.get('ros2', {}).get('action'),
+            peer_x_medkit.get('ros2', {}).get('action'),
+            f'the aggregate answered for a different action than the peer holds: {body}',
+        )
+        self.assertEqual(x_medkit.get('goal_id'), peer_x_medkit.get('goal_id'), body)
+
+    def test_a_peer_owned_execution_is_stoppable_through_the_aggregate(self):
+        """R5b for PUT: the capability lands on the gateway holding the goal.
+
+        The 202 carries a Location, and that Location has to name the member's
+        own route - a Location rebuilt from the aggregate's path would send the
+        client back to a gateway that cannot resolve the id.
+        """
+        entity_path = f'functions/{MERGED_FUNCTION}'
+        peer_id = f'{PEER_LONG_APP}:{LONG_OPERATION}'
+        self._wait_for_operation(entity_path, peer_id)
+        self._peer_action_server_free()
+        execution_id = self._start_goal(entity_path, peer_id, order=SHORT_GOAL_ORDER)
+
+        self._wait_until_executing(
+            self._one_execution_url(entity_path, peer_id, execution_id))
+
+        stopped = requests.put(
+            self._one_execution_url(entity_path, peer_id, execution_id),
+            json={'capability': 'stop'},
+            timeout=20,
+        )
+        self.assertEqual(
+            stopped.status_code, 202,
+            f'stopping a peer-owned execution through the aggregate failed: {stopped.text}')
+        self.assertEqual(stopped.json().get('id'), execution_id, stopped.text)
+        self.assertIn(
+            PEER_LONG_APP, stopped.headers.get('Location', ''),
+            f'the Location does not name the member that holds the goal: {stopped.headers}')
+
+        # And the goal really stopped, on the peer, where it was running.
+        self._assert_goal_stops(
+            self._one_execution_url(
+                f'apps/{PEER_LONG_APP}', LONG_OPERATION, execution_id, base_url=PEER_URL))
+
+    def test_a_peer_owned_execution_is_cancellable_through_the_aggregate(self):
+        """R5b for DELETE, and the case where a false success costs the most.
+
+        A 204 produced locally reads exactly like a cancel that worked while
+        the goal keeps running on the peer, so the peer is asked afterwards.
+        """
+        entity_path = f'functions/{MERGED_FUNCTION}'
+        peer_id = f'{PEER_LONG_APP}:{LONG_OPERATION}'
+        self._wait_for_operation(entity_path, peer_id)
+        self._peer_action_server_free()
+        execution_id = self._start_goal(entity_path, peer_id, order=SHORT_GOAL_ORDER)
+
+        self._wait_until_executing(
+            self._one_execution_url(entity_path, peer_id, execution_id))
+
+        cancelled = requests.delete(
+            self._one_execution_url(entity_path, peer_id, execution_id), timeout=20)
+        self.assertEqual(
+            cancelled.status_code, 204,
+            f'cancelling a peer-owned execution through the aggregate failed: {cancelled.text}')
+
+        self._assert_goal_stops(
+            self._one_execution_url(
+                f'apps/{PEER_LONG_APP}', LONG_OPERATION, execution_id, base_url=PEER_URL))
+
+    def test_a_locally_owned_execution_is_still_answered_here(self):
+        """R5b's other half: dispatching did not move the local case anywhere.
+
+        The local member's goal is tracked on this gateway, so all three verbs
+        have to keep answering from here - and the peer, asked for the same id,
+        has to say it never heard of it.
+        """
+        entity_path = f'functions/{MERGED_FUNCTION}'
+        local_id = f'{PRIMARY_LONG_APP}:{LONG_OPERATION}'
+        self._wait_for_operation(entity_path, local_id)
+        self._local_action_server_free()
+        execution_id = self._start_goal(entity_path, local_id, order=SHORT_GOAL_ORDER)
+
+        here = requests.get(
+            self._one_execution_url(entity_path, local_id, execution_id), timeout=20)
+        self.assertEqual(here.status_code, 200, here.text)
+        self.assertEqual(
+            here.json().get('x-medkit', {}).get('goal_id'), execution_id, here.text)
+
+        not_there = requests.get(
+            self._one_execution_url(
+                f'apps/{PEER_LONG_APP}', LONG_OPERATION, execution_id, base_url=PEER_URL),
+            timeout=20)
+        self.assertEqual(
+            not_there.status_code, 404,
+            f'a local goal was found on the peer, so the ids are not distinguishing: '
+            f'{not_there.text}')
+
+        self._wait_until_executing(
+            self._one_execution_url(entity_path, local_id, execution_id))
+        cancelled = requests.delete(
+            self._one_execution_url(entity_path, local_id, execution_id), timeout=20)
+        self.assertEqual(cancelled.status_code, 204, cancelled.text)
+
+    def _assert_goal_stops(self, execution_url, timeout=20.0):
+        """Block until the execution at `execution_url` is no longer running."""
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            response = requests.get(execution_url, timeout=10)
+            if response.status_code == 404:
+                return
+            if response.status_code == 200:
+                last = response.json().get('status')
+                if last != 'running':
+                    return
+            time.sleep(0.25)
+        raise AssertionError(
+            f'{execution_url} still reports {last!r} {timeout}s after it was stopped')
 
     def test_a_service_operation_has_an_empty_execution_collection_not_a_miss(self):
         """R6 for executions: present-but-empty is not the same as absent.
