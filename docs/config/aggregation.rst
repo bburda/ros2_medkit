@@ -471,12 +471,26 @@ Two statuses are read rather than treated as failures:
   that does not expose the route. Those members are omitted, the rest of the
   peer merges normally, and the absent routes are logged once per refresh at
   ``WARN``.
-- ``504`` with error code ``not-responding`` on a Component's detail means the
-  peer holds that id and the gateway contributing it has gone quiet - the
-  answer an aggregating peer gives for a declaration it is retaining. In a
-  chain topology this is how the far end reports a dead leaf, so the Component
-  is kept as the peer's list named it and marked
-  ``x-medkit.available: false``.
+- ``504`` with error code ``not-responding`` on any route hanging off an entity
+  - its detail, or one of its nested collections - means the peer holds that id
+  and the gateway contributing it has gone quiet, which is the answer an
+  aggregating peer gives for a declaration it is retaining. In a chain topology
+  this is how the far end reports a dead leaf, so the entity is kept as the
+  peer's list named it and marked ``x-medkit.available: false``. A nested
+  collection answering that way costs only the members that route carries;
+  treated as a failure it would discard the whole peer on every refresh, so one
+  unreachable member would freeze this gateway's view of everything that peer
+  holds. A ``504`` without ``not-responding`` is not a statement about an entity
+  and still discards the refresh.
+
+Availability is also read back off the wire. ``x-medkit.available`` is emitted
+only when false, so an absent field means the entity is reachable, and that is
+the default this gateway parses it with. It matters most beyond one hop: an App
+also carries ``x-medkit.is_online``, but a Component has no second signal, so
+without the read-back the head of a three-gateway chain reports a leaf behind a
+dead gateway as reachable. Retention never contradicts what a peer said - it
+only ever sets ``available`` to false, and it does so when the peer itself
+stopped answering, which already covers everything behind it.
 
 .. _aggregation-breaking-changes:
 

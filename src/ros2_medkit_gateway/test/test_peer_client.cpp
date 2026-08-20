@@ -20,6 +20,7 @@
 
 #include "ros2_medkit_gateway/core/aggregation/entity_merger.hpp"
 #include "ros2_medkit_gateway/core/aggregation/peer_client.hpp"
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
 
 using namespace ros2_medkit_gateway;
@@ -1003,4 +1004,190 @@ TEST(PeerClientHappyPath, asset_identity_survives_fetch_and_merge) {
   EXPECT_EQ(merged_id.serial_number, "SN-42");
   EXPECT_EQ(merged_id.firmware_version, "2.9.4");
   EXPECT_EQ(merged_id.extra.at("slot"), "3");
+}
+
+// =============================================================================
+// Availability read-back
+//
+// `x-medkit.available` is emitted only when false, so absence is the peer
+// saying the entity is reachable. Both directions are pinned here because the
+// two failures are opposite and equally silent: dropping the read reports every
+// unreachable entity of every peer as reachable, and defaulting to false
+// reports every healthy one as unreachable.
+// =============================================================================
+
+namespace {
+
+/// Serve the four collection roots a fetch always reads, so a test only has to
+/// describe the routes it is actually about. httplib answers with the first
+/// handler that matches, so this is installed AFTER the routes a test defines
+/// itself and only fills in the ones it left out.
+void install_empty_roots(httplib::Server & svr) {
+  svr.Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+}
+
+/// A SOVD error body carrying the ``not-responding`` code, which is what a
+/// gateway answers on every route of an entity whose contributor went quiet.
+std::string not_responding_body(const std::string & member_id) {
+  return nlohmann::json(
+             {{"error_code", ERR_NOT_RESPONDING}, {"message", "Member '" + member_id + "' is not available"}})
+      .dump();
+}
+
+/// Listen on a random port for the life of the scope. A failed ASSERT returns
+/// from the test body, so a hand-written stop/join at the end of it never runs
+/// and the listening thread outlives its server.
+class ScopedServer {
+ public:
+  explicit ScopedServer(httplib::Server & svr) : svr_(svr) {
+    port_ = svr_.bind_to_any_port("127.0.0.1");
+    thread_ = std::thread([this]() {
+      svr_.listen_after_bind();
+    });
+  }
+
+  ~ScopedServer() {
+    svr_.stop();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  ScopedServer(const ScopedServer &) = delete;
+  ScopedServer & operator=(const ScopedServer &) = delete;
+  ScopedServer(ScopedServer &&) = delete;
+  ScopedServer & operator=(ScopedServer &&) = delete;
+
+  std::string url() const {
+    return "http://127.0.0.1:" + std::to_string(port_);
+  }
+
+ private:
+  httplib::Server & svr_;
+  std::thread thread_;
+  int port_{0};
+};
+
+}  // namespace
+
+TEST(PeerClientAvailability, a_peers_statement_that_an_entity_is_unreachable_is_carried) {
+  httplib::Server svr;
+
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"ecu-live","name":"ecu-live"},{"id":"ecu-quiet","name":"ecu-quiet"}]})",
+                    "application/json");
+  });
+  // A 200 detail that names the entity unreachable. This is the only account of
+  // the entity the aggregator gets, so the flag has to come off the body.
+  svr.Get("/api/v1/components/ecu-quiet", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu-quiet","name":"ecu-quiet","x-medkit":{"source":"manifest","available":false}})",
+                    "application/json");
+  });
+  svr.Get("/api/v1/components/ecu-live", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu-live","name":"ecu-live","x-medkit":{"source":"manifest"}})", "application/json");
+  });
+  svr.Get(R"(/api/v1/components/([^/]+)/subcomponents)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(
+        R"({"items":[
+          {"id":"app-live","name":"app-live","x-medkit":{"source":"manifest","is_online":true}},
+          {"id":"app-quiet","name":"app-quiet","x-medkit":{"source":"manifest","available":false}}
+        ]})",
+        "application/json");
+  });
+  svr.Get(R"(/api/v1/apps/([^/]+)/operations)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << result.error();
+
+  ASSERT_EQ(result->components.size(), 2u);
+  EXPECT_EQ(result->components[0].id, "ecu-live");
+  EXPECT_TRUE(result->components[0].available) << "an entity the peer said nothing about was marked unreachable";
+  EXPECT_EQ(result->components[1].id, "ecu-quiet");
+  EXPECT_FALSE(result->components[1].available) << "the peer's statement that ecu-quiet is unreachable was dropped";
+
+  ASSERT_EQ(result->apps.size(), 2u);
+  EXPECT_EQ(result->apps[0].id, "app-live");
+  EXPECT_TRUE(result->apps[0].available) << "an app the peer said nothing about was marked unreachable";
+  EXPECT_EQ(result->apps[1].id, "app-quiet");
+  EXPECT_FALSE(result->apps[1].available) << "the peer's statement that app-quiet is unreachable was dropped";
+}
+
+TEST(PeerClientAvailability, a_nested_collection_that_says_not_responding_does_not_abort_the_fetch) {
+  httplib::Server svr;
+
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"ecu-quiet","name":"ecu-quiet"}]})", "application/json");
+  });
+  svr.Get("/api/v1/components/ecu-quiet", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu-quiet","name":"ecu-quiet","x-medkit":{"source":"manifest","available":false}})",
+                    "application/json");
+  });
+  // Every route of a retained member answers 504 not-responding, the nested
+  // collections included. Read as a failed request it would discard the peer's
+  // whole picture, including the entities that are perfectly reachable.
+  svr.Get("/api/v1/components/ecu-quiet/subcomponents", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(not_responding_body("ecu-quiet"), "application/json");
+  });
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"app-quiet","name":"app-quiet","x-medkit":{"available":false}}]})",
+                    "application/json");
+  });
+  svr.Get("/api/v1/apps/app-quiet/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(not_responding_body("app-quiet"), "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << "one unreachable member discarded the peer's whole picture: " << result.error();
+
+  ASSERT_EQ(result->components.size(), 1u);
+  EXPECT_FALSE(result->components[0].available);
+  ASSERT_EQ(result->apps.size(), 1u);
+  EXPECT_FALSE(result->apps[0].available);
+}
+
+TEST(PeerClientAvailability, a_504_that_is_not_a_statement_about_an_entity_still_fails_the_fetch) {
+  httplib::Server svr;
+
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"ecu-a","name":"ecu-a"}]})", "application/json");
+  });
+  svr.Get("/api/v1/components/ecu-a", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu-a","name":"ecu-a"})", "application/json");
+  });
+  // 504 without the not-responding code is an upstream proxy timing out, which
+  // says nothing about the entity and leaves a hole in the picture.
+  svr.Get("/api/v1/components/ecu-a/subcomponents", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(R"({"error_code":"vendor-error","message":"upstream timed out"})", "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  EXPECT_FALSE(result.has_value()) << "a gateway timeout was read as a statement that an entity is unreachable";
 }

@@ -804,6 +804,14 @@ retained entity:
 ``status: "offline"``. Availability of an entity and health of a peer are
 separate questions and are reported separately.
 
+``x-medkit.available`` is emitted **only when false**, so an absent field means
+the entity is reachable. An aggregating gateway reads the field back off its
+peers with that same default, which is what carries the fact past one hop: in a
+chain ``A <- B <- C``, ``B`` marks ``C``'s declared entities unavailable when
+``C`` goes quiet, and ``A`` reports them the same way. An App also carries
+``x-medkit.is_online``; a Component has no second signal, so for a Component
+this field is the only one.
+
 .. note::
 
    ``/configurations`` predates this rule and keeps its own: on an entity whose
@@ -1044,6 +1052,21 @@ Execute Operations
    - **504:** No response from the action server within the cancel budget and
      the status stream does not show the goal cancelling: the outcome is
      unknown - poll the execution status resource (``not-responding``)
+
+.. note::
+
+   **Executions on an aggregate.** ``GET``, ``PUT`` and ``DELETE`` on a single
+   execution resolve the operation id in the route to the member that owns it
+   and are dispatched to that member's gateway, exactly as ``POST`` and the
+   executions listing are - a goal lives on the gateway that sent it. So every
+   id the listing hands out is addressable through the same path it was listed
+   under, and the ``Location`` a dispatched ``PUT`` or ``POST`` returns names
+   the member's own route, which this gateway resolves to the same member. An
+   operation id that does not resolve to exactly one owned operation is answered
+   locally, keyed on the execution id alone, so a locally-owned execution is
+   unaffected and an id naming no goal still gets ``404``. A member whose
+   gateway is silent answers ``504 not-responding`` before anything is
+   forwarded.
 
 .. note::
 

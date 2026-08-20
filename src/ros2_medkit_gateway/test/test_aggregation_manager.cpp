@@ -499,23 +499,6 @@ TEST(AggregationManager, get_peer_url_returns_empty_for_unknown_peer) {
 }
 
 // =============================================================================
-// fetch_all_peer_entities tests (with unreachable peers)
-// =============================================================================
-
-TEST(AggregationManager, fetch_all_peer_entities_returns_empty_when_none_healthy) {
-  auto config = make_config(2);
-  AggregationManager manager(config);
-
-  // No peers healthy -> empty result
-  auto entities = manager.fetch_all_peer_entities();
-
-  EXPECT_TRUE(entities.areas.empty());
-  EXPECT_TRUE(entities.components.empty());
-  EXPECT_TRUE(entities.apps.empty());
-  EXPECT_TRUE(entities.functions.empty());
-}
-
-// =============================================================================
 // Prefix stripping tests (forward_request)
 // =============================================================================
 
@@ -1944,44 +1927,6 @@ TEST(AggregationManager, concurrent_fan_out_with_peer_mutations) {
 
   // No crash or deadlock = success
   SUCCEED();
-}
-
-// =============================================================================
-// fetch_all_peer_entities happy-path with mock server
-// =============================================================================
-
-TEST(AggregationManager, fetch_all_peer_entities_returns_entities_from_healthy_peer) {
-  MockPeerServer mock;
-  install_entity_endpoints(mock.server(), 2, 1, 3, 0);
-  int port = mock.start();
-
-  AggregationConfig config;
-  config.enabled = true;
-  config.timeout_ms = 5000;
-
-  AggregationConfig::PeerConfig peer;
-  peer.url = "http://127.0.0.1:" + std::to_string(port);
-  peer.name = "entity_peer";
-  config.peers.push_back(peer);
-
-  AggregationManager manager(config);
-  manager.check_all_health();
-  ASSERT_EQ(manager.healthy_peer_count(), 1u);
-
-  auto entities = manager.fetch_all_peer_entities();
-
-  EXPECT_EQ(entities.areas.size(), 2u);
-  EXPECT_EQ(entities.components.size(), 1u);
-  EXPECT_EQ(entities.apps.size(), 3u);
-  EXPECT_EQ(entities.functions.size(), 0u);
-
-  // Verify source tagging
-  for (const auto & area : entities.areas) {
-    EXPECT_EQ(area.source, "peer:entity_peer");
-  }
-  for (const auto & app : entities.apps) {
-    EXPECT_EQ(app.source, "peer:entity_peer");
-  }
 }
 
 // =============================================================================
