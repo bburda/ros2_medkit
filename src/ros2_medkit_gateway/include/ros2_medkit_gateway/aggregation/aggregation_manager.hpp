@@ -274,6 +274,27 @@ class AggregationManager {
   void forward_request(const std::string & peer_name, const httplib::Request & req, httplib::Response & res);
 
   /**
+   * @brief Forward an HTTP request to a peer, addressing a path of the caller's
+   *        choosing instead of the one the client sent.
+   *
+   * A request addressed to an entity that draws its resources from members is
+   * not the request the owning gateway can answer: that gateway has no such
+   * entity, only the member. The target path names the member's own route
+   * there, so the peer answers a request about something it actually holds.
+   *
+   * `target_path` goes through the same SSRF guard and peer-prefix rewrite as
+   * the incoming path, because it is built from client-supplied ids. Query
+   * parameters and body come from `req` unchanged.
+   *
+   * @param peer_name Name of the target peer
+   * @param req Incoming HTTP request supplying method, headers, body and query
+   * @param res Outgoing HTTP response to populate
+   * @param target_path Absolute path to request on the peer, `/api/v1/...`
+   */
+  void forward_request(const std::string & peer_name, const httplib::Request & req, httplib::Response & res,
+                       const std::string & target_path);
+
+  /**
    * @brief Fan-out a GET request to healthy peers in parallel.
    *
    * Sends GET requests concurrently via std::async, merges the "items"

@@ -409,6 +409,80 @@ maps to a peer, the request is forwarded transparently:
 
    @enduml
 
+Member Dispatch
+---------------
+
+The routing table answers "who owns this entity", and for an entity that draws
+its resources from members that question has no single answer: an Area, a
+merged Function and a hierarchical parent Component all have members on both
+sides of the link, which is exactly why they are deliberately absent from the
+table. Routing one of them whole would hand the request to one peer and discard
+every member the other contributors hold.
+
+A request naming one member is a different question, and it does have a single
+answer. ``HandlerContext::dispatch_to_member`` re-addresses such a request to
+the member's own entity route - ``/apps/{member}/...`` or
+``/components/{member}/...`` - on the gateway the routing table names for that
+member:
+
+.. code-block:: text
+
+   POST /api/v1/functions/vehicle_health/operations/peer_calibration:calibrate/executions
+     -> POST /api/v1/apps/peer_calibration/operations/calibrate/executions   (on the peer)
+
+   GET  /api/v1/functions/vehicle_health/data/pressure_sensor:chassis/brakes/pressure
+     -> GET  /api/v1/apps/pressure_sensor/data/chassis/brakes/pressure       (on the peer)
+
+   PUT  /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
+     -> PUT  /api/v1/apps/peer_calibration/configurations/calibration_offset (on the peer)
+
+Each collection keeps its own id scheme and each hands the same two halves to
+the dispatch. ``/data`` and ``/operations`` qualify only an ambiguous id and
+carry ``x-medkit.member_ids``; ``/configurations`` qualifies every id on a
+multi-node entity as ``<app_id>:<param_name>`` and carries
+``x-medkit.source``. What the two schemes agree on is what the dispatch needs:
+the member half is an entity id, and the item half is the id the member's own
+route uses. Nothing on the owning gateway is aggregating, so the item half is
+sent bare - a parameter as its plain name, a topic as its plain path.
+
+The member's own gateway is the only one that can answer: the ROS service, the
+topic and the parameter behind the id exist on its graph and nowhere else. What
+this gateway holds for a peer-owned member is a declaration, which is why the
+local walk's record of "does this member provide this item" is consulted only
+once the member is known to be served here - on a peer-owned member it holds no
+topics at all, and no node FQN to ask for a parameter, so every one of them
+would be a miss.
+
+The order inside ``dispatch_to_member`` is load-bearing:
+
+1. **Reachability, before anything is sent.** A member retained while its
+   gateway is silent is answered from what it declared: ``504`` with the SOVD
+   code ``not-responding``, naming the member. Forwarding to a dead peer instead
+   produces a socket failure dressed as ``502``, which reports this gateway as
+   broken rather than the link as down.
+2. **Ownership.** No routing entry means this gateway owns the member and the
+   handler carries on.
+3. **Addressing.** The member is looked up in the cache to decide whether it is
+   an App or a Component, because that decides which collection its route lives
+   under.
+4. **Forward.** ``AggregationManager::forward_request`` is called with the
+   built path. The overload taking an explicit target applies the same
+   ``/api/v1/`` SSRF guard and the same ``<peer>__`` prefix rewrite to that path
+   as the two-argument form applies to the incoming one - the target is
+   assembled from client-supplied ids and is exactly as untrusted.
+
+The wire is committed by the forward, so the handler returns
+``HandlerContext::forwarded_sentinel_error()``: the typed router recognises the
+``x-medkit-internal-forwarded`` code and renders nothing, the same channel the
+remote-entity branch of ``validate_entity_for_route`` uses.
+
+Termination does not depend on a hop count. The target is the member's own route
+on the gateway that owns it, and there that entity is local, so the receiving
+gateway serves it rather than forwarding again. A ``X-Medkit-No-Fan-Out`` header
+on the incoming request is propagated but does not suppress the dispatch:
+suppression bounds collection fan-out, while a member-qualified request names
+its owner and is one hop by construction.
+
 **Entity collection endpoints** (``GET /api/v1/areas``, ``/components``,
 ``/apps``, ``/functions``) serve from the local entity cache, which is
 populated during periodic cache refresh cycles that fetch entities from all

@@ -20,8 +20,12 @@
  * - Exposes /powertrain/engine/calibrate service (Trigger type)
  * - Returns success with calibration message
  * - Used to test POST /services/{service} endpoint
+ * - Declares a writable `calibration_offset` parameter, so the node is
+ *   addressable through the configurations collection as well as the
+ *   operations one
  */
 
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
@@ -34,6 +38,13 @@ class CalibrationService : public rclcpp::Node {
     calibration_srv_ = this->create_service<std_srvs::srv::Trigger>(
         "calibrate",
         std::bind(&CalibrationService::calibrate_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+    // Writable, and the same name on every instance of this node: two gateways
+    // each running one is what makes a member-qualified configuration id
+    // resolvable to exactly one of them.
+    rcl_interfaces::msg::ParameterDescriptor offset_desc;
+    offset_desc.description = "Calibration zero-point offset applied to the next calibration run";
+    this->declare_parameter("calibration_offset", 0.0, offset_desc);
 
     RCLCPP_INFO(this->get_logger(), "Calibration service started");
   }

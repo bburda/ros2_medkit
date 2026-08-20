@@ -133,6 +133,12 @@ PEER_CALIBRATION_NAMESPACE = '/chassis/brakes'
 # survives the merge - R1, the precondition for every addressing rule.
 COLLIDING_LEAF = 'shared_sensor'
 
+# Declared by the calibration demo node, so BOTH `primary_calibration` and
+# `peer_calibration` expose it under one name. A member-qualified id is the only
+# thing that separates the two copies, which is what makes this the parameter
+# the configuration cases below address.
+CALIBRATION_PARAM = 'calibration_offset'
+
 MERGED_AREA = 'vehicle'
 MERGED_FUNCTION = 'vehicle_health'
 PARENT_COMPONENT = 'vehicle-ecu'
@@ -383,6 +389,38 @@ class GroupingAggregationTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json().get('items', [])
 
+    @staticmethod
+    def _set_offset(base_url, app_id, value):
+        """Set `calibration_offset` on one App through ITS OWN gateway.
+
+        The member's own route on the gateway that runs it, so the value the
+        aggregate is then asked for was put there by a request that never went
+        through the aggregate.
+        """
+        response = requests.put(
+            f'{base_url}/apps/{app_id}/configurations/{CALIBRATION_PARAM}',
+            json={'data': value},
+            timeout=15,
+        )
+        if response.status_code != 200:
+            raise AssertionError(
+                f'could not seed {app_id}.{CALIBRATION_PARAM} on {base_url}: '
+                f'{response.status_code} {response.text}'
+            )
+        return response
+
+    @staticmethod
+    def _offset_of(base_url, app_id):
+        """Read `calibration_offset` from one App through ITS OWN gateway."""
+        response = requests.get(
+            f'{base_url}/apps/{app_id}/configurations/{CALIBRATION_PARAM}', timeout=15)
+        if response.status_code != 200:
+            raise AssertionError(
+                f'could not read {app_id}.{CALIBRATION_PARAM} on {base_url}: '
+                f'{response.status_code} {response.text}'
+            )
+        return response.json().get('data')
+
     # ---------------------------------------------------------------------- R1
 
     def test_a_leaf_contributed_by_both_gateways_stays_two_addressable_leaves(self):
@@ -552,13 +590,386 @@ class GroupingAggregationTest(unittest.TestCase):
         )
         self.assertTrue(body.get('data'), 'peer member returned an empty payload')
 
+        # And it is THAT member's item, not merely some 200. The comparison is
+        # against the peer's own answer for the same member and topic, so a read
+        # that silently fell back to a local member - the other half of this
+        # Function publishes a different message type on a different topic -
+        # cannot satisfy it, and neither can a hand-built empty envelope.
+        direct = requests.get(
+            f'{PEER_URL}/apps/pressure_sensor/data/chassis/brakes/pressure', timeout=15)
+        self.assertEqual(direct.status_code, 200, direct.text)
+        direct_body = direct.json()
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('topic'),
+            '/chassis/brakes/pressure',
+            f'the answer names a topic the member does not publish: {body}',
+        )
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('type'),
+            direct_body.get('x-medkit', {}).get('ros2', {}).get('type'),
+            f'the answer is not the message the member publishes: {body}',
+        )
+        self.assertEqual(
+            sorted(body['data'].keys()), sorted(direct_body['data'].keys()),
+            f"the payload is not shaped like the member's own: {body}",
+        )
+        # The answer says which entity produced it, and for a peer-owned member
+        # that is the member itself - the request was served on the member's own
+        # route, over there. Served here it would name the aggregating entity,
+        # which is the shape a local sample of a topic this gateway cannot see
+        # would also carry.
+        self.assertEqual(
+            body.get('x-medkit', {}).get('entity_id'), 'pressure_sensor',
+            f'the aggregating entity answered for a member it does not run: {body}',
+        )
+
     def test_a_compound_id_reaches_a_local_member(self):
-        """R4 in the other direction: resolving members must not lose the local half."""
+        """R4 in the other direction: resolving members must not lose the local half.
+
+        The payload is asserted, not the status, for the same reason as the peer
+        case - and against the member's own App route on THIS gateway, so a
+        dispatch that forwarded a local member to a peer that has never heard of
+        it would fail here rather than pass as a 404 nobody looked at.
+        """
         item_id = f'temp_sensor:{"/powertrain/engine/temperature".lstrip("/")}'
         url = f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/{quote(item_id, safe="")}'
         response = requests.get(url, timeout=15)
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json().get('x-medkit', {}).get('status'), 'data')
+        body = response.json()
+        self.assertEqual(body.get('x-medkit', {}).get('status'), 'data')
+        self.assertTrue(body.get('data'), 'local member returned an empty payload')
+
+        direct = requests.get(
+            f'{PRIMARY_URL}/apps/temp_sensor/data/powertrain/engine/temperature', timeout=15)
+        self.assertEqual(direct.status_code, 200, direct.text)
+        direct_body = direct.json()
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('topic'),
+            '/powertrain/engine/temperature',
+            f'the answer names a topic the local member does not publish: {body}',
+        )
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('type'),
+            direct_body.get('x-medkit', {}).get('ros2', {}).get('type'),
+            f'the answer is not the message the local member publishes: {body}',
+        )
+        self.assertEqual(
+            sorted(body['data'].keys()), sorted(direct_body['data'].keys()),
+            f"the payload is not shaped like the local member's own: {body}",
+        )
+        # And this gateway answered: the entity named is the one the request
+        # addressed. A dispatch that forwarded a locally owned member would come
+        # back naming the member instead - or, more likely, not come back at all.
+        self.assertEqual(
+            body.get('x-medkit', {}).get('entity_id'), MERGED_FUNCTION,
+            f'a locally owned member was not served here: {body}',
+        )
+
+    def test_a_compound_operation_id_runs_on_the_members_gateway(self):
+        """R4 for an operation, asserted on the result rather than the status.
+
+        The peer's calibration service is on another ROS domain, so this gateway
+        cannot call it: served locally the request answers 500 service-unavailable.
+        A 200 alone would still not say the service RAN, so the response payload
+        is read - a service that answered is the only thing that can fill it.
+        """
+        response = requests.post(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/operations/'
+            f'{quote("peer_calibration:calibrate", safe="")}/executions',
+            json={},
+            timeout=15,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        parameters = response.json().get('parameters')
+        self.assertIsInstance(
+            parameters, dict, f'no service response came back: {response.text}')
+        self.assertIs(
+            parameters.get('success'), True,
+            f"the member's service did not report success: {parameters}",
+        )
+        self.assertTrue(
+            parameters.get('message'),
+            f"the member's service answered with nothing to say: {parameters}",
+        )
+
+    def test_a_write_through_an_aggregate_reaches_the_peer_owned_member(self):
+        """R4 for a write: the topic is published where the member actually is.
+
+        A write resolves its target exactly as a read does, so it lands on the
+        same gateway. Served here it would publish onto a ROS graph the member is
+        not on - a publisher nobody is listening to - and answer 200 with the
+        same echo, which is why the status cannot decide this case and the
+        serving entity is read instead. The 404 is asserted separately because it
+        is the other way to get this wrong: consulting the local walk for a
+        member another gateway runs finds no such topic and refuses a write that
+        is perfectly valid.
+        """
+        direct = requests.get(
+            f'{PEER_URL}/apps/pressure_sensor/data/chassis/brakes/pressure', timeout=15)
+        self.assertEqual(direct.status_code, 200, direct.text)
+        direct_body = direct.json()
+        message_type = direct_body.get('x-medkit', {}).get('ros2', {}).get('type')
+        self.assertTrue(message_type, f'the member does not name its message type: {direct.text}')
+
+        response = requests.put(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote("pressure_sensor:chassis/brakes/pressure", safe="")}',
+            json={'type': message_type, 'data': direct_body['data']},
+            timeout=15,
+        )
+        self.assertNotEqual(
+            response.status_code, 404,
+            f'a write to a peer-owned member was refused as an unknown item: {response.text}',
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(
+            body.get('x-medkit', {}).get('ros2', {}).get('topic'),
+            '/chassis/brakes/pressure',
+            f'the write echo names a topic the member does not publish: {response.text}',
+        )
+        # Served here the publish would succeed too - a publisher on this
+        # gateway's graph, which the member is not on, and a 200 that looks
+        # identical. What tells them apart is which entity answered.
+        self.assertEqual(
+            body.get('x-medkit', {}).get('entity_id'), 'pressure_sensor',
+            f'the write was published by the aggregating gateway, not the member: {body}',
+        )
+
+    def test_a_configuration_id_the_list_offers_reads_back_from_its_member(self):
+        """R5 for configurations, in both directions at once.
+
+        The list of an aggregating entity is assembled from two places - this
+        gateway's own nodes and the peer fan-out - so it offers ids for members
+        this gateway cannot reach. Reading one back is what says the id is an
+        address rather than a label. The value is asserted per member, and the
+        two members are seeded to different values first, so an id answered by
+        the wrong copy fails here instead of passing as a plausible 200.
+        """
+        expected = {'primary_calibration': 11.5, 'peer_calibration': 22.5}
+        self._set_offset(PRIMARY_URL, 'primary_calibration', expected['primary_calibration'])
+        self._set_offset(PEER_URL, 'peer_calibration', expected['peer_calibration'])
+
+        items = self._items(f'functions/{MERGED_FUNCTION}', 'configurations')
+        offered = sorted(
+            item.get('id') for item in items
+            if str(item.get('id', '')).endswith(f':{CALIBRATION_PARAM}')
+        )
+        self.assertEqual(
+            offered,
+            [f'peer_calibration:{CALIBRATION_PARAM}', f'primary_calibration:{CALIBRATION_PARAM}'],
+            f"the aggregate does not offer both members' copies: "
+            f"{[item.get('id') for item in items]}",
+        )
+
+        for config_id in offered:
+            with self.subTest(configuration=config_id):
+                member = config_id.split(':', 1)[0]
+                response = requests.get(
+                    f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/configurations/'
+                    f'{quote(config_id, safe="")}',
+                    timeout=15,
+                )
+                self.assertEqual(
+                    response.status_code, 200,
+                    f'the list offers {config_id!r} but reading it answered '
+                    f'{response.status_code}: {response.text}',
+                )
+                self.assertAlmostEqual(
+                    response.json().get('data'), expected[member], places=6,
+                    msg=f"{config_id} did not answer with its own member's value: "
+                        f'{response.text}',
+                )
+
+    def test_a_configuration_of_a_local_member_is_still_served_here(self):
+        """R5 in the direction that a dispatch fix is most likely to break.
+
+        A member this gateway runs must be answered from this gateway's own
+        parameter service, with no hop. Both halves are pinned: the entity that
+        answered is the one the request addressed, and the node behind the value
+        is the local member's, not its peer namesake's - the two run the same
+        executable under the same parameter name and differ only in namespace,
+        so nothing shallower can tell them apart.
+        """
+        local_value = 2.5
+        self._set_offset(PRIMARY_URL, 'primary_calibration', local_value)
+        self._set_offset(PEER_URL, 'peer_calibration', -3.75)
+
+        config_id = f'primary_calibration:{CALIBRATION_PARAM}'
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/configurations/'
+            f'{quote(config_id, safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertAlmostEqual(
+            body.get('data'), local_value, places=6,
+            msg=f"the local member's value did not come back: {body}",
+        )
+        self.assertEqual(body.get('id'), config_id, body)
+        x_medkit = body.get('x-medkit', {})
+        self.assertEqual(
+            x_medkit.get('entity_id'), MERGED_FUNCTION,
+            f'a locally owned member was not served here: {body}',
+        )
+        self.assertEqual(
+            x_medkit.get('source_app'), 'primary_calibration',
+            f'the answer does not name the member it came from: {body}',
+        )
+        self.assertEqual(
+            x_medkit.get('ros2', {}).get('node'), '/powertrain/engine/calibration',
+            f'the value was read from a node the local member is not: {body}',
+        )
+
+    def test_a_configuration_of_a_peer_owned_member_is_read_from_that_member(self):
+        """R5 for configurations, on the half the local walk cannot serve.
+
+        A parameter lives on a node, and the node behind a peer-owned member is
+        on a ROS graph this gateway is not on. Served here the lookup finds
+        nothing and the request fails; served on the member's own gateway it
+        returns that member's value. Both members expose the same parameter
+        name, seeded to different values, and the answer is checked against the
+        peer's - a fall-back to the local namesake would otherwise be a 200
+        with a number in it.
+        """
+        peer_value = 4.25
+        local_value = -1.5
+        self._set_offset(PEER_URL, 'peer_calibration', peer_value)
+        self._set_offset(PRIMARY_URL, 'primary_calibration', local_value)
+
+        config_id = f'peer_calibration:{CALIBRATION_PARAM}'
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/configurations/'
+            f'{quote(config_id, safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertAlmostEqual(
+            body.get('data'), peer_value, places=6,
+            msg=f"the peer member's value did not come back: {body}",
+        )
+        self.assertNotAlmostEqual(
+            body.get('data'), local_value, places=6,
+            msg=f'the local namesake answered for a peer-owned member: {body}',
+        )
+        x_medkit = body.get('x-medkit', {})
+        # The answer says which entity produced it, and for a peer-owned member
+        # that is the member itself - the request was served on the member's own
+        # route, over there. Served here it would name the aggregating entity.
+        self.assertEqual(
+            x_medkit.get('entity_id'), 'peer_calibration',
+            f'the aggregating entity answered for a member it does not run: {body}',
+        )
+        self.assertEqual(
+            x_medkit.get('ros2', {}).get('node'), '/chassis/brakes/calibration',
+            f'the value was read from a node the peer member is not: {body}',
+        )
+
+    def test_a_configuration_reset_through_an_aggregate_reaches_the_member(self):
+        """R5 for a reset, the method whose answer carries no payload at all.
+
+        DELETE returns 204 and nothing else, so there is no field in the response
+        that could say where it landed. Both members are moved off their default
+        first and the pair is read back from their own gateways afterwards: the
+        member the id named is back at its default and the local namesake is not.
+        A reset served here would satisfy neither, and a 204 alone both.
+        """
+        self._set_offset(PEER_URL, 'peer_calibration', 5.5)
+        self._set_offset(PRIMARY_URL, 'primary_calibration', 6.5)
+
+        config_id = f'peer_calibration:{CALIBRATION_PARAM}'
+        response = requests.delete(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/configurations/'
+            f'{quote(config_id, safe="")}',
+            timeout=15,
+        )
+        self.assertNotEqual(
+            response.status_code, 404,
+            f'a reset of a peer-owned member was refused as an unknown member: {response.text}',
+        )
+        self.assertEqual(response.status_code, 204, response.text)
+
+        self.assertAlmostEqual(
+            self._offset_of(PEER_URL, 'peer_calibration'), 0.0, places=6,
+            msg='the reset never reached the member it named',
+        )
+        self.assertAlmostEqual(
+            self._offset_of(PRIMARY_URL, 'primary_calibration'), 6.5, places=6,
+            msg='the reset landed on the local namesake instead of the member it named',
+        )
+
+    def test_a_configuration_write_through_an_aggregate_lands_on_the_member(self):
+        """R5 for a write: the parameter changes where the member actually is.
+
+        A write echoes what it was handed, so its response cannot show where it
+        landed. The proof is read back from the PEER's own gateway afterwards,
+        and the local namesake is read too: a write served here would change
+        that one, or nothing at all, and either way the echo would look the same.
+        """
+        written = 9.75
+        self._set_offset(PEER_URL, 'peer_calibration', 0.0)
+        self._set_offset(PRIMARY_URL, 'primary_calibration', 0.0)
+
+        config_id = f'peer_calibration:{CALIBRATION_PARAM}'
+        response = requests.put(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/configurations/'
+            f'{quote(config_id, safe="")}',
+            json={'data': written},
+            timeout=15,
+        )
+        self.assertNotEqual(
+            response.status_code, 404,
+            f'a write to a peer-owned member was refused as an unknown member: {response.text}',
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json().get('x-medkit', {}).get('entity_id'), 'peer_calibration',
+            f'the write was applied by the aggregating gateway, not the member: {response.text}',
+        )
+
+        self.assertAlmostEqual(
+            self._offset_of(PEER_URL, 'peer_calibration'), written, places=6,
+            msg='the write never reached the member it named',
+        )
+        self.assertAlmostEqual(
+            self._offset_of(PRIMARY_URL, 'primary_calibration'), 0.0, places=6,
+            msg='the write landed on the local namesake instead of the member it named',
+        )
+
+    def test_an_unknown_member_in_a_compound_id_is_refused(self):
+        """R5 for the member half: absent is said, not sampled for.
+
+        A qualifier naming nothing must be refused before any gateway is asked,
+        and the refusal must name the half that was wrong - otherwise a client
+        cannot tell a mistyped member from a member whose item is missing. The
+        second half of the case pins the distinction the refusal rests on: an id
+        that DOES resolve answers 200 and states whether data arrived, so
+        "present but empty" and "absent" are never the same response.
+        """
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote("no_such_member:chassis/brakes/pressure", safe="")}',
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+        body = response.json()
+        self.assertEqual(
+            body.get('parameters', {}).get('member_id'), 'no_such_member',
+            f'the refusal does not name the member half that was wrong: {body}',
+        )
+
+        present = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote("pressure_sensor:chassis/brakes/pressure", safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(present.status_code, 200, present.text)
+        self.assertIn(
+            present.json().get('x-medkit', {}).get('status'), ('data', 'metadata_only'),
+            f'a resolvable id does not say whether data arrived: {present.text}',
+        )
 
     # ---------------------------------------------------------------------- R5
 
@@ -568,6 +979,11 @@ class GroupingAggregationTest(unittest.TestCase):
         Today an unknown topic answers 200 metadata-only on every entity, so a
         client cannot tell a typo from a silent sensor. On an aggregating entity
         the member set is known, so the answer can be exact.
+
+        The reason is asserted, not just the status: a read that fell through to
+        the ROS graph and failed to find the topic there also answers 404, so a
+        bare status check cannot tell "the member does not provide this" from
+        "nobody happened to be publishing".
         """
         response = requests.get(
             f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
@@ -575,6 +991,31 @@ class GroupingAggregationTest(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(response.status_code, 404, response.text)
+        body = response.json()
+        self.assertEqual(body.get('error_code'), 'resource-not-found', body)
+        self.assertEqual(body.get('parameters', {}).get('member_id'), 'temp_sensor', body)
+        self.assertEqual(
+            body.get('parameters', {}).get('topic_name'), '/no/such/topic', body)
+
+    def test_an_id_that_names_a_member_and_no_item_is_refused(self):
+        """R5 at the boundary: naming a member is not naming an item.
+
+        The member's own collection route is one trailing slash away from its
+        item route, so an id that stops at the colon addresses the collection if
+        it is carried any further - and the caller, having asked for one value,
+        is handed a list and no sign that anything went wrong. Checked on a
+        PEER-owned member because the local path never reaches that far.
+        """
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote("pressure_sensor:", safe="")}',
+            timeout=15,
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertNotIn(
+            'items', response.json(),
+            f'a request for one item was answered with a collection: {response.text}',
+        )
 
     # ---------------------------------------------------------------------- R7
 
@@ -596,6 +1037,48 @@ class GroupingAggregationTest(unittest.TestCase):
         self.assertNotIn(
             'peer_calibration', members,
             'suppression header ignored, so a peered pair would not terminate',
+        )
+
+    def test_loop_suppression_does_not_stop_a_request_reaching_its_member(self):
+        """R7 and R4 together: suppression bounds fan-out, it does not blind a read.
+
+        A request addressed to ONE member is not a fan-out - it names its owner,
+        and that owner serves it from its own tree without asking anyone else, so
+        the chain is one hop whatever the header says. Turning the header into a
+        refusal to dispatch would answer the same request two different ways
+        depending on a hint about collection listing, and a client that sets it
+        to keep listings local would silently start reading empty bodies.
+
+        Termination is measured on the clock rather than inferred: a bounce
+        between peered gateways shows up as a request that never comes back, and
+        an assertion that only reads the status would report that as an error
+        from the transport instead of as the loop it is.
+        """
+        started = time.monotonic()
+        read = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote("pressure_sensor:chassis/brakes/pressure", safe="")}',
+            headers={'X-Medkit-No-Fan-Out': '1'},
+            timeout=15,
+        )
+        run = requests.post(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/operations/'
+            f'{quote("peer_calibration:calibrate", safe="")}/executions',
+            headers={'X-Medkit-No-Fan-Out': '1'},
+            json={},
+            timeout=15,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(read.status_code, 200, read.text)
+        self.assertEqual(
+            read.json().get('x-medkit', {}).get('status'), 'data',
+            f'suppression turned a member read into an empty success: {read.text}',
+        )
+        self.assertIn(run.status_code, (200, 202), run.text)
+        self.assertLess(
+            elapsed, 10.0,
+            f'two suppressed member requests took {elapsed:.1f}s, which is a bounce, not a hop',
         )
 
     # ------------------------------------------------------------------ R10
@@ -939,6 +1422,58 @@ class GroupingAggregationTest(unittest.TestCase):
                     f'the list offers {operation_id!r} but executing it answered '
                     f'{response.status_code}: {response.text}',
                 )
+
+    def test_z6a_a_read_of_a_peer_owned_member_says_not_responding(self):
+        """R10 for the dispatch path: a dead link is reported, never proxied.
+
+        A forward to a peer that has stopped answering fails at the socket and
+        comes back 502, which says this gateway broke. The member is retained
+        precisely so the true answer is available without asking: it is declared,
+        it is unreachable, and 504 not-responding is the SOVD code for that. The
+        502 is asserted against explicitly because it is the regression this
+        ordering exists to prevent, and a bare `assertEqual(504)` reads the same
+        whichever wrong status arrives.
+        """
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/data/'
+            f'{quote("pressure_sensor:chassis/brakes/pressure", safe="")}',
+            timeout=15,
+        )
+        self.assertNotEqual(
+            response.status_code, 502,
+            f'a silent peer was forwarded to instead of answered for: {response.text}',
+        )
+        self.assertEqual(response.status_code, 504, response.text)
+        body = response.json()
+        self.assertEqual(body.get('error_code'), 'not-responding', body)
+        self.assertIn('pressure_sensor', body.get('message', ''), body)
+        self.assertEqual(
+            body.get('parameters', {}).get('member_id'), 'pressure_sensor', body)
+
+    def test_z6b_a_configuration_read_of_a_silent_peer_owned_member_says_not_responding(self):
+        """R10 for the configuration dispatch path, for the same reason as z6a.
+
+        Reachability is settled before anything is forwarded, so a member whose
+        gateway has stopped answering is reported as unreachable rather than as
+        a proxy hop that failed at the socket. The 502 is asserted against
+        explicitly: it is the shape this ordering exists to prevent, and a bare
+        assertEqual(504) reads the same whichever wrong status arrives.
+        """
+        response = requests.get(
+            f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/configurations/'
+            f'{quote(f"peer_calibration:{CALIBRATION_PARAM}", safe="")}',
+            timeout=15,
+        )
+        self.assertNotEqual(
+            response.status_code, 502,
+            f'a silent peer was forwarded to instead of answered for: {response.text}',
+        )
+        self.assertEqual(response.status_code, 504, response.text)
+        body = response.json()
+        self.assertEqual(body.get('error_code'), 'not-responding', body)
+        self.assertIn('peer_calibration', body.get('message', ''), body)
+        self.assertEqual(
+            body.get('parameters', {}).get('member_id'), 'peer_calibration', body)
 
     def test_z7_suppression_omits_the_peer_without_losing_ambiguity(self):
         """The loop-suppression guard, checked for the reason it was written.

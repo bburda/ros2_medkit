@@ -355,6 +355,41 @@ When aggregation is enabled, entities from peers are merged with local entities:
 Requests for remote entities are transparently forwarded to the owning peer.
 The routing table maps entity IDs to peer names.
 
+An entity that draws its resources from members - an Area, a merged Function, a
+hierarchical parent Component - is deliberately absent from that table, because
+its members can sit on different gateways and routing it whole would discard
+every member the other contributors hold. A request that names one member is
+routed instead: it is re-addressed to that member's own entity route on the
+gateway that owns it, so
+
+.. code-block:: text
+
+   POST /api/v1/functions/vehicle_health/operations/peer_calibration:calibrate/executions
+
+becomes, on the peer that runs ``peer_calibration``,
+
+.. code-block:: text
+
+   POST /api/v1/apps/peer_calibration/operations/calibrate/executions
+
+The same routing applies to a single ``/data`` item and to a single
+``/configurations`` parameter. A configuration id is ``<app_id>:<param_name>``,
+and on the owning gateway the parameter is addressed by its bare name, so
+
+.. code-block:: text
+
+   PUT /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
+
+becomes
+
+.. code-block:: text
+
+   PUT /api/v1/apps/peer_calibration/configurations/calibration_offset
+
+Reachability is answered before anything is forwarded, so a member whose gateway
+is silent gets ``504 not-responding`` rather than a ``502`` from a failed
+connection. A member this gateway owns is served here, unchanged.
+
 See :doc:`../design/ros2_medkit_gateway/aggregation` for detailed merge logic
 and architecture diagrams.
 

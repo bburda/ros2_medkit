@@ -339,6 +339,63 @@ http::ValidatorResult<EntityInfo> HandlerContext::validate_entity_for_route(cons
   return entity_info;
 }
 
+http::Result<MemberDispatch> HandlerContext::dispatch_to_member(const http::TypedRequest & req,
+                                                                const std::string & member_id,
+                                                                const std::string & member_resource_path,
+                                                                json error_params) const {
+  if (member_id.empty()) {
+    return MemberDispatch::kServeLocally;
+  }
+
+  // Reachability first, and unconditionally: a retained member is answered from
+  // what it declared, never by asking the gateway that stopped answering.
+  if (!is_entity_available(member_id)) {
+    ErrorInfo err;
+    err.code = ERR_NOT_RESPONDING;
+    err.message = "Member '" + member_id + "' is not available";
+    err.http_status = 504;
+    error_params["details"] =
+        "The gateway contributing this member is not answering; it is retained from its last known declaration";
+    error_params["member_id"] = member_id;
+    err.params = std::move(error_params);
+    return tl::unexpected(std::move(err));
+  }
+
+  if (aggregation_mgr_ == nullptr) {
+    return MemberDispatch::kServeLocally;
+  }
+  auto peer = aggregation_mgr_->find_peer_for_entity(member_id);
+  if (!peer) {
+    return MemberDispatch::kServeLocally;
+  }
+
+  // Only an App or a Component can be addressed on the peer; those are the two
+  // collections a resource route exists under. A member that is neither names
+  // nothing this gateway can re-address, so the local path answers for it.
+  const auto & cache = node_->get_thread_safe_cache();
+  std::string collection;
+  if (cache.get_app(member_id)) {
+    collection = "apps";
+  } else if (cache.get_component(member_id)) {
+    collection = "components";
+  } else {
+    return MemberDispatch::kServeLocally;
+  }
+
+  // Same escape hatch, and same justification, as the remote-entity branch of
+  // validate_entity_for_route: proxying commits the wire, and the sink is the
+  // framework's, not the handler's.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  const auto & raw_req = req.raw_for_framework();
+#pragma GCC diagnostic pop
+  if (tl_forward_response != nullptr) {
+    aggregation_mgr_->forward_request(*peer, raw_req, *tl_forward_response,
+                                      api_path("/" + collection + "/" + member_id + "/" + member_resource_path));
+  }
+  return MemberDispatch::kForwarded;
+}
+
 /// False when the entity is present only because its peer's declaration is
 /// being retained. An entity this gateway has never heard of is not "not
 /// available" - it is absent, and the caller already got a 404 for it.

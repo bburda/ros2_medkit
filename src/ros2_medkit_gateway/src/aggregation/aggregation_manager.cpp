@@ -772,6 +772,11 @@ std::string AggregationManager::get_peer_url(const std::string & peer_name) cons
 
 void AggregationManager::forward_request(const std::string & peer_name, const httplib::Request & req,
                                          httplib::Response & res) {
+  forward_request(peer_name, req, res, req.path);
+}
+
+void AggregationManager::forward_request(const std::string & peer_name, const httplib::Request & req,
+                                         httplib::Response & res, const std::string & target_path) {
   // Find peer under lock, take shared_ptr copy for lifetime safety, then release
   // before network I/O. The shared_ptr keeps the PeerClient alive even if
   // remove_discovered_peer() erases it from peers_ concurrently.
@@ -792,8 +797,10 @@ void AggregationManager::forward_request(const std::string & peer_name, const ht
   }
 
   // Validate forwarded path - only allow SOVD API paths to prevent SSRF
-  // to internal peer endpoints (e.g., /metrics, /debug, /admin).
-  if (req.path.rfind("/api/v1/", 0) != 0) {
+  // to internal peer endpoints (e.g., /metrics, /debug, /admin). The path is
+  // checked whether it came from the client or was built by a caller from
+  // client-supplied ids; both are equally untrusted.
+  if (target_path.rfind("/api/v1/", 0) != 0) {
     res.status = 400;
     nlohmann::json error_body;
     error_body["error_code"] = ERR_INVALID_REQUEST;
@@ -808,7 +815,7 @@ void AggregationManager::forward_request(const std::string & peer_name, const ht
   // the prefix before forwarding.
   // Anchor to path segment boundary: the prefix must appear right after '/' to avoid
   // false matches inside other path segments (e.g., "v1" matching "/api/v1/").
-  std::string forwarded_path = req.path;
+  std::string forwarded_path = target_path;
   std::string prefix = peer_name + EntityMerger::SEPARATOR;
   auto prefix_pos = forwarded_path.find(prefix);
   if (prefix_pos != std::string::npos && prefix_pos > 0 && forwarded_path[prefix_pos - 1] == '/') {

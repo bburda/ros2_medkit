@@ -286,10 +286,54 @@ two gateways each contribute an item under that path.
   the Foxglove panel, the MCP tools and the generated OpenAPI document all send.
 - `POST /{entity}/operations/{id}/executions` with a bare id several members
   provide is `400 invalid-request`, naming the qualified form and the members.
-- A qualified id is accepted on single-item routes; an unknown member half, or
-  an item half that member does not provide, is `404` - which is what tells an
-  absent item apart from one that exists and carries no data.
+- A qualified id is accepted on single-item routes; an unknown member half, an
+  item half that member does not provide, or a member half followed by nothing,
+  is `404` - which is what tells an absent item apart from one that exists and
+  carries no data.
 - `GET` of a bare id stays permissive and returns the first match.
+
+A member-qualified request is served by the gateway that owns that member, on
+the member's own entity route. An aggregating entity holds nothing itself and
+its members can belong to different gateways, so
+
+```
+POST /api/v1/functions/vehicle_health/operations/peer_calibration:calibrate/executions
+```
+
+becomes, when `peer_calibration` belongs to a peer,
+
+```
+POST /api/v1/apps/peer_calibration/operations/calibrate/executions
+```
+
+on that peer, and the peer's answer is what the client gets. The ROS service or
+topic behind the id lives on the owner's graph and nowhere else. A locally owned
+member is served here as before. This covers `GET` and `PUT` of one `/data` item,
+`POST` of an `/operations` execution, and `GET`, `PUT` and `DELETE` of one
+`/configurations` item.
+
+`/configurations` keeps its own id scheme, `<app_id>:<param_name>`, whose member
+half is the app id. Nothing on the owning gateway is aggregating, so the
+parameter is addressed there by its bare name:
+
+```
+PUT /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
+```
+
+becomes
+
+```
+PUT /api/v1/apps/peer_calibration/configurations/calibration_offset
+```
+
+and the write lands on the ROS node that declares the parameter. The
+`GET /{entity}/configurations` listing is unchanged - peer parameters reach it
+through the collection fan-out, and the ids it offers are the ids the
+single-item routes accept. Reachability is settled first, so a
+member whose gateway has gone silent answers `504 not-responding` instead of a
+`502` from a connection that could not be made. `X-Medkit-No-Fan-Out` bounds the
+collection fan-out and does not change where a member-qualified request is
+served - it already names its owner and is one hop.
 
 Ambiguity is decided from the declared tree, which includes a peer's declared
 operations held locally. The answer therefore does not change with who is

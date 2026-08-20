@@ -658,9 +658,63 @@ What this means for a request:
 - A qualified id is accepted on the single-item routes. A member half that
   names no member of the entity is ``404``, and so is an item half that member
   does not provide - which is what tells an absent item apart from an item that
-  exists and currently carries no data.
+  exists and currently carries no data. A member half followed by nothing names
+  no item and is ``404`` as well.
 - Reads are permissive: ``GET`` of a bare id returns the first match rather
   than refusing, which is the behaviour every existing client depends on.
+
+Where a Member-Qualified Request is Served
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An aggregating entity holds no resources of its own, and its members can belong
+to different gateways. A request naming one member is therefore served by the
+gateway that owns **that member**, on the member's own entity route:
+
+.. code-block:: text
+
+   POST /api/v1/functions/vehicle_health/operations/peer_calibration:calibrate/executions
+
+is answered, when ``peer_calibration`` belongs to a peer, by
+
+.. code-block:: text
+
+   POST /api/v1/apps/peer_calibration/operations/calibrate/executions
+
+on that peer, and the peer's response is what the client receives. The ROS
+service or topic behind the id only exists on the owner's graph, so no other
+gateway can answer. A member this gateway owns is served locally exactly as
+before. This applies to ``GET`` and ``PUT`` of a single ``/data`` item, to
+``POST`` of an ``/operations`` execution, and to ``GET``, ``PUT`` and
+``DELETE`` of a single ``/configurations`` item.
+
+``/configurations`` keeps its own id scheme, ``<app_id>:<param_name>``, and the
+member half is the app id. Because nothing on the owning gateway is aggregating,
+the parameter is addressed there by its bare name:
+
+.. code-block:: text
+
+   PUT /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
+
+is answered, when ``peer_calibration`` belongs to a peer, by
+
+.. code-block:: text
+
+   PUT /api/v1/apps/peer_calibration/configurations/calibration_offset
+
+so the value comes from - and the write lands on - the ROS node that actually
+declares the parameter. ``GET /{entity}/configurations`` is unaffected: peer
+parameters reach that listing through the collection fan-out, and the ids it
+offers are the ids the single-item routes accept.
+
+Reachability is decided before anything is forwarded. A member retained while
+its gateway is silent answers ``504 not-responding`` naming the member (see
+:ref:`retained-entities`) rather than a ``502`` from a connection that could not
+be made.
+
+``X-Medkit-No-Fan-Out`` does not change this. The header bounds the collection
+fan-out that merges peer items into a listing; a request naming one member
+already names its owner, so it is one hop and is answered by that owner whether
+or not the header is present.
 
 Ambiguity is a property of the declared tree, not of who is reachable right
 now. A peer's declared operations are held locally, so the same request gets
@@ -1017,6 +1071,11 @@ Manage ROS 2 node parameters.
    and ``DELETE`` with ``400 invalid-request``. ``GET`` accepts the bare form
    and returns the first node that answers. Items carry the owning app in
    ``x-medkit.source``.
+
+   The ``<app_id>`` half is a member id, so ``GET``, ``PUT`` and ``DELETE`` of a
+   qualified id are served by the gateway that owns that app, on its own
+   ``/apps/{app_id}/configurations/{param_name}`` route. See
+   :ref:`member-qualified-ids` for the dispatch and its ``504`` case.
 
 ``GET /api/v1/components/{id}/configurations``
    List all parameters for an entity.

@@ -227,14 +227,13 @@ std::vector<std::string> distinct_members(const std::vector<OperationMatch> & ma
   return members;
 }
 
-/// The error for a member that is in the tree but whose gateway is silent.
+/// True for a member that is in the tree but whose gateway is silent.
 ///
 /// A retained member is kept precisely so that the answer to a request does not
 /// change when a link drops: the item is still addressable, and asking for it
 /// says why it cannot be served right now. The alternatives are what this
 /// replaces - quietly running a different member's operation, or a 200 with
-/// nothing in it. `not-responding` is the SOVD code for "no response from the
-/// underlying entity", which is exactly the situation.
+/// nothing in it.
 bool member_is_unreachable(const ThreadSafeEntityCache & cache, const std::string & member_id) {
   if (auto app = cache.get_app(member_id)) {
     return !app->available;
@@ -243,20 +242,6 @@ bool member_is_unreachable(const ThreadSafeEntityCache & cache, const std::strin
     return !component->available;
   }
   return false;
-}
-
-std::optional<ErrorInfo> member_unavailable_error(const ThreadSafeEntityCache & cache, const std::string & entity_id,
-                                                  const std::string & member_id, const std::string & operation_id) {
-  if (!member_is_unreachable(cache, member_id)) {
-    return std::nullopt;
-  }
-  return make_error(504, ERR_NOT_RESPONDING, "Member '" + member_id + "' is not available",
-                    json{{"details",
-                          "The gateway contributing this member is not answering; it is retained from its "
-                          "last known declaration"},
-                         {"entity_id", entity_id},
-                         {"operation_id", operation_id},
-                         {"member_id", member_id}});
 }
 
 /// Convert a ROS 2 action goal status into the SOVD `ExecutionStatus` enum
@@ -895,14 +880,22 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
         make_error(400, ERR_INVALID_REQUEST, "Ambiguous operation id: it names more than one operation", params));
   }
 
-  // Whoever ends up owning the resolved operation must actually be reachable.
+  // Whoever ends up owning the resolved operation must be reachable, and must
+  // run it themselves when they are another gateway. The service behind this id
+  // lives on the owner's ROS graph; calling it from here finds nothing and
+  // reports the member's own operation as unavailable.
   {
     const std::string & full_path =
         resolved.service.has_value() ? resolved.service->full_path : resolved.action->full_path;
     auto owner = ops.owner_by_path.find(full_path);
     if (owner != ops.owner_by_path.end()) {
-      if (auto err = member_unavailable_error(cache, entity_id, owner->second, operation_id)) {
-        return tl::make_unexpected(*err);
+      auto dispatch = ctx_.dispatch_to_member(req, owner->second, "operations/" + parsed.item_id + "/executions",
+                                              json{{"entity_id", entity_id}, {"operation_id", operation_id}});
+      if (!dispatch) {
+        return tl::make_unexpected(dispatch.error());
+      }
+      if (*dispatch == MemberDispatch::kForwarded) {
+        return tl::make_unexpected(HandlerContext::forwarded_sentinel_error());
       }
     }
   }
