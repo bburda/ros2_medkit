@@ -396,6 +396,17 @@ becomes
 
    PUT /api/v1/apps/peer_calibration/configurations/calibration_offset
 
+A member half is recognised when the text before the first colon names a member
+of the addressed entity, so the qualified form works on an aggregating entity
+whose members are all owned by peers - a parent gateway that runs no ROS node of
+its own - and on one that runs a single node beside peer-owned members. Neither
+shape changes the ids the entity's listing offers.
+
+``DELETE /api/v1/{entity_type}/{id}/configurations`` resets the nodes this
+gateway runs. A member another gateway runs is not reset by it, and the response
+says so: ``207`` instead of ``204``, with that member named and the gateway that
+owns it named with it.
+
 Reachability is answered before anything is forwarded, so a member whose gateway
 is silent gets ``504 not-responding`` rather than a ``502`` from a failed
 connection. A member this gateway owns is served here, unchanged.

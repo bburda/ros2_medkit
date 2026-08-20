@@ -14,6 +14,7 @@
 
 #include "ros2_medkit_gateway/core/http/handlers/config_handlers.hpp"
 
+#include <algorithm>
 #include <future>
 #include <optional>
 #include <string>
@@ -87,21 +88,52 @@ struct ParsedParamId {
   bool has_prefix{false};  ///< Whether the ID had an app prefix
 };
 
-/// Parse param_id which may carry an `app_id:param_name` prefix for
-/// aggregated configurations. For aggregated entities the prefix
-/// disambiguates which app's parameter is targeted; for non-aggregated
-/// entities the colon (if any) is treated as part of the parameter name.
-ParsedParamId parse_aggregated_param_id(const std::string & param_id, bool is_aggregated) {
+/// Split `param_id` into member and parameter halves at its first colon, when
+/// the half before that colon names a member of this entity.
+///
+/// An entity id is restricted to alphanumerics, underscore and hyphen, so it
+/// can never contain a colon and the first one is the only candidate separator.
+/// Whether it IS a separator is decided by the entity's member set, because
+/// that is the set the member half draws its meaning from. A count of the nodes
+/// this gateway resolves for the entity cannot decide it: a member another
+/// gateway runs reports no ROS binding here and so contributes no node, which
+/// makes the count a measure of how much of the entity is local and not of how
+/// its ids are formed. An entity whose members all belong to peers resolves no
+/// node at all, and one that resolves a single node can still have peer-owned
+/// members alongside it.
+///
+/// A prefix that names no member is part of the parameter name. That is what
+/// keeps a parameter whose own name contains a colon addressable, and it is why
+/// the entity's own id is not read as a member half: it separates nothing, and
+/// accepting it would give a parameter a second id nothing offers.
+///
+/// A member half followed by an empty parameter name addresses no parameter.
+/// Carried further it would name the member's configurations COLLECTION - the
+/// route one path segment shorter - and hand a list back to a caller that asked
+/// for one value, so it is left unsplit and misses as an ordinary name.
+ParsedParamId address_parameter(const ThreadSafeEntityCache & cache, const EntityInfo & entity,
+                                const std::string & param_id) {
   ParsedParamId result;
   result.param_name = param_id;
 
-  auto colon_pos = param_id.find(':');
-  if (colon_pos != std::string::npos && is_aggregated) {
-    result.app_id = param_id.substr(0, colon_pos);
-    result.param_name = param_id.substr(colon_pos + 1);
-    result.has_prefix = true;
+  const auto colon_pos = param_id.find(':');
+  if (colon_pos == std::string::npos || colon_pos == 0 || colon_pos + 1 == param_id.size()) {
+    return result;
   }
 
+  std::string candidate = param_id.substr(0, colon_pos);
+  if (candidate == entity.id) {
+    return result;
+  }
+
+  const auto members = cache.get_members(entity.sovd_type(), entity.id);
+  if (std::find(members.begin(), members.end(), candidate) == members.end()) {
+    return result;
+  }
+
+  result.app_id = std::move(candidate);
+  result.param_name = param_id.substr(colon_pos + 1);
+  result.has_prefix = true;
   return result;
 }
 
@@ -482,8 +514,10 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::get_configuration(cons
   if (!entity_result) {
     return tl::unexpected(flatten_validator_error(entity_result.error()));
   }
+  const auto & entity = *entity_result;
 
-  // Parameter ID may be prefixed with app_id: for aggregated configs.
+  // Bounded before anything is parsed: the id may carry a member half, so the
+  // cap covers an entity id, the separator and a parameter name.
   if (param_id.empty() || param_id.length() > kMaxAggregatedParamIdLength) {
     return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER, "Invalid parameter ID",
                                      json{{"details", "Parameter ID is empty or too long"}}));
@@ -491,6 +525,15 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::get_configuration(cons
 
   const auto & cache = ctx_.node()->get_thread_safe_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
+  auto parsed = address_parameter(cache, entity, param_id);
+
+  // Ownership is settled before the local node set is consulted, because the
+  // node set describes this gateway's own graph: an entity all of whose members
+  // belong to peers resolves none, and refusing on that count would refuse the
+  // one id the entity can actually answer.
+  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
+    return tl::unexpected(*answered);
+  }
 
   if (agg_configs.nodes.empty()) {
     return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "No nodes available",
@@ -498,14 +541,9 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::get_configuration(cons
   }
 
   auto * config_mgr = ctx_.node()->get_configuration_manager();
-  auto parsed = parse_aggregated_param_id(param_id, agg_configs.is_aggregated);
 
-  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
-    return tl::unexpected(*answered);
-  }
-
-  // If targeting a specific app in an aggregated entity, dispatch to that
-  // app's node directly.
+  // The id named a member this gateway owns; read the parameter from that
+  // member's own node rather than probing every node the entity has.
   if (parsed.has_prefix) {
     const auto * node_info = find_node_for_app(agg_configs.nodes, parsed.app_id);
     if (node_info == nullptr) {
@@ -608,14 +646,7 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::set_configuration(cons
 
   const auto & cache = ctx_.node()->get_thread_safe_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
-
-  if (agg_configs.nodes.empty()) {
-    return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "No nodes available",
-                                     json{{"entity_id", entity_id}, {"id", param_id}}));
-  }
-
-  auto * config_mgr = ctx_.node()->get_configuration_manager();
-  auto parsed = parse_aggregated_param_id(param_id, agg_configs.is_aggregated);
+  auto parsed = address_parameter(cache, entity, param_id);
 
   // Helper: turn a successful set into the typed response. The wire shape
   // matches the legacy handler exactly - the response id is the original
@@ -626,9 +657,19 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::set_configuration(cons
     return make_read_value(entity_id, node_fqn, param_id, source_app, param_data);
   };
 
+  // Ownership is settled before the local node set is consulted, for the same
+  // reason as on the read: the node set counts this gateway's own nodes, and a
+  // member another gateway runs contributes none of them.
   if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
     return tl::unexpected(*answered);
   }
+
+  if (agg_configs.nodes.empty()) {
+    return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "No nodes available",
+                                     json{{"entity_id", entity_id}, {"id", param_id}}));
+  }
+
+  auto * config_mgr = ctx_.node()->get_configuration_manager();
 
   if (parsed.has_prefix) {
     const auto * node_info = find_node_for_app(agg_configs.nodes, parsed.app_id);
@@ -693,6 +734,14 @@ http::Result<http::NoContent> ConfigHandlers::delete_configuration(const http::T
 
   const auto & cache = ctx_.node()->get_thread_safe_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
+  auto parsed = address_parameter(cache, entity, param_id);
+
+  // Ownership is settled before the local node set is consulted, for the same
+  // reason as on the read: the node set counts this gateway's own nodes, and a
+  // member another gateway runs contributes none of them.
+  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
+    return tl::unexpected(*answered);
+  }
 
   if (agg_configs.nodes.empty()) {
     return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "No nodes available",
@@ -700,11 +749,6 @@ http::Result<http::NoContent> ConfigHandlers::delete_configuration(const http::T
   }
 
   auto * config_mgr = ctx_.node()->get_configuration_manager();
-  auto parsed = parse_aggregated_param_id(param_id, agg_configs.is_aggregated);
-
-  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
-    return tl::unexpected(*answered);
-  }
 
   if (parsed.has_prefix) {
     const auto * node_info = find_node_for_app(agg_configs.nodes, parsed.app_id);
@@ -764,14 +808,8 @@ ConfigHandlers::delete_all_configurations(const http::TypedRequest & req) {
   const auto & cache = ctx_.node()->get_thread_safe_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
 
-  if (agg_configs.nodes.empty()) {
-    // No backing nodes means nothing to reset; SOVD treats this as a success
-    // with no content (204) - matches legacy behaviour.
-    return ResultVariant{http::NoContent{}};
-  }
-
   auto * config_mgr = ctx_.node()->get_configuration_manager();
-  bool all_success = true;
+  bool all_reset = true;
   dto::ConfigurationDeleteMultiStatus multi_status;
   multi_status.entity_id = entity_id;
 
@@ -781,20 +819,65 @@ ConfigHandlers::delete_all_configurations(const http::TypedRequest & req) {
     dto::ConfigurationDeleteResultItem entry;
     entry.node = node_info.node_fqn;
     entry.app_id = node_info.app_id;
-    if (result.success) {
-      entry.success = true;
-      if (result.data.is_object() || result.data.is_array()) {
-        entry.details = result.data;
-      }
-    } else {
-      all_success = false;
-      entry.success = false;
+    entry.success = result.success;
+    if (!result.success) {
+      all_reset = false;
       entry.error = result.error_message;
+    }
+    // Carried on the failing entry as well as the succeeding one: a partial
+    // reset names the parameters it could not restore, and dropping that leaves
+    // the caller a verdict with nothing to act on.
+    if (result.data.is_object() || result.data.is_array()) {
+      entry.details = result.data;
     }
     multi_status.results.push_back(std::move(entry));
   }
 
-  if (all_success) {
+  // Members whose node another gateway runs. This route resets by calling the
+  // parameter services on this gateway's own ROS graph, and there is no such
+  // service for them here - so they are not reset, however the local half went.
+  // They are named rather than omitted because the entity's configurations
+  // collection LISTS their parameters: a caller who resets the entity and is
+  // answered 204 has been told the parameters it can see were restored, and for
+  // these they were not. A member with no parameters at all is a different case
+  // and is not reported - nothing was left undone for it.
+  //
+  // A member routed to a peer never contributes a local node: an id a peer
+  // announces that this gateway also declares is renamed `<peer>__<id>` by the
+  // merge, so the loop above and this one cannot name the same member.
+  if (auto * agg = ctx_.aggregation_manager(); agg != nullptr) {
+    for (const auto & member : cache.get_members(entity.sovd_type(), entity_id)) {
+      // Apps only: a parameter belongs to a ROS node, an App is what carries
+      // one, and a peer-owned Component's Apps are members in their own right.
+      // Naming the Component too would report the same gap twice.
+      if (!cache.get_app(member)) {
+        continue;
+      }
+      auto peer = agg->find_peer_for_entity(member);
+      if (!peer) {
+        continue;
+      }
+
+      std::string reason = "Not reset here: '";
+      reason += member;
+      reason += "' is owned by gateway '";
+      reason += *peer;
+      reason += "'. Reset it on that gateway, through its own /apps/";
+      reason += member;
+      reason += "/configurations route.";
+
+      dto::ConfigurationDeleteResultItem entry;
+      entry.app_id = member;
+      entry.success = false;
+      entry.error = std::move(reason);
+      all_reset = false;
+      multi_status.results.push_back(std::move(entry));
+    }
+  }
+
+  if (all_reset) {
+    // Every member this entity has was reset - including the case where it has
+    // none at all, which SOVD answers as a success with no content.
     return ResultVariant{http::NoContent{}};
   }
   return ResultVariant{std::move(multi_status)};

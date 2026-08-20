@@ -445,6 +445,25 @@ the member half is an entity id, and the item half is the id the member's own
 route uses. Nothing on the owning gateway is aggregating, so the item half is
 sent bare - a parameter as its plain name, a topic as its plain path.
 
+Which half is which is decided from the entity's MEMBER SET, not from the number
+of ROS nodes the local walk resolves for the entity. The two answer different
+questions. A member another gateway runs announces no ROS binding, so it
+contributes no node here: the node count measures how much of the entity is
+local, and reading an id from it refuses the qualified form on exactly the two
+deployments that need it most - an aggregator that runs no node of its own,
+where the count is zero, and a gateway running one node beside peer-owned
+members, where the count is one. The member set includes what the peers
+contributed, so it says the same thing on every deployment.
+
+A prefix that names no member is part of the parameter name. That is what makes
+the rule self-protecting: a parameter whose own name contains a colon stays
+addressable, and no id that resolves today moves, because a split only happens
+where the prefix matches a real member. An entity's own id is not a member half
+of itself - it separates nothing - and a member half with an empty item after it
+is not one either, since one path segment shorter is the member's configurations
+COLLECTION and answering there would hand a list to a caller that asked for one
+value.
+
 An operation's item half is its short name, except where the member carrying it
 exposes that short name at more than one ROS path. There the member half names
 one member for both copies and cannot separate them, so the item half is the
@@ -482,6 +501,15 @@ The order inside ``dispatch_to_member`` is load-bearing:
    ``/api/v1/`` SSRF guard and the same ``<peer>__`` prefix rewrite to that path
    as the two-argument form applies to the incoming one - the target is
    assembled from client-supplied ids and is exactly as untrusted.
+
+Reset-all, ``DELETE /{entity}/configurations``, is not a member-qualified
+request and does not go through this dispatch: it names no member, and its
+members can sit on several gateways at once, so there is no single owner to hand
+it to. This gateway resets what it runs, by calling the parameter services on
+its own ROS graph. A member owned by a peer is therefore not reset, and the
+response says so rather than implying otherwise - ``207`` with that member named
+and its owning gateway named with it, instead of a ``204`` that would report a
+reset of parameters the entity lists and this request never touched.
 
 The wire is committed by the forward, so the handler returns
 ``HandlerContext::forwarded_sentinel_error()``: the typed router recognises the
