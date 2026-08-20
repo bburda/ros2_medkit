@@ -173,8 +173,10 @@ class TriggerManager {
   using WarnLogFn = std::function<void(const std::string & message)>;
   void set_warn_log_fn(WarnLogFn fn);
 
-  /// How long deferred resolution keeps retrying before giving up.
-  /// Default 60 s; tests shrink it to exercise the expiry path.
+  /// How long deferred resolution keeps retrying after the trigger's entity has
+  /// been discovered before giving up, and how long it waits for an entity that
+  /// has never been discovered before saying so once. Default 60 s; tests
+  /// shrink it to exercise both paths.
   void set_unresolved_timeout(std::chrono::seconds timeout);
 
   /// Retry resolving data triggers whose topic names were unknown at creation.
@@ -306,13 +308,28 @@ class TriggerManager {
   // worker thread (single-threaded dispatch), so no synchronization needed.
   bool evaluating_trigger_{false};
 
-  // Deferred resolution for data triggers created before topic was discoverable.
-  // Periodically retried via retry_unresolved_triggers().
+  // Deferred resolution for data triggers whose topic was not discoverable when
+  // the trigger entered this process - created through the API before the topic
+  // existed, or restored from the store. Periodically retried via
+  // retry_unresolved_triggers().
   struct UnresolvedTrigger {
     std::string trigger_id;
     std::string entity_id;
     std::string resource_path;
     std::chrono::steady_clock::time_point created_at;
+    /// When this gateway first found the trigger's entity in discovery, empty
+    /// until then. The give-up budget runs from this instant, not from
+    /// created_at: an entity that has never been discovered has not failed to
+    /// resolve, it has simply not been reported yet, which is the same
+    /// distinction TriggerState::entity_seen draws for the orphan sweep. Tying
+    /// both to that one signal is what makes the subscription attempt live
+    /// exactly as long as the trigger record does.
+    std::optional<std::chrono::steady_clock::time_point> entity_seen_at;
+    /// Whether the "entity still undiscovered" notice has been emitted for this
+    /// trigger. Retrying for an entity that has never been seen is correct and
+    /// unbounded, so it is reported once - an unbounded wait nobody is told
+    /// about is the same dead alarm as a silent give-up.
+    bool waiting_reported{false};
   };
   std::vector<UnresolvedTrigger> unresolved_data_triggers_;  // guarded by triggers_mutex_
   ResolveTopicFn resolve_topic_fn_;                          // guarded by triggers_mutex_

@@ -151,21 +151,52 @@ void TriggerManager::retry_unresolved_triggers() {
     auto now = std::chrono::steady_clock::now();
     std::vector<size_t> resolved_indices;
     std::vector<size_t> expired_indices;
+    std::vector<size_t> stale_indices;
 
     for (size_t i = 0; i < unresolved_data_triggers_.size(); ++i) {
       auto & entry = unresolved_data_triggers_[i];
 
-      if (now - entry.created_at > unresolved_timeout_) {
-        // Give up loudly: the trigger stays registered and ACTIVE, but with no
-        // subscription it will never fire. Silence here is a dead alarm the
-        // operator believes in.
-        expired_indices.push_back(i);
-        warnings.push_back("trigger '" + entry.trigger_id + "': gave up resolving resource_path '" +
-                           entry.resource_path + "' to a topic for entity '" + entry.entity_id + "' after " +
-                           std::to_string(unresolved_timeout_.count()) +
-                           " s. The trigger stays active but cannot fire; delete it and recreate it once the topic "
-                           "exists.");
+      auto trigger_it = triggers_.find(entry.trigger_id);
+      if (trigger_it == triggers_.end()) {
+        // The trigger was deleted or expired while its topic was still
+        // unresolved. Subscribing for it now would install a handle under a
+        // trigger id nothing owns, and nothing would ever release it.
+        stale_indices.push_back(i);
         continue;
+      }
+
+      // The give-up budget starts when discovery first reports the entity. An
+      // entity this gateway has never seen is not a resolution failure, and the
+      // orphan sweep leaves the record alone for exactly the same reason - the
+      // attempt and the record therefore end together, never one before the
+      // other.
+      if (!entry.entity_seen_at.has_value() && trigger_it->second->entity_seen.load()) {
+        entry.entity_seen_at = now;
+      }
+
+      if (entry.entity_seen_at.has_value()) {
+        if (now - *entry.entity_seen_at > unresolved_timeout_) {
+          // Give up loudly: the trigger stays registered and ACTIVE, but with no
+          // subscription it will never fire. Silence here is a dead alarm the
+          // operator believes in.
+          expired_indices.push_back(i);
+          warnings.push_back("trigger '" + entry.trigger_id + "': gave up resolving resource_path '" +
+                             entry.resource_path + "' to a topic for entity '" + entry.entity_id + "' after " +
+                             std::to_string(unresolved_timeout_.count()) +
+                             " s of the entity being discovered. The trigger stays active but cannot fire; delete it "
+                             "and recreate it once the topic exists.");
+          continue;
+        }
+      } else if (!entry.waiting_reported && now - entry.created_at > unresolved_timeout_) {
+        // Waiting on an undiscovered entity is unbounded on purpose, so it is
+        // announced once. Without this the trigger is indistinguishable from
+        // one that resolved.
+        entry.waiting_reported = true;
+        warnings.push_back("trigger '" + entry.trigger_id + "': entity '" + entry.entity_id +
+                           "' has not appeared in discovery after " + std::to_string(unresolved_timeout_.count()) +
+                           " s, so resource_path '" + entry.resource_path +
+                           "' cannot be resolved to a topic. The trigger stays active and keeps retrying, and it "
+                           "cannot fire until that entity is discovered.");
       }
 
       std::string topic_name = resolve_topic_fn_(entry.entity_id, entry.resource_path);
@@ -173,10 +204,9 @@ void TriggerManager::retry_unresolved_triggers() {
         // Update the trigger's resolved_topic_name + register a transport
         // handle whose lifetime is tied to the trigger entry (cleared on
         // remove()/cleanup_expired_trigger()).
-        auto it = triggers_.find(entry.trigger_id);
-        if (it != triggers_.end()) {
-          std::lock_guard<std::mutex> state_lock(it->second->mtx);
-          it->second->info.resolved_topic_name = topic_name;
+        {
+          std::lock_guard<std::mutex> state_lock(trigger_it->second->mtx);
+          trigger_it->second->info.resolved_topic_name = topic_name;
         }
         const std::string trigger_id = entry.trigger_id;
         const std::string entity_id = entry.entity_id;
@@ -199,10 +229,11 @@ void TriggerManager::retry_unresolved_triggers() {
       }
     }
 
-    // Remove resolved and expired entries (reverse order to maintain indices)
+    // Remove resolved, expired and stale entries (reverse order to maintain indices)
     std::vector<size_t> to_remove;
     to_remove.insert(to_remove.end(), resolved_indices.begin(), resolved_indices.end());
     to_remove.insert(to_remove.end(), expired_indices.begin(), expired_indices.end());
+    to_remove.insert(to_remove.end(), stale_indices.begin(), stale_indices.end());
     std::sort(to_remove.rbegin(), to_remove.rend());
     for (size_t idx : to_remove) {
       unresolved_data_triggers_.erase(unresolved_data_triggers_.begin() + static_cast<std::ptrdiff_t>(idx));
@@ -420,8 +451,11 @@ tl::expected<TriggerInfo, TriggerCreateError> TriggerManager::create(const Trigg
       }
     } else if (!req.resource_path.empty()) {
       std::lock_guard<std::mutex> lock(triggers_mutex_);
+      // The entity was validated to exist before this request was accepted, so
+      // it counts as seen and the give-up budget runs from now.
+      const auto queued_at = std::chrono::steady_clock::now();
       unresolved_data_triggers_.push_back(
-          {info_copy.id, req.entity_id, req.resource_path, std::chrono::steady_clock::now()});
+          {info_copy.id, req.entity_id, req.resource_path, queued_at, queued_at, /*waiting_reported=*/false});
     }
   }
 
@@ -767,24 +801,40 @@ size_t TriggerManager::load_persistent_triggers() {
 
       add_to_dispatch_index(state->info.id, state->info.collection, state->info.entity_id);
 
-      // Re-subscribe to topic for restored data triggers via the transport.
-      if (topic_transport_ && state->info.collection == "data" && !state->info.resolved_topic_name.empty()) {
+      // Restored data triggers go through deferred resolution rather than
+      // straight onto the persisted topic name. The entity belongs to a process
+      // this gateway has not met yet, so the subscription attempt has to stay
+      // open for as long as the record does, and deferred resolution is the
+      // only path whose budget is tied to entity_seen. Subscribing here could
+      // not honour that in any case: restore runs inside the constructor, the
+      // transport's executor is wired after it returns, so the attempt would be
+      // parked on a clock that starts now and runs out long before a late
+      // entity arrives.
+      if (topic_transport_ && state->info.collection == "data") {
         const std::string trigger_id = state->info.id;
         const std::string entity_id = state->info.entity_id;
         const std::string resource_path = state->info.resource_path;
-        auto handle = topic_transport_->subscribe(state->info.resolved_topic_name, /*msg_type=*/"",
-                                                  [this, entity_id, resource_path](const nlohmann::json & sample) {
-                                                    notifier_.notify("data", entity_id, resource_path, sample,
-                                                                     ChangeType::UPDATED);
-                                                  });
-        if (handle) {
-          topic_handles_[trigger_id] = std::move(handle);
-        } else {
-          // Subscribe failed during persistent-trigger restore (e.g. the
-          // topic disappeared between shutdown and restart, or rclcpp threw
-          // inside TriggerTopicSubscriber). Queue the trigger for retry on
-          // the next refresh tick instead of leaving it active-but-silent.
-          unresolved_data_triggers_.push_back({trigger_id, entity_id, resource_path, std::chrono::steady_clock::now()});
+        if (!resource_path.empty()) {
+          unresolved_data_triggers_.push_back({trigger_id, entity_id, resource_path, std::chrono::steady_clock::now(),
+                                               std::nullopt,
+                                               /*waiting_reported=*/false});
+        } else if (!state->info.resolved_topic_name.empty()) {
+          // A stored row carrying a topic but no resource_path has nothing for
+          // the entity cache to re-resolve, so the persisted topic is all there
+          // is to go on.
+          auto handle = topic_transport_->subscribe(state->info.resolved_topic_name, /*msg_type=*/"",
+                                                    [this, entity_id, resource_path](const nlohmann::json & sample) {
+                                                      notifier_.notify("data", entity_id, resource_path, sample,
+                                                                       ChangeType::UPDATED);
+                                                    });
+          if (handle) {
+            topic_handles_[trigger_id] = std::move(handle);
+          } else {
+            warnings.push_back("persistent trigger restore: trigger '" + trigger_id + "' could not subscribe to '" +
+                               state->info.resolved_topic_name +
+                               "' and carries no resource_path to resolve again from. It stays active but cannot "
+                               "fire; delete it and recreate it.");
+          }
         }
       }
 

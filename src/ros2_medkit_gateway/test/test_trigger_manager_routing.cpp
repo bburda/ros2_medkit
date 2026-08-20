@@ -223,6 +223,37 @@ class TriggerManagerRoutingTest : public ::testing::Test {
     return req;
   }
 
+  /// Write an ACTIVE persistent data trigger straight into the store, so a
+  /// manager built with on_restart_behavior=restore has something to put back.
+  void persist_data_trigger(const std::string & id, const std::string & entity_id, const std::string & resource_path,
+                            const std::string & resolved_topic) {
+    TriggerInfo persisted;
+    persisted.id = id;
+    persisted.entity_id = entity_id;
+    persisted.entity_type = "apps";
+    persisted.resource_uri = "/api/v1/apps/" + entity_id + "/data" + resource_path;
+    persisted.collection = "data";
+    persisted.resource_path = resource_path;
+    persisted.resolved_topic_name = resolved_topic;
+    persisted.path = "";
+    persisted.condition_type = "OnChange";
+    persisted.condition_params = nlohmann::json::object();
+    persisted.protocol = "sse";
+    persisted.multishot = true;
+    persisted.persistent = true;
+    persisted.status = TriggerStatus::ACTIVE;
+    persisted.created_at = std::chrono::system_clock::now();
+    ASSERT_TRUE(store_.save(persisted).has_value());
+  }
+
+  /// Build a second manager over the same store, configured to restore.
+  std::unique_ptr<TriggerManager> make_restoring_manager() {
+    TriggerConfig restore_config;
+    restore_config.max_triggers = 50;
+    restore_config.on_restart_behavior = "restore";
+    return std::make_unique<TriggerManager>(notifier_, registry_, store_, restore_config, transport_);
+  }
+
   ResourceChangeNotifier notifier_;
   ConditionRegistry registry_;
   SqliteTriggerStore store_{":memory:"};
@@ -332,68 +363,166 @@ TEST_F(TriggerManagerRoutingTest, CreateReturnsErrorWhenSubscribeReturnsNullHand
   EXPECT_EQ(transport_->alive_count(), 0u);
 }
 
-TEST_F(TriggerManagerRoutingTest, RestoreQueuesPersistentTriggerOnSubscribeFailure) {
-  // Pre-populate the SQLite store with a persistent data trigger so that the
-  // fresh manager's load_persistent_triggers() call has something to restore.
-  TriggerInfo persisted;
-  persisted.id = "trig_restore_fail_1";
-  persisted.entity_id = "sensor_a";
-  persisted.entity_type = "apps";
-  persisted.resource_uri = "/api/v1/apps/sensor_a/data/temperature";
-  persisted.collection = "data";
-  persisted.resource_path = "/temperature";
-  persisted.resolved_topic_name = "/sensor_a/temperature";
-  persisted.path = "";
-  persisted.condition_type = "OnChange";
-  persisted.condition_params = nlohmann::json::object();
-  persisted.protocol = "sse";
-  persisted.multishot = true;
-  persisted.persistent = true;
-  persisted.status = TriggerStatus::ACTIVE;
-  persisted.created_at = std::chrono::system_clock::now();
-  ASSERT_TRUE(store_.save(persisted).has_value());
+TEST_F(TriggerManagerRoutingTest, RestoreDefersSubscriptionInsteadOfSubscribingDirectly) {
+  persist_data_trigger("trig_restore_defer_1", "sensor_a", "/temperature", "/sensor_a/temperature");
 
-  // Force the next subscribe() call (made by load_persistent_triggers() for
-  // the restored data trigger) to return a null handle, simulating the
-  // "topic disappeared between shutdown and restart" race that the production
-  // code path guards against by queuing the trigger onto
-  // unresolved_data_triggers_ for retry.
-  transport_->fail_next_subscribe();
-
-  // Build a fresh manager configured for restore. The default fixture manager
-  // uses on_restart_behavior=reset, which makes load_persistent_triggers() a
-  // no-op - we need restore semantics to exercise the failure path.
-  TriggerConfig restore_config;
-  restore_config.max_triggers = 50;
-  restore_config.on_restart_behavior = "restore";
-  auto restored_mgr = std::make_unique<TriggerManager>(notifier_, registry_, store_, restore_config, transport_);
+  auto restored_mgr = make_restoring_manager();
   restored_mgr->load_persistent_triggers();
 
-  // The trigger is visible in the manager despite the subscribe failure -
-  // load_persistent_triggers() must not silently drop persistent triggers.
+  // The trigger is visible, and nothing has been subscribed yet: restore hands
+  // the trigger to deferred resolution, whose budget is tied to the entity
+  // being discovered, rather than parking an attempt on a clock of its own.
   auto triggers = restored_mgr->list("sensor_a");
   ASSERT_EQ(triggers.size(), 1u);
-  EXPECT_EQ(triggers[0].id, "trig_restore_fail_1");
+  EXPECT_EQ(triggers[0].id, "trig_restore_defer_1");
+  EXPECT_EQ(transport_->total_subscribes(), 0u) << "restore must not subscribe straight from the persisted topic";
 
-  // The first failed subscribe is recorded. No alive handle yet.
-  const auto subscribes_after_fail = transport_->total_subscribes();
-  EXPECT_GE(subscribes_after_fail, 1u);
-  EXPECT_EQ(transport_->alive_count(), 0u);
-
-  // Now exercise the retry path. retry_unresolved_triggers() requires both a
-  // resolve_topic_fn_ and a non-empty resolved topic; provide a resolver that
-  // returns the persisted topic name so the manager can re-subscribe.
+  // Deferred resolution then does the subscribing, from the entity cache.
   restored_mgr->set_resolve_topic_fn([](const std::string & entity_id, const std::string & resource_path) {
     return "/" + entity_id + resource_path;
   });
   restored_mgr->retry_unresolved_triggers();
 
-  // The retry must have called subscribe() again. This time it succeeds and
-  // an alive handle backs the restored trigger.
-  EXPECT_GT(transport_->total_subscribes(), subscribes_after_fail);
+  EXPECT_EQ(transport_->total_subscribes(), 1u);
+  EXPECT_EQ(transport_->alive_count(), 1u);
+  EXPECT_EQ(transport_->last_subscribed_topic(), "/sensor_a/temperature");
+
+  restored_mgr->shutdown();
+}
+
+TEST_F(TriggerManagerRoutingTest, RestoreSubscribesDirectlyWhenThereIsNothingToResolveFrom) {
+  // A stored row with a topic but no resource_path gives the entity cache
+  // nothing to match on, so the persisted topic is the only thing left. It is
+  // still better than restoring the record with no subscription at all.
+  persist_data_trigger("trig_restore_no_path_1", "sensor_a", /*resource_path=*/"", "/sensor_a/temperature");
+
+  auto restored_mgr = make_restoring_manager();
+  restored_mgr->load_persistent_triggers();
+
+  EXPECT_EQ(restored_mgr->list("sensor_a").size(), 1u);
+  EXPECT_EQ(transport_->total_subscribes(), 1u);
+  EXPECT_EQ(transport_->alive_count(), 1u);
+  EXPECT_EQ(transport_->last_subscribed_topic(), "/sensor_a/temperature");
+
+  restored_mgr->shutdown();
+}
+
+TEST_F(TriggerManagerRoutingTest, RestoredTriggerKeepsResolvingPastTheBudgetWhileItsEntityIsUndiscovered) {
+  persist_data_trigger("trig_restore_wait_1", "sensor_a", "/temperature", "/sensor_a/temperature");
+
+  auto restored_mgr = make_restoring_manager();
+  std::vector<std::string> warnings;
+  restored_mgr->set_warn_log_fn([&warnings](const std::string & m) {
+    warnings.push_back(m);
+  });
+  restored_mgr->load_persistent_triggers();
+
+  // Nothing resolves while the entity is undiscovered, and the budget is spent
+  // several times over.
+  bool entity_known = false;
+  restored_mgr->set_resolve_topic_fn([&entity_known](const std::string & entity_id, const std::string & resource_path) {
+    return entity_known ? "/" + entity_id + resource_path : std::string{};
+  });
+  restored_mgr->set_unresolved_timeout(std::chrono::seconds(0));
+  restored_mgr->retry_unresolved_triggers();
+  restored_mgr->retry_unresolved_triggers();
+  restored_mgr->retry_unresolved_triggers();
+
+  // An unbounded wait is announced exactly once, naming the trigger and the
+  // entity it is waiting for.
+  ASSERT_EQ(warnings.size(), 1u);
+  EXPECT_NE(warnings[0].find("trig_restore_wait_1"), std::string::npos) << warnings[0];
+  EXPECT_NE(warnings[0].find("sensor_a"), std::string::npos) << warnings[0];
+  EXPECT_NE(warnings[0].find("has not appeared in discovery"), std::string::npos) << warnings[0];
+
+  // The entity finally shows up, long past the budget. The attempt is still
+  // there to take it - that is the whole point of holding it open.
+  entity_known = true;
+  restored_mgr->retry_unresolved_triggers();
+
+  EXPECT_EQ(transport_->total_subscribes(), 1u) << "a trigger whose entity arrives late must still subscribe";
   EXPECT_EQ(transport_->alive_count(), 1u);
 
   restored_mgr->shutdown();
+}
+
+TEST_F(TriggerManagerRoutingTest, RestoredTriggerGivesUpLoudlyOnceItsEntityHasBeenSeen) {
+  persist_data_trigger("trig_restore_giveup_1", "sensor_a", "/temperature", "/sensor_a/temperature");
+
+  auto restored_mgr = make_restoring_manager();
+  std::vector<std::string> warnings;
+  restored_mgr->set_warn_log_fn([&warnings](const std::string & m) {
+    warnings.push_back(m);
+  });
+  restored_mgr->load_persistent_triggers();
+  restored_mgr->set_resolve_topic_fn([](const std::string &, const std::string &) {
+    return std::string{};
+  });
+  restored_mgr->set_unresolved_timeout(std::chrono::seconds(0));
+
+  // Discovery reports the entity. From here the trigger is sweepable and its
+  // resolution budget runs - the two start together.
+  restored_mgr->set_entity_exists_fn([](const std::string &, const std::string &) {
+    return true;
+  });
+  restored_mgr->sweep_orphaned_triggers();
+
+  // The tick that observes the entity starts the budget, it does not spend it.
+  restored_mgr->retry_unresolved_triggers();
+  EXPECT_TRUE(warnings.empty()) << "the budget must start when the entity is seen, not end there";
+
+  restored_mgr->retry_unresolved_triggers();
+  ASSERT_EQ(warnings.size(), 1u);
+  EXPECT_NE(warnings[0].find("trig_restore_giveup_1"), std::string::npos) << warnings[0];
+  EXPECT_NE(warnings[0].find("gave up resolving"), std::string::npos) << warnings[0];
+
+  // Given up means stopped: later ticks are silent and nothing subscribes.
+  restored_mgr->retry_unresolved_triggers();
+  EXPECT_EQ(warnings.size(), 1u);
+  EXPECT_EQ(transport_->total_subscribes(), 0u);
+
+  restored_mgr->shutdown();
+}
+
+TEST_F(TriggerManagerRoutingTest, ApiCreatedTriggerBudgetRunsFromCreationNotFromTheFirstTick) {
+  // The entity behind an accepted request was validated to exist, so nothing
+  // about this trigger is waiting on discovery: its budget is already running
+  // by the time the first retry tick arrives, and that tick can spend it.
+  // Starting the budget at the first tick instead would silently hand every
+  // trigger a whole extra tick.
+  std::vector<std::string> warnings;
+  manager_->set_warn_log_fn([&warnings](const std::string & m) {
+    warnings.push_back(m);
+  });
+  manager_->set_resolve_topic_fn([](const std::string &, const std::string &) {
+    return std::string{};
+  });
+  manager_->set_unresolved_timeout(std::chrono::seconds(0));
+
+  auto created = manager_->create(make_data_request("plc_app", /*resolved_topic=*/"", "/counter"));
+  ASSERT_TRUE(created.has_value()) << created.error().message;
+
+  manager_->retry_unresolved_triggers();
+
+  ASSERT_EQ(warnings.size(), 1u) << "the first tick after creation must find the budget already spent";
+  EXPECT_NE(warnings[0].find("gave up resolving"), std::string::npos) << warnings[0];
+  EXPECT_NE(warnings[0].find(created->id), std::string::npos) << warnings[0];
+}
+
+TEST_F(TriggerManagerRoutingTest, DeferredResolutionDropsEntriesWhoseTriggerIsGone) {
+  // A deferred entry outliving its trigger would subscribe under a trigger id
+  // nothing owns, so nothing would ever release the handle.
+  auto created = manager_->create(make_data_request("plc_app", /*resolved_topic=*/"", "/counter"));
+  ASSERT_TRUE(created.has_value()) << created.error().message;
+  ASSERT_TRUE(manager_->remove(created->id));
+
+  manager_->set_resolve_topic_fn([](const std::string & entity_id, const std::string & resource_path) {
+    return "/" + entity_id + resource_path;
+  });
+  manager_->retry_unresolved_triggers();
+
+  EXPECT_EQ(transport_->total_subscribes(), 0u) << "a removed trigger must not acquire a subscription";
+  EXPECT_EQ(transport_->alive_count(), 0u);
 }
 
 TEST_F(TriggerManagerRoutingTest, UnresolvedTriggerExpiryWarnsAndStopsRetrying) {

@@ -283,13 +283,21 @@ if(BUILD_TESTING)
   # break the range, wait for the confirmation, wait for the post-roll to finalise
   # into a listed descriptor, repair, acknowledge - and then downloads every bag.
   # Two of those cycles do not fit the feature glob's 120s.
+  #
+  # test_triggers_restore_before_discovery keeps its entity provably absent for
+  # longer than the 60s budget a trigger subscription attempt gets, because a
+  # shorter window is one a gateway that abandons the attempt would also pass.
+  # That window plus two gateway startups and the SSE wait after it exceed the
+  # 120s the feature glob assigns, so it gets its own budget rather than have
+  # the file killed with no test name in the output.
   set(_MEDKIT_TEST_TIMEOUT_OVERRIDES
     test_rosbag_boundary_download 180
     test_rosbag_history_download 180
     test_grouping_entity_aggregation 300
     test_graph_provider_greenwave 300
     test_graph_provider_stale 300
-    test_graph_provider_sse 300)
+    test_graph_provider_sse 300
+    test_triggers_restore_before_discovery 300)
   # Names actually matched against a discovered test_name in the two loops
   # below. Checked against _MEDKIT_TEST_TIMEOUT_OVERRIDES itself after both
   # loops finish - see the FATAL_ERROR check at the end of this block - so a
