@@ -184,6 +184,10 @@ CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
                                      json{{"collection", parsed->collection}}));
   }
 
+  if (auto path_ok = validate_resource_path_support(sampler_registry_, *parsed, resource); !path_ok) {
+    return tl::unexpected(path_ok.error());
+  }
+
   // Create subscription
   auto result = sub_mgr_.create(entity_id, entity_type, resource, parsed->collection, parsed->resource_path, protocol,
                                 interval, duration);
@@ -483,6 +487,19 @@ CyclicSubscriptionHandlers::parse_resource_uri(const std::string & resource) {
   return tl::make_unexpected(
       "Resource URI must match /api/v1/{apps|components|functions}/{id}/{collection}[/{path}] "
       "or /api/v1/updates/{id}/status");
+}
+
+tl::expected<void, ErrorInfo> CyclicSubscriptionHandlers::validate_resource_path_support(
+    const ResourceSamplerRegistry & registry, const ParsedResourceUri & parsed, const std::string & resource) {
+  if (parsed.resource_path.empty() || registry.honours_resource_path(parsed.collection)) {
+    return {};
+  }
+  return tl::unexpected(make_error(
+      400, ERR_X_MEDKIT_INVALID_RESOURCE_URI,
+      "Collection '" + parsed.collection +
+          "' is streamed as a whole and does not support a resource path. Subscribe to the collection URI without a "
+          "trailing resource path.",
+      json{{"parameter", "resource"}, {"value", resource}, {"collection", parsed.collection}}));
 }
 
 }  // namespace handlers

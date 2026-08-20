@@ -300,3 +300,8 @@ The plugin registers a sampler via ``PluginContext::register_sampler()`` for the
 ``x-medkit-graph`` resource. This allows clients to create cyclic subscriptions
 that receive periodic graph snapshots over SSE, enabling live dashboard updates
 without polling the HTTP endpoint.
+
+The sampler builds one document for the whole function and ignores the resource
+path, so it registers without ``honours_resource_path``. A subscription URI that
+appends a path below ``x-medkit-graph`` is refused with 400 rather than answered
+with the full graph document.

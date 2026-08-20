@@ -1310,7 +1310,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
         }
         return tl::make_unexpected("Topic data not available: " + resource_path);
       },
-      true);
+      /*is_builtin=*/true, /*honours_resource_path=*/true);
 
   sampler_registry_->register_sampler(
       "faults",
@@ -1340,7 +1340,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
         result.data["faults"] = std::move(filtered);
         return result.data;
       },
-      true);
+      /*is_builtin=*/true);
 
   sampler_registry_->register_sampler(
       "configurations",
@@ -1365,7 +1365,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
         payload["items"] = std::move(items);
         return payload;
       },
-      true);
+      /*is_builtin=*/true);
 
   sampler_registry_->register_sampler(
       "logs",
@@ -1405,7 +1405,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
         payload["items"] = std::move(*result);
         return payload;
       },
-      true);
+      /*is_builtin=*/true);
 
   // Register update status sampler (server-level, uses UpdateManager)
   if (update_mgr_) {
@@ -1423,7 +1423,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
           }
           return update_status_to_json(*result);
         },
-        true);
+        /*is_builtin=*/true, /*honours_resource_path=*/true);
   }
 
   RCLCPP_INFO(get_logger(), "Registered built-in resource samplers: data, faults, configurations, logs%s",

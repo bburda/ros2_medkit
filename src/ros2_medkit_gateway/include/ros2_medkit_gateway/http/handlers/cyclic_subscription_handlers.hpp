@@ -96,6 +96,16 @@ class CyclicSubscriptionHandlers {
   /// Parse resource URI to extract entity type, entity id, collection, and resource path.
   static tl::expected<ParsedResourceUri, std::string> parse_resource_uri(const std::string & resource);
 
+  /// Refuse a resource path the collection's sampler cannot act on.
+  ///
+  /// A sampler registered without `honours_resource_path` answers with its
+  /// whole collection on every tick, so a URI naming a single item of that
+  /// collection cannot be served as written. The refusal keeps a narrow
+  /// request from being answered with a wide stream.
+  static tl::expected<void, ErrorInfo> validate_resource_path_support(const ResourceSamplerRegistry & registry,
+                                                                      const ParsedResourceUri & parsed,
+                                                                      const std::string & resource);
+
  private:
   /// Build event_source URI from subscription info
   static std::string build_event_source(const CyclicSubscriptionInfo & info);

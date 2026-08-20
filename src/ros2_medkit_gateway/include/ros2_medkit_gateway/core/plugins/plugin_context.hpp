@@ -186,10 +186,17 @@ class PluginContext {
   // ---- Resource sampler registration ----
 
   /// Register a cyclic subscription sampler for a custom collection.
+  ///
+  /// `honours_resource_path` states that `fn` narrows its payload to the one
+  /// resource named by its second argument. Leave it false for a sampler that
+  /// ignores that argument: the gateway then refuses a subscription whose URI
+  /// names a single item of this collection, instead of accepting it and
+  /// streaming the whole collection on every tick.
   virtual void register_sampler(
       const std::string & /*collection*/,
       const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> &
-      /*fn*/) {
+      /*fn*/,
+      bool /*honours_resource_path*/ = false) {
   }
 
   // ---- Trigger infrastructure access ----

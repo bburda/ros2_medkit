@@ -174,3 +174,153 @@ TEST(ParseResourceUriTest, UpdatesListNotSubscribable) {
 // test_primitives.cpp (write_generic_error / write_oauth2_error suites)
 // and the per-route handler tests assert error bodies end-to-end via the
 // typed router.
+
+// --- validate_resource_path_support tests ---
+
+namespace {
+
+/// Fill `registry` the way the gateway fills its own: `data` and `updates`
+/// narrow their payload to a named resource, the rest stream their whole
+/// collection. ResourceSamplerRegistry holds a shared_mutex and so is neither
+/// copyable nor movable - the caller owns the instance and passes it in.
+void register_builtin_like_samplers(ResourceSamplerRegistry & registry) {
+  auto stub = [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+    return nlohmann::json::object();
+  };
+  registry.register_sampler("data", stub, /*is_builtin=*/true, /*honours_resource_path=*/true);
+  registry.register_sampler("updates", stub, /*is_builtin=*/true, /*honours_resource_path=*/true);
+  registry.register_sampler("faults", stub, /*is_builtin=*/true);
+  registry.register_sampler("configurations", stub, /*is_builtin=*/true);
+  registry.register_sampler("logs", stub, /*is_builtin=*/true);
+}
+
+ParsedResourceUri parsed_uri(const std::string & resource) {
+  auto parsed = CyclicSubscriptionHandlers::parse_resource_uri(resource);
+  EXPECT_TRUE(parsed.has_value()) << "fixture URI must parse: " << resource;
+  return parsed.value_or(ParsedResourceUri{});
+}
+
+}  // namespace
+
+TEST(ValidateResourcePathSupportTest, ConfigurationsWithResourcePathRefused) {
+  ResourceSamplerRegistry registry;
+  register_builtin_like_samplers(registry);
+  const std::string resource = "/api/v1/components/ecu1/configurations/param1";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 400);
+  EXPECT_EQ(result.error().code, ERR_X_MEDKIT_INVALID_RESOURCE_URI);
+  EXPECT_NE(result.error().message.find("configurations"), std::string::npos);
+  EXPECT_NE(result.error().message.find("streamed as a whole"), std::string::npos);
+  EXPECT_EQ(result.error().params["collection"], "configurations");
+  EXPECT_EQ(result.error().params["value"], resource);
+}
+
+TEST(ValidateResourcePathSupportTest, FaultsWithResourcePathRefused) {
+  ResourceSamplerRegistry registry;
+  register_builtin_like_samplers(registry);
+  const std::string resource = "/api/v1/apps/node1/faults/fault_001";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 400);
+  EXPECT_NE(result.error().message.find("faults"), std::string::npos);
+  EXPECT_EQ(result.error().params["collection"], "faults");
+}
+
+TEST(ValidateResourcePathSupportTest, LogsWithResourcePathRefused) {
+  ResourceSamplerRegistry registry;
+  register_builtin_like_samplers(registry);
+  const std::string resource = "/api/v1/apps/node1/logs/entry_7";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_NE(result.error().message.find("logs"), std::string::npos);
+}
+
+TEST(ValidateResourcePathSupportTest, ConfigurationsWithoutResourcePathAccepted) {
+  ResourceSamplerRegistry registry;
+  register_builtin_like_samplers(registry);
+  const std::string resource = "/api/v1/components/ecu1/configurations";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  EXPECT_TRUE(result.has_value());
+}
+
+TEST(ValidateResourcePathSupportTest, FaultsWithoutResourcePathAccepted) {
+  ResourceSamplerRegistry registry;
+  register_builtin_like_samplers(registry);
+  const std::string resource = "/api/v1/apps/node1/faults";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  EXPECT_TRUE(result.has_value());
+}
+
+TEST(ValidateResourcePathSupportTest, DataWithTopicAccepted) {
+  ResourceSamplerRegistry registry;
+  register_builtin_like_samplers(registry);
+  const std::string resource = "/api/v1/apps/node1/data/temperature";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  EXPECT_TRUE(result.has_value());
+}
+
+TEST(ValidateResourcePathSupportTest, UpdateStatusPackageIdAccepted) {
+  ResourceSamplerRegistry registry;
+  register_builtin_like_samplers(registry);
+  const std::string resource = "/api/v1/updates/my-package/status";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  EXPECT_TRUE(result.has_value());
+}
+
+TEST(ValidateResourcePathSupportTest, UndeclaredPluginSamplerRefusesResourcePath) {
+  ResourceSamplerRegistry registry;
+  registry.register_sampler("x-medkit-metrics",
+                            [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+                              return nlohmann::json::object();
+                            });
+  const std::string resource = "/api/v1/apps/node1/x-medkit-metrics/cpu_usage";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 400);
+  EXPECT_EQ(result.error().params["collection"], "x-medkit-metrics");
+}
+
+TEST(ValidateResourcePathSupportTest, DeclaredPluginSamplerAcceptsResourcePath) {
+  ResourceSamplerRegistry registry;
+  registry.register_sampler(
+      "x-medkit-metrics",
+      [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+        return nlohmann::json::object();
+      },
+      /*is_builtin=*/false, /*honours_resource_path=*/true);
+  const std::string resource = "/api/v1/apps/node1/x-medkit-metrics/cpu_usage";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  EXPECT_TRUE(result.has_value());
+}
+
+TEST(ValidateResourcePathSupportTest, UndeclaredPluginSamplerAcceptsCollectionUri) {
+  ResourceSamplerRegistry registry;
+  registry.register_sampler("x-medkit-graph",
+                            [](const std::string &, const std::string &) -> tl::expected<nlohmann::json, std::string> {
+                              return nlohmann::json::object();
+                            });
+  const std::string resource = "/api/v1/functions/func1/x-medkit-graph";
+
+  auto result = CyclicSubscriptionHandlers::validate_resource_path_support(registry, parsed_uri(resource), resource);
+
+  EXPECT_TRUE(result.has_value());
+}
