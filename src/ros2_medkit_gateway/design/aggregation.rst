@@ -436,6 +436,19 @@ member:
    PUT  /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
      -> PUT  /api/v1/apps/peer_calibration/configurations/calibration_offset (on the peer)
 
+A member half a peer supplied is read through the collision rename before it
+means anything here. A peer describes its own tree in its own names, and an App
+whose id collided with a local one was merged under ``<peer>__<id>``, so the
+name the peer sends names the LOCAL leaf on this gateway. ``fan_out_get``
+therefore records the peer each item came from in
+``FanOutResult::item_peers``, and ``AggregationManager::local_member_id``
+resolves that name against the routing table: an item arriving through the
+fan-out is re-attributed to the id the merge gave its owner, in
+``x-medkit.member_ids`` and in the member half of the item id, before any of it
+is offered to a client. Read verbatim instead, the peer's item is attributed to
+a member that does not own it, the collection offers one id for two operations,
+and the peer's copy is not addressable through the aggregate at all.
+
 Each collection keeps its own id scheme and each hands the same two halves to
 the dispatch. ``/data`` and ``/operations`` qualify only an ambiguous id and
 carry ``x-medkit.member_ids``; ``/configurations`` qualifies every id on a
@@ -694,6 +707,18 @@ link that is down.
 so the last complete one survives; it re-checks that peer's health to decide
 whether to replay it marked unavailable (health check failed) or exactly as it
 was last read (health check still passes).
+
+The same field on a listed ITEM answers for that item's member and for nothing
+else. ``/operations`` holds back the copies its declared tree carries for
+peer-owned members and offers them only when the fan-out did not bring the
+owner's own copy, and whether such a copy is marked unavailable is decided from
+the member's reachability - the same reading ``dispatch_to_member`` acts on, so
+the listing and the request cannot disagree. A fan-out that produced nothing is
+not evidence on its own: it also never runs when no peer contributes the entity,
+which is the ordinary shape of a grouping declared on this gateway alone that
+hosts a member another gateway runs. Deciding from the fan-out there marks every
+peer-owned item of that entity unreachable while its gateway is answering
+normally.
 
 The aggregator also publishes its own ``/health`` response with two
 additional fields when aggregation is enabled (x-medkit extensions on our

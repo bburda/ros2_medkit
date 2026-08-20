@@ -97,7 +97,15 @@ class AggregationManager {
    * @brief Result of a fan-out GET across all healthy peers
    */
   struct FanOutResult {
-    nlohmann::json merged_items;            ///< Merged "items" array from all peers
+    nlohmann::json merged_items;  ///< Merged "items" array from all peers
+    /// Name of the peer that sent `merged_items[i]`, same order and length.
+    ///
+    /// A peer describes its own tree in its own names, and an id this gateway
+    /// renamed on collision means something else here, so an item can only be
+    /// re-addressed once the peer it came from is known. Merging the responses
+    /// into one array without this loses that, and the attribution cannot be
+    /// recovered afterwards from the item alone.
+    std::vector<std::string> item_peers;
     bool is_partial{false};                 ///< True if some peers failed
     std::vector<std::string> failed_peers;  ///< Names of peers that failed
   };
@@ -210,6 +218,20 @@ class AggregationManager {
    * @return Peer name if entity is remote, std::nullopt if local or unknown
    */
   std::optional<std::string> find_peer_for_entity(const std::string & entity_id) const;
+
+  /**
+   * @brief The id this gateway uses for a member `peer_name` calls `member_id`.
+   *
+   * An App whose id collides with a local one is merged under `<peer>__<id>`,
+   * and the routing table is where that renaming is recorded. A peer knows
+   * nothing of it and keeps naming the member as it always did, so anything a
+   * peer says about its own members has to be read through this before it can
+   * be used to address something here - the unprefixed id names the LOCAL leaf.
+   *
+   * Returns `member_id` unchanged when nothing was renamed, which is the
+   * ordinary case. Thread-safe.
+   */
+  std::string local_member_id(const std::string & peer_name, const std::string & member_id) const;
 
   /**
    * @brief Replace the map of per-entity peer contributors.

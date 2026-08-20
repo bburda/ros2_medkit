@@ -744,6 +744,50 @@ class AggregatorOnlyConfigurationsTest(unittest.TestCase):
             msg='the response said nothing was reset, but the peer value moved',
         )
 
+    def test_b1_a_peer_owned_operation_of_a_local_entity_is_not_reported_unreachable(self):
+        """`available: false` is a statement about the member, not about the fan-out.
+
+        Only this gateway declares the mixed Function, so no peer contributes
+        the entity and the peer collection fan-out for it never runs - there is
+        nobody to ask. That says nothing about the member: its gateway is up,
+        and the request for the operation is dispatched to the member's own
+        route and served. Marking the item unavailable there contradicts both
+        the field's meaning and what the very next request does, so the two are
+        checked together and the execution is asserted on its body - a status
+        alone cannot tell a service that ran from one that was never called.
+        """
+        items = self._items(f'functions/{MIXED_FUNCTION}', 'operations')
+        by_id = {item.get('id'): item for item in items}
+        operation_id = f'{PEER_CALIBRATION_APP}:calibrate'
+        self.assertIn(
+            operation_id, by_id,
+            f'the mixed Function does not offer its peer-owned operation: {sorted(by_id)}',
+        )
+        self.assertNotEqual(
+            by_id[operation_id].get('x-medkit', {}).get('available'), False,
+            f'a peer-owned operation was reported unreachable while its gateway '
+            f'answers: {by_id[operation_id]}',
+        )
+
+        response = requests.post(
+            f'{PRIMARY_URL}/functions/{MIXED_FUNCTION}/operations/'
+            f'{quote(operation_id, safe="")}/executions',
+            json={},
+            timeout=15,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        parameters = response.json().get('parameters')
+        self.assertIsInstance(
+            parameters, dict, f'no service response came back: {response.text}')
+        self.assertIs(
+            parameters.get('success'), True,
+            f"the member's service did not report success: {parameters}",
+        )
+        self.assertTrue(
+            parameters.get('message'),
+            f"the member's service answered with nothing to say: {parameters}",
+        )
+
 
 @launch_testing.post_shutdown_test()
 class TestShutdown(unittest.TestCase):

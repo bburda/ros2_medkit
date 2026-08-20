@@ -706,9 +706,36 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
   // peered pair into a bounce. A fan-out that ran and came back without them
   // means the peer is not answering, and the tree still knows what it declared.
   const bool fan_out_suppressed = raw_req.has_header("X-Medkit-No-Fan-Out");
-  auto fan_out = fan_out_collection<dto::OperationItem>(ctx_.aggregation_manager(), raw_req);
+  auto * agg = ctx_.aggregation_manager();
+  auto fan_out = fan_out_collection<dto::OperationItem>(agg, raw_req);
+
+  // A peer names its members as its own tree names them, and an App whose id
+  // collided with a local one was merged under `<peer>__<id>` - so the name the
+  // peer sends names the LOCAL leaf here. Re-emitted verbatim it attributes the
+  // peer's operation to a member that does not own it, and every id built from
+  // that attribution - by this gateway or by a client reading the list - is
+  // resolved against the wrong member. The member half of the id the peer
+  // already qualified carries the same name and is rewritten with it.
+  const auto retarget_to_local_member = [agg](dto::OperationItem & item, const std::string & peer_name) {
+    if (agg == nullptr || peer_name.empty() || !item.x_medkit.has_value() || !item.x_medkit->member_ids.has_value() ||
+        item.x_medkit->member_ids->size() != 1) {
+      return;
+    }
+    const std::string reported = item.x_medkit->member_ids->front();
+    const std::string local = agg->local_member_id(peer_name, reported);
+    if (local == reported) {
+      return;
+    }
+    item.x_medkit->member_ids = std::vector<std::string>{local};
+    auto parsed = http::parse_member_qualified_id(item.id, true);
+    if (parsed.has_member && parsed.member_id == reported) {
+      item.id = http::make_member_qualified_id(local, parsed.item_id);
+    }
+  };
+
   std::unordered_set<std::string> paths_from_peers;
-  for (auto & item : fan_out.items) {
+  for (size_t index = 0; index < fan_out.items.size(); ++index) {
+    auto & item = fan_out.items[index];
     if (item.x_medkit.has_value() && item.x_medkit->ros2.has_value()) {
       const auto & ros2 = *item.x_medkit->ros2;
       auto path = ros2.service.value_or(ros2.action.value_or(std::string{}));
@@ -716,6 +743,7 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
         paths_from_peers.insert(std::move(path));
       }
     }
+    retarget_to_local_member(item, index < fan_out.item_peers.size() ? fan_out.item_peers[index] : std::string{});
     qualify_from_declared_tree(item);
     collection.items.push_back(std::move(item));
   }
@@ -727,7 +755,19 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
       if (!path.empty() && paths_from_peers.count(path) > 0u) {
         continue;  // the owner answered for itself, which is the better copy
       }
-      item.x_medkit->available = false;
+      // `available` is a statement about the MEMBER, not about the fan-out:
+      // false means the gateway that owns the item is not answering, so a
+      // request for it cannot be served. A fan-out reaching this gateway with
+      // nothing for this path says nothing on its own - it also never ran when
+      // no peer contributes this entity, which is the ordinary shape of a
+      // grouping declared here that hosts a member another gateway runs. The
+      // member's own reachability is what a request for the item will meet,
+      // and it is the same reading `dispatch_to_member` acts on, so the listing
+      // and the execution cannot disagree.
+      auto owner = ops.owner_by_path.find(path);
+      if (owner != ops.owner_by_path.end() && member_is_unreachable(cache, owner->second)) {
+        item.x_medkit->available = false;
+      }
       collection.items.push_back(std::move(item));
     }
   }

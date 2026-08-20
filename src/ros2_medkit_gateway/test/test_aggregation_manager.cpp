@@ -435,6 +435,32 @@ TEST(AggregationManager, get_peer_contributors_unions_routing_and_contributor_ma
   EXPECT_EQ(both_peers[1], "peer_y");
 }
 
+TEST(AggregationManager, local_member_id_reads_a_peers_own_name_through_the_collision_rename) {
+  auto config = make_config(0);
+  AggregationManager manager(config);
+
+  // A member nothing collided with keeps the name its peer uses.
+  manager.update_routing_table({{"pressure_sensor", "peer_a"}});
+  EXPECT_EQ(manager.local_member_id("peer_a", "pressure_sensor"), "pressure_sensor");
+
+  // A member whose id collided is merged under the prefixed id, and that is
+  // the only name that addresses it here.
+  manager.update_routing_table({{"peer_a__shared_sensor", "peer_a"}});
+  EXPECT_EQ(manager.local_member_id("peer_a", "shared_sensor"), "peer_a__shared_sensor");
+
+  // The prefixed id has to be routed to the peer that sent the item. Another
+  // peer can own an entity whose id reads like this peer's prefix, and
+  // answering with it would re-address the item to a gateway that never sent
+  // it - here peer_b owns an entity literally called `peer_a__shared_sensor`,
+  // so peer_a's own uncollided `shared_sensor` must not be rewritten to it.
+  manager.update_routing_table({{"peer_a__shared_sensor", "peer_b"}});
+  EXPECT_EQ(manager.local_member_id("peer_a", "shared_sensor"), "shared_sensor");
+
+  // An empty half names nothing to look up.
+  EXPECT_EQ(manager.local_member_id("", "shared_sensor"), "shared_sensor");
+  EXPECT_EQ(manager.local_member_id("peer_a", ""), "");
+}
+
 TEST(AggregationManager, update_peer_contributors_drops_empty_entries) {
   auto config = make_config(0);
   AggregationManager manager(config);
