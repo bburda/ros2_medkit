@@ -938,6 +938,21 @@ if(BUILD_TESTING)
     ENV "GATEWAY_TEST_PORT=19540" "WATCHDOG_E2E_SCENARIO=budget_spent_then_owned"
       "${_WATCHDOG_E2E_ENV}")
 
+  # A crash loop whose uptime is shorter than the warmup: killed, reported, back for less than
+  # one re-warm, killed again. The other restart rows in this package all wait for the returned
+  # node to arm before killing it, so none of them can see a key handed back while it is merely
+  # re-warming. 60 (arming, app_id-scoped, at RESTART_WARMUP_CYCLES) + 30 (faults-live) + 30
+  # (first departure poll) + 60 (first raise poll) + 60 (return poll,
+  # RESTART_RESPAWN_DELAY_SEC + 30) + 30 (un-armed state poll) + 30 (record poll) + 30 (second
+  # departure poll) + 60 (second raise poll) + 10 (no-PASSED window, SILENCE_WINDOW_SEC) = 400
+  # internal - ten independent budgets, not merged. Rounded to 540 to also cover the launch's
+  # own teardown for TWO processes (sigterm 30 + sigkill 15 each, not fully serial).
+  medkit_add_launch_test(test_presence_ownership_e2e_restart_inside_warmup
+    test/e2e/test_presence_ownership_e2e.test.py TIMEOUT 540
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19600" "WATCHDOG_E2E_SCENARIO=restart_inside_warmup"
+      "${_WATCHDOG_E2E_ENV}")
+
   # The two GROUNDS for ownership, and the only row here that asserts GRAPH_NODE_DISAPPEARED
   # ABSENT: the fixture is left until its GetState budget is spent (provisional ownership),
   # then told to announce "inactive", then killed. 60 (arming, app_id-scoped) + 30

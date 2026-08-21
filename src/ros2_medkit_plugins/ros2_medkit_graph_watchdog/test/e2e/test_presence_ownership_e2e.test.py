@@ -70,6 +70,13 @@ launch and which assertions run:
   detector held this node was that nobody else could report it, and the label ends that. It is
   also the one row that rejects a detector wired to the permissive `reliability_allows()`, which
   admits the node during the unread window and, tracking being sticky, never lets go.
+- "restart_inside_warmup": a crash loop whose uptime is shorter than the warmup. The node is
+  killed, reported, and comes back - and while it is merely RE-WARMING the gate has no claim to
+  state either way, which is not the same fact as the graph having measured the node as another
+  detector's. A key already admitted must survive that, or its next death is reported by nobody
+  and the detector spends the whole outage saying PASSED. The row kills the returned node
+  without waiting for it to arm, and asserts both halves: the second death advances the stored
+  record's `last_occurred`, and `last_passed` stays frozen for as long as the node is dead.
 - "gate_unaffected": nothing is killed. With the same unmeasured managed node in the graph, the
   three other detectors must still report. GRAPH_PARAM_DRIFT is the discriminating leg - it is
   the only one of the three whose raise passes through the app-keyed gate at all
@@ -160,6 +167,26 @@ ANSWER_PARAM = 'start_answering'
 TICK_INTERVAL_MS = 200
 WARMUP_CYCLES = 3
 
+# "restart_inside_warmup" needs the RE-WARM window to be wide enough for the test to observe
+# the returned node un-armed and kill it again inside that window, which the shipped-size
+# warmup above cannot give it: 3 ticks is 600 ms, shorter than one entity-cache refresh. 30
+# ticks is 6 s at this cadence, and the row asserts the un-armed state from the status route
+# rather than trusting the arithmetic.
+RESTART_WARMUP_CYCLES = 30
+
+# The plain demo node that row restarts. No lifecycle interface at all, so the gate's ownership
+# answer for it is EARNED throughout and the row turns on nothing but arming.
+PLAIN_NODE = 'calibration'
+
+# How long the plain node stays down after each kill - an enforced floor under the outage, not
+# a sleep. It has to clear two windows, not one: the detector's own miss window
+# ([MISS_GRACE + 1] * TICK_INTERVAL_MS = 3400 ms) plus the entity cache's refresh debounce,
+# before the death can be reported at all; and then the whole no-PASSED window this row watches
+# afterwards, because the node coming back is a legitimate reason to report PASSED and would
+# land inside that window otherwise. 30 s covers ~5 s of detection plus SILENCE_WINDOW_SEC with
+# margin to spare.
+RESTART_RESPAWN_DELAY_SEC = 30.0
+
 # node_death's grace, in TICKS. Nominal window is [MISS_GRACE + 1] * TICK_INTERVAL_MS = 3400 ms,
 # comfortably past the 3000 ms wall-clock floor configure() would otherwise raise it to and two
 # ticks clear of that floor's own boundary value (14 at this tick period) - the "comfortably
@@ -186,6 +213,10 @@ RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # is the same shape of budget the "unreadable" scenario in test_lifecycle_expectation_e2e.test.py
 # sizes for the identical hold at a comparable cadence.
 UNREADABLE_RAISE_TIMEOUT_SEC = 90.0 * TIME_SCALE
+
+# How long the restart row waits for the respawned node to reappear: the enforced respawn delay
+# plus the entity cache's own refresh, with margin.
+RESTART_RETURN_TIMEOUT_SEC = (RESTART_RESPAWN_DELAY_SEC + 30.0) * TIME_SCALE
 
 # How long a code that must NOT appear is watched for, once the code that must appear already
 # has. Not a give-up bound and deliberately not scaled: it is a window in which every poll has
@@ -243,6 +274,28 @@ def _droppable_node_action():
     )
 
 
+def _plain_node_action():
+    """Build the plain demo node as a respawning launch action with a PID handle.
+
+    No lifecycle services at all, so the gate answers kEarned for it whenever it is armed and
+    nothing about this row depends on a lifecycle label. `respawn` is what brings the SAME node
+    name back after the test kills it, under a new pid the action reports.
+    """
+    executable, ros_name, namespace = DEMO_NODE_REGISTRY[PLAIN_NODE]
+    return launch_ros.actions.Node(
+        package='ros2_medkit_integration_tests',
+        executable=executable,
+        name=ros_name,
+        namespace=namespace,
+        output='screen',
+        additional_env=get_coverage_env('ros2_medkit_integration_tests'),
+        sigterm_timeout='30',
+        sigkill_timeout='15',
+        respawn=True,
+        respawn_delay=RESTART_RESPAWN_DELAY_SEC,
+    )
+
+
 def _unreadable_node_action(transition_label=None):
     """Build the fixture as a launch action with a PID handle the test can signal.
 
@@ -294,6 +347,10 @@ def generate_test_description():
     elif SCENARIO == 'measured_then_unmeasured':
         # node_death is zero-config, and this row is entirely about it.
         pass
+    elif SCENARIO == 'restart_inside_warmup':
+        # A wide warmup is the whole instrument here: it makes the re-warm window observable
+        # and long enough to act inside, instead of something the test would have to race.
+        detector_params['plugins.graph_watchdog.warmup_cycles'] = RESTART_WARMUP_CYCLES
     elif SCENARIO == 'gate_unaffected':
         # `baseline: false` plus one absolute `expect` pin: the pin fires on a STATIC graph, with
         # no runtime perturbation to race, and it only fires for a node that HAS the parameter
@@ -313,6 +370,8 @@ def generate_test_description():
 
     if SCENARIO == 'measured_then_unmeasured':
         target = _droppable_node_action()
+    elif SCENARIO == 'restart_inside_warmup':
+        target = _plain_node_action()
     elif SCENARIO == 'provisional_yields_to_a_real_label':
         target = _unreadable_node_action(transition_label=LATE_LABEL)
     else:
@@ -393,6 +452,74 @@ def _poll_apps_absent(port, app_id, timeout=30.0, interval=0.5):
             last_seen = f'GET /apps failed: {exc}'
         time.sleep(interval)
     print(f'_poll_apps_absent({app_id!r}) timed out after {timeout}s; last seen: {last_seen}')
+    return False
+
+
+def _fault_record(port, code, timeout=30.0, interval=0.5):
+    """Poll ``GET /faults?status=all`` until `code` appears, whatever its status.
+
+    ``poll_faults`` uses the default (pending + confirmed) filter, so a record that HEALED
+    while the node was briefly back drops out of it. The restart row needs the record itself -
+    ``last_occurred``, which advances on every FAILED, and ``last_passed``, which advances on
+    every PASSED - and both survive healing. Returns the matching item dict, or ``None``.
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', params={'status': 'all'}, timeout=5)
+            if response.status_code == 200:
+                for item in response.json().get('items', []):
+                    if item.get('fault_code') == code:
+                        return item
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return None
+
+
+def _poll_watchdog_entity_state(port, app_id, timeout=30.0, interval=0.5):
+    """Return the entity's own ``state`` from GET /x-medkit-watchdog, or ``None``.
+
+    The restart row needs the OPPOSITE of what wait_until_watchdog_armed waits for: proof that
+    a node which has just come back is NOT yet armed, so the kill that follows lands inside the
+    re-warm window rather than after it.
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/x-medkit-watchdog', timeout=5)
+            if response.status_code == 200:
+                status = response.json().get('x-medkit-watchdog', {})
+                for entity in status.get('entities') or []:
+                    if entity.get('id') == app_id:
+                        return entity.get('state')
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return None
+
+
+def _poll_apps_present(port, app_id, timeout=30.0, interval=0.5):
+    """Poll ``GET /apps`` until `app_id` IS listed. ``True`` once it appears."""
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + timeout
+    last_seen = 'GET /apps was never answered at all'
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/apps', timeout=5)
+            if response.status_code == 200:
+                ids = [item.get('id') for item in response.json().get('items', [])]
+                last_seen = str(ids)
+                if app_id in ids:
+                    return True
+            else:
+                last_seen = f'HTTP {response.status_code} from GET /apps'
+        except requests.exceptions.RequestException as exc:
+            last_seen = f'GET /apps failed: {exc}'
+        time.sleep(interval)
+    print(f'_poll_apps_present({app_id!r}) timed out after {timeout}s; last seen: {last_seen}')
     return False
 
 
@@ -692,6 +819,107 @@ class TestMeasuredThenUnmeasured(unittest.TestCase):
         self.assertIn(DROPPABLE_NODE, fault.get('description', ''))
 
 
+class TestRestartInsideWarmup(unittest.TestCase):
+    """A crash loop whose uptime is shorter than the warmup: the second death must be reported.
+
+    Handing a key back is for one situation only - the graph has MEASURED the node as something
+    the presence detector must not own. A node that is merely re-warming has been measured as
+    nothing at all: the gate withholds a claim because warmup is incomplete, which is the
+    absence of knowledge, not knowledge of another owner. Releasing a key on that answer costs
+    two things at once, and this row asserts both. The node's next death goes unreported,
+    because the key is no longer tracked; and the detector reports PASSED every tick while the
+    node is dead, because an empty dead set reads as health.
+
+    The other restart rows in this package all wait for the returned node to arm before killing
+    it again, so none of them can see this: they only ever kill an armed node. This one kills
+    inside the re-warm window on purpose, and proves it was inside by reading the entity's own
+    state off the watchdog route rather than by timing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rclpy.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        rclpy.shutdown()
+
+    def test_a_second_death_inside_the_rewarm_window_is_still_reported(self, target_node):
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC, app_id=PLAIN_NODE),
+            f'graph_watchdog never reported {PLAIN_NODE} armed, so the first death below could '
+            'never have been tracked at all')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, PLAIN_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{PLAIN_NODE} never left GET /apps after the first SIGTERM')
+        first = poll_faults(PORT, FAULT_CODE_DISAPPEARED, timeout=RAISE_TIMEOUT_SEC)
+        if first is None:
+            self.fail(
+                f'{FAULT_CODE_DISAPPEARED} never raised for the first death of {PLAIN_NODE} - '
+                'there is no first death here for a second one to follow')
+        self.assertIn(PLAIN_NODE, first.get('description', ''))
+
+        # The node comes back under the same name and a new pid. Everything after this point
+        # happens inside its re-warm window, which is why nothing here waits for arming.
+        self.assertTrue(
+            _poll_apps_present(PORT, PLAIN_NODE, timeout=RESTART_RETURN_TIMEOUT_SEC),
+            f'{PLAIN_NODE} never came back into GET /apps after its respawn')
+        state = _poll_watchdog_entity_state(PORT, PLAIN_NODE, timeout=LABEL_TIMEOUT_SEC)
+        self.assertEqual(
+            state, 'warming_up',
+            f'{PLAIN_NODE} was already {state!r} when it came back, so the kill below would land '
+            'AFTER the re-warm window and this row would be a second copy of the restart-loop '
+            'scenarios that already pass')
+
+        before = _fault_record(PORT, FAULT_CODE_DISAPPEARED, timeout=DEPARTURE_TIMEOUT_SEC)
+        self.assertIsNotNone(
+            before, f'{FAULT_CODE_DISAPPEARED} left the store entirely once {PLAIN_NODE} came '
+                    'back, so there is no record for the second death to move')
+
+        os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        self.assertTrue(
+            _poll_apps_absent(PORT, PLAIN_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
+            f'{PLAIN_NODE} never left GET /apps after the second SIGTERM')
+
+        deadline = time.monotonic() + RAISE_TIMEOUT_SEC
+        after = before
+        while time.monotonic() < deadline:
+            after = _fault_record(PORT, FAULT_CODE_DISAPPEARED, timeout=5.0) or after
+            if after.get('last_occurred') != before.get('last_occurred'):
+                break
+            time.sleep(0.5)
+        self.assertNotEqual(
+            after.get('last_occurred'), before.get('last_occurred'),
+            f'{FAULT_CODE_DISAPPEARED} was never reported again for the second death of '
+            f'{PLAIN_NODE} (last_occurred stayed {before.get("last_occurred")!r}) - the key was '
+            'handed back while the node was merely re-warming, so nothing was tracking it when '
+            'it died')
+
+        # The other half of the same defect: with nothing tracked, an empty dead set reads as
+        # health and the detector reports PASSED for a node that is lying dead in front of it.
+        passed_at_confirmation = after.get('last_passed')
+        deadline = time.monotonic() + SILENCE_WINDOW_SEC
+        polls = 0
+        while time.monotonic() < deadline:
+            record = _fault_record(PORT, FAULT_CODE_DISAPPEARED, timeout=5.0)
+            self.assertIsNotNone(
+                record, f'{FAULT_CODE_DISAPPEARED} left the store {polls} poll(s) into the '
+                        'window that was supposed to show no PASSED at all')
+            self.assertEqual(
+                record.get('last_passed'), passed_at_confirmation,
+                f'{FAULT_CODE_DISAPPEARED} was reported PASSED {polls} poll(s) after it was '
+                f'confirmed dead again (last_passed moved to {record.get("last_passed")!r}) - '
+                f'{PLAIN_NODE} is still gone, so that is a heal for a node nobody is watching')
+            polls += 1
+            time.sleep(0.5)
+        self.assertGreater(polls, 0, 'the no-PASSED window never actually polled the store')
+
+
 class TestProvisionalOwnershipYieldsToARealLabel(unittest.TestCase):
     """A provisional owner hands the node back the moment the graph says whose it is.
 
@@ -863,6 +1091,7 @@ class TestGateStaysPermissiveForTheOtherDetectors(unittest.TestCase):
 # one case, and a missing result is a real failure rather than an expected line of output - see
 # the sibling e2e files' identical rationale.
 _SCENARIO_CASES = {
+    'restart_inside_warmup': 'TestRestartInsideWarmup',
     'provisional_yields_to_a_real_label': 'TestProvisionalOwnershipYieldsToARealLabel',
     'budget_spent_then_owned': 'TestBudgetSpentThenOwned',
     'no_require_active_still_owned': 'TestNoRequireActiveStillOwned',

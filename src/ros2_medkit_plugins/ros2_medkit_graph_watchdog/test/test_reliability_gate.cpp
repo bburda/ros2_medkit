@@ -207,9 +207,10 @@ TEST_F(ReliabilityGateTest, UnmeasuredManagedNodeIsArmedButNotOwnedByPresence) {
   ASSERT_TRUE(g.allows_raise("/unmeasured"))
       << "the gate's permissive answer for an unread label is deliberate and must not change: "
          "param_drift is app-keyed and depends on it";
-  EXPECT_EQ(g.presence_ownership("/unmeasured"), PresenceOwnership::kNone)
+  EXPECT_EQ(g.presence_ownership("/unmeasured"), PresenceOwnership::kUnclaimed)
       << "a managed node the watcher has not finished asking about cannot be owned by the "
-         "presence detector - the measurement may be one tick away";
+         "presence detector - the measurement may be one tick away - and it has not been "
+         "disowned either, because nothing has been measured at all";
 
   // The instrument, not a paraphrase of it: armed alone reads the same for a plain node and
   // for a managed one nobody has measured, so the claim is only visible in the PAIR.
@@ -246,12 +247,12 @@ TEST_F(ReliabilityGateTest, PresenceOwnershipSweepsEveryLifecycleStateTheWatcher
     int reseeds_remaining;
     PresenceOwnership owned;
   };
-  const Case cases[] = {{"", LifecycleWatcher::kReseedAttempts, PresenceOwnership::kNone},
+  const Case cases[] = {{"", LifecycleWatcher::kReseedAttempts, PresenceOwnership::kUnclaimed},
                         {"", 0, PresenceOwnership::kProvisional},
                         {"active", 0, PresenceOwnership::kEarned},
-                        {"inactive", LifecycleWatcher::kReseedAttempts, PresenceOwnership::kNone},
-                        {"unconfigured", LifecycleWatcher::kReseedAttempts, PresenceOwnership::kNone},
-                        {"finalized", LifecycleWatcher::kReseedAttempts, PresenceOwnership::kNone}};
+                        {"inactive", LifecycleWatcher::kReseedAttempts, PresenceOwnership::kDisowned},
+                        {"unconfigured", LifecycleWatcher::kReseedAttempts, PresenceOwnership::kDisowned},
+                        {"finalized", LifecycleWatcher::kReseedAttempts, PresenceOwnership::kDisowned}};
   for (const auto & c : cases) {
     g.set_lifecycle_state_for_test("/m", c.label, c.reseeds_remaining);
     EXPECT_EQ(g.presence_ownership("/m"), c.owned)
@@ -318,7 +319,7 @@ TEST_F(ReliabilityGateTest, UnansweredManagedNodeIsOwnedOnlyOnceTheReseedBudgetI
   ASSERT_GT(left, 0) << "the arming tick spent the whole budget, so there is no transient half "
                         "of this claim left to observe";
   for (int i = 0; i < kMaxTicks && left > 0; ++i) {
-    EXPECT_EQ(g.presence_ownership("/unanswered"), PresenceOwnership::kNone)
+    EXPECT_EQ(g.presence_ownership("/unanswered"), PresenceOwnership::kUnclaimed)
         << "still " << left << " re-seed attempt(s) left, so the ignorance can still resolve";
     g.update(managed_snap("/unanswered"), static_cast<uint64_t>(9 + i));
     const int now_left = g.lifecycle_reseeds_remaining_for_test("/unanswered");
@@ -347,7 +348,7 @@ TEST_F(ReliabilityGateTest, PresenceOwnershipFollowsALabelThatArrivesAndVanishes
   g.update(managed_snap("/flip"), 8);  // armed, still unmeasured
   ASSERT_TRUE(g.allows_raise("/flip"));
   g.set_lifecycle_state_for_test("/flip", "", LifecycleWatcher::kReseedAttempts);
-  EXPECT_EQ(g.presence_ownership("/flip"), PresenceOwnership::kNone);
+  EXPECT_EQ(g.presence_ownership("/flip"), PresenceOwnership::kUnclaimed);
 
   g.set_lifecycle_state_for_test("/flip", "active");  // a transition_event finally arrives
   EXPECT_EQ(g.presence_ownership("/flip"), PresenceOwnership::kEarned);
@@ -355,7 +356,7 @@ TEST_F(ReliabilityGateTest, PresenceOwnershipFollowsALabelThatArrivesAndVanishes
   // Re-bound to a binding that answers nothing: the entry is re-seeded from scratch, so the
   // knowledge is gone AND the budget is back - transient ignorance again, not settled.
   g.set_lifecycle_state_for_test("/flip", "", LifecycleWatcher::kReseedAttempts);
-  EXPECT_EQ(g.presence_ownership("/flip"), PresenceOwnership::kNone);
+  EXPECT_EQ(g.presence_ownership("/flip"), PresenceOwnership::kUnclaimed);
   EXPECT_TRUE(g.allows_raise("/flip")) << "the permissive answer is unchanged by any of this";
 
   // The same empty label with the budget spent is a different GROUND, not merely a different
@@ -367,7 +368,7 @@ TEST_F(ReliabilityGateTest, PresenceOwnershipFollowsALabelThatArrivesAndVanishes
   // the sequence the bound alone would have missed: provisional owner, then the graph says the
   // node was inactive all along.
   g.set_lifecycle_state_for_test("/flip", "inactive", 0);
-  EXPECT_EQ(g.presence_ownership("/flip"), PresenceOwnership::kNone);
+  EXPECT_EQ(g.presence_ownership("/flip"), PresenceOwnership::kDisowned);
 
   g.set_lifecycle_state_for_test("/flip", "active");
   EXPECT_EQ(g.presence_ownership("/flip"), PresenceOwnership::kEarned);
@@ -380,9 +381,40 @@ TEST_F(ReliabilityGateTest, PresenceOwnershipStillRequiresArming) {
   ReliabilityGate g(3, node_.get(), &mtx_);
   g.update(snap({"/plain"}), 5);  // 0 elapsed -> not armed
   EXPECT_FALSE(g.allows_raise("/plain"));
-  EXPECT_EQ(g.presence_ownership("/plain"), PresenceOwnership::kNone);
+  EXPECT_EQ(g.presence_ownership("/plain"), PresenceOwnership::kUnclaimed)
+      << "not armed is UNCLAIMED, never disowned: nothing has been measured about this node, "
+         "and a caller that already holds the key must not read this as a reason to drop it";
   g.update(snap({"/plain"}), 8);  // 3 elapsed -> armed
   EXPECT_EQ(g.presence_ownership("/plain"), PresenceOwnership::kEarned);
+}
+
+// The order the two negative answers are decided in, which is the whole of what separates
+// "nothing is known yet" from "the graph says this node is someone else's". node_ok() already
+// refuses a managed non-active node, so asking allows_raise() first would answer the same for
+// a node measured `inactive` and for one that has simply not armed yet - and a caller that
+// releases keys on the negative answer would then drop every node that restarts, because a
+// returning node is un-armed for its whole re-warm.
+TEST_F(ReliabilityGateTest, NotArmedAndMeasuredElsewhereAreDifferentAnswers) {
+  ReliabilityGate g(3, node_.get(), &mtx_);
+  // The measured one is MANAGED, so its tracked entry (and the injected label with it) survives
+  // the second update below - a service-less app is dropped from the watcher by every update.
+  g.update(mixed_snap("/warming", "/measured"), 5);  // 0 elapsed: neither is armed
+  g.set_lifecycle_state_for_test("/measured", "inactive");
+
+  ASSERT_FALSE(g.allows_raise("/warming")) << "neither entity may be armed here, or this test "
+                                              "cannot show which of the two facts decided it";
+  ASSERT_FALSE(g.allows_raise("/measured"));
+  EXPECT_EQ(g.presence_ownership("/warming"), PresenceOwnership::kUnclaimed)
+      << "a node with no lifecycle record that has not armed yet has been measured as nothing";
+  EXPECT_EQ(g.presence_ownership("/measured"), PresenceOwnership::kDisowned)
+      << "a measured non-active label is knowledge about who this node belongs to, and it must "
+         "outrank the warmup state rather than being hidden behind it";
+
+  // And once armed, the un-measured one is owned outright while the measured one is not.
+  g.update(mixed_snap("/warming", "/measured"), 8);
+  EXPECT_EQ(g.presence_ownership("/warming"), PresenceOwnership::kEarned);
+  EXPECT_EQ(g.presence_ownership("/measured"), PresenceOwnership::kDisowned)
+      << "the label survives a re-seed that cannot answer, so the verdict must survive it too";
 }
 
 // A null gate (not yet wired by the plugin) must not suppress tracking either - same
@@ -397,10 +429,10 @@ TEST(PresenceOwnershipFreeFunction, NullGateAlwaysOwnsOutright) {
 TEST_F(ReliabilityGateTest, PresenceOwnershipFreeFunctionMirrorsTheGate) {
   ReliabilityGate g(3, node_.get(), &mtx_);
   g.update(managed_snap("/mirror"), 5);
-  EXPECT_EQ(presence_ownership(&g, "/mirror"), PresenceOwnership::kNone);  // not armed yet
-  g.update(managed_snap("/mirror"), 8);                                    // armed, still unmeasured
+  EXPECT_EQ(presence_ownership(&g, "/mirror"), PresenceOwnership::kUnclaimed);  // not armed yet
+  g.update(managed_snap("/mirror"), 8);                                         // armed, still unmeasured
   g.set_lifecycle_state_for_test("/mirror", "", LifecycleWatcher::kReseedAttempts);
-  EXPECT_EQ(presence_ownership(&g, "/mirror"), PresenceOwnership::kNone);
+  EXPECT_EQ(presence_ownership(&g, "/mirror"), PresenceOwnership::kUnclaimed);
   g.set_lifecycle_state_for_test("/mirror", "", 0);
   EXPECT_EQ(presence_ownership(&g, "/mirror"), PresenceOwnership::kProvisional);
   g.set_lifecycle_state_for_test("/mirror", "active");

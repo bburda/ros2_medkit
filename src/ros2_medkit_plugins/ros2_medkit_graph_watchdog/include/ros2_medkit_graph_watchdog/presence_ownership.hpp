@@ -34,9 +34,17 @@ namespace ros2_medkit_graph_watchdog {
 ///     the node belongs to. A provisional owner must therefore hand the node back while it
 ///     is still alive, rather than discover at its death that it never had a claim.
 ///
+/// The two NEGATIVE answers are just as different from each other, and conflating them is its
+/// own defect: kUnclaimed says nothing is known yet, kDisowned says the graph has said whose
+/// node this is. Only the second may take a key away from a caller that already holds it. A
+/// node that is merely re-warming after a restart answers kUnclaimed, and treating that as a
+/// verdict releases a key the detector must keep - its next death would then be reported by
+/// nobody, and the detector would call an outage healthy every tick it lasted.
+///
 /// See ReliabilityGate::presence_ownership() for the exact per-state mapping.
 enum class PresenceOwnership : std::uint8_t {
-  kNone,         ///< not this detector's: still warming up, still being asked about, or measured non-active
+  kUnclaimed,    ///< nothing known either way yet: still warming up, or still being asked about
+  kDisowned,     ///< measured, and measured as a state this detector does not report - another detector's
   kProvisional,  ///< owned only because the asking stopped with no answer; withdrawn as soon as one arrives
   kEarned,       ///< owned on a measurement, or on the absence of any lifecycle to measure; never withdrawn
 };

@@ -281,13 +281,6 @@ class NodeDeathDetector : public Detector {
       present.insert(key);
       // Tracking follows OWNERSHIP rather than permission, and the two are not the same
       // question: the gate answers "may this entity raise" permissively for a managed node
-      // whose lifecycle label has never been read, and a key admitted on that answer is
-      // tracked for the rest of its life. This detector can only report a node it can
-      // reliably observe, so it asks the stricter predicate instead - a managed node whose
-      // state is still being asked for belongs to lifecycle_expectation's absence path until
-      // the asking stops. The gate is keyed by App::id.
-      // Tracking follows OWNERSHIP rather than permission, and the two are not the same
-      // question: the gate answers "may this entity raise" permissively for a managed node
       // whose lifecycle label has never been read. What the gate returns here is the GROUND,
       // and the ground decides whether admission is permanent. kEarned came from a
       // measurement (or from a node with no lifecycle to measure) and is latched exactly as
@@ -304,13 +297,22 @@ class NodeDeathDetector : public Detector {
         case PresenceOwnership::kProvisional:
           armed.insert(key);
           break;
-        case PresenceOwnership::kNone:
-          // Never earned, and no longer owned: hand it back while it is still alive. A key
-          // that WAS earned keeps its admission - a node that ran and then deactivated is
-          // still a death when it stops running.
+        case PresenceOwnership::kDisowned:
+          // The graph has measured this node as another detector's. If this detector never
+          // earned it, hand it back while it is still alive. A key that WAS earned keeps its
+          // admission - a node that ran and then deactivated is still a death when it stops
+          // running.
           if (earned_.count(key) == 0) {
             handed_back.insert(key);
           }
+          break;
+        case PresenceOwnership::kUnclaimed:
+          // Nothing is known about this node yet - it is warming up, or the watcher is still
+          // asking. That is not a reason to admit it, and it is emphatically not a reason to
+          // give up a key already admitted: a node that dies, is reported, comes back and dies
+          // again inside its re-warm window reads exactly like this on the tick it returns, and
+          // releasing it there means its second death is tracked by nothing and every tick of
+          // the outage reports PASSED.
           break;
       }
       // Capture the allowlist's id-form verdict WHILE the entity is still present and
