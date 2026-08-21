@@ -288,7 +288,10 @@ class NodeDeathDetector : public Detector {
       // watcher giving up on asking, so it holds only while that stays true: if a label
       // arrives afterwards - the ~/transition_event subscription outlives the seed budget -
       // the node turns out to have been another detector's all along, and it is handed back
-      // below rather than reported dead later. The gate is keyed by App::id.
+      // below rather than reported dead later. The two NEGATIVE grounds are just as different
+      // from each other: kDisowned is that measurement arriving, and kUnclaimed is the absence
+      // of any measurement at all, which is what a re-warming node answers - so only the first
+      // withdraws a key. The gate is keyed by App::id.
       switch (presence_ownership(ctx.gate, app.id)) {
         case PresenceOwnership::kEarned:
           earned_.insert(key);  // knowledge, once had, is never withdrawn
@@ -585,8 +588,9 @@ class NodeDeathDetector : public Detector {
   /// is what a dead key is judged by, since id is unavailable once the entity has left
   /// ctx.snapshot. Bounded to tracker_.known_keys() at the end of every tick.
   /// Keys whose ownership the gate granted on kEarned grounds while they were present. Read
-  /// only by the hand-back branch in tick(), which is the one place the difference between the
-  /// two grounds decides anything. Pruned to the live graph every tick.
+  /// only by the kDisowned branch in tick(), which is the one place the difference between an
+  /// admission earned from a measurement and one granted provisionally decides anything.
+  /// Pruned to the live graph every tick.
   std::set<std::string> earned_;
   std::set<std::string> id_allowlisted_;
   /// Whether THIS detector instance has itself genuinely raised GRAPH_NODE_DISAPPEARED at

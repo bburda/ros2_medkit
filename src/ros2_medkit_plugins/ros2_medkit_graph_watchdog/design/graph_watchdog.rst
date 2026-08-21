@@ -486,7 +486,7 @@ Where the presence class CAN also report the same departure, it no longer does:
 ``GRAPH_NODE_DISAPPEARED`` (this package's own ``node_death`` detector) independently
 reports it, whether or not the node was ever measured not-active first. But ``node_death``
 only ever tracks an App once the reliability gate says it OWNS that App's departure, on one of
-the two grounds ``ReliabilityGate::presence_ownership()`` distinguishes - so a ``require_active``
+one of the two grounds ``ReliabilityGate::presence_ownership()`` accepts - so a ``require_active``
 node that never reaches ``active`` is never tracked by ``node_death``, and neither is a managed
 node whose ``GetState`` has not answered while the watcher is still asking. The gate would
 permit that second one to RAISE - ``LifecycleWatcher::node_ok()`` treats an unread label as

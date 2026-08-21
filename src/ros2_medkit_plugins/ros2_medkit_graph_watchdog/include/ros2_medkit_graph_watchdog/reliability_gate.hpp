@@ -56,28 +56,37 @@ class ReliabilityGate {
   /// and lifecycle-ok; unknown entities fall back to the global warmup window.
   bool allows_raise(const std::string & source_id) const;
 
-  /// On what grounds the PRESENCE detector (node_death) owns this source's departure. The
-  /// entity must be allowed to raise at all, and then:
+  /// On what grounds the PRESENCE detector (node_death) owns this source's departure, listed
+  /// in the order the cases are decided, because that order is itself load-bearing:
   ///
-  ///   - no managed record for it (a plain node)      -> kEarned
-  ///   - the record reads "active"                    -> kEarned
-  ///   - no label yet, GetState attempts still to run  -> kNone (we have not finished asking)
-  ///   - no label, every attempt spent                -> kProvisional (we asked and failed)
-  ///   - any other label                              -> kNone (measured non-active)
+  ///   1. a label that is neither empty nor "active"  -> kDisowned    (measured elsewhere)
+  ///   2. not allowed to raise                        -> kUnclaimed   (warming up)
+  ///   3. no managed record at all (a plain node)     -> kEarned
+  ///   4. empty label, GetState attempts still to run -> kUnclaimed   (still asking)
+  ///   5. empty label, every attempt spent            -> kProvisional (asked, and failed)
+  ///   6. the label reads "active"                    -> kEarned
+  ///
+  /// Case 1 is deliberately decided BEFORE arming, and not merely for tidiness: node_ok()
+  /// already refuses a managed non-active node, so asking allows_raise() first would answer
+  /// the same for a node the graph has measured as inactive and for one that has simply not
+  /// armed yet. A caller that gives up a key on the negative answer would then drop every
+  /// node that restarts, since a returning node is un-armed for its whole re-warm - see
+  /// PresenceOwnership for why only kDisowned may take a key away.
   ///
   /// Narrower than allows_raise(), and deliberately so. allows_raise() answers "may this
   /// entity raise", and for a managed node whose label has never been read it answers yes,
   /// because gating every detector on an unread label would silence a node whose GetState
   /// never answers (see LifecycleWatcher::node_ok()). Ownership needs knowledge rather than
-  /// permission, so an unread label answers kNone while that ignorance can still resolve.
+  /// permission, so an unread label answers kUnclaimed while that ignorance can still resolve.
   ///
-  /// It does NOT stay kNone forever: `lifecycle_expectation` is the only other detector that
-  /// could report such a node's departure, and it looks at nothing unless an operator named
-  /// the node in `require_active`, which defaults to empty. So once the watcher has stopped
-  /// asking, the answer becomes kProvisional - owned, because otherwise nobody reports this
-  /// death, and provisional, because the label may still arrive over ~/transition_event
-  /// (that subscription outlives the seed budget) and would then say the node was never
-  /// this detector's. See PresenceOwnership for what each caller owes the distinction.
+  /// It does NOT stay kUnclaimed forever: `lifecycle_expectation` is the only other detector
+  /// that could report such a node's departure, and it looks at nothing unless an operator
+  /// named the node in `require_active`, which defaults to empty. So once the watcher has
+  /// stopped asking, the answer becomes kProvisional - owned, because otherwise nobody
+  /// reports this death, and provisional, because the label may still arrive over
+  /// ~/transition_event (that subscription outlives the seed budget) and would then say the
+  /// node was never this detector's. See PresenceOwnership for what each caller owes the
+  /// distinction.
   PresenceOwnership presence_ownership(const std::string & source_id) const;
 
   /// Raw lifecycle state label for `app_id` (delegates to the internal
@@ -95,8 +104,11 @@ class ReliabilityGate {
   /// plugin-internal seam for LifecycleShutdownSuppressor.
   std::optional<DepartedLifecycle> departed_lifecycle_state_of(const std::string & fqn) const;
 
-  /// SOVD `x-medkit-watchdog` extension payload: schema_version, warmup_cycles,
-  /// global_state, and per-entity state/armed/lifecycle.
+  /// SOVD `x-medkit-watchdog` extension payload: schema_version, warmup_cycles, global_state,
+  /// and per entity id/first_seen_tick/armed/state/lifecycle/measurement_pending. The last two
+  /// are a pair on purpose: `lifecycle` is null for a node with no managed record and "" for
+  /// one whose GetState has not answered, and `measurement_pending` says whether that second
+  /// case is still being asked about - which nothing else on the route distinguishes.
   nlohmann::json status_json() const;
 
   /// Drop lifecycle subscriptions (shutdown path).
@@ -128,8 +140,9 @@ class ReliabilityGate {
   // thread. warmup_ (an unordered_map) and the scalars below have no internal lock, so
   // gate_mutex_ serializes the writer (update) against the cross-thread reader
   // (status_json). lifecycle_ is separately self-synchronized and is deliberately updated
-  // OUTSIDE gate_mutex_ (it does blocking reads); allows_raise() is a reader that only
-  // runs on the tick thread (sequentially after update), so it needs no lock.
+  // OUTSIDE gate_mutex_ (it does blocking reads); allows_raise() and presence_ownership()
+  // are readers that only run on the tick thread (sequentially after update), so they need no
+  // lock - the lifecycle_ reads inside them take that class's own mutex.
   mutable std::mutex gate_mutex_;
   WarmupTracker warmup_;
   LifecycleWatcher lifecycle_;

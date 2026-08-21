@@ -1686,13 +1686,7 @@ bringup-quiesce centrally so no individual detector has to reimplement it.
   departure". The latter is true for a node with no managed record at all (a
   plain node) and for one reading `active`. An unread label is ignorance rather
   than a state, so it answers no - but only while that ignorance can still
-  resolve. The two NEGATIVE answers are kept apart for the same reason the
-  positive ones are: `unclaimed` means nothing is known yet (still warming up,
-  or still being asked about) and `disowned` means the graph has said whose node
-  this is. Only `disowned` may take a key away from a detector already holding
-  it, and the label decides it before arming does - a node that restarts is
-  un-armed for its whole re-warm, and reading that as a verdict would drop the
-  key just in time for the node's next death to be reported by nobody. `LifecycleWatcher` charges a bounded GetState re-seed budget per node,
+  resolve. `LifecycleWatcher` charges a bounded GetState re-seed budget per node,
   and charges it only for a read that actually ran, so an empty label with
   attempts left means "we have not finished asking" and an empty label with the
   budget spent means "we asked and failed". Past that point the answer flips back
@@ -1712,6 +1706,13 @@ bringup-quiesce centrally so no individual detector has to reimplement it.
   ground, and ANDs it with the node being ONLINE, because `node_death` skips an
   offline app before it ever consults the gate. Both detectors read the one
   shared answer on the same tick rather than each guessing from a label.
+  The two NEGATIVE answers are kept apart for the same reason the positive ones
+  are: `unclaimed` means nothing is known yet (still warming up, or still being
+  asked about) and `disowned` means the graph has said whose node this is. Only
+  `disowned` may take a key away from a detector already holding it, and the
+  label decides it before arming does - a node that restarts is un-armed for its
+  whole re-warm, and reading that as a verdict would drop the key just in time
+  for the node's next death to be reported by nobody.
   What this does NOT close: an
   App counts as managed only once the snapshot shows it advertising a
   `GetState`-typed service, and until then it is indistinguishable from a plain
