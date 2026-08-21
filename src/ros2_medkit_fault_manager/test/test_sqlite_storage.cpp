@@ -2334,6 +2334,63 @@ TEST_F(SqliteFaultStorageTest, NearMissSeriesEmptyForUnknownFault) {
   EXPECT_TRUE(storage_->get_near_misses("NEVER_REPORTED").empty());
 }
 
+// --- Snapshot retention through the startup reclassification ---
+//
+// clear_fault is not the only place that drops a fault's snapshots: reclassifying a HEALED fault
+// as CLEARED at startup does it too, and snapshots.retain_on_clear has to reach both.
+
+/// Store @p count snapshots for @p fault_code, one per topic.
+static void store_snapshots_for(ros2_medkit_fault_manager::FaultStorage & storage, const std::string & fault_code,
+                                int count) {
+  for (int i = 0; i < count; ++i) {
+    ros2_medkit_fault_manager::SnapshotData snapshot;
+    snapshot.fault_code = fault_code;
+    snapshot.topic = "/test/topic" + std::to_string(i);
+    snapshot.message_type = "std_msgs/msg/String";
+    snapshot.data = R"({"data": "value"})";
+    snapshot.captured_at_ns = 1000 + i;
+    storage.store_snapshot(snapshot);
+  }
+}
+
+/// Drive @p fault_code to a latched HEALED state.
+static void drive_to_healed(ros2_medkit_fault_manager::FaultStorage & storage, const std::string & fault_code) {
+  DebounceConfig config;
+  config.healing_enabled = true;
+  config.healing_threshold = 1;
+
+  storage.report_fault_event(fault_code, ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "fault",
+                             "/test_node", nth_report_time(0), config);
+  store_snapshots_for(storage, fault_code, 2);
+  // Two PASSED reports: the first only lifts the counter to 0, which the CONFIRMED latch holds.
+  for (int i = 1; i <= 2; ++i) {
+    storage.report_fault_event(fault_code, ReportFault::Request::EVENT_PASSED, Fault::SEVERITY_ERROR, "", "/test_node",
+                               nth_report_time(i), config);
+  }
+}
+
+TEST_F(SqliteFaultStorageTest, SnapshotsRetainedThroughHealedReclassification) {
+  storage_->set_retain_snapshots_on_clear(true);
+  drive_to_healed(*storage_, "SNAPSHOT_RETAIN_TEST");
+
+  auto healed = storage_->get_fault("SNAPSHOT_RETAIN_TEST");
+  ASSERT_TRUE(healed.has_value());
+  ASSERT_EQ(healed->status, Fault::STATUS_HEALED) << "test setup: the fault must be latched HEALED";
+  ASSERT_EQ(storage_->get_snapshots("SNAPSHOT_RETAIN_TEST").size(), 2u);
+
+  ASSERT_EQ(storage_->reclassify_healed_as_cleared().size(), 1u);
+
+  EXPECT_EQ(storage_->get_snapshots("SNAPSHOT_RETAIN_TEST").size(), 2u)
+      << "the restart reclassification deleted snapshots the configuration asked to keep";
+}
+
+TEST_F(SqliteFaultStorageTest, SnapshotsDroppedByHealedReclassificationByDefault) {
+  drive_to_healed(*storage_, "SNAPSHOT_DROP_TEST");
+  ASSERT_EQ(storage_->reclassify_healed_as_cleared().size(), 1u);
+
+  EXPECT_TRUE(storage_->get_snapshots("SNAPSHOT_DROP_TEST").empty());
+}
+
 int main(int argc, char ** argv) {
   rclcpp::init(argc, argv);
   ::testing::InitGoogleTest(&argc, argv);

@@ -1033,11 +1033,16 @@ std::vector<std::string> SqliteFaultStorage::reclassify_healed_as_cleared() {
   }
 
   // Drop snapshots for the affected faults so a reclassified row matches CLEARED semantics.
-  SqliteStatement del(db_,
-                      "DELETE FROM snapshots WHERE fault_code IN (SELECT fault_code FROM faults WHERE status = ?)");
-  del.bind_text(1, ros2_medkit_msgs::msg::Fault::STATUS_HEALED);
-  if (del.step() != SQLITE_DONE) {
-    throw std::runtime_error(std::string("Failed to delete snapshots: ") + sqlite3_errmsg(db_));
+  // clear_fault is not the only place that takes a fault's readings, so retain_snapshots_on_clear_
+  // has to reach here too: otherwise the setting holds until the next restart and then the
+  // reclassification deletes exactly what it was set to keep.
+  if (!retain_snapshots_on_clear_) {
+    SqliteStatement del(db_,
+                        "DELETE FROM snapshots WHERE fault_code IN (SELECT fault_code FROM faults WHERE status = ?)");
+    del.bind_text(1, ros2_medkit_msgs::msg::Fault::STATUS_HEALED);
+    if (del.step() != SQLITE_DONE) {
+      throw std::runtime_error(std::string("Failed to delete snapshots: ") + sqlite3_errmsg(db_));
+    }
   }
 
   SqliteStatement stmt(db_, "UPDATE faults SET status = ? WHERE status = ?");
