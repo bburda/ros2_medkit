@@ -1525,9 +1525,13 @@ done. `/fault_manager/list_faults` would tell this detector that a `GRAPH_NODE_D
 record is outstanding and that it is among its reporting sources - but not WHICH nodes it
 names, which is the only thing that would make a fresh instance's silence meaningful. The fault
 manager keeps one record per `fault_code`, and this detector folds every dead key into that one
-record's description, capped at `kMaxDescriptionChars` with the remainder collapsed into a
-count, so the key list is not recoverable even by parsing prose. `lifecycle_expectation` has the
-same boundary and resolves it differently (a bounded hold, then the clear flows) because its
+record's description. That description is this detector's own deterministic text, so for a
+record that never hit `kMaxDescriptionChars` the key list could in principle be read back out of
+it - the detector does not, because past the cap the remainder is collapsed into a count and the
+names are gone for good, and a re-seeding rule that works only for small faults is worse than
+none. In practice the operator carries the cost: after a reboot that follows a node death, the
+fault is still CONFIRMED and has to be deleted by hand even though the graph is healthy again.
+`lifecycle_expectation` has the same boundary and resolves it differently (a bounded hold, then the clear flows) because its
 `require_active` set is enumerable from config alone; this detector is zero-config over the
 whole graph and has no such set. The integration test
 `RestartedInstanceNeverClearsAFaultItDidNotRaiseEvenAsTheNodeReturns` pins the behaviour so it

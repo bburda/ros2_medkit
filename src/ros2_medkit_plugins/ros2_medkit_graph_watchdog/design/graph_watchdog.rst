@@ -1094,27 +1094,32 @@ reclaim tick, one tick to spare
 (``GraphWatchdogPlugin::compute_departed_retention_ticks()`` - the resulting window is
 larger than ``prune_ticks_`` alone).
 
-**Bounded by evidence, not by age - and why this cap, unlike the sibling's, cannot
-actually saturate.** This detector is zero-config over every armed App in the graph - a
-strictly larger scope than ``lifecycle_expectation``'s named ``require_active`` set - so
-identity churn would grow the tracker's map without a bound if nothing capped it. An
-unsuppressed, still-dead entry is never reclaimed by age (``prune_grace`` only ever
-reclaims a DURABLY suppressed key), so ``tracked_node_cap`` (default 512, accepted range
-1..16384) is what bounds memory. At the cap: idle entries (present, carrying no evidence)
-are evicted first - free, since a still-armed one is simply re-tracked a moment later -
-then departed entries are collapsed into one synthetic count, keeping at most three
-individually named, and only if even that leaves no room is every departed entry
-collapsed. Unlike ``LifecycleExpectationTracker``, whose two clocks let a node be
-simultaneously present and mid-violation (neither idle nor departed, and so un-evictable -
-exactly what lets ITS cap genuinely saturate and withhold ``GRAPH_NODE_INACTIVE``'s
-clear), ``NodeLivenessTracker`` carries exactly one piece of per-key state, so every
-tracked identity is always either idle or departed; collapsing every departed entry always
-empties enough room, so a newcomer is never actually refused while the cap is at least 1
-(``NodeLivenessTrackerCap.SaturationNeverFiresBecauseEveryKeyIsEitherIdleOrCollapsible``
-pins this directly). ``tracking_saturated`` and ``tracked_node_cap`` still appear in this
-detector's own ``GET /x-medkit-watchdog`` block, in the same shape the sibling reports
-them, but the field is never observed true here - the shared shape exists for consistency
-with the sibling detector, not because saturation is reachable in this one.
+**Bounded by evidence, not by age - and what the cap actually bounds.** This detector is
+zero-config over every armed App in the graph - a strictly larger scope than
+``lifecycle_expectation``'s named ``require_active`` set - so identity churn would grow the
+tracker's map without a bound if nothing capped it. An unsuppressed, still-dead entry is
+never reclaimed by age (``prune_grace`` only ever reclaims a DURABLY suppressed key), so
+``tracked_node_cap`` (default 512, accepted range 1..16384) is what bounds memory -
+specifically the DEPARTED subset of the map. A PRESENT/armed key never counts against the
+cap and is never evicted to make room for anything, at any map size
+(``NodeLivenessTrackerCap.PresentEntriesExceedingTheCapAreAllStillIndividuallyReportableOnDeath``):
+it is bounded by the live graph rather than by churn, so a graph far larger than the cap is
+not capacity pressure at all.
+
+Under pressure the cap collapses departed entries into one synthetic count, keeping at most
+three individually named
+(``NodeLivenessTrackerCap.MaturedDepartedEntriesAreCollapsedIntoACountUnderCapPressure``) -
+but only entries that have actually crossed ``miss_grace``. An entry still mid-grace is
+never a collapse candidate, because collapsing erases the identity and would report a death
+the node has not earned, permanently
+(``NodeLivenessTrackerCap.ImmatureDepartedEntriesAreNeverCollapsedOrReportedUnderCapPressure``).
+So saturation IS reachable here: when immature departures alone exceed the cap,
+``tracking_saturated`` goes true and the departed set stays oversized for a few ticks -
+bounded by how fast departures arrive times ``miss_grace``, not by process uptime, which is
+the growth the cap exists to prevent. What differs from ``LifecycleExpectationTracker`` is
+not whether the flag can fire but what it costs: there a refused newcomer withholds
+``GRAPH_NODE_INACTIVE``'s clear, whereas here nothing is refused and no report is lost, the
+map is merely temporarily larger than its target.
 
 **The boundary with** ``lifecycle_expectation``. ``GRAPH_NODE_INACTIVE`` and
 ``GRAPH_NODE_DISAPPEARED`` can both be raised for the same node at the same time, and that
@@ -1225,11 +1230,12 @@ plus the suppression chain the detector shares no code with any sibling for:
    of a capped description's blind spot; ``prune()`` reclaims a key only once it has been
    suppressed for MORE than ``prune_ticks`` CONSECUTIVE calls, resets the streak the
    moment a veto lifts even once, and never reclaims an unsuppressed death no matter how
-   long it stays dead; the cap evicts idle entries before collapsing departed ones, keeps
-   the collapsed count monotone within one tracker lifetime, and - the property most at
-   odds with a naive read of the sibling detector - can never actually report
-   ``tracking_saturated`` at all, since every tracked key here is always either idle or
-   collapsible, never both at once the way the sibling's two clocks allow.
+   long it stays dead; the cap leaves every PRESENT key individually tracked and reportable
+   however far the map is past it, collapses only departed entries that have crossed
+   ``miss_grace``, keeps the collapsed count monotone within one tracker lifetime, and - the
+   property most at odds with a naive read of the sibling detector - reports
+   ``tracking_saturated`` for a departed set that immature entries alone keep oversized,
+   which unlike the sibling's saturation refuses nothing and loses no report.
    ``test_suppressor.cpp`` pins the ``Suppressor`` interface and the free
    ``apply_suppressors()`` helper (order-independent, null-safe, returns the dropped
    count); ``test_allowlist_suppressor.cpp`` and ``test_lifecycle_shutdown_suppressor.cpp``
