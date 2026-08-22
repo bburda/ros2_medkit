@@ -1421,10 +1421,10 @@ class TestNodeDeathRestartRebaseline(unittest.TestCase):
         old_pid = gateway_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
         self.assertTrue(
-            _wait_until_port_is_down(PORT, timeout=60.0),
+            _wait_until_port_is_down(PORT, timeout=60.0 * TIME_SCALE),
             f'the gateway (pid {old_pid}) kept answering after SIGTERM - nothing restarted')
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=90.0),
+            wait_until_watchdog_armed(PORT, timeout=90.0 * TIME_SCALE),
             'the gateway never came back armed after the restart')
         self.assertNotEqual(
             gateway_node.process_details['pid'], old_pid,
