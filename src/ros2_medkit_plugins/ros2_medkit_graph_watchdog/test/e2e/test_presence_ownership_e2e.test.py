@@ -128,6 +128,7 @@ from harness import (  # noqa: E402, I100
     poll_faults,
     wait_until_faults_endpoint_live,
     wait_until_watchdog_armed,
+    watchdog_detector_status,
 )
 
 from ros2_medkit_test_utils.constants import (  # noqa: E402
@@ -150,6 +151,8 @@ FAULT_CODE_UNREADABLE = 'GRAPH_NODE_UNREADABLE'
 FAULT_CODE_PARAM_DRIFT = 'GRAPH_PARAM_DRIFT'
 FAULT_CODE_QOS = 'GRAPH_QOS_MISMATCH'
 FAULT_CODE_ORPHAN = 'GRAPH_ORPHAN'
+
+DETECTOR_ID_NODE_DEATH = 'node_death'
 
 _LIFECYCLE_PREFIX = 'plugins.graph_watchdog.detectors.lifecycle_expectation'
 _NODE_DEATH_PREFIX = 'plugins.graph_watchdog.detectors.node_death'
@@ -520,6 +523,35 @@ def _poll_apps_present(port, app_id, timeout=30.0, interval=0.5):
             last_seen = f'GET /apps failed: {exc}'
         time.sleep(interval)
     print(f'_poll_apps_present({app_id!r}) timed out after {timeout}s; last seen: {last_seen}')
+    return False
+
+
+def _poll_tracked_count_below(port, detector_id, threshold, timeout=30.0, interval=0.2):
+    """Poll until `detector_id` reports a `tracked_count` strictly below `threshold`.
+
+    The one observable on this route that reflects what the DETECTOR did rather than what the
+    watcher knows. Everything else an ownership row could gate on is published straight from
+    LifecycleWatcher: `lifecycle` is its cached label, and the per-entity `armed`/`state` pair
+    is warmup plus node_ok(), so all three flip the moment a transition_event lands, whole
+    detector ticks before node_death has looked at the graph again. Its own `tracked_count`
+    comes off the tracker, republished once per tick, so it only moves when a key is actually
+    admitted or released.
+
+    Returns ``True`` once the count drops, ``False`` on timeout (after printing the last value,
+    which is gone once the launch tears down).
+    """
+    deadline = time.monotonic() + timeout
+    last_seen = 'the node_death status block was never answered at all'
+    while time.monotonic() < deadline:
+        block = watchdog_detector_status(port, detector_id, timeout=5.0)
+        if block is not None:
+            last_seen = str(block)
+            count = block.get('tracked_count')
+            if isinstance(count, int) and count < threshold:
+                return True
+        time.sleep(interval)
+    print(f'_poll_tracked_count_below({detector_id!r}, {threshold}) timed out after {timeout}s; '
+          f'last status: {last_seen}')
     return False
 
 
@@ -969,6 +1001,22 @@ class TestProvisionalOwnershipYieldsToARealLabel(unittest.TestCase):
             'that state there is no provisional grant for the label below to revoke')
         self.assertTrue(entity.get('armed'))
 
+        # Captured while the node is still provisionally OWNED, so the drop below is this
+        # node's release and not some unrelated entity leaving the graph.
+        block = watchdog_detector_status(PORT, DETECTOR_ID_NODE_DEATH, timeout=5.0)
+        self.assertIsNotNone(
+            block, 'node_death published no status block, so this row has no way to see what it '
+                   'does with the key')
+        tracked_before = block.get('tracked_count')
+        self.assertIsInstance(
+            tracked_before, int,
+            f'node_death reported no tracked_count ({block!r}) - without it the release below '
+            'is unobservable and the kill would be timed against the watcher instead')
+        self.assertGreater(
+            tracked_before, 0,
+            'node_death is tracking nothing at all, so there is no admitted key here for the '
+            'label to take back')
+
         self.assertTrue(
             _set_bool_parameter(
                 type(self)._client_node, f'/{UNREADABLE_NODE}/set_parameters',
@@ -980,6 +1028,21 @@ class TestProvisionalOwnershipYieldsToARealLabel(unittest.TestCase):
             _poll_watchdog_entity(PORT, UNREADABLE_NODE, LATE_LABEL, timeout=LABEL_TIMEOUT_SEC),
             f'{UNREADABLE_NODE} never reported the "{LATE_LABEL}" label - the graph never said '
             'whose node this is, so a presence report below would not be a defect')
+
+        # The label being READABLE is the watcher's fact, and it is not the one this row needs.
+        # node_death hands a provisionally owned key back inside its own tick, and only on a
+        # tick that still sees the app present - a kill landing between the label appearing on
+        # this route and that tick finds the key admitted, and the death is then reported by a
+        # detector the label had already disqualified. Measured on a live stack: the label
+        # became visible 210 ms before tracked_count dropped. So wait for the DETECTOR's own
+        # view to move before killing anything; gating on the label alone tests the watcher and
+        # calls it the detector.
+        self.assertTrue(
+            _poll_tracked_count_below(PORT, DETECTOR_ID_NODE_DEATH, tracked_before,
+                                      timeout=LABEL_TIMEOUT_SEC),
+            f'node_death never released {UNREADABLE_NODE} after the "{LATE_LABEL}" label - its '
+            f'tracked_count never fell below {tracked_before}, so the key was still admitted '
+            'and the kill below would be measuring the window rather than the handover')
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(

@@ -1713,6 +1713,20 @@ bringup-quiesce centrally so no individual detector has to reimplement it.
   label decides it before arming does - a node that restarts is un-armed for its
   whole re-warm, and reading that as a verdict would drop the key just in time
   for the node's next death to be reported by nobody.
+  **The hand-back is not instantaneous, and the gap is stated rather than
+  hidden.** `node_death` releases a provisionally owned key inside its own tick,
+  and only on a tick that still sees the app present, so a node that dies within
+  about one entity-cache refresh of its label arriving is reported by the
+  presence code after all - measured at 210 ms between the label reaching
+  `GET /x-medkit-watchdog` and the release. The report is TRUE (the node did
+  disappear); what the window costs is attribution, and where `require_active`
+  names the node both codes stand, which the boundary already accepts elsewhere.
+  Closing it would mean deciding at REPORT time, and that cannot be done from
+  what survives a departure: the departed record carries only the last label,
+  which reads `inactive` both for a node that was earned and then deactivated
+  (must be reported) and for one that was only ever provisional (must not), so
+  telling them apart needs per-key ownership history outliving the departure -
+  the unbounded state the tracked-key prune exists to prevent.
   What this does NOT close: an
   App counts as managed only once the snapshot shows it advertising a
   `GetState`-typed service, and until then it is indistinguishable from a plain

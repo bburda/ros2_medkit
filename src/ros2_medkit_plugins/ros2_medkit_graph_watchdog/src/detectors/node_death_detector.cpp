@@ -305,6 +305,19 @@ class NodeDeathDetector : public Detector {
           // earned it, hand it back while it is still alive. A key that WAS earned keeps its
           // admission - a node that ran and then deactivated is still a death when it stops
           // running.
+          //
+          // This runs inside the per-app loop, so the hand-back needs a tick on which the app
+          // is BOTH still present and already disowned. A node that dies within one such tick
+          // of its label arriving is reported by this detector after all - measured at 210 ms
+          // between the label reaching the status route and the release, against a ~1 s entity
+          // cache refresh. The window cannot be closed by deciding at REPORT time instead: by
+          // then the key has departed, `earned_` has been pruned for it (that prune is what
+          // bounds this map against identity churn), and the departed record carries only the
+          // LAST label - which reads "inactive" both for a node that was earned and then
+          // deactivated, which must be reported, and for one that was only ever provisional,
+          // which must not. Telling those apart at report time needs per-key ownership history
+          // that survives the departure, which is the unbounded state the prune exists to
+          // prevent. The window is stated in the README rather than papered over.
           if (earned_.count(key) == 0) {
             handed_back.insert(key);
           }

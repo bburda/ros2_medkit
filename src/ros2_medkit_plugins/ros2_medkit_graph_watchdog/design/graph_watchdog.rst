@@ -496,7 +496,17 @@ node IS tracked, provisionally, and a label arriving afterwards over ``~/transit
 reading non-active takes it straight back out again. A node that is merely RE-WARMING is not
 that: warmup says nothing about who a node belongs to, so the gate distinguishes ``kUnclaimed``
 (nothing known yet) from ``kDisowned`` (measured as another detector's) and only the second
-withdraws a key already held. So
+withdraws a key already held.
+
+That withdrawal happens inside ``node_death``'s own tick, and only on a tick that still sees
+the app present, so it leaves a window of about one entity-cache refresh in which a node that
+dies right after its label arrives is reported by the presence code anyway (measured: 210 ms
+between the label reaching the status route and the release). It is a mis-attribution of a TRUE
+report, not a false positive, and it cannot be closed at report time: the departed record keeps
+only the last label, which reads ``inactive`` both for a node earned and then deactivated - a
+death this detector must report - and for one only ever held provisionally. Separating them
+after the fact needs per-key ownership history surviving the departure, which is the unbounded
+state the tracked-key prune exists to prevent. So
 the split is on whether the presence detector EVER owned the node - a fact read from the
 reliability gate itself, not guessed from the observed label: once owned, a below-``grace``
 streak that goes absent is simply HELD rather than matured on the strength of the absence
