@@ -501,7 +501,12 @@ withdraws a key already held.
 That withdrawal happens inside ``node_death``'s own tick, and only on a tick that still sees
 the app present, so it leaves a window of about one entity-cache refresh in which a node that
 dies right after its label arrives is reported by the presence code anyway (measured: 210 ms
-between the label reaching the status route and the release). It is a mis-attribution of a TRUE
+between the label reaching the status route and the release). A withdrawal that HAS happened
+is final, which needed its own guard: a dying managed node loses its lifecycle services from
+the snapshot before it loses its App entry, and a node with no managed record answers
+``kEarned`` - so dying erased the very measurement that disowned the node and re-admitted the
+key on the tick before it departed. A released key is therefore readmitted only on a label
+reading ``active``, never on the absence of a label. It is a mis-attribution of a TRUE
 report, not a false positive, and it cannot be closed at report time: the departed record keeps
 only the last label, which reads ``inactive`` both for a node earned and then deactivated - a
 death this detector must report - and for one only ever held provisionally. Separating them

@@ -123,6 +123,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (  # noqa: E402, I100
     API_BASE_PATH,
     assert_fault_absent_throughout,
+    assert_fault_never_names,
     create_watchdog_test_launch,
     poll_fault_describing,
     poll_faults,
@@ -1112,8 +1113,14 @@ class TestProvisionalOwnershipYieldsToARealLabel(unittest.TestCase):
             'detector handed back was then reported by nobody at all '
             f'(last description: {description!r})')
 
-        assert_fault_absent_throughout(
-            self, PORT, FAULT_CODE_DISAPPEARED, SILENCE_WINDOW_SEC)
+        # Needle-scoped, and the distinction is not cosmetic: the code-only form fails for a
+        # GRAPH_NODE_DISAPPEARED about ANY node, so its red cannot say whether the handover
+        # broke or some unrelated entity died, and a reader has to go and find out. This row's
+        # claim is about one node, so the assertion names it and the next failure carries the
+        # answer. Anything else disappearing here is not this row's business.
+        assert_fault_never_names(
+            self, PORT, FAULT_CODE_DISAPPEARED, forbidden=[UNREADABLE_NODE],
+            duration=SILENCE_WINDOW_SEC)
 
 
 class TestGateStaysPermissiveForTheOtherDetectors(unittest.TestCase):

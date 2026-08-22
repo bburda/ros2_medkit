@@ -73,6 +73,17 @@ constexpr std::int64_t kMaxTrackedNodeCap = 16384;
 /// "dead" entry per CLI invocation for the life of the gateway. The prefix is rcl's own
 /// naming convention for hidden nodes, so matching it is an exact structural check, not a
 /// heuristic over operator-chosen names.
+/// Whether the gate can currently read this app's lifecycle label as "active" - the one
+/// positive measurement that says a node is the presence detector's. Distinct from a kEarned
+/// answer, which is also given to a node that carries no lifecycle at all.
+bool reads_active(const ReliabilityGate * gate, const std::string & app_id) {
+  if (gate == nullptr) {
+    return true;  // not wired (a bare-context test): every other predicate here is permissive
+  }
+  const auto label = gate->lifecycle_state_of(app_id);
+  return label.has_value() && *label == "active";
+}
+
 bool is_ros2cli_node(const std::string & fqn) {
   const auto slash = fqn.rfind('/');
   const std::string leaf = slash == std::string::npos ? fqn : fqn.substr(slash + 1);
@@ -294,10 +305,29 @@ class NodeDeathDetector : public Detector {
       // withdraws a key. The gate is keyed by App::id.
       switch (presence_ownership(ctx.gate, app.id)) {
         case PresenceOwnership::kEarned:
+          // kEarned has two grounds and only one of them is a measurement: "the label reads
+          // active" is, "there is no managed record at all" is not. For a key this detector has
+          // already handed back that difference decides everything, because a dying managed
+          // node produces the second shape on its way out - its lifecycle services leave the
+          // snapshot a sweep before the App does, the watcher drops the record, and a node with
+          // no record reads exactly like a plain one. Re-admitting on that would let the act of
+          // dying erase the measurement that disowned the node, and the death would be reported
+          // by the detector the label had already disqualified. So a released key waits for the
+          // graph to say ACTIVE again; the disappearance of what disowned it is not news that
+          // the node became ours.
+          if (released_.count(key) != 0 && !reads_active(ctx.gate, app.id)) {
+            break;
+          }
+          released_.erase(key);
           earned_.insert(key);  // knowledge, once had, is never withdrawn
           armed.insert(key);
           break;
         case PresenceOwnership::kProvisional:
+          // Same rule, same reason: the asking starting over on a re-bound entry is the absence
+          // of knowledge, not the arrival of it, so it cannot readmit a key already handed back.
+          if (released_.count(key) != 0) {
+            break;
+          }
           armed.insert(key);
           break;
         case PresenceOwnership::kDisowned:
@@ -320,6 +350,7 @@ class NodeDeathDetector : public Detector {
           // prevent. The window is stated in the README rather than papered over.
           if (earned_.count(key) == 0) {
             handed_back.insert(key);
+            released_.insert(key);
           }
           break;
         case PresenceOwnership::kUnclaimed:
@@ -358,6 +389,11 @@ class NodeDeathDetector : public Detector {
     // the life of the process, which is the growth the tracker's own cap exists to bound.
     for (auto it = earned_.begin(); it != earned_.end();) {
       it = present.count(*it) == 0 ? earned_.erase(it) : std::next(it);
+    }
+    // Bounded the same way and for the same reason: a key that leaves the graph is a fact about
+    // a node that is gone, and the incarnation that returns re-derives its own ground.
+    for (auto it = released_.begin(); it != released_.end();) {
+      it = present.count(*it) == 0 ? released_.erase(it) : std::next(it);
     }
 
     auto report = tracker_.update(present, armed);
@@ -600,6 +636,12 @@ class NodeDeathDetector : public Detector {
   /// Refreshed every tick a key is present (see tick()); the value from its last live tick
   /// is what a dead key is judged by, since id is unavailable once the entity has left
   /// ctx.snapshot. Bounded to tracker_.known_keys() at the end of every tick.
+  /// Keys this detector handed back on a measured disown and has not been given back by a
+  /// measurement since. Read only by the two admission branches in tick(), where it is what
+  /// stops the loss of a lifecycle record - which is what dying looks like from the snapshot -
+  /// counting as the node becoming this detector's. Cleared by a label reading "active", and
+  /// pruned to the live graph every tick.
+  std::set<std::string> released_;
   /// Keys whose ownership the gate granted on kEarned grounds while they were present. Read
   /// only by the kDisowned branch in tick(), which is the one place the difference between an
   /// admission earned from a measurement and one granted provisionally decides anything.
