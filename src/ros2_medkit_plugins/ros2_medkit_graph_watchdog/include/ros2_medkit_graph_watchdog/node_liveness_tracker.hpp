@@ -158,8 +158,11 @@ class NodeLivenessTracker {
   }
 
   /// Undo the admission of a key that is still PRESENT and whose ground for being tracked
-  /// has been withdrawn (a provisionally owned node whose lifecycle label finally arrived and
-  /// said the node belongs to another detector - see PresenceOwnership::kProvisional).
+  /// has been withdrawn: a node admitted on PresenceOwnership::kProvisional whose lifecycle
+  /// label finally arrived and answered kDisowned, so the graph has said the node belongs to
+  /// another detector. Those are the only two grounds involved - kUnclaimed is not one of
+  /// them, because it says nothing has been measured, and a node that is merely re-warming
+  /// after a restart reads exactly like that.
   ///
   /// Only ever call this for a key the caller can see in this tick's snapshot. A present key
   /// carries `misses_ == 0`, so dropping it loses no evidence: it is exactly the state a key

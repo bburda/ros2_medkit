@@ -486,14 +486,17 @@ Where the presence class CAN also report the same departure, it no longer does:
 ``GRAPH_NODE_DISAPPEARED`` (this package's own ``node_death`` detector) independently
 reports it, whether or not the node was ever measured not-active first. But ``node_death``
 only ever tracks an App once the reliability gate says it OWNS that App's departure, on one of
-the two grounds ``ReliabilityGate::presence_ownership()`` distinguishes - so a ``require_active``
+one of the two grounds ``ReliabilityGate::presence_ownership()`` accepts - so a ``require_active``
 node that never reaches ``active`` is never tracked by ``node_death``, and neither is a managed
 node whose ``GetState`` has not answered while the watcher is still asking. The gate would
 permit that second one to RAISE - ``LifecycleWatcher::node_ok()`` treats an unread label as
 permission, deliberately, or a broken lifecycle service would silence ``qos_mismatch``,
 ``orphan`` and ``param_drift`` too - but permission is not knowledge. Once the asking stops the
 node IS tracked, provisionally, and a label arriving afterwards over ``~/transition_event`` and
-reading non-active takes it straight back out again. So
+reading non-active takes it straight back out again. A node that is merely RE-WARMING is not
+that: warmup says nothing about who a node belongs to, so the gate distinguishes ``kUnclaimed``
+(nothing known yet) from ``kDisowned`` (measured as another detector's) and only the second
+withdraws a key already held. So
 the split is on whether the presence detector EVER owned the node - a fact read from the
 reliability gate itself, not guessed from the observed label: once owned, a below-``grace``
 streak that goes absent is simply HELD rather than matured on the strength of the absence
@@ -1248,7 +1251,7 @@ plus the suppression chain the detector shares no code with any sibling for:
    ``GRAPH_NODE_INACTIVE`` alone instead - node_death cannot track a node the gate never
    admitted for ownership, so absence has to mature it here - a large ``miss_grace`` delays
    but does not swallow the report, and a restarted gateway's warmup window never produces a
-   spurious PASSED); and ``test/e2e/test_presence_ownership_e2e.test.py`` (six scenarios
+   spurious PASSED); and ``test/e2e/test_presence_ownership_e2e.test.py`` (seven scenarios
    against the fixture whose ``GetState`` never answers, so the unread state is permanent
    rather than the race the boundary file's B6 row has to live with: a managed node the
    watcher asked and could not read, killed, raises BOTH ``GRAPH_NODE_DISAPPEARED`` and
@@ -1265,7 +1268,9 @@ plus the suppression chain the detector shares no code with any sibling for:
    an ABSENCE, where the same never-answering node is owned provisionally, then announces
    ``inactive`` over ~/transition_event, then dies: ``GRAPH_NODE_INACTIVE`` names it and
    ``GRAPH_NODE_DISAPPEARED`` never appears, which is also what rejects a detector wired to
-   the permissive ``reliability_allows()``).
+   the permissive ``reliability_allows()``; and a crash loop shorter than the warmup, where the
+   node is killed, reported, brought back for less than one re-warm and killed again - the
+   second death must still be reported, and no PASSED may be emitted while it is dead).
 
 
 Status

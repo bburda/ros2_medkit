@@ -1370,6 +1370,21 @@ the lifecycle watcher's cached label for the departed node's LAST observed trans
 | `unconfigured` | No, deliberately - it is also the resting state of a node whose `configure()` failed or that never activated at all, and suppressing on it would hide exactly that startup failure. |
 | Any other label, or no departure on record at all | No (abstains). |
 
+**Which bindings the mechanism can see.** The departed-lifecycle record it reads is written
+when a tracked app's `get_state` path stops appearing in `App::services`, which is what the
+lifecycle watcher builds its managed set from. `App::is_online` plays no part in that, and the
+two do not have to coincide: a manifest-declared App outlives the node it binds, keeping its id
+and fqn while only its runtime-derived collections empty out. That case still works - the
+services go with the node, so the departure is recorded - because a manifest cannot declare
+services at all: `ManifestParser::parse_app` reads `id`, `name`, `description`,
+`is_located_on`, `depends_on`, `tags`, `external` and `ros_binding`, and nothing else, so an
+app's services can only ever come from a live runtime match. The case the mechanism genuinely
+cannot cover is `discovery.inherit_runtime_resources: false`, which restores the manifest's own
+(empty) collections on every sweep: such an app is never lifecycle-tracked in the first place,
+so it has no lifecycle label, `node_ok()` never gates it, and there is nothing for this
+suppressor to classify. That is the documented meaning of the flag - the app exposes only what
+the manifest declared - rather than a gap here.
+
 `finalized` needs the extra corroboration because it is also where a node's `on_error`
 override lands after `ON_ERROR_FAILURE`/`ON_ERROR_ERROR` out of `errorprocessing` - the
 standard way a driver reports a hardware fault it cannot recover from, which is precisely the
@@ -1493,6 +1508,31 @@ Acknowledging between the two deaths avoids this: `DELETE
 second node's next report reactivates a CLEARED record instead of updating a CONFIRMED one - a
 genuine new occurrence, with its own `occurrence_count` and its own capture.
 
+**A fault outlives a gateway restart even if the node comes back, and only an acknowledgement
+closes it.** Within one process this detector heals on return: the node reappears, the dead set
+empties, a PASSED flows and the fault heals. Across a restart it does not, in either direction.
+The restarted instance may clear `GRAPH_NODE_DISAPPEARED` only once it has ITSELF put a FAILED
+on the wire for it, because until then it cannot tell "the node came back" from "I never saw
+that node" - and clearing on the second reading is the ungated heal the guard exists to
+prevent. So a fault CONFIRMED before a restart stays CONFIRMED afterwards whether or not the
+node returned, and with the sqlite backend it survives every reboot until
+`DELETE /api/v1/apps/graph_watchdog/faults/GRAPH_NODE_DISAPPEARED` acknowledges it. That is the
+acknowledge model doing what it is for, not an accident: an occurrence is closed by an
+operator, not by the passage of a restart.
+
+Re-seeding the tracker from the fault store at startup would change it, and today it cannot be
+done. `/fault_manager/list_faults` would tell this detector that a `GRAPH_NODE_DISAPPEARED`
+record is outstanding and that it is among its reporting sources - but not WHICH nodes it
+names, which is the only thing that would make a fresh instance's silence meaningful. The fault
+manager keeps one record per `fault_code`, and this detector folds every dead key into that one
+record's description, capped at `kMaxDescriptionChars` with the remainder collapsed into a
+count, so the key list is not recoverable even by parsing prose. `lifecycle_expectation` has the
+same boundary and resolves it differently (a bounded hold, then the clear flows) because its
+`require_active` set is enumerable from config alone; this detector is zero-config over the
+whole graph and has no such set. The integration test
+`RestartedInstanceNeverClearsAFaultItDidNotRaiseEvenAsTheNodeReturns` pins the behaviour so it
+cannot change silently.
+
 **Test tiers.**
 
 1. **Unit**: `test_node_liveness_tracker.cpp` pins the pure presence/absence state machine -
@@ -1576,7 +1616,7 @@ genuine new occurrence, with its own `occurrence_count` and its own capture.
      so absence has to mature the violation here; a large `miss_grace` delays the report but does not swallow
      it; and a restarted gateway's own warmup window never produces a spurious PASSED for a
      node it has not yet re-measured.
-   - `test/e2e/test_presence_ownership_e2e.test.py` (six scenarios, presence ownership
+   - `test/e2e/test_presence_ownership_e2e.test.py` (seven scenarios, presence ownership
      against a node whose `GetState` never answers - the boundary file's B6 row covers the
      measured-not-active side, where the unread window is a race rather than a permanent
      state): a managed node the watcher asked and could not read, killed, raises BOTH
@@ -1593,7 +1633,11 @@ genuine new occurrence, with its own `occurrence_count` and its own capture.
      The sixth is the one that asserts an ABSENCE: the same never-answering node, owned
      provisionally once the asking stops, is then told to announce `inactive` and killed -
      `GRAPH_NODE_INACTIVE` names it and `GRAPH_NODE_DISAPPEARED` never appears, which is also
-     the row that rejects a detector wired to the permissive `reliability_allows()`.
+     the row that rejects a detector wired to the permissive `reliability_allows()`. The
+     seventh is a crash loop shorter than the warmup: killed, reported, back for less than one
+     re-warm, killed again - the second death must still be reported, and no PASSED may be
+     emitted while the node is dead, which is what a key handed back for merely re-warming
+     would produce.
 
 ## Reliability (bringup-quiesce)
 
@@ -1662,6 +1706,13 @@ bringup-quiesce centrally so no individual detector has to reimplement it.
   ground, and ANDs it with the node being ONLINE, because `node_death` skips an
   offline app before it ever consults the gate. Both detectors read the one
   shared answer on the same tick rather than each guessing from a label.
+  The two NEGATIVE answers are kept apart for the same reason the positive ones
+  are: `unclaimed` means nothing is known yet (still warming up, or still being
+  asked about) and `disowned` means the graph has said whose node this is. Only
+  `disowned` may take a key away from a detector already holding it, and the
+  label decides it before arming does - a node that restarts is un-armed for its
+  whole re-warm, and reading that as a verdict would drop the key just in time
+  for the node's next death to be reported by nobody.
   What this does NOT close: an
   App counts as managed only once the snapshot shows it advertising a
   `GetState`-typed service, and until then it is indistinguishable from a plain

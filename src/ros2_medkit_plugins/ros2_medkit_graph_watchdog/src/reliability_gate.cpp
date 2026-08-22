@@ -74,14 +74,24 @@ bool ReliabilityGate::allows_raise(const std::string & source_id) const {
 }
 
 PresenceOwnership ReliabilityGate::presence_ownership(const std::string & source_id) const {
-  if (!allows_raise(source_id)) {
-    return PresenceOwnership::kNone;
-  }
   // Read without gate_mutex_, for the same reason allows_raise() takes none: lifecycle_ is
   // separately self-synchronized, and both run on the tick thread, sequentially after update().
   // Two reads rather than one combined lock: the only transition either can observe mid-call is
   // an empty label becoming a real one, and both orderings of that give the same answer here.
   const auto label = lifecycle_.state_of(source_id);
+
+  // Decided BEFORE arming, and that order is the point. A measured non-active label is
+  // knowledge about who the node belongs to, and it is the only negative answer a caller may
+  // act on by giving a key up. Warmup is not: an entity that has not armed yet, or has gone
+  // back to warming after a restart, has been measured as nothing at all. Asking allows_raise()
+  // first would collapse the two, because node_ok() already refuses a managed non-active node -
+  // so every re-warming node would read exactly like a node the graph had disowned.
+  if (label.has_value() && !label->empty() && *label != "active") {
+    return PresenceOwnership::kDisowned;
+  }
+  if (!allows_raise(source_id)) {
+    return PresenceOwnership::kUnclaimed;
+  }
   if (!label.has_value()) {
     // No managed record: a plain node. Nothing about it can ever say it belonged elsewhere,
     // so this is knowledge, not a gap in it.
@@ -92,11 +102,9 @@ PresenceOwnership ReliabilityGate::presence_ownership(const std::string & source
     // measurement may be one tick away and taking ownership now would race it. Once they are
     // spent, nothing here will ASK again - but ~/transition_event is still subscribed and can
     // still deliver a label, so the grant is provisional rather than final.
-    return lifecycle_.measurement_pending(source_id) ? PresenceOwnership::kNone : PresenceOwnership::kProvisional;
+    return lifecycle_.measurement_pending(source_id) ? PresenceOwnership::kUnclaimed : PresenceOwnership::kProvisional;
   }
-  // A measured non-active node is the lifecycle detector's business, and allows_raise() has
-  // already refused it anyway.
-  return *label == "active" ? PresenceOwnership::kEarned : PresenceOwnership::kNone;
+  return PresenceOwnership::kEarned;  // "active", the one label that says this node is ours
 }
 
 nlohmann::json ReliabilityGate::status_json() const {

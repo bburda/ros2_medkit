@@ -281,13 +281,6 @@ class NodeDeathDetector : public Detector {
       present.insert(key);
       // Tracking follows OWNERSHIP rather than permission, and the two are not the same
       // question: the gate answers "may this entity raise" permissively for a managed node
-      // whose lifecycle label has never been read, and a key admitted on that answer is
-      // tracked for the rest of its life. This detector can only report a node it can
-      // reliably observe, so it asks the stricter predicate instead - a managed node whose
-      // state is still being asked for belongs to lifecycle_expectation's absence path until
-      // the asking stops. The gate is keyed by App::id.
-      // Tracking follows OWNERSHIP rather than permission, and the two are not the same
-      // question: the gate answers "may this entity raise" permissively for a managed node
       // whose lifecycle label has never been read. What the gate returns here is the GROUND,
       // and the ground decides whether admission is permanent. kEarned came from a
       // measurement (or from a node with no lifecycle to measure) and is latched exactly as
@@ -295,7 +288,10 @@ class NodeDeathDetector : public Detector {
       // watcher giving up on asking, so it holds only while that stays true: if a label
       // arrives afterwards - the ~/transition_event subscription outlives the seed budget -
       // the node turns out to have been another detector's all along, and it is handed back
-      // below rather than reported dead later. The gate is keyed by App::id.
+      // below rather than reported dead later. The two NEGATIVE grounds are just as different
+      // from each other: kDisowned is that measurement arriving, and kUnclaimed is the absence
+      // of any measurement at all, which is what a re-warming node answers - so only the first
+      // withdraws a key. The gate is keyed by App::id.
       switch (presence_ownership(ctx.gate, app.id)) {
         case PresenceOwnership::kEarned:
           earned_.insert(key);  // knowledge, once had, is never withdrawn
@@ -304,13 +300,22 @@ class NodeDeathDetector : public Detector {
         case PresenceOwnership::kProvisional:
           armed.insert(key);
           break;
-        case PresenceOwnership::kNone:
-          // Never earned, and no longer owned: hand it back while it is still alive. A key
-          // that WAS earned keeps its admission - a node that ran and then deactivated is
-          // still a death when it stops running.
+        case PresenceOwnership::kDisowned:
+          // The graph has measured this node as another detector's. If this detector never
+          // earned it, hand it back while it is still alive. A key that WAS earned keeps its
+          // admission - a node that ran and then deactivated is still a death when it stops
+          // running.
           if (earned_.count(key) == 0) {
             handed_back.insert(key);
           }
+          break;
+        case PresenceOwnership::kUnclaimed:
+          // Nothing is known about this node yet - it is warming up, or the watcher is still
+          // asking. That is not a reason to admit it, and it is emphatically not a reason to
+          // give up a key already admitted: a node that dies, is reported, comes back and dies
+          // again inside its re-warm window reads exactly like this on the tick it returns, and
+          // releasing it there means its second death is tracked by nothing and every tick of
+          // the outage reports PASSED.
           break;
       }
       // Capture the allowlist's id-form verdict WHILE the entity is still present and
@@ -583,8 +588,9 @@ class NodeDeathDetector : public Detector {
   /// is what a dead key is judged by, since id is unavailable once the entity has left
   /// ctx.snapshot. Bounded to tracker_.known_keys() at the end of every tick.
   /// Keys whose ownership the gate granted on kEarned grounds while they were present. Read
-  /// only by the hand-back branch in tick(), which is the one place the difference between the
-  /// two grounds decides anything. Pruned to the live graph every tick.
+  /// only by the kDisowned branch in tick(), which is the one place the difference between an
+  /// admission earned from a measurement and one granted provisionally decides anything.
+  /// Pruned to the live graph every tick.
   std::set<std::string> earned_;
   std::set<std::string> id_allowlisted_;
   /// Whether THIS detector instance has itself genuinely raised GRAPH_NODE_DISAPPEARED at
