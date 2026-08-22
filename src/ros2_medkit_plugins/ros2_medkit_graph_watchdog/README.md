@@ -1594,8 +1594,11 @@ cannot change silently.
      and a fault confirmed before a gateway restart stays CONFIRMED across it.
    - `test/e2e/test_node_death_suppression_e2e.test.py` (five scenarios): the allowlist
      suppresses the node it names; the SAME allowlist left unnamed in `suppress` is inert,
-     and a startup warning says so; a managed lifecycle node that reached a clean shutdown
-     is never named while an active sibling that was simply killed still is; naming a node
+     and a startup warning says so; a managed lifecycle node driven ACTIVE and then all the way
+     down through deactivate, cleanup and shutdown is never named, while an active sibling that
+     was simply killed still is (the node has to be admitted before the suppressor is reached at
+     all, which is why that row starts it active rather than shutting it down from
+     unconfigured); naming a node
      on the allowlist alone, with `suppress` unset, does not suppress it; and an ALLOWLISTED
      death (the only shape pruning ever applies to - see "Bounded by evidence, not by age")
      held well past `prune_grace` is actually reclaimed (`tracked_count` on

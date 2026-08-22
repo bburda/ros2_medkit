@@ -645,7 +645,11 @@ def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, 
     deadline = time.monotonic() + timeout
     status = None
     last_count = None
-    streak_start = None
+    # Seeded, not left None: the first sample can legitimately BE None (the route not up yet, or
+    # answering without a block for this detector), and None == last_count then takes the elif
+    # on the very first pass - which used to subtract from None and raise TypeError, turning an
+    # unrelated slow start into an error rather than a wait.
+    streak_start = time.monotonic()
     while time.monotonic() < deadline:
         now = time.monotonic()
         status = watchdog_detector_status(port, detector_id)
@@ -653,7 +657,10 @@ def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, 
         if count != last_count:
             last_count = count
             streak_start = now
-        elif now - streak_start >= stable_seconds:
+        elif count is not None and now - streak_start >= stable_seconds:
+            # A route that never answers holds None steady forever; that is not a settled
+            # count, it is an absent one, and calling it stable would hand the caller a
+            # baseline it never read.
             return status, True
         time.sleep(interval)
     return status, False
