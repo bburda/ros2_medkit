@@ -151,7 +151,12 @@ _LIFECYCLE_PREFIX = 'plugins.graph_watchdog.detectors.lifecycle_expectation'
 
 # Same fast cadence and miss_grace convention test_node_death_e2e.test.py uses: comfortably past
 # the documented 3000 ms floor (config sweep C1 owns the floor's own boundary values) without
-# accidentally landing on it.
+# accidentally landing on it. Applied to EVERY scenario in this file, not only the one that
+# reasons about the window: left unset, node_death takes kDefaultMissGrace (2), which spans
+# 600 ms at this tick and is silently raised to the floor (14) with a startup warning - so the
+# gateway would run on a grace no constant here names. Every silence window in this file is
+# SUSTAINED_WINDOW_SEC, several times the (MISS_GRACE + 1) * TICK_INTERVAL_MS a death needs, so
+# an unsuppressed report still lands well inside the window an absence claim watches.
 TICK_INTERVAL_MS = 200
 WARMUP_CYCLES = 3
 MISS_GRACE = 20
@@ -297,6 +302,7 @@ def generate_test_description():
     detector_params = {
         'plugins.graph_watchdog.tick_interval_ms': TICK_INTERVAL_MS,
         'plugins.graph_watchdog.warmup_cycles': WARMUP_CYCLES,
+        f'{_NODE_DEATH_PREFIX}.miss_grace': MISS_GRACE,
     }
     demo_nodes = []
 
@@ -321,7 +327,6 @@ def generate_test_description():
         detector_params[f'{_NODE_DEATH_PREFIX}.allowlist'] = [TARGET_NODE]
         # No 'suppress' key at all - the whole point of this scenario.
     elif SCENARIO == 'prune_no_false_heal':
-        detector_params[f'{_NODE_DEATH_PREFIX}.miss_grace'] = MISS_GRACE
         detector_params[f'{_NODE_DEATH_PREFIX}.prune_grace'] = PRUNE_GRACE
         # Durable suppression is the only path prune() ever reclaims through - see the
         # module docstring's own note on why an unsuppressed death cannot exercise it.
