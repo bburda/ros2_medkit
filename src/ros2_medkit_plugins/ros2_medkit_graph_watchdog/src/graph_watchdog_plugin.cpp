@@ -486,10 +486,28 @@ void GraphWatchdogPlugin::tick() {
     dctx.fault_client = fault_client_;
     dctx.snapshot = &snapshot;
     dctx.cancelled = &shutdown_requested_;
+    dctx.presence_tracked = presence_tracked_;
     try {
       detector->tick(dctx);
     } catch (const std::exception & e) {
       log_error("detector '" + detector->id() + "' threw: " + e.what());
+    }
+  }
+
+  // Published AFTER the sweep, so every detector in a tick sees the same view and none depends
+  // on registry order - the cost is that the view is one tick old, which its own doc explains is
+  // harmless for the sticky question it answers. Only a detector that will actually REPORT a
+  // departure may speak for the presence class: one running Advisory or Off tracks keys it will
+  // never raise for, and a reader treating that as "somebody has this covered" would hold back
+  // its own report for a fault nobody is going to file.
+  presence_tracked_ = nullptr;
+  for (const auto & [detector, mode] : detectors_) {
+    if (!mode_emits(mode)) {
+      continue;
+    }
+    if (const auto * keys = detector->tracked_departure_keys()) {
+      presence_tracked_ = keys;
+      break;
     }
   }
 }

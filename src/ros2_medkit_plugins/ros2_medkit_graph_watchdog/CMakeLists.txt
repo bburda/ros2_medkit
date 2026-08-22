@@ -320,9 +320,13 @@ if(BUILD_TESTING)
 
   # Registers a fake /fault_manager/report_fault service like orphan/param_drift above, so it
   # shares the same RESOURCE_LOCK (see the comment on the integration block).
+  # Both detectors, because the boundary between them is only observable with both of them on
+  # one gate: what one admits decides what the other latches, and a claim about the handover
+  # cannot be driven from either side alone.
   medkit_add_gtest(test_lifecycle_expectation_integration
     test/test_lifecycle_expectation_integration.cpp
     src/detectors/lifecycle_expectation_detector.cpp
+    src/detectors/node_death_detector.cpp
     src/detector_registry.cpp
     src/reliability_gate.cpp
     src/lifecycle_watcher.cpp

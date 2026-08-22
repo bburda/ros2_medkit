@@ -1161,6 +1161,54 @@ TEST_F(NodeDeathIntegrationTest, RestartedInstanceNeverClearsAFaultItDidNotRaise
 // The sequence is the production one, driven here where it can be made exact: provisional
 // admission, a late non-active label, the release, then a sweep that still carries the App but
 // no longer carries its get_state service, then the departure.
+// The crash loop, which the README calls the case this detector most exists for. A managed node
+// that was measured active, died, and was reported comes back the way a respawned lifecycle
+// node always comes back: at "unconfigured", because nothing re-drives it. That reads kDisowned,
+// and the hand-back consults earned_ - which had been pruned to the PRESENT graph while the node
+// was away, so its earned ground was gone and the key was handed back. The fault healed on the
+// return, correctly, and then the detector was tracking nothing: the second death, and every one
+// after it, went unreported.
+//
+// earned_ is bookkeeping that belongs to a tracked KEY, so it has to live as long as the tracker
+// keeps that key - which is what NodeLivenessTracker::known_keys() is for, and what bounds it.
+TEST_F(NodeDeathIntegrationTest, AnEarnedKeyKeepsItsGroundAcrossTheOutageSoTheNextDeathIsReported) {
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}});  // floor(3000ms) == 0
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("looper"), anchor_app()});
+  gate.update(snapshot_, 0);
+  gate.set_lifecycle_state_for_test("looper", "active");
+  det->tick(ctx);  // measured active: earned, admitted
+  ASSERT_EQ(gate.presence_ownership("looper"), PresenceOwnership::kEarned);
+
+  set_apps({anchor_app()});  // first death
+  gate.update(snapshot_, 1);
+  det->tick(ctx);
+  std::this_thread::sleep_for(50ms);
+  const auto after_first = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
+  ASSERT_GT(after_first, 0u) << "the first death was never reported, so there is no loop here yet";
+
+  // It respawns, and a respawned lifecycle node reads unconfigured until something activates it.
+  set_apps({app_of("looper"), anchor_app()});
+  gate.update(snapshot_, 2);
+  gate.set_lifecycle_state_for_test("looper", "unconfigured");
+  det->tick(ctx);
+  det->tick(ctx);  // a second tick: the outage-era miss count is cleared by now
+
+  set_apps({anchor_app()});  // and it crashes again
+  gate.update(snapshot_, 3);
+  det->tick(ctx);
+  std::this_thread::sleep_for(50ms);
+  EXPECT_GT(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), after_first)
+      << "the second death of a crash-looping node was reported by nobody - the key was handed "
+         "back on the respawn because its earned ground had been pruned during the outage, and "
+         "a detector that reports the first death and then goes quiet is the failure this one "
+         "exists to prevent";
+}
+
 TEST_F(NodeDeathIntegrationTest, AReleasedKeyIsNotReAdmittedWhenItsLifecycleRecordVanishes) {
   ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
   auto det = make_node_death();

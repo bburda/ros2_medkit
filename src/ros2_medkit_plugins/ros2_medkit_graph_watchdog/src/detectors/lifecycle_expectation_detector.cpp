@@ -336,21 +336,18 @@ class LifecycleExpectationDetector : public Detector {
         // does not actually hold - either because the watcher has not finished asking about it,
         // or because it asked, gave up, and then a label arrived and took the node back.
         //
-        // kEarned only, and the two exclusions are for different reasons.
+        // ASKED, not re-derived. This value stands for "the presence detector could report this
+        // node's departure", and node_death is the detector that decides that - from its own
+        // admission rule, which is the gate's answer plus what it remembers handing back. Every
+        // attempt to mirror that here has disagreed with it somewhere: the sweep in which a
+        // dying node loses its lifecycle record answers kEarned at the gate while node_death
+        // refuses the key, and a mirror latched a handover to a detector that was never going
+        // to report. Reading node_death's own tracked set makes the two agree by construction.
         //
-        // A PROVISIONAL grant is deliberately not enough: the tracker latches this value for
-        // the node's whole life, and a provisional grant is the one node_death itself gives up
-        // the moment a real label arrives. Latching it here would leave this detector believing
-        // the presence class had a node it had already handed back - the same silence in the
-        // opposite direction.
-        //
-        // ANDed with is_online because node_death skips an app that is not online before it
-        // ever consults the gate, and the gate has no notion of online-ness: a manifest app
-        // whose node never started is armed, carries no lifecycle record, and would otherwise
-        // read as owned by a detector that will never look at it. The remaining filters
-        // node_death applies need no mirror here: a peer-aggregated app and one with no binding
-        // both have an empty fqn and are already skipped above.
-        const bool armed = app.is_online && presence_ownership(ctx.gate, app.id) == PresenceOwnership::kEarned;
+        // A null view means nothing will report a departure at all (no presence detector, or one
+        // running Advisory or Off), and false is then the honest answer: this detector must keep
+        // its own report rather than hold it for one nobody will file.
+        const bool armed = ctx.presence_tracked != nullptr && ctx.presence_tracked->count(fqn) > 0;
         // One match per (entry, node): the tracker keys violations by NODE, so two
         // namesakes are both reported instead of one silently replacing the other.
         matches.push_back(LifecycleMatch{id, fqn, state, armed});

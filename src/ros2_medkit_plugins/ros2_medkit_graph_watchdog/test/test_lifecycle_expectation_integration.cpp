@@ -76,6 +76,7 @@ using ros2_medkit_graph_watchdog::DetectorContext;
 using ros2_medkit_graph_watchdog::DetectorMode;
 using ros2_medkit_graph_watchdog::kDefaultAbsenceGrace;
 using ros2_medkit_graph_watchdog::ReliabilityGate;
+using ros2_medkit_graph_watchdog::graph_fault_codes::kNodeDisappeared;
 using ros2_medkit_graph_watchdog::graph_fault_codes::kNodeInactive;
 using ros2_medkit_graph_watchdog::graph_fault_codes::kNodeNotManaged;
 using ros2_medkit_graph_watchdog::graph_fault_codes::kNodeUnreadable;
@@ -87,6 +88,17 @@ namespace {
 // The detector class is file-local in lifecycle_expectation_detector.cpp but
 // self-registers via REGISTER_DETECTOR, which runs when that .cpp is linked into this
 // test. Pull an instance from the registry (no production factory needed).
+/// The presence detector, from the same global registry. Both detectors are linked into this
+/// binary because the handover between them is what several cases here are about.
+std::unique_ptr<ros2_medkit_graph_watchdog::Detector> make_node_death() {
+  for (auto & d : ros2_medkit_graph_watchdog::DetectorRegistry::instance().create_all()) {
+    if (d->id() == "node_death") {
+      return std::move(d);
+    }
+  }
+  return nullptr;
+}
+
 std::unique_ptr<ros2_medkit_graph_watchdog::Detector> make_lifecycle_expectation() {
   for (auto & d : ros2_medkit_graph_watchdog::DetectorRegistry::instance().create_all()) {
     if (d->id() == "lifecycle_expectation") {
@@ -3966,7 +3978,20 @@ TEST_F(LifecycleExpectationIntegrationTest, BelowGraceStreakSurvivesTheTightestP
   det->configure(nlohmann::json{{"require_active", nlohmann::json::array({"a"})}, {"grace", 4}, {"prune_grace", 0}});
   auto ctx = make_ctx(DetectorMode::Raise, &gate);
 
+  // The hold this case is about applies only where the presence detector will report the
+  // departure instead, and that is now asked of node_death rather than inferred from a label -
+  // so the owner has to be here and has to have admitted the key. Ticked alongside below for
+  // the same reason: its set is what this detector reads.
+  auto death = make_node_death();
+  ASSERT_TRUE(death);
+  death->configure(nlohmann::json{{"tick_interval_ms", 3000}, {"miss_grace", 0}});
+  ctx.presence_tracked = death->tracked_departure_keys();
+
   gate.set_lifecycle_state_for_test("a", "active");
+  death->tick(ctx);  // measured active: the presence detector admits the key
+  ASSERT_EQ(death->tracked_count_for_test(), 1u)
+      << "the presence detector never admitted the node, so there is nothing here that could "
+         "report its departure and the hold below would be wrong rather than right";
   ASSERT_TRUE(poll_for_new(kGraphSource, ReportFault::Request::EVENT_PASSED, 0, *det, ctx))
       << "the healthy baseline never cleared, so the node below cannot be shown to have armed";
   gate.set_lifecycle_state_for_test("a", "inactive");
@@ -4033,6 +4058,70 @@ TEST_F(LifecycleExpectationIntegrationTest, BelowGraceStreakSurvivesTheTightestP
 // Staged in the order that reaches it: the app is offline and unmeasured while the gate arms
 // it (the window where a naive `armed` latches), then reads inactive, then vanishes below
 // grace. Nothing else can report that departure, so absence has to mature the violation.
+// The handover has to agree from BOTH sides, and this is the sweep where it did not. A dying
+// managed node loses its get_state service one sweep before its App leaves the snapshot, so for
+// that one tick the gate has no record for it and answers kEarned - the same shape node_death
+// already refuses, because a lost measurement is not a measurement. This detector mirrored the
+// gate's answer instead of asking who actually owns the node, latched ever_armed on it, and
+// then HELD the below-grace streak through the departure waiting for a presence report that
+// was never coming: node_death had never admitted the key at all.
+//
+// The cost is the worst shape this work can produce - a require_active node that sat
+// unconfigured and then died is reported by NOBODY, permanently, and GRAPH_NODE_INACTIVE's
+// clear stays withheld behind it for every other node. Absence maturing the streak is what
+// this package shipped before the boundary existed, and it is what must still happen here.
+TEST_F(LifecycleExpectationIntegrationTest, ADroppedRecordOnADisownedNodeIsNotAPresenceHandover) {
+  set_apps({"victim"});
+  ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
+  arm_global_grace(gate);
+
+  auto life = make_lifecycle_expectation();
+  auto death = make_node_death();
+  ASSERT_TRUE(life);
+  ASSERT_TRUE(death);
+  life->configure(nlohmann::json{{"require_active", nlohmann::json::array({"victim"})}, {"grace", 30}});
+  death->configure(nlohmann::json{{"tick_interval_ms", 3000}, {"miss_grace", 0}});
+  auto ctx = make_ctx(DetectorMode::Raise, &gate);
+  // The plugin republishes this view after each sweep; a test pointing straight at the owner's
+  // set sees it a tick sooner, which is strictly the harder case for a claim about a latch.
+  ctx.presence_tracked = death->tracked_departure_keys();
+  ASSERT_NE(ctx.presence_tracked, nullptr) << "the presence detector must expose what it tracks, "
+                                              "or this test is asserting against a null view";
+
+  // Measured non-active for ten present ticks: this node is the lifecycle detector's, and
+  // node_death must never admit it.
+  gate.set_lifecycle_state_for_test("victim", "unconfigured");
+  for (int i = 0; i < 10; ++i) {
+    life->tick(ctx);
+    death->tick(ctx);
+  }
+  ASSERT_EQ(death->tracked_count_for_test(), 0u)
+      << "the presence detector must not have admitted a node it measured as unconfigured, or "
+         "the handover below is not the one under test";
+
+  // The drop sweep. The App is still present; only its lifecycle record goes, which is what a
+  // node dying looks like to the snapshot one sweep before it disappears.
+  gate.update(snapshot_, 99);
+  ASSERT_FALSE(gate.lifecycle_state_of("victim").has_value())
+      << "the record must be gone here, or this test is not driving the sweep that used to "
+         "latch ever_armed";
+  life->tick(ctx);
+  death->tick(ctx);
+  ASSERT_EQ(death->tracked_count_for_test(), 0u)
+      << "losing a record is not a measurement, so the presence detector must still be out";
+
+  // And now it dies, below grace. Nothing else can report this, so absence has to mature it.
+  set_apps({});
+  const auto inactive_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED, kNodeInactive);
+  ASSERT_TRUE(
+      poll_for_new(kGraphSource, ReportFault::Request::EVENT_FAILED, inactive_before, *life, ctx, kNodeInactive))
+      << "a below-grace violation on a node the presence detector never owned did not mature "
+         "from absence - it is now reported by nobody at all, and every other required node's "
+         "clear is withheld behind it";
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED, kNodeDisappeared), 0u)
+      << "the presence detector must not report a node it never admitted";
+}
+
 TEST_F(LifecycleExpectationIntegrationTest, OfflineAppIsNeverTreatedAsOwnedByThePresenceDetector) {
   set_offline_app("a");
   ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);

@@ -234,6 +234,12 @@ class NodeDeathDetector : public Detector {
     tracked_node_cap_.store(tracked_node_cap);
   }
 
+  /// This detector IS the presence class, so the set it tracks is the answer every other
+  /// reader needs - see DetectorContext::presence_tracked for why they ask rather than re-derive.
+  const std::set<std::string> * tracked_departure_keys() const override {
+    return &tracker_.known_keys();
+  }
+
   std::size_t tracked_count_for_test() const override {
     return tracked_count_.load();
   }
@@ -383,20 +389,30 @@ class NodeDeathDetector : public Detector {
     for (const auto & key : handed_back) {
       tracker_.release(key);
     }
-    // `earned_` is a fact about keys in the CURRENT graph, so it is pruned to them: a key
-    // that departs and later returns is a new incarnation, and it re-earns (or does not) from
-    // whatever the gate then says. Without the prune this would grow with identity churn for
-    // the life of the process, which is the growth the tracker's own cap exists to bound.
+    auto report = tracker_.update(present, armed);
+
+    // Pruned AFTER update(), because update() is what admits this tick's keys: running it before
+    // means pruning against a tracker that has not seen them yet, which on a key's very first
+    // tick throws away the ground it was just admitted on.
+    //
+    // `earned_` is bookkeeping about a TRACKED KEY, so it lives exactly as long as the tracker
+    // keeps that key - which is what known_keys() is for, and what bounds it (tracked_key_cap
+    // plus prune(), the same ceiling the tracker itself has). Pruning it to the PRESENT graph
+    // instead threw the ground away during an outage, and a crash-looping node came back at
+    // "unconfigured" - which is where a respawned lifecycle node always starts, since nothing
+    // re-drives it - with nothing left to say it had ever been this detector's. It was handed
+    // back on the return, its fault healed, and every death after the first went unreported.
+    const auto & tracked_keys = tracker_.known_keys();
     for (auto it = earned_.begin(); it != earned_.end();) {
-      it = present.count(*it) == 0 ? earned_.erase(it) : std::next(it);
+      it = tracked_keys.count(*it) == 0 ? earned_.erase(it) : std::next(it);
     }
-    // Bounded the same way and for the same reason: a key that leaves the graph is a fact about
-    // a node that is gone, and the incarnation that returns re-derives its own ground.
+    // `released_` answers a different question with a different lifetime: it is the set of
+    // PRESENT keys this detector has refused, and a released key is by definition not in the
+    // tracker at all, so it cannot be bounded by known_keys(). It goes when the node does; the
+    // incarnation that returns is re-derived from whatever the gate then says about it.
     for (auto it = released_.begin(); it != released_.end();) {
       it = present.count(*it) == 0 ? released_.erase(it) : std::next(it);
     }
-
-    auto report = tracker_.update(present, armed);
 
     std::set<std::string> keys_before_suppression;
     for (const auto & [key, detail] : report.dead) {
