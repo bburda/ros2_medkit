@@ -180,9 +180,10 @@ reporter emitting a stream of distinct codes still grows the table; the bound ca
 code costs, not the total.
 
 Retention is **bounded per fault code** by `near_miss.max_per_fault` (default 200), evicting the
-**oldest** entries first. That is deliberately the opposite of the snapshot limit's keep-earliest
-rule: a series frozen at boot says nothing about whether the rate is changing. Set it to 0 for
-unlimited, accepting that the database then grows with the reporting rate.
+**oldest** entries first. That is the same direction as `snapshots.max_per_fault` and the rosbag
+cap, and for the same reason: a series frozen at boot says nothing about whether the rate is
+changing, and the evidence a technician wants is the evidence from the fault happening now. Set it
+to 0 for unlimited, accepting that the database then grows with the reporting rate.
 
 The series lives in the `near_misses` table of the fault database and is read through the storage
 API (`FaultStorage::get_near_misses`). A database written by an earlier build gains the table on
