@@ -243,6 +243,14 @@ DROP_PARAM = 'drop_services'
 # The label the never-answering fixture announces once it is told to answer. "inactive" is a
 # measured, NON-active state: it says the node was never the presence detector's, which is
 # exactly what a provisional grant has to yield to.
+# The rclpy node this row's own test process spins to drive the fixture's parameter. It is an
+# App like any other, so node_death admits it too - and an admission landing between the
+# release and the sample that looks for it hides the release completely, because tracked_count
+# is a graph-wide total rather than a per-key flag. The row therefore waits for this one to arm
+# before it takes its baseline, which leaves the fixture's release the only admission event
+# still to come.
+LATE_LABEL_CLIENT_NODE = 'presence_ownership_late_label_client'
+
 TRANSITION_LABEL_PARAM = 'transition_label'
 LATE_LABEL = 'inactive'
 
@@ -537,6 +545,14 @@ def _poll_tracked_count_below(port, detector_id, threshold, timeout=30.0, interv
     comes off the tracker, republished once per tick, so it only moves when a key is actually
     admitted or released.
 
+    It is a graph-WIDE total, though, and that costs the caller two obligations. The count must
+    have stopped moving before it is used as a threshold, or the admission this release will
+    later undo is not inside it. And every other App that will ever be admitted must already
+    be admitted, or one landing after the release refills the total and hides it: measured on a
+    live stack, a release dipped the count for 200 ms before the test's own client node was
+    admitted, which a 200 ms poll reads as no release at all. `_poll_stable_tracked_count`
+    covers the first; gating on every other node being armed covers the second.
+
     Returns ``True`` once the count drops, ``False`` on timeout (after printing the last value,
     which is gone once the launch tears down).
     """
@@ -553,6 +569,31 @@ def _poll_tracked_count_below(port, detector_id, threshold, timeout=30.0, interv
     print(f'_poll_tracked_count_below({detector_id!r}, {threshold}) timed out after {timeout}s; '
           f'last status: {last_seen}')
     return False
+
+
+def _poll_stable_tracked_count(port, detector_id, samples=5, interval=0.25, timeout=30.0):
+    """Return `detector_id`'s `tracked_count` once it has held the same value `samples` times.
+
+    A baseline read the instant the gate answers PROVISIONAL is taken too early: the gate is
+    answering out of LifecycleWatcher, and the admission it licenses happens on the detector's
+    next tick. Sampling until the value stops moving is what puts the admission inside the
+    baseline instead of after it - without that, the release later returns the count to exactly
+    the number this captured and "fell below" is never true.
+
+    Returns the stable value, or ``None`` on timeout.
+    """
+    deadline = time.monotonic() + timeout
+    history = []
+    while time.monotonic() < deadline:
+        block = watchdog_detector_status(port, detector_id, timeout=5.0)
+        count = block.get('tracked_count') if block else None
+        history = (history + [count]) if count is not None else []
+        if len(history) >= samples and len(set(history[-samples:])) == 1:
+            return history[-1]
+        time.sleep(interval)
+    print(f'_poll_stable_tracked_count({detector_id!r}) never settled in {timeout}s; '
+          f'last samples: {history[-samples:]}')
+    return None
 
 
 def _set_bool_parameter(client_node, service_name, param_name, value, timeout=30.0):
@@ -975,7 +1016,7 @@ class TestProvisionalOwnershipYieldsToARealLabel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         rclpy.init()
-        cls._client_node = Node('presence_ownership_late_label_client')
+        cls._client_node = Node(LATE_LABEL_CLIENT_NODE)
 
     @classmethod
     def tearDownClass(cls):
@@ -1001,17 +1042,29 @@ class TestProvisionalOwnershipYieldsToARealLabel(unittest.TestCase):
             'that state there is no provisional grant for the label below to revoke')
         self.assertTrue(entity.get('armed'))
 
-        # Captured while the node is still provisionally OWNED, so the drop below is this
-        # node's release and not some unrelated entity leaving the graph.
-        block = watchdog_detector_status(PORT, DETECTOR_ID_NODE_DEATH, timeout=5.0)
+        # Everything else that will ever be admitted must be admitted FIRST, or the baseline
+        # below is measured against a moving total. This process's own client node is the one
+        # that moves it: it is an ordinary App, node_death admits it like any other, and an
+        # admission landing between the release and the sample looking for it puts the count
+        # straight back where it started. Measured on a live stack: the release dipped the
+        # count for 200 ms and the client node's admission refilled it, which a 200 ms poll
+        # sees as no release at all.
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC,
+                                      app_id=LATE_LABEL_CLIENT_NODE),
+            f'{LATE_LABEL_CLIENT_NODE} never armed, so an admission of it could still land on '
+            'top of the release this row has to see')
+
+        # And the baseline has to include the fixture's OWN admission, which the gate licenses
+        # a tick before the detector acts on it. Sampling until the total stops moving is what
+        # puts it inside; capturing on the gate's answer alone captures the number the release
+        # will later return to, and "fell below" is then never true however long it waits.
+        tracked_before = _poll_stable_tracked_count(PORT, DETECTOR_ID_NODE_DEATH,
+                                                    timeout=LABEL_TIMEOUT_SEC)
         self.assertIsNotNone(
-            block, 'node_death published no status block, so this row has no way to see what it '
-                   'does with the key')
-        tracked_before = block.get('tracked_count')
-        self.assertIsInstance(
-            tracked_before, int,
-            f'node_death reported no tracked_count ({block!r}) - without it the release below '
-            'is unobservable and the kill would be timed against the watcher instead')
+            tracked_before,
+            "node_death's tracked_count never settled, so there is no baseline here that the "
+            'release below could be measured against')
         self.assertGreater(
             tracked_before, 0,
             'node_death is tracking nothing at all, so there is no admitted key here for the '
