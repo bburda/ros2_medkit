@@ -151,7 +151,11 @@ from harness import (  # noqa: E402, I100
     watchdog_detector_status,
 )
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
+from ros2_medkit_test_utils.constants import (  # noqa: E402
+    ALLOWED_EXIT_CODES,
+    get_test_port,
+    get_time_scale,
+)
 from ros2_medkit_test_utils.coverage import get_coverage_env  # noqa: E402
 from ros2_medkit_test_utils.launch_helpers import DEMO_NODE_REGISTRY  # noqa: E402
 
@@ -161,6 +165,25 @@ from ros2_medkit_test_utils.launch_helpers import DEMO_NODE_REGISTRY  # noqa: E4
 # together into one scenario and still report 1/1 passed. A KeyError is loud.
 SCENARIO = os.environ['WATCHDOG_E2E_SCENARIO']
 PORT = get_test_port()
+
+# Every GIVE-UP bound below is multiplied by MEDKIT_TEST_TIME_SCALE, which the sanitizer jobs
+# set to the same factor they apply to each declared CTest timeout. A deadline asserted INSIDE
+# a test is invisible to that rewrite, so an instrumented build that takes longer to notice a
+# departure blows a poll here and the failure reads as a detector that never reported - the
+# exact red this suite exists to produce for a real defect. Unset elsewhere, so the normal jobs
+# keep the tight budgets that give these assertions their falsifying edge.
+#
+# Deliberately NOT scaled, and each for its own reason: the sustained-observation windows
+# (SILENT_WINDOW_SEC, UNREADABLE_INACTIVE_SILENCE_SEC, MUTUAL_EXCLUSION_WINDOW_SEC,
+# CAP_WITHHOLD_WINDOW_SEC), because watching for silence longer buys no confidence; the enforced
+# launch delays (HEALING_RESPAWN_DELAY_SEC, RESTART_LOOP_RESPAWN_DELAY_SEC,
+# CAP_REFUSED_NODE_DELAY_SEC), because they are floors the launch imposes rather than bounds
+# this file waits out; the deliberate settles (DEPARTURE_SETTLE_SEC); the HTTP per-request
+# timeouts inside this file's own helpers, which bound one call and not a wait; and every
+# quantity that MEASURES a detector window rather than budgeting for one - the absence-grace
+# arithmetic in _blink() above all, since scaling that would stop the blink proving it stayed
+# inside the grace at all.
+TIME_SCALE = get_time_scale()
 
 # Fast tick cadence + short warmup so the whole story (gateway/fault_manager startup,
 # demo-node discovery, lifecycle label seeding, global bringup grace) comfortably fits
@@ -253,7 +276,7 @@ UNREADABLE_INACTIVE_SILENCE_SEC = 10.0
 # demo_delay, DDS discovery, entity-cache debounce) the sibling scenarios' 60 s "raise
 # poll" budgets already carry for a MUCH smaller expected cost - kept here rather than
 # tightened, since CI slowness is the variable this margin exists for, not the tick math.
-UNREADABLE_RAISE_TIMEOUT_SEC = 60.0
+UNREADABLE_RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 
 # The "departure_keeps" scenario's own budgets, for what a DEPARTURE does to an
 # already-reported unmeasured fault: nothing. A SIGTERM's DDS "participant left" propagates
@@ -261,8 +284,8 @@ UNREADABLE_RAISE_TIMEOUT_SEC = 60.0
 # healing_threshold defines it: giving the entity cache room to reflect a kill quickly)
 # bounds the entity-cache catch-up. The generous margin below is the same CI-slowness
 # allowance every other poll budget in this file carries, not a measurement of that cost.
-ABSENCE_DEPARTURE_TIMEOUT_SEC = 30.0
-ABSENCE_CLEAR_TIMEOUT_SEC = 30.0
+ABSENCE_DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+ABSENCE_CLEAR_TIMEOUT_SEC = 30.0 * TIME_SCALE
 # Slept after a departure has been CONFIRMED on GET /apps, before asserting the fault
 # survived it. Long enough to cover every horizon that could have discarded the node's
 # evidence at this scenario's 100 ms cadence: the tracker's absence grace (3 ticks),
@@ -300,7 +323,7 @@ RESTART_LOOP_RESPAWN_DELAY_SEC = 1.0
 # been seen, so ~61 ticks (6.1 s) plus the held blink ticks is the real expected cost; this
 # is several times that, and a detector that discarded evidence on absence stays silent for
 # all of it however many cycles fit.
-RESTART_LOOP_WINDOW_SEC = 45.0
+RESTART_LOOP_WINDOW_SEC = 45.0 * TIME_SCALE
 # Kills the loop must have completed before a sighting of the fault is accepted. Three, so
 # the run is unambiguously a LOOP rather than one departure, and so the fault is proven to
 # survive the restarts that follow its first appearance. At ~3.5 s per cycle that is ~11 s,
@@ -322,12 +345,12 @@ FAULT_CODE_NOT_MANAGED = 'GRAPH_NODE_NOT_MANAGED'
 # and NOT_MANAGED needs no blocking GetState round trips at all (there is no lifecycle
 # service to call), so if anything this scenario's real cost is lower, not higher - the same
 # generous CI-slowness margin is kept rather than tightened.
-NOT_MANAGED_RAISE_TIMEOUT_SEC = 60.0
+NOT_MANAGED_RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # Same margins as ABSENCE_DEPARTURE_TIMEOUT_SEC / ABSENCE_CLEAR_TIMEOUT_SEC above, for the
 # same OTHER way an unmeasured code clears: an already-reported node leaving the graph and
 # staying away past the absence grace, never by being read (there is nothing to read here).
-NOT_MANAGED_DEPARTURE_TIMEOUT_SEC = 30.0
-NOT_MANAGED_CLEAR_TIMEOUT_SEC = 30.0
+NOT_MANAGED_DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+NOT_MANAGED_CLEAR_TIMEOUT_SEC = 30.0 * TIME_SCALE
 
 # The detector id its own status block is filed under on GET /x-medkit-watchdog.
 DETECTOR_ID = 'lifecycle_expectation'
@@ -354,14 +377,14 @@ CAP_REFUSED_NODE_DELAY_SEC = 10.0
 # Long enough for the unmeasured hold (60 ticks, fixed) to run out after the tracked node's
 # lifecycle services are dropped, plus the usual CI-slowness margin every raise poll here
 # carries: 61 * 0.1 = 6.1 s of tick cadence.
-CAP_NOT_MANAGED_RAISE_TIMEOUT_SEC = 60.0
+CAP_NOT_MANAGED_RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # How long GRAPH_NODE_INACTIVE's clear must stay withheld while a required node is refused.
 # ~100 ticks at this cadence, and the fault_manager runs at healing_threshold 1 here, so a
 # single spurious PASSED anywhere in the window is enough to fail the assertion.
 CAP_WITHHOLD_WINDOW_SEC = 10.0
 # Budget for the refused node to be admitted and confirmed once the departed entry is
 # collapsed: absence grace (3 ticks) + grace (3 ticks) + the report reaching the store.
-CAP_ADMISSION_TIMEOUT_SEC = 60.0
+CAP_ADMISSION_TIMEOUT_SEC = 60.0 * TIME_SCALE
 
 # ---- the "unsettled_departure" scenario: what ONE bad sweep may decide ----------------
 #
@@ -386,7 +409,7 @@ UNSETTLED_SETTLED_HOLD_TICKS = 10
 # The unmeasured hold (60 ticks, fixed) plus the absence grace, at this cadence: 63 * 0.5 =
 # 31.5 s, plus the usual margin. Both legs are measured against this same budget - the
 # settled one must raise inside it, the blinking one must never raise at all.
-UNSETTLED_RAISE_TIMEOUT_SEC = 90.0
+UNSETTLED_RAISE_TIMEOUT_SEC = 90.0 * TIME_SCALE
 # Sped up from the gateway's own 1000 ms default so the entity cache reflects a kill quickly
 # relative to the settling budget the blink leg has to stay inside.
 UNSETTLED_REFRESH_DEBOUNCE_MS = 300
@@ -402,7 +425,7 @@ WIDE_GRACE_TICK_INTERVAL_MS = 100
 WIDE_GRACE_VALUE = 2147483646
 # The raise poll's budget. With the value refused and the documented default (5) in force,
 # the node is confirmed within a handful of ticks; the margin is the usual bringup allowance.
-WIDE_GRACE_RAISE_TIMEOUT_SEC = 60.0
+WIDE_GRACE_RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 
 # ---- the "restart_departed" scenario: what a gateway RESTART does ---------------------
 #
@@ -415,7 +438,7 @@ RESTART_TICK_INTERVAL_MS = 100
 # kDefaultUnmeasuredHoldTicks (60, fixed): the never-matched hold's own bound, after which
 # the clear is released. 60 * 0.1 = 6 s, plus healing at healing_threshold 1 and the usual
 # CI margin.
-RESTART_HEAL_TIMEOUT_SEC = 90.0
+RESTART_HEAL_TIMEOUT_SEC = 90.0 * TIME_SCALE
 
 
 def generate_test_description():
@@ -684,7 +707,7 @@ def _droppable_node(name, state_label):
     )
 
 
-def _fault_record(port, code, timeout=30.0, interval=0.5):
+def _fault_record(port, code, timeout=30.0 * TIME_SCALE, interval=0.5):
     """Poll ``GET /faults?status=all`` until `code` appears, whatever its status.
 
     ``poll_faults`` uses the default (pending+confirmed) filter, so a fault that
@@ -710,7 +733,7 @@ def _fault_record(port, code, timeout=30.0, interval=0.5):
     return None
 
 
-def _poll_fault_description_contains(port, code, needle, timeout=30.0, interval=0.5):
+def _poll_fault_description_contains(port, code, needle, timeout=30.0 * TIME_SCALE, interval=0.5):
     """Poll ``GET /faults?status=all`` until `code`'s description contains `needle`.
 
     A single read of the description is a snapshot of whatever the last emitted tick said,
@@ -733,7 +756,7 @@ def _poll_fault_description_contains(port, code, needle, timeout=30.0, interval=
     return False
 
 
-def _wait_until_port_is_down(port, timeout=60.0, interval=0.2):
+def _wait_until_port_is_down(port, timeout=60.0 * TIME_SCALE, interval=0.2):
     """Wait until the gateway's HTTP port stops answering. True once it does."""
     base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
     deadline = time.monotonic() + timeout
@@ -746,7 +769,7 @@ def _wait_until_port_is_down(port, timeout=60.0, interval=0.2):
     return False
 
 
-def _poll_watchdog_entity(port, app_id, lifecycle, timeout=30.0, interval=0.5):
+def _poll_watchdog_entity(port, app_id, lifecycle, timeout=30.0 * TIME_SCALE, interval=0.5):
     """Poll GET /x-medkit-watchdog until `app_id` appears with this lifecycle label.
 
     The absence scenarios need one fact wait_until_watchdog_armed cannot give them:
@@ -787,7 +810,7 @@ def _poll_watchdog_entity(port, app_id, lifecycle, timeout=30.0, interval=0.5):
     return None
 
 
-def _poll_apps_absent(port, app_id, timeout=30.0, interval=0.5):
+def _poll_apps_absent(port, app_id, timeout=30.0 * TIME_SCALE, interval=0.5):
     """Poll ``GET /apps`` until `app_id` is no longer listed. ``True`` once it is gone.
 
     The "departure_keeps" scenario's own gate: confirms the fixture process it just
@@ -838,7 +861,7 @@ def _poll_apps_absent(port, app_id, timeout=30.0, interval=0.5):
     return False
 
 
-def _poll_apps_present(port, app_id, timeout=30.0, interval=0.5):
+def _poll_apps_present(port, app_id, timeout=30.0 * TIME_SCALE, interval=0.5):
     """Poll ``GET /apps`` until `app_id` IS listed. ``True`` once it appears.
 
     The "not_managed" scenario's own gate: `calibration` is launched via a delayed
@@ -869,7 +892,7 @@ def _poll_apps_present(port, app_id, timeout=30.0, interval=0.5):
     return False
 
 
-def _set_bool_parameter(client_node, service_name, param_name, value, timeout=30.0):
+def _set_bool_parameter(client_node, service_name, param_name, value, timeout=30.0 * TIME_SCALE):
     """Set one bool parameter on a REMOTE node via its own ``~/set_parameters`` service.
 
     Drives ``unreadable_lifecycle_node.cpp``'s ``start_answering`` parameter at a time
@@ -940,7 +963,8 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         cls._client_node.destroy_node()
         rclpy.shutdown()
 
-    def _call_transition(self, transition_id, reached_label, timeout=30.0, attempts=3):
+    def _call_transition(self, transition_id, reached_label,
+                         timeout=30.0 * TIME_SCALE, attempts=3):
         """Drive one real lifecycle transition, retrying a call that never comes back.
 
         The whole scenario hangs off two of these, and a single-shot call makes one lost
@@ -991,7 +1015,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
             'attempt - the node refused a transition that must be valid from where it was',
         )
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, reached_label, timeout=10.0),
+            _poll_watchdog_entity(PORT, TARGET_NODE, reached_label, timeout=10.0 * TIME_SCALE),
             f'ChangeState (transition {transition_id}) was rejected after a retry and '
             f'{TARGET_NODE} is not in "{reached_label}" either - the transition neither '
             'applied on the lost attempt nor succeeded on the retry',
@@ -1008,7 +1032,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # loaded and the tick loop ran, so a bringup failure dies here naming itself
         # instead of as a 60 s poll timeout blaming the detector.
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state - the plugin did not '
             'load, its tick loop never ran, or the bringup grace never elapsed, so no '
             'raise below could mean anything',
@@ -1016,7 +1040,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
 
         # managed_lifecycle launches unconfigured: present in the graph, alive, but not
         # active. That alone must raise once it persists past the configured grace.
-        fault = poll_faults(PORT, FAULT_CODE, timeout=60.0)
+        fault = poll_faults(PORT, FAULT_CODE, timeout=60.0 * TIME_SCALE)
         self.assertIsNotNone(
             fault,
             f'{FAULT_CODE} never raised while {TARGET_NODE} stayed unconfigured',
@@ -1027,7 +1051,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # entity-scoped surface proves an operator can OPEN it somewhere (see
         # test_qos_e2e.test.py's identical rationale for the same entity).
         self.assertIsNotNone(
-            poll_entity_faults(PORT, 'apps/graph_watchdog', FAULT_CODE, timeout=30.0),
+            poll_entity_faults(PORT, 'apps/graph_watchdog', FAULT_CODE, timeout=30.0 * TIME_SCALE),
             f'{FAULT_CODE} is not reachable at /apps/graph_watchdog/faults - the '
             'entity the plugin publishes does not own the fault it raises',
         )
@@ -1039,7 +1063,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # "configured" as good enough would heal it here.
         self._call_transition(Transition.TRANSITION_CONFIGURE, reached_label='inactive')
 
-        fault = poll_faults(PORT, FAULT_CODE, timeout=30.0)
+        fault = poll_faults(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(
             fault,
             f'{FAULT_CODE} did not stay raised once {TARGET_NODE} reached "inactive"',
@@ -1068,7 +1092,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         and is never unset, so it catches a single spurious clear whether or not it
         ever reached HEALED.
         """
-        before = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        before = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(
             before,
             f'{FAULT_CODE} is not in the store before the restart, so there is nothing '
@@ -1084,7 +1108,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         old_pid = gateway_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
         self.assertTrue(
-            _wait_until_port_is_down(PORT, timeout=60.0),
+            _wait_until_port_is_down(PORT, timeout=60.0 * TIME_SCALE),
             f'the gateway (pid {old_pid}) kept answering after SIGTERM - nothing was '
             'restarted, so the rest of this test would measure the original process',
         )
@@ -1093,7 +1117,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # globally armed again: a raise (or a clear) is only possible past that point,
         # so measuring before it would measure a stack that had not started detecting.
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=90.0),
+            wait_until_watchdog_armed(PORT, timeout=90.0 * TIME_SCALE),
             'the gateway never came back armed after the restart',
         )
         new_pid = gateway_node.process_details['pid']
@@ -1107,7 +1131,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # fault_manager needs healing_threshold (default 3) PASSED reports to heal.
         time.sleep(max(4.0, (GRACE + 8) * TICK_INTERVAL_MS / 1000.0))
 
-        after = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        after = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(
             after,
             f'{FAULT_CODE} vanished from the store entirely after the restart',
@@ -1127,7 +1151,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # And the fault is still on the operator-visible active list, i.e. the withhold
         # preserved it rather than merely delaying the damage.
         self.assertIsNotNone(
-            poll_faults(PORT, FAULT_CODE, timeout=30.0),
+            poll_faults(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE),
             f'{FAULT_CODE} is no longer an active fault after the gateway restart',
         )
 
@@ -1139,7 +1163,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # is a heal of a proven-present fault (same pairing as
         # test_param_drift_e2e.test.py's heal leg).
         self.assertIsNotNone(
-            poll_faults(PORT, FAULT_CODE, timeout=30.0),
+            poll_faults(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE),
             f'{FAULT_CODE} is not active at the start of the heal test, so there is '
             'nothing here that could heal and the clear below would pass without '
             'measuring anything',
@@ -1154,13 +1178,13 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # label arrived but the clear never flowed, poll_cleared below is the one that
         # fails.
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0, app_id=TARGET_NODE),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE, app_id=TARGET_NODE),
             f'the gate never armed {TARGET_NODE} after a successful ACTIVATE - the '
             'live lifecycle machinery (transition_event / GetState) never delivered '
             'the "active" label to the watcher',
         )
 
-        cleared = poll_cleared(PORT, FAULT_CODE, timeout=60.0)
+        cleared = poll_cleared(PORT, FAULT_CODE, timeout=60.0 * TIME_SCALE)
         self.assertTrue(
             cleared,
             f'{FAULT_CODE} did not heal after {TARGET_NODE} reached "active"',
@@ -1173,7 +1197,7 @@ class TestLifecycleExpectationMain(unittest.TestCase):
         # Pin that the node is still present and reading "active" once the clear was
         # observed.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, 'active', timeout=15.0),
+            _poll_watchdog_entity(PORT, TARGET_NODE, 'active', timeout=15.0 * TIME_SCALE),
             f'{TARGET_NODE} is no longer present and reading "active" once the clear was '
             'observed - the clear could have come from the absence path (a fixture exit) '
             'rather than the ACTIVATE that this test is actually about',
@@ -1188,7 +1212,7 @@ class TestLifecycleExpectationDefaultConfig(unittest.TestCase):
         # same "no fault" result, and every bringup failure mode on this launch still
         # exits 0 (see the harness docstring).
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state - the plugin did not '
             'load or its tick loop never ran, so an absent fault proves nothing',
         )
@@ -1198,7 +1222,7 @@ class TestLifecycleExpectationDefaultConfig(unittest.TestCase):
         # poll_faults swallows that and returns None, and the absence assertion passes
         # for the one reason it must never pass.
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the '
             'fault_manager in this launch, so an absent fault proves nothing about the '
             'detector',
@@ -1207,7 +1231,7 @@ class TestLifecycleExpectationDefaultConfig(unittest.TestCase):
         # node AND read its non-active label. Without this the silence below could just
         # as well mean the label never arrived.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=30.0),
+            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=30.0 * TIME_SCALE),
             f'the gate never reported {TARGET_NODE} with lifecycle "unconfigured" - '
             'the node was not discovered or its label was never read, so the silence '
             'below would be vacuous',
@@ -1224,7 +1248,7 @@ class TestLifecycleExpectationDefaultConfig(unittest.TestCase):
         # check and invisible to the tracker (a departed node is the presence class's
         # problem), which would leave 2 s of trigger and 18 s of empty graph.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=15.0),
+            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=15.0 * TIME_SCALE),
             f'{TARGET_NODE} is no longer reported as "unconfigured" at the END of the '
             'silence window - the trigger did not survive it, so most of the window '
             'proved nothing',
@@ -1252,7 +1276,7 @@ class TestLifecycleExpectationNegativeControl(unittest.TestCase):
         # .so loaded, the tick loop ran, the node was discovered, its warmup elapsed,
         # and the watcher considers it ok.
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0, app_id=ACTIVE_NODE),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE, app_id=ACTIVE_NODE),
             f'graph_watchdog never reported {ACTIVE_NODE} as an armed entity - the '
             'plugin did not load, its tick loop never ran, or the gateway never '
             'discovered the node, so an absent fault proves nothing',
@@ -1263,7 +1287,7 @@ class TestLifecycleExpectationNegativeControl(unittest.TestCase):
         # never DDS-matched - leaves GET /faults answering 503, which poll_faults
         # swallows into exactly the None the assertion below wants.
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the '
             'fault_manager in this launch, so a wrong raise would have been lost rather '
             'than caught',
@@ -1272,7 +1296,7 @@ class TestLifecycleExpectationNegativeControl(unittest.TestCase):
         # label, and the tracker treats unread as benign - a run whose label never
         # arrived would stay silent for the wrong reason. Pin that "active" was READ.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, ACTIVE_NODE, 'active', timeout=30.0),
+            _poll_watchdog_entity(PORT, ACTIVE_NODE, 'active', timeout=30.0 * TIME_SCALE),
             f'the gate never reported {ACTIVE_NODE} with lifecycle "active" - its '
             'label was never read, so the silence below would be vacuous',
         )
@@ -1286,7 +1310,7 @@ class TestLifecycleExpectationNegativeControl(unittest.TestCase):
         # window: a node that exited early leaves an empty graph, which is silent for a
         # reason that has nothing to do with the detector being right.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, ACTIVE_NODE, 'active', timeout=15.0),
+            _poll_watchdog_entity(PORT, ACTIVE_NODE, 'active', timeout=15.0 * TIME_SCALE),
             f'{ACTIVE_NODE} is no longer reported as "active" at the END of the silence '
             'window - the required node did not survive it, so most of the window was '
             'not exercising an active node at all',
@@ -1339,13 +1363,13 @@ class TestLifecycleExpectationUnreadable(unittest.TestCase):
         # bringup failure must die here, naming itself, instead of as a raise-poll
         # timeout that blames the detector.
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state - the plugin did not '
             'load, its tick loop never ran, or the bringup grace never elapsed, so no '
             'assertion below could mean anything',
         )
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the '
             'fault_manager in this launch, so a wrong raise would have been lost rather '
             'than caught',
@@ -1356,7 +1380,7 @@ class TestLifecycleExpectationUnreadable(unittest.TestCase):
         # - LifecycleWatcher seeded it once and nothing has answered since (see
         # _poll_watchdog_entity's docstring for why "" is not "no data yet").
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=30.0),
+            _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=30.0 * TIME_SCALE),
             f'the gate never reported {UNREADABLE_NODE} with an empty (never-read) '
             'lifecycle label - the fixture was not discovered as a managed node, or its '
             'GetState answered when it must not have, so nothing below would prove '
@@ -1373,7 +1397,7 @@ class TestLifecycleExpectationUnreadable(unittest.TestCase):
         # And the node must still be genuinely unread at the END of the window, or the
         # silence above measured an empty graph rather than a real unreadable node.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=15.0),
+            _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=15.0 * TIME_SCALE),
             f'{UNREADABLE_NODE} no longer reads an empty (never-read) lifecycle label '
             'at the end of the silence window - the trigger did not survive it, so '
             'most of the window proved nothing',
@@ -1404,14 +1428,15 @@ class TestLifecycleExpectationUnreadable(unittest.TestCase):
         # entity-scoped surface proves an operator can OPEN it somewhere (see
         # TestLifecycleExpectationMain.test_01's identical rationale for the sibling code).
         self.assertIsNotNone(
-            poll_entity_faults(PORT, 'apps/graph_watchdog', FAULT_CODE_UNREADABLE, timeout=30.0),
+            poll_entity_faults(PORT, 'apps/graph_watchdog', FAULT_CODE_UNREADABLE,
+                               timeout=30.0 * TIME_SCALE),
             f'{FAULT_CODE_UNREADABLE} is not reachable at /apps/graph_watchdog/faults - '
             'the entity the plugin publishes does not own the fault it raises',
         )
 
     def test_04_answering_active_clears_it(self):
         self.assertIsNotNone(
-            poll_faults(PORT, FAULT_CODE_UNREADABLE, timeout=30.0),
+            poll_faults(PORT, FAULT_CODE_UNREADABLE, timeout=30.0 * TIME_SCALE),
             f'{FAULT_CODE_UNREADABLE} is not active at the start of the heal test, so '
             'there is nothing here that could heal and the clear below would pass '
             'without measuring anything',
@@ -1420,7 +1445,7 @@ class TestLifecycleExpectationUnreadable(unittest.TestCase):
         self.assertTrue(
             _set_bool_parameter(
                 type(self)._client_node, f'/{UNREADABLE_NODE}/set_parameters',
-                'start_answering', True, timeout=30.0),
+                'start_answering', True, timeout=30.0 * TIME_SCALE),
             f'setting start_answering:=true on /{UNREADABLE_NODE}/set_parameters '
             'never succeeded - the fixture never got the signal to start answering '
             'GetState, so no heal below could mean anything',
@@ -1431,13 +1456,13 @@ class TestLifecycleExpectationUnreadable(unittest.TestCase):
         # this node: node_ok() was already true while unread (an unread label defaults
         # open, see lifecycle_watcher.cpp), so this is the read itself, not the gate.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, UNREADABLE_NODE, 'active', timeout=30.0),
+            _poll_watchdog_entity(PORT, UNREADABLE_NODE, 'active', timeout=30.0 * TIME_SCALE),
             f'the gate never reported {UNREADABLE_NODE} with lifecycle "active" after '
             'start_answering:=true - the fixture accepted the parameter but its '
             'GetState still never delivered "active" to the watcher',
         )
 
-        cleared = poll_cleared(PORT, FAULT_CODE_UNREADABLE, timeout=30.0)
+        cleared = poll_cleared(PORT, FAULT_CODE_UNREADABLE, timeout=30.0 * TIME_SCALE)
         self.assertTrue(
             cleared,
             f'{FAULT_CODE_UNREADABLE} did not heal after {UNREADABLE_NODE} started '
@@ -1530,7 +1555,7 @@ class TestLifecycleExpectationHealingThreshold(unittest.TestCase):
         # including the absence duration below, describes a node the tracker never saw
         # leave. GET /apps carries no such retention.
         self.assertTrue(
-            _poll_apps_present(PORT, TARGET_NODE, timeout=15.0),
+            _poll_apps_present(PORT, TARGET_NODE, timeout=15.0 * TIME_SCALE),
             f'blink {blink_number}: {TARGET_NODE} never came back into GET /apps - the '
             'respawn or its rediscovery did not complete, so this blink cannot be trusted '
             'to have stayed inside the absence grace',
@@ -1576,19 +1601,19 @@ class TestLifecycleExpectationHealingThreshold(unittest.TestCase):
 
     def test_repeated_blinks_do_not_heal_a_still_violating_fault(self, target_node):
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state for the '
             'healing_threshold scenario - no assertion below could mean anything',
         )
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=30.0),
+            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=30.0 * TIME_SCALE),
             f'{TARGET_NODE} never read "unconfigured" - the false-positive trigger this '
             'test needs was never actually present',
         )
 
-        fault = poll_faults(PORT, FAULT_CODE, timeout=60.0)
+        fault = poll_faults(PORT, FAULT_CODE, timeout=60.0 * TIME_SCALE)
         self.assertIsNotNone(fault, f'{FAULT_CODE} never raised for the stuck {TARGET_NODE}')
-        before = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        before = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(before, f'{FAULT_CODE} is not in the store before the blinks')
         self.assertIsNone(
             before.get('last_passed'),
@@ -1652,7 +1677,7 @@ class TestLifecycleExpectationHealingThreshold(unittest.TestCase):
             sse_response.close()
             sse_pump.join(timeout=5)
 
-        after = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        after = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(
             after, f'{FAULT_CODE} vanished from the store entirely after the blinks')
         self.assertIsNone(
@@ -1670,7 +1695,7 @@ class TestLifecycleExpectationHealingThreshold(unittest.TestCase):
         # And the node is still genuinely stuck, so the outcome above measured something
         # real rather than an empty graph.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=15.0),
+            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=15.0 * TIME_SCALE),
             f'{TARGET_NODE} is no longer reading "unconfigured" at the end of the test - '
             'the trigger did not survive the blinks, so the assertions above proved '
             'nothing',
@@ -1783,19 +1808,19 @@ class TestLifecycleExpectationDepartureKeeps(unittest.TestCase):
 
     def test_01_present_and_unread_before_anything_else(self):
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state - the plugin did not '
             'load, its tick loop never ran, or the bringup grace never elapsed, so no '
             'assertion below could mean anything',
         )
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the '
             'fault_manager in this launch, so a wrong raise would have been lost rather '
             'than caught',
         )
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=30.0),
+            _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=30.0 * TIME_SCALE),
             f'the gate never reported {UNREADABLE_NODE} with an empty (never-read) '
             'lifecycle label - the fixture was not discovered as a managed node, or its '
             'GetState answered when it must not have, so nothing below would prove '
@@ -1829,7 +1854,7 @@ class TestLifecycleExpectationDepartureKeeps(unittest.TestCase):
         # evidence on absence has had every opportunity to do so.
         time.sleep(DEPARTURE_SETTLE_SEC)
 
-        record = _fault_record(PORT, FAULT_CODE_UNREADABLE, timeout=30.0)
+        record = _fault_record(PORT, FAULT_CODE_UNREADABLE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(
             record,
             f'{FAULT_CODE_UNREADABLE} vanished from the store entirely after '
@@ -1852,7 +1877,8 @@ class TestLifecycleExpectationDepartureKeeps(unittest.TestCase):
         # describe a graph it left.
         self.assertIn(
             'has since left the graph',
-            _fault_record(PORT, FAULT_CODE_UNREADABLE, timeout=10.0).get('description', ''),
+            _fault_record(PORT, FAULT_CODE_UNREADABLE,
+                          timeout=10.0 * TIME_SCALE).get('description', ''),
             f'{FAULT_CODE_UNREADABLE} still describes {UNREADABLE_NODE} as a present '
             'node whose state cannot be read, after it left the graph',
         )
@@ -1897,13 +1923,13 @@ class TestLifecycleExpectationNotManaged(unittest.TestCase):
 
     def test_01_present_and_not_managed_before_anything_else(self):
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state - the plugin did not '
             'load, its tick loop never ran, or the bringup grace never elapsed, so no '
             'assertion below could mean anything',
         )
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the '
             'fault_manager in this launch, so a wrong raise would have been lost rather '
             'than caught',
@@ -1915,7 +1941,7 @@ class TestLifecycleExpectationNotManaged(unittest.TestCase):
         # statement about ABSENCE of tracking, which GET /apps + the raise below prove
         # together more directly than a nullable JSON field would.
         self.assertTrue(
-            _poll_apps_present(PORT, NOT_MANAGED_NODE, timeout=30.0),
+            _poll_apps_present(PORT, NOT_MANAGED_NODE, timeout=30.0 * TIME_SCALE),
             f'{NOT_MANAGED_NODE} never appeared on GET /apps - the fixture never came up, '
             'so nothing below would prove anything about NOT-MANAGED',
         )
@@ -1943,7 +1969,8 @@ class TestLifecycleExpectationNotManaged(unittest.TestCase):
             self, PORT, FAULT_CODE_UNREADABLE, MUTUAL_EXCLUSION_WINDOW_SEC)
 
         self.assertIsNotNone(
-            poll_entity_faults(PORT, 'apps/graph_watchdog', FAULT_CODE_NOT_MANAGED, timeout=30.0),
+            poll_entity_faults(PORT, 'apps/graph_watchdog', FAULT_CODE_NOT_MANAGED,
+                               timeout=30.0 * TIME_SCALE),
             f'{FAULT_CODE_NOT_MANAGED} is not reachable at /apps/graph_watchdog/faults - '
             'the entity the plugin publishes does not own the fault it raises',
         )
@@ -1967,7 +1994,7 @@ class TestLifecycleExpectationNotManaged(unittest.TestCase):
         )
         time.sleep(DEPARTURE_SETTLE_SEC)
 
-        record = _fault_record(PORT, FAULT_CODE_NOT_MANAGED, timeout=30.0)
+        record = _fault_record(PORT, FAULT_CODE_NOT_MANAGED, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(
             record,
             f'{FAULT_CODE_NOT_MANAGED} vanished from the store entirely after '
@@ -1987,7 +2014,8 @@ class TestLifecycleExpectationNotManaged(unittest.TestCase):
         )
         self.assertIn(
             'has since left the graph',
-            _fault_record(PORT, FAULT_CODE_NOT_MANAGED, timeout=10.0).get('description', ''),
+            _fault_record(PORT, FAULT_CODE_NOT_MANAGED,
+                          timeout=10.0 * TIME_SCALE).get('description', ''),
             f'{FAULT_CODE_NOT_MANAGED} still describes {NOT_MANAGED_NODE} as a present '
             'node, after it left the graph',
         )
@@ -2032,14 +2060,14 @@ class TestLifecycleExpectationRestartLoop(unittest.TestCase):
         old_pid = node_action.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
         self.assertTrue(
-            _poll_apps_absent(PORT, NOT_MANAGED_NODE, timeout=30.0, interval=0.05),
+            _poll_apps_absent(PORT, NOT_MANAGED_NODE, timeout=30.0 * TIME_SCALE, interval=0.05),
             f'cycle {cycle}: {NOT_MANAGED_NODE} (pid {old_pid}) was never observed absent '
             'from GET /apps after the SIGTERM - this cycle never crossed the absence '
             'horizon it exists to cross',
         )
         absence_observed = time.monotonic()
         self.assertTrue(
-            _poll_apps_present(PORT, NOT_MANAGED_NODE, timeout=30.0, interval=0.05),
+            _poll_apps_present(PORT, NOT_MANAGED_NODE, timeout=30.0 * TIME_SCALE, interval=0.05),
             f'cycle {cycle}: {NOT_MANAGED_NODE} never came back after the SIGTERM - launch '
             'did not respawn it, so this is a single departure, not a restart loop',
         )
@@ -2057,18 +2085,18 @@ class TestLifecycleExpectationRestartLoop(unittest.TestCase):
 
     def test_crash_looping_node_is_reported(self, target_node):
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state - the plugin did not '
             'load, its tick loop never ran, or the bringup grace never elapsed, so no '
             'assertion below could mean anything',
         )
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the '
             'fault_manager in this launch, so a missing fault would prove nothing',
         )
         self.assertTrue(
-            _poll_apps_present(PORT, NOT_MANAGED_NODE, timeout=30.0),
+            _poll_apps_present(PORT, NOT_MANAGED_NODE, timeout=30.0 * TIME_SCALE),
             f'{NOT_MANAGED_NODE} never appeared on GET /apps - the fixture never came up, '
             'so there is no node here to crash-loop',
         )
@@ -2152,13 +2180,13 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
 
     def test_01_the_refused_node_is_reported_as_saturation(self):
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state - the plugin did not '
             'load, its tick loop never ran, or the bringup grace never elapsed, so no '
             'assertion below could mean anything',
         )
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the fault_manager '
             'in this launch',
         )
@@ -2166,24 +2194,26 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
         # refused" would just be "one of them never came up".
         for node_id in (CAP_TRACKED_NODE, CAP_REFUSED_NODE):
             self.assertTrue(
-                _poll_apps_present(PORT, node_id, timeout=30.0),
+                _poll_apps_present(PORT, node_id, timeout=30.0 * TIME_SCALE),
                 f'{node_id} never appeared on GET /apps - with only one required node '
                 'present the cap of one is not full and nothing is refused',
             )
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, CAP_TRACKED_NODE, 'unconfigured', timeout=30.0),
+            _poll_watchdog_entity(PORT, CAP_TRACKED_NODE, 'unconfigured',
+                                  timeout=30.0 * TIME_SCALE),
             f'{CAP_TRACKED_NODE} never read "unconfigured" - the node that must win the '
             'single slot was never measured as a violation at all',
         )
 
-        fault = poll_faults(PORT, FAULT_CODE, timeout=60.0)
+        fault = poll_faults(PORT, FAULT_CODE, timeout=60.0 * TIME_SCALE)
         self.assertIsNotNone(
             fault, f'{FAULT_CODE} never raised for {CAP_TRACKED_NODE}, which holds the one slot')
         self.assertIn(CAP_TRACKED_NODE, fault.get('description', ''))
 
         # The refusal itself, on the operator-visible surface.
         self.assertTrue(
-            poll_detector_status(PORT, DETECTOR_ID, 'tracking_saturated', True, timeout=30.0),
+            poll_detector_status(PORT, DETECTOR_ID, 'tracking_saturated', True,
+                                 timeout=30.0 * TIME_SCALE),
             'GET /x-medkit-watchdog never reported the lifecycle_expectation tracked-node '
             f'cap as saturated while {CAP_REFUSED_NODE} was present, required and refused - '
             'a required node is going unchecked and nothing an operator can read says so',
@@ -2196,7 +2226,7 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
             f'configured ({CAP_NODE_CAP}) - the key did not reach the detector: {block}')
 
     def test_02_a_refused_node_withholds_the_clear(self):
-        before = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        before = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(
             before, f'{FAULT_CODE} is not in the store, so there is nothing a clear could heal')
         self.assertIsNone(
@@ -2213,7 +2243,7 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
         self.assertTrue(
             _set_bool_parameter(
                 type(self)._client_node, f'/{CAP_TRACKED_NODE}/set_parameters',
-                'drop_services', True, timeout=30.0),
+                'drop_services', True, timeout=30.0 * TIME_SCALE),
             f'setting drop_services:=true on /{CAP_TRACKED_NODE}/set_parameters never '
             'succeeded, so the state this test needs was never reached',
         )
@@ -2224,7 +2254,7 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
             f'{FAULT_CODE} still has content and the withhold below would prove nothing',
         )
         time.sleep(CAP_WITHHOLD_WINDOW_SEC)
-        after = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        after = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(after, f'{FAULT_CODE} vanished from the store entirely')
         self.assertIsNone(
             after.get('last_passed'),
@@ -2241,7 +2271,8 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
         # unmeasured clock is evidence), so it kept the single slot the whole way through and
         # the other required node was never admitted behind our back.
         self.assertTrue(
-            poll_detector_status(PORT, DETECTOR_ID, 'tracking_saturated', True, timeout=15.0),
+            poll_detector_status(PORT, DETECTOR_ID, 'tracking_saturated', True,
+                                 timeout=15.0 * TIME_SCALE),
             'the cap stopped reporting itself saturated once the tracked node went '
             'not-managed - the refused node was admitted, so the window above was not about '
             'a withheld clear at all',
@@ -2251,12 +2282,12 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
         old_pid = tracked_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
         self.assertTrue(
-            _poll_apps_absent(PORT, CAP_TRACKED_NODE, timeout=30.0),
+            _poll_apps_absent(PORT, CAP_TRACKED_NODE, timeout=30.0 * TIME_SCALE),
             f'{CAP_TRACKED_NODE} (pid {old_pid}) is still listed on GET /apps after SIGTERM '
             '- it never left the graph, so its entry was never a DEPARTED one',
         )
         self.assertTrue(
-            _poll_apps_present(PORT, CAP_REFUSED_NODE, timeout=30.0),
+            _poll_apps_present(PORT, CAP_REFUSED_NODE, timeout=30.0 * TIME_SCALE),
             f'{CAP_REFUSED_NODE} is not on GET /apps - the node that must now be admitted '
             'is not even present',
         )
@@ -2272,13 +2303,14 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
         )
         # And the refusal is over, so the latch that reports it has re-armed for a later one.
         self.assertTrue(
-            poll_detector_status(PORT, DETECTOR_ID, 'tracking_saturated', False, timeout=30.0),
+            poll_detector_status(PORT, DETECTOR_ID, 'tracking_saturated', False,
+                                 timeout=30.0 * TIME_SCALE),
             'the cap still reports itself saturated after the departed entry was collapsed '
             'and the present node admitted - a later, real saturation would be indistinguishable',
         )
         # The departed node's own fault is not healed by its departure: its evidence lives on
         # as a count, which is what keeps that code's content non-empty.
-        record = _fault_record(PORT, FAULT_CODE_NOT_MANAGED, timeout=30.0)
+        record = _fault_record(PORT, FAULT_CODE_NOT_MANAGED, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(
             record, f'{FAULT_CODE_NOT_MANAGED} vanished from the store after the departure')
         self.assertIsNone(
@@ -2288,7 +2320,7 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
             'slot threw its evidence away instead of keeping it as a count',
         )
         # Nothing anywhere in this run ever cleared GRAPH_NODE_INACTIVE.
-        final = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        final = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNone(
             final.get('last_passed'),
             f'{FAULT_CODE} was reported PASSED at some point in this run '
@@ -2339,25 +2371,25 @@ class TestLifecycleExpectationUnsettledDeparture(unittest.TestCase):
         self.assertTrue(
             _set_bool_parameter(
                 type(self)._client_node, f'/{node_id}/set_parameters',
-                'drop_services', True, timeout=30.0),
+                'drop_services', True, timeout=30.0 * TIME_SCALE),
             f'setting drop_services:=true on /{node_id}/set_parameters never succeeded - '
             'the node never stopped looking like a managed lifecycle node',
         )
 
     def test_01_both_required_nodes_are_present_and_healthy(self):
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state, so no assertion below '
             'could mean anything',
         )
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the fault_manager '
             'in this launch, so an absent fault would prove nothing',
         )
         for node_id in (UNSETTLED_BLINK_NODE, UNSETTLED_SETTLED_NODE):
             self.assertIsNotNone(
-                _poll_watchdog_entity(PORT, node_id, 'active', timeout=30.0),
+                _poll_watchdog_entity(PORT, node_id, 'active', timeout=30.0 * TIME_SCALE),
                 f'{node_id} never read lifecycle "active" - it was not discovered as a '
                 'managed node, so it cannot be a HEALTHY managed node whose services then '
                 'disappear',
@@ -2370,14 +2402,15 @@ class TestLifecycleExpectationUnsettledDeparture(unittest.TestCase):
         # the watchdog route reports a null lifecycle exactly when the watcher no longer
         # tracks the id, which is what the tracker classifies as kNotManaged.
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, UNSETTLED_BLINK_NODE, None, timeout=15.0),
+            _poll_watchdog_entity(PORT, UNSETTLED_BLINK_NODE, None, timeout=15.0 * TIME_SCALE),
             f'{UNSETTLED_BLINK_NODE} never lost its tracked lifecycle state after its '
             'services were dropped - this leg never produced the unmeasured observation it '
             'is about',
         )
         os.kill(blink_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
-            _poll_apps_absent(PORT, UNSETTLED_BLINK_NODE, timeout=30.0, interval=0.05),
+            _poll_apps_absent(PORT, UNSETTLED_BLINK_NODE,
+                              timeout=30.0 * TIME_SCALE, interval=0.05),
             f'{UNSETTLED_BLINK_NODE} never left GET /apps after SIGTERM')
         unmanaged_for = time.monotonic() - dropped_at
         settle_budget_sec = (UNSETTLED_SETTLE_TICKS * UNSETTLED_TICK_INTERVAL_MS) / 1000.0
@@ -2392,7 +2425,7 @@ class TestLifecycleExpectationUnsettledDeparture(unittest.TestCase):
     def test_03_a_settled_not_managed_departure_is_still_reported(self, settled_node):
         self._drop_services(UNSETTLED_SETTLED_NODE)
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, UNSETTLED_SETTLED_NODE, None, timeout=15.0),
+            _poll_watchdog_entity(PORT, UNSETTLED_SETTLED_NODE, None, timeout=15.0 * TIME_SCALE),
             f'{UNSETTLED_SETTLED_NODE} never lost its tracked lifecycle state after its '
             'services were dropped',
         )
@@ -2401,7 +2434,7 @@ class TestLifecycleExpectationUnsettledDeparture(unittest.TestCase):
         time.sleep((UNSETTLED_SETTLED_HOLD_TICKS * UNSETTLED_TICK_INTERVAL_MS) / 1000.0)
         os.kill(settled_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
-            _poll_apps_absent(PORT, UNSETTLED_SETTLED_NODE, timeout=30.0),
+            _poll_apps_absent(PORT, UNSETTLED_SETTLED_NODE, timeout=30.0 * TIME_SCALE),
             f'{UNSETTLED_SETTLED_NODE} never left GET /apps after SIGTERM')
 
         fault = poll_faults(PORT, FAULT_CODE_NOT_MANAGED, timeout=UNSETTLED_RAISE_TIMEOUT_SEC)
@@ -2418,7 +2451,7 @@ class TestLifecycleExpectationUnsettledDeparture(unittest.TestCase):
         # have matured the blinker's own one-sweep reading has been passed on this same
         # stack: it dropped its services first and left the graph first.
         for code in (FAULT_CODE_NOT_MANAGED, FAULT_CODE_UNREADABLE, FAULT_CODE):
-            record = _fault_record(PORT, code, timeout=5.0)
+            record = _fault_record(PORT, code, timeout=5.0 * TIME_SCALE)
             description = (record or {}).get('description', '')
             self.assertNotIn(
                 UNSETTLED_BLINK_NODE, description,
@@ -2453,17 +2486,17 @@ class TestLifecycleExpectationWideGrace(unittest.TestCase):
 
     def test_01_an_out_of_range_grace_is_refused_and_the_default_applies(self):
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state, so a missing fault would '
             'prove nothing',
         )
         self.assertTrue(
-            wait_until_faults_endpoint_live(PORT, timeout=30.0),
+            wait_until_faults_endpoint_live(PORT, timeout=30.0 * TIME_SCALE),
             'GET /faults never answered 200 - the gateway never reached the fault_manager, '
             'so a missing fault would prove nothing',
         )
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=30.0),
+            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=30.0 * TIME_SCALE),
             f'{TARGET_NODE} never read "unconfigured" - the violation this test needs was '
             'never present',
         )
@@ -2482,15 +2515,15 @@ class TestLifecycleExpectationWideGrace(unittest.TestCase):
     def test_02_the_fault_survives_the_node_leaving(self, target_node):
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
-            _poll_apps_absent(PORT, TARGET_NODE, timeout=30.0),
+            _poll_apps_absent(PORT, TARGET_NODE, timeout=30.0 * TIME_SCALE),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
         self.assertTrue(
             _poll_fault_description_contains(
-                PORT, FAULT_CODE, 'has since left the graph', timeout=30.0),
+                PORT, FAULT_CODE, 'has since left the graph', timeout=30.0 * TIME_SCALE),
             f'{FAULT_CODE} still describes {TARGET_NODE} as a present node after it left '
             'the graph',
         )
-        record = _fault_record(PORT, FAULT_CODE, timeout=10.0)
+        record = _fault_record(PORT, FAULT_CODE, timeout=10.0 * TIME_SCALE)
         self.assertIsNone(
             record.get('last_passed'),
             f'{FAULT_CODE} was reported PASSED once {TARGET_NODE} left the graph '
@@ -2530,21 +2563,21 @@ class TestLifecycleExpectationRestartDeparted(unittest.TestCase):
 
     def test_01_the_fault_raises_and_survives_the_node_leaving(self, target_node):
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=60.0),
+            wait_until_watchdog_armed(PORT, timeout=60.0 * TIME_SCALE),
             'graph_watchdog never reported an armed global state')
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=30.0),
+            _poll_watchdog_entity(PORT, TARGET_NODE, 'unconfigured', timeout=30.0 * TIME_SCALE),
             f'{TARGET_NODE} never read "unconfigured"')
         self.assertIsNotNone(
-            poll_faults(PORT, FAULT_CODE, timeout=60.0),
+            poll_faults(PORT, FAULT_CODE, timeout=60.0 * TIME_SCALE),
             f'{FAULT_CODE} never raised for the stuck {TARGET_NODE}')
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
-            _poll_apps_absent(PORT, TARGET_NODE, timeout=30.0),
+            _poll_apps_absent(PORT, TARGET_NODE, timeout=30.0 * TIME_SCALE),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
         time.sleep(max(4.0, (GRACE + 8) * RESTART_TICK_INTERVAL_MS / 1000.0))
-        record = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        record = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(record, f'{FAULT_CODE} vanished from the store')
         self.assertIsNone(
             record.get('last_passed'),
@@ -2557,10 +2590,10 @@ class TestLifecycleExpectationRestartDeparted(unittest.TestCase):
         old_pid = gateway_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
         self.assertTrue(
-            _wait_until_port_is_down(PORT, timeout=60.0),
+            _wait_until_port_is_down(PORT, timeout=60.0 * TIME_SCALE),
             f'the gateway (pid {old_pid}) kept answering after SIGTERM - nothing restarted')
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=90.0),
+            wait_until_watchdog_armed(PORT, timeout=90.0 * TIME_SCALE),
             'the gateway never came back armed after the restart')
         self.assertNotEqual(
             gateway_node.process_details['pid'], old_pid,
@@ -2577,7 +2610,7 @@ class TestLifecycleExpectationRestartDeparted(unittest.TestCase):
             'stopped being bounded or something now re-seeds the tracker at startup - '
             'either way the documented scope of the promise needs rewriting, not this test',
         )
-        record = _fault_record(PORT, FAULT_CODE, timeout=30.0)
+        record = _fault_record(PORT, FAULT_CODE, timeout=30.0 * TIME_SCALE)
         self.assertIsNotNone(record, f'{FAULT_CODE} vanished from the store entirely')
         self.assertIsNotNone(
             record.get('last_passed'),
