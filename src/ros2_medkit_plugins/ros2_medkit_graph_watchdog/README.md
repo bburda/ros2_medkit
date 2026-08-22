@@ -1718,7 +1718,14 @@ bringup-quiesce centrally so no individual detector has to reimplement it.
   and only on a tick that still sees the app present, so a node that dies within
   about one entity-cache refresh of its label arriving is reported by the
   presence code after all - measured at 210 ms between the label reaching
-  `GET /x-medkit-watchdog` and the release. The report is TRUE (the node did
+  `GET /x-medkit-watchdog` and the release. Once the release HAS happened it
+  holds, and that took fixing: a dying managed node loses its lifecycle services
+  from the snapshot a sweep before the App itself goes, and a node with no
+  managed record reads as a plain node, which is `kEarned`. The act of dying was
+  therefore erasing the measurement that disowned the node and walking the key
+  straight back in. A released key now waits for the graph to read `active`
+  again; the disappearance of what disowned it is not news that the node became
+  the presence detector's. The report is TRUE (the node did
   disappear); what the window costs is attribution, and where `require_active`
   names the node both codes stand, which the boundary already accepts elsewhere.
   Closing it would mean deciding at REPORT time, and that cannot be done from
