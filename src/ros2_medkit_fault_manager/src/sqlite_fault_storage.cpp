@@ -1354,9 +1354,9 @@ void SqliteFaultStorage::record_near_miss_locked(const std::string & fault_code,
     return;  // Unlimited
   }
 
-  // Evict oldest-first, keeping the newest max_near_misses_per_fault_ rows. Newest-first is the
-  // deliberate opposite of the snapshot limit's keep-earliest rule: a series frozen at boot
-  // answers nothing about whether the rate of near misses is changing.
+  // Evict oldest-first, keeping the newest max_near_misses_per_fault_ rows - the same direction as
+  // the snapshot and rosbag caps. A series frozen at boot answers nothing about whether the rate
+  // of near misses is changing.
   //
   // "Oldest" means earliest ARRIVAL (id), not earliest occurred_at_ns. Reporters carry their own
   // clocks, so a report can arrive with a timestamp behind one already stored; ordering eviction

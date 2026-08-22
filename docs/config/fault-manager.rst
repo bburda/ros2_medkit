@@ -112,9 +112,9 @@ fault cycle must not erase how often that code approached confirmation across cy
    * - ``near_miss.max_per_fault``
      - ``200``
      - Near-miss entries retained per fault code. When the bound is reached the **oldest**
-       entries are evicted - the opposite of ``snapshots.max_per_fault``, which keeps the
-       earliest, because a series frozen at boot says nothing about whether the rate of near
-       misses is changing. Set to 0 for unlimited, accepting growth with the reporting rate.
+       entries are evicted, the same direction as ``snapshots.max_per_fault`` and the rosbag cap:
+       a series frozen at boot says nothing about whether the rate of near misses is changing.
+       Set to 0 for unlimited, accepting growth with the reporting rate.
 
 .. note::
 
