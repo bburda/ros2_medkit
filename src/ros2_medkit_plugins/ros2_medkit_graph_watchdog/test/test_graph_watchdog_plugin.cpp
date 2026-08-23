@@ -116,11 +116,97 @@ class RaisingDetector : public ros2_medkit_graph_watchdog::Detector {
   }
 };
 
+// ---- The presence-view handoff: publisher, and one observer on each side of it ----------
+//
+// DetectorContext::presence_tracked is produced by the PLUGIN, from whichever emitting
+// detector exposes tracked_departure_keys(). Every other test of that seam stages the view by
+// hand, which cannot tell a working publication from a deleted one, so these three stand in for
+// the two real detectors and let the plugin do the work.
+
+/// Stands in for the presence class. Its key set GROWS inside its own tick(), which is what
+/// makes "pointer into live state" and "copy taken at one point" distinguishable from the
+/// outside: with a pointer, an observer that ticks before it and one that ticks after it read
+/// different contents on the same sweep.
+std::atomic<int> g_owner_ticks{0};
+
+class FakePresenceOwner : public ros2_medkit_graph_watchdog::Detector {
+ public:
+  std::string id() const override {
+    return "fake_owner";
+  }
+  void tick(ros2_medkit_graph_watchdog::DetectorContext & /*ctx*/) override {
+    keys_.insert("/grown_" + std::to_string(g_owner_ticks.fetch_add(1)));
+  }
+  const std::set<std::string> * tracked_departure_keys() const override {
+    return &keys_;
+  }
+
+ private:
+  std::set<std::string> keys_{"/seeded"};
+};
+
+/// What one observer saw, in sweep order: the Nth entry of two observers' logs belong to the
+/// same sweep, because the plugin ticks every detector once per sweep in registry order.
+struct ViewLog {
+  std::mutex mutex;
+  std::vector<std::optional<std::set<std::string>>> seen;
+};
+ViewLog g_view_before;
+ViewLog g_view_after;
+
+void record_view(ViewLog & log, const ros2_medkit_graph_watchdog::DetectorContext & ctx) {
+  std::lock_guard<std::mutex> lk(log.mutex);
+  if (ctx.presence_tracked == nullptr) {
+    log.seen.emplace_back(std::nullopt);
+  } else {
+    log.seen.emplace_back(*ctx.presence_tracked);
+  }
+}
+
+std::vector<std::optional<std::set<std::string>>> view_snapshot(ViewLog & log) {
+  std::lock_guard<std::mutex> lk(log.mutex);
+  return log.seen;
+}
+
+void reset_view_logs() {
+  {
+    std::lock_guard<std::mutex> lk(g_view_before.mutex);
+    g_view_before.seen.clear();
+  }
+  std::lock_guard<std::mutex> lk(g_view_after.mutex);
+  g_view_after.seen.clear();
+}
+
+class ViewObserverBefore : public ros2_medkit_graph_watchdog::Detector {
+ public:
+  std::string id() const override {
+    return "view_obs_before";
+  }
+  void tick(ros2_medkit_graph_watchdog::DetectorContext & ctx) override {
+    record_view(g_view_before, ctx);
+  }
+};
+
+class ViewObserverAfter : public ros2_medkit_graph_watchdog::Detector {
+ public:
+  std::string id() const override {
+    return "view_obs_after";
+  }
+  void tick(ros2_medkit_graph_watchdog::DetectorContext & ctx) override {
+    record_view(g_view_after, ctx);
+  }
+};
+
 REGISTER_DETECTOR(CountingDetector, "counting")
 REGISTER_DETECTOR(RaisingDetector, "raising")
 REGISTER_DETECTOR(ThrowingDetector, "throwing")
 REGISTER_DETECTOR(OffDetector, "offd")
 REGISTER_DETECTOR(ConfigCapturingDetector, "capturing")
+// Order matters here and nowhere else in this file: DetectorRegistry keeps its factories in a
+// vector, so these three tick in exactly this order and the owner sits BETWEEN its observers.
+REGISTER_DETECTOR(ViewObserverBefore, "view_obs_before")
+REGISTER_DETECTOR(FakePresenceOwner, "fake_owner")
+REGISTER_DETECTOR(ViewObserverAfter, "view_obs_after")
 
 }  // namespace
 
@@ -426,6 +512,183 @@ TEST_F(GraphWatchdogPluginTest, LifecycleRunsTickAndShutsDownCleanly) {
 
   exec.cancel();
   spin.join();
+}
+
+// ---- DetectorContext::presence_tracked, as the PLUGIN actually produces it ----------------
+
+namespace {
+/// Runs a real plugin until both observers have logged at least `sweeps` ticks. Returns their
+/// logs. node_death is turned OFF in every caller: it is linked into this binary, exposes a
+/// view of its own, and the publication loop takes the FIRST emitting detector that has one -
+/// which would make these tests depend on static-init order ACROSS translation units.
+std::pair<std::vector<std::optional<std::set<std::string>>>, std::vector<std::optional<std::set<std::string>>>>
+run_until_observed(rclcpp::Node::SharedPtr gateway_node, const nlohmann::json & detectors_config, std::size_t sweeps) {
+  reset_view_logs();
+  g_owner_ticks.store(0);
+
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  FakeContext ctx(gateway_node.get());
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(gateway_node);
+  std::thread spin([&exec] {
+    exec.spin();
+  });
+
+  nlohmann::json config{{"tick_interval_ms", 50}, {"detectors", detectors_config}};
+  config["detectors"]["node_death"] = {{"mode", "off"}};
+  plugin.configure(config);
+  plugin.set_context(ctx);
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (view_snapshot(g_view_before).size() >= sweeps && view_snapshot(g_view_after).size() >= sweeps) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  plugin.shutdown();
+  exec.cancel();
+  spin.join();
+  return {view_snapshot(g_view_before), view_snapshot(g_view_after)};
+}
+}  // namespace
+
+// The publication itself. Nothing in this test stages a view by hand, so deleting the plugin's
+// publication loop - or having it hand out a view the owning detector never produced - leaves
+// every observation null and fails here.
+TEST_F(GraphWatchdogPluginTest, ThePluginPublishesTheOwningDetectorsKeysToEveryDetector) {
+  const auto [before, after] = run_until_observed(gateway_node_, nlohmann::json::object(), 3);
+  ASSERT_GE(before.size(), 3u) << "the plugin never completed enough sweeps to observe a handoff";
+  ASSERT_GE(after.size(), 3u);
+
+  EXPECT_FALSE(before.front().has_value())
+      << "the very first sweep has no previous sweep to publish, so the view must be null there "
+         "rather than an empty set a reader would take for 'tracked nothing'";
+  ASSERT_TRUE(before[1].has_value()) << "the owner's key set never reached a detector at all - the plugin is not "
+                                        "publishing what tracked_departure_keys() returns";
+  EXPECT_EQ(before[1]->count("/seeded"), 1u) << "the published view is not the owner's own set";
+  ASSERT_TRUE(after[1].has_value());
+  EXPECT_EQ(after[1]->count("/seeded"), 1u);
+}
+
+// A SNAPSHOT, not a pointer into the owner's live set. The owner grows its set inside its own
+// tick(), and these two observers sit on either side of it in the registry: with a pointer they
+// read different contents on the same sweep, and which one a real detector gets would depend on
+// where it happens to be registered.
+TEST_F(GraphWatchdogPluginTest, EveryDetectorInASweepSeesTheSameViewWhateverItsRegistryPosition) {
+  const auto [before, after] = run_until_observed(gateway_node_, nlohmann::json::object(), 5);
+  ASSERT_GE(before.size(), 5u);
+  ASSERT_GE(after.size(), 5u);
+
+  const std::size_t sweeps = std::min(before.size(), after.size());
+  for (std::size_t i = 0; i < sweeps; ++i) {
+    ASSERT_EQ(before[i].has_value(), after[i].has_value()) << "sweep " << i
+                                                           << ": one side saw a view and the other "
+                                                              "did not";
+    if (before[i].has_value()) {
+      EXPECT_EQ(*before[i], *after[i])
+          << "sweep " << i
+          << ": the detector that ticks BEFORE the owner and the one that ticks AFTER it read "
+             "different contents, so what a detector sees depends on where it sits in the "
+             "registry - the view is a pointer into live state, not a snapshot";
+    }
+  }
+
+  // And the snapshot is genuinely refreshed, not frozen: the owner adds a key per tick, so a
+  // later sweep must see more than an earlier one. Without this, publishing a copy ONCE would
+  // satisfy the equality above.
+  ASSERT_TRUE(before[1].has_value() && before[sweeps - 1].has_value());
+  EXPECT_GT(before[sweeps - 1]->size(), before[1]->size())
+      << "the published view stopped tracking the owner's set after the first sweep";
+}
+
+// An Advisory owner speaks for nobody: it tracks keys it will never file a fault for, and a
+// reader treating that as "somebody has this covered" would hold back its own report.
+TEST_F(GraphWatchdogPluginTest, AnAdvisoryOwnersKeysAreNeverPublished) {
+  const auto [before, after] = run_until_observed(gateway_node_, {{"fake_owner", {{"mode", "advisory"}}}}, 3);
+  ASSERT_GE(before.size(), 3u);
+  ASSERT_GE(after.size(), 3u);
+  for (std::size_t i = 0; i < before.size(); ++i) {
+    EXPECT_FALSE(before[i].has_value()) << "sweep " << i
+                                        << ": an Advisory detector's tracked keys were published as "
+                                           "though somebody would report those departures";
+  }
+  for (std::size_t i = 0; i < after.size(); ++i) {
+    EXPECT_FALSE(after[i].has_value()) << "sweep " << i;
+  }
+  EXPECT_GT(g_owner_ticks.load(), 0) << "the Advisory detector never ticked, so this test never had a view to "
+                                        "exclude in the first place";
+}
+
+// And with no owner at all the view is null rather than an empty set: "nobody is tracking
+// anything" and "somebody is tracking nothing" select opposite behaviour in the reader.
+TEST_F(GraphWatchdogPluginTest, WithNoPresenceDetectorAtAllTheViewIsNull) {
+  const auto [before, after] = run_until_observed(gateway_node_, {{"fake_owner", {{"mode", "off"}}}}, 3);
+  ASSERT_GE(before.size(), 3u);
+  ASSERT_GE(after.size(), 3u);
+  for (std::size_t i = 0; i < before.size(); ++i) {
+    EXPECT_FALSE(before[i].has_value()) << "sweep " << i;
+  }
+  for (std::size_t i = 0; i < after.size(); ++i) {
+    EXPECT_FALSE(after[i].has_value()) << "sweep " << i;
+  }
+  EXPECT_EQ(g_owner_ticks.load(), 0) << "an Off detector must not be built into the active set at all";
+}
+
+// Plugin-scope integer keys are checked WIDE. JSON and ROS parameters both carry 64-bit
+// integers, so narrowing first lets a huge value wrap back into the accepted band and pass as
+// though the operator had asked for something legal. 4294967346 is 2^32 + 50: narrowed first it
+// becomes a perfectly plausible 50 ms cadence, which is why the retention window - the one
+// observable that reads tick_interval_ms_ without running the tick loop - is what this asserts
+// on rather than the absence of a log line.
+TEST_F(GraphWatchdogPluginTest, AnOutOfRangeTickIntervalIsRejectedRatherThanWrappedIntoTheBand) {
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  FakeContext ctx(gateway_node_.get());
+  plugin.configure(nlohmann::json{{"tick_interval_ms", 4294967346LL}});
+  plugin.set_context(ctx);  // load_parameters() runs here, not in configure()
+  plugin.shutdown();
+
+  // The default 1000 ms cadence: miss_grace defaults to 2 (its floor at this tick is 2), so
+  // prune_ticks = max(60, 3) = 60 and retention = 60 + 2 + 1.
+  EXPECT_EQ(plugin.compute_departed_retention_ticks_for_test(nlohmann::json::object()), 63)
+      << "tick_interval_ms=4294967346 was narrowed to 50 and accepted, so every window sized "
+         "from the cadence is sized for a configuration nobody asked for";
+}
+
+// Both ends of the band, against the same observable. The upper endpoint (INT_MAX) is
+// deliberately NOT asserted here: at any tick past 1500 ms the 3000 ms floor needs no ticks at
+// all, so its retention is arithmetically identical to the default's and the check could not
+// tell an applied value from an ignored one.
+TEST_F(GraphWatchdogPluginTest, TheTickIntervalBandIsEnforcedAtBothEnds) {
+  {  // the smallest accepted cadence, and it must genuinely take effect
+    ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+    FakeContext ctx(gateway_node_.get());
+    plugin.configure(nlohmann::json{{"tick_interval_ms", 1}});
+    plugin.set_context(ctx);
+    plugin.shutdown();
+    // A 1 ms tick needs 2999 ticks to span the 3000 ms floor, so miss_grace is raised from 2 to
+    // 2999: prune_ticks = max(60, 3000) = 3000, retention = 3000 + 2999 + 1.
+    EXPECT_EQ(plugin.compute_departed_retention_ticks_for_test(nlohmann::json::object()), 6000)
+        << "the low endpoint of the documented band was not applied";
+  }
+  {  // one below it, which must be refused and leave the default standing
+    ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+    FakeContext ctx(gateway_node_.get());
+    plugin.configure(nlohmann::json{{"tick_interval_ms", 0}});
+    plugin.set_context(ctx);
+    plugin.shutdown();
+    EXPECT_EQ(plugin.compute_departed_retention_ticks_for_test(nlohmann::json::object()), 63)
+        << "a zero cadence was accepted";
+  }
+  {  // and the negative that a narrowing read turns 2147483648 into
+    ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+    FakeContext ctx(gateway_node_.get());
+    plugin.configure(nlohmann::json{{"tick_interval_ms", 2147483648LL}});
+    plugin.set_context(ctx);
+    plugin.shutdown();
+    EXPECT_EQ(plugin.compute_departed_retention_ticks_for_test(nlohmann::json::object()), 63)
+        << "a value one past INT_MAX was not rejected on the wide integer";
+  }
 }
 
 TEST_F(GraphWatchdogPluginTest, FansOutTicksSkipsOffModeAndIsolatesThrowingDetector) {

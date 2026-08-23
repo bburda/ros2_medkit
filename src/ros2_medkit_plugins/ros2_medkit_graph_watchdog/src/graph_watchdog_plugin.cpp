@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <set>
 #include <string>
 #include <utility>
@@ -150,31 +151,34 @@ void GraphWatchdogPlugin::configure(const nlohmann::json & config) {
 
 void GraphWatchdogPlugin::load_parameters() {
   std::lock_guard<std::mutex> lock(config_mutex_);
-  if (config_.contains("tick_interval_ms") && config_["tick_interval_ms"].is_number_integer()) {
-    const int candidate = config_["tick_interval_ms"].get<int>();
-    if (candidate > 0) {
-      tick_interval_ms_ = candidate;
-    } else {
-      log_warn("ignoring non-positive tick_interval_ms=" + std::to_string(candidate) + "; keeping " +
-               std::to_string(tick_interval_ms_));
+  // Every read here is WIDE, range-checked, and only then narrowed. JSON (and the ROS
+  // parameters these values arrive from) carry 64-bit integers, so get<int>() first is an
+  // implementation-defined narrowing that lands a huge value back inside the accepted band:
+  // tick_interval_ms 4294968296 narrows to 1000 and passes "> 0" as though the operator had
+  // asked for the default, and 2147483648 narrows to a negative and is merely "ignored" with a
+  // warning naming a number nobody typed. compute_departed_retention_ticks() below already
+  // reads node_death's own miss_grace this way, for the identical reason.
+  const auto read_wide = [this](const char * key, std::int64_t lo, std::int64_t hi, int & out) {
+    if (!config_.contains(key) || !config_[key].is_number_integer()) {
+      return;
     }
-  }
-  if (config_.contains("warmup_cycles") && config_["warmup_cycles"].is_number_integer()) {
-    const int candidate = config_["warmup_cycles"].get<int>();
-    if (candidate >= 0) {
-      warmup_cycles_ = candidate;
-    } else {
-      log_warn("ignoring negative warmup_cycles=" + std::to_string(candidate));
+    const std::int64_t candidate = config_[key].get<std::int64_t>();
+    if (candidate >= lo && candidate <= hi) {
+      out = static_cast<int>(candidate);
+      return;
     }
-  }
-  if (config_.contains("prune_grace") && config_["prune_grace"].is_number_integer()) {
-    const int candidate = config_["prune_grace"].get<int>();
-    if (candidate >= 0) {
-      prune_grace_ = candidate;
-    } else {
-      log_warn("ignoring negative prune_grace=" + std::to_string(candidate));
-    }
-  }
+    log_warn("ignoring out-of-range " + std::string(key) + "=" + std::to_string(candidate) + " (accepted " +
+             std::to_string(lo) + ".." + std::to_string(hi) + "); keeping " + std::to_string(out));
+  };
+  // The bands are the ones this plugin already documented, now actually enforced: the only
+  // change is WHERE the value is checked, never which values are legal. INT_MAX is the real
+  // ceiling in each case - min_node_death_miss_grace() is written to stay defined right up to
+  // it, and a plugin-scope prune_grace is re-validated against each detector's own 0..3600
+  // before it takes effect anywhere.
+  constexpr std::int64_t kIntMax = std::numeric_limits<int>::max();
+  read_wide("tick_interval_ms", 1, kIntMax, tick_interval_ms_);
+  read_wide("warmup_cycles", 0, kIntMax, warmup_cycles_);
+  read_wide("prune_grace", 0, kIntMax, prune_grace_);
 }
 
 int GraphWatchdogPlugin::compute_departed_retention_ticks(const nlohmann::json & config_snapshot) const {
@@ -486,10 +490,38 @@ void GraphWatchdogPlugin::tick() {
     dctx.fault_client = fault_client_;
     dctx.snapshot = &snapshot;
     dctx.cancelled = &shutdown_requested_;
+    dctx.presence_tracked = presence_tracked_valid_ ? &presence_tracked_ : nullptr;
     try {
       detector->tick(dctx);
     } catch (const std::exception & e) {
       log_error("detector '" + detector->id() + "' threw: " + e.what());
+    }
+  }
+
+  // COPIED at one defined point: after every detector has ticked, so the content is the owner's
+  // set as it stood at the END of this sweep. A pointer into that set would not be a view at all
+  // - the owner mutates it inside its own tick(), so a reader registered before it would see the
+  // previous tick's contents and one registered after would see this tick's, which is exactly
+  // the registry-order dependence this seam exists to remove. The end of the sweep is the right
+  // point because it is the only one at which no detector is mid-update: taking it at the start
+  // would publish the same content one tick later without removing the hazard, since a reader
+  // still cannot tell whether the owner has run yet. Cost is one string-set copy per tick, sized
+  // by the live graph.
+  //
+  // Only a detector that will actually REPORT a departure may speak for the presence class: one
+  // running Advisory or Off tracks keys it will never raise for, and a reader treating that as
+  // "somebody has this covered" would hold back its own report for a fault nobody is going to
+  // file.
+  presence_tracked_.clear();
+  presence_tracked_valid_ = false;
+  for (const auto & [detector, mode] : detectors_) {
+    if (!mode_emits(mode)) {
+      continue;
+    }
+    if (const auto * keys = detector->tracked_departure_keys()) {
+      presence_tracked_ = *keys;
+      presence_tracked_valid_ = true;
+      break;
     }
   }
 }

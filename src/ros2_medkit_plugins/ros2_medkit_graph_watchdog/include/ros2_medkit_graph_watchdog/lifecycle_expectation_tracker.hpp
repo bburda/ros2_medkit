@@ -137,20 +137,6 @@ struct LifecycleMatch {
   std::string entry;  ///< the require_active entry that matched
   std::string fqn;    ///< the node's stable App::effective_fqn()
   std::optional<std::string> state;
-  /// Whether the presence detector will OWN this node's departure. Narrower than "may
-  /// raise": it needs the node's lifecycle state either known not to be a managed-non-active
-  /// one or asked for as often as it ever will be, so a managed node whose state has not
-  /// been read YET answers false here even though the gate would permit it to raise - and
-  /// answers true again once the watcher has stopped asking, since nothing else would report
-  /// that node at all. It also carries the caller's own online check, because node_death
-  /// skips an app that is not online before it consults the gate. Read off the gate and the
-  /// snapshot by the caller, not re-derived here: it composes warmup, the lifecycle watcher's
-  /// record and its re-seed budget, none of which this header has access to or may
-  /// reimplement. Defaults true - the narrower of the two behaviours
-  /// NodeState::ever_armed then selects between - so a caller that does not wire this
-  /// through keeps the already-shipped absence handling rather than silently gaining a new
-  /// reporting path.
-  bool armed = true;
 };
 
 /// The one observed fact this whole state machine runs on: what a MATCHED node's read
@@ -227,7 +213,13 @@ struct LifecycleExpectationReport {
   /// decision itself, which is `!pending.empty()`. A node can appear in more than one
   /// (e.g. a held violation streak while ALSO climbing the unmeasured clock), so these are
   /// not a partition and must not be summed against `pending.size()`.
-  std::set<std::string> pending_violation;    ///< below-grace violation streak
+  std::set<std::string> pending_violation;  ///< below-grace violation streak
+  /// The subset of `pending_violation` whose nodes have LEFT the graph (absence past the blink
+  /// tolerance). Split out for the withheld-clear log line only: the release conditions a
+  /// present node's hold has - reading active, or the streak crossing grace - are both
+  /// unreachable for a departed one, whose streak absence HOLDS rather than advances, so
+  /// telling an operator to wait for either would point at something that cannot happen.
+  std::set<std::string> pending_violation_departed;
   std::set<std::string> pending_unreadable;   ///< unmeasured clock climbing, cause kUnreadable
   std::set<std::string> pending_not_managed;  ///< unmeasured clock climbing, cause kNotManaged
 
@@ -326,17 +318,14 @@ struct LifecycleExpectationReport {
 ///   still naming a node that is no longer there. That is the honest reading of the
 ///   expectation the operator wrote: the node must be ACTIVE, it was not and was already
 ///   said so, and now it is gone too.
-/// - settled kInactive, NOT YET REPORTED (streak at or below `grace`), on a node that WAS
-///   ARMED at some point (`NodeState::ever_armed`): the streak is HELD, neither advanced
-///   nor erased. Maturing it here would raise GRAPH_NODE_INACTIVE from ticks gathered while
-///   the node could not be observed at all - evidence the operator's own graph never
-///   witnessed - and the presence detector is ABLE to report this exact departure instead:
-///   node_death tracks any node the gate has admitted for presence OWNERSHIP at least once
-///   (NodeLivenessTracker's own "a key becomes TRACKED the first time it is armed"), so
-///   starting a NEW violation from a departure nobody here could watch is its job, not this
-///   one's. The entry keeps what it already earned, so a node that RETURNS still inactive
-///   resumes its streak rather than re-earning `grace` from zero.
-/// - settled kInactive, NOT YET REPORTED, on a node that was NEVER armed: the streak keeps
+/// - settled kInactive, NOT YET REPORTED (streak at or below `grace`), on a node the presence
+///   detector is CURRENTLY tracking (its fqn is in the `presence_owned` set update() is given
+///   this tick): the streak is HELD, neither advanced nor erased. Maturing it here would raise
+///   GRAPH_NODE_INACTIVE from ticks gathered while the node could not be observed at all -
+///   evidence the operator's own graph never witnessed - and that detector is ABLE to report
+///   this exact departure instead. The entry keeps what it already earned, so a node that
+///   RETURNS still inactive resumes its streak rather than re-earning `grace` from zero.
+/// - settled kInactive, NOT YET REPORTED, on a node nobody is tracking: the streak keeps
 ///   climbing on absence exactly as it would on a present tick. The reasoning above
 ///   inverts: node_death only ever tracks a node the gate has admitted for presence
 ///   ownership at least once, so one that never reached that bar is structurally invisible
@@ -494,15 +483,24 @@ class LifecycleExpectationTracker {
     return nodes_.size();
   }
 
-  LifecycleExpectationReport update(const std::vector<LifecycleMatch> & matches) {
+  /// `presence_owned`, when given, is the presence detector's CURRENT set of tracked departure
+  /// keys (fqns), as published by the plugin for this tick. It is consulted, never latched: the
+  /// stickiness this class used to keep for itself lives in that detector's own tracker, which
+  /// keeps a key from its first admitted tick onward, and a second copy here could only ever
+  /// disagree with it. Null (or absent) means nobody has claimed anything, which selects the
+  /// path that keeps reporting - see the kInactive case in the absence loop.
+  LifecycleExpectationReport update(const std::vector<LifecycleMatch> & matches,
+                                    const std::set<std::string> * presence_owned = nullptr) {
     LifecycleExpectationReport report;
+    const auto presence_owns = [presence_owned](const std::string & fqn) {
+      return presence_owned != nullptr && presence_owned->count(fqn) > 0;
+    };
 
     // Collapse the per-(entry, node) matches to one record per NODE before any clock
     // moves - see "Keyed by node, not by config entry" above.
     struct NodeTick {
       std::vector<std::string> entries;  ///< every entry that named this node, in match order
       std::optional<std::string> state;  ///< the label enforced for it this tick
-      bool armed = false;                ///< whether the gate allowed a raise for this node on THIS tick
     };
     std::set<std::string> matched_entries;
     std::map<std::string, NodeTick> nodes;
@@ -522,11 +520,6 @@ class LifecycleExpectationTracker {
           observed_rank(classify_observed_state(match.state)) > observed_rank(classify_observed_state(node.state))) {
         node.state = match.state;
       }
-      // Same app.id, same tick, so every duplicate match necessarily carries the same
-      // arming fact in practice - OR rather than overwrite only so a future caller that
-      // ever legitimately disagrees cannot make this node look LESS armed than any one
-      // match already said it was.
-      node.armed = node.armed || match.armed;
     }
 
     // Clocks that cross their bound on THIS tick. Collected here rather than pushed
@@ -548,13 +541,6 @@ class LifecycleExpectationTracker {
       NodeState & node = *tracked;
       node.absent_ticks = 0;
       node.entries = node_tick.entries;  // refreshed on every matched tick, held through a blink
-      // Sticky: once the gate has admitted this node for presence OWNERSHIP on any one tick,
-      // the presence detector could have picked up its departure from that tick onward, for
-      // the rest of this node's life - see NodeState::ever_armed. Latching the stricter fact
-      // is what lets a node that went active, deactivated and then died stay node_death's,
-      // while one whose state was never measured at all never becomes its.
-      node.ever_armed = node.ever_armed || node_tick.armed;
-
       const LifecycleObservedState state = classify_observed_state(node_tick.state);
       switch (state) {
         case LifecycleObservedState::kActive:
@@ -640,23 +626,23 @@ class LifecycleExpectationTracker {
             // it exactly like any other tick would (advance_violation_streak() no-ops past
             // `grace` regardless, see its own "frozen one past itself"), so this call only
             // documents that maturity, once earned, survives a departure. Second,
-            // `!node.ever_armed`: who ELSE could ever report this node's departure. A node
-            // the presence detector could have tracked (admitted for ownership at least
-            // once) needs no help from here even below grace: maturing it would raise
+            // `!presence_owns(fqn)`: who ELSE could report this node's departure, asked
+            // fresh every tick rather than remembered. A node the presence detector is
+            // tracking RIGHT NOW needs no help from here even below grace: maturing it
+            // would raise
             // GRAPH_NODE_INACTIVE from ticks gathered while nobody could observe the node,
-            // evidence the presence detector owns instead (node_death tracks any node the
-            // gate has admitted for ownership at least once - NodeLivenessTracker's own "a
-            // key becomes TRACKED the first time it is armed") - so the streak is left
+            // evidence the presence detector owns instead - so the streak is left
             // untouched: neither advanced (no fault born from an absence the presence class
             // will report anyway) nor erased (a node that RETURNS still inactive resumes
-            // from here rather than re-earning `grace` from zero). A node that was never
-            // admitted is structurally invisible to the presence detector no matter what
-            // happens to it afterwards - a managed node whose lifecycle state was never
-            // measured is one of them, since ownership needs the state positively known -
-            // so nothing else in the plugin will ever report this departure either: absence
-            // keeps advancing the streak for it exactly as a present tick would, the same
-            // way it already does for a still-climbing unmeasured clock below.
-            if (is_content(node) || !node.ever_armed) {
+            // from here rather than re-earning `grace` from zero). Membership is READ, never
+            // latched, and that is the whole point: a key the presence detector has given
+            // back (a provisional admission its label later disowned), reclaimed (a durably
+            // suppressed death it will file nothing for) or collapsed under its cap is no
+            // longer owned by anybody, and a latch cannot represent any of those - it would
+            // hold the streak for a departure nothing is going to report. When nobody owns
+            // the key, absence keeps advancing the streak exactly as a present tick would,
+            // the same way it already does for a still-climbing unmeasured clock below.
+            if (is_content(node) || !presence_owns(fqn)) {
               advance_violation_streak(node, fqn, crossed_violation);
             }
             break;
@@ -714,6 +700,9 @@ class LifecycleExpectationTracker {
       if (node.violation_streak > 0 && report.affected.count(fqn) == 0) {
         report.pending.insert(fqn);
         report.pending_violation.insert(fqn);
+        if (departed) {
+          report.pending_violation_departed.insert(fqn);
+        }
       }
       if (node.unmeasured_clock > 0) {
         report.pending.insert(fqn);
@@ -782,17 +771,6 @@ class LifecycleExpectationTracker {
     /// restart loop, the case this detector most exists to catch) would have its clock
     /// released on every absence and never mature.
     bool ever_measured = false;
-    /// Whether the reliability gate has admitted this node for presence OWNERSHIP on at
-    /// least one matched tick, ever. Sticky: once true it stays true, because the fact it
-    /// stands in for - "the presence detector could report this node's departure" - is
-    /// itself sticky (NodeLivenessTracker tracks a key from its first admitted tick onward,
-    /// regardless of its arm state afterwards). Read here rather than re-derived from
-    /// `settled_observed` or the live label: this node's LIFECYCLE state alone cannot say
-    /// whether the gate admitted it, since admission also needs warmup, which this class
-    /// does not track - guessing from state would either miss a warming-up node that later
-    /// arms, or wrongly treat a node this class never measured active as owned. See the
-    /// absence loop's kInactive case for the one place this decides anything.
-    bool ever_armed = false;
     /// The label of the last kInactive observation, already trimmed to
     /// kMaxLifecycleLabelChars. Kept because the detail for a CONFIRMED violation names the
     /// state the node is stuck in, and absence carries no label of its own to name. Cleared
@@ -894,11 +872,11 @@ class LifecycleExpectationTracker {
   /// absence advances it every tick and nothing can reset it any more, so it would have
   /// matured under that cause within a bounded number of ticks anyway, and dropping it
   /// instead would let freeing a slot heal a fault. A violation streak counts only once it
-  /// has already matured (past `grace`): for a node the presence detector could also have
-  /// reported (`ever_armed`), absence does not keep advancing a streak that has not yet
+  /// has already matured (past `grace`): for a node the presence detector is tracking,
+  /// absence does not keep advancing a streak that has not yet
   /// matured (see the kInactive case in update()'s absence loop), so counting one that had
   /// not crossed `grace` would fabricate a violation the node never earned. The below-grace
-  /// streak of a node the presence detector could never own is the one case where that is
+  /// streak of a node nobody is tracking is the one case where that is
   /// not true - absence keeps
   /// advancing it too, so left alone it would eventually mature the same way a climbing
   /// unmeasured clock does - but this tally still leaves it uncounted rather than folding

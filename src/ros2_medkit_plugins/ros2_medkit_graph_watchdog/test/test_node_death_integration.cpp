@@ -52,6 +52,7 @@ using ros2_medkit_graph_watchdog::Detector;
 using ros2_medkit_graph_watchdog::DetectorContext;
 using ros2_medkit_graph_watchdog::DetectorMode;
 using ros2_medkit_graph_watchdog::DetectorRegistry;
+using ros2_medkit_graph_watchdog::PresenceOwnership;
 using ros2_medkit_graph_watchdog::ReliabilityGate;
 using ros2_medkit_graph_watchdog::graph_fault_codes::kNodeDisappeared;
 using ReportFault = ros2_medkit_msgs::srv::ReportFault;
@@ -1149,6 +1150,155 @@ TEST_F(NodeDeathIntegrationTest, RestartedInstanceNeverClearsAFaultItDidNotRaise
          "never came back";
   EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), 0u)
       << "nothing died here, so nothing may be reported either";
+}
+
+// What re-admits a key the detector has just handed back, and why the handover does not hold
+// without this: a dying managed node loses its lifecycle SERVICES from the snapshot, and a node
+// with no managed record reads as a plain node - which is kEarned. So the very act of dying
+// erases the measurement that disowned the node, and the key walks straight back in on the tick
+// before it departs.
+//
+// The sequence is the production one, driven here where it can be made exact: provisional
+// admission, a late non-active label, the release, then a sweep that still carries the App but
+// no longer carries its get_state service, then the departure.
+// The crash loop, which the README calls the case this detector most exists for. A managed node
+// that was measured active, died, and was reported comes back the way a respawned lifecycle
+// node always comes back: at "unconfigured", because nothing re-drives it. That reads kDisowned,
+// and the hand-back consults earned_ - which had been pruned to the PRESENT graph while the node
+// was away, so its earned ground was gone and the key was handed back. The fault healed on the
+// return, correctly, and then the detector was tracking nothing: the second death, and every one
+// after it, went unreported.
+//
+// earned_ is bookkeeping that belongs to a tracked KEY, so it has to live as long as the tracker
+// keeps that key - which is what NodeLivenessTracker::known_keys() is for, and what bounds it.
+TEST_F(NodeDeathIntegrationTest, AnEarnedKeyKeepsItsGroundAcrossTheOutageSoTheNextDeathIsReported) {
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}});  // floor(3000ms) == 0
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("looper"), anchor_app()});
+  gate.update(snapshot_, 0);
+  gate.set_lifecycle_state_for_test("looper", "active");
+  det->tick(ctx);  // measured active: earned, admitted
+  ASSERT_EQ(gate.presence_ownership("looper"), PresenceOwnership::kEarned);
+
+  set_apps({anchor_app()});  // first death
+  gate.update(snapshot_, 1);
+  det->tick(ctx);
+  std::this_thread::sleep_for(50ms);
+  const auto after_first = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
+  ASSERT_GT(after_first, 0u) << "the first death was never reported, so there is no loop here yet";
+
+  // It respawns, and a respawned lifecycle node reads unconfigured until something activates it.
+  set_apps({app_of("looper"), anchor_app()});
+  gate.update(snapshot_, 2);
+  gate.set_lifecycle_state_for_test("looper", "unconfigured");
+  det->tick(ctx);
+  det->tick(ctx);  // a second tick: the outage-era miss count is cleared by now
+
+  set_apps({anchor_app()});  // and it crashes again
+  gate.update(snapshot_, 3);
+  det->tick(ctx);
+  std::this_thread::sleep_for(50ms);
+  EXPECT_GT(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), after_first)
+      << "the second death of a crash-looping node was reported by nobody - the key was handed "
+         "back on the respawn because its earned ground had been pruned during the outage, and "
+         "a detector that reports the first death and then goes quiet is the failure this one "
+         "exists to prevent";
+}
+
+// The other side of AReleasedKeyIsNotReAdmittedWhenItsLifecycleRecordVanishes below: the
+// refusal is a WINDOW, not a life sentence. A node that stops being managed - drops its
+// lifecycle services and keeps running as an ordinary node - shows the same "no record at all"
+// shape a dying one does, and holding the refusal for as long as that lasts would leave its
+// eventual death reported by nobody: this detector has no key for it, and lifecycle_expectation
+// only ever looks at require_active entries. Past miss_grace + 1 record-less PRESENT ticks -
+// this detector's own "absent this long means dead" window, which a genuinely dying node cannot
+// outlive - the key comes back.
+TEST_F(NodeDeathIntegrationTest, AReleasedKeyIsTakenBackOnceItOutlivesTheDeathWindowWithoutARecord) {
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}});  // floor(3000ms) == 0, so the hold is 1 tick
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("victim"), anchor_app()});
+  gate.update(snapshot_, 0);
+  gate.set_lifecycle_state_for_test("victim", "", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kProvisional);
+  det->tick(ctx);  // admitted provisionally
+
+  gate.set_lifecycle_state_for_test("victim", "inactive", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kDisowned);
+  det->tick(ctx);  // handed back
+
+  // The record goes while the node stays ONLINE and present - the shape this detector must not
+  // read as "the node became mine", for one window.
+  gate.update(snapshot_, 1);
+  ASSERT_FALSE(gate.lifecycle_state_of("victim").has_value());
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kEarned)
+      << "with no record at all the gate must answer kEarned here, or the branch under test is "
+         "never reached";
+  det->tick(ctx);  // inside the window: still refused
+
+  // And now it outlives the window while still present, which no dying node can do.
+  det->tick(ctx);
+  det->tick(ctx);
+
+  set_apps({anchor_app()});
+  gate.update(snapshot_, 2);
+  const auto failed_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
+  det->tick(ctx);  // misses(1) > miss_grace(0)
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_GT(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
+      << "a node that stopped being managed and then died was reported by nobody - this detector "
+         "refused it for the rest of its life over a lifecycle record that had been gone for "
+         "longer than any death takes";
+}
+
+TEST_F(NodeDeathIntegrationTest, AReleasedKeyIsNotReAdmittedWhenItsLifecycleRecordVanishes) {
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}});  // floor(3000ms) == 0
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("victim"), anchor_app()});
+  gate.update(snapshot_, 0);
+  // Injected AFTER the update: a service-less app is dropped from the watcher by every update,
+  // so an entry staged before it would not survive to be read.
+  gate.set_lifecycle_state_for_test("victim", "", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kProvisional)
+      << "the key has to be admitted on PROVISIONAL grounds, or there is nothing here to hand "
+         "back and the sequence below tests nothing";
+  det->tick(ctx);  // admits it
+
+  gate.set_lifecycle_state_for_test("victim", "inactive", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kDisowned);
+  det->tick(ctx);  // hands it back
+
+  // The node begins to die. Its services leave the snapshot while the App is still in it, so
+  // the watcher drops the record - and the gate, seeing no lifecycle at all, answers kEarned.
+  gate.update(snapshot_, 1);
+  ASSERT_FALSE(gate.lifecycle_state_of("victim").has_value())
+      << "the watcher must have dropped the record here, or this test is not driving the sweep "
+         "that erases the disowning measurement";
+  ASSERT_TRUE(gate.allows_raise("victim"));
+  det->tick(ctx);
+
+  set_apps({anchor_app()});  // and now the App itself goes
+  gate.update(snapshot_, 2);
+  const auto failed_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
+  det->tick(ctx);  // misses(1) > miss_grace(0)
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
+      << "the key was handed back to lifecycle_expectation and then reported dead anyway - "
+         "losing a lifecycle record is not a measurement that the node became this detector's, "
+         "it is the loss of the one that said it was not";
 }
 
 TEST_F(NodeDeathIntegrationTest, ClearFlowsOnceThisInstanceHasGenuinelyRaised) {

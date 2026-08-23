@@ -645,7 +645,11 @@ def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, 
     deadline = time.monotonic() + timeout
     status = None
     last_count = None
-    streak_start = None
+    # Seeded, not left None: the first sample can legitimately BE None (the route not up yet, or
+    # answering without a block for this detector), and None == last_count then takes the elif
+    # on the very first pass - which used to subtract from None and raise TypeError, turning an
+    # unrelated slow start into an error rather than a wait.
+    streak_start = time.monotonic()
     while time.monotonic() < deadline:
         now = time.monotonic()
         status = watchdog_detector_status(port, detector_id)
@@ -653,7 +657,10 @@ def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, 
         if count != last_count:
             last_count = count
             streak_start = now
-        elif now - streak_start >= stable_seconds:
+        elif count is not None and now - streak_start >= stable_seconds:
+            # A route that never answers holds None steady forever; that is not a settled
+            # count, it is an absent one, and calling it stable would hand the caller a
+            # baseline it never read.
             return status, True
         time.sleep(interval)
     return status, False
@@ -1414,10 +1421,10 @@ class TestNodeDeathRestartRebaseline(unittest.TestCase):
         old_pid = gateway_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
         self.assertTrue(
-            _wait_until_port_is_down(PORT, timeout=60.0),
+            _wait_until_port_is_down(PORT, timeout=60.0 * TIME_SCALE),
             f'the gateway (pid {old_pid}) kept answering after SIGTERM - nothing restarted')
         self.assertTrue(
-            wait_until_watchdog_armed(PORT, timeout=90.0),
+            wait_until_watchdog_armed(PORT, timeout=90.0 * TIME_SCALE),
             'the gateway never came back armed after the restart')
         self.assertNotEqual(
             gateway_node.process_details['pid'], old_pid,
