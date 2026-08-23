@@ -802,6 +802,16 @@ if(BUILD_TESTING)
     ENV "GATEWAY_TEST_PORT=19430" "WATCHDOG_E2E_SCENARIO=lifecycle_clean_shutdown"
       "${_WATCHDOG_E2E_ENV}")
 
+  # The control for the row above, and the same launch minus one config key, so it carries the
+  # same budget: the suppressed row's "the clean node is never named" cannot tell a working
+  # suppressor from a key node_death never admitted, and this one does by requiring that name.
+  medkit_add_launch_test(test_node_death_suppression_e2e_lifecycle_clean_shutdown_unsuppressed
+    test/e2e/test_node_death_suppression_e2e.test.py TIMEOUT 720
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19610"
+      "WATCHDOG_E2E_SCENARIO=lifecycle_clean_shutdown_unsuppressed"
+      "${_WATCHDOG_E2E_ENV}")
+
   # 60 (arming, app_id-scoped) + 30 (departure poll) + 60 (raise poll) = 150 internal. Rounded
   # to 240 to also cover the launch's own teardown for TWO processes.
   medkit_add_launch_test(test_node_death_suppression_e2e_suppression_is_opt_in

@@ -316,13 +316,16 @@ def generate_test_description():
         # this specific string is a placeholder for the framework's second mechanism rather
         # than a malformed entry.
         detector_params[f'{_NODE_DEATH_PREFIX}.suppress'] = ['lifecycle']
-    elif SCENARIO == 'lifecycle_clean_shutdown':
+    elif SCENARIO in ('lifecycle_clean_shutdown', 'lifecycle_clean_shutdown_unsuppressed'):
         detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [CLEAN_NODE, KILLED_NODE]
         detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = LIFECYCLE_GRACE
-        # Suppression is opt-in by ruling: without naming the self-suppression mechanism here,
-        # a correct detector reports BOTH departed nodes, and this scenario's own "the clean one
-        # is never named" half would be false against a correct implementation.
-        detector_params[f'{_NODE_DEATH_PREFIX}.suppress'] = ['lifecycle']
+        if SCENARIO == 'lifecycle_clean_shutdown':
+            # Suppression is opt-in by ruling: without naming the self-suppression mechanism
+            # here, a correct detector reports BOTH departed nodes, and this scenario's own "the
+            # clean one is never named" half would be false against a correct implementation.
+            # The paired _unsuppressed scenario differs in this key and NOTHING else, which is
+            # what lets it stand in for the admission this row cannot observe directly.
+            detector_params[f'{_NODE_DEATH_PREFIX}.suppress'] = ['lifecycle']
     elif SCENARIO == 'suppression_is_opt_in':
         detector_params[f'{_NODE_DEATH_PREFIX}.allowlist'] = [TARGET_NODE]
         # No 'suppress' key at all - the whole point of this scenario.
@@ -352,7 +355,7 @@ def generate_test_description():
         launch_description.add_action(TimerAction(period=2.0, actions=[second]))
         context['second_node'] = second
 
-    if SCENARIO == 'lifecycle_clean_shutdown':
+    if SCENARIO in ('lifecycle_clean_shutdown', 'lifecycle_clean_shutdown_unsuppressed'):
         # auto_activate: the suppressor is only ever consulted for a key node_death ADMITTED,
         # and it admits a managed node only once the graph has measured it active. A fixture
         # that never activates is refused before the suppressor exists, so the row that names
@@ -703,6 +706,102 @@ class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
             duration=SUSTAINED_WINDOW_SEC)
 
 
+class TestSuppressionLifecycleCleanShutdownUnsuppressed(unittest.TestCase):
+    """The control for the row above: without `suppress`, the cleanly shut-down node IS named.
+
+    The suppressed row cannot prove what it most needs to. Its positive claim is about
+    KILLED_NODE and its negative claim is that CLEAN_NODE is never named - and "never named" is
+    equally true of a node the presence detector never ADMITTED, so an implementation that
+    admits only the node it is going to report would pass it. The settled tracked_count that row
+    waits on is an aggregate: it says some number of keys is being tracked, never which.
+
+    This scenario is the same launch with `detectors.node_death.suppress` removed and nothing
+    else changed. It drives CLEAN_NODE down the identical deactivate/cleanup/shutdown walk and
+    kills both processes the same way, and requires BOTH names in the description. A key that
+    was never admitted cannot be named whatever the suppression configuration, so the pair
+    together says what neither says alone: CLEAN_NODE entered node_death's tracked set, and the
+    suppressor - not an absent admission - is what keeps it out of the fault.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rclpy.init()
+        cls._client_node = Node('node_death_suppression_e2e_unsuppressed_client')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._client_node.destroy_node()
+        rclpy.shutdown()
+
+    def test_without_the_suppressor_the_clean_node_is_named_too(self, clean_node, killed_node):
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
+            'graph_watchdog never reported an armed global state')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        for node_id in (CLEAN_NODE, KILLED_NODE):
+            self.assertIsNotNone(
+                _poll_watchdog_entity(PORT, node_id, 'active', timeout=ARM_TIMEOUT_SEC),
+                f'{node_id} never reached "active" - node_death only admits a managed node the '
+                'graph has measured active, so this control would be measuring the same '
+                'never-admitted key the suppressed row cannot rule out',
+            )
+
+        # Same gate as the suppressed row, for the same reason: the route's label is the
+        # watcher's and moves the instant a transition_event lands, while admission happens on
+        # node_death's own next tick.
+        _, admitted = _poll_stable_tracked_count(
+            PORT, DETECTOR_ID_NODE_DEATH, timeout=ARM_TIMEOUT_SEC, stable_seconds=3.0)
+        self.assertTrue(
+            admitted,
+            "node_death's tracked_count never settled while both fixtures were active")
+
+        change_state_service = f'/{CLEAN_NODE}/change_state'
+        for transition_id, reached in (
+                (Transition.TRANSITION_DEACTIVATE, 'inactive'),
+                (Transition.TRANSITION_CLEANUP, 'unconfigured'),
+                (Transition.TRANSITION_UNCONFIGURED_SHUTDOWN, 'finalized')):
+            self.assertTrue(
+                _call_change_state_once(
+                    type(self)._client_node, change_state_service, transition_id, timeout=30.0),
+                f'the real transition {transition_id} on {CLEAN_NODE} was rejected or never '
+                'answered, so this control is not driving the same shutdown the suppressed row '
+                'does',
+            )
+            self.assertIsNotNone(
+                _poll_watchdog_entity(PORT, CLEAN_NODE, reached, timeout=30.0),
+                f'{CLEAN_NODE} never read as "{reached}" after transition {transition_id}',
+            )
+
+        os.kill(clean_node.process_details['pid'], signal.SIGTERM)
+        os.kill(killed_node.process_details['pid'], signal.SIGTERM)
+        for node_id in (CLEAN_NODE, KILLED_NODE):
+            self.assertTrue(
+                _poll_apps_absent(PORT, node_id, timeout=DEPARTURE_TIMEOUT_SEC),
+                f'{node_id} never left GET /apps after SIGTERM')
+
+        fault = poll_faults(PORT, FAULT_CODE, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(f'{FAULT_CODE} never raised after both fixtures exited')
+
+        # BOTH, sustained. The clean one being named here is the whole point: it proves the key
+        # was in the tracked set all along, which is what the suppressed row's silence cannot
+        # distinguish from a key that was never there.
+        description = fault.get('description', '')
+        self.assertIn(
+            CLEAN_NODE, description,
+            f'{CLEAN_NODE} shut down cleanly and departed, and with no suppressor configured it '
+            f'was still not named (description: {description!r}) - node_death never admitted '
+            'that key, so the suppressed row proves nothing about self-suppression',
+        )
+        assert_fault_describes_only(
+            self, PORT, FAULT_CODE,
+            required=[CLEAN_NODE, KILLED_NODE], forbidden=[],
+            duration=SUSTAINED_WINDOW_SEC)
+
+
 class TestSuppressionOptIn(unittest.TestCase):
     """An allowlist entry with no `suppress` key at all does not suppress by itself."""
 
@@ -818,6 +917,7 @@ _SCENARIO_CASES = {
     'allowlist_suppresses': 'TestSuppressionAllowlistSuppresses',
     'allowlist_not_named_is_inert': 'TestSuppressionAllowlistNotNamedIsInert',
     'lifecycle_clean_shutdown': 'TestSuppressionLifecycleCleanShutdown',
+    'lifecycle_clean_shutdown_unsuppressed': 'TestSuppressionLifecycleCleanShutdownUnsuppressed',
     'suppression_is_opt_in': 'TestSuppressionOptIn',
     'prune_no_false_heal': 'TestSuppressionPruneNoFalseHeal',
 }

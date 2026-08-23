@@ -429,15 +429,15 @@ at all this tick is ABSENT, a fact separate from any observed state (there is no
 classify). For up to ``absence_grace`` (a fixed 3 ticks) consecutive absent ticks a node's
 whole state is held unchanged - the blink tolerance. Past ``absence_grace`` absence resets
 nothing, but what it ADVANCES depends on whether the node's SETTLED observation is already
-CONTENT, and - for a below-grace violation streak only - on whether the presence detector ever
-OWNED the node: a settled-``INACTIVE`` node ALREADY reported under ``GRAPH_NODE_INACTIVE``
-keeps its streak exactly as it was, so the fault stays raised, regardless of ownership. One not
-yet past ``grace`` splits on that fact: a node the presence detector COULD have tracked
-(admitted for ownership at least once) is HELD - neither advanced (no fault born from evidence
-gathered while nobody could observe the node, since ``node_death`` is able to report this exact
-departure instead) nor erased (it
-resumes rather than restarts on return) - while a node the presence detector could NEVER have
-tracked keeps climbing on absence exactly as it would on a present tick, because nothing else
+CONTENT, and - for a below-grace violation streak only - on whether the presence detector is
+CURRENTLY tracking the node: a settled-``INACTIVE`` node ALREADY reported under
+``GRAPH_NODE_INACTIVE`` keeps its streak exactly as it was, so the fault stays raised,
+regardless of ownership. One not yet past ``grace`` splits on that fact, read every tick from
+the key set ``node_death`` publishes and never remembered: a node in that set is HELD - neither
+advanced (no fault born from evidence gathered while nobody could observe the node, since
+``node_death`` is tracking this exact departure) nor erased (it
+resumes rather than restarts on return) - while a node outside it keeps climbing on absence
+exactly as it would on a present tick, because nothing else
 in the plugin will ever report its departure either. A settled-``UNREADABLE``/``NOT_MANAGED``
 node keeps climbing its unmeasured clock under that same cause regardless of maturity or
 ownership - that clock's own absence behaviour is unrelated to this distinction. A
@@ -505,20 +505,29 @@ between the label reaching the status route and the release). A withdrawal that 
 is final, which needed its own guard: a dying managed node loses its lifecycle services from
 the snapshot before it loses its App entry, and a node with no managed record answers
 ``kEarned`` - so dying erased the very measurement that disowned the node and re-admitted the
-key on the tick before it departed. A released key is therefore readmitted only on a label
-reading ``active``, never on the absence of a label. It is a mis-attribution of a TRUE
+key on the tick before it departed. A released key is therefore readmitted on a label
+reading ``active``, never on the mere absence of a label - but the refusal runs for a bounded
+window rather than the node's whole life: after ``miss_grace + 1`` consecutive record-less
+PRESENT ticks (this detector's own "absent this long means dead" span, already floored to
+``kMinNodeDeathWindowMs`` of wall clock) the key is taken back, because a node still present
+past that window is not mid-death, it has simply stopped being managed - and holding the
+refusal open would leave its eventual death reported by nobody at all. It is a mis-attribution of a TRUE
 report, not a false positive, and it cannot be closed at report time: the departed record keeps
 only the last label, which reads ``inactive`` both for a node earned and then deactivated - a
 death this detector must report - and for one only ever held provisionally. Separating them
 after the fact needs per-key ownership history surviving the departure, which is the unbounded
 state the tracked-key prune exists to prevent. So
-the split is on whether the presence detector EVER owned the node - a fact read from the
-reliability gate itself, not guessed from the observed label: once owned, a below-``grace``
-streak that goes absent is simply HELD rather than matured on the strength of the absence
+the split is on whether the presence detector is tracking the node RIGHT NOW - read from the
+key set that detector publishes each sweep, not from the reliability gate and not guessed from
+the observed label: while it holds the key, a below-``grace`` streak that goes absent is simply
+HELD rather than matured on the strength of the absence
 alone - two codes standing at once for the same node is not a problem to fix, it is
-``GRAPH_NODE_INACTIVE`` and ``GRAPH_NODE_DISAPPEARED`` saying different, both-true things. A
-node the presence detector never owned gets no such backstop - ``GRAPH_NODE_DISAPPEARED``
-structurally cannot report it - so absence keeps advancing its streak exactly as a present tick
+``GRAPH_NODE_INACTIVE`` and ``GRAPH_NODE_DISAPPEARED`` saying different, both-true things.
+Reading membership rather than latching it is what makes the hold end when the claim behind it
+does: a key handed back on a measured disown, one reclaimed by ``prune()`` after a durable
+suppression, and one collapsed under the cap all leave the set, and the streak resumes climbing
+for each. A node outside the set gets no backstop - ``GRAPH_NODE_DISAPPEARED``
+will not report it - so absence keeps advancing its streak exactly as a present tick
 would. Reporting a HEALTHY node that left remains ``GRAPH_NODE_DISAPPEARED``'s job as well, for
 either kind of node - a healthy departure never starts a violation regardless of ownership.
 
@@ -581,7 +590,7 @@ non-idle entry is never pruned by age. An entry whose UNMEASURED clock is still 
 cannot grow without bound in time either: past the absence grace it advances every tick, so
 it matures within at most ``60 + absence_grace + 1`` ticks and is reported - the longest
 ``GRAPH_NODE_UNREADABLE`` or ``GRAPH_NODE_NOT_MANAGED``'s clear can be withheld by one
-departed node. A below-``grace`` VIOLATION streak on a node the presence detector never owned
+departed node. A below-``grace`` VIOLATION streak on a node the presence detector is not tracking
 shares that same bound, for the same reason it advances at all while absent: it matures within
 at most ``grace + absence_grace + 1`` ticks, because nothing else will ever report that node's
 departure either. Only once a node HAS been owned does its below-grace streak lose the
@@ -770,7 +779,7 @@ overlapping - plus the shared-watcher seam the re-bind behaviour lives in:
    two ``(UNREADABLE/NOT_MANAGED, ABSENT x N)`` restart-loop shapes are swept at the
    absence grace and past it (their ``INACTIVE`` sibling pinned to the opposite claim at the
    same two N: it never crosses grace from absence alone, for a node the presence detector
-   owned at some point - a node it never owned gets the opposite result instead, maturing
+   is tracking - a node outside its key set gets the opposite result instead, maturing
    from absence alone within ``grace + absence_grace + 1`` ticks exactly like the unmeasured
    clock does, and resuming rather than restarting on return the same way an owned node's
    held streak does); the ``pending`` set and its
@@ -1145,7 +1154,7 @@ absence CONTINUES a violation that has already matured past ``grace`` (the fault
 raised, still naming the node), but no longer CREATES one that has not. A node that was
 briefly non-active and then died is reported as gone (``GRAPH_NODE_DISAPPEARED``) rather
 than also acquiring an inactive fault born from ticks gathered while nobody could observe
-it. A ``require_active`` node that never reaches ``active`` is never owned, is never tracked
+it. A ``require_active`` node that never reaches ``active`` is never admitted, is never tracked
 here, and its departure can never raise ``GRAPH_NODE_DISAPPEARED``; the same holds for an app
 that is not online. For those, ``lifecycle_expectation`` keeps the older behaviour: absence
 still matures a below-``grace`` streak, because it is structurally the only detector that will
