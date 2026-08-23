@@ -1656,6 +1656,58 @@ TEST_F(LifecycleExpectationIntegrationTest, NeverMatchedEntryPastTheHoldBoundSto
 // and finding nothing. The two reasons release on different conditions, so the log has to
 // say which one is in effect - here the measured-but-below-grace one, whose hold ends when
 // the node reads active or its streak passes grace, NOT after a fixed number of ticks.
+// The same log line for a node that has LEFT. Both exits the present-node sentence offers -
+// reading active, or the streak crossing grace - are unreachable for a departed node the
+// presence detector still holds: absence holds that streak rather than advancing it, and there
+// is no node left to read active. An operator told to wait for either is being pointed at
+// something that cannot happen, so the two cases get different sentences.
+TEST_F(LifecycleExpectationIntegrationTest, WithholdingForADepartedNodeSaysWhatCannotHappenInstead) {
+  const LogCapture log;
+  set_apps({"a"});
+  ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
+  arm_global_grace(gate);
+
+  auto life = make_lifecycle_expectation();
+  auto death = make_node_death();
+  ASSERT_TRUE(life);
+  ASSERT_TRUE(death);
+  life->configure(nlohmann::json{{"require_active", nlohmann::json::array({"a"})}, {"grace", 200}});
+  death->configure(nlohmann::json{{"tick_interval_ms", 3000}, {"miss_grace", 3600}});  // never reports here
+
+  std::set<std::string> published;
+  auto ctx = make_ctx(DetectorMode::Raise, &gate);
+  ctx.presence_tracked = &published;
+  const auto sweep = [&] {
+    life->tick(ctx);
+    death->tick(ctx);
+    if (const auto * keys = death->tracked_departure_keys()) {
+      published = *keys;
+    }
+  };
+
+  // Owned by the presence detector (measured active), then measured non-active, so the streak
+  // starts while node_death keeps the key - which is what makes absence HOLD it below.
+  gate.set_lifecycle_state_for_test("a", "active");
+  sweep();
+  ASSERT_EQ(published.count("/a"), 1u) << "the presence detector never admitted the node, so the "
+                                          "hold this test is about would have a different cause";
+  gate.set_lifecycle_state_for_test("a", "inactive");
+  sweep();
+
+  set_apps({});
+  for (int i = 0; i < 30; ++i) {  // well past the reporting horizon and the absence grace
+    sweep();
+  }
+
+  EXPECT_EQ(log.count("withheld from clearing"), 1)
+      << "a hold that outlives the reporting horizon must be explained exactly once per episode";
+  EXPECT_EQ(log.count("have since LEFT the graph"), 1)
+      << "the operator was told to wait for a reading the departed node cannot produce";
+  EXPECT_EQ(log.count("measured not-active but still within grace"), 0)
+      << "the present-node sentence was used for a node that is gone - its two exits (reads "
+         "active, or the streak passes grace) are both unreachable while the node is absent";
+}
+
 TEST_F(LifecycleExpectationIntegrationTest, WithholdingForAYoungStreakSaysSoInTheLog) {
   const LogCapture log;
   set_apps({"a"});
