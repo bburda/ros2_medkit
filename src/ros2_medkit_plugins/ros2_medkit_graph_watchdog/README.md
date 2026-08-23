@@ -1431,6 +1431,26 @@ exists to prevent in the first place. `tracking_saturated` reports exactly this:
 set still exceeds `tracked_node_cap` even after collapsing every confirmed death it safely
 could, because immature entries alone account for the excess.
 
+**What collapsing costs, and why it is not fixed here.** Collapsing DISCARDS the identity: the
+fold is one-way, `collapsed_dead_count_` only ever grows within a tracker's life, and nothing
+decrements it when a collapsed node comes back. Two consequences follow, and both are real.
+The description stops naming those nodes and carries an unattributable `and N more` instead;
+and because the aggregated fault clears only when its dead set is EMPTY, the synthetic
+collapsed entry keeps it non-empty, so once anything has been collapsed
+`GRAPH_NODE_DISAPPEARED` cannot clear again for the life of the process - it ends by operator
+acknowledge (`DELETE /api/v1/apps/graph_watchdog/faults/GRAPH_NODE_DISAPPEARED`) or by a
+restart, never by the graph recovering.
+
+Neither is repairable from inside this tracker. Decrementing on return needs the identity the
+collapse threw away, and keeping identities is exactly the unbounded state the cap exists to
+prevent; decaying the count by time would heal a fault by waiting, which this package refuses
+everywhere else (an occurrence is closed by an operator, not by the passage of time). What
+makes it acceptable is what collapsing is allowed to touch: only a MATURED entry, whose death
+has already been reported by name. No departure becomes unreported by being collapsed - the
+fault stays raised, and it is the attribution and the self-healing that are lost, not the
+warning. Reaching the condition at all needs more than `tracked_node_cap` (512 by default)
+distinct dead identities at once, which is a churn problem in its own right.
+
 Unlike `lifecycle_expectation`'s identical-looking cap, a PRESENT/armed key here is never the
 thing evicted to free a slot. `LifecycleExpectationTracker` carries two clocks per node, so a
 node can be simultaneously present and mid-violation - a third state this tracker does not

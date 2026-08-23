@@ -1122,6 +1122,19 @@ but only entries that have actually crossed ``miss_grace``. An entry still mid-g
 never a collapse candidate, because collapsing erases the identity and would report a death
 the node has not earned, permanently
 (``NodeLivenessTrackerCap.ImmatureDepartedEntriesAreNeverCollapsedOrReportedUnderCapPressure``).
+Collapsing is one-way, and the cost is worth stating plainly: the identity is DISCARDED, the
+collapsed count only grows within a tracker's life, and nothing decrements it when one of those
+nodes returns. So the description stops naming them, and - since the aggregated fault clears
+only on an EMPTY dead set - the synthetic collapsed entry keeps that set non-empty, which means
+``GRAPH_NODE_DISAPPEARED`` cannot clear again for the life of the process once anything has been
+collapsed. It ends by operator acknowledge or by a restart, never by the graph recovering.
+Neither half is repairable here: decrementing needs the identity the collapse threw away, and
+keeping identities is the unbounded state the cap exists to prevent, while decaying the count by
+time would heal a fault by waiting - which this package refuses everywhere else. What bounds the
+damage is what collapsing may touch: only a MATURED entry, whose death has already been reported
+by name, so nothing becomes UNREPORTED by being collapsed. The attribution and the self-healing
+are lost, not the warning.
+
 So saturation IS reachable here: when immature departures alone exceed the cap,
 ``tracking_saturated`` goes true and the departed set stays oversized for a few ticks -
 bounded by how fast departures arrive times ``miss_grace``, not by process uptime, which is
