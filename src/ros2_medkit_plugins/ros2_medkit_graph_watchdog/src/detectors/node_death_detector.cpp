@@ -211,7 +211,11 @@ class NodeDeathDetector : public Detector {
     // just rebuilt (or dropped) that allowlist above, so a value captured under the OLD
     // config would misrepresent the new one - clear rather than carry it forward.
     id_allowlisted_.clear();
-    // Deliberately NOT reset here, unlike id_allowlisted_ above: ever_raised_ is a fact about
+    // Same reasoning for the latched durable verdicts: each one was reached by a suppressor
+    // that build_suppressor_chain() has just rebuilt or dropped, so carrying it forward would
+    // let a key stay suppressed under a configuration that no longer suppresses it.
+    durably_suppressed_.clear();
+    // Deliberately NOT reset here, unlike the two maps above: ever_raised_ is a fact about
     // this PROCESS's history ("has this instance ever put a genuine FAILED on the wire"),
     // not about the current config. A live reconfigure (an operator editing the allowlist,
     // say) can run with a death still outstanding and absent; resetting the flag would make
@@ -485,11 +489,32 @@ class NodeDeathDetector : public Detector {
     // key was still present. The id form bypasses chain_ dispatch entirely rather than
     // going through Suppressor::suppresses() - see allowlist_suppressor.hpp for why.
     for (auto it = report.dead.begin(); it != report.dead.end();) {
-      bool suppressed = id_allowlisted_.count(it->first) > 0;
+      // A durable verdict already reached for this key stands without re-asking. That is not a
+      // shortcut, it is the only way the verdict can outlive the EVIDENCE behind it:
+      // LifecycleShutdownSuppressor reads the lifecycle watcher's departed record, which is
+      // retained for a bounded number of ticks and then dropped, while the veto it produces has
+      // to hold until prune() reclaims the key - and prune() needs the veto UNBROKEN for
+      // prune_ticks consecutive ticks to get there. Re-asking on every tick made those two
+      // windows race, and the retention clock starts at the wrong event to win it: it is
+      // anchored when the node's lifecycle SERVICES leave the graph, while the reclaim tick
+      // counts from when its App does, one or more sweeps later. Every tick of that lead came
+      // out of the single tick of margin the window is sized with; past one, the record expired
+      // first, the veto lifted, the streak reset to zero, and - the record now gone for good -
+      // the key could never be suppressed again, so a cleanly shut-down node stayed named for
+      // the life of the process.
+      //
+      // Latching is sound here for the same reason `durable()` exists: a durable suppressor's
+      // answer for a given key never lifts, so remembering it can never diverge from asking
+      // again - it only survives the evidence being garbage-collected. Only POSITIVE verdicts
+      // are latched, and only from durable suppressors; nothing here remembers a "no".
+      bool suppressed = id_allowlisted_.count(it->first) > 0 || durably_suppressed_.count(it->first) > 0;
       if (!suppressed) {
         for (const Suppressor * s : chain_) {
           if (s != nullptr && s->suppresses(it->first, ctx)) {
             suppressed = true;
+            if (s->durable()) {
+              durably_suppressed_.insert(it->first);
+            }
             break;
           }
         }
@@ -513,7 +538,7 @@ class NodeDeathDetector : public Detector {
       if (report.dead.count(key) > 0) {
         continue;  // survived the filter - nothing suppressed it this tick
       }
-      if (id_allowlisted_.count(key) > 0) {
+      if (id_allowlisted_.count(key) > 0 || durably_suppressed_.count(key) > 0) {
         suppressed_for_prune.insert(key);
         continue;
       }
@@ -532,6 +557,14 @@ class NodeDeathDetector : public Detector {
     // identity churn is exactly the failure N11 exists to rule out for tracker_ itself).
     for (auto it = id_allowlisted_.begin(); it != id_allowlisted_.end();) {
       it = tracker_.known_keys().count(*it) > 0 ? std::next(it) : id_allowlisted_.erase(it);
+    }
+    // Bound the latched verdicts to keys that are BOTH still tracked and still gone. Dropping a
+    // key the moment it is present again is what keeps the latch honest: the verdict describes
+    // one departure, and a node that came back and later dies a second time must be judged on
+    // that second departure - which may not be clean at all.
+    for (auto it = durably_suppressed_.begin(); it != durably_suppressed_.end();) {
+      const bool still_relevant = tracker_.known_keys().count(*it) > 0 && present.count(*it) == 0;
+      it = still_relevant ? std::next(it) : durably_suppressed_.erase(it);
     }
     // Published once per sweep, after prune() has settled this tick's count - see
     // status_json()'s own doc for why this is the only cross-thread-safe way to read it.
@@ -730,6 +763,12 @@ class NodeDeathDetector : public Detector {
   /// Pruned to the live graph every tick.
   std::set<std::string> earned_;
   std::set<std::string> id_allowlisted_;
+  /// Departed keys a DURABLE suppressor has already vetoed at least once. Consulted before the
+  /// chain and fed to prune() exactly like an id-form allowlist match, so a veto outlives the
+  /// evidence that produced it - see the suppression filter in tick() for why it has to. Bounded
+  /// to keys that are still tracked AND still absent, so it can neither outlive the tracker's own
+  /// map nor carry one departure's verdict into the next.
+  std::set<std::string> durably_suppressed_;
   /// Whether THIS detector instance has itself genuinely raised GRAPH_NODE_DISAPPEARED at
   /// least once - the ungated-clear guard. See tick()'s own comment for why this, and not
   /// tracker_.tracked_count(), is the right granularity.
