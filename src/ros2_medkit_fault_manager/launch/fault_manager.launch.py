@@ -19,6 +19,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.descriptions import ParameterFile
 
 
 def generate_launch_description():
@@ -26,6 +27,11 @@ def generate_launch_description():
         get_package_share_directory('ros2_medkit_fault_manager'),
         'config',
         'fault_manager.yaml',
+    )
+
+    configured_params = ParameterFile(
+        LaunchConfiguration('params_file'),
+        allow_substs=True,
     )
 
     return LaunchDescription([
@@ -49,6 +55,6 @@ def generate_launch_description():
             name='fault_manager',
             namespace=LaunchConfiguration('namespace'),
             output='screen',
-            parameters=[LaunchConfiguration('params_file')],
+            parameters=[configured_params],
         ),
     ])
