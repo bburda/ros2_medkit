@@ -64,10 +64,18 @@ struct DepartedLifecycle {
 /// Concretely, `update()` and `pump_events()` MUST be called from one and the same thread
 /// (the plugin's tick thread), and `reset()`/the destructor MUST NOT run while either is
 /// in flight (the plugin joins its tick thread before tearing the gate down). The const
-/// readers - node_ok(), state_of(), departed_state_of() - are the only members safe to
-/// call from another thread; they take the shared-state mutex and touch no ROS entity.
+/// readers - node_ok(), state_of(), measurement_pending(), departed_state_of() - are the
+/// only members safe to call from another thread; they take the shared-state mutex and
+/// touch no ROS entity.
 class LifecycleWatcher {
  public:
+  /// How many extra GetState re-seeds a tracked-but-non-active node gets to self-heal a
+  /// missed activation. Two ticks of coverage comfortably outlast the tens-of-ms DDS
+  /// endpoint-matching window; after that a matched subscription catches every transition.
+  /// Public because it is also the bound on how long an unmeasured node's ignorance can
+  /// still resolve - see measurement_pending().
+  static constexpr int kReseedAttempts = 2;
+
   LifecycleWatcher(rclcpp::Node * gateway_node, std::mutex * node_mutex,
                    int departed_retention_ticks = kDefaultDepartedRetentionTicks);
   ~LifecycleWatcher();
@@ -95,6 +103,19 @@ class LifecycleWatcher {
 
   bool node_ok(const std::string & app_id) const;  // true if untracked or "active"
   std::optional<std::string> state_of(const std::string & app_id) const;
+  /// True while `app_id` is a tracked managed node whose state is not measured YET and
+  /// still can be: the label is empty and the GetState self-heal budget has attempts left.
+  ///
+  /// This is what separates transient ignorance from settled ignorance, and the two must
+  /// not be treated alike. `reseeds_remaining` is charged only for a read that actually
+  /// ran (see update()), so it answers "have we finished asking" rather than "how many
+  /// ticks have passed". False for an untracked node, false for one carrying a real label,
+  /// and false once the budget is spent: at that point nothing in this class will ever
+  /// issue another GetState for it, so the label can only still change through a
+  /// ~/transition_event the node may never publish. A caller deciding who OWNS such a
+  /// node's departure must treat that as settled and take it, or the node is reported by
+  /// nobody - see ReliabilityGate::presence_ownership().
+  bool measurement_pending(const std::string & app_id) const;
   /// Last cached lifecycle label of a node that WAS tracked but is no longer present in
   /// the snapshot (departed within `departed_retention_ticks` ticks of "now"), keyed by
   /// its stable fqn (App::effective_fqn(), NOT App::id - mirrors node_death's own keying,
@@ -107,7 +128,12 @@ class LifecycleWatcher {
   /// it too, and it is idempotent.
   void reset();
 
-  void set_state_for_test(const std::string & app_id, const std::string & label);
+  /// Test seam: stage a tracked entry directly. `reseeds_remaining` defaults to the same
+  /// budget a freshly discovered node gets, so an injected EMPTY label reads as transient
+  /// ignorance (the state a node is in right after discovery); pass 0 to stage the settled
+  /// form a node reaches once its GetState has been asked and never answered.
+  void set_state_for_test(const std::string & app_id, const std::string & label,
+                          int reseeds_remaining = kReseedAttempts);
   /// Test-only: how much of the bounded GetState self-heal budget a tracked node has left.
   /// -1 if the node is not tracked. Lets a test assert that a re-seed job cut by the per-tick
   /// blocking budget was not charged for a read it never issued.

@@ -128,7 +128,11 @@ from harness import (  # noqa: E402, I100
     watchdog_detector_status,
 )
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
+from ros2_medkit_test_utils.constants import (  # noqa: E402
+    ALLOWED_EXIT_CODES,
+    get_test_port,
+    get_time_scale,
+)
 from ros2_medkit_test_utils.coverage import get_coverage_env  # noqa: E402
 
 # No default on purpose - a default makes this file FAIL OPEN (see harness-consuming
@@ -192,12 +196,23 @@ TARGET_NAMESPACE = '/powertrain/engine'
 # 12500-1100=11400ms, 3.35x the nominal grace.
 RESPAWN_DELAY_SEC = 12.5
 
-ARM_TIMEOUT_SEC = 60.0
-FAULTS_LIVE_TIMEOUT_SEC = 30.0
-PRESENCE_TIMEOUT_SEC = 30.0
-DEPARTURE_TIMEOUT_SEC = 30.0
-RAISE_TIMEOUT_SEC = 60.0
-CLEAR_TIMEOUT_SEC = 60.0
+# The budgets below are scaled by MEDKIT_TEST_TIME_SCALE, which the sanitizer jobs set to the
+# same factor they apply to every declared CTest timeout. A deadline asserted INSIDE a test is
+# invisible to that rewrite, so an instrumented graph that takes longer to forget a departed
+# node blows a budget here and the failure reads as a detector that never reported - the exact
+# red this suite exists to produce for a real defect. Unset elsewhere, so the normal jobs keep
+# the tight budgets that give these assertions their falsifying edge.
+#
+# Poll intervals, enforced respawn delays and the sustained-observation windows are NOT scaled.
+# Those are not give-up bounds: stretching a window a scenario watches for silence buys no
+# confidence and spends the whole package's test budget to do it.
+TIME_SCALE = get_time_scale()
+ARM_TIMEOUT_SEC = 60.0 * TIME_SCALE
+FAULTS_LIVE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+PRESENCE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
+CLEAR_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # How long a fault must stay ABSENT, or CONFIRMED, for the scenarios whose claim is
 # sustained rather than momentary. Short (well under a minute) because every window here
 # is measured from the arming gate, not process start, so bringup cannot eat it - matching
@@ -255,7 +270,7 @@ ROS2CLI_CYCLES = 3
 # filter_internal_nodes) arming on its own schedule, not against anything this scenario's
 # own cycles do. Must comfortably exceed _poll_stable_tracked_count's own stable_seconds
 # default (10.0), or the poll could time out before stability was ever even reachable.
-STABLE_TRACKED_COUNT_TIMEOUT_SEC = 40.0
+STABLE_TRACKED_COUNT_TIMEOUT_SEC = 40.0 * TIME_SCALE
 
 # ---- the "restart_loop_occurrences" scenario's own target -------------------------------
 # The claim under test is that occurrence_count tracks the number of genuine deaths. Three

@@ -373,6 +373,78 @@ TEST_F(LifecycleWatcherTest, ReseedBudgetIsNotChargedForAJobTheTickBudgetSkipped
       << "; a job the per-tick budget skipped must keep its attempts";
 }
 
+// The sharp form of the claim above, and the one the whole presence-ownership bound rests on:
+// not "some job kept its attempts" but "exactly the read that RAN was charged". Two managed
+// nodes, neither answering: the first read overruns the 150ms per-tick budget on its own
+// (~500ms reader timeout), the loop breaks, and the second node is left queued and unread. Its
+// budget must be untouched, not merely non-zero. An aggregate over eight nodes cannot say that
+// - a loop that charged half its queue would still leave the total above the floor - and an
+// implementation that charged every SELECTED job would drain a node that was never asked
+// anything, which is precisely the fact the bound reads as "we asked and failed".
+TEST_F(LifecycleWatcherTest, OnlyTheJobWhoseReadRanIsChargedWhenTheTickBudgetCutsTheQueue) {
+  const std::vector<std::string> ids{"/q0", "/q1"};
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+
+  w.update(managed_nodes_snapshot(ids), /*tick=*/1);  // both new: subscribed, full budget
+  for (const auto & id : ids) {
+    ASSERT_EQ(w.reseeds_remaining_for_test(id), ros2_medkit_graph_watchdog::LifecycleWatcher::kReseedAttempts)
+        << id << " must start with the full self-heal budget";
+  }
+
+  w.update(managed_nodes_snapshot(ids), /*tick=*/2);  // both selected; only one read fits
+  const int spent0 =
+      ros2_medkit_graph_watchdog::LifecycleWatcher::kReseedAttempts - w.reseeds_remaining_for_test("/q0");
+  const int spent1 =
+      ros2_medkit_graph_watchdog::LifecycleWatcher::kReseedAttempts - w.reseeds_remaining_for_test("/q1");
+  EXPECT_EQ(spent0 + spent1, 1) << "exactly one GetState can have run inside the per-tick blocking "
+                                   "budget, so exactly one attempt may have been charged - "
+                                   "/q0 spent "
+                                << spent0 << ", /q1 spent " << spent1;
+}
+
+// What the departed-lifecycle record - the only input LifecycleShutdownSuppressor has - is
+// actually keyed on. Not the node being gone, and not App::is_online: an entry departs when its
+// GetState path stops appearing in App::services, which is what update() builds current_paths
+// from. That distinction decides whether a clean shutdown can be suppressed at all, and the
+// shape it matters for is a manifest-bound app: the App survives its node, keeping its id and
+// fqn, and only its runtime-derived collections empty out.
+//
+// So the manifest shape is driven here directly - the app stays in the snapshot, goes offline,
+// and loses its services - and the record must be written all the same. ManifestParser::parse_app
+// reads no services/topics/actions at all, so a manifest app's services can only ever come from
+// a live runtime match (RuntimeLinker::enrich_app), which is exactly what stops existing the
+// tick the node dies.
+TEST_F(LifecycleWatcherTest, DepartureIsRecordedWhenTheServicesGoEvenWhileTheAppRemains) {
+  ros2_medkit_graph_watchdog::LifecycleWatcher w(node_.get(), &mtx_);
+
+  auto managed = managed_node_snapshot("/mf_app");
+  managed.apps.front().is_online = true;
+  w.update(managed, /*tick=*/1);
+  w.set_state_for_test("/mf_app", "shuttingdown");
+  ASSERT_TRUE(w.state_of("/mf_app").has_value()) << "the app must be tracked before it departs";
+  ASSERT_FALSE(w.departed_state_of("/mf_app").has_value())
+      << "nothing has departed yet, so a record here would make the assertion below vacuous";
+
+  // The node dies. The App itself survives (a manifest declares it), so the snapshot still
+  // carries the id and the fqn - only is_online and the runtime-derived services go.
+  ros2_medkit_gateway::IntrospectionInput after;
+  ros2_medkit_gateway::App app;
+  app.id = "/mf_app";
+  app.bound_fqn = "/mf_app";
+  app.is_online = false;
+  after.apps.push_back(app);
+  w.update(after, /*tick=*/2);
+
+  EXPECT_FALSE(w.state_of("/mf_app").has_value())
+      << "an app with no GetState service left is not a managed lifecycle node any more";
+  const auto departed = w.departed_state_of("/mf_app");
+  ASSERT_TRUE(departed.has_value())
+      << "no departure was recorded for an app that stopped advertising its lifecycle services, "
+         "so LifecycleShutdownSuppressor would have nothing to read and a clean shutdown an "
+         "operator opted to suppress would be reported as a death";
+  EXPECT_EQ(departed->label, "shuttingdown");
+}
+
 // fqn capture + departed-lifecycle retention: a tracked node's stable fqn
 // (App::effective_fqn(), captured at first sighting) is what departed_state_of() is
 // keyed by, and its last-known label stays retrievable through that fqn for exactly

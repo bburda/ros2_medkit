@@ -196,6 +196,7 @@ IntrospectionInput snapshot_of(const std::vector<std::string> & ids) {
     App a;
     a.id = id;
     a.bound_fqn = "/" + id;
+    a.is_online = true;  // App defaults it to FALSE; every app here models a node that is running
     snapshot.apps.push_back(a);
   }
   return snapshot;
@@ -209,6 +210,7 @@ IntrospectionInput namespaced_snapshot_of(const std::string & ns, const std::str
   App a;
   a.id = ns + "_" + leaf;
   a.bound_fqn = "/" + ns + "/" + leaf;
+  a.is_online = true;  // see snapshot_of() - the default is FALSE, which models a different node
   snapshot.apps.push_back(a);
   return snapshot;
 }
@@ -307,8 +309,25 @@ class LifecycleExpectationIntegrationTest : public ::testing::Test {
       App a;
       a.id = id;
       a.bound_fqn = "/" + id;
+      // App::is_online defaults to FALSE, which is the manifest-declared-but-not-running
+      // shape - a node node_death skips entirely. Every app built here models a node that
+      // IS running, and the detector's own `armed` fact depends on the difference, so it is
+      // set explicitly rather than inherited. set_offline_app() stages the other one.
+      a.is_online = true;
       snapshot_.apps.push_back(a);
     }
+  }
+
+  // The manifest shape the builders above deliberately do not produce: an app the gateway
+  // carries with no running node behind it. node_death skips such an app outright, so
+  // nothing about it can ever be reported by the presence class.
+  void set_offline_app(const std::string & id) {
+    snapshot_.apps.clear();
+    App a;
+    a.id = id;
+    a.bound_fqn = "/" + id;
+    a.is_online = false;
+    snapshot_.apps.push_back(a);
   }
 
   // Seed apps with EXPLICIT (id, fqn) pairs - to reproduce App::id instability, where the
@@ -319,6 +338,7 @@ class LifecycleExpectationIntegrationTest : public ::testing::Test {
       App a;
       a.id = id;
       a.bound_fqn = fqn;
+      a.is_online = true;  // see set_apps() for why this is explicit
       snapshot_.apps.push_back(a);
     }
   }
@@ -340,6 +360,7 @@ class LifecycleExpectationIntegrationTest : public ::testing::Test {
     a.id = id;
     a.bound_fqn = fqn;
     a.services = {get_state, change_state};
+    a.is_online = true;  // see set_apps() for why this is explicit
     snapshot_.apps.push_back(a);
   }
 
@@ -4002,6 +4023,50 @@ TEST_F(LifecycleExpectationIntegrationTest, BelowGraceStreakSurvivesTheTightestP
 // BelowGraceStreakSurvivesTheTightestPruneGraceWithoutConfirmingWhileAbsent immediately
 // above, with arming the only difference - together the two rows prove the split is keyed on
 // arming and nothing else.
+// The gate has no notion of `is_online`, but node_death does: it skips an app that is not
+// online before it ever consults the gate. So an OFFLINE app can be armed, can be owned by the
+// gate's own answer (it carries no lifecycle record, and a node with no record is the presence
+// detector's outright), and can still be one node_death will never track. Latching that answer
+// makes this detector hand a departure to a detector that structurally cannot report it - the
+// same silence a permanently unmeasured node used to fall into.
+//
+// Staged in the order that reaches it: the app is offline and unmeasured while the gate arms
+// it (the window where a naive `armed` latches), then reads inactive, then vanishes below
+// grace. Nothing else can report that departure, so absence has to mature the violation.
+TEST_F(LifecycleExpectationIntegrationTest, OfflineAppIsNeverTreatedAsOwnedByThePresenceDetector) {
+  set_offline_app("a");
+  ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
+  arm_global_grace(gate);
+
+  auto det = make_lifecycle_expectation();
+  ASSERT_TRUE(det);
+  det->configure(nlohmann::json{{"require_active", nlohmann::json::array({"a"})}, {"grace", 4}});
+  auto ctx = make_ctx(DetectorMode::Raise, &gate);
+
+  // The window a naive `armed` latches in: armed by the gate, no lifecycle record at all, so
+  // the gate's ownership answer is TRUE for an app node_death has already skipped.
+  ASSERT_TRUE(gate.allows_raise("a")) << "the app was never armed, so the latch window this test "
+                                         "is about was never open";
+  ASSERT_EQ(gate.presence_ownership("a"), ros2_medkit_graph_watchdog::PresenceOwnership::kEarned)
+      << "the gate must still say it OWNS an app with no lifecycle record, and own it OUTRIGHT - "
+         "if it did not, this test would pass for a reason that has nothing to do with is_online";
+  det->tick(ctx);
+
+  gate.set_lifecycle_state_for_test("a", "inactive");
+  const auto failed_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
+  det->tick(ctx);  // streak 1, well below grace(4)
+  ASSERT_EQ(det->tracked_count_for_test(), 1u);
+  std::this_thread::sleep_for(200ms);
+  ASSERT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
+      << "the node was confirmed already, so grace(4) was never in force and the absence run "
+         "below proves nothing about a below-grace streak";
+
+  snapshot_.apps.clear();
+  ASSERT_TRUE(poll_for_new(kGraphSource, ReportFault::Request::EVENT_FAILED, failed_before, *det, ctx))
+      << "a below-grace violation on an OFFLINE app did not mature from absence - node_death "
+         "skips an app that is not online, so this departure is reported by nothing at all";
+}
+
 TEST_F(LifecycleExpectationIntegrationTest, NeverArmedBelowGraceStreakMaturesFromAbsenceInsteadOfHoldingIndefinitely) {
   set_apps({"a"});
   ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);

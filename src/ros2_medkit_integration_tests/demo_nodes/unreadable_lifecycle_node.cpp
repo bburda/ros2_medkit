@@ -55,6 +55,16 @@
  * fixture is never driven through a lifecycle transition by anything that reads its
  * result.
  *
+ * `transition_label` (string parameter, default "active") is the label this fixture
+ * announces once it starts answering, on both channels. The default keeps the
+ * GRAPH_NODE_UNREADABLE story unchanged: the node was unreadable, then it is active, then
+ * the fault clears. A NON-active value stages the other sequence a caller may need - the
+ * lifecycle state arriving late and saying the node was never healthy - which is what
+ * distinguishes a node the presence detector may keep from one it has to hand back. The
+ * reported state id follows the label for the two the state machine names ("active" and
+ * "inactive"); anything else reports UNCONFIGURED's id, which is what a caller asking for
+ * an arbitrary label wants a reader to classify as non-active.
+ *
  * `start_answering` (bool parameter, default false) is how the e2e proves the CLEAR
  * half of the story: setting it true - a real `ros2 param set` /
  * `rcl_interfaces/srv/SetParameters` call against this node's own auto-started
@@ -76,6 +86,7 @@
  * calls GetState again to collect that answer unless this event arrives first.
  */
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -93,6 +104,7 @@ class UnreadableLifecycleNode : public rclcpp::Node {
  public:
   UnreadableLifecycleNode() : Node("unreadable_lifecycle") {
     answering_ = this->declare_parameter<bool>("start_answering", false);
+    transition_label_ = this->declare_parameter<std::string>("transition_label", "active");
 
     // Reliable + volatile (the QoS default LifecycleWatcher's own subscription
     // requires - see its "stay volatile" comment), matching how rclcpp_lifecycle
@@ -107,7 +119,7 @@ class UnreadableLifecycleNode : public rclcpp::Node {
           // below), so this callback and the parameter callback that flips
           // `answering_` below can never run concurrently with each other.
           if (answering_) {
-            send_active(header);
+            send_state(header);
             return;
           }
           pending_.push_back(header);  // deliberately leaked for this process's lifetime - see the file doc
@@ -135,7 +147,9 @@ class UnreadableLifecycleNode : public rclcpp::Node {
 
     RCLCPP_INFO(get_logger(),
                 "unreadable_lifecycle started: advertises get_state/change_state like a managed "
-                "lifecycle node, but get_state never answers until start_answering:=true");
+                "lifecycle node, but get_state never answers until start_answering:=true (then it "
+                "reports '%s')",
+                transition_label_.c_str());
   }
 
   ~UnreadableLifecycleNode() override {
@@ -150,10 +164,22 @@ class UnreadableLifecycleNode : public rclcpp::Node {
   UnreadableLifecycleNode & operator=(UnreadableLifecycleNode &&) = delete;
 
  private:
-  void send_active(const std::shared_ptr<rmw_request_id_t> & header) {
+  /// The id the label maps to. Only the two the caller can select matter here; everything
+  /// else answers with UNCONFIGURED's id, which every reader classifies as non-active.
+  static std::uint8_t state_id_for(const std::string & label) {
+    if (label == "active") {
+      return lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+    }
+    if (label == "inactive") {
+      return lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
+    }
+    return lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED;
+  }
+
+  void send_state(const std::shared_ptr<rmw_request_id_t> & header) {
     lifecycle_msgs::srv::GetState::Response response;
-    response.current_state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
-    response.current_state.label = "active";
+    response.current_state.id = state_id_for(transition_label_);
+    response.current_state.label = transition_label_;
     get_state_service_->send_response(*header, response);
   }
 
@@ -163,7 +189,7 @@ class UnreadableLifecycleNode : public rclcpp::Node {
     }
     answering_ = true;
     for (const auto & header : pending_) {
-      send_active(header);
+      send_state(header);
     }
     pending_.clear();
 
@@ -174,12 +200,13 @@ class UnreadableLifecycleNode : public rclcpp::Node {
     lifecycle_msgs::msg::TransitionEvent event;
     event.start_state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED;
     event.start_state.label = "unconfigured";
-    event.goal_state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
-    event.goal_state.label = "active";
+    event.goal_state.id = state_id_for(transition_label_);
+    event.goal_state.label = transition_label_;
     transition_event_pub_->publish(event);
   }
 
   bool answering_ = false;
+  std::string transition_label_;
   std::vector<std::shared_ptr<rmw_request_id_t>> pending_;
   rclcpp::Service<lifecycle_msgs::srv::GetState>::SharedPtr get_state_service_;
   rclcpp::Service<lifecycle_msgs::srv::ChangeState>::SharedPtr change_state_service_;
