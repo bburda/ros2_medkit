@@ -13,6 +13,8 @@
 // limitations under the License.
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
 #include <set>
 #include <string>
 #include <vector>
@@ -48,6 +50,50 @@ inline constexpr double kJumpThreshTickPeriods = 3.0;
 /// Smallest jump threshold that is safe at a given tick period.
 inline constexpr double min_jump_thresh_sec(int tick_interval_ms) {
   return kJumpThreshTickPeriods * static_cast<double>(tick_interval_ms) / 1000.0;
+}
+
+/// Floor for node_death's own `miss_grace`, in milliseconds of wall clock.
+///
+/// The entity cache a detector reads (ctx.snapshot) is not rebuilt every tick: it is
+/// rebuilt on a graph event debounced to about one refresh per second, so every tick
+/// between two refreshes sees the SAME snapshot. A tick-counted miss_grace therefore does
+/// not measure independent samples of the graph - it can re-count one stale cache
+/// generation as several misses - and that collapses silently the moment the tick period
+/// is shortened: at a 200ms tick, a miss_grace of 2 ticks is only 600ms of nominal grace,
+/// well under a single refresh cycle, so one omitted refresh alone can already cross it.
+/// 3000ms is one debounce cycle plus margin, chosen so the shipped default (miss_grace 2 at
+/// the 1000ms default tick) is unaffected and only a faster-than-default tick ever raises
+/// the effective grace.
+inline constexpr int kMinNodeDeathWindowMs = 3000;
+
+/// Ceiling node_death applies to BOTH `miss_grace` and `prune_grace` - ticks-before-
+/// something-happens knobs that, at the 1s default tick, already mean an hour of silence
+/// before either takes effect at 3600; a value past it is a typo or a unit mix-up, not a
+/// real operator choice. Shared (not detector-local) so graph_watchdog_plugin.cpp's own
+/// compute_departed_retention_ticks() - which has to predict node_death's eventual
+/// prune_ticks_ before that detector's own configure() has run - clamps to the IDENTICAL
+/// bound rather than risking a plugin-side window sized for a value the detector will
+/// itself reject.
+inline constexpr std::int64_t kMaxNodeDeathGraceTicks = 3600;
+
+/// Smallest `miss_grace` (in ticks) that keeps kMinNodeDeathWindowMs of wall clock,
+/// whatever `tick_interval_ms` is configured to. A death is reported once misses EXCEED
+/// miss_grace, i.e. after miss_grace + 1 ticks, so the ceiling divides the window by the
+/// tick period and subtracts the one tick that boundary already buys back.
+///
+/// Computed in int64_t throughout: `tick_interval_ms` is validated only against
+/// `> 0 && <= INT_MAX` (node_death_detector.cpp's own configure()), and at that documented-
+/// valid endpoint `kMinNodeDeathWindowMs + tick_interval_ms - 1` overflows a 32-bit int
+/// before the division ever runs - undefined behaviour at a value the config contract
+/// explicitly accepts. The final result is always small (it shrinks as tick_interval_ms
+/// grows), so narrowing it back to int at the end never loses anything.
+inline int min_node_death_miss_grace(int tick_interval_ms) {
+  if (tick_interval_ms <= 0) {
+    return 0;  // not a real cadence; nothing meaningful to floor against
+  }
+  const std::int64_t wide_tick = tick_interval_ms;
+  const std::int64_t window = static_cast<std::int64_t>(kMinNodeDeathWindowMs) + wide_tick - 1;
+  return static_cast<int>(std::max<std::int64_t>(0, window / wide_tick - 1));
 }
 
 /// Append one warning per key in `detector_cfg` that the detector does not read.

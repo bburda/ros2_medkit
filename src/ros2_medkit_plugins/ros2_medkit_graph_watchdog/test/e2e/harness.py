@@ -585,18 +585,229 @@ def assert_fault_absent_throughout(test_case, port, code, duration, interval=0.5
         f'>= interval ({interval}s)')
 
 
+def assert_fault_persists_throughout(test_case, port, code, duration, interval=0.5):
+    """Fail unless `code` is present on EVERY poll for `duration` seconds.
+
+    The mirror of assert_fault_absent_throughout, and it owes the same proof: a fault
+    surface that stops answering must fail the assertion rather than satisfy it. Poll the
+    same endpoint the same way; a request error, a non-200, or a body that does not parse
+    is a failure, not a skipped sample. Waiting for a single sighting
+    (``assertIsNotNone(poll_faults(...))``) proves the fault appeared once, not that it
+    stayed - it returns on the first match and says nothing about a channel that goes dark
+    on poll three of twenty. Use this for every scenario whose claim is sustained presence
+    over a window, not merely "present right now".
+
+    Parameters
+    ----------
+    test_case : unittest.TestCase
+        Used for the actual assertion calls, so a failure here reports through the normal
+        unittest failure path rather than a bare ``AssertionError`` from a free function.
+    port : int
+        Gateway HTTP port.
+    code : str
+        The ``fault_code`` that must be present on every poll.
+    duration : float
+        Total seconds to keep polling.
+    interval : float
+        Sleep between polls in seconds.
+
+    """
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + duration
+    polls = 0
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', timeout=5)
+        except requests.exceptions.RequestException as exc:
+            test_case.fail(
+                f'/faults became unreachable {polls} poll(s) into a {duration}s persistence '
+                f'window (could not ask, which is not the same as "asked, and {code} is '
+                f'still there"): {exc}')
+            return
+        if response.status_code != 200:
+            test_case.fail(
+                f'/faults answered HTTP {response.status_code} {polls} poll(s) into a '
+                f'{duration}s persistence window - the channel died mid-window, which this '
+                'assertion must not read as "still there"')
+            return
+        codes = {item.get('fault_code') for item in response.json().get('items', [])}
+        test_case.assertIn(
+            code, codes,
+            f'{code} was missing {polls} poll(s) into a {duration}s window that was supposed '
+            'to stay confirmed the whole way through')
+        polls += 1
+        time.sleep(interval)
+    test_case.assertGreater(
+        polls, 0,
+        f'the {duration}s persistence window never actually polled /faults - duration must '
+        f'be >= interval ({interval}s)')
+
+
+def assert_fault_describes_only(
+        test_case, port, code, required, forbidden, duration, interval=0.5):
+    """Fail unless `code` is present with a matching description on every poll.
+
+    On every poll for `duration` seconds, `code` must be present and its description must
+    contain every needle in `required` and none in `forbidden`. `required` and `forbidden`
+    are iterables of plain substrings. The aggregated fault
+    names several entities in one description, so this is how a scenario says "this node is
+    named and that one is not" without depending on ordering. Polls the whole window, not a
+    single sample: a description this assertion must hold true FOR THE DURATION (one node
+    named, a sibling never named) is exactly the kind of claim a channel that goes dark
+    mid-window can falsely satisfy if only checked once.
+
+    Parameters
+    ----------
+    test_case : unittest.TestCase
+        Used for the actual assertion calls, so a failure here reports through the normal
+        unittest failure path rather than a bare ``AssertionError`` from a free function.
+    port : int
+        Gateway HTTP port.
+    code : str
+        The ``fault_code`` that must be present, with a matching description, on every poll.
+    required : iterable of str
+        Substrings that must all appear in the fault's description on every poll.
+    forbidden : iterable of str
+        Substrings that must never appear in the fault's description on any poll.
+    duration : float
+        Total seconds to keep polling.
+    interval : float
+        Sleep between polls in seconds.
+
+    """
+    required = list(required)
+    forbidden = list(forbidden)
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + duration
+    polls = 0
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', timeout=5)
+        except requests.exceptions.RequestException as exc:
+            test_case.fail(
+                f'/faults became unreachable {polls} poll(s) into a {duration}s description '
+                f'window (could not ask, which is not the same as "asked, and the '
+                f'description still holds"): {exc}')
+            return
+        if response.status_code != 200:
+            test_case.fail(
+                f'/faults answered HTTP {response.status_code} {polls} poll(s) into a '
+                f'{duration}s description window - the channel died mid-window, which this '
+                'assertion must not read as "the description still holds"')
+            return
+        items = {item.get('fault_code'): item for item in response.json().get('items', [])}
+        fault = items.get(code)
+        if fault is None:
+            test_case.fail(
+                f'{code} was missing {polls} poll(s) into a {duration}s window that was '
+                'supposed to keep describing it')
+        description = fault.get('description', '')
+        for needle in required:
+            test_case.assertIn(
+                needle, description,
+                f"{code}'s description dropped required text {needle!r} {polls} poll(s) "
+                f'into a {duration}s window: {description!r}')
+        for needle in forbidden:
+            test_case.assertNotIn(
+                needle, description,
+                f"{code}'s description carries forbidden text {needle!r} {polls} poll(s) "
+                f'into a {duration}s window: {description!r}')
+        polls += 1
+        time.sleep(interval)
+    test_case.assertGreater(
+        polls, 0,
+        f'the {duration}s description window never actually polled /faults - duration must '
+        f'be >= interval ({interval}s)')
+
+
+def assert_fault_never_names(test_case, port, code, forbidden, duration, interval=0.5):
+    """Fail if `code`'s description EVER names a forbidden needle, whatever `code` itself does.
+
+    Distinct from the three assertions above in what it does NOT require: it takes no position
+    on whether `code` is raised at all. ``assert_fault_absent_throughout`` is too strong for a
+    claim like "no disappearance names THIS node" - a correct detector raising `code` for some
+    OTHER entity would trip it for a reason that has nothing to do with the node under test.
+    ``assert_fault_describes_only`` is too strong the other way: it REQUIRES `code` present on
+    every poll, which is wrong for a scenario where the code staying fully absent is itself a
+    correct outcome. This is the narrower claim in between: whenever `code` happens to be
+    present, on any poll, none of `forbidden` may appear in its description; `code` being absent
+    on a given poll is not a failure.
+
+    Same channel-alive discipline as the other window assertions: a request error or a non-200
+    is a failure naming which poll and why, never a silently-skipped sample.
+
+    Parameters
+    ----------
+    test_case : unittest.TestCase
+        Used for the actual assertion calls, so a failure here reports through the normal
+        unittest failure path rather than a bare ``AssertionError`` from a free function.
+    port : int
+        Gateway HTTP port.
+    code : str
+        The ``fault_code`` whose description must never name a forbidden needle. Its own
+        presence or absence is not judged.
+    forbidden : iterable of str
+        Substrings that must never appear in `code`'s description, on any poll where `code` is
+        present.
+    duration : float
+        Total seconds to keep polling.
+    interval : float
+        Sleep between polls in seconds.
+
+    """
+    forbidden = list(forbidden)
+    base = f'http://127.0.0.1:{port}{API_BASE_PATH}'
+    deadline = time.monotonic() + duration
+    polls = 0
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f'{base}/faults', timeout=5)
+        except requests.exceptions.RequestException as exc:
+            test_case.fail(
+                f'/faults became unreachable {polls} poll(s) into a {duration}s window (could '
+                f'not ask, which is not the same as "asked, and {code} never named a forbidden '
+                f'entity"): {exc}')
+            return
+        if response.status_code != 200:
+            test_case.fail(
+                f'/faults answered HTTP {response.status_code} {polls} poll(s) into a '
+                f'{duration}s window - the channel died mid-window, which this assertion must '
+                'not read as "never named a forbidden entity"')
+            return
+        items = {item.get('fault_code'): item for item in response.json().get('items', [])}
+        fault = items.get(code)
+        if fault is not None:
+            description = fault.get('description', '')
+            for needle in forbidden:
+                test_case.assertNotIn(
+                    needle, description,
+                    f"{code}'s description named forbidden text {needle!r} {polls} poll(s) "
+                    f'into a {duration}s window: {description!r}')
+        polls += 1
+        time.sleep(interval)
+    test_case.assertGreater(
+        polls, 0,
+        f'the {duration}s window never actually polled /faults - duration must be >= interval '
+        f'({interval}s)')
+
+
 class _FlakyFaultsHandler(http.server.BaseHTTPRequestHandler):
     """Stands in for a gateway whose ``GET /faults`` answers normally, then dies.
 
-    Answers 200 with an empty fault list for the first ``healthy_polls`` requests to
-    ``{API_BASE_PATH}/faults`` (this class's own attribute, set per instantiation via
-    ``make_handler``), then drops the connection with no response at all for every
+    Answers 200 with ``{'items': healthy_items}`` for the first ``healthy_polls`` requests
+    to ``{API_BASE_PATH}/faults`` (both class attributes, set per instantiation via
+    `_FlakyFaultsServer`), then drops the connection with no response at all for every
     request after that - the same "channel gone" shape a crashed or hung fault_manager
     produces, distinct from an ordinary 503 (also exercised via ``dead_status``).
+    `healthy_items` defaults to empty (a healthy-but-silent fault surface, what the
+    absence proof needs); the persistence and describes-only proofs set it to a list
+    holding the fault they poll for, so the same handler can stand in for a surface that
+    is healthy AND SAYING SOMETHING before it goes dark.
     """
 
     healthy_polls = 2
     dead_status = None  # None = drop the connection; an int = answer with that status instead
+    healthy_items = []  # the `items` list served while healthy
 
     def do_GET(self):
         if self.path != f'{API_BASE_PATH}/faults':
@@ -611,14 +822,14 @@ class _FlakyFaultsHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(type(self).dead_status)
             self.end_headers()
             return
-        body = json.dumps({'items': []}).encode()
+        body = json.dumps({'items': type(self).healthy_items}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, log_format, *args):
+    def log_message(self, format, *args):  # noqa: A002 - matches the base class's own name
         pass  # keep test output quiet - this is expected traffic, not diagnostics
 
 
@@ -626,15 +837,16 @@ class _FlakyFaultsServer:
     """Context manager for a local `_FlakyFaultsHandler` HTTP server.
 
     Starts on a free port in a daemon thread and tears itself down on exit - the
-    boilerplate every leg of `prove_silence_proof_catches_a_dead_fault_surface` below
-    needs, factored out once so each leg reads as the claim it is checking rather than
-    server plumbing.
+    boilerplate every leg of `prove_silence_proof_catches_a_dead_fault_surface` (and its
+    persistence/describes-only siblings) below needs, factored out once so each leg reads
+    as the claim it is checking rather than server plumbing.
     """
 
-    def __init__(self, healthy_polls, dead_status):
+    def __init__(self, healthy_polls, dead_status, healthy_items=None):
         handler = type(
             '_Handler', (_FlakyFaultsHandler,),
-            {'healthy_polls': healthy_polls, 'dead_status': dead_status})
+            {'healthy_polls': healthy_polls, 'dead_status': dead_status,
+             'healthy_items': [] if healthy_items is None else healthy_items})
         self._server = http.server.HTTPServer(('127.0.0.1', 0), handler)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -699,6 +911,171 @@ def prove_silence_proof_catches_a_dead_fault_surface(test_case):
     with _FlakyFaultsServer(healthy_polls=10_000, dead_status=None) as fake:
         assert_fault_absent_throughout(
             test_case, fake.port, 'GRAPH_NODE_INACTIVE', duration=1.0, interval=0.2)
+
+
+def prove_persistence_proof_catches_a_dead_fault_surface(test_case):
+    """Prove `assert_fault_persists_throughout` catches a `/faults` that dies mid-window.
+
+    The mirror of `prove_silence_proof_catches_a_dead_fault_surface`, for the opposite
+    claim: a fault that must stay CONFIRMED for a whole window, not one that must stay
+    absent. Self-contained, same stand-in server, same three-part proof:
+
+    (1) the naive pattern this fix replaces - `poll_faults` + `assertIsNotNone` - actually
+    DOES pass against a `/faults` that answers healthily a couple of times and then dies:
+    it returns the moment `code` is first seen, before the channel goes dark, so it never
+    observes the death at all; (2) `assert_fault_persists_throughout` raises against the
+    SAME dying channel, for both dead-channel shapes (a dropped connection and a 503); (3)
+    a channel that never dies, and keeps answering `code` present the whole time, does NOT
+    trip the fixed helper - otherwise the RED result above would be meaningless.
+
+    Raises whatever `test_case`'s own assertions raise on failure; callers use it from
+    inside a test method exactly like any other assertion helper.
+    """
+    code = 'GRAPH_NODE_INACTIVE'
+    healthy_items = [{'fault_code': code, 'description': f'{code} present'}]
+    for dead_status, label in ((None, 'a dropped connection'), (503, 'a 503 response')):
+        with _FlakyFaultsServer(healthy_polls=2, dead_status=dead_status,
+                                healthy_items=healthy_items) as fake:
+            # (1) The OLD pattern this fix replaces: prove it actually passes on this
+            # exact dying channel - it returns on the first sighting, before the death.
+            test_case.assertIsNotNone(
+                poll_faults(fake.port, code, timeout=2.0, interval=0.2),
+                f'the OLD pattern (poll_faults + assertIsNotNone) did NOT pass against a '
+                f'/faults that later died via {label} - this self-test no longer '
+                'demonstrates the hole the fix closes')
+            # (2) The fixed helper must fail against the identical dying channel.
+            with test_case.assertRaises(
+                    AssertionError,
+                    msg=f'assert_fault_persists_throughout did not fail when /faults died '
+                        f'mid-window via {label} - it would pass on the exact '
+                        'channel-death this fix exists to catch'):
+                assert_fault_persists_throughout(
+                    test_case, fake.port, code, duration=2.0, interval=0.2)
+
+    # (3) The companion proof: a channel that never dies, and keeps answering `code`
+    # present, must not trip the assertion, or the RED result above would be meaningless.
+    with _FlakyFaultsServer(healthy_polls=10_000, dead_status=None,
+                            healthy_items=healthy_items) as fake:
+        assert_fault_persists_throughout(test_case, fake.port, code, duration=1.0, interval=0.2)
+
+
+def prove_describes_only_proof_catches_a_dead_fault_surface(test_case):
+    """Prove `assert_fault_describes_only` catches a `/faults` that dies mid-window.
+
+    Same shape as the silence and persistence self-tests above, for the third claim this
+    package's scenarios rely on: a description that must hold ("names alpha, never beta")
+    for a whole window, not merely on one lucky read before the channel goes dark.
+
+    (1) `poll_fault_describing` (the existing single-shot reader) DOES pass against a
+    `/faults` that answers correctly a couple of times and then dies - it returns the
+    moment the description matches, never observing the death; (2)
+    `assert_fault_describes_only` raises against the SAME dying channel, for both
+    dead-channel shapes; (3) a channel that never dies, and keeps describing the fault
+    correctly the whole time, does NOT trip the fixed helper.
+    """
+    code = 'GRAPH_NODE_INACTIVE'
+    healthy_items = [{'fault_code': code, 'description': 'alpha is gone, beta is fine'}]
+    for dead_status, label in ((None, 'a dropped connection'), (503, 'a 503 response')):
+        with _FlakyFaultsServer(healthy_polls=2, dead_status=dead_status,
+                                healthy_items=healthy_items) as fake:
+            # (1) The OLD pattern this fix replaces: a single successful description read
+            # proves nothing about the rest of the window.
+            found, _description = poll_fault_describing(
+                fake.port, code, ['alpha'], timeout=2.0, interval=0.2)
+            test_case.assertTrue(
+                found,
+                f'the OLD pattern (poll_fault_describing) did NOT pass against a /faults '
+                f'that later died via {label} - this self-test no longer demonstrates the '
+                'hole the fix closes')
+            # (2) The fixed helper must fail against the identical dying channel.
+            with test_case.assertRaises(
+                    AssertionError,
+                    msg=f'assert_fault_describes_only did not fail when /faults died '
+                        f'mid-window via {label} - it would pass on the exact '
+                        'channel-death this fix exists to catch'):
+                assert_fault_describes_only(
+                    test_case, fake.port, code, required=['alpha'], forbidden=['gamma'],
+                    duration=2.0, interval=0.2)
+
+    # (3) The companion proof: a channel that never dies, and keeps the description
+    # correct the whole time, must not trip the assertion.
+    with _FlakyFaultsServer(healthy_polls=10_000, dead_status=None,
+                            healthy_items=healthy_items) as fake:
+        assert_fault_describes_only(
+            test_case, fake.port, code, required=['alpha'], forbidden=['gamma'],
+            duration=1.0, interval=0.2)
+
+
+def prove_never_names_proof_catches_a_wrongly_scoped_absence(test_case):
+    """Prove `assert_fault_never_names` succeeds where a whole-code absence check would not.
+
+    The gap this closes: a claim like "no disappearance names THIS node" is not the same claim
+    as "this code never appears at all". A correct detector raising `code` for some OTHER entity
+    should leave a "never names X" assertion GREEN - it is exactly the case
+    `assert_fault_absent_throughout` cannot tell apart from a real defect, since it only ever
+    looks at whether the code is present, never at what it names.
+
+    (1) A `/faults` that answers healthily throughout, with `code` present but naming only an
+    unrelated entity, fails the OLD pattern (`assert_fault_absent_throughout` on the bare code) -
+    the concrete false failure this fix replaces, demonstrated rather than asserted in prose. (2)
+    The SAME server does not trip `assert_fault_never_names`. (3) A server whose `code` DOES name
+    the forbidden entity at some point trips the new helper - or it would never fail on the
+    actual defect it exists to catch. (4) The same channel-alive discipline the other three
+    window assertions already carry: a dead channel mid-window fails this one too.
+
+    Raises whatever `test_case`'s own assertions raise on failure; callers use it from inside a
+    test method exactly like any other assertion helper.
+    """
+    code = 'GRAPH_NODE_DISAPPEARED'
+    forbidden_entity = '/target/allowlisted'
+    unrelated_items = [
+        {'fault_code': code, 'description': f'{code}: node /other/unrelated is gone'}]
+    naming_items = [
+        {'fault_code': code, 'description': f'{code}: node {forbidden_entity} is gone'}]
+
+    with _FlakyFaultsServer(healthy_polls=10_000, dead_status=None,
+                            healthy_items=unrelated_items) as fake:
+        # (1) The OLD pattern this fix replaces: a whole-code absence check trips on a raise for
+        # an unrelated entity - the false failure this fix exists to stop, demonstrated rather
+        # than asserted.
+        with test_case.assertRaises(
+                AssertionError,
+                msg='assert_fault_absent_throughout did NOT fail against a code raised for an '
+                    'unrelated entity - this self-test no longer demonstrates the false failure '
+                    'the fix replaces'):
+            assert_fault_absent_throughout(test_case, fake.port, code, duration=1.0, interval=0.2)
+
+        # (2) The fixed helper must NOT fail on the identical server: the code is present, but
+        # never names the forbidden entity.
+        assert_fault_never_names(
+            test_case, fake.port, code, forbidden=[forbidden_entity], duration=1.0, interval=0.2)
+
+    with _FlakyFaultsServer(healthy_polls=10_000, dead_status=None,
+                            healthy_items=naming_items) as fake:
+        # (3) The fixed helper MUST fail once the description actually names the forbidden
+        # entity - or it would never catch the defect it exists for.
+        with test_case.assertRaises(
+                AssertionError,
+                msg='assert_fault_never_names did not fail when the description named the '
+                    'forbidden entity - it would pass on the exact defect this fix exists to '
+                    'catch'):
+            assert_fault_never_names(
+                test_case, fake.port, code, forbidden=[forbidden_entity],
+                duration=1.0, interval=0.2)
+
+    # (4) Channel-alive discipline, matching the other three window assertions: a dead channel
+    # mid-window must fail this one too, not be read as "never named a forbidden entity".
+    for dead_status, label in ((None, 'a dropped connection'), (503, 'a 503 response')):
+        with _FlakyFaultsServer(healthy_polls=2, dead_status=dead_status,
+                                healthy_items=unrelated_items) as fake:
+            with test_case.assertRaises(
+                    AssertionError,
+                    msg=f'assert_fault_never_names did not fail when /faults died mid-window '
+                        f'via {label} - it would pass on the exact channel-death this fix '
+                        'exists to catch'):
+                assert_fault_never_names(
+                    test_case, fake.port, code, forbidden=[forbidden_entity],
+                    duration=2.0, interval=0.2)
 
 
 def poll_cleared(port, code, timeout=30.0, interval=0.5):

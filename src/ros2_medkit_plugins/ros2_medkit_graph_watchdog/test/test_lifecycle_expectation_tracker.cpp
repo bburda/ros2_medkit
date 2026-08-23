@@ -39,9 +39,12 @@ using ros2_medkit_graph_watchdog::LifecycleMatch;
 using M = std::vector<LifecycleMatch>;
 
 // Violations are keyed by the NODE, so a match carries both the config entry that
-// matched and the node's stable fqn.
-LifecycleMatch match(const std::string & entry, const std::string & fqn, std::optional<std::string> state) {
-  return LifecycleMatch{entry, fqn, std::move(state)};
+// matched and the node's stable fqn. `armed` defaults true, matching LifecycleMatch's own
+// default: a call that does not pass it exercises a node the presence detector could
+// report, and only a test about the never-armed split passes `false` explicitly.
+LifecycleMatch match(const std::string & entry, const std::string & fqn, std::optional<std::string> state,
+                     bool armed = true) {
+  return LifecycleMatch{entry, fqn, std::move(state), armed};
 }
 
 // ---- Violation streak: unchanged behaviour from before this slice's redesign ----
@@ -259,37 +262,39 @@ TEST(LifecycleExpectation, AlternatingEveryTickStillMaturesTheClockEventually) {
 
 // The pair the two clocks have to divide between them: a node alternating between a REAL
 // not-active read and a not-managed one, with runs of ABSENCE longer than the absence grace
-// in between - so every tick belongs to one of the three cases and the alternation crosses
-// both ownership and presence. kNotManaged never touches the violation streak and kInactive
-// always resets the unmeasured clock, so the streak is the only clock that can accumulate
-// here, and it must: whichever way the node flaps, it was MEASURED not-active repeatedly.
-TEST(LifecycleExpectation, InactiveAlternatingWithNotManagedAcrossAbsenceGapsStillConfirmsTheViolation) {
+// in between - so every tick belongs to one of the three cases. kNotManaged never touches the
+// violation streak (only its own unmeasured clock), kInactive always resets the unmeasured
+// clock, and absence below grace contributes to neither (see the kInactive case in update()'s
+// absence loop) - so the ONLY thing that can ever advance the violation streak here is a
+// genuine matched "inactive" read, and it takes exactly grace + 1 of them, however many
+// not-managed legs and absence gaps sit in between.
+TEST(LifecycleExpectation, InactiveAlternatingWithNotManagedAcrossAbsenceGapsCountsOnlyMatchedReads) {
   constexpr int kGap = kDefaultAbsenceGrace + 1;
-  LifecycleExpectationTracker t({"a"}, /*grace=*/5, kDefaultAbsenceGrace);
-  bool reported = false;
-  for (int cycle = 0; cycle < 20 && !reported; ++cycle) {
+  constexpr int kGrace = 3;
+  LifecycleExpectationTracker t({"a"}, kGrace, kDefaultAbsenceGrace);
+  for (int matched_tick = 1; matched_tick <= kGrace; ++matched_tick) {
     auto measured = t.update(M{match("a", "/a", "inactive")});
-    reported = !measured.affected.empty();
-    for (int i = 0; i < kGap && !reported; ++i) {
-      reported = !t.update(M{}).affected.empty();
-    }
-    if (reported) {
-      break;
+    EXPECT_TRUE(measured.affected.empty())
+        << "matched tick " << matched_tick << " crossed grace(" << kGrace << ") early";
+    for (int i = 0; i < kGap; ++i) {
+      EXPECT_TRUE(t.update(M{}).affected.empty())
+          << "matched tick " << matched_tick << ", absence gap " << i << ": crossed on an ABSENT tick";
     }
     auto unmanaged = t.update(M{match("a", "/a", std::nullopt)});
-    EXPECT_TRUE(unmanaged.affected.empty()) << "cycle " << cycle
-                                            << ": a node inside an unmeasured spell is not confirmed content, "
-                                               "however far its held streak had already climbed";
+    EXPECT_TRUE(unmanaged.affected.empty())
+        << "matched tick " << matched_tick << ": a not-managed read crossed grace on its own";
     EXPECT_EQ(unmanaged.pending_violation.count("/a"), 1u)
-        << "cycle " << cycle << ": the streak was RESET by a not-managed tick instead of merely held";
-    for (int i = 0; i < kGap && !reported; ++i) {
-      reported = !t.update(M{}).affected.empty();
+        << "matched tick " << matched_tick << ": the streak was RESET by a not-managed tick instead of held";
+    for (int i = 0; i < kGap; ++i) {
+      EXPECT_TRUE(t.update(M{}).affected.empty())
+          << "matched tick " << matched_tick << ", trailing gap " << i << ": crossed on an ABSENT tick";
     }
   }
-  EXPECT_TRUE(reported) << "a node alternating between a measured not-active read and a not-managed one, "
-                           "separated by absence runs longer than the absence grace, was never confirmed - "
-                           "invisible to GRAPH_NODE_INACTIVE and, since the unmeasured clock keeps being reset "
-                           "by the real reads, to its siblings too";
+  auto crossed = t.update(M{match("a", "/a", "inactive")});  // the (grace + 1)-th matched inactive read
+  EXPECT_EQ(crossed.affected.count("/a"), 1u)
+      << "never crossed grace after exactly grace + 1 matched inactive reads - the not-managed legs and "
+         "absence gaps in between must have contributed nothing to either side of the count";
+  EXPECT_EQ(crossed.newly_affected, (std::vector<std::string>{"/a"}));
 }
 
 // The violation streak resets ONLY on kActive. A mutant that zeroed it on every unmeasured
@@ -584,24 +589,138 @@ TEST(LifecycleExpectation, NotManagedInterleavedWithAbsenceRunsStillMaturesAndRe
   }
 }
 
-TEST(LifecycleExpectation, InactiveInterleavedWithAbsenceRunsStillCrossesGraceAndReports) {
+// Companion to UnreadableInterleavedWithAbsenceRunsStillMaturesAndReports and its
+// not-managed sibling above, but for the VIOLATION streak the claim is the opposite: an
+// absence run - however many, however long, however far past kDefaultAbsenceGrace - must
+// contribute NOTHING to a streak that has not yet crossed `grace`. Crossing happens at
+// exactly grace + 1 MATCHED "inactive" reads, never earlier and never later, whatever the
+// interleaved absence pattern looks like - absence must never mature an unmatured streak,
+// pinned directly against the exact shape that used to defeat that rule.
+TEST(LifecycleExpectation, InactiveInterleavedWithAbsenceRunsNeverCrossesGraceFromAbsenceAlone) {
   for (const int run_length : kAbsenceRunLengths) {
-    LifecycleExpectationTracker t({"a"}, /*grace=*/5, kDefaultAbsenceGrace);
-    bool reported = false;
-    for (int cycle = 0; cycle < kDefaultUnmeasuredHoldTicks + 5 && !reported; ++cycle) {
+    constexpr int kGrace = 3;
+    LifecycleExpectationTracker t({"a"}, kGrace, kDefaultAbsenceGrace);
+    for (int matched_tick = 1; matched_tick <= kGrace; ++matched_tick) {
       auto present = t.update(M{match("a", "/a", "inactive")});
-      reported = !present.affected.empty();
+      EXPECT_TRUE(present.affected.empty()) << "run_length=" << run_length << ": matched tick " << matched_tick
+                                            << " crossed grace(" << kGrace << ") early";
       EXPECT_TRUE(present.unreadable_affected.empty() && present.not_managed_affected.empty())
           << "run_length=" << run_length << ": a MEASURED read must never feed an unmeasured code";
-      for (int i = 0; i < run_length && !reported; ++i) {
-        reported = !t.update(M{}).affected.empty();
+      for (int i = 0; i < run_length; ++i) {
+        auto absent = t.update(M{});
+        EXPECT_TRUE(absent.affected.empty()) << "run_length=" << run_length
+                                             << ": crossed grace on an ABSENT tick - a below-grace violation "
+                                                "must never mature while nobody can observe the node";
       }
     }
-    EXPECT_TRUE(reported) << "run_length=" << run_length
-                          << ": a node measured inactive whenever it is present and absent the rest "
-                             "of the time never crossed grace - the violation streak was discarded "
-                             "by every absence run";
+    // The (grace + 1)-th matched tick, after grace full interleaved cycles that must have
+    // contributed nothing: this crosses if and only if every absence run above truly added
+    // zero to the streak.
+    auto crossed = t.update(M{match("a", "/a", "inactive")});
+    EXPECT_EQ(crossed.affected.count("/a"), 1u)
+        << "run_length=" << run_length
+        << ": never crossed after exactly grace + 1 matched ticks - an "
+           "absence run either stole progress from a match or silently added some of its own";
+    EXPECT_EQ(crossed.newly_affected, (std::vector<std::string>{"/a"}));
   }
+}
+
+// ---- Never armed: nothing else can ever report the departure, so absence must mature it ----
+
+// The node the row above cannot cover: one the reliability gate never armed at all. Compare
+// directly against InactiveInterleavedWithAbsenceRunsNeverCrossesGraceFromAbsenceAlone above -
+// same shape, same grace, same absence budget - with the single difference being `armed`.
+// There the presence detector could report the departure instead, so absence merely holds a
+// below-grace streak; here nothing else in the plugin ever will, so absence has to be the one
+// that matures it, or the node's departure is reported by nothing at all.
+TEST(LifecycleExpectation, NeverArmedNodeMaturesFromAbsenceAloneAndStaysGone) {
+  constexpr int kGrace = 5;
+  constexpr int kAbsenceGrace = 2;
+  LifecycleExpectationTracker t({"a"}, kGrace, kAbsenceGrace);
+  ASSERT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty())
+      << "sanity: one present tick, streak 1 <= grace";
+
+  // Node vanishes forever. Inside the blink tolerance nothing moves - a never-armed node
+  // gets the same blink tolerance as any other.
+  for (int i = 0; i < kAbsenceGrace; ++i) {
+    EXPECT_TRUE(t.update(M{}).affected.empty()) << "absence " << i << ": still inside the blink tolerance";
+  }
+  // Past the blink, absence itself keeps the streak climbing. It was 1 after the one present
+  // tick above, so exactly (kGrace - 1) further absent ticks reach kGrace (still not past it)
+  // and the next one crosses.
+  for (int i = 0; i < kGrace - 1; ++i) {
+    EXPECT_TRUE(t.update(M{}).affected.empty()) << "past the blink, iteration " << i;
+  }
+  auto matured = t.update(M{});
+  ASSERT_EQ(matured.affected.count("/a"), 1u)
+      << "a below-grace violation on a node the presence detector could never have reported "
+         "must still mature from absence alone, or its departure is reported by nothing";
+  EXPECT_NE(matured.affected.at("/a").find("has since left the graph"), std::string::npos);
+  EXPECT_EQ(matured.newly_affected, (std::vector<std::string>{"/a"}));
+
+  // And it stays matured while the node remains gone - absence never un-matures a violation,
+  // never-armed or not.
+  for (int i = 0; i < 5; ++i) {
+    auto still = t.update(M{});
+    EXPECT_EQ(still.affected.count("/a"), 1u) << "iteration " << i;
+    EXPECT_TRUE(still.newly_affected.empty()) << "iteration " << i << ": no re-raise churn while merely absent";
+  }
+}
+
+// The narrowing itself, restated for the case it must keep working for: a node armed once
+// (however briefly) before it went non-active. `ever_armed` is sticky, so the CURRENT tick
+// reading non-active - which, against a real gate, means NOT currently armed, since a managed
+// node's node_ok() is false whenever it reads anything but "active" - must not un-arm it. This
+// is the fact GRAPH_NODE_DISAPPEARED needs in order to be ABLE to report this exact node, so
+// GRAPH_NODE_INACTIVE must stay out of the way, exactly as
+// InactiveInterleavedWithAbsenceRunsNeverCrossesGraceFromAbsenceAlone already pins for the
+// unqualified (default-armed) case.
+TEST(LifecycleExpectation, ArmedNodeBelowGraceThenGoneStillDoesNotMatureFromAbsence) {
+  constexpr int kGrace = 5;
+  constexpr int kAbsenceGrace = 2;
+  LifecycleExpectationTracker t({"a"}, kGrace, kAbsenceGrace);
+  ASSERT_TRUE(t.update(M{match("a", "/a", "active", /*armed=*/true)}).affected.empty()) << "sanity: arms the node";
+  ASSERT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty())
+      << "sanity: one inactive tick, streak 1 <= grace";
+
+  for (int i = 0; i < kAbsenceGrace + 20; ++i) {
+    auto report = t.update(M{});
+    EXPECT_TRUE(report.affected.empty()) << "iteration " << i
+                                         << ": a node the presence detector could report must never have "
+                                            "its below-grace streak matured by absence alone";
+    EXPECT_EQ(report.pending_violation.count("/a"), 1u)
+        << "iteration " << i << ": the streak must stay HELD, not erased either";
+  }
+}
+
+// A never-armed node that RESUMES rather than restarts: absence-driven progress survives the
+// return exactly like a present-tick streak already does (see
+// ViolationStreakSurvivesNonMaturingUnmeasuredTicksAndIsNotRestarted for the unmeasured-clock
+// analogue), counted exactly enough that a mutant which restarted the streak at zero - either
+// on absence or on return - would need more matched ticks than this test gives it.
+TEST(LifecycleExpectation, NeverArmedNodeResumesRatherThanRestartingAfterReturning) {
+  constexpr int kGrace = 5;
+  constexpr int kAbsenceGrace = 2;
+  LifecycleExpectationTracker t({"a"}, kGrace, kAbsenceGrace);
+  t.update(M{match("a", "/a", "inactive", /*armed=*/false)});                                // streak 1
+  ASSERT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty());  // streak 2
+
+  // Vanishes long enough to pass the blink and advance on absence alone a few times, but
+  // stops short of grace: 2 held (absent_ticks 1..kAbsenceGrace) + 1 advancing tick
+  // (absent_ticks kAbsenceGrace+1, streak 2 -> 3).
+  for (int i = 0; i < kAbsenceGrace + 1; ++i) {
+    EXPECT_TRUE(t.update(M{}).affected.empty()) << "absence " << i;
+  }
+
+  // Node returns, still inactive. If absence above had genuinely advanced the streak to 3
+  // (not restarted it), exactly 2 more matched ticks reach grace(5) and the 3rd crosses.
+  EXPECT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty()) << "streak 3 -> 4";
+  EXPECT_TRUE(t.update(M{match("a", "/a", "inactive", /*armed=*/false)}).affected.empty()) << "streak 4 -> 5 == grace";
+  auto crossed = t.update(M{match("a", "/a", "inactive", /*armed=*/false)});  // streak 5 -> 6 > grace
+  EXPECT_EQ(crossed.affected.count("/a"), 1u)
+      << "the streak restarted at zero across the absence run instead of resuming what absence "
+         "had already advanced - a node that departs and returns while never armed would then "
+         "need far longer than grace + 1 present ticks to ever be reported";
 }
 
 // The tightest prune horizon the documented config space can produce (grace: 0 with
@@ -946,35 +1065,74 @@ TEST(LifecycleExpectation, NodeCrossingGraceDoesNotDisturbAnothersAbsenceBookkee
   EXPECT_EQ(crossed.newly_affected[0], "/a");
 }
 
-// Sustained absence CONTINUES the streak instead of discarding it: the node was measured
-// not-active, nothing has said otherwise, and being gone is not an answer.
-TEST(LifecycleExpectation, SustainedAbsenceContinuesTheStreakAndEventuallyConfirmsIt) {
-  LifecycleExpectationTracker t({"a"}, /*grace=*/2, /*absence_grace=*/1);
-  t.update(M{match("a", "/a", "inactive")});  // streak 1 <= grace
-  EXPECT_TRUE(t.update(M{}).affected.empty()) << "absent 1 == absence_grace: held, not advanced";
-  EXPECT_TRUE(t.update(M{}).affected.empty()) << "absent 2 > absence_grace: streak 2 == grace, not past it";
-  auto crossed = t.update(M{});  // absent 3: streak 3 > grace
-  ASSERT_EQ(crossed.affected.count("/a"), 1u)
-      << "absence discarded the streak instead of continuing it, so a node that leaves while "
-         "violating is never confirmed";
-  EXPECT_EQ(crossed.newly_affected, (std::vector<std::string>{"/a"}));
-  EXPECT_NE(crossed.affected.at("/a").find("inactive"), std::string::npos)
+// Sustained absence CONTINUES an ALREADY-MATURED streak instead of discarding it: the node
+// was CONFIRMED not-active, nothing has said otherwise, and being gone is not an answer. It
+// does not create one that was not already there - see
+// BelowGraceStreakStaysPendingForeverWhileAbsentAndNeverBecomesContent for the below-grace
+// half of the same absence branch.
+TEST(LifecycleExpectation, MaturedStreakSurvivesAbsenceUnconditionally) {
+  LifecycleExpectationTracker t({"a"}, /*grace=*/1, /*absence_grace=*/1);
+  t.update(M{match("a", "/a", "inactive")});                   // streak 1 <= grace
+  auto confirmed = t.update(M{match("a", "/a", "inactive")});  // streak 2 > grace: confirmed
+  ASSERT_EQ(confirmed.affected.count("/a"), 1u) << "sanity: must be confirmed before it can survive a departure";
+
+  t.update(M{});  // absent 1 == absence_grace: held through the blink, unchanged
+  for (int i = 0; i < 10; ++i) {
+    auto still = t.update(M{});  // absent 2.. > absence_grace
+    ASSERT_EQ(still.affected.count("/a"), 1u)
+        << "iteration " << i
+        << ": absence discarded an already-confirmed streak instead of continuing "
+           "it, so a node that leaves while violating is not confirmed any more";
+    EXPECT_TRUE(still.newly_affected.empty()) << "iteration " << i << ": no re-raise churn while merely absent";
+  }
+  auto report = t.update(M{});
+  const std::string & detail = report.affected.at("/a");
+  EXPECT_NE(detail.find("inactive"), std::string::npos)
       << "the detail must still name the state the node was last measured in";
-  EXPECT_NE(crossed.affected.at("/a").find("has since left the graph"), std::string::npos);
+  EXPECT_NE(detail.find("has since left the graph"), std::string::npos);
 }
 
-// `pending` gives way to CONTENT, never to silence: the withheld-clear hold ends because
-// the tracker finally settled the node's status, not because it gave up on it.
-TEST(LifecycleExpectation, PendingBecomesContentWhenAbsenceOutlivesTheAbsenceGrace) {
+// The other half: a streak that had NOT yet crossed grace when the node left is held at
+// whatever it already reached, resuming rather than restarting. Counted exactly - a streak
+// that had restarted at zero would still read `grace` (not past it) after these same three
+// return ticks, one short of the four a fresh climb needs.
+TEST(LifecycleExpectation, BelowGraceStreakHeldByAbsenceResumesRatherThanRestartsOnReturn) {
+  constexpr int kGrace = 3;
+  LifecycleExpectationTracker t({"a"}, kGrace, /*absence_grace=*/1);
+  auto first = t.update(M{match("a", "/a", "inactive")});  // streak 1 <= grace
+  ASSERT_EQ(first.pending_violation.count("/a"), 1u);
+
+  for (int i = 0; i < 30; ++i) {
+    t.update(M{});  // absent, well past absence_grace: held at streak 1 the whole time
+  }
+
+  EXPECT_TRUE(t.update(M{match("a", "/a", "inactive")}).affected.empty()) << "resumed streak 2 <= grace";
+  EXPECT_TRUE(t.update(M{match("a", "/a", "inactive")}).affected.empty()) << "resumed streak 3 == grace";
+  auto confirmed = t.update(M{match("a", "/a", "inactive")});  // resumed streak 4 > grace
+  ASSERT_EQ(confirmed.affected.count("/a"), 1u)
+      << "the streak restarted from zero on return instead of resuming where the absence had held it";
+  EXPECT_EQ(confirmed.newly_affected, (std::vector<std::string>{"/a"}));
+}
+
+// `pending` NEVER becomes content merely by waiting: a below-grace streak that goes absent
+// stays exactly where it was for as long as the node is gone, so the withheld-clear hold has
+// no timeout of its own - it ends only when the tracker actually SETTLES the node's status (a
+// fresh present tick reading active or inactive), never because enough absent ticks went by.
+// Maturing a below-grace streak on absence alone would raise GRAPH_NODE_INACTIVE from ticks
+// gathered while nobody could observe the node at all.
+TEST(LifecycleExpectation, BelowGraceStreakStaysPendingForeverWhileAbsentAndNeverBecomesContent) {
   LifecycleExpectationTracker t({"a"}, /*grace=*/3, /*absence_grace=*/2);
-  EXPECT_EQ(t.update(M{match("a", "/a", "inactive")}).pending.count("/a"), 1u);  // streak 1
-  EXPECT_EQ(t.update(M{}).pending.count("/a"), 1u) << "absent 1: inside the blink tolerance, held";
-  EXPECT_EQ(t.update(M{}).pending.count("/a"), 1u) << "absent 2 == absence_grace: still held";
-  EXPECT_EQ(t.update(M{}).pending.count("/a"), 1u) << "absent 3: streak 2, still below grace";
-  EXPECT_EQ(t.update(M{}).pending.count("/a"), 1u) << "absent 4: streak 3 == grace, still below";
-  auto settled = t.update(M{});  // absent 5: streak 4 > grace
-  EXPECT_TRUE(settled.pending.empty()) << "the hold must end by SETTLING, not by discarding";
-  EXPECT_EQ(settled.affected.count("/a"), 1u);
+  EXPECT_EQ(t.update(M{match("a", "/a", "inactive")}).pending.count("/a"), 1u);  // streak 1 <= grace
+
+  for (int i = 0; i < 50; ++i) {
+    auto report = t.update(M{});  // absent, past absence_grace for every iteration but the first two
+    EXPECT_EQ(report.pending.count("/a"), 1u) << "iteration " << i
+                                              << ": the hold ended without the node ever being measured active or "
+                                                 "confirmed inactive";
+    EXPECT_EQ(report.pending_violation.count("/a"), 1u) << "iteration " << i;
+    EXPECT_TRUE(report.affected.empty()) << "iteration " << i
+                                         << ": a below-grace streak matured purely from waiting while absent";
+  }
 }
 
 // A node the detector already reported keeps its content through a blink AND past it - it
@@ -1204,18 +1362,29 @@ TEST(LifecycleExpectation, CorroboratedUnmeasuredRunBeforeADepartureIsStillRepor
 }
 
 // A real measurement needs no corroboration at all: one not-active read is a fact about the
-// node, so a node that departs immediately after it still confirms. Without this the
-// settling rule would swallow the very case the detector exists for at grace: 0.
+// node, so it is content the instant it is read (grace: 0 makes that one tick the crossing
+// tick), and a node that departs immediately after keeps that content unconditionally, the
+// same as any other already-matured entry. Without instant settling for a real measurement,
+// the corroboration rule built for the unmeasured clock would swallow the very case grace: 0
+// exists for. grace: 0 also keeps this test meaningful now that absence alone may not mature
+// a below-grace streak: at any grace > 0 a single read leaves the streak BELOW grace, and a
+// below-grace streak is now held rather than
+// confirmed by a departure - see BelowGraceStreakStaysPendingForeverWhileAbsentAndNever
+// BecomesContent for that (deliberately different) claim.
 TEST(LifecycleExpectation, OneMeasuredNotActiveReadBeforeADepartureStillConfirms) {
-  LifecycleExpectationTracker t({"a"}, /*grace=*/2);
-  t.update(M{match("a", "/a", "inactive")});  // exactly one real measurement, then gone
-  bool confirmed = false;
-  for (int i = 0; i < kDefaultAbsenceGrace + 10 && !confirmed; ++i) {
-    confirmed = !t.update(M{}).affected.empty();
+  LifecycleExpectationTracker t({"a"}, /*grace=*/0);
+  auto confirmed_before_leaving = t.update(M{match("a", "/a", "inactive")});  // grace 0: confirmed on this tick
+  ASSERT_EQ(confirmed_before_leaving.affected.count("/a"), 1u)
+      << "sanity: the node must already be confirmed before it departs, or nothing below is tested";
+
+  for (int i = 0; i < kDefaultAbsenceGrace + 10; ++i) {
+    auto report = t.update(M{});  // gone, immediately
+    ASSERT_EQ(report.affected.count("/a"), 1u)
+        << "iteration " << i
+        << ": a node measured not-active once, already confirmed, and then gone lost "
+           "its fault - a lifecycle label is a measurement, not something a sweep can invent, so it needs "
+           "no corroborating, and a departure must not un-confirm it either";
   }
-  EXPECT_TRUE(confirmed) << "a node measured not-active once and then gone was never confirmed - a "
-                            "lifecycle label is a measurement, not something a sweep can invent, so it "
-                            "needs no corroborating";
 }
 
 // ---- The cap: a present node always wins a slot ----
@@ -1296,6 +1465,36 @@ TEST(LifecycleExpectation, ANodeReturningAfterItsEntryWasCollapsedIsMeasuredAfre
       << "the collapsed count was dropped when the node came back, so a fault that a departure must "
          "never heal was healed by one: "
       << AggregatedFault::describe(returned.affected);
+}
+
+// The one cap/collapse shape no OTHER test in this file can tell apart: every sibling above
+// uses grace=0, where violation_streak > 0 and violation_streak > grace_ are the SAME
+// condition, so they cannot distinguish count_collapsed() counting "any non-zero streak" from
+// counting "only an already-matured one". Here grace is wide enough that the departed entry
+// is genuinely BELOW it when the cap forces its collapse: under the design this replaces,
+// absence kept advancing it regardless, so folding it into collapsed_inactive_ merely
+// anticipated a maturity it would have reached anyway. That is no longer true now that
+// absence alone never matures a below-grace streak - so collapsing it as content would
+// fabricate a violation the node never earned.
+TEST(LifecycleExpectation, BelowGraceDepartedEntryCollapsedAtTheCapContributesNothingToTheCount) {
+  constexpr int kCap = 1;
+  LifecycleExpectationTracker t({"/held", "/live"}, /*grace=*/5, /*absence_grace=*/1, kDefaultNoMatchWarnTicks,
+                                LifecycleExpectationTracker::kNoPrune, kDefaultUnmeasuredHoldTicks, kCap);
+  t.update(M{match("/held", "/held", "inactive")});  // streak 1, well below grace(5)
+  ASSERT_EQ(t.tracked_count(), 1u);
+  for (int i = 0; i < 3; ++i) {
+    t.update(M{});  // "/held" leaves for good, past the absence grace - HELD, never matures
+  }
+
+  // "/live" needs the only slot. "/held" is departed, so it is collapsed rather than "/live"
+  // being refused - but "/held" was never content, so nothing may be fabricated for it.
+  auto report = t.update(M{match("/live", "/live", "inactive")});
+  ASSERT_EQ(t.tracked_count(), 1u) << "the slot was never freed - a departed entry blocked a present node";
+  EXPECT_FALSE(report.tracking_saturated) << "a departed, below-grace entry blocked a present node's slot";
+  EXPECT_TRUE(report.affected.empty())
+      << "the collapsed below-grace entry fabricated a violation it never earned ('/live' itself is "
+         "only at streak 1, well below grace(5)): "
+      << AggregatedFault::describe(report.affected);
 }
 
 // ---- Entries matching nothing: unrelated per-entry mechanism, unaffected by this slice ----
