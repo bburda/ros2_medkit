@@ -311,6 +311,16 @@ class NodeLivenessTracker {
     return departed_count() > static_cast<std::size_t>(tracked_key_cap_);
   }
 
+  /// One-way, and that is the whole cost of the cap. The identity is DISCARDED, the count only
+  /// ever grows within this tracker's life, and nothing decrements it when a collapsed node
+  /// returns - decrementing would need the identity that was just thrown away, and keeping
+  /// identities is the unbounded state the cap exists to prevent. Downstream that means the
+  /// caller's aggregated fault, which clears only on an EMPTY dead set, can never clear again
+  /// once anything has been collapsed: the synthetic collapsed entry keeps the set non-empty
+  /// until an operator acknowledges the fault or the process restarts. Bounded by what this
+  /// may touch: only a MATURED entry, whose death has already been reported by name, so being
+  /// collapsed never turns a reported departure into an unreported one.
+  ///
   /// Fold MATURED departed entries (misses_ > miss_grace_) into collapsed_dead_count_ until
   /// at most `keep_named` remain individually tracked. NEVER touches an immature departed
   /// entry (0 < misses_ <= miss_grace_) or a present one - collapsing either would report

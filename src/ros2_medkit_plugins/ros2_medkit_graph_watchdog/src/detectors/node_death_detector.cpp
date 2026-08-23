@@ -283,6 +283,10 @@ class NodeDeathDetector : public Detector {
     std::set<std::string> present;
     std::set<std::string> armed;
     std::set<std::string> handed_back;  // provisionally admitted, and the ground has gone
+    // Keys the snapshot carries AT ALL this tick, online or not. A superset of `present`, and
+    // the right lifetime for bookkeeping about a node that has not left the graph - see the
+    // `released_` cleanup at the end of this function.
+    std::set<std::string> seen;
     for (const auto & app : ctx.snapshot->apps) {
       // A peer-aggregated app carries no ROS binding of its own (PeerClient::parse_app
       // never reads x-medkit.ros2.node), so effective_fqn() is empty for every one of
@@ -291,16 +295,19 @@ class NodeDeathDetector : public Detector {
       if (app.source.rfind("peer:", 0) == 0) {
         continue;
       }
-      // Liveness is the bound node actually running, not mere presence in the snapshot -
-      // see the class doc for why membership alone would make a manifest node immortal.
-      if (!app.is_online) {
-        continue;
-      }
       // Keyed on the STABLE fqn, not App::id: id is recomputed every sweep and only gets a
       // namespace prefix once a bare-name collision currently exists anywhere in the
       // graph, so a live node's id can change out from under a key built from it.
       const std::string key = app.effective_fqn();
       if (key.empty() || is_ros2cli_node(key)) {
+        continue;
+      }
+      seen.insert(key);
+      // Liveness is the bound node actually running, not mere presence in the snapshot -
+      // see the class doc for why membership alone would make a manifest node immortal.
+      // Computed AFTER the key, because "not tracked this tick" and "left the graph" are
+      // different facts and one piece of bookkeeping below needs the second one.
+      if (!app.is_online) {
         continue;
       }
       present.insert(key);
@@ -437,15 +444,29 @@ class NodeDeathDetector : public Detector {
     for (auto it = earned_.begin(); it != earned_.end();) {
       it = tracked_keys.count(*it) == 0 ? earned_.erase(it) : std::next(it);
     }
-    // `released_` answers a different question with a different lifetime: it is the set of
-    // PRESENT keys this detector has refused, and a released key is by definition not in the
-    // tracker at all, so it cannot be bounded by known_keys() - it is bounded by the live graph
-    // instead, since every member of it is a key present this tick. It goes when the node does;
+    // `released_` answers a different question with a different lifetime: it is the set of keys
+    // this detector has refused, and a released key is by definition not in the tracker at all,
+    // so it cannot be bounded by known_keys() - it is bounded by the live graph instead, since
+    // every member of it is a key the snapshot carried this tick. It goes when the node does;
     // the incarnation that returns is re-derived from whatever the gate then says about it. The
     // no-record counter beside it answers only about keys in `released_`, so it is pruned with
     // it rather than separately.
+    //
+    // Against `seen`, NOT `present`: an App whose process stopped keeps its snapshot entry with
+    // is_online cleared (a manifest or hybrid App does exactly this), and that node has not left
+    // the graph - it is merely not trackable this tick. Pruning on the narrower set threw the
+    // withheld key and its window away on the offline tick, so the first tick back online
+    // readmitted it outright, with none of the record-less present ticks the window promises. A
+    // node whose lifecycle services vanished as it died and whose App flickered online once
+    // would then be reported here after being handed to lifecycle_expectation.
+    //
+    // The counter is neither advanced nor reset by an offline tick, only carried: it counts
+    // ticks in which the node was OBSERVED present-and-unmanaged, and an offline tick observes
+    // nothing of the kind. Counting those would let a window that exists to establish "this node
+    // is alive and no longer managed" be satisfied by ticks in which the node was not running -
+    // ignorance standing in for the evidence the window is asking for.
     for (auto it = released_.begin(); it != released_.end();) {
-      if (present.count(*it) != 0) {
+      if (seen.count(*it) != 0) {
         ++it;
         continue;
       }
