@@ -108,8 +108,11 @@ jobs:
           RMW_IMPLEMENTATION: ${{ matrix.ros_distro == 'humble' && 'rmw_cyclonedds_cpp' || '' }}
         run: |
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
+          # ros2_medkit_graph_watchdog is tested in graph-watchdog below. Its end-to-end suite
+          # is 24 minutes on its own, and this step is capped rather than the job, so a package
+          # that overruns takes every package behind it down and reports no test name doing it.
           colcon test --return-code-on-test-failure \
-            --packages-skip ros2_medkit_opcua \
+            --packages-skip ros2_medkit_opcua ros2_medkit_graph_watchdog \
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
@@ -122,6 +125,120 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.ros_distro }}
+          path: |
+            log/
+            build/*/test_results/
+
+  # ros2_medkit_graph_watchdog on the two distros build-and-test covers, in a job of its own.
+  # Same reasoning as sanitizer-graph-watchdog in quality.yml: the package's end-to-end suite runs
+  # 24 minutes, the sweep it left had 3 minutes of headroom on humble and none at all on lyrical,
+  # and a suite that grows with every new detector should not decide whether the packages behind it
+  # get to run. Not path-filtered: the plugin drives the gateway, the fault manager and discovery,
+  # so the changes most likely to break it are outside its own tree.
+  graph-watchdog:
+    name: graph_watchdog (${{ matrix.ros_distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ros_distro: humble
+            os_image: ubuntu:jammy
+          - ros_distro: lyrical
+            os_image: ubuntu:resolute
+    container:
+      image: ${{ matrix.os_image }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install Git
+        run: |
+          apt-get update
+          apt-get install -y git
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pre-install ROS 2 apt source
+        uses: ./.github/actions/ros-apt-source
+
+      - name: Set up ROS 2 ${{ matrix.ros_distro }}
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: ${{ matrix.ros_distro }}
+
+      - name: Install ccache
+        run: apt-get install -y ccache
+
+      - name: Restore ccache
+        # Restore, never save. This job compiles a subset of the sources build-and-test compiles,
+        # with the same flags, so that job's cache is a superset of what this one needs and serves
+        # its misses. A second copy would spend the repository's Actions cache quota twice over for
+        # one set of objects.
+        uses: actions/cache/restore@v4
+        with:
+          path: /root/.cache/ccache
+          key: ccache-${{ matrix.ros_distro }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.ros_distro }}-
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y ros-${{ matrix.ros_distro }}-test-msgs
+          if [ "${{ matrix.ros_distro }}" = "humble" ]; then
+            apt-get install -y ros-humble-rmw-cyclonedds-cpp
+          fi
+          source /opt/ros/${{ matrix.ros_distro }}/setup.bash
+          rosdep update
+          # Same skip-keys as build-and-test: the linters run only in the Jazzy quality job.
+          rosdep install --from-paths src --ignore-src -y \
+            --skip-keys "ament_cmake_clang_tidy ament_cmake_clang_format"
+
+      - name: Build packages
+        env:
+          CCACHE_DIR: /root/.cache/ccache
+          CCACHE_MAXSIZE: 500M
+          CCACHE_SLOPPINESS: pch_defines,time_macros
+        run: |
+          source /opt/ros/${{ matrix.ros_distro }}/setup.bash
+          ccache -z
+          # --packages-up-to, not the workspace: the chain reaches the gateway, the fault manager
+          # and ros2_medkit_integration_tests, which is a test dependency and is where the launch
+          # helpers and the demo nodes the end-to-end scenarios start actually live. opcua is not in
+          # that chain, so it needs no explicit skip here.
+          colcon build --symlink-install \
+            --packages-up-to ros2_medkit_graph_watchdog \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release \
+            --event-handlers console_direct+
+          ccache -s
+          ./scripts/ccache_report.sh "${{ matrix.ros_distro }}-graph-watchdog"
+
+      - name: Run graph_watchdog tests
+        timeout-minutes: 45
+        env:
+          # The DDS choice belongs to the distro, not to this package - see the long note in
+          # build-and-test for why humble is forced onto CycloneDDS and lyrical is not.
+          RMW_IMPLEMENTATION: ${{ matrix.ros_distro == 'humble' && 'rmw_cyclonedds_cpp' || '' }}
+        run: |
+          source /opt/ros/${{ matrix.ros_distro }}/setup.bash
+          colcon test --return-code-on-test-failure \
+            --packages-select ros2_medkit_graph_watchdog \
+            --ctest-args -LE linter \
+            --event-handlers console_direct+
+
+      - name: Show test results
+        if: always()
+        run: colcon test-result --verbose
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-graph-watchdog-${{ matrix.ros_distro }}
           path: |
             log/
             build/*/test_results/

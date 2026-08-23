@@ -382,6 +382,11 @@ jobs:
           failed=0
           for pkg_dir in build/ros2_medkit_*/; do
             pkg=$(basename "$pkg_dir")
+            # graph_watchdog is tested in sanitizer-graph-watchdog. Its
+            # end-to-end suite is 24 minutes under instrumentation, which is
+            # more than the headroom left here, and a package that overruns
+            # this step takes every package after it down with it.
+            if [ "$pkg" = "ros2_medkit_graph_watchdog" ]; then continue; fi
             echo "::group::Testing $pkg"
             (cd "$pkg_dir" && ctest -LE "linter" --output-on-failure) || failed=1
             echo "::endgroup::"
@@ -392,6 +397,7 @@ jobs:
         if: always()
         run: |
           for pkg_dir in build/ros2_medkit_*/; do
+            if [ "$(basename "$pkg_dir")" = "ros2_medkit_graph_watchdog" ]; then continue; fi
             colcon test-result --test-result-base "$pkg_dir" --verbose 2>/dev/null || true
           done
 
@@ -500,6 +506,11 @@ jobs:
           failed=0
           for pkg_dir in build/ros2_medkit_*/; do
             pkg=$(basename "$pkg_dir")
+            # graph_watchdog is tested in sanitizer-graph-watchdog. Its
+            # end-to-end suite is 24 minutes under instrumentation, which is
+            # more than the headroom left here, and a package that overruns
+            # this step takes every package after it down with it.
+            if [ "$pkg" = "ros2_medkit_graph_watchdog" ]; then continue; fi
             echo "::group::Testing $pkg"
             (cd "$pkg_dir" && ctest -j1 -LE "linter" --output-on-failure) || failed=1
             echo "::endgroup::"
@@ -510,5 +521,152 @@ jobs:
         if: always()
         run: |
           for pkg_dir in build/ros2_medkit_*/; do
+            if [ "$(basename "$pkg_dir")" = "ros2_medkit_graph_watchdog" ]; then continue; fi
             colcon test-result --test-result-base "$pkg_dir" --verbose 2>/dev/null || true
           done
+
+  # ros2_medkit_graph_watchdog's end-to-end suite runs 24 minutes under
+  # instrumentation, against a 45-minute test budget the rest of the workspace
+  # already spends 22 to 38 of. Testing it here instead of in the workspace
+  # sweeps gives it a budget of its own, and stops a suite that grows with every
+  # new detector from deciding whether the packages behind it get to run at all.
+  # It is not path-filtered: the plugin drives the gateway, the fault manager and
+  # discovery, so the changes most likely to break it are not in its own tree.
+  sanitizer-graph-watchdog:
+    name: Sanitizer ${{ matrix.name }} (graph_watchdog)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: asan
+            name: ASan + UBSan
+            cmake_sanitizer: asan,ubsan
+            # Both sizes are the ones the matching workspace job argued for.
+            # This job restores that job's cache and must not evict what it
+            # restored, so it cannot be smaller here.
+            ccache_size: 2G
+          - sanitizer: tsan
+            name: TSan
+            cmake_sanitizer: tsan
+            ccache_size: 1.5G
+    container:
+      image: ubuntu:noble
+      # See sanitizer-asan: the instrumented build tree does not fit the
+      # container overlay on small GitHub runners, so build on /mnt.
+      volumes:
+        - "/mnt:/mnt"
+    # A cold cache builds the chain from scratch, which is the ~20 min the TSan
+    # workspace job measures, before the 45-minute test budget starts.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install Git
+        run: |
+          apt-get update
+          apt-get install -y git
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pre-install ROS 2 apt source
+        uses: ./.github/actions/ros-apt-source
+
+      - name: Set up ROS 2 Jazzy
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: jazzy
+
+      - name: Install ccache
+        run: apt-get install -y ccache
+
+      - name: Restore ccache
+        # Restore, never save. This job compiles a subset of the sources
+        # sanitizer-${{ matrix.sanitizer }} compiles, with the same flags, so
+        # that job's cache is a superset of what this one needs and serves its
+        # misses. A second copy would buy nothing and would spend the
+        # repository's 10 GB Actions cache quota twice for one set of objects.
+        uses: actions/cache/restore@v4
+        with:
+          path: /root/.cache/ccache
+          key: ccache-jazzy-${{ matrix.sanitizer }}-${{ github.sha }}
+          restore-keys: |
+            ccache-jazzy-${{ matrix.sanitizer }}-
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y ros-jazzy-test-msgs
+          source /opt/ros/jazzy/setup.bash
+          rosdep update
+          rosdep install --from-paths src --ignore-src -y
+
+      - name: Redirect heavy build output to /mnt
+        run: |
+          # Same reasoning as the workspace sanitizer jobs, and the same need:
+          # the chain built here still includes the gateway.
+          mkdir -p /mnt/gw/build /mnt/gw/tmp
+          ln -sfn /mnt/gw/build build
+          df -h / /mnt
+
+      - name: Build with ${{ matrix.name }}
+        env:
+          CCACHE_DIR: /root/.cache/ccache
+          CCACHE_MAXSIZE: ${{ matrix.ccache_size }}
+          CCACHE_SLOPPINESS: pch_defines,time_macros
+          TMPDIR: /mnt/gw/tmp
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          ccache -z
+          # --packages-up-to rather than the workspace: the chain reaches the
+          # gateway, the fault manager and ros2_medkit_integration_tests, which
+          # is a test dependency and is where the launch helpers and the demo
+          # nodes the end-to-end scenarios start actually live.
+          colcon build --symlink-install \
+            --packages-up-to ros2_medkit_graph_watchdog \
+            --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+              -DSANITIZER=${{ matrix.cmake_sanitizer }} \
+            --event-handlers console_direct+
+          ccache -s
+          ./scripts/ccache_report.sh jazzy-${{ matrix.sanitizer }}-graph-watchdog
+          df -h / /mnt
+
+      - name: Extend test timeouts for sanitizer overhead
+        run: |
+          # The same generic x3 rewrite the workspace sanitizer jobs apply - see
+          # the comment in sanitizer-asan for why it is not a list of literals.
+          find build/ -name "CTestTestfile.cmake" -exec \
+            perl -pi -e 's/\bTIMEOUT "(\d+)"/sprintf(q{TIMEOUT "%d"}, $1 * 3)/ge' {} +
+          find build/ -name "CTestTestfile.cmake" -exec cat {} + \
+            | grep -oE 'TIMEOUT "[0-9]+"' | sort -t'"' -k2 -n | uniq -c
+
+      - name: Run graph_watchdog tests with ${{ matrix.name }}
+        timeout-minutes: 45
+        env:
+          # Same factor as the ctest TIMEOUT rewrite above, for the wall-clock
+          # budgets tests assert internally - ctest's clock cannot reach those.
+          MEDKIT_TEST_TIME_SCALE: 3
+          # Lets tests size instrumented-only-expensive resources down.
+          MEDKIT_TEST_SANITIZED: 1
+        run: |
+          if [ "${{ matrix.sanitizer }}" = "tsan" ]; then
+            export TSAN_OPTIONS="halt_on_error=0:history_size=4:suppressions=$(pwd)/tsan_suppressions.txt"
+          else
+            # detect_leaks=0: FastDDS allocator leaks on shutdown (not our code)
+            # new_delete_type_mismatch=0: ROS 2 DDS scalar/array new/delete mismatch
+            export ASAN_OPTIONS=halt_on_error=1:detect_leaks=0:new_delete_type_mismatch=0
+            export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+          fi
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          cd build/ros2_medkit_graph_watchdog
+          ctest -j1 -LE "linter" --output-on-failure
+
+      - name: Show test results
+        if: always()
+        run: |
+          colcon test-result --test-result-base build/ros2_medkit_graph_watchdog \
+            --verbose 2>/dev/null || true
