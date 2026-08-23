@@ -47,18 +47,22 @@ which assertions run:
   say) must not satisfy a warning this specific, so the pattern requires "allowlist" and
   "suppress" on the SAME line at WARN severity - see _INERT_ALLOWLIST_WARNING_RE.
 - "lifecycle_clean_shutdown": self-suppression - a node this package already watches through
-  lifecycle_expectation is suppressed only when it departed while not active, not a
-  lifecycle-agnostic notion of "clean". Two identical managed_lifecycle instances, both listed in
+  lifecycle_expectation is suppressed only when it departed through a real clean shutdown, not a
+  lifecycle-agnostic notion of "clean". The node is driven ACTIVE first and only then walked
+  down to finalized: node_death admits a managed key only on a measurement of "active", so a
+  fixture that never activates never reaches the suppressor at all and the row would pass with
+  the mechanism deleted. Two identical managed_lifecycle instances, both listed in
   ``detectors.lifecycle_expectation.require_active`` (self-suppression needs BOTH "this node is
-  require_active-owned" and "it departed while not active" - the lifecycle label alone would
-  over-suppress a node nobody is watching), AND ``detectors.node_death.suppress: ["lifecycle"]``
-  naming the self-suppression mechanism this row is about - suppression is opt-in by ruling, so
-  without that entry a correct detector reports BOTH departed nodes and this row's own "the clean
-  one is never named" half would be false against a correct implementation. One is driven through
-  a REAL ``lifecycle_msgs/srv/ChangeState`` UNCONFIGURED_SHUTDOWN transition (reaching
-  "finalized") before its process is killed; the other reaches "active" (auto_activate) and is
-  killed outright, still active. The finalized one is never named; the active one is - proven
-  with assert_fault_describes_only so the claim holds over the whole window, not one lucky read.
+  require_active-owned" and "it departed cleanly" - the lifecycle label alone would over-suppress
+  a node nobody is watching), AND ``detectors.node_death.suppress: ["lifecycle"]`` naming the
+  self-suppression mechanism this row is about - suppression is opt-in by ruling, so without that
+  entry a correct detector reports BOTH departed nodes and this row's own "the clean one is never
+  named" half would be false against a correct implementation. Both reach "active"
+  (auto_activate); one is then walked down through REAL
+  ``lifecycle_msgs/srv/ChangeState`` DEACTIVATE, CLEANUP and UNCONFIGURED_SHUTDOWN transitions
+  (reaching "finalized") before its process is killed, the other is killed outright while still
+  active. The finalized one is never named; the active one is - proven with
+  assert_fault_describes_only so the claim holds over the whole window, not one lucky read.
 - "suppression_is_opt_in": the allowlist key is set, but ``suppress`` is not configured AT ALL -
   merely naming a node on the allowlist must not suppress it by itself. The fault raises and
   names the node.
@@ -78,13 +82,14 @@ which assertions run:
 
 Every scenario gates on wait_until_watchdog_armed(PORT, app_id=...) BEFORE asserting anything -
 see harness.py's own docstring for why a stack that never came up otherwise produces exactly the
-silence an absence claim is looking for. "lifecycle_clean_shutdown" is the one exception: both its
-nodes are non-active managed_lifecycle instances, and ReliabilityGate reports a tracked node with
-a known non-active label as "warming_up" by design (LifecycleWatcher::node_ok() is false for
-exactly the node this whole detector class exists to catch) - so a per-entity armed gate on either
-one would wait for something that can never become true. It gates on the GLOBAL armed state
-instead, exactly as test_lifecycle_expectation_e2e.test.py's own "main" scenario does for the
-identical reason.
+silence an absence claim is looking for. "lifecycle_clean_shutdown" is the one exception: it
+walks one of its nodes down to "finalized", and ReliabilityGate reports a tracked node with a
+known non-active label as "warming_up" by design (LifecycleWatcher::node_ok() is false for
+exactly the node this whole detector class exists to catch) - so a per-entity armed gate on that
+one would stop being true partway through the row. It gates on the GLOBAL armed state instead,
+exactly as test_lifecycle_expectation_e2e.test.py's own "main" scenario does, and then waits for
+node_death's own tracked count to settle before driving anything, which is the fact the row
+actually depends on.
 
 "allowlist_not_named_is_inert" and "lifecycle_clean_shutdown" both configure
 ``suppress: ["lifecycle"]`` for the second suppression mechanism this port carries (see
@@ -141,11 +146,17 @@ PORT = get_test_port()
 
 FAULT_CODE = 'GRAPH_NODE_DISAPPEARED'
 _NODE_DEATH_PREFIX = 'plugins.graph_watchdog.detectors.node_death'
+DETECTOR_ID_NODE_DEATH = 'node_death'
 _LIFECYCLE_PREFIX = 'plugins.graph_watchdog.detectors.lifecycle_expectation'
 
 # Same fast cadence and miss_grace convention test_node_death_e2e.test.py uses: comfortably past
 # the documented 3000 ms floor (config sweep C1 owns the floor's own boundary values) without
-# accidentally landing on it.
+# accidentally landing on it. Applied to EVERY scenario in this file, not only the one that
+# reasons about the window: left unset, node_death takes kDefaultMissGrace (2), which spans
+# 600 ms at this tick and is silently raised to the floor (14) with a startup warning - so the
+# gateway would run on a grace no constant here names. Every silence window in this file is
+# SUSTAINED_WINDOW_SEC, several times the (MISS_GRACE + 1) * TICK_INTERVAL_MS a death needs, so
+# an unsuppressed report still lands well inside the window an absence claim watches.
 TICK_INTERVAL_MS = 200
 WARMUP_CYCLES = 3
 MISS_GRACE = 20
@@ -291,6 +302,7 @@ def generate_test_description():
     detector_params = {
         'plugins.graph_watchdog.tick_interval_ms': TICK_INTERVAL_MS,
         'plugins.graph_watchdog.warmup_cycles': WARMUP_CYCLES,
+        f'{_NODE_DEATH_PREFIX}.miss_grace': MISS_GRACE,
     }
     demo_nodes = []
 
@@ -304,18 +316,20 @@ def generate_test_description():
         # this specific string is a placeholder for the framework's second mechanism rather
         # than a malformed entry.
         detector_params[f'{_NODE_DEATH_PREFIX}.suppress'] = ['lifecycle']
-    elif SCENARIO == 'lifecycle_clean_shutdown':
+    elif SCENARIO in ('lifecycle_clean_shutdown', 'lifecycle_clean_shutdown_unsuppressed'):
         detector_params[f'{_LIFECYCLE_PREFIX}.require_active'] = [CLEAN_NODE, KILLED_NODE]
         detector_params[f'{_LIFECYCLE_PREFIX}.grace'] = LIFECYCLE_GRACE
-        # Suppression is opt-in by ruling: without naming the self-suppression mechanism here,
-        # a correct detector reports BOTH departed nodes, and this scenario's own "the clean one
-        # is never named" half would be false against a correct implementation.
-        detector_params[f'{_NODE_DEATH_PREFIX}.suppress'] = ['lifecycle']
+        if SCENARIO == 'lifecycle_clean_shutdown':
+            # Suppression is opt-in by ruling: without naming the self-suppression mechanism
+            # here, a correct detector reports BOTH departed nodes, and this scenario's own "the
+            # clean one is never named" half would be false against a correct implementation.
+            # The paired _unsuppressed scenario differs in this key and NOTHING else, which is
+            # what lets it stand in for the admission this row cannot observe directly.
+            detector_params[f'{_NODE_DEATH_PREFIX}.suppress'] = ['lifecycle']
     elif SCENARIO == 'suppression_is_opt_in':
         detector_params[f'{_NODE_DEATH_PREFIX}.allowlist'] = [TARGET_NODE]
         # No 'suppress' key at all - the whole point of this scenario.
     elif SCENARIO == 'prune_no_false_heal':
-        detector_params[f'{_NODE_DEATH_PREFIX}.miss_grace'] = MISS_GRACE
         detector_params[f'{_NODE_DEATH_PREFIX}.prune_grace'] = PRUNE_GRACE
         # Durable suppression is the only path prune() ever reclaims through - see the
         # module docstring's own note on why an unsuppressed death cannot exercise it.
@@ -341,8 +355,13 @@ def generate_test_description():
         launch_description.add_action(TimerAction(period=2.0, actions=[second]))
         context['second_node'] = second
 
-    if SCENARIO == 'lifecycle_clean_shutdown':
-        clean = _lifecycle_node_action(CLEAN_NODE, auto_activate=False)
+    if SCENARIO in ('lifecycle_clean_shutdown', 'lifecycle_clean_shutdown_unsuppressed'):
+        # auto_activate: the suppressor is only ever consulted for a key node_death ADMITTED,
+        # and it admits a managed node only once the graph has measured it active. A fixture
+        # that never activates is refused before the suppressor exists, so the row that names
+        # this mechanism has to start from a node that genuinely became the presence
+        # detector's, then walk the whole way down to finalized.
+        clean = _lifecycle_node_action(CLEAN_NODE, auto_activate=True)
         killed = _lifecycle_node_action(KILLED_NODE, auto_activate=True)
         launch_description.add_action(TimerAction(period=2.0, actions=[clean, killed]))
         context['clean_node'] = clean
@@ -455,7 +474,11 @@ def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, 
     deadline = time.monotonic() + timeout
     status = None
     last_count = None
-    streak_start = None
+    # Seeded, not left None: the first sample can legitimately BE None (the route not up yet, or
+    # answering without a block for this detector), and None == last_count then takes the elif
+    # on the very first pass - which used to subtract from None and raise TypeError, turning an
+    # unrelated slow start into an error rather than a wait.
+    streak_start = time.monotonic()
     while time.monotonic() < deadline:
         now = time.monotonic()
         status = watchdog_detector_status(port, detector_id)
@@ -463,7 +486,10 @@ def _poll_stable_tracked_count(port, detector_id, timeout, stable_seconds=10.0, 
         if count != last_count:
             last_count = count
             streak_start = now
-        elif now - streak_start >= stable_seconds:
+        elif count is not None and now - streak_start >= stable_seconds:
+            # A route that never answers holds None steady forever; that is not a settled
+            # count, it is an absent one, and calling it stable would hand the caller a
+            # baseline it never read.
             return status, True
         time.sleep(interval)
     return status, False
@@ -559,7 +585,17 @@ class TestSuppressionAllowlistNotNamedIsInert(unittest.TestCase):
 
 
 class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
-    """Self-suppression: a require_active node that departed while not active is not named.
+    """Self-suppression: a node that reached a clean shutdown before departing is not named.
+
+    The route to the mechanism matters as much as the outcome, because for a long time this row
+    did not take it. The suppressor is consulted only for a key node_death ADMITTED, and it
+    admits a managed node only once the graph has measured it ACTIVE - so a fixture that sat at
+    unconfigured and was shut down from there never entered the dead set, never reached the
+    suppressor, and left this row green with the suppressor deleted entirely. It now starts the
+    node active, waits for node_death's own tracked count to settle so the admission is real
+    rather than assumed, and walks it down deactivate, cleanup, shutdown with each step
+    confirmed on the status route before the next - which is what leaves the watcher holding
+    "finalized" WITH the transitions that classify it as clean.
 
     Two managed_lifecycle instances, both require_active-owned - self-suppression needs "this
     node is owned by lifecycle_expectation", "it departed while not active", AND
@@ -602,9 +638,10 @@ class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
             'GET /faults never answered 200 - nothing below would prove anything')
 
         self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, CLEAN_NODE, 'unconfigured', timeout=ARM_TIMEOUT_SEC),
-            f'{CLEAN_NODE} never read as "unconfigured" - the fixture was not discovered as a '
-            'managed node, or this scenario never set up the trigger it is named for',
+            _poll_watchdog_entity(PORT, CLEAN_NODE, 'active', timeout=ARM_TIMEOUT_SEC),
+            f'{CLEAN_NODE} never reached "active" - node_death only admits a managed node the '
+            'graph has measured active, and a key it never admitted never reaches the '
+            'suppressor at all, so the whole row would pass without the mechanism existing',
         )
         self.assertIsNotNone(
             _poll_watchdog_entity(PORT, KILLED_NODE, 'active', timeout=ARM_TIMEOUT_SEC),
@@ -612,20 +649,41 @@ class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
             'needs (an active node killed outright) was never set up',
         )
 
-        change_state_service = f'/{CLEAN_NODE}/change_state'
+        # And the presence detector has to have ADMITTED it before anything is driven, which
+        # the route's label does not say: the label is LifecycleWatcher's, republished the
+        # moment a transition_event lands, while the admission happens on node_death's own next
+        # tick. Deactivating in that gap leaves the key never admitted, the suppressor never
+        # consulted, and the row green for a mechanism that never ran - which is exactly how it
+        # was vacuous before. A settled tracked_count is the detector's own signal that its
+        # sweep has caught up.
+        _, admitted = _poll_stable_tracked_count(
+            PORT, DETECTOR_ID_NODE_DEATH, timeout=ARM_TIMEOUT_SEC, stable_seconds=3.0)
         self.assertTrue(
-            _call_change_state_once(
-                type(self)._client_node, change_state_service,
-                Transition.TRANSITION_UNCONFIGURED_SHUTDOWN, timeout=30.0),
-            f'the real UNCONFIGURED_SHUTDOWN transition on {CLEAN_NODE} was rejected or never '
-            'answered',
-        )
-        self.assertIsNotNone(
-            _poll_watchdog_entity(PORT, CLEAN_NODE, 'finalized', timeout=30.0),
-            f'{CLEAN_NODE} never read as "finalized" after its own UNCONFIGURED_SHUTDOWN - the '
-            'clean-shutdown trigger this scenario is about was never actually reached',
-        )
+            admitted,
+            "node_death's tracked_count never settled while both fixtures were active, so this "
+            'row cannot tell whether the key it is about was ever admitted')
 
+        # The whole way down, one real transition at a time, each one confirmed on the status
+        # route before the next: the suppressor classifies the LAST label the watcher saw, and
+        # it only counts "finalized" when it also saw the transitions leading there. Jumping
+        # straight to shutdown from a node that never activated is what made this row vacuous.
+        change_state_service = f'/{CLEAN_NODE}/change_state'
+        for transition_id, reached in (
+                (Transition.TRANSITION_DEACTIVATE, 'inactive'),
+                (Transition.TRANSITION_CLEANUP, 'unconfigured'),
+                (Transition.TRANSITION_UNCONFIGURED_SHUTDOWN, 'finalized')):
+            self.assertTrue(
+                _call_change_state_once(
+                    type(self)._client_node, change_state_service, transition_id, timeout=30.0),
+                f'the real transition {transition_id} on {CLEAN_NODE} was rejected or never '
+                'answered, so the clean shutdown this row is about was never performed',
+            )
+            self.assertIsNotNone(
+                _poll_watchdog_entity(PORT, CLEAN_NODE, reached, timeout=30.0),
+                f'{CLEAN_NODE} never read as "{reached}" after transition {transition_id} - the '
+                'watcher did not see the step, so the departure it records cannot be classified '
+                'as a clean shutdown',
+            )
         os.kill(clean_node.process_details['pid'], signal.SIGTERM)
         os.kill(killed_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
@@ -645,6 +703,102 @@ class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
         assert_fault_describes_only(
             self, PORT, FAULT_CODE,
             required=[KILLED_NODE], forbidden=[CLEAN_NODE],
+            duration=SUSTAINED_WINDOW_SEC)
+
+
+class TestSuppressionLifecycleCleanShutdownUnsuppressed(unittest.TestCase):
+    """The control for the row above: without `suppress`, the cleanly shut-down node IS named.
+
+    The suppressed row cannot prove what it most needs to. Its positive claim is about
+    KILLED_NODE and its negative claim is that CLEAN_NODE is never named - and "never named" is
+    equally true of a node the presence detector never ADMITTED, so an implementation that
+    admits only the node it is going to report would pass it. The settled tracked_count that row
+    waits on is an aggregate: it says some number of keys is being tracked, never which.
+
+    This scenario is the same launch with `detectors.node_death.suppress` removed and nothing
+    else changed. It drives CLEAN_NODE down the identical deactivate/cleanup/shutdown walk and
+    kills both processes the same way, and requires BOTH names in the description. A key that
+    was never admitted cannot be named whatever the suppression configuration, so the pair
+    together says what neither says alone: CLEAN_NODE entered node_death's tracked set, and the
+    suppressor - not an absent admission - is what keeps it out of the fault.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rclpy.init()
+        cls._client_node = Node('node_death_suppression_e2e_unsuppressed_client')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._client_node.destroy_node()
+        rclpy.shutdown()
+
+    def test_without_the_suppressor_the_clean_node_is_named_too(self, clean_node, killed_node):
+        self.assertTrue(
+            wait_until_watchdog_armed(PORT, timeout=ARM_TIMEOUT_SEC),
+            'graph_watchdog never reported an armed global state')
+        self.assertTrue(
+            wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
+            'GET /faults never answered 200 - nothing below would prove anything')
+
+        for node_id in (CLEAN_NODE, KILLED_NODE):
+            self.assertIsNotNone(
+                _poll_watchdog_entity(PORT, node_id, 'active', timeout=ARM_TIMEOUT_SEC),
+                f'{node_id} never reached "active" - node_death only admits a managed node the '
+                'graph has measured active, so this control would be measuring the same '
+                'never-admitted key the suppressed row cannot rule out',
+            )
+
+        # Same gate as the suppressed row, for the same reason: the route's label is the
+        # watcher's and moves the instant a transition_event lands, while admission happens on
+        # node_death's own next tick.
+        _, admitted = _poll_stable_tracked_count(
+            PORT, DETECTOR_ID_NODE_DEATH, timeout=ARM_TIMEOUT_SEC, stable_seconds=3.0)
+        self.assertTrue(
+            admitted,
+            "node_death's tracked_count never settled while both fixtures were active")
+
+        change_state_service = f'/{CLEAN_NODE}/change_state'
+        for transition_id, reached in (
+                (Transition.TRANSITION_DEACTIVATE, 'inactive'),
+                (Transition.TRANSITION_CLEANUP, 'unconfigured'),
+                (Transition.TRANSITION_UNCONFIGURED_SHUTDOWN, 'finalized')):
+            self.assertTrue(
+                _call_change_state_once(
+                    type(self)._client_node, change_state_service, transition_id, timeout=30.0),
+                f'the real transition {transition_id} on {CLEAN_NODE} was rejected or never '
+                'answered, so this control is not driving the same shutdown the suppressed row '
+                'does',
+            )
+            self.assertIsNotNone(
+                _poll_watchdog_entity(PORT, CLEAN_NODE, reached, timeout=30.0),
+                f'{CLEAN_NODE} never read as "{reached}" after transition {transition_id}',
+            )
+
+        os.kill(clean_node.process_details['pid'], signal.SIGTERM)
+        os.kill(killed_node.process_details['pid'], signal.SIGTERM)
+        for node_id in (CLEAN_NODE, KILLED_NODE):
+            self.assertTrue(
+                _poll_apps_absent(PORT, node_id, timeout=DEPARTURE_TIMEOUT_SEC),
+                f'{node_id} never left GET /apps after SIGTERM')
+
+        fault = poll_faults(PORT, FAULT_CODE, timeout=RAISE_TIMEOUT_SEC)
+        if fault is None:
+            self.fail(f'{FAULT_CODE} never raised after both fixtures exited')
+
+        # BOTH, sustained. The clean one being named here is the whole point: it proves the key
+        # was in the tracked set all along, which is what the suppressed row's silence cannot
+        # distinguish from a key that was never there.
+        description = fault.get('description', '')
+        self.assertIn(
+            CLEAN_NODE, description,
+            f'{CLEAN_NODE} shut down cleanly and departed, and with no suppressor configured it '
+            f'was still not named (description: {description!r}) - node_death never admitted '
+            'that key, so the suppressed row proves nothing about self-suppression',
+        )
+        assert_fault_describes_only(
+            self, PORT, FAULT_CODE,
+            required=[CLEAN_NODE, KILLED_NODE], forbidden=[],
             duration=SUSTAINED_WINDOW_SEC)
 
 
@@ -763,6 +917,7 @@ _SCENARIO_CASES = {
     'allowlist_suppresses': 'TestSuppressionAllowlistSuppresses',
     'allowlist_not_named_is_inert': 'TestSuppressionAllowlistNotNamedIsInert',
     'lifecycle_clean_shutdown': 'TestSuppressionLifecycleCleanShutdown',
+    'lifecycle_clean_shutdown_unsuppressed': 'TestSuppressionLifecycleCleanShutdownUnsuppressed',
     'suppression_is_opt_in': 'TestSuppressionOptIn',
     'prune_no_false_heal': 'TestSuppressionPruneNoFalseHeal',
 }

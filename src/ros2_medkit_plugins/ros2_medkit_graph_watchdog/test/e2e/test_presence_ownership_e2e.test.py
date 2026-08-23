@@ -660,21 +660,24 @@ class TestBudgetSpentThenOwned(unittest.TestCase):
             wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
             'GET /faults never answered 200 - nothing below would prove anything')
 
-        entity = _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC)
+        # SETTLED ignorance, read off the route rather than argued from how many ticks the
+        # steps above must have cost: measurement_pending=False is the watcher saying it has
+        # stopped asking. Without it this polls only for an unread label, which is equally true
+        # while the reads are still in flight - the PENDING half of the bound, where the
+        # opposite answer is correct and this row would be testing the other case.
+        entity = _poll_watchdog_entity(
+            PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC, measurement_pending=False)
         self.assertIsNotNone(
             entity,
-            f'{UNREADABLE_NODE} never appeared with an EMPTY lifecycle label - the fixture was '
-            'either not tracked as managed at all or its GetState was answered, and this row '
-            'needs a node that is tracked and unmeasured')
+            f'{UNREADABLE_NODE} never reached an EMPTY lifecycle label with the asking finished '
+            '- the fixture was either not tracked as managed at all, or its GetState was '
+            'answered, or the watcher is still retrying; this row needs a node that is tracked '
+            'and settled-unmeasured')
         self.assertTrue(
             entity.get('armed'),
             f'{UNREADABLE_NODE} is unmeasured but NOT armed, so node_death would decline it for '
             'the warmup reason instead of the ownership reason this row is about')
 
-        # The budget is spent within a handful of ticks of discovery (kReseedAttempts issued
-        # reads, each cut off by the reader's own timeout), and everything above has already
-        # cost far more than that. Killing here therefore lands in the SETTLED half of the
-        # bound, which is what this row is about.
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
             _poll_apps_absent(PORT, UNREADABLE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
@@ -731,11 +734,14 @@ class TestNoRequireActiveStillOwned(unittest.TestCase):
             wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
             'GET /faults never answered 200 - nothing below would prove anything')
 
-        entity = _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC)
+        # Settled, not merely unread - same instrument and same reason as the sibling row: an
+        # unread label alone is also what a node in the middle of its reseed attempts shows.
+        entity = _poll_watchdog_entity(
+            PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC, measurement_pending=False)
         self.assertIsNotNone(
             entity,
-            f'{UNREADABLE_NODE} never appeared with an EMPTY lifecycle label, so this row is not '
-            'about an unmeasured managed node at all')
+            f'{UNREADABLE_NODE} never reached an EMPTY lifecycle label with the asking finished, '
+            'so this row is not about a settled-unmeasured managed node at all')
         self.assertTrue(entity.get('armed'))
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)

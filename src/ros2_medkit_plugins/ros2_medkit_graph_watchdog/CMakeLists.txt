@@ -320,9 +320,13 @@ if(BUILD_TESTING)
 
   # Registers a fake /fault_manager/report_fault service like orphan/param_drift above, so it
   # shares the same RESOURCE_LOCK (see the comment on the integration block).
+  # Both detectors, because the boundary between them is only observable with both of them on
+  # one gate: what one admits decides what the other latches, and a claim about the handover
+  # cannot be driven from either side alone.
   medkit_add_gtest(test_lifecycle_expectation_integration
     test/test_lifecycle_expectation_integration.cpp
     src/detectors/lifecycle_expectation_detector.cpp
+    src/detectors/node_death_detector.cpp
     src/detector_registry.cpp
     src/reliability_gate.cpp
     src/lifecycle_watcher.cpp
@@ -796,6 +800,16 @@ if(BUILD_TESTING)
     test/e2e/test_node_death_suppression_e2e.test.py TIMEOUT 720
     LABELS "integration;e2e"
     ENV "GATEWAY_TEST_PORT=19430" "WATCHDOG_E2E_SCENARIO=lifecycle_clean_shutdown"
+      "${_WATCHDOG_E2E_ENV}")
+
+  # The control for the row above, and the same launch minus one config key, so it carries the
+  # same budget: the suppressed row's "the clean node is never named" cannot tell a working
+  # suppressor from a key node_death never admitted, and this one does by requiring that name.
+  medkit_add_launch_test(test_node_death_suppression_e2e_lifecycle_clean_shutdown_unsuppressed
+    test/e2e/test_node_death_suppression_e2e.test.py TIMEOUT 720
+    LABELS "integration;e2e"
+    ENV "GATEWAY_TEST_PORT=19610"
+      "WATCHDOG_E2E_SCENARIO=lifecycle_clean_shutdown_unsuppressed"
       "${_WATCHDOG_E2E_ENV}")
 
   # 60 (arming, app_id-scoped) + 30 (departure poll) + 60 (raise poll) = 150 internal. Rounded

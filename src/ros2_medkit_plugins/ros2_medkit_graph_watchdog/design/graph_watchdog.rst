@@ -429,15 +429,15 @@ at all this tick is ABSENT, a fact separate from any observed state (there is no
 classify). For up to ``absence_grace`` (a fixed 3 ticks) consecutive absent ticks a node's
 whole state is held unchanged - the blink tolerance. Past ``absence_grace`` absence resets
 nothing, but what it ADVANCES depends on whether the node's SETTLED observation is already
-CONTENT, and - for a below-grace violation streak only - on whether the presence detector ever
-OWNED the node: a settled-``INACTIVE`` node ALREADY reported under ``GRAPH_NODE_INACTIVE``
-keeps its streak exactly as it was, so the fault stays raised, regardless of ownership. One not
-yet past ``grace`` splits on that fact: a node the presence detector COULD have tracked
-(admitted for ownership at least once) is HELD - neither advanced (no fault born from evidence
-gathered while nobody could observe the node, since ``node_death`` is able to report this exact
-departure instead) nor erased (it
-resumes rather than restarts on return) - while a node the presence detector could NEVER have
-tracked keeps climbing on absence exactly as it would on a present tick, because nothing else
+CONTENT, and - for a below-grace violation streak only - on whether the presence detector is
+CURRENTLY tracking the node: a settled-``INACTIVE`` node ALREADY reported under
+``GRAPH_NODE_INACTIVE`` keeps its streak exactly as it was, so the fault stays raised,
+regardless of ownership. One not yet past ``grace`` splits on that fact, read every tick from
+the key set ``node_death`` publishes and never remembered: a node in that set is HELD - neither
+advanced (no fault born from evidence gathered while nobody could observe the node, since
+``node_death`` is tracking this exact departure) nor erased (it
+resumes rather than restarts on return) - while a node outside it keeps climbing on absence
+exactly as it would on a present tick, because nothing else
 in the plugin will ever report its departure either. A settled-``UNREADABLE``/``NOT_MANAGED``
 node keeps climbing its unmeasured clock under that same cause regardless of maturity or
 ownership - that clock's own absence behaviour is unrelated to this distinction. A
@@ -505,20 +505,29 @@ between the label reaching the status route and the release). A withdrawal that 
 is final, which needed its own guard: a dying managed node loses its lifecycle services from
 the snapshot before it loses its App entry, and a node with no managed record answers
 ``kEarned`` - so dying erased the very measurement that disowned the node and re-admitted the
-key on the tick before it departed. A released key is therefore readmitted only on a label
-reading ``active``, never on the absence of a label. It is a mis-attribution of a TRUE
+key on the tick before it departed. A released key is therefore readmitted on a label
+reading ``active``, never on the mere absence of a label - but the refusal runs for a bounded
+window rather than the node's whole life: after ``miss_grace + 1`` consecutive record-less
+PRESENT ticks (this detector's own "absent this long means dead" span, already floored to
+``kMinNodeDeathWindowMs`` of wall clock) the key is taken back, because a node still present
+past that window is not mid-death, it has simply stopped being managed - and holding the
+refusal open would leave its eventual death reported by nobody at all. It is a mis-attribution of a TRUE
 report, not a false positive, and it cannot be closed at report time: the departed record keeps
 only the last label, which reads ``inactive`` both for a node earned and then deactivated - a
 death this detector must report - and for one only ever held provisionally. Separating them
 after the fact needs per-key ownership history surviving the departure, which is the unbounded
 state the tracked-key prune exists to prevent. So
-the split is on whether the presence detector EVER owned the node - a fact read from the
-reliability gate itself, not guessed from the observed label: once owned, a below-``grace``
-streak that goes absent is simply HELD rather than matured on the strength of the absence
+the split is on whether the presence detector is tracking the node RIGHT NOW - read from the
+key set that detector publishes each sweep, not from the reliability gate and not guessed from
+the observed label: while it holds the key, a below-``grace`` streak that goes absent is simply
+HELD rather than matured on the strength of the absence
 alone - two codes standing at once for the same node is not a problem to fix, it is
-``GRAPH_NODE_INACTIVE`` and ``GRAPH_NODE_DISAPPEARED`` saying different, both-true things. A
-node the presence detector never owned gets no such backstop - ``GRAPH_NODE_DISAPPEARED``
-structurally cannot report it - so absence keeps advancing its streak exactly as a present tick
+``GRAPH_NODE_INACTIVE`` and ``GRAPH_NODE_DISAPPEARED`` saying different, both-true things.
+Reading membership rather than latching it is what makes the hold end when the claim behind it
+does: a key handed back on a measured disown, one reclaimed by ``prune()`` after a durable
+suppression, and one collapsed under the cap all leave the set, and the streak resumes climbing
+for each. A node outside the set gets no backstop - ``GRAPH_NODE_DISAPPEARED``
+will not report it - so absence keeps advancing its streak exactly as a present tick
 would. Reporting a HEALTHY node that left remains ``GRAPH_NODE_DISAPPEARED``'s job as well, for
 either kind of node - a healthy departure never starts a violation regardless of ownership.
 
@@ -581,7 +590,7 @@ non-idle entry is never pruned by age. An entry whose UNMEASURED clock is still 
 cannot grow without bound in time either: past the absence grace it advances every tick, so
 it matures within at most ``60 + absence_grace + 1`` ticks and is reported - the longest
 ``GRAPH_NODE_UNREADABLE`` or ``GRAPH_NODE_NOT_MANAGED``'s clear can be withheld by one
-departed node. A below-``grace`` VIOLATION streak on a node the presence detector never owned
+departed node. A below-``grace`` VIOLATION streak on a node the presence detector is not tracking
 shares that same bound, for the same reason it advances at all while absent: it matures within
 at most ``grace + absence_grace + 1`` ticks, because nothing else will ever report that node's
 departure either. Only once a node HAS been owned does its below-grace streak lose the
@@ -770,7 +779,7 @@ overlapping - plus the shared-watcher seam the re-bind behaviour lives in:
    two ``(UNREADABLE/NOT_MANAGED, ABSENT x N)`` restart-loop shapes are swept at the
    absence grace and past it (their ``INACTIVE`` sibling pinned to the opposite claim at the
    same two N: it never crosses grace from absence alone, for a node the presence detector
-   owned at some point - a node it never owned gets the opposite result instead, maturing
+   is tracking - a node outside its key set gets the opposite result instead, maturing
    from absence alone within ``grace + absence_grace + 1`` ticks exactly like the unmeasured
    clock does, and resuming rather than restarting on return the same way an owned node's
    held streak does); the ``pending`` set and its
@@ -1094,27 +1103,32 @@ reclaim tick, one tick to spare
 (``GraphWatchdogPlugin::compute_departed_retention_ticks()`` - the resulting window is
 larger than ``prune_ticks_`` alone).
 
-**Bounded by evidence, not by age - and why this cap, unlike the sibling's, cannot
-actually saturate.** This detector is zero-config over every armed App in the graph - a
-strictly larger scope than ``lifecycle_expectation``'s named ``require_active`` set - so
-identity churn would grow the tracker's map without a bound if nothing capped it. An
-unsuppressed, still-dead entry is never reclaimed by age (``prune_grace`` only ever
-reclaims a DURABLY suppressed key), so ``tracked_node_cap`` (default 512, accepted range
-1..16384) is what bounds memory. At the cap: idle entries (present, carrying no evidence)
-are evicted first - free, since a still-armed one is simply re-tracked a moment later -
-then departed entries are collapsed into one synthetic count, keeping at most three
-individually named, and only if even that leaves no room is every departed entry
-collapsed. Unlike ``LifecycleExpectationTracker``, whose two clocks let a node be
-simultaneously present and mid-violation (neither idle nor departed, and so un-evictable -
-exactly what lets ITS cap genuinely saturate and withhold ``GRAPH_NODE_INACTIVE``'s
-clear), ``NodeLivenessTracker`` carries exactly one piece of per-key state, so every
-tracked identity is always either idle or departed; collapsing every departed entry always
-empties enough room, so a newcomer is never actually refused while the cap is at least 1
-(``NodeLivenessTrackerCap.SaturationNeverFiresBecauseEveryKeyIsEitherIdleOrCollapsible``
-pins this directly). ``tracking_saturated`` and ``tracked_node_cap`` still appear in this
-detector's own ``GET /x-medkit-watchdog`` block, in the same shape the sibling reports
-them, but the field is never observed true here - the shared shape exists for consistency
-with the sibling detector, not because saturation is reachable in this one.
+**Bounded by evidence, not by age - and what the cap actually bounds.** This detector is
+zero-config over every armed App in the graph - a strictly larger scope than
+``lifecycle_expectation``'s named ``require_active`` set - so identity churn would grow the
+tracker's map without a bound if nothing capped it. An unsuppressed, still-dead entry is
+never reclaimed by age (``prune_grace`` only ever reclaims a DURABLY suppressed key), so
+``tracked_node_cap`` (default 512, accepted range 1..16384) is what bounds memory -
+specifically the DEPARTED subset of the map. A PRESENT/armed key never counts against the
+cap and is never evicted to make room for anything, at any map size
+(``NodeLivenessTrackerCap.PresentEntriesExceedingTheCapAreAllStillIndividuallyReportableOnDeath``):
+it is bounded by the live graph rather than by churn, so a graph far larger than the cap is
+not capacity pressure at all.
+
+Under pressure the cap collapses departed entries into one synthetic count, keeping at most
+three individually named
+(``NodeLivenessTrackerCap.MaturedDepartedEntriesAreCollapsedIntoACountUnderCapPressure``) -
+but only entries that have actually crossed ``miss_grace``. An entry still mid-grace is
+never a collapse candidate, because collapsing erases the identity and would report a death
+the node has not earned, permanently
+(``NodeLivenessTrackerCap.ImmatureDepartedEntriesAreNeverCollapsedOrReportedUnderCapPressure``).
+So saturation IS reachable here: when immature departures alone exceed the cap,
+``tracking_saturated`` goes true and the departed set stays oversized for a few ticks -
+bounded by how fast departures arrive times ``miss_grace``, not by process uptime, which is
+the growth the cap exists to prevent. What differs from ``LifecycleExpectationTracker`` is
+not whether the flag can fire but what it costs: there a refused newcomer withholds
+``GRAPH_NODE_INACTIVE``'s clear, whereas here nothing is refused and no report is lost, the
+map is merely temporarily larger than its target.
 
 **The boundary with** ``lifecycle_expectation``. ``GRAPH_NODE_INACTIVE`` and
 ``GRAPH_NODE_DISAPPEARED`` can both be raised for the same node at the same time, and that
@@ -1140,7 +1154,7 @@ absence CONTINUES a violation that has already matured past ``grace`` (the fault
 raised, still naming the node), but no longer CREATES one that has not. A node that was
 briefly non-active and then died is reported as gone (``GRAPH_NODE_DISAPPEARED``) rather
 than also acquiring an inactive fault born from ticks gathered while nobody could observe
-it. A ``require_active`` node that never reaches ``active`` is never owned, is never tracked
+it. A ``require_active`` node that never reaches ``active`` is never admitted, is never tracked
 here, and its departure can never raise ``GRAPH_NODE_DISAPPEARED``; the same holds for an app
 that is not online. For those, ``lifecycle_expectation`` keeps the older behaviour: absence
 still matures a below-``grace`` streak, because it is structurally the only detector that will
@@ -1225,11 +1239,12 @@ plus the suppression chain the detector shares no code with any sibling for:
    of a capped description's blind spot; ``prune()`` reclaims a key only once it has been
    suppressed for MORE than ``prune_ticks`` CONSECUTIVE calls, resets the streak the
    moment a veto lifts even once, and never reclaims an unsuppressed death no matter how
-   long it stays dead; the cap evicts idle entries before collapsing departed ones, keeps
-   the collapsed count monotone within one tracker lifetime, and - the property most at
-   odds with a naive read of the sibling detector - can never actually report
-   ``tracking_saturated`` at all, since every tracked key here is always either idle or
-   collapsible, never both at once the way the sibling's two clocks allow.
+   long it stays dead; the cap leaves every PRESENT key individually tracked and reportable
+   however far the map is past it, collapses only departed entries that have crossed
+   ``miss_grace``, keeps the collapsed count monotone within one tracker lifetime, and - the
+   property most at odds with a naive read of the sibling detector - reports
+   ``tracking_saturated`` for a departed set that immature entries alone keep oversized,
+   which unlike the sibling's saturation refuses nothing and loses no report.
    ``test_suppressor.cpp`` pins the ``Suppressor`` interface and the free
    ``apply_suppressors()`` helper (order-independent, null-safe, returns the dropped
    count); ``test_allowlist_suppressor.cpp`` and ``test_lifecycle_shutdown_suppressor.cpp``
