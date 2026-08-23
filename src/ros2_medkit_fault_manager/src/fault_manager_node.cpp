@@ -1328,6 +1328,7 @@ std::unique_ptr<correlation::CorrelationEngine> FaultManagerNode::create_correla
   }
 
   try {
+    RCLCPP_INFO(get_logger(), "Loading correlation config from: %s", config_file.c_str());
     auto config = correlation::parse_config_file(config_file);
 
     if (!config.enabled) {
