@@ -26,6 +26,7 @@
 #include <ros2_medkit_msgs/srv/report_fault.hpp>
 
 #include "ros2_medkit_graph_watchdog/fault_request.hpp"
+#include "ros2_medkit_graph_watchdog/presence_ownership.hpp"
 
 namespace ros2_medkit_gateway {
 struct IntrospectionInput;
@@ -45,6 +46,14 @@ class ReliabilityGate;  // defined in reliability_gate.hpp; only a pointer is st
 // header free of lifecycle_msgs). Defined in reliability_gate.cpp. Returns true when
 // gate is null (not yet wired) or the entity is armed + lifecycle-ok.
 bool reliability_allows(const ReliabilityGate * gate, const std::string & source_id);
+
+// The stricter sibling of reliability_allows(), same null-gate convention, also defined in
+// reliability_gate.cpp: on what GROUNDS the presence detector owns this entity's departure -
+// see ReliabilityGate::presence_ownership() and PresenceOwnership. Where reliability_allows()
+// answers "may this entity raise" and is permissive about a label that has never been read,
+// this answers "whose node is this" and distinguishes an answer earned from a measurement
+// from one granted only because the asking stopped.
+PresenceOwnership presence_ownership(const ReliabilityGate * gate, const std::string & source_id);
 
 /// QoS for subscribing to /tf_static: publishers latch with transient-local
 /// durability, so a late subscriber must match it to receive the static transforms.

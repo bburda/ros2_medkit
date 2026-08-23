@@ -42,11 +42,6 @@ constexpr int kMaxGetStateSeedsPerTick = 8;
 /// timeout (~500 ms), never N of them; async ~/transition_event keeps state fresh meanwhile.
 constexpr std::chrono::milliseconds kGetStateBudgetPerTick{150};
 
-/// How many extra GetState re-seeds a tracked-but-non-active node gets to self-heal a
-/// missed activation. Two ticks of coverage comfortably outlast the tens-of-ms DDS
-/// endpoint-matching window; after that a matched subscription catches every transition.
-constexpr int kReseedAttempts = 2;
-
 /// The error branch of the default lifecycle state machine. A node reaches it from any
 /// primary state via ON_ERROR, and leaves it either back to `unconfigured` (ON_ERROR_SUCCESS,
 /// the default on_error) or into `finalized` (ON_ERROR_FAILURE / ON_ERROR_ERROR).
@@ -289,7 +284,7 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
         options);
     auto & tracked = state_->tracked[id];
     tracked.sub = std::move(sub);
-    tracked.reseeds_remaining = kReseedAttempts;
+    tracked.reseeds_remaining = LifecycleWatcher::kReseedAttempts;
     const auto seed_it = seeded.find(id);
     tracked.state_label = (seed_it != seeded.end()) ? seed_it->second : "";
     // Captured at first sighting: current_fqns is built from the same snapshot pass
@@ -361,6 +356,19 @@ bool LifecycleWatcher::node_ok(const std::string & app_id) const {
   return it->second.state_label.empty() || it->second.state_label == "active";
 }
 
+bool LifecycleWatcher::measurement_pending(const std::string & app_id) const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  const auto it = state_->tracked.find(app_id);
+  if (it == state_->tracked.end()) {
+    return false;
+  }
+  // Both conjuncts matter. A non-empty label is a measurement, however stale. An empty one
+  // with no attempts left is a measurement that will never arrive: update() only queues a
+  // re-seed while `reseeds_remaining > 0`, so nothing here will issue another GetState for
+  // this entry for the rest of its tracked life.
+  return it->second.state_label.empty() && it->second.reseeds_remaining > 0;
+}
+
 std::optional<std::string> LifecycleWatcher::state_of(const std::string & app_id) const {
   std::lock_guard<std::mutex> lock(state_->mutex);
   const auto it = state_->tracked.find(app_id);
@@ -408,10 +416,12 @@ int LifecycleWatcher::reseeds_remaining_for_test(const std::string & app_id) con
   return it == state_->tracked.end() ? -1 : it->second.reseeds_remaining;
 }
 
-void LifecycleWatcher::set_state_for_test(const std::string & app_id, const std::string & label) {
+void LifecycleWatcher::set_state_for_test(const std::string & app_id, const std::string & label,
+                                          int reseeds_remaining) {
   std::lock_guard<std::mutex> lock(state_->mutex);
   auto & tracked = state_->tracked[app_id];
   tracked.state_label = label;
+  tracked.reseeds_remaining = reseeds_remaining;
   // This seam stands in for a live ~/transition_event round-trip, so it must record the same
   // thing that callback does: we WATCHED the node reach this label. Leaving saw_transition false
   // would make every shim-driven departure look like a node found already sitting in its final

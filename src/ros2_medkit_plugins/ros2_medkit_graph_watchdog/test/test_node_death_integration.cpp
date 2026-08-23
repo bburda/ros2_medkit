@@ -1105,6 +1105,52 @@ TEST_F(NodeDeathIntegrationTest, UngatedClearStaysSuppressedWhileAnUnrelatedNode
          "clear it either, however many unrelated entities become tracked";
 }
 
+// The fourth quadrant of the restart matrix, and a LIMITATION rather than a property worth
+// having: gateway restarts AND the node returns. The fresh instance sees the node present,
+// armed and not missing, so report.dead is empty, ever_raised_ stays false, and no PASSED is
+// ever emitted - a fault CONFIRMED before the restart therefore stays CONFIRMED, and with the
+// sqlite backend it survives every reboot until an operator acknowledges it.
+//
+// Why it is not simply fixed here: the guard exists because a fresh instance cannot tell "the
+// node came back" from "I never saw that node". Answering that needs the KEYS the outstanding
+// record names, and they are not reachable. /fault_manager/list_faults would tell this detector
+// that a GRAPH_NODE_DISAPPEARED record is outstanding and that it is among its reporting
+// sources, but not which nodes it names: fault_manager aggregates one record per fault_code,
+// and this detector merges every dead key into that one record's description, capped at
+// AggregatedFault::kMaxDescriptionChars with the remainder collapsed into a count. Acting on
+// the record's mere existence would clear it for a node that is still dead and simply never
+// re-observed, which is the ungated heal the sibling tests above forbid.
+//
+// So this pins the behaviour rather than asserting a fix: it is what the README's restart
+// section documents, and it must not change silently.
+TEST_F(NodeDeathIntegrationTest, RestartedInstanceNeverClearsAFaultItDidNotRaiseEvenAsTheNodeReturns) {
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  // A brand-new detector object is exactly what a gateway restart produces - see configure()'s
+  // own note on why ever_raised_ needs no reset. Nothing here ever kills "victim": this
+  // instance's whole life is the healthy graph a returned node presents.
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}});
+  auto ctx = make_ctx(&gate);
+
+  for (std::uint64_t t = 0; t < 20; ++t) {
+    set_apps({app_of("victim"), anchor_app()});
+    gate.update(snapshot_, t);
+    det->tick(ctx);
+  }
+  ASSERT_GT(det->tracked_count_for_test(), 0u)
+      << "the returned node must be tracked and healthy, or this test is not about the quadrant "
+         "where the node came back";
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_PASSED), 0u)
+      << "a fresh instance emitted PASSED for a fault it never raised - it cannot know which "
+         "node the stored record names, so this clear would be just as wrong for a node that "
+         "never came back";
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), 0u)
+      << "nothing died here, so nothing may be reported either";
+}
+
 TEST_F(NodeDeathIntegrationTest, ClearFlowsOnceThisInstanceHasGenuinelyRaised) {
   ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
   auto det = make_node_death();

@@ -171,7 +171,11 @@ from harness import (  # noqa: E402, I100
     wait_until_watchdog_armed,
 )
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_test_port  # noqa: E402
+from ros2_medkit_test_utils.constants import (  # noqa: E402
+    ALLOWED_EXIT_CODES,
+    get_test_port,
+    get_time_scale,
+)
 from ros2_medkit_test_utils.coverage import get_coverage_env  # noqa: E402
 from ros2_medkit_test_utils.launch_helpers import DEMO_NODE_REGISTRY  # noqa: E402
 
@@ -243,12 +247,23 @@ B5_MISS_GRACE = 16
 # by 1200 ms - worst-case observed window 12500 - 1100 = 11400 ms, 3.35x the nominal grace.
 B5_RESPAWN_DELAY_SEC = 12.5
 
-ARM_TIMEOUT_SEC = 60.0
-FAULTS_LIVE_TIMEOUT_SEC = 30.0
-PRESENCE_TIMEOUT_SEC = 30.0
-DEPARTURE_TIMEOUT_SEC = 30.0
-RAISE_TIMEOUT_SEC = 60.0
-CLEAR_TIMEOUT_SEC = 60.0
+# The budgets below are scaled by MEDKIT_TEST_TIME_SCALE, which the sanitizer jobs set to the
+# same factor they apply to every declared CTest timeout. A deadline asserted INSIDE a test is
+# invisible to that rewrite, so an instrumented graph that takes longer to forget a departed
+# node blows a budget here and the failure reads as a detector that never reported - the exact
+# red this suite exists to produce for a real defect. Unset elsewhere, so the normal jobs keep
+# the tight budgets that give these assertions their falsifying edge.
+#
+# Poll intervals, enforced respawn delays and the sustained-observation windows are NOT scaled.
+# Those are not give-up bounds: stretching a window a scenario watches for silence buys no
+# confidence and spends the whole package's test budget to do it.
+TIME_SCALE = get_time_scale()
+ARM_TIMEOUT_SEC = 60.0 * TIME_SCALE
+FAULTS_LIVE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+PRESENCE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
+CLEAR_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # How long an absent or a persisting fault is watched for - measured from the arming gate, not
 # process start, so bringup cannot eat it. Matches test_node_death_e2e.test.py's identical
 # constant.
@@ -285,7 +300,7 @@ C4_EARLY_WINDOW_SEC = 25.0
 # Measured from the END of C4_EARLY_WINDOW_SEC, not from the kill: comfortably covers the
 # remaining ~75s to C4_MISS_GRACE_LARGE's own nominal grace-crossing point plus reporting
 # latency.
-C4_LATE_RAISE_TIMEOUT_SEC = 100.0
+C4_LATE_RAISE_TIMEOUT_SEC = 100.0 * TIME_SCALE
 
 # ---- "d2_ungated_clear" scenario's own fixtures -------------------------------------------------
 D2_TARGET_NODE = 'calibration'
@@ -321,11 +336,11 @@ def _lifecycle_node_action(
     here explicitly rather than inferred from it. Defaults to whether `name` is ACTIVE_NODE -
     the historical convention every scenario but B3/B5 relies on - but a caller launching
     TARGET_NODE (managed_lifecycle) for a scenario that needs it to actually ARM for
-    node_death passes `auto_activate=True` explicitly: node_death only ever tracks a node it
-    has seen armed at least once (reliability_allows() requires "active" for a managed node -
-    LifecycleWatcher::node_ok()), so a require_active node that never activates is invisible
-    to it no matter what happens to it afterwards. See TestBoundaryMaturedThenGone and
-    TestBoundaryRestartLoopStillCaught's own class docstrings.
+    node_death passes `auto_activate=True` explicitly: node_death only ever tracks a node whose
+    departure the gate has said it OWNS at least once (presence_ownership() needs a
+    MANAGED node's lifecycle state positively known to read "active"), so a require_active node
+    that never activates is invisible to it no matter what happens to it afterwards. See
+    TestBoundaryMaturedThenGone and TestBoundaryRestartLoopStillCaught's own class docstrings.
     """
     executable, ros_name, namespace = DEMO_NODE_REGISTRY[name]
     if auto_activate is None:
@@ -774,9 +789,9 @@ class TestBoundaryInactiveBelowGraceThenGone(unittest.TestCase):
 
     Both of this row's claims are satisfiable together, which took getting the arming gate
     wrong once to learn: the target must reach "active" FIRST, or GRAPH_NODE_DISAPPEARED can
-    never report its death, whatever kills it - reliability_allows() requires "active" for a
-    MANAGED node (LifecycleWatcher::node_ok()), so a managed_lifecycle instance that stays
-    "unconfigured" its whole life is structurally invisible to node_death, exactly as
+    never report its death, whatever kills it - presence_ownership() needs a MANAGED
+    node's lifecycle state positively known to read "active", so a managed_lifecycle instance
+    that stays "unconfigured" its whole life is structurally invisible to node_death, exactly as
     TestBoundaryMaturedThenGone's own docstring explains for its target. The launch therefore
     drives TARGET_NODE through "active" first, THEN a real DEACTIVATE transition - the same two
     steps B3 takes - but where B3 leaves the node inactive long enough to CONFIRM (past
@@ -898,12 +913,13 @@ class TestBoundaryMaturedThenGone(unittest.TestCase):
     for the UNREADABLE code.
 
     The second - GRAPH_NODE_DISAPPEARED also joining once the node is gone, still naming it -
-    needs node_death to have TRACKED the node at all, which only ever happens for a node armed
-    at least once: reliability_allows() requires "active" for a MANAGED node
-    (LifecycleWatcher::node_ok()). A managed_lifecycle instance that stays "unconfigured" its
-    whole life is never armed and so is structurally invisible to node_death whatever happens
-    to it afterwards - the second claim would be unreachable by ANY correct implementation
-    against that fixture, not merely an unimplemented one. This is why the launch drives
+    needs node_death to have TRACKED the node at all, which only ever happens for a node the gate
+    has admitted for presence ownership at least once: presence_ownership() needs a
+    MANAGED node's lifecycle state positively known to read "active". A managed_lifecycle
+    instance that stays "unconfigured" its whole life is never admitted and so is structurally
+    invisible to node_death whatever happens to it afterwards - the second claim would be
+    unreachable by ANY correct implementation against that fixture, not merely an unimplemented
+    one. This is why the launch drives
     TARGET_NODE through "active" FIRST (arming it - the same mechanism B4's target uses), THEN
     a real DEACTIVATE transition (maturing GRAPH_NODE_INACTIVE the same way the original
     "stays unconfigured" fixture did), THEN kills it: the node this row's second claim needs
@@ -1031,10 +1047,11 @@ class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
 
     The target launches with auto_activate (the same mechanism B4's target uses) and keeps that
     parameter across every respawn, not merely the first start: node_death only ever tracks a
-    node it has seen ARMED at least once (reliability_allows() requires "active" for a managed
-    node - LifecycleWatcher::node_ok()), so a fixture that never activates would make
-    GRAPH_NODE_DISAPPEARED structurally unreachable for every cycle here, not merely slow to
-    catch - this row carries the evidence that forbidding absence from maturing an unmatured
+    node whose departure the gate has said it OWNS at least once (presence_ownership()
+    needs a managed node's lifecycle state positively known to read "active"), so a fixture that
+    never activates would make GRAPH_NODE_DISAPPEARED structurally unreachable for every cycle
+    here, not merely slow to catch - this row carries the evidence that forbidding absence from
+    maturing an unmatured
     streak is safe, so it has to run against a node that can actually be reported. Each cycle's
     respawned instance is re-armed (app_id-scoped wait_until_watchdog_armed, not merely
     presence) before the NEXT kill for the identical reason a fresh process needs it the first
