@@ -4122,6 +4122,73 @@ TEST_F(LifecycleExpectationIntegrationTest, ADroppedRecordOnADisownedNodeIsNotAP
       << "the presence detector must not report a node it never admitted";
 }
 
+TEST_F(LifecycleExpectationIntegrationTest, AProvisionalAdmissionLaterDisownedDoesNotSilenceTheDeparture) {
+  set_apps({"victim"});
+  ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
+  arm_global_grace(gate);
+
+  auto life = make_lifecycle_expectation();
+  auto death = make_node_death();
+  ASSERT_TRUE(life);
+  ASSERT_TRUE(death);
+  life->configure(nlohmann::json{{"require_active", nlohmann::json::array({"victim"})}, {"grace", 30}});
+  death->configure(nlohmann::json{{"tick_interval_ms", 3000}, {"miss_grace", 0}});
+
+  // The production handoff reproduced exactly, rather than pointed at the owner's live set: the
+  // plugin COPIES the key set after the whole sweep, so a reader sees it as it stood at the end
+  // of the previous tick. Staging it any fresher would hide a latch that only shows up when the
+  // membership a reader saw is later withdrawn.
+  std::set<std::string> published;
+  auto ctx = make_ctx(DetectorMode::Raise, &gate);
+  ctx.presence_tracked = &published;
+  const auto sweep = [&] {
+    life->tick(ctx);
+    death->tick(ctx);
+    if (const auto * keys = death->tracked_departure_keys()) {
+      published = *keys;
+    }
+  };
+
+  // A PROVISIONAL admission: the label has never been read and the watcher's re-seed budget is
+  // spent, so node_death takes the node for want of anyone else - ignorance, not knowledge.
+  gate.set_lifecycle_state_for_test("victim", "", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), ros2_medkit_graph_watchdog::PresenceOwnership::kProvisional)
+      << "the admission under test has to rest on a spent budget and an unread label, or this "
+         "sequence is about some other ground entirely";
+  for (int i = 0; i < 3; ++i) {
+    sweep();
+  }
+  ASSERT_EQ(published.count("/victim"), 1u)
+      << "the provisionally admitted key never reached the published view, so nothing here could "
+         "have latched and the rest of this test proves nothing";
+
+  // The label finally arrives - the ~/transition_event subscription outlives the seed budget -
+  // and it disowns the node. node_death hands the key back while the node is still present.
+  gate.set_lifecycle_state_for_test("victim", "inactive", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), ros2_medkit_graph_watchdog::PresenceOwnership::kDisowned);
+  for (int i = 0; i < 8; ++i) {
+    sweep();
+  }
+  ASSERT_EQ(published.count("/victim"), 0u)
+      << "node_death still holds a key the graph measured as another detector's, so the silence "
+         "below would have a different cause than the one under test";
+  ASSERT_EQ(death->tracked_count_for_test(), 0u);
+
+  // And it dies with its violation streak still far below grace(30). node_death gave the key
+  // back, so nothing over there will report this. Holding the streak because the node was ONCE
+  // in the published set means the departure is reported by nobody, and the pending entry keeps
+  // every other required node's clear withheld behind it.
+  set_apps({});
+  const auto inactive_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED, kNodeInactive);
+  ASSERT_TRUE(
+      poll_for_new(kGraphSource, ReportFault::Request::EVENT_FAILED, inactive_before, *life, ctx, kNodeInactive))
+      << "a below-grace violation on a node whose ONLY claim to being owned was a provisional "
+         "admission that has since been withdrawn did not mature from absence - stickiness was "
+         "earned by ignorance, and this departure is now reported by nobody at all";
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED, kNodeDisappeared), 0u)
+      << "node_death reported a node it had handed back";
+}
+
 TEST_F(LifecycleExpectationIntegrationTest, OfflineAppIsNeverTreatedAsOwnedByThePresenceDetector) {
   set_offline_app("a");
   ReliabilityGate gate(kWarmupCycles, gateway_.get(), &node_mutex_);
