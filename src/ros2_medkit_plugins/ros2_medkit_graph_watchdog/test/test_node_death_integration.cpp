@@ -1209,6 +1209,56 @@ TEST_F(NodeDeathIntegrationTest, AnEarnedKeyKeepsItsGroundAcrossTheOutageSoTheNe
          "exists to prevent";
 }
 
+// The other side of AReleasedKeyIsNotReAdmittedWhenItsLifecycleRecordVanishes below: the
+// refusal is a WINDOW, not a life sentence. A node that stops being managed - drops its
+// lifecycle services and keeps running as an ordinary node - shows the same "no record at all"
+// shape a dying one does, and holding the refusal for as long as that lasts would leave its
+// eventual death reported by nobody: this detector has no key for it, and lifecycle_expectation
+// only ever looks at require_active entries. Past miss_grace + 1 record-less PRESENT ticks -
+// this detector's own "absent this long means dead" window, which a genuinely dying node cannot
+// outlive - the key comes back.
+TEST_F(NodeDeathIntegrationTest, AReleasedKeyIsTakenBackOnceItOutlivesTheDeathWindowWithoutARecord) {
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 0}});  // floor(3000ms) == 0, so the hold is 1 tick
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("victim"), anchor_app()});
+  gate.update(snapshot_, 0);
+  gate.set_lifecycle_state_for_test("victim", "", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kProvisional);
+  det->tick(ctx);  // admitted provisionally
+
+  gate.set_lifecycle_state_for_test("victim", "inactive", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kDisowned);
+  det->tick(ctx);  // handed back
+
+  // The record goes while the node stays ONLINE and present - the shape this detector must not
+  // read as "the node became mine", for one window.
+  gate.update(snapshot_, 1);
+  ASSERT_FALSE(gate.lifecycle_state_of("victim").has_value());
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kEarned)
+      << "with no record at all the gate must answer kEarned here, or the branch under test is "
+         "never reached";
+  det->tick(ctx);  // inside the window: still refused
+
+  // And now it outlives the window while still present, which no dying node can do.
+  det->tick(ctx);
+  det->tick(ctx);
+
+  set_apps({anchor_app()});
+  gate.update(snapshot_, 2);
+  const auto failed_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
+  det->tick(ctx);  // misses(1) > miss_grace(0)
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_GT(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
+      << "a node that stopped being managed and then died was reported by nobody - this detector "
+         "refused it for the rest of its life over a lifecycle record that had been gone for "
+         "longer than any death takes";
+}
+
 TEST_F(NodeDeathIntegrationTest, AReleasedKeyIsNotReAdmittedWhenItsLifecycleRecordVanishes) {
   ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
   auto det = make_node_death();

@@ -230,6 +230,14 @@ class NodeDeathDetector : public Detector {
     // reclaimed the very tick it would first have been reported, and the report would be
     // silently lost rather than silently suppressed.
     const int prune_ticks = std::max(prune_grace, miss_grace + 1);
+    // How long a RELEASED key may keep showing "no lifecycle record at all" while still PRESENT
+    // before this detector takes it back. Derived from miss_grace rather than picked, and the
+    // derivation is the argument: miss_grace + 1 ticks is this detector's own definition of
+    // "absent long enough to be dead", already floored to span at least kMinNodeDeathWindowMs
+    // of wall clock whatever the tick rate. A node that really is dying is GONE inside that
+    // window - its App follows its lifecycle services within one entity-cache refresh - so a
+    // node still present past it is not mid-death, it has simply stopped being managed.
+    released_no_record_hold_ticks_ = miss_grace + 1;
     tracker_ = NodeLivenessTracker(miss_grace, prune_ticks, tracked_node_cap);
     tracked_node_cap_.store(tracked_node_cap);
   }
@@ -296,6 +304,11 @@ class NodeDeathDetector : public Detector {
         continue;
       }
       present.insert(key);
+      // Any lifecycle record at all - whatever it says - ends a "no record" run, so the hold
+      // below only ever counts CONSECUTIVE record-less ticks.
+      if (ctx.gate != nullptr && ctx.gate->lifecycle_state_of(app.id).has_value()) {
+        released_no_record_ticks_.erase(key);
+      }
       // Tracking follows OWNERSHIP rather than permission, and the two are not the same
       // question: the gate answers "may this entity raise" permissively for a managed node
       // whose lifecycle label has never been read. What the gate returns here is the GROUND,
@@ -321,10 +334,21 @@ class NodeDeathDetector : public Detector {
           // by the detector the label had already disqualified. So a released key waits for the
           // graph to say ACTIVE again; the disappearance of what disowned it is not news that
           // the node became ours.
-          if (released_.count(key) != 0 && !reads_active(ctx.gate, app.id)) {
+          //
+          // The wait is bounded, and it has to be. Refusing on "no record" for as long as the
+          // condition lasts means a node that merely STOPPED being managed - dropped its
+          // lifecycle services and kept running as an ordinary node - is refused for the rest of
+          // its life, and its eventual death is reported by nobody: this detector has no key,
+          // and lifecycle_expectation only ever looks at require_active entries. So the refusal
+          // runs for released_no_record_hold_ticks_ consecutive record-less PRESENT ticks (see
+          // configure()), which is this detector's own "gone means dead" window; past it the
+          // node has outlived any plausible death and is taken back.
+          if (released_.count(key) != 0 && !reads_active(ctx.gate, app.id) &&
+              ++released_no_record_ticks_[key] <= released_no_record_hold_ticks_) {
             break;
           }
           released_.erase(key);
+          released_no_record_ticks_.erase(key);
           earned_.insert(key);  // knowledge, once had, is never withdrawn
           armed.insert(key);
           break;
@@ -396,8 +420,14 @@ class NodeDeathDetector : public Detector {
     // tick throws away the ground it was just admitted on.
     //
     // `earned_` is bookkeeping about a TRACKED KEY, so it lives exactly as long as the tracker
-    // keeps that key - which is what known_keys() is for, and what bounds it (tracked_key_cap
-    // plus prune(), the same ceiling the tracker itself has). Pruning it to the PRESENT graph
+    // keeps that key - which is what known_keys() is for, and what bounds it. Note what that
+    // bound actually is: tracked_key_cap governs the DEPARTED subset only (a present, armed key
+    // is admitted unconditionally and never evicted - see NodeLivenessTracker's class doc), so
+    // known_keys() is bounded by the live graph PLUS the cap, not by the cap alone. Neither term
+    // grows with uptime, which is what matters here: a churned identity is present only while
+    // its process runs, and once it departs and matures it becomes a collapse candidate that
+    // enforce_departed_cap() erases outright, so identity churn cannot accumulate. Pruning
+    // `earned_` to the PRESENT graph
     // instead threw the ground away during an outage, and a crash-looping node came back at
     // "unconfigured" - which is where a respawned lifecycle node always starts, since nothing
     // re-drives it - with nothing left to say it had ever been this detector's. It was handed
@@ -408,10 +438,18 @@ class NodeDeathDetector : public Detector {
     }
     // `released_` answers a different question with a different lifetime: it is the set of
     // PRESENT keys this detector has refused, and a released key is by definition not in the
-    // tracker at all, so it cannot be bounded by known_keys(). It goes when the node does; the
-    // incarnation that returns is re-derived from whatever the gate then says about it.
+    // tracker at all, so it cannot be bounded by known_keys() - it is bounded by the live graph
+    // instead, since every member of it is a key present this tick. It goes when the node does;
+    // the incarnation that returns is re-derived from whatever the gate then says about it. The
+    // no-record counter beside it answers only about keys in `released_`, so it is pruned with
+    // it rather than separately.
     for (auto it = released_.begin(); it != released_.end();) {
-      it = present.count(*it) == 0 ? released_.erase(it) : std::next(it);
+      if (present.count(*it) != 0) {
+        ++it;
+        continue;
+      }
+      released_no_record_ticks_.erase(*it);
+      it = released_.erase(it);
     }
 
     std::set<std::string> keys_before_suppression;
@@ -652,6 +690,12 @@ class NodeDeathDetector : public Detector {
   /// Refreshed every tick a key is present (see tick()); the value from its last live tick
   /// is what a dead key is judged by, since id is unavailable once the entity has left
   /// ctx.snapshot. Bounded to tracker_.known_keys() at the end of every tick.
+  /// Consecutive PRESENT ticks a released key has shown no lifecycle record at all. Bounded to
+  /// `released_` (pruned with it every tick), which is itself bounded by the live graph.
+  std::map<std::string, int> released_no_record_ticks_;
+  /// How many such ticks a released key is refused before this detector takes it back. Set from
+  /// the configured miss_grace - see configure() for why that is the right window.
+  int released_no_record_hold_ticks_ = kDefaultMissGrace + 1;
   /// Keys this detector handed back on a measured disown and has not been given back by a
   /// measurement since. Read only by the two admission branches in tick(), where it is what
   /// stops the loss of a lifecycle record - which is what dying looks like from the snapshot -
