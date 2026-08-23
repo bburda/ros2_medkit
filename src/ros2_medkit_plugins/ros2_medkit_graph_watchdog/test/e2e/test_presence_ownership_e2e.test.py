@@ -123,6 +123,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (  # noqa: E402, I100
     API_BASE_PATH,
     assert_fault_absent_throughout,
+    assert_fault_never_names,
     create_watchdog_test_launch,
     poll_fault_describing,
     poll_faults,
@@ -659,21 +660,24 @@ class TestBudgetSpentThenOwned(unittest.TestCase):
             wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
             'GET /faults never answered 200 - nothing below would prove anything')
 
-        entity = _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC)
+        # SETTLED ignorance, read off the route rather than argued from how many ticks the
+        # steps above must have cost: measurement_pending=False is the watcher saying it has
+        # stopped asking. Without it this polls only for an unread label, which is equally true
+        # while the reads are still in flight - the PENDING half of the bound, where the
+        # opposite answer is correct and this row would be testing the other case.
+        entity = _poll_watchdog_entity(
+            PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC, measurement_pending=False)
         self.assertIsNotNone(
             entity,
-            f'{UNREADABLE_NODE} never appeared with an EMPTY lifecycle label - the fixture was '
-            'either not tracked as managed at all or its GetState was answered, and this row '
-            'needs a node that is tracked and unmeasured')
+            f'{UNREADABLE_NODE} never reached an EMPTY lifecycle label with the asking finished '
+            '- the fixture was either not tracked as managed at all, or its GetState was '
+            'answered, or the watcher is still retrying; this row needs a node that is tracked '
+            'and settled-unmeasured')
         self.assertTrue(
             entity.get('armed'),
             f'{UNREADABLE_NODE} is unmeasured but NOT armed, so node_death would decline it for '
             'the warmup reason instead of the ownership reason this row is about')
 
-        # The budget is spent within a handful of ticks of discovery (kReseedAttempts issued
-        # reads, each cut off by the reader's own timeout), and everything above has already
-        # cost far more than that. Killing here therefore lands in the SETTLED half of the
-        # bound, which is what this row is about.
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(
             _poll_apps_absent(PORT, UNREADABLE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
@@ -730,11 +734,14 @@ class TestNoRequireActiveStillOwned(unittest.TestCase):
             wait_until_faults_endpoint_live(PORT, timeout=FAULTS_LIVE_TIMEOUT_SEC),
             'GET /faults never answered 200 - nothing below would prove anything')
 
-        entity = _poll_watchdog_entity(PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC)
+        # Settled, not merely unread - same instrument and same reason as the sibling row: an
+        # unread label alone is also what a node in the middle of its reseed attempts shows.
+        entity = _poll_watchdog_entity(
+            PORT, UNREADABLE_NODE, '', timeout=LABEL_TIMEOUT_SEC, measurement_pending=False)
         self.assertIsNotNone(
             entity,
-            f'{UNREADABLE_NODE} never appeared with an EMPTY lifecycle label, so this row is not '
-            'about an unmeasured managed node at all')
+            f'{UNREADABLE_NODE} never reached an EMPTY lifecycle label with the asking finished, '
+            'so this row is not about a settled-unmeasured managed node at all')
         self.assertTrue(entity.get('armed'))
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
@@ -1112,8 +1119,14 @@ class TestProvisionalOwnershipYieldsToARealLabel(unittest.TestCase):
             'detector handed back was then reported by nobody at all '
             f'(last description: {description!r})')
 
-        assert_fault_absent_throughout(
-            self, PORT, FAULT_CODE_DISAPPEARED, SILENCE_WINDOW_SEC)
+        # Needle-scoped, and the distinction is not cosmetic: the code-only form fails for a
+        # GRAPH_NODE_DISAPPEARED about ANY node, so its red cannot say whether the handover
+        # broke or some unrelated entity died, and a reader has to go and find out. This row's
+        # claim is about one node, so the assertion names it and the next failure carries the
+        # answer. Anything else disappearing here is not this row's business.
+        assert_fault_never_names(
+            self, PORT, FAULT_CODE_DISAPPEARED, forbidden=[UNREADABLE_NODE],
+            duration=SILENCE_WINDOW_SEC)
 
 
 class TestGateStaysPermissiveForTheOtherDetectors(unittest.TestCase):

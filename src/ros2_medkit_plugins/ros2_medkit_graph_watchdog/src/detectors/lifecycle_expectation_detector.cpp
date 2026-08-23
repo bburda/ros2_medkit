@@ -11,9 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -320,40 +322,9 @@ class LifecycleExpectationDetector : public Detector {
         if (state.has_value()) {
           entry_has_managed_match.insert(id);
         }
-        // Whether the gate says the presence detector OWNS this node's departure, for this
-        // SAME app.id. It is what node_death's tracking decision consults, not the whole of
-        // it: that detector applies its own filters first (peer-aggregated apps, apps that
-        // are not online, an empty fqn, ros2cli helper names - see node_death_detector.cpp),
-        // so a true answer here means the GATE would let it track this node, not that it
-        // will. Reading it from the one gate both detectors share on the same tick is what
-        // makes "armed" trustworthy rather than a guess: it is not derived from this node's
-        // own lifecycle label, it IS the fact the presence detector would itself consult if
-        // asked right now. The tracker needs it to tell a node the presence detector could
-        // someday report from one it structurally never can - see LifecycleExpectationTracker's
-        // own class doc. Deliberately NOT reliability_allows(): that one is permissive about a
-        // managed node whose lifecycle label has never been read, so taking its permission for
-        // ownership would switch this detector's absence path off for a node the presence class
-        // does not actually hold - either because the watcher has not finished asking about it,
-        // or because it asked, gave up, and then a label arrived and took the node back.
-        //
-        // kEarned only, and the two exclusions are for different reasons.
-        //
-        // A PROVISIONAL grant is deliberately not enough: the tracker latches this value for
-        // the node's whole life, and a provisional grant is the one node_death itself gives up
-        // the moment a real label arrives. Latching it here would leave this detector believing
-        // the presence class had a node it had already handed back - the same silence in the
-        // opposite direction.
-        //
-        // ANDed with is_online because node_death skips an app that is not online before it
-        // ever consults the gate, and the gate has no notion of online-ness: a manifest app
-        // whose node never started is armed, carries no lifecycle record, and would otherwise
-        // read as owned by a detector that will never look at it. The remaining filters
-        // node_death applies need no mirror here: a peer-aggregated app and one with no binding
-        // both have an empty fqn and are already skipped above.
-        const bool armed = app.is_online && presence_ownership(ctx.gate, app.id) == PresenceOwnership::kEarned;
         // One match per (entry, node): the tracker keys violations by NODE, so two
         // namesakes are both reported instead of one silently replacing the other.
-        matches.push_back(LifecycleMatch{id, fqn, state, armed});
+        matches.push_back(LifecycleMatch{id, fqn, state});
       }
     }
     std::set<std::string> matched_entries;
@@ -407,7 +378,20 @@ class LifecycleExpectationDetector : public Detector {
       }
     }
 
-    auto report = tracker_.update(matches);
+    // Who owns a departure is ASKED of the presence detector on every tick, never mirrored and
+    // never remembered. node_death decides it from its own admission rule - the gate's answer
+    // plus what it remembers handing back - and every attempt to re-derive that here has
+    // disagreed with it somewhere: the sweep in which a dying node loses its lifecycle record
+    // answers kEarned at the gate while node_death refuses the key, and a mirror once latched a
+    // handover to a detector that was never going to report. Passing that detector's own current
+    // key set makes the two agree by construction, and passing it EVERY tick (rather than
+    // latching the first true answer) is what keeps a key it has since given back, reclaimed or
+    // collapsed from holding a streak nobody will ever mature.
+    //
+    // A null view means no detector will report a departure at all (none present, or the one
+    // that would is running Advisory or Off). The tracker reads that as "nobody owns anything",
+    // which keeps this detector's own report rather than holding it for a fault nobody files.
+    auto report = tracker_.update(matches, ctx.presence_tracked);
     // Published for GET /x-medkit-watchdog. Written here on the plugin's tick thread and
     // read by status_json() on an HTTP handler thread, which holds no lock this detector
     // takes - hence atomics rather than plain members.
@@ -484,8 +468,8 @@ class LifecycleExpectationDetector : public Detector {
     // node cannot assert that every required node is healthy, for as long as it keeps
     // declining.
     if (report.affected.empty() && (!report.pending.empty() || unmatched_blocking || report.tracking_saturated)) {
-      report_withheld_clear(ctx, report.pending_violation, report.pending_unreadable, report.pending_not_managed,
-                            unmatched_blocking, report.tracking_saturated);
+      report_withheld_clear(ctx, report.pending_violation, report.pending_violation_departed, report.pending_unreadable,
+                            report.pending_not_managed, unmatched_blocking, report.tracking_saturated);
       return;  // GRAPH_NODE_INACTIVE: nothing measured - and a young streak - is not the same as healthy
     }
     withheld_ticks_ = 0;
@@ -524,6 +508,7 @@ class LifecycleExpectationDetector : public Detector {
   /// `violation` releases either into content (GRAPH_NODE_INACTIVE itself) or into health,
   /// so the three cannot share one sentence.
   void report_withheld_clear(const DetectorContext & ctx, const std::set<std::string> & pending_violation,
+                             const std::set<std::string> & pending_violation_departed,
                              const std::set<std::string> & pending_unreadable,
                              const std::set<std::string> & pending_not_managed, bool unmatched, bool saturated) {
     ++withheld_ticks_;
@@ -563,11 +548,23 @@ class LifecycleExpectationDetector : public Detector {
           " unanswered ticks that hold releases by itself and the node is reported under "
           "GRAPH_NODE_UNREADABLE instead)");
     }
-    if (!pending_violation.empty()) {
-      add(std::to_string(pending_violation.size()) +
+    // Split by whether the node is still THERE, because the two have different exits and only
+    // one of them is something an operator can wait for.
+    std::vector<std::string> present_violation;
+    std::set_difference(pending_violation.begin(), pending_violation.end(), pending_violation_departed.begin(),
+                        pending_violation_departed.end(), std::back_inserter(present_violation));
+    if (!present_violation.empty()) {
+      add(std::to_string(present_violation.size()) +
           " required node(s) are measured not-active but still within grace " + "(starting with '" +
-          *pending_violation.begin() + "'; that hold releases as soon as the node reads active or " +
+          present_violation.front() + "'; that hold releases as soon as the node reads active or " +
           "its streak passes grace)");
+    }
+    if (!pending_violation_departed.empty()) {
+      add(std::to_string(pending_violation_departed.size()) +
+          " required node(s) were measured not-active below grace and have since LEFT the graph " + "(starting with '" +
+          *pending_violation_departed.begin() +
+          "'; absence holds that streak rather than advancing it, so the hold lasts until the node " +
+          "comes back - it will not time out, and the presence detector reports the departure itself)");
     }
     RCLCPP_WARN(ctx.gateway_node->get_logger(),
                 "graph_watchdog lifecycle_expectation: nothing is reported inactive, but GRAPH_NODE_INACTIVE is "

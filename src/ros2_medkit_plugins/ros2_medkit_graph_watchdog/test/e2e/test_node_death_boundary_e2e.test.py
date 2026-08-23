@@ -203,10 +203,16 @@ ACTIVE_NODE = 'managed_lifecycle_active'
 # test_lifecycle_expectation_e2e.test.py's own GRACE constant uses, for the same reason.
 GRACE = 3
 # B2's own grace: large enough that "killed after a couple of observed ticks" is unambiguously
-# BELOW it, whatever small overshoot this scenario's own polling interval costs.
+# BELOW it, whatever small overshoot this scenario's own polling interval costs. The clock it
+# has to cover is NOT the whole setup: the violation streak starts at the tracker's first
+# observation of a non-active label, which for B2 is after the DEACTIVATE round trip, so only
+# the two polls between that and the kill are charged against this value.
 B2_GRACE = 15
 # B6's own grace: same magnitude as B2_GRACE and for the identical reason - "killed after a
-# couple of observed ticks" must be unambiguously BELOW it.
+# couple of observed ticks" must be unambiguously BELOW it. Charged the same way: the streak
+# advances from the tracker's first SETTLED reading of "unconfigured" (LifecycleWatcher seeds
+# get_state at a bounded rate and the tracker corroborates over several ticks before trusting a
+# label), not from the moment the gateway arms or the moment this row starts polling.
 B6_GRACE = 15
 # B5's own grace: large relative to one restart cycle's uptime. Not load-bearing for what this
 # row actually asserts (see the module docstring - B5 checks GRAPH_NODE_DISAPPEARED only), kept
@@ -1310,7 +1316,7 @@ class TestBoundaryUngatedClear(unittest.TestCase):
         old_pid = gateway_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
         self.assertTrue(
-            _wait_until_port_is_down(PORT, timeout=60.0),
+            _wait_until_port_is_down(PORT, timeout=60.0 * TIME_SCALE),
             f'the gateway (pid {old_pid}) kept answering after SIGTERM - nothing restarted')
 
         # Gate on the fault surface being reachable AT ALL before opening the ungated-window

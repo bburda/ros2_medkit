@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -82,6 +83,23 @@ struct DetectorContext {
   const ros2_medkit_gateway::IntrospectionInput * snapshot =
       nullptr;                                    ///< entities this tick (id + bound_fqn); null in bare-context tests
   const std::atomic<bool> * cancelled = nullptr;  ///< plugin shutdown flag; a long sweep polls it (null => never)
+
+  /// The keys the PRESENCE detector currently tracks, keyed by App::effective_fqn(), as of the
+  /// last tick it completed - or null when nothing is going to report a departure at all
+  /// (node_death absent, Off, or Advisory).
+  ///
+  /// Exists so that "will the presence class report this node's departure" has exactly ONE
+  /// answer in this plugin, given by the detector that decides it. Re-deriving that from the
+  /// gate plus local bookkeeping is what put three copies of the rule in three places, and they
+  /// disagreed on the sweep where a dying node loses its lifecycle record: the gate answers
+  /// kEarned for it, node_death refuses it, and anything mirroring the gate concluded the
+  /// opposite of the truth. A reader asks the owner instead.
+  ///
+  /// One tick stale by construction - it is published after the detectors have run, so a key
+  /// admitted this tick appears next tick. That is deliberate and harmless for the one consumer:
+  /// a sticky "could the presence class ever report this" latch cannot be wrong by being a tick
+  /// late, only by being wrong about a node nobody tracks.
+  const std::set<std::string> * presence_tracked = nullptr;
 
   /// Returns true only once `async_send_request` has actually been called - false for every
   /// suppression path (Advisory/Off, no client, empty source_id, reliability gate, service
@@ -156,6 +174,17 @@ class Detector {
   /// integration tests assert a tracker's map stays bounded under prune without
   /// exposing the tracker itself through the public interface. Default 0 for
   /// detectors with no such tracker.
+  /// The keys whose departure THIS detector would report, keyed by App::effective_fqn(), or
+  /// null for a detector that reports no departures. Only the presence class overrides it; the
+  /// plugin publishes the one non-null view it finds as DetectorContext::presence_tracked, so
+  /// that the question "is this node the presence detector's" has a single owner rather than a
+  /// copy of the rule in every detector that needs the answer.
+  ///
+  /// The returned reference must stay valid until the next tick of the detector that owns it.
+  virtual const std::set<std::string> * tracked_departure_keys() const {
+    return nullptr;
+  }
+
   virtual std::size_t tracked_count_for_test() const {
     return 0;
   }

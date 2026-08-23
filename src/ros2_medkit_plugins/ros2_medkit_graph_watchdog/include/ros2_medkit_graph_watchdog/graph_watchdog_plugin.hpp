@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -171,6 +172,16 @@ class GraphWatchdogPlugin : public ros2_medkit_gateway::GatewayPlugin,
   std::mutex tick_mutex_;  ///< Serializes the get_routes() handler against shutdown()'s member teardown.
 
   std::vector<std::pair<std::unique_ptr<Detector>, DetectorMode>> detectors_;
+  /// The presence class's own tracked-key view, handed to every detector as
+  /// DetectorContext::presence_tracked. A COPY, not a pointer into the owning detector's live
+  /// set: that detector mutates its set inside its own tick(), so a pointer would show a reader
+  /// pre-update or post-update contents depending on where the reader sits in `detectors_`.
+  /// Refreshed at one defined point - the end of the sweep - so every detector in a tick sees
+  /// the same content and none depends on registry order. Empty while no detector both reports
+  /// departures and runs in a mode that emits; `presence_tracked_valid_` is what tells that
+  /// apart from a detector that genuinely tracks nothing. Touched only on the tick thread.
+  std::set<std::string> presence_tracked_;
+  bool presence_tracked_valid_ = false;
 
   std::atomic<uint64_t> tick_count_{0};
   std::atomic<bool> shutdown_requested_{false};  ///< stop signal for the tick loop; set by BOTH the

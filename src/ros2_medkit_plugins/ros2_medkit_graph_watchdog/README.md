@@ -33,9 +33,9 @@ With the gateway built and sourced:
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `tick_interval_ms` | int | `1000` | Detector tick cadence. |
-| `warmup_cycles` | int | `5` | An entity must be continuously present for this many ticks before it arms. A mid-run restart re-warms it. Enforced centrally, see "Reliability (bringup-quiesce)" below. |
-| `prune_grace` | int | `60` | Default injected into every detector's own config before `configure()`; a per-detector `detectors.<id>.prune_grace` overrides it. Used by detectors that keep per-key bookkeeping. |
+| `tick_interval_ms` | int | `1000` | Detector tick cadence. Accepted range 1..`INT_MAX`; the check runs on the wide integer, so a value past `INT_MAX` is rejected rather than truncated back into the band. |
+| `warmup_cycles` | int | `5` | An entity must be continuously present for this many ticks before it arms. A mid-run restart re-warms it. Enforced centrally, see "Reliability (bringup-quiesce)" below. Accepted range 0..`INT_MAX`, checked on the wide integer. |
+| `prune_grace` | int | `60` | Default injected into every detector's own config before `configure()`; a per-detector `detectors.<id>.prune_grace` overrides it. Used by detectors that keep per-key bookkeeping. Accepted range 0..`INT_MAX` here, checked on the wide integer; each detector re-validates it against its own documented range before using it. |
 | `detectors.<id>.mode` | string \| bool | `raise` | `raise` = push faults; `advisory` = observe, do not push; `off` = disabled. Bare `off`/`no` (YAML booleans) also disable; bare `on`/`yes` mean `raise`. |
 | `detectors.<id>.<field>` | any | - | Per-detector thresholds, passed to that detector's `configure()`. |
 
@@ -721,8 +721,8 @@ node's SETTLED observation had started, and resets nothing:
 | Settled observation | What sustained absence does |
 |---|---|
 | `inactive`, ALREADY reported under `GRAPH_NODE_INACTIVE` | the streak continues exactly as it did on its last present tick, so the fault stays raised and keeps naming a node that is no longer there |
-| `inactive`, not yet past `grace`, node the presence detector OWNED at some point | the streak is HELD - neither advanced (no fault is born while nobody can observe the node) nor erased (a node that returns still inactive resumes rather than re-earning `grace`). The presence detector could report this exact departure instead (`node_death` tracks any node the reliability gate has admitted for presence ownership at least once), so this detector does not need to. |
-| `inactive`, not yet past `grace`, node the presence detector NEVER owned | the streak keeps climbing on absence exactly as it would on a present tick. `node_death` only ever tracks a node the gate has admitted for ownership AND that is online, so a node that never reached that bar - one that never reached `active`, or one whose ROS binding never started - is structurally invisible to it no matter what happens afterwards. If this detector held the streak too, the departure would be reported by nothing at all. |
+| `inactive`, not yet past `grace`, node the presence detector currently TRACKS | the streak is HELD - neither advanced (no fault is born while nobody can observe the node) nor erased (a node that returns still inactive resumes rather than re-earning `grace`). `node_death` is tracking this exact departure, so this detector stands back. Note what membership does and does not promise: `node_death` will report the departure unless one of its own suppressors vetoes the key, and a durably suppressed key is reclaimed by `prune()` - at which point it leaves the set and the streak resumes climbing here. Membership is re-read every tick for exactly that reason, so the two detectors cannot disagree about who holds a node. |
+| `inactive`, not yet past `grace`, node the presence detector does NOT track | the streak keeps climbing on absence exactly as it would on a present tick. A node `node_death` never admitted - one that never reached `active`, one whose ROS binding never started, one it handed back on a measured disown - is invisible to it, and so is every node when `node_death` is `off` or `advisory`. If this detector held the streak too, the departure would be reported by nothing at all. |
 | unread label, or no tracked lifecycle | the unmeasured clock keeps climbing under that same cause, so the node is eventually reported under `GRAPH_NODE_UNREADABLE` / `GRAPH_NODE_NOT_MANAGED` |
 | `active` | nothing. Anything the node had started but not corroborated is released, the entry becomes idle and is reclaimed silently |
 
@@ -791,13 +791,17 @@ still asking: the gate would let it raise throughout (`LifecycleWatcher::node_ok
 unread label as permission, deliberately), and once the re-seed budget is spent the node is
 `node_death`'s after all, because nothing else would ever report it. The tracker therefore
 splits on
-whether the presence detector EVER owned a node, read from the reliability gate itself rather
-than guessed from the observed label: once owned, a below-`grace` streak that goes absent is
+whether the presence detector is tracking a node RIGHT NOW, read from the key set that detector
+publishes each sweep rather than from the reliability gate and never latched: while it holds
+the key, a below-`grace` streak that goes absent is
 simply HELD - maturing it would raise `GRAPH_NODE_INACTIVE` from ticks gathered while nobody
 could observe the node, a fault its presence never earned, and `GRAPH_NODE_DISAPPEARED` is
-there to report the departure instead. A node the presence detector never owned gets no such
-backstop - `GRAPH_NODE_DISAPPEARED` structurally cannot report it - so absence keeps advancing
-its streak exactly as a present tick would, maturing it within the same bound an owned node's
+there to report the departure instead. Reading membership instead of remembering it is what
+ends the hold when the claim behind it ends: a key handed back on a measured disown, reclaimed
+after a durable suppression, or collapsed under the cap leaves the set, and the streak resumes.
+A node outside the set gets no such
+backstop - `GRAPH_NODE_DISAPPEARED` will not report it - so absence keeps advancing
+its streak exactly as a present tick would, maturing it within the same bound a tracked node's
 UNMEASURED clock already has (`grace` + `absence_grace` + 1 ticks). An ALREADY-matured
 streak still continues through absence exactly as before, for either kind of node: two
 codes standing at once for the same node (`GRAPH_NODE_INACTIVE` because it was measured
@@ -1462,7 +1466,7 @@ already matured past `grace` (the fault stays raised, still naming the node), bu
 CREATES one that has not. A node that was briefly non-active and then died is reported as gone
 (`GRAPH_NODE_DISAPPEARED`) rather than also acquiring an inactive fault born from ticks
 gathered while nobody could observe it. A `require_active` node that never reaches `active` is
-never owned, is never tracked here, and its departure can never raise
+never admitted, is never tracked here, and its departure can never raise
 `GRAPH_NODE_DISAPPEARED`; the same holds for an app that is not online. For those,
 `lifecycle_expectation` keeps the older behaviour: absence still matures a below-`grace`
 streak, because it is structurally the only detector that will ever get to report them. See
@@ -1525,9 +1529,13 @@ done. `/fault_manager/list_faults` would tell this detector that a `GRAPH_NODE_D
 record is outstanding and that it is among its reporting sources - but not WHICH nodes it
 names, which is the only thing that would make a fresh instance's silence meaningful. The fault
 manager keeps one record per `fault_code`, and this detector folds every dead key into that one
-record's description, capped at `kMaxDescriptionChars` with the remainder collapsed into a
-count, so the key list is not recoverable even by parsing prose. `lifecycle_expectation` has the
-same boundary and resolves it differently (a bounded hold, then the clear flows) because its
+record's description. That description is this detector's own deterministic text, so for a
+record that never hit `kMaxDescriptionChars` the key list could in principle be read back out of
+it - the detector does not, because past the cap the remainder is collapsed into a count and the
+names are gone for good, and a re-seeding rule that works only for small faults is worse than
+none. In practice the operator carries the cost: after a reboot that follows a node death, the
+fault is still CONFIRMED and has to be deleted by hand even though the graph is healthy again.
+`lifecycle_expectation` has the same boundary and resolves it differently (a bounded hold, then the clear flows) because its
 `require_active` set is enumerable from config alone; this detector is zero-config over the
 whole graph and has no such set. The integration test
 `RestartedInstanceNeverClearsAFaultItDidNotRaiseEvenAsTheNodeReturns` pins the behaviour so it
@@ -1594,8 +1602,11 @@ cannot change silently.
      and a fault confirmed before a gateway restart stays CONFIRMED across it.
    - `test/e2e/test_node_death_suppression_e2e.test.py` (five scenarios): the allowlist
      suppresses the node it names; the SAME allowlist left unnamed in `suppress` is inert,
-     and a startup warning says so; a managed lifecycle node that reached a clean shutdown
-     is never named while an active sibling that was simply killed still is; naming a node
+     and a startup warning says so; a managed lifecycle node driven ACTIVE and then all the way
+     down through deactivate, cleanup and shutdown is never named, while an active sibling that
+     was simply killed still is (the node has to be admitted before the suppressor is reached at
+     all, which is why that row starts it active rather than shutting it down from
+     unconfigured); naming a node
      on the allowlist alone, with `suppress` unset, does not suppress it; and an ALLOWLISTED
      death (the only shape pruning ever applies to - see "Bounded by evidence, not by age")
      held well past `prune_grace` is actually reclaimed (`tracked_count` on
@@ -1718,7 +1729,20 @@ bringup-quiesce centrally so no individual detector has to reimplement it.
   and only on a tick that still sees the app present, so a node that dies within
   about one entity-cache refresh of its label arriving is reported by the
   presence code after all - measured at 210 ms between the label reaching
-  `GET /x-medkit-watchdog` and the release. The report is TRUE (the node did
+  `GET /x-medkit-watchdog` and the release. Once the release HAS happened it
+  holds, and that took fixing: a dying managed node loses its lifecycle services
+  from the snapshot a sweep before the App itself goes, and a node with no
+  managed record reads as a plain node, which is `kEarned`. The act of dying was
+  therefore erasing the measurement that disowned the node and walking the key
+  straight back in. A released key now waits for the graph to read `active`
+  again; the disappearance of what disowned it is not news that the node became
+  the presence detector's. That wait is bounded, and has to be: a node that
+  merely STOPPED being managed - dropped its lifecycle services and kept running
+  - shows the same record-less shape forever, and refusing it forever would
+  leave its eventual death reported by nobody. So the refusal lasts
+  `miss_grace + 1` consecutive record-less PRESENT ticks, this detector's own
+  "absent this long means dead" window, which a node that really is dying cannot
+  outlive while still present. The report is TRUE (the node did
   disappear); what the window costs is attribution, and where `require_active`
   names the node both codes stand, which the boundary already accepts elsewhere.
   Closing it would mean deciding at REPORT time, and that cannot be done from
