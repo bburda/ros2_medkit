@@ -1393,16 +1393,33 @@ the manifest declared - rather than a gap here.
 override lands after `ON_ERROR_FAILURE`/`ON_ERROR_ERROR` out of `errorprocessing` - the
 standard way a driver reports a hardware fault it cannot recover from, which is precisely the
 death an operator needs reported, not silenced. Without an observed transition history the
-departure is unclassified and stays reported - the safe direction. This mechanism is
+departure is unclassified and stays reported - the safe direction. The suppressor itself is
 stateless by construction: a detector's `configure()` (where the suppressor chain is built)
 runs before any per-tick context exists, so it stores nothing at construction and reads the
-gate fresh on every call. Its retention window is not this detector's own to size, either:
-before this detector's own `configure()` has run, the plugin predicts the same
-`prune_ticks_` (`max(prune_grace, miss_grace + 1)`) this detector will compute, then sizes
-the lifecycle watcher's departed-node retention from it with enough margin that a
-clean-shutdown label is still cached at this detector's own reclaim tick, one tick to
-spare - see `GraphWatchdogPlugin::compute_departed_retention_ticks()` for the exact
-arithmetic, which is larger than `prune_ticks_` alone.
+gate fresh on every call.
+
+**The verdict is latched; the evidence is not.** `node_death` remembers that a durable
+suppressor vetoed a given departed key and stops re-asking for as long as that key stays
+tracked and absent. This is not an optimisation. The departed-lifecycle label the suppressor
+reads is retained for a bounded number of ticks, while the veto has to hold all the way to
+`prune()`'s reclaim - which itself needs the veto UNBROKEN for `prune_ticks` consecutive
+ticks. Re-asking every tick made those two windows race, and the retention clock starts at
+the wrong event to win it: it is anchored when the node's lifecycle SERVICES leave the graph,
+while the reclaim tick counts from when its App does, one or more sweeps later. Once the
+label expired mid-veto the suppressor abstained, the streak reset to zero, and with the label
+gone for good the key could never be suppressed again - a cleanly shut-down node named in
+`GRAPH_NODE_DISAPPEARED` for the life of the process. Latching is sound because that is what
+`durable()` means: such a verdict never lifts for a given key, so remembering it cannot
+diverge from asking again. Only positive verdicts from durable suppressors are latched, and
+the entry is dropped the moment the key is present again, so one departure's verdict is never
+carried into the next.
+
+The retention window is still not this detector's own to size: before its `configure()` has
+run, the plugin predicts the same `prune_ticks_` (`max(prune_grace, miss_grace + 1)`) this
+detector will compute and sizes the lifecycle watcher's departed-node retention from it. With
+the verdict latched, all that window has to outlive is the FIRST tick suppression is evaluated
+on; it is left sized to the reclaim tick anyway, as slack against the services-before-App lead
+above - see `GraphWatchdogPlugin::compute_departed_retention_ticks()`.
 
 **Bounded by evidence, not by age.** This detector is zero-config over every armed App in
 the graph - a strictly larger scope than `lifecycle_expectation`'s named `require_active`
