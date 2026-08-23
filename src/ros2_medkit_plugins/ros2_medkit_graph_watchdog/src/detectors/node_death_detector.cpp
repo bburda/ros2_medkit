@@ -305,8 +305,9 @@ class NodeDeathDetector : public Detector {
       }
       present.insert(key);
       // Any lifecycle record at all - whatever it says - ends a "no record" run, so the hold
-      // below only ever counts CONSECUTIVE record-less ticks.
-      if (ctx.gate != nullptr && ctx.gate->lifecycle_state_of(app.id).has_value()) {
+      // below only ever counts CONSECUTIVE record-less ticks. Only asked for a key that is
+      // actually withheld: nothing else can have an entry, and this is a watcher lookup.
+      if (released_.count(key) != 0 && ctx.gate != nullptr && ctx.gate->lifecycle_state_of(app.id).has_value()) {
         released_no_record_ticks_.erase(key);
       }
       // Tracking follows OWNERSHIP rather than permission, and the two are not the same
