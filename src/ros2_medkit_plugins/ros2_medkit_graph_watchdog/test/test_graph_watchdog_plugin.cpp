@@ -280,6 +280,36 @@ class FakeContextChurningApps : public FakeContext {
   mutable std::atomic<int> counter_{0};
 };
 
+// Reports a permanently-present "/anchor" app (so the snapshot is never empty - an empty
+// snapshot re-arms ReliabilityGate's global bringup grace, which would delay arming for a
+// reason unrelated to what this context exists to drive) plus one "/victim" app on the VERY
+// FIRST call only - departed on every call after that. Built for
+// MalformedNodeDeathPruneGraceUsesThePluginScopeFallbackNotTheDetectorsOwnDefault, which
+// needs a real death to drive real reclaim timing, not merely a config-read seam.
+class FakeContextVictimDepartsAfterFirstTick : public FakeContext {
+ public:
+  using FakeContext::FakeContext;
+  ros2_medkit_gateway::IntrospectionInput get_entity_snapshot() const override {
+    ros2_medkit_gateway::IntrospectionInput input;
+    ros2_medkit_gateway::App anchor;
+    anchor.id = "/anchor";
+    anchor.bound_fqn = "/anchor";
+    anchor.is_online = true;
+    input.apps.push_back(anchor);
+    if (calls_.fetch_add(1) == 0) {
+      ros2_medkit_gateway::App victim;
+      victim.id = "/victim";
+      victim.bound_fqn = "/victim";
+      victim.is_online = true;
+      input.apps.push_back(victim);
+    }
+    return input;
+  }
+
+ private:
+  mutable std::atomic<int> calls_{0};
+};
+
 class GraphWatchdogPluginTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -330,6 +360,34 @@ TEST_F(GraphWatchdogPluginTest, PluginScopePruneGraceStillAppliesWhenTheDetector
   std::lock_guard<std::mutex> lk(g_captured_mutex);
   ASSERT_TRUE(g_captured_config.contains("prune_grace"));
   EXPECT_EQ(g_captured_config["prune_grace"].get<int>(), 42) << "the plugin-scope value is still the default";
+}
+
+// compute_departed_retention_ticks() needs no ROS node at all - it reads only its own
+// config_snapshot parameter plus tick_interval_ms_/prune_grace_, both left at their
+// constructor defaults (1000, 60) when configure()/set_context() are never called.
+TEST(ComputeDepartedRetentionTicks, OversizedNodeDeathPruneGraceIsRejectedNotTruncated) {
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  const int ticks = plugin.compute_departed_retention_ticks_for_test(
+      nlohmann::json{{"detectors", {{"node_death", {{"prune_grace", 4294967296LL}}}}}});
+  // 4294967296 (2^32) narrowed to int BEFORE a range check wraps to exactly 0, which passes
+  // a bare ">= 0" check silently - node_death_detector.cpp's own configure() rejects this
+  // same value and keeps its default (60), so the correct retention here is computed from
+  // that same default: prune_ticks=max(60, miss_grace+1), miss_grace floored to 2 at the
+  // 1000ms default tick (unaffected, since the floor only bites below ~1500ms), so
+  // 60+2+1=63. A narrow-then-validate bug would instead compute from the wrapped 0:
+  // max(0,3)+2+1=6.
+  EXPECT_EQ(ticks, 63);
+}
+
+TEST(ComputeDepartedRetentionTicks, OversizedNodeDeathMissGraceIsRejectedNotTruncated) {
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  const int ticks = plugin.compute_departed_retention_ticks_for_test(
+      nlohmann::json{{"detectors", {{"node_death", {{"miss_grace", 4294967296LL}}}}}});
+  // Same shape as the prune_grace case above, for the other field this function reads the
+  // same way. miss_grace stays at its default (2, unaffected by the floor at the 1000ms
+  // default tick), prune_grace stays at the plugin's own default (60):
+  // prune_ticks=max(60,3)=60, retention=60+2+1=63.
+  EXPECT_EQ(ticks, 63);
 }
 
 TEST_F(GraphWatchdogPluginTest, ExportsAdvertiseCorrectApiVersion) {
@@ -501,6 +559,107 @@ TEST_F(GraphWatchdogPluginTest, WatchdogStatusRouteReportsEntityLifecycleAndArme
   EXPECT_EQ(entity["state"], "armed");
   EXPECT_TRUE(entity["armed"].get<bool>());
   EXPECT_TRUE(entity.contains("lifecycle"));  // untracked (non-lifecycle) node -> null, but key present
+
+  EXPECT_NO_THROW(plugin.shutdown());
+  exec.cancel();
+  spin.join();
+}
+
+// The plugin injects its own prune_grace default only when the
+// per-detector key is ABSENT (see set_context()'s configure loop), so a PRESENT but
+// malformed detectors.node_death.prune_grace used to reach node_death's own configure()
+// unfiltered, which falls back to ITS OWN hardcoded default (60) rather than the plugin's.
+// compute_departed_retention_ticks() independently falls back to the plugin's own
+// prune_grace_ for the exact same malformed value, so the two disagreed whenever an
+// operator's plugin-scope prune_grace was anything other than the coincidentally-matching
+// 60 - sizing the lifecycle-departed retention window for a reclaim tick node_death would
+// not actually reach for roughly another 57 ticks. Proven here through REAL reclaim timing
+// (an allowlisted, durably-suppressed death) rather than by inspecting either side's
+// computation in isolation - either side alone can look right while still disagreeing with
+// the other, which is exactly why OversizedNodeDeathPruneGraceIsRejectedNotTruncated below
+// (plugin-scope prune_grace left at the coincidentally-matching default 60) could not catch
+// this.
+TEST_F(GraphWatchdogPluginTest, MalformedNodeDeathPruneGraceUsesThePluginScopeFallbackNotTheDetectorsOwnDefault) {
+  ros2_medkit_graph_watchdog::GraphWatchdogPlugin plugin;
+  FakeContextVictimDepartsAfterFirstTick ctx(gateway_node_.get());
+
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(gateway_node_);
+  std::thread spin([&exec] {
+    exec.spin();
+  });
+
+  // tick_interval_ms MUST be 3000: node_death's own wall-clock floor
+  // (min_node_death_miss_grace) bumps a fast-tick miss_grace up regardless of what is
+  // configured, and prune_ticks = max(prune_grace, miss_grace + 1) - a bumped-up miss_grace
+  // would dominate that max() identically whether prune_grace fell back to 1 or to 60,
+  // masking the exact divergence this test exists to catch. At 3000ms the floor is exactly
+  // 0, so the configured miss_grace(0) is used as written.
+  plugin.configure(
+      nlohmann::json{{"tick_interval_ms", 3000},
+                     {"warmup_cycles", 0},
+                     {"prune_grace", 0},  // plugin-scope, deliberately far from node_death's own hardcoded 60
+                     {"detectors",
+                      {{"node_death",
+                        {{"miss_grace", 0},
+                         {"prune_grace", "invalid"},  // malformed: must fall back, not pass through unfiltered
+                         {"allowlist", nlohmann::json::array({"/victim"})},
+                         {"suppress", nlohmann::json::array({"allowlist"})}}}}}});
+  plugin.set_context(ctx);
+
+  const auto routes = plugin.get_routes();
+  const auto route_it = find_watchdog_route(routes);
+  ASSERT_NE(route_it, routes.end());
+
+  // node_death's tracked_count_ atomic default-initializes to 0 - the SAME value a reclaimed
+  // /victim would leave it at - so reading it before the first tick has actually run would
+  // make the deadline below pass vacuously, having proven nothing. Wait for the first tick to
+  // publish "both anchor and victim are tracked" (2) before timing anything past it.
+  const auto armed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  std::size_t tracked_count = 0;
+  while (std::chrono::steady_clock::now() < armed_deadline) {
+    TestResponseSink armed_sink;
+    ros2_medkit_gateway::PluginRequest armed_req(nullptr);
+    ros2_medkit_gateway::PluginResponse armed_res(&armed_sink);
+    route_it->handler(armed_req, armed_res);
+    const auto & armed_detectors = armed_sink.body["x-medkit-watchdog"]["detectors"];
+    if (armed_detectors.contains("node_death")) {
+      tracked_count = armed_detectors["node_death"]["tracked_count"].get<std::size_t>();
+      if (tracked_count >= 2) {
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_EQ(tracked_count, 2u) << "precondition: anchor and victim must both have been observed "
+                                  "tracked at least once, or the reclaim timing below proves "
+                                  "nothing";
+
+  // prune_ticks = max(0, miss_grace(0)+1=1) = 1 if the plugin-scope fallback is used: victim
+  // departs and mis-suppresses on tick 2 (streak 1), reclaimed on tick 3 (streak 2 > 1) - two
+  // more 3000ms ticks past the precondition above, ~6-7s including scheduling slack. If
+  // node_death instead fell back to its own hardcoded 60, reclaim needs streak 61 - roughly
+  // 180s at this tick rate. The deadline sits well inside that gap: generous for the fixed
+  // case, a small fraction of the hardcoded-fallback case, so this discriminates rather than
+  // merely giving both enough time to pass.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+  while (std::chrono::steady_clock::now() < deadline) {
+    TestResponseSink sink;
+    ros2_medkit_gateway::PluginRequest req(nullptr);
+    ros2_medkit_gateway::PluginResponse res(&sink);
+    route_it->handler(req, res);
+    const auto & detectors = sink.body["x-medkit-watchdog"]["detectors"];
+    if (detectors.contains("node_death")) {
+      tracked_count = detectors["node_death"]["tracked_count"].get<std::size_t>();
+      if (tracked_count == 1) {
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  EXPECT_EQ(tracked_count, 1u) << "the allowlisted, durably-suppressed /victim must be reclaimed within a few prune "
+                                  "ticks sized off the plugin's OWN prune_grace default, not node_death's unrelated "
+                                  "hardcoded fallback - only the anchor (never departed) should remain tracked";
 
   EXPECT_NO_THROW(plugin.shutdown());
   exec.cancel();
