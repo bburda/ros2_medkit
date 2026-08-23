@@ -656,12 +656,13 @@ class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
         # consulted, and the row green for a mechanism that never ran - which is exactly how it
         # was vacuous before. A settled tracked_count is the detector's own signal that its
         # sweep has caught up.
-        _, admitted = _poll_stable_tracked_count(
+        before_walk, admitted = _poll_stable_tracked_count(
             PORT, DETECTOR_ID_NODE_DEATH, timeout=ARM_TIMEOUT_SEC, stable_seconds=3.0)
         self.assertTrue(
             admitted,
             "node_death's tracked_count never settled while both fixtures were active, so this "
             'row cannot tell whether the key it is about was ever admitted')
+        tracked_while_active = before_walk.get('tracked_count')
 
         # The whole way down, one real transition at a time, each one confirmed on the status
         # route before the next: the suppressor classifies the LAST label the watcher saw, and
@@ -684,6 +685,30 @@ class TestSuppressionLifecycleCleanShutdown(unittest.TestCase):
                 'watcher did not see the step, so the departure it records cannot be classified '
                 'as a clean shutdown',
             )
+
+        # The key is STILL tracked now that it reads "finalized", and that is what makes this row
+        # about self-suppression rather than about a key nobody ever admitted. The count alone is
+        # an aggregate, but the DIFFERENCE across the walk is not: nothing appeared or left the
+        # graph between the two samples - both fixtures are still running - so the only thing that
+        # changed is CLEAN_NODE's lifecycle label. A detector that refuses or drops a finalized
+        # key at admission whenever the lifecycle suppressor is configured shows up here as a
+        # count one lower, while passing every other assertion in this row and in its
+        # unsuppressed sibling. A correct one keeps the key: an EARNED admission is not withdrawn
+        # by a later non-active label, and suppression happens at report time, not at admission.
+        after_walk, settled = _poll_stable_tracked_count(
+            PORT, DETECTOR_ID_NODE_DEATH, timeout=ARM_TIMEOUT_SEC, stable_seconds=3.0)
+        self.assertTrue(
+            settled,
+            "node_death's tracked_count never settled after the shutdown walk")
+        self.assertEqual(
+            after_walk.get('tracked_count'), tracked_while_active,
+            f'node_death stopped tracking a key when {CLEAN_NODE} reached "finalized" '
+            f'({tracked_while_active} -> {after_walk.get("tracked_count")}, with both fixtures '
+            'still running and nothing else changed). The suppressor is only ever consulted for '
+            'a key that is still tracked when the node departs, so with the key dropped here the '
+            'silence below is a key that was never admitted, not self-suppression working',
+        )
+
         os.kill(clean_node.process_details['pid'], signal.SIGTERM)
         os.kill(killed_node.process_details['pid'], signal.SIGTERM)
         self.assertTrue(

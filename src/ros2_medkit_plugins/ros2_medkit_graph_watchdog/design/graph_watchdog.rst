@@ -1092,16 +1092,29 @@ recover from, which is precisely the death an operator needs reported, not silen
 ``unconfigured`` is deliberately excluded even though it looks quiet: it is also the
 resting state of a node whose ``configure()`` failed or that never activated at all, and
 suppressing on it would hide exactly that startup failure. Any other label, or no
-departure on record at all, abstains. The mechanism is stateless by construction - a
+departure on record at all, abstains. The suppressor itself is stateless by construction - a
 detector's ``configure()`` runs before any per-tick context exists, so it stores nothing
-at construction and reads the gate fresh on every call - and its retention window is not
-this detector's own to size: before this detector's own ``configure()`` has run, the
-plugin predicts the same ``prune_ticks_`` (``max(prune_grace, miss_grace + 1)``) this
-detector will compute, then sizes the lifecycle watcher's departed-node retention from it
-with enough margin that a clean-shutdown label is still cached at this detector's own
-reclaim tick, one tick to spare
-(``GraphWatchdogPlugin::compute_departed_retention_ticks()`` - the resulting window is
-larger than ``prune_ticks_`` alone).
+at construction and reads the gate fresh on every call.
+
+**The verdict is latched; the evidence is not.** ``node_death`` remembers that a durable
+suppressor vetoed a given departed key and stops re-asking while that key stays tracked and
+absent. The label the suppressor reads is retained for a bounded number of ticks, while the
+veto must hold to ``prune()``'s reclaim - which needs it UNBROKEN for ``prune_ticks``
+consecutive ticks. Re-asking every tick made those windows race, and the retention clock is
+anchored on the wrong event to win it: it starts when the node's lifecycle SERVICES leave the
+graph, while the reclaim tick counts from when its App does, one or more sweeps later. Once
+the label expired mid-veto the suppressor abstained, the streak reset, and with the label gone
+for good the key could never be suppressed again - a cleanly shut-down node named for the life
+of the process. Latching is sound because that is what ``durable()`` means: the verdict never
+lifts for a given key, so remembering it cannot diverge from asking again. Only positive
+verdicts from durable suppressors are latched, and an entry is dropped the moment its key is
+present again, so one departure's verdict never carries into the next.
+
+The retention window is still not this detector's own to size: the plugin predicts the same
+``prune_ticks_`` (``max(prune_grace, miss_grace + 1)``) and sizes the watcher's departed-node
+retention from it. With the verdict latched, that window only has to outlive the FIRST tick
+suppression is evaluated on; it stays sized to the reclaim tick as slack against the
+services-before-App lead (``GraphWatchdogPlugin::compute_departed_retention_ticks()``).
 
 **Bounded by evidence, not by age - and what the cap actually bounds.** This detector is
 zero-config over every armed App in the graph - a strictly larger scope than
@@ -1122,6 +1135,19 @@ but only entries that have actually crossed ``miss_grace``. An entry still mid-g
 never a collapse candidate, because collapsing erases the identity and would report a death
 the node has not earned, permanently
 (``NodeLivenessTrackerCap.ImmatureDepartedEntriesAreNeverCollapsedOrReportedUnderCapPressure``).
+Collapsing is one-way, and the cost is worth stating plainly: the identity is DISCARDED, the
+collapsed count only grows within a tracker's life, and nothing decrements it when one of those
+nodes returns. So the description stops naming them, and - since the aggregated fault clears
+only on an EMPTY dead set - the synthetic collapsed entry keeps that set non-empty, which means
+``GRAPH_NODE_DISAPPEARED`` cannot clear again for the life of the process once anything has been
+collapsed. It ends by operator acknowledge or by a restart, never by the graph recovering.
+Neither half is repairable here: decrementing needs the identity the collapse threw away, and
+keeping identities is the unbounded state the cap exists to prevent, while decaying the count by
+time would heal a fault by waiting - which this package refuses everywhere else. What bounds the
+damage is what collapsing may touch: only a MATURED entry, whose death has already been reported
+by name, so nothing becomes UNREPORTED by being collapsed. The attribution and the self-healing
+are lost, not the warning.
+
 So saturation IS reachable here: when immature departures alone exceed the cap,
 ``tracking_saturated`` goes true and the departed set stays oversized for a few ticks -
 bounded by how fast departures arrive times ``miss_grace``, not by process uptime, which is
