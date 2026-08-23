@@ -163,6 +163,7 @@ from harness import (  # noqa: E402, I100
     assert_fault_describes_only,
     assert_fault_never_names,
     assert_fault_persists_throughout,
+    assert_process_exited,
     create_watchdog_test_launch,
     poll_cleared,
     poll_detector_status,
@@ -267,6 +268,13 @@ TIME_SCALE = get_time_scale()
 ARM_TIMEOUT_SEC = 60.0 * TIME_SCALE
 FAULTS_LIVE_TIMEOUT_SEC = 30.0 * TIME_SCALE
 PRESENCE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+# Unchanged, and now it only has to cover what it can actually be held to. Every call site
+# proves the process EXITED first (assert_process_exited), so the two terms left are the ones
+# somebody owns: the Fast DDS participant lease an unclean death costs before the graph drops
+# the participant (measured 19.8-20.1 s on this stack) plus the gateway's own graph-to-/apps
+# latency (refresh_debounce_ms 1000 + one 100 ms tick) = 21.1 s. 30 s clears that with room
+# for the sanitizer jobs, so nothing here needed widening - see harness.py's "What 'the node
+# is gone' costs" note for who promises which term.
 DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
 RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 CLEAR_TIMEOUT_SEC = 60.0 * TIME_SCALE
@@ -890,6 +898,7 @@ class TestBoundaryInactiveBelowGraceThenGone(unittest.TestCase):
         )
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
@@ -986,6 +995,7 @@ class TestBoundaryMaturedThenGone(unittest.TestCase):
         self.assertIn(TARGET_NODE, fault.get('description', ''))
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
@@ -1028,6 +1038,7 @@ class TestBoundaryHealthyThenGone(unittest.TestCase):
             'GET /faults never answered 200 - nothing below would prove anything')
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], ACTIVE_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, ACTIVE_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{ACTIVE_NODE} never left GET /apps after SIGTERM')
@@ -1091,6 +1102,7 @@ class TestBoundaryRestartLoopStillCaught(unittest.TestCase):
         pid = target_node.process_details['pid']
         for cycle in range(1, B5_CYCLES + 1):
             os.kill(pid, signal.SIGTERM)
+            assert_process_exited(self, pid, TARGET_NODE)
             self.assertTrue(
                 _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
                 f'cycle {cycle}: {TARGET_NODE} never left GET /apps after SIGTERM',
@@ -1207,6 +1219,7 @@ class TestBoundaryNeverArmedBelowGraceThenGone(unittest.TestCase):
         )
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
@@ -1254,6 +1267,7 @@ class TestBoundaryConfigEndpointE2E(unittest.TestCase):
             'GET /faults never answered 200 - nothing below would prove anything')
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], C4_TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, C4_TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{C4_TARGET_NODE} never left GET /apps after SIGTERM')
@@ -1290,6 +1304,7 @@ class TestBoundaryUngatedClear(unittest.TestCase):
             f'graph_watchdog never reported {D2_TARGET_NODE} armed')
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], D2_TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, D2_TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{D2_TARGET_NODE} never left GET /apps after SIGTERM')

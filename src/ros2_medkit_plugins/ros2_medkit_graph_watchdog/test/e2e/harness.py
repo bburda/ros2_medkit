@@ -41,7 +41,7 @@ from launch import LaunchDescription
 from launch.actions import TimerAction
 import launch_testing.actions
 import requests
-from ros2_medkit_test_utils.constants import get_test_port
+from ros2_medkit_test_utils.constants import get_test_port, get_time_scale
 from ros2_medkit_test_utils.launch_helpers import (
     create_demo_nodes,
     create_fault_manager_node,
@@ -49,6 +49,126 @@ from ros2_medkit_test_utils.launch_helpers import (
 )
 
 API_BASE_PATH = '/api/v1'
+
+# ---- What "the node is gone" costs, and who promises which part -------------------------
+#
+# Read this before writing another assertion about a killed node disappearing. "A SIGTERM'd
+# node is absent from GET /apps within N seconds" is three quantities in a trench coat, and
+# only the last one is a promise anybody makes:
+#
+#   1. signal -> the node stops announcing itself on DDS. NOBODY PROMISES THIS. It is the
+#      node's own shutdown path, and how long a node takes to shut down is the node's own
+#      business. Measured at 225 ms for a demo node on an uninstrumented box; under a
+#      sanitizer every step of that teardown is instrumented and it is unbounded as far as
+#      any test here is concerned.
+#   2. participant gone -> the ROS graph drops the node. Free if the participant
+#      unregistered cleanly. If it did not - the process died without completing its
+#      shutdown - remote participants must wait out the Fast DDS PARTICIPANT LEASE, measured
+#      at 19.8-20.1 s over three runs on this stack (stock rmw_fastrtps_cpp, no profile
+#      override anywhere in this repo).
+#   3. graph drops it -> GET /apps stops listing it. THIS ONE THE GATEWAY PROMISES, and it
+#      is the only bound of the three: at most `discovery.refresh_debounce_ms` (1000 by
+#      default) plus one 100 ms graph-check tick, and create_gateway_node additionally pins
+#      `refresh_interval_ms` to 1000 as an unconditional backstop. There is no retention
+#      anywhere behind it - RuntimeLayer rebuilds from scratch and discover_apps() reads
+#      get_node_names_and_namespaces() live.
+#
+# So a test may hold the gateway to term 3 and to nothing else. Term 1 must be OBSERVED, not
+# budgeted for - assert_process_exited() below is how - because budgeting for it produces a
+# failure that blames a component whose own bound is one second. Term 2 is the reason the
+# post-exit budgets here are tens of seconds rather than the ~1 s term 3 would suggest.
+#
+# The two measurements above were taken with the gateway and a demo node on this stack,
+# polling GET /apps at 200 ms: SIGTERM gone in 225 ms, SIGKILL (no unregister) gone in
+# 20073 / 19762 / 19989 ms.
+
+# The Fast DDS participant lease, from the measurement above. What an UNCLEAN death costs
+# before the graph drops the participant - the worst case, not the typical one.
+PARTICIPANT_LEASE_SEC = 20.0
+# The gateway's own graph-to-/apps latency: refresh_debounce_ms (1000) + one 100 ms tick.
+GATEWAY_GRAPH_TO_APPS_SEC = 1.1
+# What a departure may cost once the process is PROVEN gone: the two real terms, added.
+# Every per-file DEPARTURE_TIMEOUT_SEC in this suite is 30 s * the time scale, which already
+# clears this with room to spare, so this constant is here to be compared against rather
+# than to replace them.
+DEPARTURE_AFTER_EXIT_SEC = PARTICIPANT_LEASE_SEC + GATEWAY_GRAPH_TO_APPS_SEC  # 21.1
+
+# How long assert_process_exited() waits. NOT derived from anything, because term 1 above is
+# not promised by anyone: this is a diagnostic ceiling, chosen at the same magnitude the
+# departure budgets already used so no existing budget grows. It is scaled like every other
+# give-up bound here because the thing being waited on is instrumented in the sanitizer jobs.
+NODE_EXIT_TIMEOUT_SEC = 30.0 * get_time_scale()
+
+
+def process_is_running(pid):
+    """Whether `pid` is still a LIVE process - a zombie counts as gone.
+
+    The distinction matters and is not pedantry. A launch-spawned node that has exited but
+    not yet been reaped by the launch service is a zombie: it holds no DDS participant, has
+    stopped announcing, and is therefore gone as far as every question this suite asks - but
+    ``os.kill(pid, 0)`` still succeeds for it, so a naive liveness check would wait for a
+    reap that may not happen until launch shuts down at the end of the test.
+
+    Reads /proc directly for that reason. The state character sits after the comm field,
+    which is parenthesised and may itself contain spaces and parentheses, so the split is on
+    the LAST ')' rather than on whitespace. Falls back to a signal probe where /proc is not
+    available.
+    """
+    try:
+        with open(f'/proc/{pid}/stat', 'rb') as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return False
+    except (PermissionError, ProcessLookupError):
+        return False
+    except OSError:
+        raw = None
+    if raw is None:  # no /proc: fall back to a signal probe, which cannot see zombies
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return False
+        return True
+    close = raw.rfind(b')')
+    if close < 0:
+        return False  # unparseable: treat as gone rather than wait forever on a guess
+    state = raw[close + 2:close + 3].decode('ascii', 'replace')
+    return state != 'Z'
+
+
+def wait_until_process_exits(pid, timeout, interval=0.1):
+    """Poll until `pid` is no longer a live process. ``True`` once it is gone."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_is_running(pid):
+            return True
+        time.sleep(interval)
+    return not process_is_running(pid)
+
+
+def assert_process_exited(test_case, pid, label, timeout=None):
+    """Fail unless `pid` has actually exited - the precondition for any departure claim.
+
+    Every "the node left GET /apps" assertion in this suite is downstream of this one, and
+    before it existed those assertions blamed the gateway for a node that had not finished
+    dying. See the "What 'the node is gone' costs" note at the top of this module: the time
+    from a signal to a process actually stopping is the one term in that chain nobody
+    promises, so it is OBSERVED here rather than folded into a budget and charged to a
+    component whose own bound is one second.
+
+    Call it immediately after the signal and before polling GET /apps. On failure the
+    message says the node never died, which is both true and the thing worth knowing; the
+    departure poll after it then only has to cover the two terms that are real.
+    """
+    timeout = NODE_EXIT_TIMEOUT_SEC if timeout is None else timeout
+    test_case.assertTrue(
+        wait_until_process_exits(pid, timeout=timeout),
+        f'{label} (pid {pid}) was still a live process {timeout}s after the signal, so it '
+        'had not stopped announcing itself on DDS and no departure could possibly have been '
+        'observed downstream. This is the node failing to shut down, not the graph failing '
+        'to notice: nothing here promises how long a shutdown takes, and under a sanitizer '
+        'every step of it is instrumented.',
+    )
 
 
 def create_watchdog_test_launch(

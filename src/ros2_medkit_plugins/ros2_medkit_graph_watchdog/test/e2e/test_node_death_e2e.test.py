@@ -117,6 +117,7 @@ from harness import (  # noqa: E402, I100
     assert_fault_absent_throughout,
     assert_fault_describes_only,
     assert_fault_persists_throughout,
+    assert_process_exited,
     create_watchdog_test_launch,
     poll_cleared,
     poll_entity_faults,
@@ -210,6 +211,13 @@ TIME_SCALE = get_time_scale()
 ARM_TIMEOUT_SEC = 60.0 * TIME_SCALE
 FAULTS_LIVE_TIMEOUT_SEC = 30.0 * TIME_SCALE
 PRESENCE_TIMEOUT_SEC = 30.0 * TIME_SCALE
+# Unchanged, and now it only has to cover what it can actually be held to. Every call site
+# proves the process EXITED first (assert_process_exited), so the two terms left are the ones
+# somebody owns: the Fast DDS participant lease an unclean death costs before the graph drops
+# the participant (measured 19.8-20.1 s on this stack) plus the gateway's own graph-to-/apps
+# latency (refresh_debounce_ms 1000 + one 100 ms tick) = 21.1 s. 30 s clears that with room
+# for the sanitizer jobs, so nothing here needed widening - see harness.py's "What 'the node
+# is gone' costs" note for who promises which term.
 DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
 RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 CLEAR_TIMEOUT_SEC = 60.0 * TIME_SCALE
@@ -688,6 +696,7 @@ class TestNodeDeathRaise(unittest.TestCase):
         )
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM - this scenario never '
@@ -734,6 +743,7 @@ class TestNodeDeathClearOnReturn(unittest.TestCase):
 
         old_pid = target_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
+        assert_process_exited(self, old_pid, TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
@@ -780,6 +790,7 @@ class TestNodeDeathNoHealStandalone(unittest.TestCase):
         )
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
@@ -1054,6 +1065,7 @@ class TestNodeDeathRos2cliIgnored(unittest.TestCase):
                 )
 
                 os.kill(proc.pid, signal.SIGTERM)
+                assert_process_exited(self, proc.pid, name)
                 self.assertTrue(
                     _poll_apps_absent(PORT, name, timeout=DEPARTURE_TIMEOUT_SEC),
                     f'cycle {cycle}: {name} never left GET /apps after SIGTERM - this '
@@ -1192,6 +1204,7 @@ class TestNodeDeathBareNameCollision(unittest.TestCase):
 
         node_b_pid = node_b.process_details['pid']
         os.kill(node_a.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, node_a.process_details['pid'], COLLISION_APP_ID_A)
         self.assertTrue(
             _poll_apps_absent(PORT, COLLISION_APP_ID_A, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{COLLISION_APP_ID_A} never left GET /apps after SIGTERM')
@@ -1322,6 +1335,7 @@ class TestNodeDeathRestartLoopOccurrences(unittest.TestCase):
         pid = target_node.process_details['pid']
         for cycle in range(1, RESTART_LOOP_OCCURRENCES_TARGET + 1):
             os.kill(pid, signal.SIGTERM)
+            assert_process_exited(self, pid, TARGET_NODE)
             self.assertTrue(
                 _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
                 f'cycle {cycle}: {TARGET_NODE} never left GET /apps after SIGTERM',
@@ -1400,6 +1414,7 @@ class TestNodeDeathRestartRebaseline(unittest.TestCase):
             f'graph_watchdog never reported {TARGET_NODE} armed')
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=DEPARTURE_TIMEOUT_SEC),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')

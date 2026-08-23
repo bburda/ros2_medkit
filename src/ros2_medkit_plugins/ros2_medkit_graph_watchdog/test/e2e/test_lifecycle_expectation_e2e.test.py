@@ -140,6 +140,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (  # noqa: E402, I100
     API_BASE_PATH,
     assert_fault_absent_throughout,
+    assert_process_exited,
     create_watchdog_test_launch,
     poll_cleared,
     poll_detector_status,
@@ -284,6 +285,13 @@ UNREADABLE_RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # healing_threshold defines it: giving the entity cache room to reflect a kill quickly)
 # bounds the entity-cache catch-up. The generous margin below is the same CI-slowness
 # allowance every other poll budget in this file carries, not a measurement of that cost.
+# Unchanged, and now it only has to cover what it can actually be held to. Every call site
+# proves the process EXITED first (assert_process_exited), so the two terms left are the ones
+# somebody owns: the Fast DDS participant lease an unclean death costs before the graph drops
+# the participant (measured 19.8-20.1 s on this stack) plus the gateway's own graph-to-/apps
+# latency (refresh_debounce_ms 1000 + one 100 ms tick) = 21.1 s. 30 s clears that with room
+# for the sanitizer jobs, so nothing here needed widening - see harness.py's "What 'the node
+# is gone' costs" note for who promises which term.
 ABSENCE_DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
 ABSENCE_CLEAR_TIMEOUT_SEC = 30.0 * TIME_SCALE
 # Slept after a departure has been CONFIRMED on GET /apps, before asserting the fault
@@ -1532,6 +1540,7 @@ class TestLifecycleExpectationHealingThreshold(unittest.TestCase):
         """
         old_pid = node_action.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
+        assert_process_exited(self, old_pid, TARGET_NODE)
 
         # This scenario is named for a departure that stays INSIDE the tracker's
         # absence grace (kDefaultAbsenceGrace, 3 ticks - fixed, not configurable) - not
@@ -1841,6 +1850,7 @@ class TestLifecycleExpectationDepartureKeeps(unittest.TestCase):
     def test_03_killed_node_confirmed_gone_and_the_fault_survives_it(self, target_node):
         old_pid = target_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
+        assert_process_exited(self, old_pid, UNREADABLE_NODE)
 
         self.assertTrue(
             _poll_apps_absent(PORT, UNREADABLE_NODE, timeout=ABSENCE_DEPARTURE_TIMEOUT_SEC),
@@ -1985,6 +1995,7 @@ class TestLifecycleExpectationNotManaged(unittest.TestCase):
 
         old_pid = target_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
+        assert_process_exited(self, old_pid, NOT_MANAGED_NODE)
 
         self.assertTrue(
             _poll_apps_absent(PORT, NOT_MANAGED_NODE, timeout=NOT_MANAGED_DEPARTURE_TIMEOUT_SEC),
@@ -2059,6 +2070,7 @@ class TestLifecycleExpectationRestartLoop(unittest.TestCase):
         """SIGTERM the node, prove it left the graph past the absence grace, wait it back."""
         old_pid = node_action.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
+        assert_process_exited(self, old_pid, NOT_MANAGED_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, NOT_MANAGED_NODE, timeout=30.0 * TIME_SCALE, interval=0.05),
             f'cycle {cycle}: {NOT_MANAGED_NODE} (pid {old_pid}) was never observed absent '
@@ -2281,6 +2293,7 @@ class TestLifecycleExpectationCapPressure(unittest.TestCase):
     def test_03_a_departed_entry_is_collapsed_so_the_present_node_is_checked(self, tracked_node):
         old_pid = tracked_node.process_details['pid']
         os.kill(old_pid, signal.SIGTERM)
+        assert_process_exited(self, old_pid, CAP_TRACKED_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, CAP_TRACKED_NODE, timeout=30.0 * TIME_SCALE),
             f'{CAP_TRACKED_NODE} (pid {old_pid}) is still listed on GET /apps after SIGTERM '
@@ -2408,6 +2421,7 @@ class TestLifecycleExpectationUnsettledDeparture(unittest.TestCase):
             'is about',
         )
         os.kill(blink_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, blink_node.process_details['pid'], UNSETTLED_BLINK_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, UNSETTLED_BLINK_NODE,
                               timeout=30.0 * TIME_SCALE, interval=0.05),
@@ -2433,6 +2447,7 @@ class TestLifecycleExpectationUnsettledDeparture(unittest.TestCase):
         # node leaves - the difference, and the only difference, from the blink leg above.
         time.sleep((UNSETTLED_SETTLED_HOLD_TICKS * UNSETTLED_TICK_INTERVAL_MS) / 1000.0)
         os.kill(settled_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, settled_node.process_details['pid'], UNSETTLED_SETTLED_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, UNSETTLED_SETTLED_NODE, timeout=30.0 * TIME_SCALE),
             f'{UNSETTLED_SETTLED_NODE} never left GET /apps after SIGTERM')
@@ -2514,6 +2529,7 @@ class TestLifecycleExpectationWideGrace(unittest.TestCase):
 
     def test_02_the_fault_survives_the_node_leaving(self, target_node):
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=30.0 * TIME_SCALE),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
@@ -2573,6 +2589,7 @@ class TestLifecycleExpectationRestartDeparted(unittest.TestCase):
             f'{FAULT_CODE} never raised for the stuck {TARGET_NODE}')
 
         os.kill(target_node.process_details['pid'], signal.SIGTERM)
+        assert_process_exited(self, target_node.process_details['pid'], TARGET_NODE)
         self.assertTrue(
             _poll_apps_absent(PORT, TARGET_NODE, timeout=30.0 * TIME_SCALE),
             f'{TARGET_NODE} never left GET /apps after SIGTERM')
