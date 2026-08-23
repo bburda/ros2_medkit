@@ -211,7 +211,11 @@ class NodeDeathDetector : public Detector {
     // just rebuilt (or dropped) that allowlist above, so a value captured under the OLD
     // config would misrepresent the new one - clear rather than carry it forward.
     id_allowlisted_.clear();
-    // Deliberately NOT reset here, unlike id_allowlisted_ above: ever_raised_ is a fact about
+    // Same reasoning for the latched durable verdicts: each one was reached by a suppressor
+    // that build_suppressor_chain() has just rebuilt or dropped, so carrying it forward would
+    // let a key stay suppressed under a configuration that no longer suppresses it.
+    durably_suppressed_.clear();
+    // Deliberately NOT reset here, unlike the two maps above: ever_raised_ is a fact about
     // this PROCESS's history ("has this instance ever put a genuine FAILED on the wire"),
     // not about the current config. A live reconfigure (an operator editing the allowlist,
     // say) can run with a death still outstanding and absent; resetting the flag would make
@@ -283,6 +287,10 @@ class NodeDeathDetector : public Detector {
     std::set<std::string> present;
     std::set<std::string> armed;
     std::set<std::string> handed_back;  // provisionally admitted, and the ground has gone
+    // Keys the snapshot carries AT ALL this tick, online or not. A superset of `present`, and
+    // the right lifetime for bookkeeping about a node that has not left the graph - see the
+    // `released_` cleanup at the end of this function.
+    std::set<std::string> seen;
     for (const auto & app : ctx.snapshot->apps) {
       // A peer-aggregated app carries no ROS binding of its own (PeerClient::parse_app
       // never reads x-medkit.ros2.node), so effective_fqn() is empty for every one of
@@ -291,16 +299,19 @@ class NodeDeathDetector : public Detector {
       if (app.source.rfind("peer:", 0) == 0) {
         continue;
       }
-      // Liveness is the bound node actually running, not mere presence in the snapshot -
-      // see the class doc for why membership alone would make a manifest node immortal.
-      if (!app.is_online) {
-        continue;
-      }
       // Keyed on the STABLE fqn, not App::id: id is recomputed every sweep and only gets a
       // namespace prefix once a bare-name collision currently exists anywhere in the
       // graph, so a live node's id can change out from under a key built from it.
       const std::string key = app.effective_fqn();
       if (key.empty() || is_ros2cli_node(key)) {
+        continue;
+      }
+      seen.insert(key);
+      // Liveness is the bound node actually running, not mere presence in the snapshot -
+      // see the class doc for why membership alone would make a manifest node immortal.
+      // Computed AFTER the key, because "not tracked this tick" and "left the graph" are
+      // different facts and one piece of bookkeeping below needs the second one.
+      if (!app.is_online) {
         continue;
       }
       present.insert(key);
@@ -437,15 +448,29 @@ class NodeDeathDetector : public Detector {
     for (auto it = earned_.begin(); it != earned_.end();) {
       it = tracked_keys.count(*it) == 0 ? earned_.erase(it) : std::next(it);
     }
-    // `released_` answers a different question with a different lifetime: it is the set of
-    // PRESENT keys this detector has refused, and a released key is by definition not in the
-    // tracker at all, so it cannot be bounded by known_keys() - it is bounded by the live graph
-    // instead, since every member of it is a key present this tick. It goes when the node does;
+    // `released_` answers a different question with a different lifetime: it is the set of keys
+    // this detector has refused, and a released key is by definition not in the tracker at all,
+    // so it cannot be bounded by known_keys() - it is bounded by the live graph instead, since
+    // every member of it is a key the snapshot carried this tick. It goes when the node does;
     // the incarnation that returns is re-derived from whatever the gate then says about it. The
     // no-record counter beside it answers only about keys in `released_`, so it is pruned with
     // it rather than separately.
+    //
+    // Against `seen`, NOT `present`: an App whose process stopped keeps its snapshot entry with
+    // is_online cleared (a manifest or hybrid App does exactly this), and that node has not left
+    // the graph - it is merely not trackable this tick. Pruning on the narrower set threw the
+    // withheld key and its window away on the offline tick, so the first tick back online
+    // readmitted it outright, with none of the record-less present ticks the window promises. A
+    // node whose lifecycle services vanished as it died and whose App flickered online once
+    // would then be reported here after being handed to lifecycle_expectation.
+    //
+    // The counter is neither advanced nor reset by an offline tick, only carried: it counts
+    // ticks in which the node was OBSERVED present-and-unmanaged, and an offline tick observes
+    // nothing of the kind. Counting those would let a window that exists to establish "this node
+    // is alive and no longer managed" be satisfied by ticks in which the node was not running -
+    // ignorance standing in for the evidence the window is asking for.
     for (auto it = released_.begin(); it != released_.end();) {
-      if (present.count(*it) != 0) {
+      if (seen.count(*it) != 0) {
         ++it;
         continue;
       }
@@ -464,11 +489,32 @@ class NodeDeathDetector : public Detector {
     // key was still present. The id form bypasses chain_ dispatch entirely rather than
     // going through Suppressor::suppresses() - see allowlist_suppressor.hpp for why.
     for (auto it = report.dead.begin(); it != report.dead.end();) {
-      bool suppressed = id_allowlisted_.count(it->first) > 0;
+      // A durable verdict already reached for this key stands without re-asking. That is not a
+      // shortcut, it is the only way the verdict can outlive the EVIDENCE behind it:
+      // LifecycleShutdownSuppressor reads the lifecycle watcher's departed record, which is
+      // retained for a bounded number of ticks and then dropped, while the veto it produces has
+      // to hold until prune() reclaims the key - and prune() needs the veto UNBROKEN for
+      // prune_ticks consecutive ticks to get there. Re-asking on every tick made those two
+      // windows race, and the retention clock starts at the wrong event to win it: it is
+      // anchored when the node's lifecycle SERVICES leave the graph, while the reclaim tick
+      // counts from when its App does, one or more sweeps later. Every tick of that lead came
+      // out of the single tick of margin the window is sized with; past one, the record expired
+      // first, the veto lifted, the streak reset to zero, and - the record now gone for good -
+      // the key could never be suppressed again, so a cleanly shut-down node stayed named for
+      // the life of the process.
+      //
+      // Latching is sound here for the same reason `durable()` exists: a durable suppressor's
+      // answer for a given key never lifts, so remembering it can never diverge from asking
+      // again - it only survives the evidence being garbage-collected. Only POSITIVE verdicts
+      // are latched, and only from durable suppressors; nothing here remembers a "no".
+      bool suppressed = id_allowlisted_.count(it->first) > 0 || durably_suppressed_.count(it->first) > 0;
       if (!suppressed) {
         for (const Suppressor * s : chain_) {
           if (s != nullptr && s->suppresses(it->first, ctx)) {
             suppressed = true;
+            if (s->durable()) {
+              durably_suppressed_.insert(it->first);
+            }
             break;
           }
         }
@@ -492,7 +538,7 @@ class NodeDeathDetector : public Detector {
       if (report.dead.count(key) > 0) {
         continue;  // survived the filter - nothing suppressed it this tick
       }
-      if (id_allowlisted_.count(key) > 0) {
+      if (id_allowlisted_.count(key) > 0 || durably_suppressed_.count(key) > 0) {
         suppressed_for_prune.insert(key);
         continue;
       }
@@ -511,6 +557,14 @@ class NodeDeathDetector : public Detector {
     // identity churn is exactly the failure N11 exists to rule out for tracker_ itself).
     for (auto it = id_allowlisted_.begin(); it != id_allowlisted_.end();) {
       it = tracker_.known_keys().count(*it) > 0 ? std::next(it) : id_allowlisted_.erase(it);
+    }
+    // Bound the latched verdicts to keys that are BOTH still tracked and still gone. Dropping a
+    // key the moment it is present again is what keeps the latch honest: the verdict describes
+    // one departure, and a node that came back and later dies a second time must be judged on
+    // that second departure - which may not be clean at all.
+    for (auto it = durably_suppressed_.begin(); it != durably_suppressed_.end();) {
+      const bool still_relevant = tracker_.known_keys().count(*it) > 0 && present.count(*it) == 0;
+      it = still_relevant ? std::next(it) : durably_suppressed_.erase(it);
     }
     // Published once per sweep, after prune() has settled this tick's count - see
     // status_json()'s own doc for why this is the only cross-thread-safe way to read it.
@@ -709,6 +763,12 @@ class NodeDeathDetector : public Detector {
   /// Pruned to the live graph every tick.
   std::set<std::string> earned_;
   std::set<std::string> id_allowlisted_;
+  /// Departed keys a DURABLE suppressor has already vetoed at least once. Consulted before the
+  /// chain and fed to prune() exactly like an id-form allowlist match, so a veto outlives the
+  /// evidence that produced it - see the suppression filter in tick() for why it has to. Bounded
+  /// to keys that are still tracked AND still absent, so it can neither outlive the tracker's own
+  /// map nor carry one departure's verdict into the next.
+  std::set<std::string> durably_suppressed_;
   /// Whether THIS detector instance has itself genuinely raised GRAPH_NODE_DISAPPEARED at
   /// least once - the ungated-clear guard. See tick()'s own comment for why this, and not
   /// tracker_.tracked_count(), is the right granularity.

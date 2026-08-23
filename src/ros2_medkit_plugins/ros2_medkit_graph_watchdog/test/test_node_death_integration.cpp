@@ -980,6 +980,62 @@ TEST_F(NodeDeathIntegrationTest, CleanShutdownDepartureAtMissGraceBoundaryIsSupp
          "evaluated for it";
 }
 
+// The same reclaim boundary, with the one thing the row above holds at zero: the gap between a
+// dying node's lifecycle SERVICES leaving the graph and its App entry following them. That gap
+// is real and documented (see the kDisowned branch in node_death_detector.cpp - a dying managed
+// node loses its services a sweep before its App), and the retention window is anchored on the
+// FIRST of those two events while node_death's reclaim tick counts from the SECOND. So every
+// tick of lead comes straight out of the single tick of margin the window is sized with, and
+// past one tick of lead the label expires BEFORE the reclaim: the suppressor abstains, the veto
+// lifts, prune()'s consecutive-suppression streak resets to zero, and - the label now being gone
+// for good - the key can never be suppressed again. A cleanly shut-down node is then named in
+// GRAPH_NODE_DISAPPEARED for the life of the process, which is the exact outcome the retention
+// formula's own comment says it exists to prevent.
+TEST_F(NodeDeathIntegrationTest, CleanShutdownIsStillSuppressedWhenItsServicesLeaveBeforeItsApp) {
+  const int tick_interval_ms = 200;
+  const int floored_miss_grace = 14;
+  const int prune_ticks = 15;
+  const int retention_ticks = prune_ticks + floored_miss_grace + 1;  // 30, exactly as shipped
+  // How many ticks the App outlives its own lifecycle services. Two, not one, so the case is a
+  // tick clear of the boundary rather than sitting on it.
+  const std::uint64_t kServiceLeadTicks = 2;
+
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_, retention_ticks);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  det->configure(
+      {{"tick_interval_ms", tick_interval_ms}, {"prune_grace", 3}, {"suppress", nlohmann::json::array({"lifecycle"})}});
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("clean"), anchor_app()});
+  gate.update(snapshot_, 0);
+  det->tick(ctx);
+  // The services go first, recorded at tick 0 - this is what starts the retention clock.
+  gate.set_departed_lifecycle_state_for_test("/clean", "finalized", /*saw_transition=*/true,
+                                             /*error_terminated=*/false);
+
+  // ...and the App itself is still there for another couple of sweeps, so node_death's own miss
+  // count - and with it the reclaim tick - starts that much later than the retention clock did.
+  for (std::uint64_t t = 1; t <= kServiceLeadTicks; ++t) {
+    gate.update(snapshot_, t);
+    det->tick(ctx);
+  }
+  set_apps({anchor_app()});
+
+  for (std::uint64_t t = kServiceLeadTicks + 1; t <= 40; ++t) {
+    gate.update(snapshot_, t);
+    det->tick(ctx);
+  }
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), 0u)
+      << "the label expired before node_death's reclaim tick because the retention clock started "
+         "when the SERVICES left, not when the App did - so a cleanly shut-down node was named in "
+         "GRAPH_NODE_DISAPPEARED, and with the label gone it can never be suppressed again";
+  EXPECT_EQ(det->tracked_count_for_test(), 1u)
+      << "only the anchor may remain: a permanently clean departure must be RECLAIMED, and a "
+         "veto that lifts even once resets the streak that reclaim depends on";
+}
+
 TEST_F(NodeDeathIntegrationTest, CleanShutdownDepartureIsReclaimedNotReRaisedPastRetention) {
   const int tick_interval_ms = 200;
   const int floored_miss_grace = 14;
@@ -1217,6 +1273,65 @@ TEST_F(NodeDeathIntegrationTest, AnEarnedKeyKeepsItsGroundAcrossTheOutageSoTheNe
 // only ever looks at require_active entries. Past miss_grace + 1 record-less PRESENT ticks -
 // this detector's own "absent this long means dead" window, which a genuinely dying node cannot
 // outlive - the key comes back.
+// The window has to survive a node going OFFLINE while staying in the snapshot. A manifest or
+// hybrid App keeps its entry with `is_online` cleared once its process stops, and this detector
+// skips such an app for TRACKING - correctly, liveness is the bound node running. But "not
+// tracked this tick" is not "left the graph", and pruning the withheld key on that basis erases
+// the window: the first tick back online walks the key straight in, with none of the record-less
+// present ticks it was supposed to wait out. A node whose lifecycle services vanished as part of
+// dying, and whose App flickers online once before disappearing, would then be reported by this
+// detector after being handed explicitly to lifecycle_expectation.
+TEST_F(NodeDeathIntegrationTest, AnOfflineFlickerDoesNotEraseTheWithheldKeysWindow) {
+  ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
+  auto det = make_node_death();
+  ASSERT_TRUE(det);
+  // A hold of miss_grace + 1 == 6 ticks, wide enough that the two record-less online ticks this
+  // case spends cannot reach it on their own - so a readmission here can only come from the
+  // window having been erased.
+  det->configure({{"tick_interval_ms", 3000}, {"miss_grace", 5}});
+  auto ctx = make_ctx(&gate);
+
+  set_apps({app_of("victim"), anchor_app()});
+  gate.update(snapshot_, 0);
+  gate.set_lifecycle_state_for_test("victim", "", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kProvisional);
+  det->tick(ctx);  // admitted provisionally
+
+  gate.set_lifecycle_state_for_test("victim", "inactive", 0);
+  ASSERT_EQ(gate.presence_ownership("victim"), PresenceOwnership::kDisowned);
+  det->tick(ctx);  // handed back
+
+  gate.update(snapshot_, 1);  // services gone: no record at all, still online
+  ASSERT_FALSE(gate.lifecycle_state_of("victim").has_value());
+  det->tick(ctx);  // one record-less online tick, far short of the hold
+
+  // OFFLINE but still in the snapshot. Nothing is observed about the node on this tick, so the
+  // window must neither advance nor be thrown away.
+  set_apps({app_of("victim", /*online=*/false), anchor_app()});
+  gate.update(snapshot_, 2);
+  det->tick(ctx);
+
+  // Back online, still with no record. This is the tick the erased-window bug readmits on.
+  set_apps({app_of("victim"), anchor_app()});
+  gate.update(snapshot_, 3);
+  det->tick(ctx);
+
+  set_apps({anchor_app()});  // and now it really goes
+  gate.update(snapshot_, 4);
+  const auto failed_before = count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED);
+  for (int i = 0; i < 8; ++i) {  // well past miss_grace(5)
+    det->tick(ctx);
+  }
+
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(count_faults(kGraphSource, ReportFault::Request::EVENT_FAILED), failed_before)
+      << "an offline tick erased the withheld key and its window, so the flicker back online "
+         "re-admitted a node the graph had measured as another detector's - and this detector "
+         "then reported a death it had explicitly handed away";
+  EXPECT_EQ(det->tracked_count_for_test(), 1u)
+      << "only the anchor may be tracked here; the withheld key must not have been admitted";
+}
+
 TEST_F(NodeDeathIntegrationTest, AReleasedKeyIsTakenBackOnceItOutlivesTheDeathWindowWithoutARecord) {
   ReliabilityGate gate(/*warmup_cycles=*/0, gateway_.get(), &node_mutex_);
   auto det = make_node_death();

@@ -224,23 +224,25 @@ int GraphWatchdogPlugin::compute_departed_retention_ticks(const nlohmann::json &
   // under-run the rest of this function's comment describes.
   node_death_miss_grace = std::max(node_death_miss_grace, min_node_death_miss_grace(tick_interval_ms_));
   // prune_ticks mirrors node_death's OWN prune_ticks_ clamp (node_death_detector.cpp's
-  // configure()): max(prune_grace, miss_grace + 1). The departed-lifecycle label must
-  // survive not just past the FIRST tick node_death evaluates suppression on
-  // (T_depart + miss_grace, see test_node_death_integration.cpp's
-  // CleanShutdownDepartureAtMissGraceBoundaryIsSuppressed), but all the way through
-  // node_death's own RECLAIM tick (T_depart + miss_grace + prune_ticks): only a durable
-  // suppressor (lifecycle_clean_shutdown IS one, see suppressor.hpp) may feed
-  // NodeLivenessTracker::prune(), and that reclaim can only happen while the suppressor
-  // still actively vetoes the id - i.e. while the label is still cached. A retention window
-  // anchored at T_depart instead and merely as long as prune_ticks itself (`max(prune_grace,
-  // miss_grace + 1)`, with no `+ node_death_miss_grace + 1` on top) would expire miss_grace
-  // ticks too early: the suppressor would then abstain right at the reclaim tick, node_death
-  // would RAISE instead of silently reclaiming, and - because the label is now gone for good
-  // - the id could never be suppressed again: a permanent false GRAPH_NODE_DISAPPEARED for a
-  // cleanly-shut-down node. The extra "+1" below keeps one full tick of margin past the
-  // reclaim tick itself. See
-  // test_node_death_integration.cpp's CleanShutdownDepartureIsReclaimedNotReRaisedPastRetention
-  // for the regression this formula fixes.
+  // configure()): max(prune_grace, miss_grace + 1). What the departed-lifecycle label must
+  // outlive is the FIRST tick node_death evaluates suppression on (T_depart + miss_grace, see
+  // test_node_death_integration.cpp's CleanShutdownDepartureAtMissGraceBoundaryIsSuppressed).
+  // That is the whole requirement, because node_death LATCHES a durable suppressor's verdict
+  // per departed key and stops re-asking - see the suppression filter in its tick().
+  //
+  // The window is sized well past that anyway, out to node_death's own RECLAIM tick
+  // (T_depart + miss_grace + prune_ticks) plus one, and that generosity is deliberate rather
+  // than vestigial: sizing it to the first evaluation alone would leave nothing for the gap
+  // between the two events this arithmetic straddles. The retention clock starts when a dying
+  // node's lifecycle SERVICES leave the graph, while every T_depart above counts from when its
+  // App does - one or more sweeps later - so a window with no slack loses whatever that lead
+  // costs. Before the latch existed that lead came straight out of the single tick of margin
+  // here, and past one tick of it the label expired mid-veto: the suppressor abstained, the
+  // consecutive-suppression streak prune() depends on reset to zero, and with the label then
+  // gone for good the key could never be suppressed again - a permanent false
+  // GRAPH_NODE_DISAPPEARED for a cleanly-shut-down node. See that scenario in
+  // test_node_death_integration.cpp's CleanShutdownIsStillSuppressedWhenItsServicesLeaveBeforeItsApp,
+  // and CleanShutdownDepartureIsReclaimedNotReRaisedPastRetention for the reclaim boundary itself.
   const int prune_ticks = std::max(node_death_prune_grace, node_death_miss_grace + 1);
   return prune_ticks + node_death_miss_grace + 1;
 }
