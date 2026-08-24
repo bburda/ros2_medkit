@@ -346,18 +346,30 @@ class AggregatorOnlyConfigurationsTest(unittest.TestCase):
         between, the member is listed and offers nothing, which is the same
         shape as a member that genuinely has none.
 
-        The last read is returned either way, so a collection that never gains
-        the item fails on the caller's own assertion and message rather than on
-        a timeout that says only that something did not happen.
+        A read that fails while the answer is still converging is treated as an
+        answer that has not arrived yet, the same way the class gates treat one:
+        a gateway busy merging can refuse or drop a request, and dying on the
+        first blip would report a transport hiccup as a missing operation. The
+        last read is returned once the budget is spent, so a collection that
+        never gains the item fails on the caller's own assertion and message
+        rather than on a timeout that says only that something did not happen.
+        The final read is asserted, so a gateway that is still failing then is
+        reported as the failure it is.
         """
         deadline = time.monotonic() + DISCOVERY_TIMEOUT
-        items = self._items(entity_path, collection)
-        while not any(item.get('id') == item_id for item in items):
-            if time.monotonic() >= deadline:
-                break
+        items = []
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(
+                    f'{PRIMARY_URL}/{entity_path}/{collection}', timeout=15)
+                if response.status_code == 200:
+                    items = response.json().get('items', [])
+                    if any(item.get('id') == item_id for item in items):
+                        return items
+            except (requests.RequestException, ValueError):
+                pass
             time.sleep(DISCOVERY_INTERVAL)
-            items = self._items(entity_path, collection)
-        return items
+        return self._items(entity_path, collection)
 
     @staticmethod
     def _config_url(base_url, entity_path, config_id):

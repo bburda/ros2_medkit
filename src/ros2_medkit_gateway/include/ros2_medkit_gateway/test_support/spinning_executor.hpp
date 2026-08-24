@@ -14,9 +14,10 @@
 
 #pragma once
 
+#include <gtest/gtest.h>
+
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <exception>
 #include <memory>
 #include <thread>
@@ -47,6 +48,9 @@ namespace ros2_medkit_gateway::test_support {
  */
 class SpinningExecutor {
  public:
+  /// How long stop() keeps re-issuing the cancel before it just joins.
+  static constexpr std::chrono::seconds kCancelRetryBudget{5};
+
   explicit SpinningExecutor(std::vector<rclcpp::Node::SharedPtr> nodes)
     : executor_(std::make_shared<rclcpp::executors::SingleThreadedExecutor>()), nodes_(std::move(nodes)) {
     for (const auto & node : nodes_) {
@@ -71,12 +75,16 @@ class SpinningExecutor {
   SpinningExecutor & operator=(SpinningExecutor &&) = delete;
 
   ~SpinningExecutor() {
+    // Every call site leaves the teardown to this destructor, so reporting what
+    // spin() threw to the console and nowhere else would let a test whose
+    // callback threw finish green. ADD_FAILURE records it against the running
+    // test and does not itself throw, which is what a destructor needs.
     try {
       stop();
     } catch (const std::exception & e) {
-      std::fprintf(stderr, "SpinningExecutor: spin() threw: %s\n", e.what());
+      ADD_FAILURE() << "a callback on this executor threw: " << e.what();
     } catch (...) {
-      std::fprintf(stderr, "SpinningExecutor: spin() threw a non-std exception\n");
+      ADD_FAILURE() << "a callback on this executor threw a non-std exception";
     }
   }
 
@@ -86,10 +94,17 @@ class SpinningExecutor {
     if (thread_.joinable()) {
       // On Jazzy, cancel() clears the same `spinning` flag that spin() sets on
       // entry, so a cancel issued before the worker reaches spin() is
-      // overwritten and lost - and join() then waits for a spin nobody asked to
-      // stop. Repeating it until the worker is provably out costs one sleep in
-      // the ordinary case and cannot deadlock in the racing one.
-      while (!spin_returned_.load()) {
+      // overwritten and lost, and join() then waits for a spin nobody asked to
+      // stop. Re-issuing it closes that window, and one sleep is the usual cost.
+      //
+      // The retry is bounded because cancel() cannot pre-empt a callback that is
+      // already running: against a callback that never returns this would spin
+      // forever, burning a core and reporting nothing. Past the bound the join
+      // below takes over, which is where a test with a wedged callback hung
+      // before this type existed - no better, but no worse, and not disguised as
+      // progress.
+      const auto give_up_at = std::chrono::steady_clock::now() + kCancelRetryBudget;
+      while (!spin_returned_.load() && std::chrono::steady_clock::now() < give_up_at) {
         executor_->cancel();
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
