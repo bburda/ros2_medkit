@@ -119,6 +119,13 @@ if(BUILD_TESTING)
   set_tests_properties(test_launch_test_guard PROPERTIES LABELS "unit")
   medkit_test_needs_no_domain(test_launch_test_guard)
 
+  # A layout sweep over the source tree, so it belongs to no one package and
+  # runs wherever the tree is present.
+  ament_add_pytest_test(test_pytest_collection_layout
+    test/test_pytest_collection_layout.py TIMEOUT 300)
+  set_tests_properties(test_pytest_collection_layout PROPERTIES LABELS "unit")
+  medkit_test_needs_no_domain(test_pytest_collection_layout)
+
   set_property(TEST test_domain_band APPEND PROPERTY RESOURCE_LOCK medkit_domain_band)
   set_property(TEST test_domain_wrapper APPEND PROPERTY RESOURCE_LOCK medkit_domain_band)
 
