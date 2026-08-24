@@ -198,7 +198,7 @@ if(BUILD_TESTING)
   # The only suite running above max_bags_per_fault=1: drives confirm / clear /
   # confirm on one code and asserts both recordings survive and stay separately
   # addressable. Six occurrences plus their post-roll windows, hence the timeout.
-  medkit_add_launch_test(test_rosbag_history test/test_rosbag_history.test.py TIMEOUT 240
+  medkit_add_launch_test(test_rosbag_history test/integration/test_rosbag_history.test.py TIMEOUT 240
     LABELS "integration")
 
   # Parametrized over both storage formats (sqlite3 + mcap), so the launch
