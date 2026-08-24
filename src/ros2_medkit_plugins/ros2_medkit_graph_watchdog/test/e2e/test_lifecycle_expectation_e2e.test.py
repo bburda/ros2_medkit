@@ -287,11 +287,11 @@ UNREADABLE_RAISE_TIMEOUT_SEC = 60.0 * TIME_SCALE
 # allowance every other poll budget in this file carries, not a measurement of that cost.
 # Unchanged, and now it only has to cover what it can actually be held to. Every call site
 # proves the process EXITED first (assert_process_exited), so the two terms left are the ones
-# somebody owns: the Fast DDS participant lease an unclean death costs before the graph drops
-# the participant (measured 19.8-20.1 s on this stack) plus the gateway's own graph-to-/apps
-# latency (refresh_debounce_ms 1000 + one 100 ms tick) = 21.1 s. 30 s clears that with room
-# for the sanitizer jobs, so nothing here needed widening - see harness.py's "What 'the node
-# is gone' costs" note for who promises which term.
+# somebody owns: the DDS participant lease an unclean death costs before the graph drops the
+# participant, plus the gateway's own graph-to-/apps latency - 20 + 1.1 = 21.1 s. 30 s clears
+# that with room for the sanitizer jobs, so nothing here needed widening. Both figures, and
+# who promises which term, are in the gateway's docs/config/server.rst under "How long a
+# departed node keeps being listed".
 ABSENCE_DEPARTURE_TIMEOUT_SEC = 30.0 * TIME_SCALE
 ABSENCE_CLEAR_TIMEOUT_SEC = 30.0 * TIME_SCALE
 # Slept after a departure has been CONFIRMED on GET /apps, before asserting the fault
