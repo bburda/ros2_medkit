@@ -76,6 +76,8 @@ import requests
 from ros2_medkit_test_utils.constants import (
     ALLOWED_EXIT_CODES,
     API_BASE_PATH,
+    DISCOVERY_INTERVAL,
+    DISCOVERY_TIMEOUT,
     get_test_domain_id,
     get_test_port,
 )
@@ -290,7 +292,7 @@ class AggregatorOnlyConfigurationsTest(unittest.TestCase):
     @classmethod
     def _wait_for_apps(cls, base_url, required, label):
         """Block until `required` Apps are present AND bound to a live node."""
-        deadline = time.monotonic() + 60.0
+        deadline = time.monotonic() + DISCOVERY_TIMEOUT
         while time.monotonic() < deadline:
             try:
                 response = requests.get(f'{base_url}/apps', timeout=5)
@@ -304,13 +306,14 @@ class AggregatorOnlyConfigurationsTest(unittest.TestCase):
                         return
             except requests.RequestException:
                 pass
-            time.sleep(1.0)
-        raise AssertionError(f'{label}: {required} not online within 60s')
+            time.sleep(DISCOVERY_INTERVAL)
+        raise AssertionError(
+            f'{label}: {required} not online within {DISCOVERY_TIMEOUT}s')
 
     @classmethod
     def _wait_until_merged(cls):
         """Block until the peer's members are visible on the primary."""
-        deadline = time.monotonic() + 60.0
+        deadline = time.monotonic() + DISCOVERY_TIMEOUT
         while time.monotonic() < deadline:
             try:
                 response = requests.get(f'{PRIMARY_URL}/apps', timeout=5)
@@ -322,8 +325,9 @@ class AggregatorOnlyConfigurationsTest(unittest.TestCase):
                         return
             except requests.RequestException:
                 pass
-            time.sleep(0.5)
-        raise AssertionError("the peer's Apps did not merge into the primary in 60s")
+            time.sleep(DISCOVERY_INTERVAL)
+        raise AssertionError(
+            f"the peer's Apps did not merge into the primary in {DISCOVERY_TIMEOUT}s")
 
     # ------------------------------------------------------------------ helpers
 
@@ -332,6 +336,28 @@ class AggregatorOnlyConfigurationsTest(unittest.TestCase):
             f'{PRIMARY_URL}/{entity_path}/{collection}', timeout=15)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json().get('items', [])
+
+    def _items_once_offering(self, entity_path, collection, item_id):
+        """Read a collection, retrying until `item_id` is in it.
+
+        A peer-owned member is present in this gateway's tree before what it
+        offers is: the App arrives with the peer's entity list, and its
+        operations arrive by a second read the aggregator makes per App. In
+        between, the member is listed and offers nothing, which is the same
+        shape as a member that genuinely has none.
+
+        The last read is returned either way, so a collection that never gains
+        the item fails on the caller's own assertion and message rather than on
+        a timeout that says only that something did not happen.
+        """
+        deadline = time.monotonic() + DISCOVERY_TIMEOUT
+        items = self._items(entity_path, collection)
+        while not any(item.get('id') == item_id for item in items):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(DISCOVERY_INTERVAL)
+            items = self._items(entity_path, collection)
+        return items
 
     @staticmethod
     def _config_url(base_url, entity_path, config_id):
@@ -756,9 +782,10 @@ class AggregatorOnlyConfigurationsTest(unittest.TestCase):
         checked together and the execution is asserted on its body - a status
         alone cannot tell a service that ran from one that was never called.
         """
-        items = self._items(f'functions/{MIXED_FUNCTION}', 'operations')
-        by_id = {item.get('id'): item for item in items}
         operation_id = f'{PEER_CALIBRATION_APP}:calibrate'
+        items = self._items_once_offering(
+            f'functions/{MIXED_FUNCTION}', 'operations', operation_id)
+        by_id = {item.get('id'): item for item in items}
         self.assertIn(
             operation_id, by_id,
             f'the mixed Function does not offer its peer-owned operation: {sorted(by_id)}',
