@@ -731,9 +731,7 @@ class MockPeerServer {
   MockPeerServer() = default;
 
   ~MockPeerServer() {
-    if (server_) {
-      server_->stop();
-    }
+    stop();
     if (thread_.joinable()) {
       thread_.join();
     }
@@ -768,6 +766,30 @@ class MockPeerServer {
     return port_;
   }
 
+  /**
+   * @brief Stop listening. Idempotent, and the only route to the server's stop.
+   *
+   * httplib's Server::stop() asserts the listening socket is still valid
+   * whenever the server reports itself running, but it is the listen thread
+   * that clears the running flag - and only once it comes back out of accept(),
+   * which the shutdown of the socket does not promise to do promptly. A second
+   * stop() issued before that sees a running server whose socket has already
+   * been taken away, and the assertion aborts the whole binary. A build with
+   * NDEBUG drops the assertion and hides it; the RoboStack toolchain keeps it,
+   * which is where the abort surfaces.
+   *
+   * Issuing the stop exactly once removes the second call rather than trying to
+   * order it, so nothing here waits on accept() coming back. The join stays in
+   * the destructor, where the thread's exit is the last thing anyone needs.
+   */
+  void stop() {
+    if (stop_issued_ || !server_) {
+      return;
+    }
+    stop_issued_ = true;
+    server_->stop();
+  }
+
   int port() const {
     return port_;
   }
@@ -780,6 +802,7 @@ class MockPeerServer {
   std::unique_ptr<httplib::Server> server_;
   std::thread thread_;
   int port_{0};
+  bool stop_issued_{false};
 };
 
 /**
@@ -1549,7 +1572,7 @@ TEST(AggregationManager, an_incomplete_refresh_does_not_replace_the_declaration_
     manager.fetch_and_merge_peer_entities({}, {}, {}, {});
 
     // Then the peer goes away for good and only the retained picture is left.
-    mock.server().stop();
+    mock.stop();
     manager.check_all_health();
     ASSERT_EQ(manager.healthy_peer_count(), 0u);
 
@@ -1612,7 +1635,7 @@ TEST(AggregationManager, a_peer_that_dies_mid_refresh_reports_its_entities_unava
     auto complete = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
     ASSERT_NE(find_entity(complete.apps, "brake_monitor"), nullptr);
 
-    mock.server().stop();
+    mock.stop();
     ASSERT_EQ(manager.healthy_peer_count(), 1u) << "the refresh must start out believing the peer is there";
 
     auto silent = manager.fetch_and_merge_peer_entities({}, {}, {}, {});
@@ -2228,7 +2251,7 @@ TEST(AggregationManager, retains_declared_peer_entities_when_the_peer_goes_silen
     EXPECT_TRUE(discovered->available);
 
     // The peer stops answering: health goes false and the fetch fails.
-    mock.server().stop();
+    mock.stop();
     manager.check_all_health();
     ASSERT_EQ(manager.healthy_peer_count(), 0u);
 
