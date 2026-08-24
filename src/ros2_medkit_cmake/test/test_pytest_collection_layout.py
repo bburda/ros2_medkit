@@ -29,9 +29,20 @@ pytest file joined a directory of launch tests, and it came back after a move
 that took seven launch tests out of that directory and left the eighth, so the
 same failure returned naming the file that stayed.
 
-The check is a fact about the layout, deliberately not a reading of any
-``CMakeLists.txt``: a directory either holds both kinds of file or it does not,
-and no build configuration changes the answer.
+The check reads the layout rather than any ``CMakeLists.txt``. That is a
+deliberate trade, and it is worth being exact about which way it errs.
+
+It is STRICTER than "what is registered today": a directory holding both kinds
+of file fails even if nothing currently points pytest at it. That is the point.
+Registration moves, and the shape is what breaks when it does.
+
+It is also INCOMPLETE, and reading CMake would not close the gap either.
+``ament_add_pytest_test`` accepts a directory, and this repository uses that
+form, so a launch test can be collected next to a file this check does not
+recognise as a plain test - one that does not start with ``test_``, or a
+``python_files`` setting that widens what pytest collects. Those are not
+guarded here. What is guarded is the one shape that has actually broken the
+build, twice.
 """
 
 import pathlib
@@ -43,17 +54,19 @@ PRUNED = {'build', 'install', 'log', '__pycache__', '.git', 'node_modules'}
 
 
 def find_source_root():
-    """Return the directory the packages sit in.
+    """Return the directory the packages sit in, and whether it is the workspace.
 
-    In a workspace that is ``src``; in a build of this package alone it is
-    whatever directory contains it, and the sweep below then covers exactly
-    what is present. Either way the answer is a real tree, so the check never
-    silently covers nothing.
+    In a workspace that is ``src``. Without one - a package unpacked on its own,
+    as the build farm does - the fallback is this package and nothing above it.
+    Walking the parent instead would sweep whatever else that directory happens
+    to hold, which on a packaging worker is other projects and their build
+    output, and this check would then fail on a layout that is none of our
+    business.
     """
     for candidate in PACKAGE_ROOT.parents:
         if (candidate / 'src' / PACKAGE_ROOT.name / 'package.xml').is_file():
-            return candidate / 'src'
-    return PACKAGE_ROOT.parent
+            return candidate / 'src', True
+    return PACKAGE_ROOT, False
 
 
 def collect_by_directory(source_root):
@@ -73,7 +86,7 @@ def collect_by_directory(source_root):
 
 def test_no_launch_test_shares_a_directory_with_a_plain_pytest_file():
     """The layout that breaks pytest collection does not exist in the tree."""
-    source_root = find_source_root()
+    source_root, _ = find_source_root()
     launch_tests, plain_tests = collect_by_directory(source_root)
 
     collisions = sorted(set(launch_tests) & set(plain_tests))
@@ -93,18 +106,38 @@ def test_no_launch_test_shares_a_directory_with_a_plain_pytest_file():
     )
 
 
-def test_the_sweep_reaches_the_packages_it_claims_to_cover():
+def test_the_sweep_reaches_packages_other_than_this_one():
     """Guards the instrument: a sweep that finds nothing proves nothing.
 
-    The assertion above passes trivially if the walk resolved to an empty or
-    wrong directory, and that failure mode looks exactly like success. Requiring
-    that the sweep saw this package's own tests keeps it honest.
-    """
-    source_root = find_source_root()
-    _, plain_tests = collect_by_directory(source_root)
+    The assertion above passes trivially if the walk resolved to a directory
+    holding no tests, and that failure mode looks exactly like success. Asking
+    only whether this package's own tests were seen would not catch it: this
+    file is itself one of them and sits in the directory the sweep starts from,
+    so that answer is yes however badly the root resolved.
 
-    assert PACKAGE_ROOT / 'test' in plain_tests, (
-        f"the sweep rooted at '{source_root}' did not reach "
-        f"'{PACKAGE_ROOT / 'test'}', so it covered nothing and its verdict is "
-        f'meaningless; directories seen: {sorted(map(str, plain_tests))}'
+    What a correct workspace sweep can show and a broken one cannot is reach
+    into OTHER packages. Without a workspace there are none to reach, and the
+    honest report is then how far it did get.
+    """
+    source_root, is_workspace = find_source_root()
+    launch_tests, plain_tests = collect_by_directory(source_root)
+
+    packages = {
+        directory.relative_to(source_root).parts[0]
+        for directory in set(launch_tests) | set(plain_tests)
+        if directory != source_root
+    }
+    others = sorted(packages - {PACKAGE_ROOT.name})
+
+    if not is_workspace:
+        assert source_root == PACKAGE_ROOT, (
+            f'without a workspace the sweep must stay inside this package, but '
+            f"it was rooted at '{source_root}'"
+        )
+        return
+
+    assert len(others) >= 3, (
+        f"the sweep rooted at '{source_root}' reached tests in {len(others)} "
+        f'package(s) besides this one, so it is not covering the workspace and '
+        f'its verdict says nothing about it; reached: {others}'
     )
