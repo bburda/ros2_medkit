@@ -313,7 +313,7 @@ def _start_late_node():
     """Put one undeclared node on the graph, once, and keep it running.
 
     Started from the test rather than the launch description so it cannot
-    appear before the baseline generations have been read.
+    appear before the baseline sample has been recorded.
     """
     global _LATE_NODE_PROCESS
     if _LATE_NODE_PROCESS is not None:
@@ -376,21 +376,43 @@ def _collect_samples():
     for url in ALL_URLS:
         _wait_for_linking(url)
 
-    baseline = {url: _generation(url) for url in ALL_URLS}
     samples = {url: [] for url in ALL_URLS}
+    started = time.monotonic()
+
+    # Sample 0 is taken before the change and its generation is the baseline.
+    # Reading a generation that no sample is recorded against proves only what
+    # the counter said at that instant; it leaves the first recorded sample free
+    # to land on the far side of the change, and then no sample sits before it.
+    # Taking the baseline from a sample in the window makes "a sample before the
+    # change" a property of the window rather than of the scheduler.
+    baseline = {}
+    for url in ALL_URLS:
+        sample = _sample(url, SELF_NAMED_APP_ID)
+        sample['generation'] = _generation(url)
+        sample['index'] = 0
+        sample['at'] = round(time.monotonic() - started, 3)
+        samples[url].append(sample)
+        baseline[url] = sample['generation']
 
     # The change that drives the liveness proof is started HERE, after every
-    # gateway has linked and its baseline generation has been read - not on a
+    # gateway has linked and its baseline sample has been taken - not on a
     # launch-time timer. A fixed timer races convergence: on a slow box the
     # node joins before the baseline is taken, no generation advance is ever
     # observed, and a correct implementation fails as an opaque timeout.
     _start_late_node()
 
-    started = time.monotonic()
-    deadline = started + SAMPLE_DEADLINE_SEC
-    index = 0
+    # The budget for the advance runs from the change, not from the first
+    # baseline read: the reads above are HTTP round trips on an instrumented
+    # gateway and charging them to the liveness proof shortens it by however
+    # long they took.
+    deadline = time.monotonic() + SAMPLE_DEADLINE_SEC
+    # Sample 1 follows the change with no sleep in front of it. A merge that
+    # drops or rewrites the app for one refresh and repairs itself on the next
+    # is only visible to a read taken while it is wrong, so the window keeps an
+    # observation at the moment the entity set changed.
+    index = 1
     while True:
-        if index:
+        if index > 1:
             time.sleep(SAMPLE_INTERVAL_SEC)
         for url in ALL_URLS:
             sample = _sample(url, SELF_NAMED_APP_ID)
@@ -520,8 +542,9 @@ class ProvenanceHoldsMixin:
     def test_the_app_survives_the_graph_change_too(self):
         """Change, not just steady state: a node joins and it still holds.
 
-        The samples straddle the moment the late node appeared, so the
-        assertions above already cover both sides of a real entity-set change.
+        Sample 0 is taken before the late node is started and carries the
+        baseline generation, so the window always straddles the moment the
+        entity set changed and the assertions above cover both sides of it.
         This names the claim so it is not read as a steady-state result.
         """
         changed_at = next(
