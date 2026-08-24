@@ -218,12 +218,19 @@ TEST(StreamProxy, on_event_can_set_callback) {
 
 namespace {
 
-/// Helper to wait for httplib::Server to be ready for connections
+/// Helper to wait for httplib::Server to be ready for connections.
+///
+/// Running out of budget here is a failure and has to be reported as one. A
+/// silent return leaves the case to go on against a server that is not
+/// listening yet, and whatever it then asserts is about the wait, not about the
+/// proxy.
 void wait_for_server(httplib::Server & svr, int timeout_ms = 5000) {
   auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   while (!svr.is_running() && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
+  ASSERT_TRUE(svr.is_running()) << "the mock server was not listening after " << timeout_ms
+                                << " ms, so nothing below is a test of the proxy";
 }
 
 }  // namespace

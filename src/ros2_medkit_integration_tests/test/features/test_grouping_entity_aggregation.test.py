@@ -481,6 +481,7 @@ class GroupingAggregationTest(unittest.TestCase):
             'peer')
         cls._wait_until_merged()
         cls._wait_for_peer_topic_ownership()
+        cls._wait_for_peer_operations()
 
     @classmethod
     def _wait_for_apps(cls, base_url, required, label):
@@ -533,6 +534,37 @@ class GroupingAggregationTest(unittest.TestCase):
                         and response.json().get('x-medkit', {}).get('entity_id')
                         == PEER_ONLY_TOPIC_APP):
                     return
+            except requests.RequestException:
+                pass
+            time.sleep(0.5)
+
+    @classmethod
+    def _wait_for_peer_operations(cls):
+        """Block until a peer-owned operation is offered by the merged Function.
+
+        The same poll behind that the topic gate above absorbs, for the other
+        collection: the aggregator reads each peer App's operations separately
+        from the entity list, so a member can be merged here and offer nothing
+        for one more cycle. A case that reads an operation collection in that
+        window sees the local half alone and reports a merge defect that is not
+        there.
+
+        Best effort, like the topic gate and for the same reason: raising here
+        would turn one late collection into a setUpClass error for every case
+        below, and the cases assert on the operations they name anyway.
+        """
+        deadline = time.monotonic() + 30.0
+        peer_operation = f'{PEER_LONG_APP}:{LONG_OPERATION}'
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(
+                    f'{PRIMARY_URL}/functions/{MERGED_FUNCTION}/operations', timeout=10)
+                if response.status_code == 200:
+                    offered = {
+                        item.get('id') for item in response.json().get('items', [])
+                    }
+                    if peer_operation in offered:
+                        return
             except requests.RequestException:
                 pass
             time.sleep(0.5)
