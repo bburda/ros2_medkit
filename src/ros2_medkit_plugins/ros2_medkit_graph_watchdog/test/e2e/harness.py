@@ -50,40 +50,31 @@ from ros2_medkit_test_utils.launch_helpers import (
 
 API_BASE_PATH = '/api/v1'
 
-# ---- What "the node is gone" costs, and who promises which part -------------------------
+# ---- What "the node is gone" costs, and what these tests may hold the gateway to --------
 #
-# Read this before writing another assertion about a killed node disappearing. "A SIGTERM'd
-# node is absent from GET /apps within N seconds" is three quantities in a trench coat, and
-# only the last one is a promise anybody makes:
+# The bound itself is NOT stated here. It belongs to the gateway and is written down in its
+# own configuration reference, docs/config/server.rst, under "How long a departed node keeps
+# being listed" - including the measurements behind it. Read that first; this note only says
+# what the tests in this package do about it, and the constants below only exist so those
+# tests can be sized against it.
 #
-#   1. signal -> the node stops announcing itself on DDS. NOBODY PROMISES THIS. It is the
-#      node's own shutdown path, and how long a node takes to shut down is the node's own
-#      business. Measured at 225 ms for a demo node on an uninstrumented box; under a
-#      sanitizer every step of that teardown is instrumented and it is unbounded as far as
-#      any test here is concerned.
-#   2. participant gone -> the ROS graph drops the node. Free if the participant
-#      unregistered cleanly. If it did not - the process died without completing its
-#      shutdown - remote participants must wait out the Fast DDS PARTICIPANT LEASE, measured
-#      at 19.8-20.1 s over three runs on this stack (stock rmw_fastrtps_cpp, no profile
-#      override anywhere in this repo).
-#   3. graph drops it -> GET /apps stops listing it. THIS ONE THE GATEWAY PROMISES, and it
-#      is the only bound of the three: at most `discovery.refresh_debounce_ms` (1000 by
-#      default) plus one 100 ms graph-check tick, and create_gateway_node additionally pins
-#      `refresh_interval_ms` to 1000 as an unconditional backstop. There is no retention
-#      anywhere behind it - RuntimeLayer rebuilds from scratch and discover_apps() reads
-#      get_node_names_and_namespaces() live.
+# The short of it: "a SIGTERM'd node is absent from GET /apps within N seconds" is three
+# quantities, and only the last is the gateway's.
 #
-# So a test may hold the gateway to term 3 and to nothing else. Term 1 must be OBSERVED, not
-# budgeted for - assert_process_exited() below is how - because budgeting for it produces a
-# failure that blames a component whose own bound is one second. Term 2 is the reason the
-# post-exit budgets here are tens of seconds rather than the ~1 s term 3 would suggest.
+#   1. signal -> the node stops announcing itself on DDS. Nobody promises this, so it is
+#      OBSERVED here rather than budgeted for - assert_process_exited() below is how.
+#      Budgeting for it produces a failure that blames a component whose own bound is about
+#      a second, which is how four sanitizer runs came to accuse the gateway of a node that
+#      had not finished dying.
+#   2. participant gone -> the graph drops it. Free after a clean unregister, the full DDS
+#      participant lease after an unclean death. This is why the post-exit budgets here are
+#      tens of seconds rather than the ~1 s term 3 alone would suggest.
+#   3. graph drops it -> GET /apps stops listing it. The gateway's share, and the only one
+#      of the three a test may hold it to.
 #
-# The two measurements above were taken with the gateway and a demo node on this stack,
-# polling GET /apps at 200 ms: SIGTERM gone in 225 ms, SIGKILL (no unregister) gone in
-# 20073 / 19762 / 19989 ms.
-
-# The Fast DDS participant lease, from the measurement above. What an UNCLEAN death costs
-# before the graph drops the participant - the worst case, not the typical one.
+# The Fast DDS participant lease - what an UNCLEAN death costs before the graph drops the
+# participant, and the worst case rather than the typical one. Figure and measurement in
+# docs/config/server.rst.
 PARTICIPANT_LEASE_SEC = 20.0
 # The gateway's own graph-to-/apps latency: refresh_debounce_ms (1000) + one 100 ms tick.
 GATEWAY_GRAPH_TO_APPS_SEC = 1.1
@@ -94,9 +85,9 @@ GATEWAY_GRAPH_TO_APPS_SEC = 1.1
 DEPARTURE_AFTER_EXIT_SEC = PARTICIPANT_LEASE_SEC + GATEWAY_GRAPH_TO_APPS_SEC  # 21.1
 
 # How long assert_process_exited() waits. NOT derived from anything, because term 1 above is
-# not promised by anyone: this is a diagnostic ceiling, chosen at the same magnitude the
-# departure budgets already used so no existing budget grows. It is scaled like every other
-# give-up bound here because the thing being waited on is instrumented in the sanitizer jobs.
+# nobody's promise: a diagnostic ceiling, chosen at the same magnitude the departure budgets
+# already used so no existing budget grows. Scaled like every other give-up bound here
+# because the thing being waited on is instrumented in the sanitizer jobs.
 NODE_EXIT_TIMEOUT_SEC = 30.0 * get_time_scale()
 
 
@@ -151,10 +142,11 @@ def assert_process_exited(test_case, pid, label, timeout=None):
 
     Every "the node left GET /apps" assertion in this suite is downstream of this one, and
     before it existed those assertions blamed the gateway for a node that had not finished
-    dying. See the "What 'the node is gone' costs" note at the top of this module: the time
-    from a signal to a process actually stopping is the one term in that chain nobody
-    promises, so it is OBSERVED here rather than folded into a budget and charged to a
-    component whose own bound is one second.
+    dying. The time from a signal to a process actually stopping is the one term in that
+    chain nobody promises, so it is OBSERVED here rather than folded into a budget and
+    charged to a component whose own bound is about a second. The gateway's own share, and
+    the measurements either side of it, are in docs/config/server.rst under "How long a
+    departed node keeps being listed".
 
     Call it immediately after the signal and before polling GET /apps. On failure the
     message says the node never died, which is both true and the thing worth knowing; the

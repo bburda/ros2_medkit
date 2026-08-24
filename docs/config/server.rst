@@ -475,6 +475,35 @@ Lower values shorten the worst-case recovery window if a graph event is missed
 but increase idle CPU. The default rarely fires on a stable graph because the
 graph-event poll handles node up/down events directly.
 
+How long a departed node keeps being listed
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Once a node has actually left the ROS graph, ``GET /apps`` stops listing it within
+roughly one refresh: at most ``discovery.refresh_debounce_ms`` plus the 100 ms graph
+poll, or ``refresh_interval_ms``, whichever comes first. Nothing is retained behind
+that - every refresh rebuilds the entity set from a live read of the graph - so this
+is the whole of the gateway's share, and it is the only part of a departure the
+gateway can be held to.
+
+Before that point nothing here is promised, and the difference is not small:
+
+* A node that shuts down cleanly unregisters its DDS participant on the way out, and
+  the graph drops it almost at once. Measured at 225 ms from the signal to the node
+  no longer being listed, polling ``GET /apps`` every 200 ms.
+* A node that dies without unregistering - killed outright, or stopped before its
+  shutdown could finish - costs the DDS participant lease instead, because remote
+  participants have nothing to go on but its silence. Measured at 20.07 s, 19.76 s
+  and 19.99 s over three runs, with stock ``rmw_fastrtps_cpp`` and no participant
+  profile override.
+* How long a node takes to shut down is the node's own business. The gateway cannot
+  tell a node that is slow to exit from one that is simply still running, and neither
+  can this bound.
+
+So a caller waiting for a specific node to disappear should watch for its absence
+rather than assume a deadline. Anything that measures a departure should establish
+that the process has actually exited first, and only then hold the gateway to the
+figure above.
+
 Thread Pools
 ------------
 
