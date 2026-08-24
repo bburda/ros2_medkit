@@ -351,7 +351,9 @@ BulkDataHandlers::list_descriptors(const http::TypedRequest & req) {
       }
     }
 
-    return dto::Collection<dto::BulkDataDescriptor>{detail::fold_rosbag_rows_into_descriptors(all_rosbags, fault_map)};
+    dto::Collection<dto::BulkDataDescriptor> rosbag_response;
+    rosbag_response.items = detail::fold_rosbag_rows_into_descriptors(all_rosbags, fault_map);
+    return rosbag_response;
   }
 
   // === Non-rosbag categories: served via BulkDataStore ===
