@@ -122,6 +122,32 @@ on wall-clock budgets via their own local `test_time_scale()` helper. Unset,
 unparseable or below `1` means no scaling, so ordinary runs keep the tight
 budgets that give the assertions their falsifying power.
 
+#### An executor's node set is fixed while its thread runs
+
+A test that needs a node on the graph for part of its run must give that node
+its own executor, not hand it to one a thread is already spinning:
+
+```cpp
+#include "ros2_medkit_gateway/test_support/spinning_executor.hpp"
+
+auto helper = std::make_shared<rclcpp::Node>("helper");
+ros2_medkit_gateway::test_support::SpinningExecutor helper_spin({helper});
+// ... the node is served for as long as helper_spin is in scope
+```
+
+`add_node()` and `remove_node()` make the executor rebuild its entity
+collection, and a thread inside `spin()`/`spin_some()` reads that collection
+through the executor's notify waitable. There is no lock a caller can take
+across the two, and ThreadSanitizer reports the overlap as a write in
+`operator delete` against `ExecutorNotifyWaitable::is_ready()`. The report
+names whichever test happened to be running, so it reads as a defect in that
+test rather than as the shared pattern it is.
+
+`SpinningExecutor` takes its nodes in the constructor, starts the thread after
+them, and cancels and joins before any node leaves, so the two never overlap.
+A fixture may still add its nodes in `SetUp()` as long as it does so before the
+spin thread starts and removes them after joining it.
+
 #### Code Coverage
 
 Run from the workspace root. This mirrors the measurement pipeline of the CI
