@@ -56,6 +56,7 @@
 
 #include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
 #include "ros2_medkit_gateway/core/transports/parameter_transport.hpp"
+#include "ros2_medkit_gateway/test_support/spinning_executor.hpp"
 #include "ros2_medkit_graph_watchdog/aggregated_fault.hpp"
 #include "ros2_medkit_graph_watchdog/detector.hpp"
 #include "ros2_medkit_graph_watchdog/detector_registry.hpp"
@@ -64,6 +65,7 @@
 using ros2_medkit_gateway::App;
 using ros2_medkit_gateway::Component;
 using ros2_medkit_gateway::IntrospectionInput;
+using ros2_medkit_gateway::test_support::SpinningExecutor;
 using ros2_medkit_graph_watchdog::AggregatedFault;
 using ros2_medkit_graph_watchdog::DetectorContext;
 using ros2_medkit_graph_watchdog::DetectorMode;
@@ -840,10 +842,7 @@ TEST_F(ParamDriftIntegrationTest, ExpectRuleFlagsWrongFromStart) {
   // A separate node that comes up already violating the production pin use_sim_time=false.
   auto bad = std::make_shared<rclcpp::Node>("pd_it_badsim");
   bad->set_parameter(rclcpp::Parameter("use_sim_time", true));
-  exec_.add_node(bad);
-  const auto bad_guard = on_scope_exit([this, bad] {
-    exec_.remove_node(bad);
-  });
+  SpinningExecutor bad_spin({bad});
   set_apps({{"pd_it_badsim", "/pd_it_badsim"}});
 
   auto det = make_param_drift();
@@ -970,10 +969,7 @@ TEST_F(ParamDriftIntegrationTest, NamespacedNodeGateKeyingLifecycleDiscriminator
   // node n in namespace /ns: FQN /ns/n != app.id n
   auto nsnode = std::make_shared<rclcpp::Node>("n", "/ns");
   nsnode->declare_parameter<double>("gain", 1.0);
-  exec_.add_node(nsnode);
-  const auto nsnode_guard = on_scope_exit([this, nsnode] {
-    exec_.remove_node(nsnode);
-  });
+  SpinningExecutor nsnode_spin({nsnode});
   ASSERT_TRUE(wait_param_service("/ns/n"));
   IntrospectionInput snap;
   {
@@ -1040,10 +1036,7 @@ TEST_F(ParamDriftIntegrationTest, NamespacedNodeGateKeyingLifecycleDiscriminator
 TEST_F(ParamDriftIntegrationTest, GateDenialDoesNotHealAPresentDrift) {
   auto node = std::make_shared<rclcpp::Node>("g", "/gd");
   node->declare_parameter<double>("gain", 1.0);
-  exec_.add_node(node);
-  const auto node_guard = on_scope_exit([this, node] {
-    exec_.remove_node(node);
-  });
+  SpinningExecutor node_spin({node});
   ASSERT_TRUE(wait_param_service("/gd/g"));
 
   IntrospectionInput snap;
@@ -1191,12 +1184,7 @@ TEST_F(ParamDriftIntegrationTest, NodeRemovalPrunesAndClears) {
   keep->declare_parameter<double>("k", 1.0);
   auto gone = std::make_shared<rclcpp::Node>("pd_it_gone");
   gone->declare_parameter<double>("g", 1.0);
-  exec_.add_node(keep);
-  exec_.add_node(gone);
-  const auto nodes_guard = on_scope_exit([this, keep, gone] {
-    exec_.remove_node(keep);
-    exec_.remove_node(gone);
-  });
+  SpinningExecutor nodes_spin({keep, gone});
   set_apps({{"pd_it_keep", "/pd_it_keep"}, {"pd_it_gone", "/pd_it_gone"}});
 
   auto det = make_param_drift();
@@ -1230,12 +1218,7 @@ TEST_F(ParamDriftIntegrationTest, VanishedThenHealthyReappearanceStaysClear) {
   keep->declare_parameter<double>("k", 1.0);
   auto reap = std::make_shared<rclcpp::Node>("pd_it_reap");
   reap->declare_parameter<double>("r", 1.0);
-  exec_.add_node(keep);
-  exec_.add_node(reap);
-  const auto nodes_guard = on_scope_exit([this, keep, reap] {
-    exec_.remove_node(keep);
-    exec_.remove_node(reap);
-  });
+  SpinningExecutor nodes_spin({keep, reap});
   set_apps({{"pd_it_tbkeep", "/pd_it_tbkeep"}, {"pd_it_reap", "/pd_it_reap"}});
 
   auto det = make_param_drift();
@@ -2653,12 +2636,7 @@ TEST_F(ParamDriftIntegrationTest, MultiNodeAggregationOneFaultNamesBothThenClear
   a1->declare_parameter<double>("alpha", 1.0);
   auto a2 = std::make_shared<rclcpp::Node>("pd_it_agg2");
   a2->declare_parameter<double>("beta", 2.0);
-  exec_.add_node(a1);
-  exec_.add_node(a2);
-  const auto nodes_guard = on_scope_exit([this, a1, a2] {
-    exec_.remove_node(a1);
-    exec_.remove_node(a2);
-  });
+  SpinningExecutor nodes_spin({a1, a2});
   set_apps({{"pd_it_agg1", "/pd_it_agg1"}, {"pd_it_agg2", "/pd_it_agg2"}});
 
   auto det = make_param_drift();
@@ -2734,12 +2712,7 @@ TEST_F(ParamDriftIntegrationTest, ExpectBudgetTruncationDoesNotFlap) {
   bud2->declare_parameter<double>("a_ok", 1.0);
   bud2->declare_parameter<double>("b_ok", 2.0);
   bud2->declare_parameter<double>("z_bad", 3.0);  // all pins satisfied
-  exec_.add_node(bud1);
-  exec_.add_node(bud2);
-  const auto nodes_guard = on_scope_exit([this, bud1, bud2] {
-    exec_.remove_node(bud1);
-    exec_.remove_node(bud2);
-  });
+  SpinningExecutor nodes_spin({bud1, bud2});
   set_apps({{"pd_it_bud1", "/pd_it_bud1"}, {"pd_it_bud2", "/pd_it_bud2"}});
 
   auto det = make_param_drift();
@@ -3169,10 +3142,7 @@ TEST_F(ParamDriftIntegrationTest, AReadThatOverrunsThePerReadBoundIsAbandoned) {
 
   auto ok = std::make_shared<rclcpp::Node>(kOk);
   ok->declare_parameter<double>("speed_limit", 3.5);  // violates the pin below from the first read
-  exec_.add_node(ok);
-  const auto ok_guard = on_scope_exit([this, ok] {
-    exec_.remove_node(ok);
-  });
+  SpinningExecutor ok_spin({ok});
 
   // The late node. list_parameters is the round trip an `expect` read makes first, so holding it is
   // what makes the whole read overrun; get_parameters exists so discovery finds a complete node.
@@ -3664,10 +3634,7 @@ TEST_F(ParamDriftIntegrationTest, AnExpectPinOnADeclaredButUnsetParameterRaisesA
   dynamic_typing.dynamic_typing = true;  // a statically typed declaration demands a value or an override
   node->declare_parameter("threshold", rclcpp::ParameterValue{}, dynamic_typing);         // declared, never set
   node->declare_parameter<double>("headroom", std::numeric_limits<double>::quiet_NaN());  // a value, and it is NaN
-  exec_.add_node(node);
-  const auto node_guard = on_scope_exit([this, node] {
-    exec_.remove_node(node);
-  });
+  SpinningExecutor node_spin({node});
   set_apps({{"pd_it_unset", "/pd_it_unset"}});
 
   auto det = make_param_drift();

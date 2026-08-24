@@ -38,8 +38,10 @@
 #include <rclcpp/rclcpp.hpp>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "ros2_medkit_gateway/ros2/transports/ros2_parameter_transport.hpp"
+#include "ros2_medkit_gateway/test_support/spinning_executor.hpp"
 
 using namespace ros2_medkit_gateway;
 
@@ -328,7 +330,7 @@ TEST_F(TestRos2ParameterTransportUnresponsiveNode, ClientCacheStaysBoundedAcross
 // on param_node_, so a broken rebuild would otherwise be invisible.
 TEST_F(TestRos2ParameterTransportUnresponsiveNode, EvictedLiveClientIsTransparentlyRebuilt) {
   auto responsive_node = make_responsive_param_node("client_evict_responsive_node", "answer", 42);
-  executor_->add_node(responsive_node);
+  test_support::SpinningExecutor responsive_spin({responsive_node});
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   const std::string responsive_fqn = responsive_node->get_fully_qualified_name();
 
@@ -352,8 +354,6 @@ TEST_F(TestRos2ParameterTransportUnresponsiveNode, EvictedLiveClientIsTransparen
   auto again = transport->get_parameter(responsive_fqn, "answer");
   ASSERT_TRUE(again.success) << "evicting a live node's client must be transparent; got: " << again.error_message;
   EXPECT_EQ(again.data["value"].get<int64_t>(), 42);
-
-  executor_->remove_node(responsive_node);
 }
 
 // When a live node's cached defaults are evicted, get_default must RE-FETCH them
@@ -362,8 +362,7 @@ TEST_F(TestRos2ParameterTransportUnresponsiveNode, EvictedLiveClientIsTransparen
 TEST_F(TestRos2ParameterTransportUnresponsiveNode, EvictedDefaultsAreRefetchedNotReportedMissing) {
   auto node_a = make_responsive_param_node("defaults_evict_node_a", "p", 7);
   auto node_b = make_responsive_param_node("defaults_evict_node_b", "p", 8);
-  executor_->add_node(node_a);
-  executor_->add_node(node_b);
+  test_support::SpinningExecutor defaults_spin({node_a, node_b});
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   const std::string fqn_a = node_a->get_fully_qualified_name();
   const std::string fqn_b = node_b->get_fully_qualified_name();
@@ -389,9 +388,6 @@ TEST_F(TestRos2ParameterTransportUnresponsiveNode, EvictedDefaultsAreRefetchedNo
   ASSERT_TRUE(def_a2.success) << "evicted defaults must be re-fetched, not NO_DEFAULTS_CACHED; got error_code "
                               << static_cast<int>(def_a2.error_code);
   EXPECT_EQ(def_a2.data.get<int64_t>(), 7);
-
-  executor_->remove_node(node_a);
-  executor_->remove_node(node_b);
 }
 
 // After the gateway overwrites a parameter, reset-to-default must restore the
@@ -400,7 +396,7 @@ TEST_F(TestRos2ParameterTransportUnresponsiveNode, EvictedDefaultsAreRefetchedNo
 // (from its existing pre-read) and get_default prefers it.
 TEST_F(TestRos2ParameterTransportUnresponsiveNode, GetDefaultReturnsPreWriteValueAfterSet) {
   auto responsive_node = make_responsive_param_node("prewrite_responsive_node", "p", 100);
-  executor_->add_node(responsive_node);
+  test_support::SpinningExecutor prewrite_spin({responsive_node});
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   const std::string fqn = responsive_node->get_fully_qualified_name();
 
@@ -418,8 +414,6 @@ TEST_F(TestRos2ParameterTransportUnresponsiveNode, GetDefaultReturnsPreWriteValu
   auto got = transport->get_parameter(fqn, "p");
   ASSERT_TRUE(got.success) << got.error_message;
   EXPECT_EQ(got.data["value"].get<int64_t>(), 200);
-
-  executor_->remove_node(responsive_node);
 }
 
 // ---------------------------------------------------------------------------
