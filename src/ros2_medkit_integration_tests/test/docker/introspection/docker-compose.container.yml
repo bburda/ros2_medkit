@@ -15,14 +15,45 @@
 # Docker Compose for container introspection plugin integration tests.
 # Runs gateway + demo nodes inside a resource-limited Docker container.
 # The container plugin detects containerization via cgroup paths.
+#
+# The same image runs under both cgroup namespace modes, because the mode
+# decides where the limit files sit: private mounts the container's own cgroup
+# at /sys/fs/cgroup, host exposes the whole hierarchy and the path reported in
+# /proc/self/cgroup leads into it. Both must report the limits set below.
 
 services:
   gateway-container:
     build:
-      context: ../../../..  # worktree root (ros2_medkit)
+      context: ../../../../..  # worktree root (ros2_medkit)
       dockerfile: src/ros2_medkit_integration_tests/test/docker/introspection/Dockerfile.container
+    image: ros2-medkit-container-introspection:test
     ports:
       - "9210:8080"
+    cgroup: private
+    environment:
+      # Both services publish demo nodes on the same compose network, so each
+      # needs its own domain or a gateway discovers the other's nodes and
+      # cannot resolve a PID for them.
+      ROS_DOMAIN_ID: "91"
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  gateway-container-hostns:
+    image: ros2-medkit-container-introspection:test
+    pull_policy: never  # built by gateway-container, never published
+    depends_on:
+      - gateway-container
+    ports:
+      - "9211:8080"
+    cgroup: host
+    environment:
+      ROS_DOMAIN_ID: "92"
     mem_limit: 512m
     cpus: 1.0
     healthcheck:

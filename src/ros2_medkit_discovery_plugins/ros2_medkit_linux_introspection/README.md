@@ -14,7 +14,11 @@ Maps ROS 2 nodes to OS processes and reports CPU, memory, systemd unit status, a
 ## Key Components
 
 - **ProcReader** - Parses procfs files for process metrics with configurable proc root
-- **CgroupReader** - Reads cgroup v2 hierarchy for container/service context
+- **CgroupReader** - Reads the unified (v2), legacy (v1) and hybrid cgroup hierarchies for
+  container/service context, under both cgroup namespace modes. Each limit is reported
+  together with the outcome of reading it, so "unlimited" and "could not be read" stay
+  distinguishable. A container whose ID the cgroup namespace hides is recognised from the
+  markers its runtime leaves behind
 - **SystemdUtils** - Queries systemd via D-Bus for service metadata
 - **PidCache** - TTL-based cache mapping ROS 2 node names to Linux PIDs
 

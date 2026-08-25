@@ -2837,8 +2837,9 @@ Requires: ``systemd_introspection`` plugin and ``libsystemd``.
 Container Introspection (x-medkit-container)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Requires: ``container_introspection`` plugin. Only supports cgroup v2
-(Ubuntu 22.04+, Fedora 31+).
+Requires: ``container_introspection`` plugin. Supports the unified cgroup
+hierarchy (v2), the legacy one (v1), and hybrid hosts, under both the
+``host`` and ``private`` cgroup namespace modes.
 
 ``GET /api/v1/apps/{id}/x-medkit-container``
    Get container information for the app's process.
@@ -2851,15 +2852,28 @@ Requires: ``container_introspection`` plugin. Only supports cgroup v2
         "container_id": "a1b2c3d4e5f6...",
         "runtime": "docker",
         "memory_limit_bytes": 1073741824,
+        "memory_limit_state": "limited",
         "cpu_quota_us": 100000,
-        "cpu_period_us": 100000
+        "cpu_period_us": 100000,
+        "cpu_quota_state": "limited"
       }
 
    Fields ``memory_limit_bytes``, ``cpu_quota_us``, and ``cpu_period_us`` are only present
-   when the container has resource limits configured.
+   when a limit was actually read. ``memory_limit_state`` and ``cpu_quota_state`` are
+   always present and carry one of ``limited``, ``unlimited``, ``unreadable`` or
+   ``unavailable``, so a client can tell an unconstrained container from one whose limit
+   files could not be read. ``cpu_quota_state`` covers the quota and its period together.
+
+   ``cpu_quota_us`` is the CFS bandwidth limit. It does not reflect the set of CPUs the
+   container is pinned to (``--cpuset-cpus``), which is visible only through
+   ``sched_getaffinity()``; the effective CPU budget needs both.
+
+   ``container_id`` is empty when the cgroup namespace hides it (``--cgroupns=private``
+   reports the namespace root as the path). The container is still recognised from the
+   markers its runtime leaves behind, and the limits are still reported.
 
    - **404:** Process not found or not running in a container
-   - **503:** Failed to read cgroup information
+   - **503:** The cgroup of the process could not be determined at all
 
 ``GET /api/v1/components/{id}/x-medkit-container``
    Aggregate container info for all apps in the component. Containers are

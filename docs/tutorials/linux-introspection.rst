@@ -12,7 +12,9 @@ Apps and Components.
   unit properties (ActiveState, SubState, NRestarts, WatchdogUSec) via sd-bus. Requires
   ``libsystemd``.
 - **container** - detects containerization via cgroup path analysis. Supports Docker,
-  podman, and containerd. Reads cgroup v2 resource limits (``memory.max``, ``cpu.max``).
+  podman, and containerd. Reads resource limits from the unified hierarchy
+  (``memory.max``, ``cpu.max``) and from the legacy one (``memory.limit_in_bytes``,
+  ``cpu.cfs_quota_us``, ``cpu.cfs_period_us``).
 
 Each plugin maintains its own PID cache that maps ROS 2 node fully-qualified names to
 Linux PIDs by scanning ``/proc``. The cache refreshes on each discovery cycle and on
@@ -24,8 +26,10 @@ Requirements
 - **procfs**: Linux only (reads ``/proc`` filesystem). No extra dependencies.
 - **systemd**: requires ``libsystemd-dev`` at build time, systemd at runtime. Skipped
   automatically if ``libsystemd`` is not found during the build.
-- **container**: requires cgroup v2, which is the default on modern kernels (Ubuntu 22.04+,
-  Fedora 31+).
+- **container**: Linux only. Works on the unified cgroup hierarchy (v2, the default on
+  Ubuntu 22.04+ and Fedora 31+), on the legacy hierarchy (v1), and on hybrid hosts that
+  mount both. Both cgroup namespace modes (``--cgroupns=host`` and ``--cgroupns=private``)
+  are handled.
 
 Building
 --------
@@ -217,15 +221,27 @@ Returns container metadata for a node running inside a container:
      "container_id": "a1b2c3d4e5f6...",
      "runtime": "docker",
      "memory_limit_bytes": 536870912,
+     "memory_limit_state": "limited",
      "cpu_quota_us": 100000,
-     "cpu_period_us": 100000
+     "cpu_period_us": 100000,
+     "cpu_quota_state": "limited"
    }
 
 .. note::
 
    The ``memory_limit_bytes``, ``cpu_quota_us``, and ``cpu_period_us`` fields are only
-   present when cgroup v2 resource limits are set. If no limits are configured, these
-   fields are omitted from the response.
+   present when a limit was actually read. ``memory_limit_state`` and ``cpu_quota_state``
+   are always present and say why a number is missing:
+
+   - ``limited`` - a limit is in force, and the numeric field carries it
+   - ``unlimited`` - the container may use the whole machine
+   - ``unreadable`` - a limit file was found but its contents could not be parsed
+   - ``unavailable`` - no limit file exists in any supported cgroup layout
+
+   The distinction matters: an unreadable limit file reported as "no limit" would look
+   exactly like an unconstrained container. The CPU limit is the quota together with its
+   period, so ``cpu_quota_state`` covers both and ``cpu_period_us`` has no state of its
+   own; the period is reported even when the quota is ``unlimited``.
 
 **GET /components/{id}/x-medkit-container**
 
@@ -243,8 +259,10 @@ Returns aggregated container info for all child Apps, deduplicated by container 
          "container_id": "a1b2c3d4e5f6...",
          "runtime": "docker",
          "memory_limit_bytes": 536870912,
+         "memory_limit_state": "limited",
          "cpu_quota_us": 100000,
          "cpu_period_us": 100000,
+         "cpu_quota_state": "limited",
          "node_ids": ["temp_sensor", "rpm_sensor"]
        }
      ]
@@ -275,8 +293,11 @@ validation errors (404 for unknown entities) are handled automatically by
 | 404 | ``x-medkit-not-containerized``        | Node's process is not running inside a        |
 |     |                                       | container (no container cgroup path detected).|
 +-----+---------------------------------------+-----------------------------------------------+
-| 503 | ``x-medkit-cgroup-read-failed``       | Failed to read cgroup info for the container. |
-|     |                                       | Check cgroup v2 filesystem access.            |
+| 503 | ``x-medkit-cgroup-read-failed``       | The cgroup of the process could not be        |
+|     |                                       | determined at all. Check access to            |
+|     |                                       | ``/proc/{pid}/cgroup``. A limit that could    |
+|     |                                       | not be read is reported as a state on a 200,  |
+|     |                                       | not as this error.                            |
 +-----+---------------------------------------+-----------------------------------------------+
 
 .. note::
@@ -369,17 +390,28 @@ Without system bus access, the systemd plugin will return 503 errors for all que
 Container detection
 ~~~~~~~~~~~~~~~~~~~
 
-The container plugin relies on cgroup v2 path analysis. To verify your system uses
-cgroup v2:
+The container plugin relies on cgroup path analysis. To see which hierarchy your
+system mounts:
 
 .. code-block:: bash
 
-   mount | grep cgroup2
-   # Should show: cgroup2 on /sys/fs/cgroup type cgroup2 (...)
+   mount | grep cgroup
+   # unified (v2): cgroup2 on /sys/fs/cgroup type cgroup2 (...)
+   # legacy (v1):  cgroup on /sys/fs/cgroup/memory type cgroup (...)
 
    # Or check a process's cgroup path
    cat /proc/self/cgroup
-   # cgroup v2 output: "0::/user.slice/..."
+   # unified (v2): "0::/user.slice/..."
+   # legacy (v1):  "12:memory:/docker/<id>" - one line per hierarchy
+
+Both are supported, as is the hybrid layout that mounts the legacy controllers at the
+top level and the unified hierarchy beside them at ``/sys/fs/cgroup/unified``.
+
+The reported path is relative to the cgroup namespace of the container, so where the
+limit files sit depends on the namespace mode: ``--cgroupns=private`` mounts the
+container's own cgroup at the mount point, while ``--cgroupns=host`` exposes the whole
+hierarchy and the reported path leads into it. The plugin looks in both places and does
+not need to be told which mode is in use.
 
 Supported container runtimes and their cgroup path patterns:
 
@@ -389,3 +421,20 @@ Supported container runtimes and their cgroup path patterns:
 
 If your runtime uses a different cgroup path format, the plugin will not detect the
 container. The ``runtime`` field in the response indicates the detected runtime.
+
+Under ``--cgroupns=private`` the reported cgroup path is the namespace root and carries
+no container ID at all. The plugin then falls back to the markers a runtime leaves
+behind - ``/.dockerenv``, ``/run/.containerenv``, or an overlay filesystem mounted as the
+process's root - so the limits are still reported, with ``container_id`` empty. A process
+that is not in a container matches none of these and still gets
+``404 x-medkit-not-containerized``.
+
+CPU limits and cpusets
+~~~~~~~~~~~~~~~~~~~~~~
+
+``cpu_quota_us`` and ``cpu_period_us`` describe the CFS bandwidth limit
+(``--cpus``/``--cpu-quota``) and nothing else. A container pinned to a subset of the
+machine with ``--cpuset-cpus`` has no quota at all, so it is reported as
+``"cpu_quota_state": "unlimited"`` even though it cannot use every core. The cpuset is
+visible only through ``sched_getaffinity()``; a caller that wants the effective CPU
+budget has to combine the two.

@@ -30,7 +30,8 @@
 #
 # Port allocations (outside colcon test port range 9100+):
 #   - 9200: systemd test gateway
-#   - 9210: container test gateway
+#   - 9210: container test gateway, private cgroup namespace
+#   - 9211: container test gateway, host cgroup namespace
 
 set -euo pipefail
 
@@ -114,19 +115,21 @@ run_container_tests() {
     docker compose -f docker-compose.container.yml build
 
     echo ""
-    echo "--- Starting container ---"
+    echo "--- Starting containers (private and host cgroup namespaces) ---"
     docker compose -f docker-compose.container.yml up -d
 
-    if ! wait_for_healthy docker-compose.container.yml gateway-container 60; then
-        echo "FAIL: container did not start properly"
-        docker compose -f docker-compose.container.yml logs
-        docker compose -f docker-compose.container.yml down
-        return 1
-    fi
+    for service in gateway-container gateway-container-hostns; do
+        if ! wait_for_healthy docker-compose.container.yml "$service" 60; then
+            echo "FAIL: $service did not start properly"
+            docker compose -f docker-compose.container.yml logs
+            docker compose -f docker-compose.container.yml down
+            return 1
+        fi
+    done
 
     echo ""
     echo "--- Running container tests ---"
-    if pytest test_container_introspection.py -v; then
+    if pytest test_container_introspection.py test_container_cgroup_layouts.py -v; then
         echo "PASS: container tests"
     else
         echo "FAIL: container tests"

@@ -77,7 +77,7 @@ class ContainerPlugin : public GatewayPlugin, public IntrospectionProvider {
       }
 
       auto cgroup_info = ros2_medkit_linux_introspection::read_cgroup_info(*pid_opt, proc_root_);
-      if (!cgroup_info || cgroup_info->container_id.empty()) {
+      if (!cgroup_info || !cgroup_info->containerized) {
         continue;
       }
 
@@ -111,7 +111,7 @@ class ContainerPlugin : public GatewayPlugin, public IntrospectionProvider {
       return;
     }
 
-    if (cgroup_info->container_id.empty()) {
+    if (!cgroup_info->containerized) {
       res.send_error(404, "x-medkit-not-containerized", "Entity " + entity_id + " is not running in a container");
       return;
     }
@@ -127,7 +127,10 @@ class ContainerPlugin : public GatewayPlugin, public IntrospectionProvider {
     }
 
     auto child_apps = ctx_->get_child_apps(entity_id);
-    std::map<std::string, nlohmann::json> containers;  // Deduplicate by container_id
+    // Deduplicate by container_id. Under cgroupns=private every app reports an
+    // empty id and they all collapse into one entry, which is what they are:
+    // the single container whose id the namespace hides.
+    std::map<std::string, nlohmann::json> containers;
 
     for (const auto & app : child_apps) {
       auto pid_opt = pid_cache_->lookup(app.fqn, proc_root_);
@@ -136,7 +139,7 @@ class ContainerPlugin : public GatewayPlugin, public IntrospectionProvider {
       }
 
       auto cgroup_info = ros2_medkit_linux_introspection::read_cgroup_info(*pid_opt, proc_root_);
-      if (!cgroup_info || cgroup_info->container_id.empty()) {
+      if (!cgroup_info || !cgroup_info->containerized) {
         continue;
       }
 
