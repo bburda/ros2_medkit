@@ -16,20 +16,34 @@
 """Integration tests for combined procfs + container introspection plugins.
 
 Validates that loading multiple introspection plugins simultaneously works
-correctly. On a non-containerized host, procfs should return 200 while
-container returns 404 - verifying route isolation between plugins.
+correctly: procfs returns 200 while container returns 404, verifying route
+isolation between plugins.
+
+The container plugin reads a synthetic tree describing a process on a plain
+host, so the 404 is a property of the test rather than of the machine. The
+tests themselves often run inside a container, where the gateway's own process
+really is containerized and the endpoint would correctly answer 200.
 """
 
+import atexit
 import os
+import shutil
+import tempfile
 import time
 import unittest
 
 import launch_testing
 import requests
 
+from ros2_medkit_test_utils.cgroup_fixtures import HOST_MOUNTINFO, v2_cgroup, write_process
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
+
+HOST_PROC_ROOT = tempfile.mkdtemp(prefix='medkit_combined_host_')
+atexit.register(shutil.rmtree, HOST_PROC_ROOT, True)
+
+HOST_CGROUP = v2_cgroup('/user.slice/user-1000.slice/session-1.scope')
 
 
 def _get_plugin_path(plugin_so_name):
@@ -46,6 +60,14 @@ def generate_test_description():
     """Launch gateway with both procfs and container plugins."""
     procfs_path = _get_plugin_path('libprocfs_introspection.so')
     container_path = _get_plugin_path('libcontainer_introspection.so')
+
+    # Only the container plugin reads the synthetic tree; procfs keeps the real
+    # root so it still reports this machine's processes.
+    write_process(HOST_PROC_ROOT, 5101, '/powertrain/engine/temp_sensor', HOST_CGROUP,
+                  mountinfo=HOST_MOUNTINFO)
+    write_process(HOST_PROC_ROOT, 5102, '/powertrain/engine/rpm_sensor', HOST_CGROUP,
+                  mountinfo=HOST_MOUNTINFO)
+
     return create_test_launch(
         demo_nodes=['temp_sensor', 'rpm_sensor'],
         fault_manager=False,
@@ -53,6 +75,8 @@ def generate_test_description():
             'plugins': ['procfs', 'container'],
             'plugins.procfs.path': procfs_path,
             'plugins.container.path': container_path,
+            'plugins.container.proc_root': HOST_PROC_ROOT,
+            'plugins.container.pid_cache_ttl_seconds': 1,
         },
     )
 
@@ -142,7 +166,7 @@ class TestCombinedIntrospection(GatewayTestCase):
 
     def test_02_container_returns_404_on_host(self):
         """Container plugin returns 404 'not containerized' on a host system."""
-        app_id = self._get_any_app_id()
+        app_id = 'temp_sensor'
         r = self._poll_container_app(app_id)
 
         self.assertEqual(
@@ -160,7 +184,7 @@ class TestCombinedIntrospection(GatewayTestCase):
         Verify procfs still returns 200 even though container returns 404
         for the same entity - routes are isolated between plugins.
         """
-        app_id = self._get_any_app_id()
+        app_id = 'temp_sensor'
 
         # Container should be 404 (not containerized)
         container_resp = self._poll_container_app(app_id)

@@ -233,7 +233,7 @@ TEST_F(CgroupTree, V2PrivateNamespaceNestedPathPrefersOwnCgroup) {
 // @verifies REQ_INTEROP_003
 TEST_F(CgroupTree, PrivateNamespaceDetectedByDockerMarker) {
   write_proc_cgroup(42, "0::/\n");
-  write_file(".dockerenv", "");
+  write_file("proc/42/root/.dockerenv", "");
   write_file("sys/fs/cgroup/memory.max", "536870912\n");
   write_file("sys/fs/cgroup/cpu.max", "100000 100000\n");
 
@@ -254,7 +254,7 @@ TEST_F(CgroupTree, PrivateNamespaceDetectedByDockerMarker) {
 // @verifies REQ_INTEROP_003
 TEST_F(CgroupTree, PrivateNamespaceDetectedByPodmanMarker) {
   write_proc_cgroup(42, "0::/\n");
-  write_file("run/.containerenv", "");
+  write_file("proc/42/root/run/.containerenv", "");
 
   EXPECT_TRUE(is_containerized(42, root()));
   auto info = read();
@@ -304,11 +304,51 @@ TEST_F(CgroupTree, OverlayBelowRootIsNotAContainer) {
   EXPECT_FALSE(is_containerized(42, root()));
 }
 
+// The marker belongs to the inspected process, not to whoever is reading. A
+// gateway that is itself in a container must not report every process it can
+// see as containerized.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, MarkerAtTheReadersRootDoesNotContainerizeAHostProcess) {
+  write_proc_cgroup(42, "0::/user.slice/user-1000.slice/session-1.scope\n");
+  write_file(".dockerenv", "");
+  write_file("run/.containerenv", "");
+  write_file("proc/42/mountinfo", "25 1 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n");
+
+  EXPECT_FALSE(is_containerized(42, root()));
+  auto info = read();
+  EXPECT_FALSE(info.containerized);
+  EXPECT_TRUE(info.container_runtime.empty());
+}
+
+// An overlay root is how whole distributions boot, so on its own it says
+// nothing. Only a cgroup path rewritten to the namespace root makes it a
+// container signal.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, OverlayRootWithAHostCgroupPathIsNotAContainer) {
+  write_proc_cgroup(42, "0::/user.slice/user-1000.slice/session-1.scope\n");
+  write_file("proc/42/mountinfo", "1700 461 0:154 / / rw,relatime - overlay overlay rw\n");
+
+  EXPECT_FALSE(is_containerized(42, root()));
+  EXPECT_FALSE(read().containerized);
+}
+
+// When mounts are stacked at "/", the visible root is the last one listed.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, StackedOverlayRootIsStillDetected) {
+  write_proc_cgroup(42, "0::/\n");
+  write_file("proc/42/mountinfo",
+             "25 1 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n"
+             "99 25 0:154 / / rw,relatime - overlay overlay rw\n");
+
+  EXPECT_TRUE(is_containerized(42, root()));
+  EXPECT_TRUE(read().containerized);
+}
+
 // A container id in the path stays the answer, and keeps naming the runtime.
 // @verifies REQ_INTEROP_003
 TEST_F(CgroupTree, CgroupPathIdWinsOverMarker) {
   write_proc_cgroup(42, docker_v2_line());
-  write_file("run/.containerenv", "");
+  write_file("proc/42/root/run/.containerenv", "");
 
   auto info = read();
   EXPECT_TRUE(info.containerized);
