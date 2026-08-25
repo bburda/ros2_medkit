@@ -23,7 +23,7 @@
 services:
   gateway-systemd:
     build:
-      context: ../../../..  # worktree root (ros2_medkit)
+      context: ../../../../..  # worktree root (ros2_medkit)
       dockerfile: src/ros2_medkit_integration_tests/test/docker/introspection/Dockerfile.systemd
     privileged: true  # Required for systemd as PID 1
     ports:
@@ -33,7 +33,7 @@ services:
       - /run/lock
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    cgroupns: host
+    cgroup: host
     stop_signal: SIGRTMIN+3  # Proper systemd shutdown signal
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/api/v1/health"]

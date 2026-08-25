@@ -21,17 +21,27 @@
 namespace ros2_medkit_linux_introspection {
 
 /// Convert CgroupInfo to JSON for the container plugin HTTP response.
-/// Optional fields (memory_limit_bytes, cpu_quota_us, cpu_period_us) are
-/// omitted from the JSON when not set.
+///
+/// The numeric fields (memory_limit_bytes, cpu_quota_us, cpu_period_us) are
+/// present only when a value was read, so a client that reads no limit still
+/// has to know why. That is what memory_limit_state and cpu_quota_state carry:
+/// "limited", "unlimited", "unreadable" or "unavailable", always present.
+///
+/// The CPU limit is the quota and its period together, so cpu_quota_state
+/// covers both and cpu_period_us has no state of its own.
 inline nlohmann::json cgroup_info_to_json(const CgroupInfo & info) {
   nlohmann::json j;
   j["container_id"] = info.container_id;
   j["runtime"] = info.container_runtime;
-  if (info.memory_limit_bytes) {
-    j["memory_limit_bytes"] = *info.memory_limit_bytes;
+
+  j["memory_limit_state"] = limit_state_to_string(info.memory_limit.state());
+  if (info.memory_limit.value()) {
+    j["memory_limit_bytes"] = *info.memory_limit.value();
   }
-  if (info.cpu_quota_us) {
-    j["cpu_quota_us"] = *info.cpu_quota_us;
+
+  j["cpu_quota_state"] = limit_state_to_string(info.cpu_quota.state());
+  if (info.cpu_quota.value()) {
+    j["cpu_quota_us"] = *info.cpu_quota.value();
   }
   if (info.cpu_period_us) {
     j["cpu_period_us"] = *info.cpu_period_us;

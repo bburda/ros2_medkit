@@ -155,6 +155,13 @@ Plugins
 
    - Registers ``x-medkit-container`` capability on Apps and Components
    - Reads ``/proc/{pid}/cgroup`` to extract container ID and runtime (Docker, containerd, Podman)
+   - Handles the unified (v2), legacy (v1) and hybrid hierarchies, and looks for the limit
+     files both at the bare mount point (``cgroupns=private``) and at the mount point joined
+     with the reported path (``cgroupns=host``)
+   - Reports each limit with a ``LimitState`` (``limited``, ``unlimited``, ``unreadable``,
+     ``unavailable``) so a failed read cannot be mistaken for an unconstrained container
+   - Recognises a container even when the cgroup namespace hides its ID, from
+     ``/.dockerenv``, ``/run/.containerenv`` or an overlay root filesystem
    - Component-level endpoint aggregates containers, deduplicating by container ID
    - Returns 404 for entities not running in a container (not an error - just bare-metal)
 

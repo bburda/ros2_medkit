@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy source tree
 WORKDIR ${COLCON_WS}
-COPY cmake/ ${COLCON_WS}/cmake/
+COPY src/ros2_medkit_cmake/ ${COLCON_WS}/src/ros2_medkit_cmake/
 COPY src/ros2_medkit_gateway/ ${COLCON_WS}/src/ros2_medkit_gateway/
 COPY src/ros2_medkit_serialization/ ${COLCON_WS}/src/ros2_medkit_serialization/
 COPY src/ros2_medkit_msgs/ ${COLCON_WS}/src/ros2_medkit_msgs/
@@ -53,13 +53,25 @@ COPY src/ros2_medkit_fault_reporter/ ${COLCON_WS}/src/ros2_medkit_fault_reporter
 COPY src/ros2_medkit_diagnostic_bridge/ ${COLCON_WS}/src/ros2_medkit_diagnostic_bridge/
 COPY src/ros2_medkit_integration_tests/ ${COLCON_WS}/src/ros2_medkit_integration_tests/
 COPY src/ros2_medkit_discovery_plugins/ ${COLCON_WS}/src/ros2_medkit_discovery_plugins/
+COPY src/ros2_medkit_plugins/ros2_medkit_graph_provider/ ${COLCON_WS}/src/ros2_medkit_plugins/ros2_medkit_graph_provider/
+COPY src/ros2_medkit_action_status_bridge/ ${COLCON_WS}/src/ros2_medkit_action_status_bridge/
+COPY src/ros2_medkit_log_bridge/ ${COLCON_WS}/src/ros2_medkit_log_bridge/
 
-# Build everything (skip test targets to speed up the image build)
-RUN bash -c "source /opt/ros/jazzy/setup.bash && \
+# Build everything (skip test targets to speed up the image build).
+# The apt lists are wiped by the layer above, and rosdep shells out to apt, so
+# they have to be refreshed here or every dependency it resolves fails to
+# install. The image builds with BUILD_TESTING=OFF, so test-only dependencies
+# are not resolved at all - one of them is not published as a package.
+# No --symlink-install: the runtime stage copies the install tree out of this
+# one, and symlinks into a build tree that stage does not have resolve nowhere.
+RUN apt-get update && bash -c "source /opt/ros/jazzy/setup.bash && \
     rosdep update && \
     rosdep install --from-paths src --ignore-src -r -y \
+      --dependency-types buildtool --dependency-types build \
+      --dependency-types build_export --dependency-types buildtool_export --dependency-types exec \
       --skip-keys='ament_cmake_clang_format ament_cmake_clang_tidy test_msgs sqlite3' && \
-    colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF"
+    colcon build --cmake-args -DBUILD_TESTING=OFF" \
+    && rm -rf /var/lib/apt/lists/*
 
 # ============================================================================
 # Stage 2: Runtime

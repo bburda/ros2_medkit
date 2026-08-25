@@ -69,9 +69,30 @@ def _get_app_ids():
     return [item['id'] for item in items]
 
 
+_container_app_id = None
+
+
 def _get_first_app_id():
-    """Get first discovered app ID."""
-    return _get_app_ids()[0]
+    """Get an app ID the container endpoint can answer for.
+
+    The gateway node is discovered as an App too, but its own process is not in
+    the PID cache, so the first entry of /apps is not usable here. Scan for one
+    that answers, and retry while the PID cache is still filling.
+    """
+    global _container_app_id
+    if _container_app_id is not None:
+        return _container_app_id
+
+    for _ in range(POLL_RETRIES):
+        for app_id in _get_app_ids():
+            r = requests.get(
+                f'{BASE_URL}/apps/{app_id}/x-medkit-container', timeout=5
+            )
+            if r.status_code == 200:
+                _container_app_id = app_id
+                return app_id
+        time.sleep(POLL_INTERVAL)
+    pytest.fail(f'No app reported container info at {BASE_URL}')
 
 
 def _get_first_component_id():
@@ -111,8 +132,13 @@ class TestContainerAppEndpoint:
         assert 'container_id' in data
         assert 'runtime' in data
 
-    def test_container_id_is_64_char_hex(self):
-        """Container ID should be a full 64-character hex SHA-256 hash.
+    def test_container_id_reflects_the_namespace_mode(self):
+        """Container ID is present only when the cgroup namespace exposes it.
+
+        This gateway runs with cgroup: private, where /proc/self/cgroup reports
+        the namespace root and carries no ID, so the field is empty. The
+        64-character form is exercised against the host-namespace gateway in
+        test_container_cgroup_layouts.py.
 
         @verifies REQ_INTEROP_003
         """
@@ -122,11 +148,8 @@ class TestContainerAppEndpoint:
         )
         assert status == 200
         cid = data['container_id']
-        assert len(cid) == 64, (
-            f'Expected 64-char container ID, got {len(cid)}: {cid}'
-        )
-        assert re.match(r'^[0-9a-f]{64}$', cid), (
-            f'Container ID is not valid hex: {cid}'
+        assert cid == '' or re.match(r'^[0-9a-f]{64}$', cid), (
+            f'Container ID is neither empty nor valid 64-char hex: {cid!r}'
         )
 
     def test_runtime_is_docker(self):

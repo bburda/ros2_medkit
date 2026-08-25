@@ -48,7 +48,12 @@ std::string read_file_contents(const std::string & path) {
   if (!f.is_open()) {
     return {};
   }
-  return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+  // Read through the stream buffer rather than a pair of istreambuf_iterators:
+  // the iterator form makes GCC lose track of the buffer pointers and report a
+  // null dereference in <streambuf> that cannot happen on an open stream.
+  std::ostringstream contents;
+  contents << f.rdbuf();
+  return contents.str();
 }
 
 // Parse VmRSS and VmSize from /proc/{pid}/status
@@ -344,7 +349,12 @@ void PidCache::refresh(const std::string & root) {
     std::string node_name;
     std::string node_ns;
     if (parse_ros_args(cmdline_path, node_name, node_ns)) {
-      auto fqn = (node_ns == "/" || node_ns.empty()) ? "/" + node_name : node_ns + "/" + node_name;
+      std::string fqn;
+      if (node_ns != "/" && !node_ns.empty()) {
+        fqn = node_ns;
+      }
+      fqn += "/";
+      fqn += node_name;
       char * end = nullptr;
       long pid_val = std::strtol(entry->d_name, &end, 10);
       if (end != entry->d_name && *end == '\0' && pid_val > 0) {
