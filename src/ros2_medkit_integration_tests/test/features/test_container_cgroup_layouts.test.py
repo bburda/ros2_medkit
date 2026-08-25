@@ -59,6 +59,13 @@ OTHER_ID = 'ccdd445566778899' * 4
 THIRD_ID = 'eeff001122334455' * 4
 FOURTH_ID = '0011223344556677' * 4
 
+# Two containers whose cgroup namespace hides their id. Nothing in the cgroup
+# path tells them apart, so only the mount namespace can.
+HIDDEN_NS_A = 4026531001
+HIDDEN_NS_B = 4026531002
+HIDDEN_A_BYTES = 111111168
+HIDDEN_B_BYTES = 222222336
+
 PROC_ROOT = tempfile.mkdtemp(prefix='medkit_cgroup_layouts_')
 atexit.register(shutil.rmtree, PROC_ROOT, True)
 
@@ -105,6 +112,23 @@ def _build_tree(root):
                   v2_cgroup('/user.slice/user-1000.slice/session-1.scope'),
                   mountinfo=HOST_MOUNTINFO)
 
+    # Two apps in one container whose id the cgroup namespace hides. They share
+    # a mount namespace, so they are one container.
+    for pid, fqn in ((4108, '/powertrain/engine/temp_monitor'),
+                     (4109, '/powertrain/engine/long_calibration')):
+        write_process(root, pid, fqn, v2_cgroup('/hidden-a'), mountinfo=OVERLAY_MOUNTINFO,
+                      markers=['.dockerenv'], mount_namespace=HIDDEN_NS_A)
+    v2_limits(root, '/hidden-a', memory=HIDDEN_A_BYTES,
+              cpu='{} {}'.format(QUOTA_US, PERIOD_US))
+
+    # A different container, also with its id hidden. Nothing but the mount
+    # namespace separates it from the pair above.
+    write_process(root, 4110, '/testrig/dual/dual_calibration', v2_cgroup('/hidden-b'),
+                  mountinfo=OVERLAY_MOUNTINFO, markers=['.dockerenv'],
+                  mount_namespace=HIDDEN_NS_B)
+    v2_limits(root, '/hidden-b', memory=HIDDEN_B_BYTES,
+              cpu='{} {}'.format(QUOTA_US, PERIOD_US))
+
 
 def _get_plugin_path(plugin_so_name):
     from ament_index_python.packages import get_package_prefix
@@ -124,6 +148,9 @@ def generate_test_description():
             'actuator',
             'calibration',
             'controller',
+            'temp_monitor',
+            'long_calibration',
+            'dual_calibration',
         ],
         fault_manager=False,
         gateway_params={
@@ -141,7 +168,7 @@ class TestContainerCgroupLayouts(GatewayTestCase):
     @verifies REQ_INTEROP_003
     """
 
-    MIN_EXPECTED_APPS = 7
+    MIN_EXPECTED_APPS = 10
     REQUIRED_APPS = {
         'temp_sensor',
         'rpm_sensor',
@@ -150,6 +177,9 @@ class TestContainerCgroupLayouts(GatewayTestCase):
         'actuator',
         'calibration',
         'controller',
+        'temp_monitor',
+        'long_calibration',
+        'dual_calibration',
     }
 
     def _container(self, app_id):
@@ -235,12 +265,12 @@ class TestContainerCgroupLayouts(GatewayTestCase):
         self.assertTrue(components, 'no components discovered')
 
         def _ready(data):
-            return data if len(data.get('containers', [])) >= 2 else None
+            return data if len(data.get('containers', [])) >= 6 else None
 
         data = self.poll_endpoint_until(
             '/components/{}/x-medkit-container'.format(components[0]['id']), _ready
         )
-        by_id = {c['container_id']: c for c in data['containers']}
+        by_id = {c['container_id']: c for c in data['containers'] if c['container_id']}
 
         self.assertIn(DOCKER_ID, by_id)
         self.assertIn(OTHER_ID, by_id)
@@ -256,6 +286,41 @@ class TestContainerCgroupLayouts(GatewayTestCase):
         # controller is on the host and must not appear at all.
         for entry in data['containers']:
             self.assertNotIn('controller', entry['node_ids'])
+
+    def test_09_hidden_ids_group_by_mount_namespace(self):
+        """Containers whose id the namespace hides are still told apart.
+
+        An empty container id is not an identity. Two apps sharing a mount
+        namespace are one container; an app in another namespace is not, and
+        merging them would report one set of limits for both.
+
+        @verifies REQ_INTEROP_003
+        """
+        components = requests.get(
+            '{}/components'.format(self.BASE_URL), timeout=5
+        ).json().get('items', [])
+        self.assertTrue(components, 'no components discovered')
+
+        def _ready(data):
+            hidden = [c for c in data.get('containers', []) if not c['container_id']]
+            return data if len(hidden) >= 2 else None
+
+        data = self.poll_endpoint_until(
+            '/components/{}/x-medkit-container'.format(components[0]['id']), _ready
+        )
+        hidden = [c for c in data['containers'] if not c['container_id']]
+
+        self.assertEqual(
+            len(hidden), 2, 'expected two hidden-id containers, got {}'.format(hidden)
+        )
+        by_nodes = {frozenset(c['node_ids']): c for c in hidden}
+        pair = frozenset({'temp_monitor', 'long_calibration'})
+        alone = frozenset({'dual_calibration'})
+
+        self.assertIn(pair, by_nodes, 'apps sharing a mount namespace were split')
+        self.assertIn(alone, by_nodes, 'apps in different mount namespaces were merged')
+        self.assertEqual(by_nodes[pair]['memory_limit_bytes'], HIDDEN_A_BYTES)
+        self.assertEqual(by_nodes[alone]['memory_limit_bytes'], HIDDEN_B_BYTES)
 
 
 @launch_testing.post_shutdown_test()

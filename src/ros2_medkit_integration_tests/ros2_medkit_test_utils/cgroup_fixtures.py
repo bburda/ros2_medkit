@@ -54,12 +54,18 @@ def write_file(root, relative, content):
     return path
 
 
-def write_process(root, pid, fqn, cgroup, mountinfo=HOST_MOUNTINFO, markers=()):
+def write_process(
+    root, pid, fqn, cgroup, mountinfo=HOST_MOUNTINFO, markers=(), mount_namespace=None
+):
     """Write a ``/proc/<pid>`` entry the PID cache resolves to ``fqn``.
 
     No process needs to exist at ``pid``: the cache scans ``<root>/proc`` for
     numeric directories and reads ``cmdline`` for ``__ns:=`` and ``__node:=``.
     ``markers`` are paths inside the process's own root, e.g. ``.dockerenv``.
+
+    ``mount_namespace`` is the inode number behind ``/proc/<pid>/ns/mnt``, which
+    is what tells two containers apart once the cgroup namespace has hidden
+    their IDs. Processes given the same number look like one container.
     """
     namespace, _, name = fqn.rpartition('/')
     args = [
@@ -75,6 +81,15 @@ def write_process(root, pid, fqn, cgroup, mountinfo=HOST_MOUNTINFO, markers=()):
     write_file(root, 'proc/{}/mountinfo'.format(pid), mountinfo)
     for marker in markers:
         write_file(root, 'proc/{}/root/{}'.format(pid, marker.lstrip('/')), '')
+
+    if mount_namespace is not None:
+        # The kernel makes this a magic symlink reading "mnt:[<inode>]". Only
+        # the link text is read, so a target that resolves nowhere is fine.
+        link_dir = os.path.join(root, 'proc', str(pid), 'ns')
+        os.makedirs(link_dir, exist_ok=True)
+        link = os.path.join(link_dir, 'mnt')
+        if not os.path.islink(link):
+            os.symlink('mnt:[{}]'.format(mount_namespace), link)
 
 
 def v1_cgroup(path):
