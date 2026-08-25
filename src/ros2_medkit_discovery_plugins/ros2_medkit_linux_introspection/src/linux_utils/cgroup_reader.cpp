@@ -138,11 +138,13 @@ CgroupPaths read_cgroup_paths(pid_t pid, const std::string & root) {
   return paths;
 }
 
-// A container's root filesystem is an overlay mount; a host's is not. This is
-// per-process, so it still answers for a PID other than our own.
+// Whether the process's own root filesystem is an overlay mount. Read from the
+// process's mountinfo, so it answers for a PID other than our own. The last
+// entry mounted at "/" is the visible one when mounts are stacked.
 bool has_overlay_root(pid_t pid, const std::string & root) {
   std::ifstream f(root + "/proc/" + std::to_string(pid) + "/mountinfo");
   std::string line;
+  bool overlay = false;
   while (std::getline(f, line)) {
     // "<id> <parent> <maj:min> <mount root> <mount point> <options> [tags] - <fstype> <source> ..."
     auto separator = line.find(" - ");
@@ -163,9 +165,9 @@ bool has_overlay_root(pid_t pid, const std::string & root) {
     if (!(tail >> fstype)) {
       continue;
     }
-    return fstype == "overlay";
+    overlay = (fstype == "overlay");
   }
-  return false;
+  return overlay;
 }
 
 // What a container runtime leaves behind when the cgroup path cannot name it.
@@ -174,15 +176,27 @@ struct ContainerMarker {
   std::string runtime;  // empty when the marker does not identify a runtime
 };
 
-ContainerMarker detect_container_marker(pid_t pid, const std::string & root) {
+// The marker files describe the filesystem of the INSPECTED process, so they
+// are read through its own root rather than the gateway's - a gateway that is
+// itself containerized would otherwise answer for every PID it can see.
+ContainerMarker detect_container_marker(pid_t pid, const std::string & root, const std::string & cgroup_path) {
+  const auto process_root = root + "/proc/" + std::to_string(pid) + "/root";
   std::error_code ec;
-  if (std::filesystem::exists(root + "/.dockerenv", ec)) {
+  if (std::filesystem::exists(process_root + "/.dockerenv", ec)) {
     return {true, "docker"};
   }
-  if (std::filesystem::exists(root + "/run/.containerenv", ec)) {
+  if (std::filesystem::exists(process_root + "/run/.containerenv", ec)) {
     return {true, "podman"};
   }
-  if (has_overlay_root(pid, root)) {
+  if (std::filesystem::exists(process_root + "/run/systemd/container", ec)) {
+    return {true, {}};
+  }
+
+  // An overlay root on its own proves nothing: whole distributions boot that
+  // way. It only says "container" together with a cgroup path that has been
+  // rewritten to the namespace root, which a process outside a cgroup
+  // namespace never reports.
+  if (cgroup_path == "/" && has_overlay_root(pid, root)) {
     return {true, {}};
   }
   return {};
@@ -416,10 +430,11 @@ std::string detect_runtime(const std::string & cgroup_path) {
 
 bool is_containerized(pid_t pid, const std::string & root) {
   auto paths = read_cgroup_paths(pid, root);
-  if (!extract_container_id(select_reported_path(paths)).empty()) {
+  auto cgroup_path = select_reported_path(paths);
+  if (!extract_container_id(cgroup_path).empty()) {
     return true;
   }
-  return detect_container_marker(pid, root).present;
+  return detect_container_marker(pid, root, cgroup_path).present;
 }
 
 tl::expected<CgroupInfo, std::string> read_cgroup_info(pid_t pid, const std::string & root) {
@@ -435,7 +450,7 @@ tl::expected<CgroupInfo, std::string> read_cgroup_info(pid_t pid, const std::str
   info.container_runtime = detect_runtime(cgroup_path);
   info.containerized = !info.container_id.empty();
   if (!info.containerized) {
-    auto marker = detect_container_marker(pid, root);
+    auto marker = detect_container_marker(pid, root, cgroup_path);
     info.containerized = marker.present;
     if (info.container_runtime.empty()) {
       info.container_runtime = marker.runtime;

@@ -24,9 +24,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
+#include <system_error>
 
 using namespace ros2_medkit_gateway;  // NOLINT(build/namespaces)
 
@@ -87,6 +89,19 @@ class ContainerPlugin : public GatewayPlugin, public IntrospectionProvider {
   }
 
  private:
+  /// Identifier of the mount namespace a PID belongs to, e.g. "[4026532563]",
+  /// or empty when it cannot be read. Processes in one container share it.
+  std::string mount_namespace_of(pid_t pid) const {
+    std::error_code ec;
+    auto link = std::filesystem::read_symlink(proc_root_ + "/proc/" + std::to_string(pid) + "/ns/mnt", ec);
+    if (ec) {
+      return {};
+    }
+    auto target = link.string();
+    auto open = target.find('[');
+    return open == std::string::npos ? std::string{} : target.substr(open);
+  }
+
   PluginContext * ctx_{nullptr};
   std::unique_ptr<ros2_medkit_linux_introspection::PidCache> pid_cache_ =
       std::make_unique<ros2_medkit_linux_introspection::PidCache>();
@@ -127,10 +142,12 @@ class ContainerPlugin : public GatewayPlugin, public IntrospectionProvider {
     }
 
     auto child_apps = ctx_->get_child_apps(entity_id);
-    // Deduplicate by container_id. Under cgroupns=private every app reports an
-    // empty id and they all collapse into one entry, which is what they are:
-    // the single container whose id the namespace hides.
+    // Deduplicate by container_id. An empty id is not an identity: when the
+    // cgroup namespace hides it, two apps may well be in different containers
+    // and there is nothing to tell them apart, so each keeps its own entry
+    // rather than being merged into one that reports a single set of limits.
     std::map<std::string, nlohmann::json> containers;
+    size_t unidentified = 0;
 
     for (const auto & app : child_apps) {
       auto pid_opt = pid_cache_->lookup(app.fqn, proc_root_);
@@ -143,7 +160,15 @@ class ContainerPlugin : public GatewayPlugin, public IntrospectionProvider {
         continue;
       }
 
-      auto & cid = cgroup_info->container_id;
+      auto cid = cgroup_info->container_id;
+      if (cid.empty()) {
+        // Fall back to the process's mount namespace, which is per-container:
+        // apps in one container share it, apps in different ones do not. When
+        // it cannot be read, a unique key keeps them apart rather than merging
+        // on no evidence.
+        auto ns = mount_namespace_of(*pid_opt);
+        cid = ns.empty() ? "unidentified-" + std::to_string(unidentified++) : "mnt-" + ns;
+      }
       if (containers.find(cid) == containers.end()) {
         auto j = ros2_medkit_linux_introspection::cgroup_info_to_json(*cgroup_info);
         j["node_ids"] = nlohmann::json::array();

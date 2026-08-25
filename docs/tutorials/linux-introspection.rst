@@ -424,10 +424,21 @@ container. The ``runtime`` field in the response indicates the detected runtime.
 
 Under ``--cgroupns=private`` the reported cgroup path is the namespace root and carries
 no container ID at all. The plugin then falls back to the markers a runtime leaves
-behind - ``/.dockerenv``, ``/run/.containerenv``, or an overlay filesystem mounted as the
-process's root - so the limits are still reported, with ``container_id`` empty. A process
-that is not in a container matches none of these and still gets
-``404 x-medkit-not-containerized``.
+behind, read through the inspected process's own root (``/proc/<pid>/root``) so that a
+containerized gateway does not answer for processes outside it:
+
+- ``/.dockerenv`` (Docker) or ``/run/.containerenv`` (Podman), which also name the runtime
+- ``/run/systemd/container`` (systemd-nspawn and others)
+- an overlay filesystem mounted as the process's root, but only together with a cgroup
+  path of ``/``. An overlay root on its own proves nothing, because whole distributions
+  boot that way
+
+The limits are still reported, with ``container_id`` empty. A process that matches none of
+these gets ``404 x-medkit-not-containerized``.
+
+A runtime that leaves no marker and does not use an overlay root - containerd or CRI-O on
+a btrfs or ZFS snapshotter, for example - is not detected under a private namespace, and
+its apps are reported as non-containerized.
 
 CPU limits and cpusets
 ~~~~~~~~~~~~~~~~~~~~~~

@@ -26,11 +26,17 @@ Maps ROS 2 nodes to OS processes and reports CPU, memory, systemd unit status, a
 
 Configure via `gateway_params.yaml` plugin parameters:
 
+Each plugin is configured on its own. `proc_root` is the prefix that contains `proc/` and
+`sys/`, so the default `/` is what a normal deployment wants; pointing it at `/proc` makes
+the plugin look for `/proc/proc/<pid>`.
+
 ```yaml
-plugins: ["linux_introspection"]
-plugins.linux_introspection.path: "/path/to/libros2_medkit_linux_introspection.so"
-plugins.linux_introspection.pid_cache_ttl_sec: 30
-plugins.linux_introspection.proc_root: "/proc"
+plugins: ["procfs", "systemd", "container"]
+plugins.procfs.path: "/path/to/libprocfs_introspection.so"
+plugins.systemd.path: "/path/to/libsystemd_introspection.so"
+plugins.container.path: "/path/to/libcontainer_introspection.so"
+plugins.container.pid_cache_ttl_seconds: 30
+plugins.container.proc_root: "/"
 ```
 
 ## Documentation

@@ -2858,8 +2858,9 @@ hierarchy (v2), the legacy one (v1), and hybrid hosts, under both the
         "cpu_quota_state": "limited"
       }
 
-   Fields ``memory_limit_bytes``, ``cpu_quota_us``, and ``cpu_period_us`` are only present
-   when a limit was actually read. ``memory_limit_state`` and ``cpu_quota_state`` are
+   Fields ``memory_limit_bytes`` and ``cpu_quota_us`` are present only when a limit is in
+   force. ``cpu_period_us`` is present whenever the CPU limit was read at all, including
+   when the quota is unlimited. ``memory_limit_state`` and ``cpu_quota_state`` are
    always present and carry one of ``limited``, ``unlimited``, ``unreadable`` or
    ``unavailable``, so a client can tell an unconstrained container from one whose limit
    files could not be read. ``cpu_quota_state`` covers the quota and its period together.
