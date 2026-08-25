@@ -42,17 +42,28 @@ std::string trim(const std::string & text) {
   return text.substr(begin, end - begin + 1);
 }
 
-// Returns nullopt when the file cannot be opened, and the (possibly empty)
-// first line when it can - the caller has to tell "no such limit file" from
-// "the limit file holds something we cannot parse".
-std::optional<std::string> read_first_line(const std::string & path) {
-  std::ifstream f(path);
-  if (!f.is_open()) {
-    return std::nullopt;
-  }
+// The outcome of looking at one limit file. "Not there" and "there but it
+// would not open" are different answers: the second is a failed read, and
+// reporting it as an absent limit is the confusion this reader exists to
+// remove.
+struct LimitFile {
+  bool exists{false};
+  bool opened{false};
   std::string line;
-  std::getline(f, line);
-  return line;
+};
+
+LimitFile read_limit_file(const std::string & path) {
+  LimitFile result;
+  std::ifstream f(path);
+  if (f.is_open()) {
+    result.exists = true;
+    result.opened = true;
+    std::getline(f, result.line);
+    return result;
+  }
+  std::error_code ec;
+  result.exists = std::filesystem::exists(path, ec);
+  return result;
 }
 
 std::optional<uint64_t> parse_u64(const std::string & text) {
@@ -215,6 +226,18 @@ std::optional<std::string> controller_path(const CgroupPaths & paths, const std:
 // hybrid host the unified line is often the bare root while the container is
 // named only on the v1 hierarchies, so a root unified path yields to those.
 std::string select_reported_path(const CgroupPaths & paths) {
+  // A path that names a container wins, whichever hierarchy carries it. The
+  // controllers the limits come from are not always the ones holding the id:
+  // a partly delegated v1 host can name the container on "pids" alone.
+  if (!extract_container_id(paths.unified).empty()) {
+    return paths.unified;
+  }
+  for (const auto & [name, path] : paths.v1) {
+    (void)name;
+    if (!extract_container_id(path).empty()) {
+      return path;
+    }
+  }
   if (!paths.unified.empty() && paths.unified != "/") {
     return paths.unified;
   }
@@ -246,6 +269,78 @@ std::vector<std::string> candidate_dirs(const std::string & mount, const std::st
   return dirs;
 }
 
+// A cgroup filesystem as the inspected process sees it.
+struct CgroupMount {
+  std::string mount_point;
+  std::string mount_root;  // the subtree of the hierarchy this mount exposes
+  std::string options;     // super options, which name the v1 controllers
+  bool unified{false};
+};
+
+// cgroup v1 does not require a controller to be mounted at a directory named
+// after it, and co-mounts may list controllers in any order, so the mount
+// points have to be read rather than guessed.
+std::vector<CgroupMount> read_cgroup_mounts(pid_t pid, const std::string & root) {
+  std::vector<CgroupMount> mounts;
+  std::ifstream f(root + "/proc/" + std::to_string(pid) + "/mountinfo");
+  std::string line;
+  while (std::getline(f, line)) {
+    auto separator = line.find(" - ");
+    if (separator == std::string::npos) {
+      continue;
+    }
+    std::istringstream head(line.substr(0, separator));
+    std::string field;
+    std::string mount_root;
+    std::string mount_point;
+    if (!(head >> field >> field >> field >> mount_root >> mount_point)) {
+      continue;
+    }
+    std::istringstream tail(line.substr(separator + 3));
+    std::string fstype;
+    std::string source;
+    std::string options;
+    if (!(tail >> fstype >> source >> options)) {
+      continue;
+    }
+    if (fstype != "cgroup" && fstype != "cgroup2") {
+      continue;
+    }
+    mounts.push_back({root + mount_point, mount_root, options, fstype == "cgroup2"});
+  }
+  return mounts;
+}
+
+bool mount_carries_controller(const CgroupMount & mount, const std::string & controller) {
+  // Super options are comma separated and include the controller names.
+  size_t start = 0;
+  while (start <= mount.options.size()) {
+    auto comma = mount.options.find(',', start);
+    auto name = comma == std::string::npos ? mount.options.substr(start) : mount.options.substr(start, comma - start);
+    if (name == controller) {
+      return true;
+    }
+    if (comma == std::string::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+  return false;
+}
+
+// Where a cgroup path is visible under a mount that exposes only part of the
+// hierarchy: the exposed subtree is stripped off the front of the path.
+void append_mount_dirs(std::vector<std::string> & dirs, const CgroupMount & mount, const std::string & cgroup_path) {
+  if (mount.mount_root != "/" && !mount.mount_root.empty() && cgroup_path.rfind(mount.mount_root, 0) == 0) {
+    auto relative = cgroup_path.substr(mount.mount_root.size());
+    dirs.push_back(relative.empty() ? mount.mount_point : mount.mount_point + relative);
+  }
+  if (!cgroup_path.empty() && cgroup_path != "/") {
+    dirs.push_back(mount.mount_point + cgroup_path);
+  }
+  dirs.push_back(mount.mount_point);
+}
+
 std::vector<std::string> unified_mounts(const std::string & root) {
   // The hybrid layout keeps the legacy controllers at the top level and mounts
   // the unified hierarchy beside them.
@@ -262,28 +357,16 @@ std::vector<std::string> v1_mounts(const std::string & root, const std::string &
   return mounts;
 }
 
-int rank(LimitState state) {
-  switch (state) {
-    case LimitState::kLimited:
-      return 3;
-    case LimitState::kUnlimited:
-      return 2;
-    case LimitState::kUnreadable:
-      return 1;
-    case LimitState::kUnavailable:
-      return 0;
-  }
-  return 0;
-}
-
-// Merges what two candidate locations said about the same limit, keeping the
-// most informative answer and, on a tie, the more specific location. A location
-// that reports no limit does not end the search: the root of a cgroup v1
-// hierarchy always reads as unlimited and would otherwise mask a limit set on
-// the container's own cgroup further down.
+// Keeps the answer from the most specific candidate that had a file at all.
+// Candidates are visited most specific first, so a location with nothing there
+// falls through to the next one, while a location that HAS the file decides -
+// including when what it holds cannot be parsed. Letting an unlimited reading
+// from a fallback location override an unreadable one from the process's own
+// cgroup would report "no limit" for a limit nobody managed to read, which is
+// the confusion this reader exists to remove.
 template <typename T>
 CgroupLimit<T> better_of(const CgroupLimit<T> & first, const CgroupLimit<T> & second) {
-  return rank(second.state()) > rank(first.state()) ? second : first;
+  return first.state() == LimitState::kUnavailable ? second : first;
 }
 
 // The CPU limit is the quota together with the period it is measured over; the
@@ -294,15 +377,18 @@ struct CpuLimit {
 };
 
 CpuLimit better_of(const CpuLimit & first, const CpuLimit & second) {
-  return rank(second.quota.state()) > rank(first.quota.state()) ? second : first;
+  return first.quota.state() == LimitState::kUnavailable ? second : first;
 }
 
 CgroupLimit<uint64_t> read_memory_v2(const std::string & dir) {
-  auto content = read_first_line(dir + "/memory.max");
-  if (!content) {
+  auto file = read_limit_file(dir + "/memory.max");
+  if (!file.exists) {
     return CgroupLimit<uint64_t>::unavailable();
   }
-  auto text = trim(*content);
+  if (!file.opened) {
+    return CgroupLimit<uint64_t>::unreadable();
+  }
+  auto text = trim(file.line);
   if (text == "max") {
     return CgroupLimit<uint64_t>::unlimited();
   }
@@ -314,11 +400,14 @@ CgroupLimit<uint64_t> read_memory_v2(const std::string & dir) {
 }
 
 CgroupLimit<uint64_t> read_memory_v1(const std::string & dir) {
-  auto content = read_first_line(dir + "/memory.limit_in_bytes");
-  if (!content) {
+  auto file = read_limit_file(dir + "/memory.limit_in_bytes");
+  if (!file.exists) {
     return CgroupLimit<uint64_t>::unavailable();
   }
-  auto value = parse_u64(trim(*content));
+  if (!file.opened) {
+    return CgroupLimit<uint64_t>::unreadable();
+  }
+  auto value = parse_u64(trim(file.line));
   if (!value) {
     return CgroupLimit<uint64_t>::unreadable();
   }
@@ -329,16 +418,21 @@ CgroupLimit<uint64_t> read_memory_v1(const std::string & dir) {
 }
 
 CpuLimit read_cpu_v2(const std::string & dir) {
-  auto content = read_first_line(dir + "/cpu.max");
-  if (!content) {
+  auto file = read_limit_file(dir + "/cpu.max");
+  if (!file.exists) {
     return {CgroupLimit<int64_t>::unavailable(), std::nullopt};
   }
+  if (!file.opened) {
+    return {CgroupLimit<int64_t>::unreadable(), std::nullopt};
+  }
 
-  // "<quota> <period>", where the quota may be the keyword "max".
-  std::istringstream ss(*content);
+  // The format is exactly two fields, "<quota> <period>", where the quota may
+  // be the keyword "max". Anything after them is not this file.
+  std::istringstream ss(file.line);
   std::string quota_text;
   std::string period_text;
-  if (!(ss >> quota_text) || !(ss >> period_text)) {
+  std::string trailing;
+  if (!(ss >> quota_text) || !(ss >> period_text) || (ss >> trailing)) {
     return {CgroupLimit<int64_t>::unreadable(), std::nullopt};
   }
 
@@ -357,24 +451,24 @@ CpuLimit read_cpu_v2(const std::string & dir) {
 }
 
 CpuLimit read_cpu_v1(const std::string & dir) {
-  auto quota_content = read_first_line(dir + "/cpu.cfs_quota_us");
-  auto period_content = read_first_line(dir + "/cpu.cfs_period_us");
-  if (!quota_content && !period_content) {
+  auto quota_file = read_limit_file(dir + "/cpu.cfs_quota_us");
+  auto period_file = read_limit_file(dir + "/cpu.cfs_period_us");
+  if (!quota_file.exists && !period_file.exists) {
     return {CgroupLimit<int64_t>::unavailable(), std::nullopt};
   }
 
   std::optional<int64_t> period;
-  if (period_content) {
-    period = parse_i64(trim(*period_content));
+  if (period_file.opened) {
+    period = parse_i64(trim(period_file.line));
     if (period && *period <= 0) {
       period.reset();
     }
   }
-  if (!quota_content || !period) {
+  if (!quota_file.opened || !period) {
     return {CgroupLimit<int64_t>::unreadable(), std::nullopt};
   }
 
-  auto quota = parse_i64(trim(*quota_content));
+  auto quota = parse_i64(trim(quota_file.line));
   if (!quota) {
     return {CgroupLimit<int64_t>::unreadable(), std::nullopt};
   }
@@ -459,28 +553,62 @@ tl::expected<CgroupInfo, std::string> read_cgroup_info(pid_t pid, const std::str
 
   CpuLimit cpu;
 
+  // The conventional mount points come first because they are the ones a
+  // gateway can reach when it does not share the target's mount namespace.
+  // The mounts read from the target's own mountinfo are tried after them, so a
+  // host that puts its controllers somewhere else is still covered and a
+  // cross-namespace path that resolves to nothing here simply does not match.
+  const auto mounts = read_cgroup_mounts(pid, root);
+
   if (!paths.unified.empty()) {
+    std::vector<std::string> dirs;
     for (const auto & mount : unified_mounts(root)) {
       for (const auto & dir : candidate_dirs(mount, paths.unified)) {
-        info.memory_limit = better_of(info.memory_limit, read_memory_v2(dir));
-        cpu = better_of(cpu, read_cpu_v2(dir));
+        dirs.push_back(dir);
       }
+    }
+    for (const auto & mount : mounts) {
+      if (mount.unified) {
+        append_mount_dirs(dirs, mount, paths.unified);
+      }
+    }
+    for (const auto & dir : dirs) {
+      info.memory_limit = better_of(info.memory_limit, read_memory_v2(dir));
+      cpu = better_of(cpu, read_cpu_v2(dir));
     }
   }
 
   if (auto memory_path = controller_path(paths, "memory")) {
+    std::vector<std::string> dirs;
     for (const auto & mount : v1_mounts(root, "memory")) {
       for (const auto & dir : candidate_dirs(mount, *memory_path)) {
-        info.memory_limit = better_of(info.memory_limit, read_memory_v1(dir));
+        dirs.push_back(dir);
       }
+    }
+    for (const auto & mount : mounts) {
+      if (!mount.unified && mount_carries_controller(mount, "memory")) {
+        append_mount_dirs(dirs, mount, *memory_path);
+      }
+    }
+    for (const auto & dir : dirs) {
+      info.memory_limit = better_of(info.memory_limit, read_memory_v1(dir));
     }
   }
 
   if (auto cpu_path = controller_path(paths, "cpu")) {
+    std::vector<std::string> dirs;
     for (const auto & mount : v1_mounts(root, "cpu")) {
       for (const auto & dir : candidate_dirs(mount, *cpu_path)) {
-        cpu = better_of(cpu, read_cpu_v1(dir));
+        dirs.push_back(dir);
       }
+    }
+    for (const auto & mount : mounts) {
+      if (!mount.unified && mount_carries_controller(mount, "cpu")) {
+        append_mount_dirs(dirs, mount, *cpu_path);
+      }
+    }
+    for (const auto & dir : dirs) {
+      cpu = better_of(cpu, read_cpu_v1(dir));
     }
   }
 

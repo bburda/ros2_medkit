@@ -675,6 +675,89 @@ TEST_F(CgroupTree, MalformedProcCgroupLinesAreIgnored) {
   EXPECT_EQ(info.cgroup_path, std::string("two:colons:is:fine:/docker/") + kDockerId);
 }
 
+// A fallback location that says "no limit" must not overwrite an unreadable
+// answer from the process's own cgroup. Reporting no limit for a limit nobody
+// could read is the failure this reader exists to remove.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, UnreadableOwnCgroupIsNotMaskedByAnUnlimitedFallback) {
+  write_proc_cgroup(42, std::string("12:memory:/docker/") + kDockerId + "\n");
+  write_file(std::string("sys/fs/cgroup/memory/docker/") + kDockerId + "/memory.limit_in_bytes", "garbage\n");
+  write_file("sys/fs/cgroup/memory/memory.limit_in_bytes", std::to_string(kV1UnlimitedSentinel) + "\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kUnreadable);
+  EXPECT_FALSE(info.memory_limit.value().has_value());
+}
+
+// cpu.max holds exactly two fields. Anything after them is not this file.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, CpuMaxWithATrailingTokenIsUnreadable) {
+  write_proc_cgroup(42, "0::/\n");
+  write_file("sys/fs/cgroup/cpu.max", "50000 100000 garbage\n");
+
+  auto info = read();
+  EXPECT_EQ(info.cpu_quota.state(), LimitState::kUnreadable);
+  EXPECT_FALSE(info.cpu_quota.value().has_value());
+  EXPECT_FALSE(info.cpu_period_us.has_value());
+}
+
+// A limit file that is there but yields nothing readable is a failed read, not
+// an absent limit. A permission-based fixture cannot be used here because root
+// bypasses it, and the tests run as root in CI.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, PresentButUnreadableLimitFileIsNotReportedAsAbsent) {
+  write_proc_cgroup(42, "0::/\n");
+  fs::create_directories(root_ / "sys/fs/cgroup/memory.max");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kUnreadable);
+  EXPECT_NE(info.memory_limit.state(), LimitState::kUnavailable);
+}
+
+// The container id can sit on a hierarchy other than the ones the limits come
+// from, so every reported path is searched for one.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, ContainerIdIsFoundOnANonPreferredHierarchy) {
+  write_proc_cgroup(42, std::string("12:memory:/\n11:cpu,cpuacct:/\n10:pids:/docker/") + kDockerId + "\n");
+
+  auto info = read();
+  EXPECT_EQ(info.container_id, kDockerId);
+  EXPECT_EQ(info.container_runtime, "docker");
+  EXPECT_TRUE(info.containerized);
+}
+
+// cgroup v1 does not require a controller to be mounted at a directory named
+// after it, so the mount points are read from the process's mountinfo.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, V1ControllerAtACustomMountPoint) {
+  write_proc_cgroup(42, std::string("12:memory:/docker/") + kDockerId + "\n");
+  write_file("proc/42/mountinfo",
+             "25 1 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n"
+             "30 25 0:26 / /sys/fs/cgroup/odd rw,relatime - cgroup cgroup rw,memory\n");
+  write_file(std::string("sys/fs/cgroup/odd/docker/") + kDockerId + "/memory.limit_in_bytes", "536870912\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kLimited);
+  ASSERT_TRUE(info.memory_limit.value().has_value());
+  EXPECT_EQ(*info.memory_limit.value(), 536870912u);
+}
+
+// A mount that exposes only part of the hierarchy shows a cgroup path with
+// that subtree stripped off the front.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, V1MountExposingASubtreeStripsItFromThePath) {
+  write_proc_cgroup(42, "12:memory:/docker/parent/child\n");
+  write_file("proc/42/mountinfo",
+             "25 1 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n"
+             "30 25 0:26 /docker/parent /sys/fs/cgroup/memory rw,relatime - cgroup cgroup rw,memory\n");
+  write_file("sys/fs/cgroup/memory/child/memory.limit_in_bytes", "268435456\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kLimited);
+  ASSERT_TRUE(info.memory_limit.value().has_value());
+  EXPECT_EQ(*info.memory_limit.value(), 268435456u);
+}
+
 // @verifies REQ_INTEROP_003
 TEST_F(CgroupTree, MissingCgroupFileIsAnError) {
   fs::create_directories(root_ / "proc" / "42");
