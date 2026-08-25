@@ -299,7 +299,12 @@ if(BUILD_TESTING)
     test_graph_provider_stale 300
     test_graph_provider_sse 300
     test_peer_recovery 300
-    test_triggers_restore_before_discovery 300)
+    test_triggers_restore_before_discovery 300
+    # Three discovery budgets in setUpClass before the first case runs, and a
+    # broken merge spends all of them. The glob default cuts that short and
+    # reports a timeout with no test name, which is the one answer that says
+    # nothing about which rule broke.
+    test_aggregator_only_configurations 300)
   # Names actually matched against a discovered test_name in the two loops
   # below. Checked against _MEDKIT_TEST_TIMEOUT_OVERRIDES itself after both
   # loops finish - see the FATAL_ERROR check at the end of this block - so a

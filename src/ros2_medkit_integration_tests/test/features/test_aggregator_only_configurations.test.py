@@ -80,6 +80,7 @@ from ros2_medkit_test_utils.constants import (
     DISCOVERY_TIMEOUT,
     get_test_domain_id,
     get_test_port,
+    get_time_scale,
 )
 from ros2_medkit_test_utils.launch_helpers import create_gateway_node
 
@@ -90,6 +91,16 @@ PEER_URL = f'http://localhost:{PEER_PORT}{API_BASE_PATH}'
 
 PRIMARY_DOMAIN_ID = get_test_domain_id(0)
 PEER_DOMAIN_ID = get_test_domain_id(1)
+
+# How long a read waits for a peer-owned operation to reach this gateway's tree.
+# Deliberately not the discovery budget: by the time anything below runs, the
+# class gates have already established that the peer's Apps are online and
+# merged here, so what is left is one aggregation refresh copying that App's
+# operations across. The gateways run that refresh every second under test, so
+# this is generous for what it waits on, and short enough that four stacked
+# discovery budgets cannot push the file past the ctest timeout its glob
+# assigns - which kills the run without naming a test.
+PEER_OPERATION_TIMEOUT = 15.0 * get_time_scale()
 
 # Declared by the calibration demo node and writable, so a value put there by
 # one request is observable by another.
@@ -356,7 +367,7 @@ class AggregatorOnlyConfigurationsTest(unittest.TestCase):
         The final read is asserted, so a gateway that is still failing then is
         reported as the failure it is.
         """
-        deadline = time.monotonic() + DISCOVERY_TIMEOUT
+        deadline = time.monotonic() + PEER_OPERATION_TIMEOUT
         items = []
         while time.monotonic() < deadline:
             try:
