@@ -17,6 +17,7 @@
 #include <chrono>
 
 #include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
+#include "ros2_medkit_gateway/core/auth/auth_middleware.hpp"
 #include "ros2_medkit_gateway/core/auth/auth_models.hpp"
 #include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
 #include "ros2_medkit_gateway/core/discovery/discovery_enums.hpp"
@@ -50,12 +51,52 @@ ErrorInfo make_internal_error(const char * where, const std::exception & e) {
 
 }  // namespace
 
+namespace {
+
+/// True when authentication is on and this request did not present a token
+/// this gateway accepts.
+///
+/// /health is the one route the "all" policy lets through unauthenticated, so
+/// that a container supervisor or load balancer can tell the process is alive
+/// without holding a credential. That exemption is only defensible while the
+/// body says nothing an anonymous caller should not learn - and the full body
+/// does: the linking warnings name entities and ROS node FQNs, and the entity
+/// cache reports how many apps, areas and components this gateway sees. The
+/// probe needs none of that, so an anonymous caller gets the liveness answer
+/// and nothing else, and an authenticated one gets the whole document.
+bool is_anonymous(const HandlerContext & ctx, const http::TypedRequest & req) {
+  if (!ctx.auth_config().enabled) {
+    return false;  // Nothing is anonymous when nothing is authenticated.
+  }
+  auto * manager = ctx.auth_manager();
+  if (manager == nullptr) {
+    return true;  // Fail closed: cannot verify, so do not disclose.
+  }
+  auto header = req.header("Authorization");
+  if (!header) {
+    return true;
+  }
+  auto token = AuthMiddleware::extract_bearer_token(*header);
+  if (!token) {
+    return true;
+  }
+  return !manager->validate_token(*token).valid;
+}
+
+}  // namespace
+
 http::Result<dto::Health> HealthHandlers::get_health(const http::TypedRequest & req) {
-  (void)req;  // Unused parameter
   try {
     dto::Health response;
     response.status = "healthy";
     response.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+
+    // Liveness and nothing else for an anonymous caller. Returned before any
+    // of the sections below are built, so a section added later is private by
+    // default rather than public until someone remembers to think about it.
+    if (is_anonymous(ctx_, req)) {
+      return response;
+    }
 
     // Operator-actionable warnings the gateway flags without taking itself
     // offline. Collected across every subsystem that can produce one, so the

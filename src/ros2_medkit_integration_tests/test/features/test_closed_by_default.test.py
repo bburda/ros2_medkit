@@ -229,15 +229,62 @@ class TestClosedByDefault(GatewayTestCase):
         resp = requests.get(f'{CLOSED_BASE_URL}/health', timeout=15)
         self.assertEqual(resp.status_code, 200, 'health must stay probe-able')
 
-    def test_06_health_discloses_no_topology(self):
-        """Health is exempt because it says nothing, so check that it says nothing."""
+    def test_06_anonymous_health_is_liveness_and_nothing_else(self):
+        """The exemption rests on the body saying nothing, so check the body.
+
+        An allowlist, not a denylist. Listing the fields known to leak today
+        would pass the day a new section is added, and the whole reason this
+        route is public is that a probe needs no more than "am I alive".
+        """
         body = requests.get(f'{CLOSED_BASE_URL}/health', timeout=15).json()
-        for leaked in ('areas', 'components', 'apps', 'functions', 'entities', 'nodes', 'topics'):
-            self.assertNotIn(
-                leaked, body,
-                f'health exposes "{leaked}" to anonymous callers - the exemption '
-                'rests on it carrying no topology'
-            )
+        # warnings and its schema version are always serialised - they are part
+        # of the /health contract whether or not anything produced one - so the
+        # allowlist includes them and the assertion below covers the content.
+        self.assertEqual(
+            set(body), {'status', 'timestamp', 'warnings', 'warning_schema_version'},
+            f'an anonymous /health returned more than liveness: {body}'
+        )
+        self.assertEqual(body['status'], 'healthy')
+        # The array is the leak vector: a linking warning reads like
+        # "App 'engine_ecu' cannot bind to '/nav/controller'", naming an entity
+        # and a ROS node FQN. Empty is the only safe value for a caller that
+        # presented nothing.
+        self.assertEqual(
+            body['warnings'], [],
+            f'an anonymous /health carried warning text: {body["warnings"]}'
+        )
+
+    def test_06b_the_full_health_document_names_entities(self):
+        """The reason test_06 matters, pinned so it cannot be argued away.
+
+        With a credential the same route returns discovery state and entity
+        cache counts. That is a legitimate operator surface, and it is exactly
+        what an anonymous caller must not receive - so if this ever stops being
+        true, the narrowing above has become pointless and should be revisited
+        rather than left as dead weight.
+        """
+        body = requests.get(
+            f'{CLOSED_BASE_URL}/health', headers=self.auth, timeout=15
+        ).json()
+        self.assertIn('discovery', body)
+        self.assertIn('x-medkit-entity-cache', body)
+        self.assertGreater(
+            len(set(body)), 2,
+            'the authenticated /health is now as bare as the anonymous one'
+        )
+
+    def test_06c_a_forged_credential_gets_the_bare_body(self):
+        """A token this gateway never issued is an anonymous caller."""
+        body = requests.get(
+            f'{CLOSED_BASE_URL}/health',
+            headers={'Authorization': 'Bearer not.a.real.token'},
+            timeout=15,
+        ).json()
+        self.assertEqual(
+            set(body), {'status', 'timestamp', 'warnings', 'warning_schema_version'},
+            f'a forged credential unlocked the full health document: {body}'
+        )
+        self.assertEqual(body['warnings'], [])
 
     def test_07_a_valid_credential_gets_through(self):
         """Otherwise the sweeps above would pass on a gateway that serves nobody."""
