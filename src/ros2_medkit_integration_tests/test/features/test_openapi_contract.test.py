@@ -1169,6 +1169,27 @@ class TestOpenApiContract(GatewayTestCase):
         undocumented = sorted(n for n in opaque if not schemas[n].get('description'))
         self.assertEqual(undocumented, [], f'opaque without a reason: {undocumented}')
 
+    def test_a_body_the_handler_refuses_does_not_validate(self):
+        """A request the gateway answers 400 on must not satisfy its schema.
+
+        `dto_fields` describes members one at a time, so a rule that spans two
+        of them - "at least one of `data` or `value`" on a configuration write -
+        cannot come from the descriptor. Left at that, both members are optional
+        and `{}` validates against a body `handle_write_configuration` refuses,
+        which is a request a generated client would compile.
+
+        Asserted against the served document rather than the header, because
+        the header is only right if the schema it produces reaches the wire.
+        """
+        schema = self.spec()['components']['schemas']['ConfigurationWriteRequest']
+        branches = schema.get('anyOf')
+        self.assertIsNotNone(
+            branches, 'ConfigurationWriteRequest states no cross-field rule, so {} validates')
+        required = {tuple(b.get('required', [])) for b in branches}
+        self.assertEqual(
+            required, {('data',), ('value',)},
+            f'the rule does not say "data or value": {branches}')
+
     def test_no_unreachable_schemas(self):
         """Every named schema is reachable from some operation.
 

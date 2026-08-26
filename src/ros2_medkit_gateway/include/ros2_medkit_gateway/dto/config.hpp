@@ -25,6 +25,7 @@
 #include "ros2_medkit_gateway/dto/contract.hpp"
 #include "ros2_medkit_gateway/dto/entities.hpp"
 #include "ros2_medkit_gateway/dto/sample.hpp"
+#include "ros2_medkit_gateway/dto/schema_writer.hpp"
 #include "ros2_medkit_gateway/dto/x_medkit.hpp"
 #include "ros2_medkit_gateway/http/alternate_status.hpp"
 
@@ -203,6 +204,30 @@ inline constexpr auto dto_fields<ConfigurationWriteRequest> =
 
 template <>
 inline constexpr std::string_view dto_name<ConfigurationWriteRequest> = "ConfigurationWriteRequest";
+
+// The "at least one of data or value" rule is a relation BETWEEN two members,
+// and `dto_fields` describes members one at a time, so the derived schema
+// cannot carry it: both are optional there and an empty object validates
+// against a request `handle_write_configuration` answers 400. A generated
+// client would compile that call. The properties still come from the
+// descriptor - only the cross-field rule is added here, so a member renamed in
+// `dto_fields` cannot leave this stale without also changing the key below.
+template <>
+struct SchemaWriter<ConfigurationWriteRequest> {
+  static nlohmann::json schema() {
+    auto derived = derived_object_schema<ConfigurationWriteRequest>();
+    // Each branch carries `type: object` as well as its `required`: a DTO
+    // schema describes an object body, and a branch that states only a
+    // constraint leaves that unsaid.
+    derived["anyOf"] =
+        nlohmann::json::array({nlohmann::json{{"type", "object"}, {"required", nlohmann::json::array({"data"})}},
+                               nlohmann::json{{"type", "object"}, {"required", nlohmann::json::array({"value"})}}});
+    derived["description"] =
+        "Configuration value to write. At least one of `data` or `value` must be present; `data` is preferred and "
+        "wins when both are supplied. `value` is a legacy alias kept for older clients.";
+    return derived;
+  }
+};
 
 // =============================================================================
 // ConfigurationDeleteResultItem - single entry in the 207 multi-status results
