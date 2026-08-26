@@ -69,18 +69,33 @@ class NoAuthRequirementPolicy : public IAuthRequirementPolicy {
 /**
  * @brief Policy that always requires authentication
  *
- * Except for public endpoints (auth endpoints, health check)
+ * Except for two public endpoints: the auth endpoints, and the health probe.
  */
 class AllAuthRequirementPolicy : public IAuthRequirementPolicy {
  public:
   bool requires_authentication(const std::string & method, const std::string & path) const override {
-    (void)method;
-    // Auth endpoints are always public (to allow login)
-    return path.find("/api/v1/auth/") != 0;
+    // Auth endpoints are always public: authentication cannot bootstrap
+    // through a door that demands the credential it exists to hand out.
+    if (path.find("/api/v1/auth/") == 0) {
+      return false;
+    }
+
+    // GET /api/v1/health is public. A container supervisor and an upstream
+    // load balancer probe it to decide whether this process is alive, and
+    // neither holds a credential; requiring one turns a healthy gateway into
+    // a restart loop. The response is a fixed status document - it names no
+    // entity, no topic and no plant data - so leaving it open discloses that
+    // a gateway is running and nothing further. HEAD is not included: a probe
+    // that wants the status document asks for it with GET.
+    if (method == "GET" && path == "/api/v1/health") {
+      return false;
+    }
+
+    return true;
   }
 
   std::string description() const override {
-    return "AllAuth: Authentication required for all endpoints except /auth/*";
+    return "AllAuth: Authentication required for all endpoints except /auth/* and GET /health";
   }
 };
 

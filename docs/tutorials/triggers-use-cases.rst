@@ -119,7 +119,7 @@ Step 4: List all triggers
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps/temp_sensor/triggers
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/temp_sensor/triggers
 
 **Response:**
 
@@ -281,7 +281,7 @@ component.
 
    .. code-block:: bash
 
-      curl http://localhost:8080/api/v1/components | jq '.items[].id'
+      curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components | jq '.items[].id'
 
    If ``engine`` does not appear, the demo nodes may not be running or the
    namespace grouping may differ. Adjust ``engine`` to match the actual
@@ -306,10 +306,10 @@ Step 4: Verify all triggers
 .. code-block:: bash
 
    # App-level triggers
-   curl http://localhost:8080/api/v1/apps/temp_sensor/triggers
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/temp_sensor/triggers
 
    # Component-level triggers
-   curl http://localhost:8080/api/v1/components/engine/triggers
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/engine/triggers
 
 Step 5: Connect SSE streams and observe cascade
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -424,10 +424,10 @@ Step 4: Verify triggers on different entity types
 .. code-block:: bash
 
    # Area-level triggers
-   curl http://localhost:8080/api/v1/areas/powertrain/triggers
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/areas/powertrain/triggers
 
    # App-level triggers
-   curl http://localhost:8080/api/v1/apps/engine-temp-sensor/triggers
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/engine-temp-sensor/triggers
 
 Step 5: Connect SSE streams
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~

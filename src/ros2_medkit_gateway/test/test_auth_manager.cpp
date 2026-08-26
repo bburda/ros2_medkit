@@ -1130,6 +1130,51 @@ TEST_F(AuthRequirementPolicyTest, AllAuthPolicyAlwaysRequiresAuth) {
   EXPECT_TRUE(policy.requires_authentication("DELETE", "/api/v1/admin/users"));
 }
 
+// The health probe is the one route the ALL policy lets through, and its
+// narrowness is the whole reason it is safe. Widening it to "any method on
+// /health", or to any path merely CONTAINING /health, is the natural next edit
+// and would open a hole, so the boundary is pinned here.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, AllAuthPolicyExemptsOnlyGetHealth) {
+  AllAuthRequirementPolicy policy;
+
+  // Exempt: a container supervisor and a load balancer probe this with no
+  // credential, and requiring one turns a healthy gateway into a restart loop.
+  EXPECT_FALSE(policy.requires_authentication("GET", "/api/v1/health"));
+
+  // Only GET. A write to the health path is not a liveness probe.
+  EXPECT_TRUE(policy.requires_authentication("POST", "/api/v1/health"));
+  EXPECT_TRUE(policy.requires_authentication("PUT", "/api/v1/health"));
+  EXPECT_TRUE(policy.requires_authentication("DELETE", "/api/v1/health"));
+  EXPECT_TRUE(policy.requires_authentication("PATCH", "/api/v1/health"));
+  EXPECT_TRUE(policy.requires_authentication("HEAD", "/api/v1/health"));
+
+  // Only that exact path. A prefix or suffix match would hand an attacker a
+  // trivial bypass: append or prepend the magic word and walk in.
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/health/detail"));
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/healthz"));
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/components/health"));
+  EXPECT_TRUE(policy.requires_authentication("GET", "/health"));
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/health?x=1"));
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v2/health"));
+}
+
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, AllAuthPolicyExemptsAuthEndpoints) {
+  AllAuthRequirementPolicy policy;
+
+  // Authentication cannot bootstrap through a door that already demands the
+  // credential it exists to hand out.
+  EXPECT_FALSE(policy.requires_authentication("POST", "/api/v1/auth/authorize"));
+  EXPECT_FALSE(policy.requires_authentication("POST", "/api/v1/auth/token"));
+  EXPECT_FALSE(policy.requires_authentication("POST", "/api/v1/auth/revoke"));
+
+  // The prefix must be anchored: a path that merely mentions auth later is
+  // not an auth endpoint.
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/components/auth/data"));
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/authorization"));
+}
+
 // @verifies REQ_INTEROP_086
 TEST_F(AuthRequirementPolicyTest, WriteOnlyPolicyForGetRequests) {
   WriteOnlyAuthRequirementPolicy policy;

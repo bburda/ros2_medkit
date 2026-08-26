@@ -80,8 +80,14 @@ ros2_medkit_gateway:
       # TLS/HTTPS Configuration
       # Enables encrypted communication using OpenSSL
       tls:
-        # Enable/disable TLS (default: false for backward compatibility)
-        enabled: false
+        # On, so a gateway reachable from anything but loopback is encrypted
+        # without a deployment having to remember to turn it on. cert_file and
+        # key_file below must be filled in; the gateway refuses to start with
+        # TLS on and no certificate, which is the intended failure - an
+        # unencrypted gateway that started anyway is the worse outcome.
+        # Turn OFF only for a gateway bound to 127.0.0.1 behind a TLS
+        # terminator that is itself doing this job.
+        enabled: true
 
         # Path to PEM-encoded certificate file (required when TLS enabled)
         # Example: "/etc/ros2_medkit/certs/cert.pem"
@@ -360,11 +366,22 @@ ros2_medkit_gateway:
     # Authentication Configuration (REQ_INTEROP_086, REQ_INTEROP_087)
     # JWT-based authentication with Role-Based Access Control (RBAC)
     auth:
-      # Enable/disable authentication
-      # Default: false (disabled for local development)
-      enabled: false
+      # On. This file is the default a deployment gets when it brings no
+      # profile of its own, so it has to be the safe one: an unauthenticated
+      # SOVD gateway exposes the entity tree, the fault history and every
+      # operation the plugins register.
+      #
+      # The gateway REFUSES TO START while this is true and jwt_secret is
+      # empty (auth_config.cpp: "JWT secret is required when authentication is
+      # enabled"). That is deliberate. A gateway that will not boot is a
+      # deployment problem someone fixes in a minute; a gateway that booted
+      # open is one nobody notices.
+      enabled: true
 
-      # JWT signing secret (required when enabled)
+      # JWT signing secret. REQUIRED - the gateway will not start without it
+      # while auth.enabled is true. At least 32 characters for HS256.
+      # Inject it from a secret store or the deployment's own configuration;
+      # do not commit a real secret here.
       # For HS256: The shared secret string
       # For RS256: Path to the private key file (PEM format)
       jwt_secret: ""
@@ -390,8 +407,14 @@ ros2_medkit_gateway:
       #   - "none": No authentication required (auth endpoints still available)
       #   - "write": Auth required for write operations (POST, PUT, DELETE)
       #   - "all": Auth required for all operations
-      # Default: "write"
-      require_auth_for: "write"
+      #
+      # "all", not "write". Under "write" every read stays open even with
+      # authentication switched on, and the reads are where the disclosure is:
+      # the entity tree names the machines, the fault history is the
+      # maintenance record. Both are readable by anyone who can reach the port.
+      # GET /health and /auth/* stay public under "all" - see
+      # AllAuthRequirementPolicy, which documents why each one has to be.
+      require_auth_for: "all"
 
       # JWT issuer claim
       # Default: "ros2_medkit_gateway"

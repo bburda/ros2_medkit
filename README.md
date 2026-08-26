@@ -28,7 +28,7 @@ corner - and the only trace is a line buried in a log you would have to SSH in t
 Start ros2_medkit next to it (no changes to Nav2). The aborted goal becomes a fault:
 
 ```bash
-curl http://localhost:8080/api/v1/apps/bt_navigator/faults
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/bt_navigator/faults
 # → ACTION_NAVIGATE_TO_POSE_ABORTED  severity=ERROR  source=/bt_navigator  status=CONFIRMED
 #   + a black-box rosbag of the seconds around the failure
 ```
@@ -51,7 +51,7 @@ trajectory. Same story: the same action bridge surfaces the aborted move as a fa
 `move_group` entity, with the freeze-frame of what the arm was doing, without touching MoveIt.
 
 ```bash
-curl http://localhost:8080/api/v1/apps/move_group/faults
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/move_group/faults
 # → the aborted MoveGroup goal, as a structured fault with its snapshot
 ```
 

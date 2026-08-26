@@ -323,13 +323,13 @@ Step 7: Test in Hybrid Mode
 
    .. code-block:: bash
 
-      curl http://localhost:8080/api/v1/manifest/status | jq
+      curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/manifest/status | jq
 
 4. **Verify apps are linked**:
 
    .. code-block:: bash
 
-      curl http://localhost:8080/api/v1/apps | jq '.items[] | {id, name, is_online}'
+      curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps | jq '.items[] | {id, name, is_online}'
 
 5. **Check for orphan nodes** (warnings in gateway logs):
 

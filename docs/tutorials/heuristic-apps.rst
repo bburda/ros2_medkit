@@ -55,7 +55,7 @@ Query available Apps:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps | jq
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps | jq
 
 Example response:
 
@@ -120,16 +120,16 @@ In runtime mode, the gateway maps the ROS 2 graph as follows:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps
    # Returns: [{"id": "lidar_driver"}, {"id": "camera_node"}]
 
-   curl http://localhost:8080/api/v1/components
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components
    # Returns: [{"id": "my-hostname", "source": "runtime", ...}]
 
-   curl http://localhost:8080/api/v1/functions
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/functions
    # Returns: [{"id": "perception"}, {"id": "navigation"}]
 
-   curl http://localhost:8080/api/v1/areas
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/areas
    # Returns: {"items": []}  (empty - Areas come from manifest only)
 
 API Endpoints
@@ -159,7 +159,7 @@ Component derived from system information:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/components | jq '.items[] | {id, source}'
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components | jq '.items[] | {id, source}'
 
 .. code-block:: json
 
@@ -177,7 +177,7 @@ In runtime mode, Functions are created from the first namespace segment:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/functions | jq '.items[] | {id}'
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/functions | jq '.items[] | {id}'
 
 .. code-block:: json
 

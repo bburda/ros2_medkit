@@ -173,7 +173,7 @@ Check manifest status:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/manifest/status
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/manifest/status
 
 Expected response:
 
@@ -195,13 +195,13 @@ List apps:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps
 
 List functions:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/functions
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/functions
 
 Understanding Hybrid Mode
 -------------------------
@@ -336,7 +336,7 @@ Check which apps are online:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps | jq '.items[] | {id, name, is_online}'
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps | jq '.items[] | {id, name, is_online}'
 
 Example response:
 

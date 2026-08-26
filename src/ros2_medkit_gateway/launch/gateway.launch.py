@@ -94,6 +94,30 @@ def generate_launch_description():
             'controls the periodic forced refresh. Must match the default '
             'in config/gateway_params.yaml.'))
 
+    declare_jwt_secret_arg = DeclareLaunchArgument(
+        'jwt_secret', default_value='',
+        description=(
+            'HS256 signing secret, at least 32 characters. REQUIRED: the '
+            'shipped config has auth.enabled true, and the gateway refuses to '
+            'start without a secret. Pass one here, or point config_file at a '
+            'file that sets auth.jwt_secret and auth.clients. To run without '
+            'authentication - only ever on a host nothing else can reach - '
+            'pass auth_enabled:=false explicitly.'))
+
+    declare_auth_enabled_arg = DeclareLaunchArgument(
+        'auth_enabled', default_value='true',
+        description=(
+            'Require a credential. On by default, matching the shipped '
+            'config. Turning it off makes the entity tree, the fault history '
+            'and every operation readable by anyone who can reach the port.'))
+
+    declare_clients_arg = DeclareLaunchArgument(
+        'auth_clients', default_value='',
+        description=(
+            'Comma-separated "client_id:client_secret:role" triples '
+            '(roles: viewer, operator, configurator, admin). Needed to obtain '
+            'a token from /auth/token.'))
+
     declare_cors_arg = DeclareLaunchArgument(
         'cors_allowed_origins',
         default_value=CORS_DEFAULT,
@@ -120,6 +144,24 @@ def generate_launch_description():
         param_overrides.update(cors_override(
             LaunchConfiguration('cors_allowed_origins').perform(context),
             LaunchConfiguration('config_file').perform(context), default_config))
+
+        auth_enabled = LaunchConfiguration('auth_enabled').perform(context).lower() in (
+            'true', '1', 'yes')
+        param_overrides['auth.enabled'] = auth_enabled
+        jwt_secret = LaunchConfiguration('jwt_secret').perform(context)
+        clients = LaunchConfiguration('auth_clients').perform(context)
+        if jwt_secret:
+            param_overrides['auth.jwt_secret'] = jwt_secret
+        if clients:
+            param_overrides['auth.clients'] = [c for c in clients.split(',') if c]
+        if auth_enabled and not jwt_secret:
+            # The gateway would refuse to start a moment from now with a
+            # message about the config file. Say the actionable thing instead,
+            # here, where the launch argument that fixes it is in scope.
+            print('[gateway.launch.py] auth is enabled and no jwt_secret was given. '
+                  'Pass jwt_secret:=<at least 32 chars> and '
+                  'auth_clients:=<id>:<secret>:admin, set them in a config_file, '
+                  'or pass auth_enabled:=false to run without authentication.')
         return [Node(
             package='ros2_medkit_gateway',
             executable='gateway_node',
@@ -133,6 +175,9 @@ def generate_launch_description():
         declare_host_arg,
         declare_port_arg,
         declare_refresh_arg,
+        declare_auth_enabled_arg,
+        declare_jwt_secret_arg,
+        declare_clients_arg,
         declare_cors_arg,
         OpaqueFunction(function=_launch_setup),
     ])

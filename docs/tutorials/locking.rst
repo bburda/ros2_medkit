@@ -117,7 +117,7 @@ Check what locks exist on an entity:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/components/motor_controller/locks \
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/motor_controller/locks \
      -H "X-Client-Id: $CLIENT_ID"
 
 The ``owned`` field in each lock item indicates whether the requesting client

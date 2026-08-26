@@ -1,15 +1,28 @@
 Gateway hardening (secure field profile)
 ========================================
 
-The gateway ships every transport and access control needed for a hardened
-deployment - JWT authentication with RBAC, TLS/HTTPS, restricted CORS, and
-token-bucket rate limiting - but they are **disabled by default** so local
-development works out of the box. A gateway exposed on a plant network with the
-defaults is wide open: unauthenticated reads and writes over cleartext HTTP.
+The gateway ships **closed**. ``config/gateway_params.yaml`` sets
+``auth.enabled: true``, ``auth.require_auth_for: "all"`` and
+``server.tls.enabled: true``, so out of the box every route needs a credential
+and the transport is encrypted.
 
-For any deployment reachable from an untrusted network, start from the secure
-field profile preset ``config/gateway_params.secure.yaml`` instead of
-``config/gateway_params.yaml``:
+Two consequences worth stating plainly:
+
+* **The gateway refuses to start without a signing secret.** With auth enabled
+  and ``auth.jwt_secret`` empty it exits with "JWT secret is required when
+  authentication is enabled" (and HS256 additionally requires at least 32
+  characters). This is intended. A gateway that will not boot is a deployment
+  problem someone fixes in a minute; a gateway that booted open is one nobody
+  notices.
+* **``GET /api/v1/health`` and ``/api/v1/auth/*`` stay public.** Health so a
+  container supervisor or load balancer with no credential can tell the
+  process is alive - it carries a fixed status document and no topology. Auth
+  because authentication cannot bootstrap through a door that already demands
+  the credential it exists to hand out. Nothing else is exempt.
+
+For a deployment reachable from an untrusted network, the remaining controls -
+restricted CORS, rate limiting, locking, a reduced surface - are collected in
+the secure field profile preset ``config/gateway_params.secure.yaml``:
 
 .. code-block:: bash
 
@@ -24,9 +37,10 @@ What the secure profile turns on
 ================================ ============== ===========================================
 Control                          Default        Secure profile
 ================================ ============== ===========================================
-``auth.enabled``                 false          true
-``auth.require_auth_for``        write          all (auth on reads + writes)
-``server.tls.enabled``           false          true (HTTPS, min TLS 1.3)
+``auth.enabled``                 true           true
+``auth.require_auth_for``        all            all (auth on reads + writes)
+``server.tls.enabled``           true           true (HTTPS, min TLS 1.3)
+``auth.jwt_secret``              *unset*        *unset* - both REQUIRE one at deploy time
 ``cors.allowed_origins``         ``[]``         explicit origin list (no wildcard)
 ``rate_limiting.enabled``        false          true (global + per-client + per-endpoint)
 ``scripts.allow_uploads``        true           false (manifest-defined scripts only)
@@ -34,6 +48,20 @@ Control                          Default        Secure profile
 ``bulk_data.max_upload_size``    100 MiB        25 MiB
 ``locking`` on operations        none           lock required before mutation
 ================================ ============== ===========================================
+
+The access-control rows now match: the difference between the two files is the
+surface reduction below them, not whether the door is locked.
+
+Running without authentication
+------------------------------
+
+On a host nothing else can reach - a laptop, a CI job, a single-container demo
+- pass ``auth_enabled:=false`` to ``gateway.launch.py``, or set
+``auth.enabled: false`` in your own params file. Do this deliberately and never
+on a machine reachable from a plant or office network: with authentication off
+the entity tree names the machines, the fault history is the maintenance record
+of the line, and every registered operation is callable by anyone who can reach
+the port.
 
 Credential and certificate provisioning
 ----------------------------------------

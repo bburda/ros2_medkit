@@ -15,16 +15,16 @@ Append ``/docs`` to any valid API path:
 .. code-block:: bash
 
    # Full gateway spec (all endpoints)
-   curl http://localhost:8080/api/v1/docs | jq .
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/docs | jq .
 
    # Spec scoped to the components collection
-   curl http://localhost:8080/api/v1/components/docs
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/docs
 
    # Spec for a specific component and its resource collections
-   curl http://localhost:8080/api/v1/components/my_sensor/docs
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/my_sensor/docs
 
    # Spec for one resource collection (e.g. data)
-   curl http://localhost:8080/api/v1/components/my_sensor/data/docs
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/my_sensor/data/docs
 
 Entity-level specs reflect the actual capabilities of each entity at
 runtime. Plugin-registered vendor routes also appear when the requested

@@ -61,7 +61,7 @@ Test the gateway:
    curl http://localhost:8080/api/v1/health
    # {"status":"healthy","timestamp":...}
 
-   curl http://localhost:8080/api/v1/version-info
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/version-info
    # {"items":[{"version":"<gateway-version>","vendor_info":{"name":"ros2_medkit",...}}]}
 
 Custom Configuration

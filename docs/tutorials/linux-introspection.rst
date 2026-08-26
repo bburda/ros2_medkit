@@ -112,7 +112,7 @@ Returns process-level metrics for a single ROS 2 node:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps/temp_sensor/x-medkit-procfs | jq
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/temp_sensor/x-medkit-procfs | jq
 
 .. code-block:: json
 
@@ -136,7 +136,7 @@ Each entry includes a ``node_ids`` array listing the Apps that share the process
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/components/sensor_suite/x-medkit-procfs | jq
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/sensor_suite/x-medkit-procfs | jq
 
 .. code-block:: json
 
@@ -167,7 +167,7 @@ Returns the systemd unit managing the node's process:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps/temp_sensor/x-medkit-systemd | jq
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/temp_sensor/x-medkit-systemd | jq
 
 .. code-block:: json
 
@@ -186,7 +186,7 @@ Returns aggregated unit info for all child Apps, deduplicated by unit name:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/components/sensor_suite/x-medkit-systemd | jq
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/sensor_suite/x-medkit-systemd | jq
 
 .. code-block:: json
 
@@ -213,7 +213,7 @@ Returns container metadata for a node running inside a container:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps/temp_sensor/x-medkit-container | jq
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/temp_sensor/x-medkit-container | jq
 
 .. code-block:: json
 
@@ -249,7 +249,7 @@ Returns aggregated container info for all child Apps, deduplicated by container 
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/components/sensor_suite/x-medkit-container | jq
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/sensor_suite/x-medkit-container | jq
 
 .. code-block:: json
 

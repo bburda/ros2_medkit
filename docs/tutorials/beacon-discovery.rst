@@ -259,7 +259,7 @@ The plugin registers a vendor extension endpoint on all apps and components:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps/engine_temp_sensor/x-medkit-topic-beacon
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/engine_temp_sensor/x-medkit-topic-beacon
 
 Example response:
 
@@ -460,7 +460,7 @@ The plugin registers its own vendor extension endpoint:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps/engine_temp_sensor/x-medkit-param-beacon
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/engine_temp_sensor/x-medkit-param-beacon
 
 The response format is identical to the topic beacon endpoint.
 
