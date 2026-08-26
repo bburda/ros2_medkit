@@ -818,32 +818,12 @@ void CapabilityGenerator::add_cache_derived_items(nlohmann::json & paths, const 
     }
   }
 
-  // The id documented for an item has to be the id the collection emits, or
-  // the document describes a request the gateway then refuses - and a path key
-  // two operations produce documents one of them and drops the other, because
-  // the second `paths[key] = ...` overwrites the first. Both halves follow the
-  // collection's own rule: `operation_item_half` decides the item half, and a
-  // short name more than one member carries is qualified with its owner.
-  std::unordered_map<std::string, size_t> short_name_counts;
-  for (const auto & svc : ops.services) {
-    ++short_name_counts[svc.name];
-  }
-  for (const auto & action : ops.actions) {
-    ++short_name_counts[action.name];
-  }
-  const auto owner_of = [&ops](const std::string & full_path) -> std::string {
-    auto owner = ops.owner_by_path.find(full_path);
-    return owner != ops.owner_by_path.end() ? owner->second : std::string{};
-  };
-  const auto addressed_by_path = http::operation_paths_addressed_by_path(ops);
-  const auto operation_id_of = [&](const std::string & name, const std::string & full_path) -> std::string {
-    std::string item_half = http::operation_item_half(name, full_path, addressed_by_path);
-    const std::string owner = owner_of(full_path);
-    if (short_name_counts[name] < 2 || owner.empty()) {
-      return item_half;
-    }
-    return http::make_member_qualified_id(owner, item_half);
-  };
+  // The id documented for an item has to be the id the collection emits, or the
+  // document describes a request the gateway then refuses. `operation_item_ids`
+  // is the one place that rule lives, so this producer and the collection
+  // cannot drift apart, and it also reports the ids no caller can reach.
+  const auto item_ids = http::operation_item_ids(ops);
+  std::size_t next_index = 0;
 
   // A specific-resource request may name its owning member, which is how the
   // collection addresses a short name that more than one member exposes.
@@ -858,12 +838,19 @@ void CapabilityGenerator::add_cache_derived_items(nlohmann::json & paths, const 
     return owner != ops.owner_by_path.end() && owner->second == requested.member_id;
   };
 
+  // Consumed in the order `operation_item_ids` filled it: services, then
+  // actions, matching the two loops below.
   const auto emit_operation = [&](const auto & op) {
+    const std::string item_id = item_ids.ids[next_index++];
     if (one_item && !(names_match(op.name, requested.item_id) && owned_by_requested(op.full_path))) {
       return;
     }
-    emit(one_item ? sibling_key : collection_path + "/" + operation_id_of(op.name, op.full_path),
-         path_builder.build_operation_item(entity_path, op));
+    // An id that names two operations answers 400, and the second write would
+    // silently replace the first, so no concrete item is published for it.
+    if (item_ids.ambiguous(item_id)) {
+      return;
+    }
+    emit(one_item ? sibling_key : collection_path + "/" + item_id, path_builder.build_operation_item(entity_path, op));
   };
   for (const auto & svc : ops.services) {
     emit_operation(svc);

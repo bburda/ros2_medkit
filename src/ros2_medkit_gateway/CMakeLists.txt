@@ -786,6 +786,10 @@ if(BUILD_TESTING)
   medkit_add_gtest(test_entity_resource_model test/test_entity_resource_model.cpp)
   target_link_libraries(test_entity_resource_model gateway_ros2)
 
+  # Operation item-id addressing rules (pure: takes an AggregatedOperations).
+  medkit_add_gtest(test_operation_item_id test/test_operation_item_id.cpp)
+  target_link_libraries(test_operation_item_id gateway_ros2)
+
   # Function/Area resource collection aggregation tests
   medkit_add_gtest(test_function_resource_collections test/test_function_resource_collections.cpp)
   target_link_libraries(test_function_resource_collections gateway_ros2)
