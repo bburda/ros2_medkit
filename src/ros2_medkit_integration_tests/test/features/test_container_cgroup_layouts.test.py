@@ -55,10 +55,15 @@ MEMORY_BYTES = 536870912
 QUOTA_US = 50000
 PERIOD_US = 100000
 
-# The cgroup the process is actually in, per v1 case.
+# The cgroup the process is actually in, per v1 case. The CPU quota differs too:
+# with one shared quota, a reader taking the wrong directory still returned the
+# expected number and every CPU assertion passed.
 V1_JOINED_BYTES = 536870912
+V1_JOINED_QUOTA = 50000
 V1_BARE_BYTES = 268435456
+V1_BARE_QUOTA = 25000
 V1_SECOND_BYTES = 111111168
+V1_SECOND_QUOTA = 12500
 
 # Further containers, so grouping has more than one entry to keep apart.
 OTHER_ID = 'ccdd445566778899' * 4
@@ -84,7 +89,7 @@ def _build_tree(root):
     # cgroup v1, gateway on the host: the reported path leads into the
     # hierarchy, so the limits sit under the mount point joined with it.
     write_process(root, 4101, '/powertrain/engine/temp_sensor', v1_cgroup(docker_path))
-    v1_limits(root, docker_path, memory_bytes=V1_JOINED_BYTES, quota_us=QUOTA_US,
+    v1_limits(root, docker_path, memory_bytes=V1_JOINED_BYTES, quota_us=V1_JOINED_QUOTA,
               period_us=PERIOD_US)
 
     # cgroup v1 seen from inside the container: Docker bind-mounts the
@@ -95,13 +100,14 @@ def _build_tree(root):
     inside_path = '/docker/' + INSIDE_ID
     write_process(root, 4102, '/powertrain/engine/rpm_sensor', v1_cgroup(inside_path),
                   mountinfo=OVERLAY_MOUNTINFO, markers=['.dockerenv'])
-    v1_limits(root, '', memory_bytes=V1_BARE_BYTES, quota_us=QUOTA_US, period_us=PERIOD_US)
+    v1_limits(root, '', memory_bytes=V1_BARE_BYTES, quota_us=V1_BARE_QUOTA,
+              period_us=PERIOD_US)
 
     # cgroup v1, second container, with its own number so the first container's
     # value cannot stand in for it.
     other_path = '/docker/' + OTHER_ID
     write_process(root, 4103, '/chassis/brakes/pressure_sensor', v1_cgroup(other_path))
-    v1_limits(root, other_path, memory_bytes=V1_SECOND_BYTES, quota_us=QUOTA_US,
+    v1_limits(root, other_path, memory_bytes=V1_SECOND_BYTES, quota_us=V1_SECOND_QUOTA,
               period_us=PERIOD_US)
 
     # Hybrid: the unified line is the bare root, so the container is named only
@@ -204,11 +210,11 @@ class TestContainerCgroupLayouts(GatewayTestCase):
             '/apps/{}/x-medkit-container'.format(app_id), _ready
         )
 
-    def _assert_limited(self, data, app_id, memory_bytes=MEMORY_BYTES):
+    def _assert_limited(self, data, app_id, memory_bytes=MEMORY_BYTES, quota_us=QUOTA_US):
         self.assertEqual(data['memory_limit_state'], 'limited', app_id)
         self.assertEqual(data['memory_limit_bytes'], memory_bytes, app_id)
         self.assertEqual(data['cpu_quota_state'], 'limited', app_id)
-        self.assertEqual(data['cpu_quota_us'], QUOTA_US, app_id)
+        self.assertEqual(data['cpu_quota_us'], quota_us, app_id)
         self.assertEqual(data['cpu_period_us'], PERIOD_US, app_id)
 
     def test_01_v1_host_namespace_joined_path(self):
@@ -216,13 +222,13 @@ class TestContainerCgroupLayouts(GatewayTestCase):
         data = self._container('temp_sensor')
         self.assertEqual(data['container_id'], DOCKER_ID)
         self.assertEqual(data['runtime'], 'docker')
-        self._assert_limited(data, 'temp_sensor', V1_JOINED_BYTES)
+        self._assert_limited(data, 'temp_sensor', V1_JOINED_BYTES, V1_JOINED_QUOTA)
 
     def test_02_v1_inside_container_bare_mount(self):
         """Legacy hierarchy where the reported path resolves nowhere inside the container."""
         data = self._container('rpm_sensor')
         self.assertEqual(data['container_id'], INSIDE_ID)
-        self._assert_limited(data, 'rpm_sensor', V1_BARE_BYTES)
+        self._assert_limited(data, 'rpm_sensor', V1_BARE_BYTES, V1_BARE_QUOTA)
 
     def test_03_v1_second_container_reports_its_own_limit(self):
         """A second container reports its own number, not the first one's.
@@ -233,13 +239,13 @@ class TestContainerCgroupLayouts(GatewayTestCase):
         """
         data = self._container('pressure_sensor')
         self.assertEqual(data['container_id'], OTHER_ID)
-        self._assert_limited(data, 'pressure_sensor', V1_SECOND_BYTES)
+        self._assert_limited(data, 'pressure_sensor', V1_SECOND_BYTES, V1_SECOND_QUOTA)
 
     def test_04_hybrid_layout_reads_the_legacy_hierarchy(self):
         """With the unified line at the root, the container is named by cgroup v1."""
         data = self._container('status_sensor')
         self.assertEqual(data['container_id'], DOCKER_ID)
-        self._assert_limited(data, 'status_sensor', V1_JOINED_BYTES)
+        self._assert_limited(data, 'status_sensor', V1_JOINED_BYTES, V1_JOINED_QUOTA)
 
     def test_05_no_limit_configured_reports_unlimited(self):
         """An unconstrained container is 'unlimited', and carries no number."""
