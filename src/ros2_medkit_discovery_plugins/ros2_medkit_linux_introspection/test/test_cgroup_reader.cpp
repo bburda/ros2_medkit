@@ -758,6 +758,76 @@ TEST_F(CgroupTree, V1MountExposingASubtreeStripsItFromThePath) {
   EXPECT_EQ(*info.memory_limit.value(), 268435456u);
 }
 
+// A controller lives on one hierarchy. The other one reporting no limit must
+// not outrank the real limit the process actually has.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, UnlimitedUnifiedDoesNotOutrankALimitedLegacyController) {
+  write_proc_cgroup(42, std::string("0::/\n12:memory:/docker/") + kDockerId + "\n");
+  write_file("sys/fs/cgroup/memory.max", "max\n");
+  write_file(std::string("sys/fs/cgroup/memory/docker/") + kDockerId + "/memory.limit_in_bytes", "536870912\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kLimited);
+  ASSERT_TRUE(info.memory_limit.value().has_value());
+  EXPECT_EQ(*info.memory_limit.value(), 536870912u);
+}
+
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, UnlimitedUnifiedCpuDoesNotOutrankALimitedLegacyQuota) {
+  write_proc_cgroup(42, std::string("0::/\n11:cpu,cpuacct:/docker/") + kDockerId + "\n");
+  write_file("sys/fs/cgroup/cpu.max", "max 100000\n");
+  write_file(std::string("sys/fs/cgroup/cpu,cpuacct/docker/") + kDockerId + "/cpu.cfs_quota_us", "50000\n");
+  write_file(std::string("sys/fs/cgroup/cpu,cpuacct/docker/") + kDockerId + "/cpu.cfs_period_us", "100000\n");
+
+  auto info = read();
+  EXPECT_EQ(info.cpu_quota.state(), LimitState::kLimited);
+  ASSERT_TRUE(info.cpu_quota.value().has_value());
+  EXPECT_EQ(*info.cpu_quota.value(), 50000);
+}
+
+// A mount root only matches on a component boundary: /docker/parent must not
+// swallow /docker/parent2, which is a different cgroup.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, MountRootMatchesOnlyWholePathComponents) {
+  write_proc_cgroup(42, "12:memory:/docker/parent2/child\n");
+  write_file("proc/42/mountinfo",
+             "25 1 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n"
+             "30 25 0:26 /docker/parent /sys/fs/cgroup/memory rw,relatime - cgroup cgroup rw,memory\n");
+  // What the bad prefix strip would have built, holding a limit that belongs to
+  // a cgroup this mount does not expose.
+  write_file("sys/fs/cgroup/memory2/child/memory.limit_in_bytes", "999999999\n");
+
+  auto info = read();
+  EXPECT_NE(info.memory_limit.state(), LimitState::kLimited);
+}
+
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, SystemdNspawnMarkerIsDetected) {
+  write_proc_cgroup(42, "0::/\n");
+  write_file("proc/42/root/run/systemd/container", "systemd-nspawn\n");
+
+  EXPECT_TRUE(is_containerized(42, root()));
+  auto info = read();
+  EXPECT_TRUE(info.containerized);
+  EXPECT_TRUE(info.container_runtime.empty());
+}
+
+// The unified hierarchy can be mounted somewhere other than /sys/fs/cgroup, and
+// can expose only part of itself, exactly like a legacy controller.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, UnifiedHierarchyAtACustomMountPointWithASubtreeRoot) {
+  write_proc_cgroup(42, "0::/tenant/workload\n");
+  write_file("proc/42/mountinfo",
+             "25 1 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n"
+             "30 25 0:26 /tenant /custom/unified rw,relatime - cgroup2 cgroup rw\n");
+  write_file("custom/unified/workload/memory.max", "268435456\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kLimited);
+  ASSERT_TRUE(info.memory_limit.value().has_value());
+  EXPECT_EQ(*info.memory_limit.value(), 268435456u);
+}
+
 // @verifies REQ_INTEROP_003
 TEST_F(CgroupTree, MissingCgroupFileIsAnError) {
   fs::create_directories(root_ / "proc" / "42");

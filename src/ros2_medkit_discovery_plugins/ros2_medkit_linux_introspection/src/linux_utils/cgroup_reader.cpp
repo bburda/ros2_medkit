@@ -15,10 +15,13 @@
 #include "ros2_medkit_linux_introspection/cgroup_reader.hpp"
 
 #include <cctype>
+#include <cerrno>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <regex>
 #include <sstream>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -54,15 +57,26 @@ struct LimitFile {
 
 LimitFile read_limit_file(const std::string & path) {
   LimitFile result;
-  std::ifstream f(path);
-  if (f.is_open()) {
-    result.exists = true;
-    result.opened = true;
-    std::getline(f, result.line);
+  // errno on the single open call separates "no such file" from "present but
+  // it would not open". Opening and then asking whether the path exists is two
+  // steps, and a file that disappears between them reads as absent when it was
+  // really a failed read.
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    result.exists = (errno != ENOENT);
     return result;
   }
-  std::error_code ec;
-  result.exists = std::filesystem::exists(path, ec);
+  result.exists = true;
+  result.opened = true;
+
+  std::string buffer(4096, '\0');
+  auto count = ::read(fd, buffer.data(), buffer.size());
+  ::close(fd);
+  if (count > 0) {
+    buffer.resize(static_cast<size_t>(count));
+    auto newline = buffer.find('\n');
+    result.line = newline == std::string::npos ? buffer : buffer.substr(0, newline);
+  }
   return result;
 }
 
@@ -333,7 +347,11 @@ bool mount_carries_controller(const CgroupMount & mount, const std::string & con
 void append_mount_dirs(std::vector<std::string> & dirs, const CgroupMount & mount, const std::string & cgroup_path) {
   if (mount.mount_root != "/" && !mount.mount_root.empty() && cgroup_path.rfind(mount.mount_root, 0) == 0) {
     auto relative = cgroup_path.substr(mount.mount_root.size());
-    dirs.push_back(relative.empty() ? mount.mount_point : mount.mount_point + relative);
+    // The prefix has to end on a component boundary, or /docker/parent matches
+    // /docker/parent2/child and names a cgroup this mount does not expose.
+    if (relative.empty() || relative.front() == '/') {
+      dirs.push_back(relative.empty() ? mount.mount_point : mount.mount_point + relative);
+    }
   }
   if (!cgroup_path.empty() && cgroup_path != "/") {
     dirs.push_back(mount.mount_point + cgroup_path);
@@ -377,6 +395,25 @@ struct CpuLimit {
 };
 
 CpuLimit better_of(const CpuLimit & first, const CpuLimit & second) {
+  return first.quota.state() == LimitState::kUnavailable ? second : first;
+}
+
+// Merges the answers from two different hierarchies. A controller is mounted on
+// the unified hierarchy or on a legacy one, never both, so the hierarchy that
+// does not carry it reports no limit rather than nothing at all. Preferring a
+// real limit keeps that empty answer from deciding.
+template <typename T>
+CgroupLimit<T> across_hierarchies(const CgroupLimit<T> & first, const CgroupLimit<T> & second) {
+  if (second.state() == LimitState::kLimited && first.state() != LimitState::kLimited) {
+    return second;
+  }
+  return first.state() == LimitState::kUnavailable ? second : first;
+}
+
+CpuLimit across_hierarchies(const CpuLimit & first, const CpuLimit & second) {
+  if (second.quota.state() == LimitState::kLimited && first.quota.state() != LimitState::kLimited) {
+    return second;
+  }
   return first.quota.state() == LimitState::kUnavailable ? second : first;
 }
 
@@ -551,14 +588,17 @@ tl::expected<CgroupInfo, std::string> read_cgroup_info(pid_t pid, const std::str
     }
   }
 
-  CpuLimit cpu;
-
   // The conventional mount points come first because they are the ones a
   // gateway can reach when it does not share the target's mount namespace.
   // The mounts read from the target's own mountinfo are tried after them, so a
   // host that puts its controllers somewhere else is still covered and a
   // cross-namespace path that resolves to nothing here simply does not match.
   const auto mounts = read_cgroup_mounts(pid, root);
+
+  CgroupLimit<uint64_t> memory_v2;
+  CgroupLimit<uint64_t> memory_v1;
+  CpuLimit cpu_v2;
+  CpuLimit cpu_v1;
 
   if (!paths.unified.empty()) {
     std::vector<std::string> dirs;
@@ -573,8 +613,8 @@ tl::expected<CgroupInfo, std::string> read_cgroup_info(pid_t pid, const std::str
       }
     }
     for (const auto & dir : dirs) {
-      info.memory_limit = better_of(info.memory_limit, read_memory_v2(dir));
-      cpu = better_of(cpu, read_cpu_v2(dir));
+      memory_v2 = better_of(memory_v2, read_memory_v2(dir));
+      cpu_v2 = better_of(cpu_v2, read_cpu_v2(dir));
     }
   }
 
@@ -591,7 +631,7 @@ tl::expected<CgroupInfo, std::string> read_cgroup_info(pid_t pid, const std::str
       }
     }
     for (const auto & dir : dirs) {
-      info.memory_limit = better_of(info.memory_limit, read_memory_v1(dir));
+      memory_v1 = better_of(memory_v1, read_memory_v1(dir));
     }
   }
 
@@ -608,10 +648,12 @@ tl::expected<CgroupInfo, std::string> read_cgroup_info(pid_t pid, const std::str
       }
     }
     for (const auto & dir : dirs) {
-      cpu = better_of(cpu, read_cpu_v1(dir));
+      cpu_v1 = better_of(cpu_v1, read_cpu_v1(dir));
     }
   }
 
+  info.memory_limit = across_hierarchies(memory_v2, memory_v1);
+  auto cpu = across_hierarchies(cpu_v2, cpu_v1);
   info.cpu_quota = cpu.quota;
   info.cpu_period_us = cpu.period_us;
   return info;
