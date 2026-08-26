@@ -49,13 +49,20 @@ from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
-# 512 MiB and half a CPU, the numbers every layout below is set to report.
+# Every candidate location gets its own number. Sharing one value would let the
+# reader pick the wrong directory and still produce the expected answer.
 MEMORY_BYTES = 536870912
 QUOTA_US = 50000
 PERIOD_US = 100000
 
+# The cgroup the process is actually in, per v1 case.
+V1_JOINED_BYTES = 536870912
+V1_BARE_BYTES = 268435456
+V1_SECOND_BYTES = 111111168
+
 # Further containers, so grouping has more than one entry to keep apart.
 OTHER_ID = 'ccdd445566778899' * 4
+INSIDE_ID = 'bbcc556677889900' * 4
 THIRD_ID = 'eeff001122334455' * 4
 FOURTH_ID = '0011223344556677' * 4
 
@@ -77,20 +84,25 @@ def _build_tree(root):
     # cgroup v1, gateway on the host: the reported path leads into the
     # hierarchy, so the limits sit under the mount point joined with it.
     write_process(root, 4101, '/powertrain/engine/temp_sensor', v1_cgroup(docker_path))
-    v1_limits(root, docker_path, memory_bytes=MEMORY_BYTES, quota_us=QUOTA_US, period_us=PERIOD_US)
+    v1_limits(root, docker_path, memory_bytes=V1_JOINED_BYTES, quota_us=QUOTA_US,
+              period_us=PERIOD_US)
 
-    # cgroup v1, same container, seen from inside it: Docker bind-mounts the
+    # cgroup v1 seen from inside the container: Docker bind-mounts the
     # container's own cgroup over /sys/fs/cgroup/<controller>, so the reported
-    # path resolves nowhere and the files are at the mount point itself.
-    write_process(root, 4102, '/powertrain/engine/rpm_sensor', v1_cgroup(docker_path),
+    # path resolves nowhere and the files sit at the mount point itself. Its
+    # number differs from every joined path, so reading the wrong candidate
+    # produces the wrong value rather than the expected one.
+    inside_path = '/docker/' + INSIDE_ID
+    write_process(root, 4102, '/powertrain/engine/rpm_sensor', v1_cgroup(inside_path),
                   mountinfo=OVERLAY_MOUNTINFO, markers=['.dockerenv'])
-    v1_limits(root, '', memory_bytes=MEMORY_BYTES, quota_us=QUOTA_US, period_us=PERIOD_US)
+    v1_limits(root, '', memory_bytes=V1_BARE_BYTES, quota_us=QUOTA_US, period_us=PERIOD_US)
 
-    # cgroup v1, second container. Its hierarchy root reads as unlimited, which
-    # must not mask the limit set on the container's own cgroup below it.
+    # cgroup v1, second container, with its own number so the first container's
+    # value cannot stand in for it.
     other_path = '/docker/' + OTHER_ID
     write_process(root, 4103, '/chassis/brakes/pressure_sensor', v1_cgroup(other_path))
-    v1_limits(root, other_path, memory_bytes=MEMORY_BYTES, quota_us=QUOTA_US, period_us=PERIOD_US)
+    v1_limits(root, other_path, memory_bytes=V1_SECOND_BYTES, quota_us=QUOTA_US,
+              period_us=PERIOD_US)
 
     # Hybrid: the unified line is the bare root, so the container is named only
     # on the legacy hierarchies and the limits come from there.
@@ -192,9 +204,9 @@ class TestContainerCgroupLayouts(GatewayTestCase):
             '/apps/{}/x-medkit-container'.format(app_id), _ready
         )
 
-    def _assert_limited(self, data, app_id):
+    def _assert_limited(self, data, app_id, memory_bytes=MEMORY_BYTES):
         self.assertEqual(data['memory_limit_state'], 'limited', app_id)
-        self.assertEqual(data['memory_limit_bytes'], MEMORY_BYTES, app_id)
+        self.assertEqual(data['memory_limit_bytes'], memory_bytes, app_id)
         self.assertEqual(data['cpu_quota_state'], 'limited', app_id)
         self.assertEqual(data['cpu_quota_us'], QUOTA_US, app_id)
         self.assertEqual(data['cpu_period_us'], PERIOD_US, app_id)
@@ -204,25 +216,30 @@ class TestContainerCgroupLayouts(GatewayTestCase):
         data = self._container('temp_sensor')
         self.assertEqual(data['container_id'], DOCKER_ID)
         self.assertEqual(data['runtime'], 'docker')
-        self._assert_limited(data, 'temp_sensor')
+        self._assert_limited(data, 'temp_sensor', V1_JOINED_BYTES)
 
     def test_02_v1_inside_container_bare_mount(self):
         """Legacy hierarchy where the reported path resolves nowhere inside the container."""
         data = self._container('rpm_sensor')
-        self.assertEqual(data['container_id'], DOCKER_ID)
-        self._assert_limited(data, 'rpm_sensor')
+        self.assertEqual(data['container_id'], INSIDE_ID)
+        self._assert_limited(data, 'rpm_sensor', V1_BARE_BYTES)
 
-    def test_03_v1_hierarchy_root_does_not_mask_the_limit(self):
-        """The always-unlimited v1 root must not win over the container's own cgroup."""
+    def test_03_v1_second_container_reports_its_own_limit(self):
+        """A second container reports its own number, not the first one's.
+
+        The always-unlimited hierarchy root is covered by the reader's own test
+        V1RootFilesDoNotMaskContainerLimit, which needs a tree where the root is
+        the sentinel; here the root is one container's cgroup.
+        """
         data = self._container('pressure_sensor')
         self.assertEqual(data['container_id'], OTHER_ID)
-        self._assert_limited(data, 'pressure_sensor')
+        self._assert_limited(data, 'pressure_sensor', V1_SECOND_BYTES)
 
     def test_04_hybrid_layout_reads_the_legacy_hierarchy(self):
         """With the unified line at the root, the container is named by cgroup v1."""
         data = self._container('status_sensor')
         self.assertEqual(data['container_id'], DOCKER_ID)
-        self._assert_limited(data, 'status_sensor')
+        self._assert_limited(data, 'status_sensor', V1_JOINED_BYTES)
 
     def test_05_no_limit_configured_reports_unlimited(self):
         """An unconstrained container is 'unlimited', and carries no number."""
@@ -270,17 +287,25 @@ class TestContainerCgroupLayouts(GatewayTestCase):
         data = self.poll_endpoint_until(
             '/components/{}/x-medkit-container'.format(components[0]['id']), _ready
         )
-        by_id = {c['container_id']: c for c in data['containers'] if c['container_id']}
+        identified = [c for c in data['containers'] if c['container_id']]
+        ids = [c['container_id'] for c in identified]
+        self.assertEqual(
+            len(ids), len(set(ids)), 'duplicate container entries: {}'.format(ids)
+        )
+        by_id = {c['container_id']: c for c in identified}
 
         self.assertIn(DOCKER_ID, by_id)
         self.assertIn(OTHER_ID, by_id)
-        # temp_sensor, rpm_sensor and status_sensor all report the same
-        # container, so they belong to one entry rather than three.
+        # temp_sensor and status_sensor report the same container, so they
+        # belong to one entry rather than two. rpm_sensor is a different
+        # container and keeps its own.
         self.assertEqual(
-            set(by_id[DOCKER_ID]['node_ids']),
-            {'temp_sensor', 'rpm_sensor', 'status_sensor'},
+            set(by_id[DOCKER_ID]['node_ids']), {'temp_sensor', 'status_sensor'}
         )
-        self.assertEqual(by_id[DOCKER_ID]['memory_limit_bytes'], MEMORY_BYTES)
+        self.assertIn(INSIDE_ID, by_id)
+        self.assertEqual(set(by_id[INSIDE_ID]['node_ids']), {'rpm_sensor'})
+        self.assertEqual(by_id[INSIDE_ID]['memory_limit_bytes'], V1_BARE_BYTES)
+        self.assertEqual(by_id[DOCKER_ID]['memory_limit_bytes'], V1_JOINED_BYTES)
         # A different container keeps its own entry and its own limits.
         self.assertEqual(set(by_id[OTHER_ID]['node_ids']), {'pressure_sensor'})
         # controller is on the host and must not appear at all.

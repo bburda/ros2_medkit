@@ -129,7 +129,7 @@ jobs:
             log/
             build/*/test_results/
 
-  # ros2_medkit_graph_watchdog on the two distros build-and-test covers, in a job of its own.
+  # ros2_medkit_graph_watchdog on every distro, in a job of its own.
   # Same reasoning as sanitizer-graph-watchdog in quality.yml: the package's end-to-end suite runs
   # 24 minutes, the sweep it left had 3 minutes of headroom on humble and none at all on lyrical,
   # and a suite that grows with every new detector should not decide whether the packages behind it
@@ -185,10 +185,11 @@ jobs:
         run: apt-get install -y ccache
 
       - name: Restore ccache
-        # Restore, never save. This job compiles a subset of the sources build-and-test compiles,
-        # with the same flags, so that job's cache is a superset of what this one needs and serves
-        # its misses. A second copy would spend the repository's Actions cache quota twice over for
-        # one set of objects.
+        # Restore, never save. This job compiles a subset of the sources the distro's own
+        # sweep compiles, with the same flags, so that job's cache is a superset of what this
+        # one needs and serves its misses. A second copy would spend the repository's Actions
+        # cache quota twice over for one set of objects. The producer is build-and-test on
+        # humble and lyrical, and jazzy-test on jazzy, which is what ccache_prefix names.
         uses: actions/cache/restore@v4
         with:
           path: /root/.cache/ccache
