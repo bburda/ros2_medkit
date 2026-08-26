@@ -52,16 +52,22 @@ std::string trim(const std::string & text) {
 struct LimitFile {
   bool exists{false};
   bool opened{false};
+  bool complete{false};  // the first line ended at a newline or at end of file
   std::string line;
 };
 
+// A limit file holds one short line. Anything longer than this is not one, and
+// stopping there keeps a pathological path from being read without bound.
+constexpr size_t kMaxLimitFileBytes = 4096;
+
 LimitFile read_limit_file(const std::string & path) {
   LimitFile result;
-  // errno on the single open call separates "no such file" from "present but
-  // it would not open". Opening and then asking whether the path exists is two
-  // steps, and a file that disappears between them reads as absent when it was
-  // really a failed read.
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  // errno on the open separates "no such file" from "present but it would not
+  // open", in one step: asking afterwards whether the path exists is a second
+  // step, and a file that disappears in between reads as absent when it was
+  // really a failed read. O_NONBLOCK so that a path which turns out to be a
+  // FIFO cannot park the calling HTTP worker for the life of the process.
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) {
     result.exists = (errno != ENOENT);
     return result;
@@ -69,14 +75,30 @@ LimitFile read_limit_file(const std::string & path) {
   result.exists = true;
   result.opened = true;
 
-  std::string buffer(4096, '\0');
-  auto count = ::read(fd, buffer.data(), buffer.size());
-  ::close(fd);
-  if (count > 0) {
-    buffer.resize(static_cast<size_t>(count));
-    auto newline = buffer.find('\n');
-    result.line = newline == std::string::npos ? buffer : buffer.substr(0, newline);
+  std::string content;
+  char chunk[256];
+  while (content.size() < kMaxLimitFileBytes) {
+    auto count = ::read(fd, chunk, sizeof(chunk));
+    if (count < 0) {
+      if (errno == EINTR) {
+        continue;  // a signal, not an answer about the file
+      }
+      break;  // EISDIR, EAGAIN on an empty FIFO, a real read error
+    }
+    if (count == 0) {
+      result.complete = true;  // end of file
+      break;
+    }
+    content.append(chunk, static_cast<size_t>(count));
+    if (content.find('\n') != std::string::npos) {
+      result.complete = true;
+      break;
+    }
   }
+  ::close(fd);
+
+  auto newline = content.find('\n');
+  result.line = newline == std::string::npos ? content : content.substr(0, newline);
   return result;
 }
 
@@ -345,8 +367,12 @@ bool mount_carries_controller(const CgroupMount & mount, const std::string & con
 // Where a cgroup path is visible under a mount that exposes only part of the
 // hierarchy: the exposed subtree is stripped off the front of the path.
 void append_mount_dirs(std::vector<std::string> & dirs, const CgroupMount & mount, const std::string & cgroup_path) {
-  if (mount.mount_root != "/" && !mount.mount_root.empty() && cgroup_path.rfind(mount.mount_root, 0) == 0) {
-    auto relative = cgroup_path.substr(mount.mount_root.size());
+  auto mount_root = mount.mount_root;
+  while (mount_root.size() > 1 && mount_root.back() == '/') {
+    mount_root.pop_back();  // "/docker/parent/" names the same subtree
+  }
+  if (mount_root != "/" && !mount_root.empty() && cgroup_path.rfind(mount_root, 0) == 0) {
+    auto relative = cgroup_path.substr(mount_root.size());
     // The prefix has to end on a component boundary, or /docker/parent matches
     // /docker/parent2/child and names a cgroup this mount does not expose.
     if (relative.empty() || relative.front() == '/') {
@@ -398,23 +424,24 @@ CpuLimit better_of(const CpuLimit & first, const CpuLimit & second) {
   return first.quota.state() == LimitState::kUnavailable ? second : first;
 }
 
-// Merges the answers from two different hierarchies. A controller is mounted on
-// the unified hierarchy or on a legacy one, never both, so the hierarchy that
-// does not carry it reports no limit rather than nothing at all. Preferring a
-// real limit keeps that empty answer from deciding.
+// Picks the hierarchy that owns the controller. /proc/<pid>/cgroup listing the
+// controller on a legacy hierarchy is what makes it legacy; otherwise it is on
+// the unified one. Choosing by which answer looks more informative instead
+// would let a reading from the hierarchy the controller is NOT on decide, and
+// report someone else's limit for this process.
 template <typename T>
-CgroupLimit<T> across_hierarchies(const CgroupLimit<T> & first, const CgroupLimit<T> & second) {
-  if (second.state() == LimitState::kLimited && first.state() != LimitState::kLimited) {
-    return second;
-  }
-  return first.state() == LimitState::kUnavailable ? second : first;
+CgroupLimit<T> owned_by(bool legacy_owns, const CgroupLimit<T> & unified, const CgroupLimit<T> & legacy) {
+  const auto & owner = legacy_owns ? legacy : unified;
+  const auto & other = legacy_owns ? unified : legacy;
+  // Nothing at all where the owner should be is the one case worth looking
+  // elsewhere for: an unusual mount layout rather than a different answer.
+  return owner.state() == LimitState::kUnavailable ? other : owner;
 }
 
-CpuLimit across_hierarchies(const CpuLimit & first, const CpuLimit & second) {
-  if (second.quota.state() == LimitState::kLimited && first.quota.state() != LimitState::kLimited) {
-    return second;
-  }
-  return first.quota.state() == LimitState::kUnavailable ? second : first;
+CpuLimit owned_by(bool legacy_owns, const CpuLimit & unified, const CpuLimit & legacy) {
+  const auto & owner = legacy_owns ? legacy : unified;
+  const auto & other = legacy_owns ? unified : legacy;
+  return owner.quota.state() == LimitState::kUnavailable ? other : owner;
 }
 
 CgroupLimit<uint64_t> read_memory_v2(const std::string & dir) {
@@ -422,7 +449,7 @@ CgroupLimit<uint64_t> read_memory_v2(const std::string & dir) {
   if (!file.exists) {
     return CgroupLimit<uint64_t>::unavailable();
   }
-  if (!file.opened) {
+  if (!file.opened || !file.complete) {
     return CgroupLimit<uint64_t>::unreadable();
   }
   auto text = trim(file.line);
@@ -441,7 +468,7 @@ CgroupLimit<uint64_t> read_memory_v1(const std::string & dir) {
   if (!file.exists) {
     return CgroupLimit<uint64_t>::unavailable();
   }
-  if (!file.opened) {
+  if (!file.opened || !file.complete) {
     return CgroupLimit<uint64_t>::unreadable();
   }
   auto value = parse_u64(trim(file.line));
@@ -459,7 +486,7 @@ CpuLimit read_cpu_v2(const std::string & dir) {
   if (!file.exists) {
     return {CgroupLimit<int64_t>::unavailable(), std::nullopt};
   }
-  if (!file.opened) {
+  if (!file.opened || !file.complete) {
     return {CgroupLimit<int64_t>::unreadable(), std::nullopt};
   }
 
@@ -495,13 +522,13 @@ CpuLimit read_cpu_v1(const std::string & dir) {
   }
 
   std::optional<int64_t> period;
-  if (period_file.opened) {
+  if (period_file.opened && period_file.complete) {
     period = parse_i64(trim(period_file.line));
     if (period && *period <= 0) {
       period.reset();
     }
   }
-  if (!quota_file.opened || !period) {
+  if (!quota_file.opened || !quota_file.complete || !period) {
     return {CgroupLimit<int64_t>::unreadable(), std::nullopt};
   }
 
@@ -652,8 +679,8 @@ tl::expected<CgroupInfo, std::string> read_cgroup_info(pid_t pid, const std::str
     }
   }
 
-  info.memory_limit = across_hierarchies(memory_v2, memory_v1);
-  auto cpu = across_hierarchies(cpu_v2, cpu_v1);
+  info.memory_limit = owned_by(controller_path(paths, "memory").has_value(), memory_v2, memory_v1);
+  auto cpu = owned_by(controller_path(paths, "cpu").has_value(), cpu_v2, cpu_v1);
   info.cpu_quota = cpu.quota;
   info.cpu_period_us = cpu.period_us;
   return info;

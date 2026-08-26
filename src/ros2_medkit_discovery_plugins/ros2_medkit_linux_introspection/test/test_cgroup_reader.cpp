@@ -16,6 +16,8 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "ros2_medkit_linux_introspection/cgroup_reader.hpp"
 
 namespace fs = std::filesystem;
@@ -826,6 +828,117 @@ TEST_F(CgroupTree, UnifiedHierarchyAtACustomMountPointWithASubtreeRoot) {
   EXPECT_EQ(info.memory_limit.state(), LimitState::kLimited);
   ASSERT_TRUE(info.memory_limit.value().has_value());
   EXPECT_EQ(*info.memory_limit.value(), 268435456u);
+}
+
+// A path whose parent is a regular file fails to open with ENOTDIR, not
+// ENOENT. That is a file we could not read, not a limit that is not there, and
+// unlike a permission fixture it behaves the same when the tests run as root.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, OpenFailureOtherThanMissingIsUnreadable) {
+  write_proc_cgroup(42, std::string("0::/docker/") + kDockerId + "\n");
+  // "docker" is a file, so ".../docker/<id>/memory.max" cannot be walked.
+  write_file("sys/fs/cgroup/docker", "not a directory\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kUnreadable);
+  EXPECT_NE(info.memory_limit.state(), LimitState::kUnavailable);
+}
+
+// A first line that never ends inside the bytes we are willing to read is not a
+// limit. Parsing the prefix would turn "536870912<spaces>garbage" into a valid
+// 512 MiB limit.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, LimitFileWithoutALineEndingWithinTheCapIsUnreadable) {
+  write_proc_cgroup(42, "0::/\n");
+  write_file("sys/fs/cgroup/memory.max", "536870912" + std::string(8192, ' ') + "garbage\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kUnreadable);
+  EXPECT_FALSE(info.memory_limit.value().has_value());
+}
+
+// A limit file with no trailing newline is still a complete first line.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, LimitFileWithoutATrailingNewlineIsRead) {
+  write_proc_cgroup(42, "0::/\n");
+  write_file("sys/fs/cgroup/memory.max", "536870912");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kLimited);
+  ASSERT_TRUE(info.memory_limit.value().has_value());
+  EXPECT_EQ(*info.memory_limit.value(), 536870912u);
+}
+
+// A mount root is the same subtree whether or not it is written with a
+// trailing slash.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, MountRootWithATrailingSlashStillMatches) {
+  write_proc_cgroup(42, "12:memory:/docker/parent/child\n");
+  write_file("proc/42/mountinfo",
+             "25 1 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n"
+             "30 25 0:26 /docker/parent/ /sys/fs/cgroup/memory rw,relatime - cgroup cgroup rw,memory\n");
+  write_file("sys/fs/cgroup/memory/child/memory.limit_in_bytes", "268435456\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kLimited);
+  ASSERT_TRUE(info.memory_limit.value().has_value());
+  EXPECT_EQ(*info.memory_limit.value(), 268435456u);
+}
+
+// The hierarchy that owns the controller answers, even when the other one has
+// a readable file. Choosing by which answer looks better would report a limit
+// belonging to a cgroup this process is not in.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, LegacyOwnedControllerAnswersEvenWhenUnifiedIsReadable) {
+  write_proc_cgroup(42, std::string("0::/\n12:memory:/docker/") + kDockerId + "\n");
+  write_file("sys/fs/cgroup/memory.max", "999999999\n");
+  write_file(std::string("sys/fs/cgroup/memory/docker/") + kDockerId + "/memory.limit_in_bytes", "garbage\n");
+
+  auto info = read();
+  // The legacy controller owns memory here, and its file cannot be parsed.
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kUnreadable);
+  EXPECT_FALSE(info.memory_limit.value().has_value());
+}
+
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, LegacyOwnedControllerReportsUnlimitedOverAUnifiedNumber) {
+  write_proc_cgroup(42, std::string("0::/\n12:memory:/docker/") + kDockerId + "\n");
+  write_file("sys/fs/cgroup/memory.max", "999999999\n");
+  write_file(std::string("sys/fs/cgroup/memory/docker/") + kDockerId + "/memory.limit_in_bytes",
+             std::to_string(kV1UnlimitedSentinel) + "\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kUnlimited);
+}
+
+// A limit path that turns out to be a FIFO with no writer must not park the
+// caller. Opening one without O_NONBLOCK blocks until a writer appears, which
+// for an HTTP worker means never. If this ever regresses the test does not
+// fail, it hangs, and its ctest timeout reports it.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, LimitPathThatIsAFifoDoesNotBlock) {
+  write_proc_cgroup(42, "0::/\n");
+  fs::create_directories(root_ / "sys/fs/cgroup");
+  auto fifo = (root_ / "sys/fs/cgroup/memory.max").string();
+  ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+
+  auto info = read();
+  // It is there and it gave us nothing, which is a failed read.
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kUnreadable);
+}
+
+// The first line can be longer than one read returns. Stopping at the first
+// chunk would take the prefix for the whole line.
+// @verifies REQ_INTEROP_003
+TEST_F(CgroupTree, FirstLineLongerThanOneReadIsAccumulated) {
+  write_proc_cgroup(42, "0::/\n");
+  // Leading blanks push the number past any single-chunk read; trim drops them.
+  write_file("sys/fs/cgroup/memory.max", std::string(1024, ' ') + "536870912\n");
+
+  auto info = read();
+  EXPECT_EQ(info.memory_limit.state(), LimitState::kLimited);
+  ASSERT_TRUE(info.memory_limit.value().has_value());
+  EXPECT_EQ(*info.memory_limit.value(), 536870912u);
 }
 
 // @verifies REQ_INTEROP_003
