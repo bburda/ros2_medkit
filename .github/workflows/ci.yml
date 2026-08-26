@@ -144,8 +144,19 @@ jobs:
         include:
           - ros_distro: humble
             os_image: ubuntu:jammy
+            # build-and-test compiles the same sources with the same flags on this
+            # distro, so its cache is the superset this job restores from.
+            ccache_prefix: ccache-humble-
           - ros_distro: lyrical
             os_image: ubuntu:resolute
+            ccache_prefix: ccache-lyrical-
+          - ros_distro: jazzy
+            os_image: ubuntu:noble
+            # ccache-jazzy-test-, not ccache-jazzy-. The shorter prefix also matches
+            # ccache-jazzy-asan-, -tsan-, -lint- and -tidy-, and restore-keys takes the
+            # most recently created match, so it would restore whichever other Jazzy job
+            # finished last. jazzy-test carries the measurement behind that.
+            ccache_prefix: ccache-jazzy-test-
     container:
       image: ${{ matrix.os_image }}
     timeout-minutes: 90
@@ -181,16 +192,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /root/.cache/ccache
-          key: ccache-${{ matrix.ros_distro }}-${{ github.sha }}
+          key: ${{ matrix.ccache_prefix }}${{ github.sha }}
           restore-keys: |
-            ccache-${{ matrix.ros_distro }}-
+            ${{ matrix.ccache_prefix }}
 
       - name: Install dependencies
         run: |
           apt-get update
           apt-get install -y ros-${{ matrix.ros_distro }}-test-msgs
-          if [ "${{ matrix.ros_distro }}" = "humble" ]; then
-            apt-get install -y ros-humble-rmw-cyclonedds-cpp
+          if [ "${{ matrix.ros_distro }}" = "humble" ] || [ "${{ matrix.ros_distro }}" = "jazzy" ]; then
+            apt-get install -y ros-${{ matrix.ros_distro }}-rmw-cyclonedds-cpp
           fi
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
           rosdep update
@@ -221,8 +232,10 @@ jobs:
         timeout-minutes: 45
         env:
           # The DDS choice belongs to the distro, not to this package - see the long note in
-          # build-and-test for why humble is forced onto CycloneDDS and lyrical is not.
-          RMW_IMPLEMENTATION: ${{ matrix.ros_distro == 'humble' && 'rmw_cyclonedds_cpp' || '' }}
+          # build-and-test for why humble is forced onto CycloneDDS and lyrical is not, and
+          # the note in jazzy-test for the FastRTPS discovery-teardown use-after-free that
+          # puts jazzy on the same implementation.
+          RMW_IMPLEMENTATION: ${{ (matrix.ros_distro == 'humble' || matrix.ros_distro == 'jazzy') && 'rmw_cyclonedds_cpp' || '' }}
         run: |
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
           colcon test --return-code-on-test-failure \
@@ -256,10 +269,11 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
-    # The more generous of the two timeouts this job replaces (build had 60,
-    # test had 45). One job now covers both phases, and a cold ccache makes the
-    # build phase the variable one, so keep the headroom rather than the sum.
-    timeout-minutes: 60
+    # 90, like build-and-test and graph-watchdog. This job covers both the build
+    # and the test phase, a cold ccache makes the build phase the variable one,
+    # and at 60 it had been finishing in 54 to 56 minutes on main - close enough
+    # to the cap that a slow runner timed it out with no failing test to name.
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -332,8 +346,11 @@ jobs:
           RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
         run: |
           source /opt/ros/jazzy/setup.bash
+          # ros2_medkit_graph_watchdog is tested in graph-watchdog, on this distro too.
+          # Its end-to-end suite is 24 minutes, which is most of what stood between this
+          # job and its cap.
           colcon test --return-code-on-test-failure \
-            --packages-skip ros2_medkit_opcua \
+            --packages-skip ros2_medkit_opcua ros2_medkit_graph_watchdog \
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
