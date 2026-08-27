@@ -100,10 +100,69 @@ Configuration Options
      - Path to PEM-encoded private key
    * - ``server.tls.ca_file``
      - ``""``
-     - CA certificate (for future mutual TLS)
+     - CA that signs client certificates. Setting it turns on mutual TLS and
+       makes a client certificate **required**; leave empty for server-only TLS
    * - ``server.tls.min_version``
      - ``"1.2"``
-     - Minimum TLS version: ``"1.2"`` or ``"1.3"``
+     - Minimum TLS version: ``"1.2"`` or ``"1.3"``. Enforced on the server's own
+       SSL context, so it is the floor regardless of what the local OpenSSL
+       policy would otherwise allow. Any other value is rejected at startup
+
+Defaults
+--------
+
+TLS is **on** in the shipped ``gateway_params.yaml``, and ``cert_file`` and
+``key_file`` are empty. A gateway with TLS enabled and no certificate refuses
+to start rather than fall back to plaintext, so a first run has to supply one
+of the two:
+
+.. code-block:: bash
+
+   # a certificate, for a real deployment or a self-signed pair for a first run
+   ros2 launch ros2_medkit_gateway gateway.launch.py \
+     cert_file:=/path/to/cert.pem key_file:=/path/to/key.pem
+
+   # or no TLS at all, only on a host nothing else can reach
+   ros2 launch ros2_medkit_gateway gateway.launch.py tls_enabled:=false
+
+For a first run on a developer machine, ``scripts/generate_dev_certs.sh``
+writes a self-signed certificate and key. Browsers and ``curl`` will refuse it
+until you pass the CA explicitly, which is the correct behaviour for a
+certificate nothing has vouched for, not a problem to work around in
+production.
+
+Mutual TLS
+----------
+
+Set ``ca_file`` to the CA that signs your client certificates and the gateway
+requires one from **every** client:
+
+.. code-block:: yaml
+
+   server:
+     tls:
+       enabled: true
+       cert_file: "/etc/ros2_medkit/certs/server.pem"
+       key_file: "/etc/ros2_medkit/certs/server-key.pem"
+       ca_file: "/etc/ros2_medkit/certs/client-ca.pem"
+
+This is all or nothing per gateway. A client that presents no certificate is
+rejected during the handshake, before any request is read, and there is no
+"verify it only if offered" setting. A client whose certificate is signed by
+any other CA is rejected the same way.
+
+.. code-block:: bash
+
+   # without a client certificate: no response, the handshake never completes
+   curl --cacert ca.pem https://localhost:8443/api/v1/areas
+
+   # with one signed by ca_file
+   curl --cacert ca.pem --cert client.pem --key client-key.pem \
+     https://localhost:8443/api/v1/areas
+
+Mutual TLS is transport-level and sits alongside token authentication rather
+than replacing it. SOVD authenticates with bearer tokens, so leave ``ca_file``
+empty unless every client on that network can be issued a certificate.
 
 Using with curl
 ---------------

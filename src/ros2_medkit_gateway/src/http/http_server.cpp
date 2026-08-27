@@ -17,6 +17,11 @@
 #include <rclcpp/rclcpp.hpp>
 #include <stdexcept>
 
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+// TLS1_2_VERSION / TLS1_3_VERSION and SSL_CTX_set_min_proto_version.
+#include <openssl/ssl.h>
+#endif
+
 namespace ros2_medkit_gateway {
 
 HttpServerManager::HttpServerManager(const TlsConfig & tls_config, std::size_t thread_pool_size,
@@ -24,8 +29,19 @@ HttpServerManager::HttpServerManager(const TlsConfig & tls_config, std::size_t t
   : tls_config_(tls_config), thread_pool_size_(thread_pool_size), keep_alive_timeout_sec_(keep_alive_timeout_sec) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
   if (tls_config_.enabled) {
-    // Create SSL server with certificate and key
-    ssl_server_ = std::make_unique<httplib::SSLServer>(tls_config_.cert_file.c_str(), tls_config_.key_file.c_str());
+    // A non-empty ca_file turns on mutual TLS. The SSLServer constructor does
+    // the work itself: given a client CA path it calls
+    // SSL_CTX_load_verify_locations and then
+    // SSL_CTX_set_verify(SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT).
+    //
+    // That pairing is why this is all-or-nothing per gateway: with a CA set,
+    // a client that presents NO certificate is rejected at the handshake.
+    // There is no "verify it if offered" middle setting without patching the
+    // vendored header. Leaving ca_file empty keeps ordinary server-only TLS,
+    // which is what the SOVD bearer-token flow expects.
+    ssl_server_ =
+        std::make_unique<httplib::SSLServer>(tls_config_.cert_file.c_str(), tls_config_.key_file.c_str(),
+                                             tls_config_.ca_file.empty() ? nullptr : tls_config_.ca_file.c_str());
 
     if (!ssl_server_->is_valid()) {
       throw std::runtime_error(
@@ -38,8 +54,10 @@ HttpServerManager::HttpServerManager(const TlsConfig & tls_config, std::size_t t
     apply_thread_pool(*ssl_server_);
     apply_keep_alive(*ssl_server_);
 
-    RCLCPP_INFO(rclcpp::get_logger("http_server"), "TLS/HTTPS enabled - cert: %s, min_version: %s",
-                tls_config_.cert_file.c_str(), tls_config_.min_version.c_str());
+    RCLCPP_INFO(rclcpp::get_logger("http_server"),
+                "TLS/HTTPS enabled - cert: %s, min_version: %s, client certificates: %s", tls_config_.cert_file.c_str(),
+                tls_config_.min_version.c_str(),
+                tls_config_.ca_file.empty() ? "not required" : "REQUIRED (mutual TLS)");
     // Note: key_file path intentionally not logged for security reasons
   } else {
     server_ = std::make_unique<httplib::Server>();
@@ -138,26 +156,25 @@ void HttpServerManager::configure_tls() {
     return;
   }
 
-  // YAGNI Decision: min_version field exists in TlsConfig for future extensibility
-  // but is not fully implemented.
+  // Set the protocol floor on our own context rather than inheriting one.
   //
-  // Rationale:
-  // - cpp-httplib's SSLServer doesn't expose SSL_CTX for min_version configuration
-  // - Modern OpenSSL (1.1.1+) defaults to TLS 1.2+ which is secure
+  // Two reasons it has to be us. The SSLServer constructor calls
+  // SSL_CTX_set_min_proto_version(ctx_, TLS1_1_VERSION), so the library asks
+  // for a floor of TLS 1.1. What a deployment actually gets on top of that is
+  // whatever the local OpenSSL policy allows, which differs between the
+  // distributions we ship for. Neither of those is a decision this project
+  // made, and SOVD requires TLS 1.2 as the minimum, so the value is set here
+  // where it can be read and tested.
   //
-  // Future implementation options:
-  // 1. Fork cpp-httplib to expose SSL_CTX for SSL_CTX_set_min_proto_version()
-  // 2. Use OpenSSL system-wide configuration (/etc/ssl/openssl.cnf)
-  // 3. Replace cpp-httplib with Boost.Beast or another library with full SSL control
-  //
-  // TODO(future): Add mutual TLS support - requires cpp-httplib modifications
-  // to expose SSL_CTX for SSL_CTX_set_verify() with SSL_VERIFY_PEER
-
-  if (tls_config_.min_version != "1.2") {
-    RCLCPP_WARN(rclcpp::get_logger("http_server"),
-                "min_version='%s' requested but cpp-httplib uses OpenSSL defaults (TLS 1.2+). "
-                "Custom min_version not enforced.",
-                tls_config_.min_version.c_str());
+  // The string is validated in TlsConfig::validate(), which rejects anything
+  // other than "1.2" or "1.3" before a server is ever constructed.
+  const int min_proto = (tls_config_.min_version == "1.3") ? TLS1_3_VERSION : TLS1_2_VERSION;
+  SSL_CTX * ctx = ssl_server_->ssl_context();
+  if (ctx == nullptr || SSL_CTX_set_min_proto_version(ctx, min_proto) != 1) {
+    // Refuse to serve rather than fall back to the library floor: a caller
+    // that asked for 1.3 and silently got 1.1 is worse off than one that got
+    // an error, because nothing downstream can tell the difference.
+    throw std::runtime_error("Failed to set the minimum TLS version to " + tls_config_.min_version);
   }
 
   // Log TLS handshake failures for debugging

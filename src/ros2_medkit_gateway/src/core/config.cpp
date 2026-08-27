@@ -58,11 +58,6 @@ std::string TlsConfig::validate() const {
     return "TLS: ca_file does not exist or is not readable: " + ca_file;
   }
 
-  // TODO(future): Add mutual TLS validation when implemented
-  // if (mutual_tls && ca_file.empty()) {
-  //   return "TLS: ca_file is required when mutual_tls is enabled";
-  // }
-
   // Validate minimum TLS version
   if (min_version != "1.2" && min_version != "1.3") {
     return "TLS: min_version must be '1.2' or '1.3', got: " + min_version;

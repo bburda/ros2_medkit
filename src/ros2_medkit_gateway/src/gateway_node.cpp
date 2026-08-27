@@ -435,7 +435,6 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
                         .with_key_file(get_parameter("server.tls.key_file").as_string())
                         .with_ca_file(get_parameter("server.tls.ca_file").as_string())
                         .with_min_version(get_parameter("server.tls.min_version").as_string())
-                        // TODO(future): Add .with_mutual_tls() when implemented
                         .build();
       // Note: HttpServerManager will log TLS configuration details
     } catch (const std::exception & e) {

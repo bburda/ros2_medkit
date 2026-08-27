@@ -186,6 +186,13 @@ class AuthManager {
    */
   bool enable_client(const std::string & client_id);
 
+  /// How many refresh records are currently held.
+  ///
+  /// Public so a test can observe that the sweep actually runs. The count is
+  /// the thing the unbounded-growth claim is about, and asserting on it is the
+  /// only way to tell a sweep that works from one that is never called.
+  size_t refresh_token_count() const;
+
  private:
   /**
    * @brief Generate a JWT token
@@ -241,6 +248,10 @@ class AuthManager {
   // Client credentials storage (thread-safe)
   mutable std::mutex clients_mutex_;
   std::unordered_map<std::string, ClientCredentials> clients_;
+
+  /// Drop every expired record. The caller must already hold
+  /// refresh_tokens_mutex_; cleanup_expired_tokens() is the locking wrapper.
+  size_t cleanup_expired_locked();
 
   // Refresh token storage (thread-safe)
   mutable std::mutex refresh_tokens_mutex_;

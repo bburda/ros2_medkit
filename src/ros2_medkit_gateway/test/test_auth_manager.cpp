@@ -677,6 +677,127 @@ TEST_F(AuthManagerTest, CleanupExpiredTokens) {
   EXPECT_GE(cleaned, 1);
 }
 
+// ---------------------------------------------------------------------------
+// Refresh-record growth, constant-time secret comparison, and revocation.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A manager with a single admin client, parameterised on the two expiry
+/// values, so a test can put them at their endpoints rather than at one
+/// comfortable middle value.
+AuthManager make_manager(int access_expiry, int refresh_expiry) {
+  auto config = AuthConfigBuilder()
+                    .with_enabled(true)
+                    .with_jwt_secret("expiry_sweep_secret_key_at_least_32_chars_long")
+                    .with_require_auth_for(AuthRequirement::ALL)
+                    .with_token_expiry(access_expiry)
+                    .with_refresh_token_expiry(refresh_expiry)
+                    .add_client("svc", "svc_secret", UserRole::ADMIN)
+                    .build();
+  return AuthManager(config);
+}
+
+}  // namespace
+
+// The sweep exists but had no production caller, so the map grew by one record
+// per successful authorisation for the life of the process. What this asserts
+// is the COUNT, because a sweep that is never invoked returns the right answer
+// when a test calls it directly and still leaks in production.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerTokenLifetimeTest, RepeatedLoginsDoNotGrowTheStoreWithoutBound) {
+  // Refresh expiry at its minimum legal value: validate() requires
+  // refresh >= access, so this is the endpoint, not a convenient number.
+  auto manager = make_manager(1, 1);
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+  }
+  EXPECT_EQ(manager.refresh_token_count(), 5U) << "records should accumulate while they are live";
+
+  // Past the refresh expiry, the next authorisation must clear them out.
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+
+  EXPECT_EQ(manager.refresh_token_count(), 1U)
+      << "the five expired records survived a later authorisation - the sweep is not running";
+}
+
+// The other endpoint. A long-lived refresh token must NOT be swept: an
+// over-eager sweep would log clients out mid-session, which is the opposite
+// failure and just as real.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerTokenLifetimeTest, LongLivedRecordsAreNotSweptEarly) {
+  auto manager = make_manager(1, 86400);
+
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+  }
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+
+  EXPECT_EQ(manager.refresh_token_count(), 5U) << "records well inside their expiry were discarded";
+}
+
+// Degenerate case: access and refresh expiry equal and both large.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerTokenLifetimeTest, EqualAccessAndRefreshExpiryKeepsRecords) {
+  auto manager = make_manager(3600, 3600);
+  ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+  ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+  EXPECT_EQ(manager.refresh_token_count(), 2U);
+}
+
+// A wrong secret must be refused whatever its shape. The interesting inputs
+// are the ones a short-circuiting comparison treats differently from a
+// constant-time one: a correct prefix, and a value that extends the real one.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerSecretComparisonTest, OnlyTheExactSecretAuthenticates) {
+  auto manager = make_manager(3600, 3600);
+
+  EXPECT_TRUE(manager.authenticate("svc", "svc_secret").has_value()) << "the real secret must work";
+
+  for (const auto & wrong : {"", "s", "svc_secre", "svc_secret_", "svc_secretX", "SVC_SECRET", "xxxxxxxxxx"}) {
+    EXPECT_FALSE(manager.authenticate("svc", wrong).has_value()) << "secret \"" << wrong << "\" was accepted";
+  }
+}
+
+// An access token whose refresh record is gone is invalid, not "unchecked".
+// Records are in memory, so this is also what a gateway restart looks like to
+// a token issued before it: the deliberate consequence is that a restart makes
+// clients re-authenticate.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerRevocationTest, AnAccessTokenWithNoSurvivingRecordIsRejected) {
+  auto manager = make_manager(3600, 3600);
+  auto issued = manager.authenticate("svc", "svc_secret");
+  ASSERT_TRUE(issued.has_value());
+
+  EXPECT_TRUE(manager.validate_token(issued->access_token).valid)
+      << "the token must be valid while its record is present";
+
+  // Revoking drops or marks the record; either way the access token that names
+  // it must stop being accepted.
+  ASSERT_TRUE(issued->refresh_token.has_value());
+  ASSERT_TRUE(manager.revoke_refresh_token(issued->refresh_token.value()));
+  EXPECT_FALSE(manager.validate_token(issued->access_token).valid)
+      << "an access token whose refresh record was revoked was still accepted";
+}
+
+// A second manager standing in for the same gateway after a restart: same
+// secret and issuer, so the signature still verifies, but no records.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerRevocationTest, ARestartInvalidatesAccessTokensRatherThanTrustingThem) {
+  auto before = make_manager(3600, 3600);
+  auto issued = before.authenticate("svc", "svc_secret");
+  ASSERT_TRUE(issued.has_value());
+  ASSERT_TRUE(before.validate_token(issued->access_token).valid);
+
+  auto after_restart = make_manager(3600, 3600);
+  EXPECT_FALSE(after_restart.validate_token(issued->access_token).valid)
+      << "a token from before the restart was accepted although the gateway has no record of it - "
+         "a revoked token would come back to life this way";
+}
+
 // Test JwtClaims
 TEST(JwtClaimsTest, ToJson) {
   JwtClaims claims;

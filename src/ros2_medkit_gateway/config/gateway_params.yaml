@@ -107,8 +107,11 @@ ros2_medkit_gateway:
         # Options: "1.2" (default, widely compatible), "1.3" (more secure)
         min_version: "1.2"
 
-        # TODO: Mutual TLS (client certificate verification) is not yet implemented
-        # See: https://github.com/selfpatch/ros2_medkit/issues/XXX
+        # Mutual TLS. Set ca_file above to the CA that signs your client
+        # certificates and the gateway REQUIRES one from every client: a
+        # caller with no certificate is rejected during the handshake, before
+        # any request is read. Leave ca_file empty for ordinary server-only
+        # TLS, which is what bearer-token clients expect.
 
     # Safety-backstop refresh interval in milliseconds.
     #

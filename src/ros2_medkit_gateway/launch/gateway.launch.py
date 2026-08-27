@@ -118,6 +118,29 @@ def generate_launch_description():
             '(roles: viewer, operator, configurator, admin). Needed to obtain '
             'a token from /auth/token.'))
 
+    declare_tls_enabled_arg = DeclareLaunchArgument(
+        'tls_enabled', default_value='true',
+        description=(
+            'Serve HTTPS. On by default, matching the shipped config. Needs '
+            'cert_file and key_file; the gateway refuses to start with TLS on '
+            'and no certificate rather than fall back to plaintext. Pass '
+            'tls_enabled:=false to serve plain HTTP on a host nothing else '
+            'can reach.'))
+
+    declare_cert_file_arg = DeclareLaunchArgument(
+        'cert_file', default_value='',
+        description=(
+            'PEM certificate (or full chain) for HTTPS. REQUIRED while '
+            'tls_enabled is true. For a first run, generate a self-signed '
+            'pair with scripts/generate_dev_certs.sh - browsers will warn, '
+            'which is correct for a certificate nothing has vouched for.'))
+
+    declare_key_file_arg = DeclareLaunchArgument(
+        'key_file', default_value='',
+        description=(
+            'PEM private key matching cert_file. REQUIRED while tls_enabled '
+            'is true. Keep it chmod 600 and owned by the gateway user.'))
+
     declare_cors_arg = DeclareLaunchArgument(
         'cors_allowed_origins',
         default_value=CORS_DEFAULT,
@@ -144,6 +167,24 @@ def generate_launch_description():
         param_overrides.update(cors_override(
             LaunchConfiguration('cors_allowed_origins').perform(context),
             LaunchConfiguration('config_file').perform(context), default_config))
+
+        tls_enabled = LaunchConfiguration('tls_enabled').perform(context).lower() in (
+            'true', '1', 'yes')
+        param_overrides['server.tls.enabled'] = tls_enabled
+        cert_file = LaunchConfiguration('cert_file').perform(context)
+        key_file = LaunchConfiguration('key_file').perform(context)
+        if cert_file:
+            param_overrides['server.tls.cert_file'] = cert_file
+        if key_file:
+            param_overrides['server.tls.key_file'] = key_file
+        if tls_enabled and not (cert_file and key_file):
+            # The gateway would refuse to start a moment from now, naming the
+            # config file. Name the launch arguments instead, here, where they
+            # are the thing the reader can actually change.
+            print('[gateway.launch.py] TLS is enabled and cert_file/key_file were not both '
+                  'given. Pass cert_file:=<path> key_file:=<path>, set them in a config_file, '
+                  'or pass tls_enabled:=false to serve plain HTTP. '
+                  'scripts/generate_dev_certs.sh makes a self-signed pair for a first run.')
 
         auth_enabled = LaunchConfiguration('auth_enabled').perform(context).lower() in (
             'true', '1', 'yes')
@@ -178,6 +219,9 @@ def generate_launch_description():
         declare_auth_enabled_arg,
         declare_jwt_secret_arg,
         declare_clients_arg,
+        declare_tls_enabled_arg,
+        declare_cert_file_arg,
+        declare_key_file_arg,
         declare_cors_arg,
         OpaqueFunction(function=_launch_setup),
     ])
