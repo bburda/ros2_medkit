@@ -114,4 +114,8 @@ ros2_medkit_gateway:
       enabled: false
       require_tls: true
       forward_auth: false
+      # This gateway's own credential for peer connections. Prefer it over
+      # forward_auth where peers authenticate: it never carries an end user's
+      # token, and it is not sent to mDNS-discovered peers at all.
+      peer_auth_header: ""
       peer_scheme: "https"
