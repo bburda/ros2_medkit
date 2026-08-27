@@ -53,6 +53,38 @@ const std::set<std::string> kOwnedA{"/a"};
 
 // ---- Violation streak: unchanged behaviour from before this slice's redesign ----
 
+// ---- What the two counters say, which is not the same thing ----
+
+// tracked_count() says an expectation matched a node. settled_inactive_count() says this
+// tracker has MEASURED one as inactive. Anything waiting for the second and given the first
+// proceeds while the node's clock has not started - which is what an e2e that kills the node
+// at that moment does, and it then waits for a fault that can never mature.
+TEST(LifecycleExpectation, TrackedCountCountsANodeWhoseLabelWasNeverRead) {
+  LifecycleExpectationTracker t({"a"}, /*grace=*/2);
+
+  // An unreadable node: matched, so it is tracked, but no label was obtained.
+  t.update(M{match("a", "/a", std::optional<std::string>(""))});
+  EXPECT_EQ(t.tracked_count(), 1u) << "a matched node is tracked whether or not its label was read";
+  EXPECT_EQ(t.settled_inactive_count(), 0u)
+      << "an unreadable node has not been measured inactive, and its violation clock has not started";
+
+  // A node that is not lifecycle-managed at all: same story.
+  LifecycleExpectationTracker unmanaged({"a"}, /*grace=*/2);
+  unmanaged.update(M{match("a", "/a", std::nullopt)});
+  EXPECT_EQ(unmanaged.tracked_count(), 1u);
+  EXPECT_EQ(unmanaged.settled_inactive_count(), 0u);
+
+  // Only a real inactive measurement moves the second counter.
+  t.update(M{match("a", "/a", "unconfigured")});
+  EXPECT_EQ(t.settled_inactive_count(), 1u) << "a measured non-active label is what starts the clock";
+
+  // And an active one takes it back off, so the counter tracks the CURRENT measurement
+  // rather than latching on the first one seen.
+  t.update(M{match("a", "/a", "active")});
+  EXPECT_EQ(t.tracked_count(), 1u);
+  EXPECT_EQ(t.settled_inactive_count(), 0u);
+}
+
 TEST(LifecycleExpectation, RequiredNodeStuckInactivePastGraceRaises) {
   LifecycleExpectationTracker t({"a"}, /*grace=*/2);
   EXPECT_TRUE(t.update(M{match("a", "/a", "inactive")}).affected.empty());  // 1 <= grace

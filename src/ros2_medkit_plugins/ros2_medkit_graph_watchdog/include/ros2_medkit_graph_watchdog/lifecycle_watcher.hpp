@@ -76,6 +76,36 @@ class LifecycleWatcher {
   /// still resolve - see measurement_pending().
   static constexpr int kReseedAttempts = 2;
 
+  /// How many EXTRA GetState attempts a node that has NEVER been measured keeps, beyond
+  /// the self-heal budget above.
+  ///
+  /// kReseedAttempts is a self-heal budget for a node whose label is known and merely
+  /// stale, and its reasoning is that a matched subscription catches every transition
+  /// afterwards. That reasoning does not reach a node which never transitions again: one
+  /// sitting at `unconfigured` forever publishes nothing for the subscription to catch, so
+  /// a GetState is the ONLY way its label is ever learned. Two attempts lost to transient
+  /// timeouts therefore left it unmeasurable for the life of the process - permanently, as
+  /// the comment at the queueing site says - and a require_active expectation on it could
+  /// then never be confirmed. The larger budget is still finite so an endpoint that never
+  /// answers is not retried without end; GRAPH_NODE_UNREADABLE is what reports that one.
+  ///
+  /// Deliberately a SEPARATE counter rather than a larger kReseedAttempts. That budget is
+  /// also what measurement_pending() withholds GRAPH_NODE_UNREADABLE on, so widening it in
+  /// place would delay reporting a node that never answers by exactly as much as it
+  /// widened - trading one silence for another. Asking for longer and reporting just as
+  /// early are separate concerns, so they get separate counters.
+  static constexpr int kUnmeasuredSeedAttempts = 40;
+
+  /// Ticks between those extra attempts.
+  ///
+  /// They are spread rather than consecutive because the node they exist for is one whose
+  /// GetState does not answer, so every attempt costs its full timeout and the per-tick
+  /// blocking budget is 150 ms shared by every job. Asking such a node once per tick eats
+  /// that budget every tick and starves the seeding and handover work queued behind it -
+  /// visible under a sanitizer, where each timeout is longer still. Spread, the same
+  /// number of attempts covers five times the wall clock at a fifth of the per-tick cost.
+  static constexpr std::uint64_t kUnmeasuredSeedInterval = 5;
+
   LifecycleWatcher(rclcpp::Node * gateway_node, std::mutex * node_mutex,
                    int departed_retention_ticks = kDefaultDepartedRetentionTicks);
   ~LifecycleWatcher();
@@ -159,6 +189,11 @@ class LifecycleWatcher {
     /// non-active, to recover an `active` transition_event lost during the DDS
     /// endpoint-matching window right after the (volatile) subscription is created.
     int reseeds_remaining = 0;
+    /// Extra GetState attempts kept while the label is still empty. Drains alongside
+    /// reseeds_remaining but is NOT what measurement_pending() consults, so a node that
+    /// never answers is still reported unreadable on the original schedule while this one
+    /// goes on asking.
+    int unmeasured_seeds_remaining = 0;
     /// The GetState path this entry was created from. Together with `fqn` it is the
     /// entry's BINDING identity, which update() re-checks every tick: the subscription
     /// topic derives from this path, so if either piece moves under an unchanged

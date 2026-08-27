@@ -275,6 +275,7 @@ class LifecycleExpectationDetector : public Detector {
   nlohmann::json status_json() const override {
     return nlohmann::json{{"tracking_saturated", saturated_.load()},
                           {"tracked_nodes", tracked_nodes_.load()},
+                          {"settled_inactive_nodes", settled_inactive_nodes_.load()},
                           {"tracked_node_cap", tracked_node_cap_.load()}};
   }
 
@@ -397,6 +398,7 @@ class LifecycleExpectationDetector : public Detector {
     // takes - hence atomics rather than plain members.
     saturated_.store(report.tracking_saturated);
     tracked_nodes_.store(tracker_.tracked_count());
+    settled_inactive_nodes_.store(tracker_.settled_inactive_count());
     // An entry that matches nothing at all is reported by the tracker, not here: the loop
     // above only sees entries that DID match a present node.
     if (ctx.gateway_node) {
@@ -586,6 +588,13 @@ class LifecycleExpectationDetector : public Detector {
   std::atomic<int> tracked_node_cap_{kDefaultTrackedNodeCap};
   std::atomic<bool> saturated_{false};         ///< the cap refused a required node on the last tick
   std::atomic<std::size_t> tracked_nodes_{0};  ///< tracker map size as of the last tick
+  /// Tracked nodes whose last real measurement was inactive, as of the last tick.
+  ///
+  /// Reported beside tracked_nodes because the two differ in exactly the case
+  /// that matters: a node is counted the moment an expectation matches it, which
+  /// is before any lifecycle label has been read. Only this one says the
+  /// detector's own clock for that node has started.
+  std::atomic<std::size_t> settled_inactive_nodes_{0};
   LifecycleExpectationTracker tracker_{{}, kDefaultGrace};
   // Fixed-severity AggregatedFault members, one per code - the same shape orphan_detector
   // and param_drift_detector use, now that each code's content decides its own emission

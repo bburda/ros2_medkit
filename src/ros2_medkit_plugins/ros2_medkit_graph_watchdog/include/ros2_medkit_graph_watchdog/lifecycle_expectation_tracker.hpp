@@ -483,6 +483,22 @@ class LifecycleExpectationTracker {
     return nodes_.size();
   }
 
+  /// Tracked nodes whose last real measurement was kInactive.
+  ///
+  /// Separate from tracked_count() because the two answer different questions and
+  /// only this one says the detector has actually READ a label. A node is entered
+  /// into the map as soon as an expectation matches it, before any label is
+  /// classified, so a non-zero tracked_count() is equally true of a node that is
+  /// kUnreadable or kNotManaged. Anything waiting for "the detector has seen this
+  /// node inactive" - a test about to kill it, above all - has to wait on this;
+  /// waiting on the count instead admits a node whose clock has not started and
+  /// whose departure therefore matures somewhere else entirely.
+  std::size_t settled_inactive_count() const {
+    return static_cast<std::size_t>(std::count_if(nodes_.begin(), nodes_.end(), [](const auto & entry) {
+      return entry.second.settled_observed == LifecycleObservedState::kInactive;
+    }));
+  }
+
   /// `presence_owned`, when given, is the presence detector's CURRENT set of tracked departure
   /// keys (fqns), as published by the plugin for this tick. It is consulted, never latched: the
   /// stickiness this class used to keep for itself lives in that detector's own tracker, which
