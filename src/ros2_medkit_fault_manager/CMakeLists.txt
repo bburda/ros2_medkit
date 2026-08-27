@@ -192,6 +192,12 @@ if(BUILD_TESTING)
   medkit_add_launch_test(test_entity_thresholds_integration test/integration/test_entity_thresholds_integration.test.py
     TIMEOUT 60 LABELS "integration")
 
+  # Drives the debounce and healing pair with the event counts an edge-triggered
+  # reporter actually sends: one FAILED per raise, one PASSED per clear. Two
+  # cases wait out the auto-confirm window, hence the timeout.
+  medkit_add_launch_test(test_debounce_and_healing test/integration/test_debounce_and_healing.test.py
+    TIMEOUT 120 LABELS "integration")
+
   medkit_add_launch_test(test_rosbag_entity_scope test/integration/test_rosbag_entity_scope.test.py TIMEOUT 120
     LABELS "integration")
 

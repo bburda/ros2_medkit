@@ -263,6 +263,36 @@ events to return to the default (CONFIRMED-only) list. During that window `last_
 reflects the activity; `occurrence_count` does not, because it counts the edge that started the
 occurrence, not every report within it.
 
+### Choosing the right lever for your reporter
+
+The counter only moves when an event arrives, so the count-based settings above work only for a
+reporter that keeps sending FAILED while the condition is still there. A reporter that samples a
+value on a timer and reports on every sample is of that kind.
+
+Many reporters do not work that way. They send one FAILED when the condition appears and one clear
+when it goes away, and nothing in between. For such a reporter the second FAILED never arrives, so
+`confirmation_threshold: -3` means the fault stays PREFAILED and never confirms. The default fault
+list returns CONFIRMED only, so the fault is invisible. Healing has the same problem in reverse:
+`healing_threshold: 3` needs four consecutive PASSED events after a fault confirmed at `-1`, and
+only one PASSED is ever sent, so the fault stays CONFIRMED until someone calls `~/clear_fault`.
+
+Pick by how your reporter behaves:
+
+| Reporter repeats FAILED while the condition holds | Reporter sends one event per transition |
+|---|---|
+| `confirmation_threshold: -N` filters N noisy samples | `confirmation_threshold: -2` plus `auto_confirm_after_sec` |
+| `healing_threshold: N` needs N clean samples | `healing_threshold: 0` heals on the single PASSED |
+
+For the second column the filtering is done by time, not by count. `confirmation_threshold: -2`
+keeps the first FAILED in PREFAILED, and `auto_confirm_after_sec` confirms it if it is still there
+when the timeout expires. Choose the timeout from how often the reporter samples, so a condition
+has to survive a few sampling cycles before it confirms. A glitch that clears in time never
+reaches CONFIRMED, because a clear takes the fault out of PREFAILED before the timer fires.
+
+Two settings ignore the counter completely. `SEVERITY_CRITICAL` confirms at once while
+`critical_immediate_confirm` is true, which is the default. `auto_confirm_after_sec` promotes a
+PREFAILED fault without changing its counter.
+
 ### Fault Lifecycle with Debounce
 
 ```
