@@ -166,6 +166,13 @@ def _handshake(port, version, client_cert=None, client_key=None, timeout=20):
     return 'Cipher is ' in out
 
 
+def _free_port():
+    """Return a port nothing is listening on, for the control server above."""
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
 def _wait_listening(port, timeout=60.0):
     """Block until the port accepts a TCP connection.
 
@@ -206,6 +213,41 @@ class TestTlsProtocolFloor(unittest.TestCase):
         """
         self.assertTrue(_handshake(PORT_TLS12, 'tls1_2'), 'TLS 1.2 must be accepted at floor 1.2')
         self.assertTrue(_handshake(PORT_TLS12, 'tls1_3'), 'TLS 1.3 must be accepted at floor 1.2')
+
+    def test_01b_the_client_actually_offers_the_old_versions(self):
+        """Guard the negative assertions below against becoming vacuous.
+
+        `_handshake` returns False both when the SERVER refuses and when the
+        client never put a ClientHello on the wire. A modern OpenSSL will not
+        offer TLS 1.0/1.1 unless `-cipher ALL:@SECLEVEL=0` persuades it, and on
+        a distro built `no-tls1 no-tls1_1`, or under a crypto policy pinning
+        MinProtocol, it cannot offer them at all. In either case test_02 below
+        would pass against a gateway happily serving TLS 1.0.
+
+        So: stand up a plain `openssl s_server` that accepts everything, and
+        require the client to reach 1.0 and 1.1 against it. If it cannot, the
+        refusals in test_02 prove nothing and this fails instead of lying.
+        """
+        for version in ('tls1', 'tls1_1'):
+            with self.subTest(version=version):
+                port = _free_port()
+                server = subprocess.Popen(
+                    ['openssl', 's_server', '-accept', str(port), '-quiet',
+                     '-cert', SRV_CRT, '-key', SRV_KEY,
+                     '-cipher', 'ALL:@SECLEVEL=0', f'-{version}'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                try:
+                    _wait_listening(port, timeout=15)
+                    self.assertTrue(
+                        _handshake(port, version),
+                        f'this client cannot offer {version} at all, so the '
+                        f'{version} refusals in test_02 would pass against a '
+                        'gateway that accepts it'
+                    )
+                finally:
+                    server.terminate()
+                    server.wait(timeout=10)
 
     def test_02_floor_12_refuses_11_and_10(self):
         """SOVD requires TLS 1.2 as the minimum, so 1.1 and 1.0 must not connect.

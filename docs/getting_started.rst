@@ -41,6 +41,7 @@ Open three terminals. In each, source your workspace:
 .. code-block:: bash
 
    ros2 launch ros2_medkit_gateway gateway.launch.py \
+     tls_enabled:=false \
      jwt_secret:=change-me-to-at-least-32-characters-long \
      auth_clients:=demo:demo-secret:admin
 
@@ -141,6 +142,14 @@ Required if you want to test the Faults API.
         -H 'Content-Type: application/json' \
         -d '{"grant_type":"client_credentials","client_id":"demo","client_secret":"demo-secret"}' \
         | jq -r .access_token)
+
+   ``tls_enabled:=false`` is what keeps the rest of this page on ``http://``.
+   TLS is on in the shipped config and the gateway will not start without a
+   certificate, so a first run either turns it off, as here, or supplies one:
+   run ``scripts/generate_dev_certs.sh ./certs`` and pass
+   ``cert_file:=./certs/cert.pem key_file:=./certs/key.pem``. Turn it off only
+   on a host nothing else can reach. See :doc:`tutorials/https` for a real
+   certificate.
 
    ``POST /api/v1/auth/authorize`` takes the ``client_credentials`` grant;
    ``/auth/token`` is the refresh endpoint and takes ``refresh_token``.

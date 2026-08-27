@@ -297,6 +297,19 @@ class TestClosedByDefault(GatewayTestCase):
         Widening it to "any method on /health" is the natural next edit and it
         would be wrong, so the narrowness is pinned here.
         """
+        # HEAD first, and separately, because it is the method that matters and
+        # the one an earlier version of this test left out despite its name.
+        # cpp-httplib dispatches HEAD into the GET handler table, so if the
+        # exemption stopped checking the method, HEAD would return the status
+        # document to an anonymous caller. The others have no handler at all on
+        # this path, so they answer 404 either way and cannot show the
+        # difference on their own.
+        head = requests.head(f'{CLOSED_BASE_URL}/health', timeout=15)
+        self.assertIn(
+            head.status_code, (401, 403),
+            f'HEAD /health answered {head.status_code} to an anonymous caller'
+        )
+
         for method in ('POST', 'PUT', 'DELETE', 'PATCH'):
             with self.subTest(method=method):
                 resp = requests.request(

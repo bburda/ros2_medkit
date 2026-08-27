@@ -52,6 +52,12 @@ def generate_launch_description():
     server_host = LaunchConfiguration('server_host')
     server_port = LaunchConfiguration('server_port')
     cors_allowed_origins = LaunchConfiguration('cors_allowed_origins')
+    tls_enabled = LaunchConfiguration('tls_enabled')
+    cert_file = LaunchConfiguration('cert_file')
+    key_file = LaunchConfiguration('key_file')
+    auth_enabled = LaunchConfiguration('auth_enabled')
+    jwt_secret = LaunchConfiguration('jwt_secret')
+    auth_clients = LaunchConfiguration('auth_clients')
 
     args = [
         DeclareLaunchArgument(
@@ -70,6 +76,32 @@ def generate_launch_description():
             default_value='http://localhost:3000,http://localhost:5173',
             description='Comma-separated CORS origins allowed to call the gateway from a browser, '
                         'so the web UI works out of the box. Empty disables CORS.'),
+        # Forwarded to gateway.launch.py. Without these the gateway's own
+        # defaults apply and bringup cannot start at all: the shipped config
+        # turns TLS and authentication on, and the gateway refuses to run
+        # without a certificate and a signing secret. Passing them here is what
+        # makes `ros2 launch ... bringup.launch.py tls_enabled:=false ...` a
+        # complete command rather than a dead end.
+        DeclareLaunchArgument(
+            'tls_enabled', default_value='true',
+            description='Serve HTTPS. Needs cert_file and key_file; pass false to serve '
+                        'plain HTTP on a host nothing else can reach.'),
+        DeclareLaunchArgument(
+            'cert_file', default_value='',
+            description='PEM certificate for HTTPS. Required while tls_enabled is true.'),
+        DeclareLaunchArgument(
+            'key_file', default_value='',
+            description='PEM private key matching cert_file.'),
+        DeclareLaunchArgument(
+            'auth_enabled', default_value='true',
+            description='Require a credential on every request.'),
+        DeclareLaunchArgument(
+            'jwt_secret', default_value='',
+            description='HS256 signing secret, at least 32 characters. Required while '
+                        'auth_enabled is true.'),
+        DeclareLaunchArgument(
+            'auth_clients', default_value='',
+            description='Comma-separated "client_id:client_secret:role" triples.'),
         DeclareLaunchArgument(
             'enable_fault_manager', default_value='true',
             description='Start the fault_manager node.'),
@@ -90,7 +122,10 @@ def generate_launch_description():
     gateway = _include(
         'ros2_medkit_gateway', 'gateway.launch.py',
         launch_arguments={'server_host': server_host, 'server_port': server_port,
-                          'cors_allowed_origins': cors_allowed_origins})
+                          'cors_allowed_origins': cors_allowed_origins,
+                          'tls_enabled': tls_enabled, 'cert_file': cert_file,
+                          'key_file': key_file, 'auth_enabled': auth_enabled,
+                          'jwt_secret': jwt_secret, 'auth_clients': auth_clients})
     fault_manager = _include(
         'ros2_medkit_fault_manager', 'fault_manager.launch.py',
         enable_arg='enable_fault_manager',

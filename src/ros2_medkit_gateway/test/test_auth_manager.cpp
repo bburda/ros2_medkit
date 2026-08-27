@@ -757,7 +757,13 @@ TEST(AuthManagerSecretComparisonTest, OnlyTheExactSecretAuthenticates) {
 
   EXPECT_TRUE(manager.authenticate("svc", "svc_secret").has_value()) << "the real secret must work";
 
-  for (const auto & wrong : {"", "s", "svc_secre", "svc_secret_", "svc_secretX", "SVC_SECRET", "xxxxxxxxxx"}) {
+  // The last two are the ones that matter. Everything before them differs in
+  // length, or in the first byte, so a comparison that checked the length and
+  // then only a prefix would satisfy the whole list. "svc_secreT" differs only
+  // in the FINAL byte: shorten the comparison loop by one and it is accepted
+  // while every other case here still fails correctly.
+  for (const auto & wrong :
+       {"", "s", "svc_secre", "svc_secret_", "svc_secretX", "SVC_SECRET", "xxxxxxxxxx", "svc_secreT", "Svc_secret"}) {
     EXPECT_FALSE(manager.authenticate("svc", wrong).has_value()) << "secret \"" << wrong << "\" was accepted";
   }
 }

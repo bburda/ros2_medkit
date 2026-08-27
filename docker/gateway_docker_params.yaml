@@ -6,6 +6,13 @@ ros2_medkit_gateway:
     server:
       host: "0.0.0.0"
       port: 8080
+      # TLS stays OFF in the image, unlike config/gateway_params.yaml. A
+      # container has no certificate of its own and is almost always fronted by
+      # something that terminates TLS; requiring one here would mean the image
+      # could not start at all. Terminate TLS at your ingress, or mount a
+      # certificate and set server.tls.* yourself.
+      tls:
+        enabled: false
     refresh_interval_ms: 2000
     # The web UI runs as a separate origin (its own host/port), so the
     # documented "run the web UI next to the gateway" path needs CORS. Without
@@ -17,3 +24,17 @@ ros2_medkit_gateway:
       allowed_origins:
         - "http://localhost:3000"
         - "http://localhost:5173"
+
+    # Authentication. On, matching config/gateway_params.yaml, so the published
+    # image has the same posture as the source default rather than a quietly
+    # weaker one.
+    #
+    # jwt_secret and clients are NOT set here on purpose: a secret baked into a
+    # published image is a secret every user of that image shares. The
+    # entrypoint generates one per container and prints the credential, or
+    # takes MEDKIT_JWT_SECRET / MEDKIT_CLIENTS from the environment. Run with
+    # MEDKIT_AUTH_DISABLED=1 to serve without authentication.
+    auth:
+      enabled: true
+      require_auth_for: "all"
+      issuer: "ros2_medkit_gateway"

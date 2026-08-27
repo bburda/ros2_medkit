@@ -92,7 +92,7 @@ ros2 launch ros2_medkit_gateway gateway.launch.py
 4. Tokens are automatically saved to environment variables
 5. Use `{{access_token}}` in Authorization header for protected endpoints
 
-> **Note:** Auth endpoints are always accessible. By default (`require_auth_for: write`), only write operations (POST, PUT, DELETE) require authentication. GET requests work without a token.
+> **Note:** Auth endpoints are always accessible. By default (`require_auth_for: all`), every request needs a token, GET included.
 
 **Discovery:**
 1. Expand **"Discovery"** folder

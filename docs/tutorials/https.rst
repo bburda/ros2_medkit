@@ -11,7 +11,7 @@ encrypted HTTPS communication with the gateway.
 Overview
 --------
 
-By default, the gateway uses plain HTTP. For production deployments,
+The gateway serves HTTPS by default. For production deployments,
 you should enable TLS to:
 
 - Encrypt all traffic between clients and the gateway

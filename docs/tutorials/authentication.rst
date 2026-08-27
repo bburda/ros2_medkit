@@ -11,7 +11,7 @@ Role-Based Access Control (RBAC) in ros2_medkit_gateway.
 Overview
 --------
 
-By default, the gateway runs without authentication for easy development.
+The gateway requires authentication by default.
 For production deployments, you should enable authentication to:
 
 - Control who can access the API

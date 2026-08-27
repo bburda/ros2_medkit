@@ -170,9 +170,16 @@ def generate_launch_description():
 
         tls_enabled = LaunchConfiguration('tls_enabled').perform(context).lower() in (
             'true', '1', 'yes')
+        # Environment override read BEFORE the value is used: the container
+        # image serves plain HTTP behind whatever terminates TLS for it, and it
+        # has no certificate of its own to offer.
+        if os.environ.get('MEDKIT_TLS_DISABLED') == '1':
+            tls_enabled = False
         param_overrides['server.tls.enabled'] = tls_enabled
-        cert_file = LaunchConfiguration('cert_file').perform(context)
-        key_file = LaunchConfiguration('key_file').perform(context)
+        cert_file = (LaunchConfiguration('cert_file').perform(context)
+                     or os.environ.get('MEDKIT_TLS_CERT_FILE', ''))
+        key_file = (LaunchConfiguration('key_file').perform(context)
+                    or os.environ.get('MEDKIT_TLS_KEY_FILE', ''))
         if cert_file:
             param_overrides['server.tls.cert_file'] = cert_file
         if key_file:
@@ -186,11 +193,19 @@ def generate_launch_description():
                   'or pass tls_enabled:=false to serve plain HTTP. '
                   'scripts/generate_dev_certs.sh makes a self-signed pair for a first run.')
 
+        # Launch argument first, then the environment. The environment path is
+        # what makes the container image work: its entrypoint generates a
+        # per-container credential and exports it, and `ros2 launch` inside that
+        # container has no other way to receive it.
         auth_enabled = LaunchConfiguration('auth_enabled').perform(context).lower() in (
             'true', '1', 'yes')
+        if os.environ.get('MEDKIT_AUTH_DISABLED') == '1':
+            auth_enabled = False
         param_overrides['auth.enabled'] = auth_enabled
-        jwt_secret = LaunchConfiguration('jwt_secret').perform(context)
-        clients = LaunchConfiguration('auth_clients').perform(context)
+        jwt_secret = (LaunchConfiguration('jwt_secret').perform(context)
+                      or os.environ.get('MEDKIT_JWT_SECRET', ''))
+        clients = (LaunchConfiguration('auth_clients').perform(context)
+                   or os.environ.get('MEDKIT_CLIENTS', ''))
         if jwt_secret:
             param_overrides['auth.jwt_secret'] = jwt_secret
         if clients:

@@ -116,7 +116,7 @@ TLS/HTTPS Configuration
      - Description
    * - ``server.tls.enabled``
      - bool
-     - ``false``
+     - ``true``
      - Enable HTTPS using OpenSSL.
    * - ``server.tls.cert_file``
      - string
@@ -857,7 +857,7 @@ default for local development.
      - Description
    * - ``auth.enabled``
      - bool
-     - ``false``
+     - ``true``
      - Enable/disable JWT authentication.
    * - ``auth.jwt_secret``
      - string
@@ -881,7 +881,7 @@ default for local development.
      - Refresh token validity period in seconds (24 hours). Must be >= ``token_expiry_seconds``.
    * - ``auth.require_auth_for``
      - string
-     - ``"write"``
+     - ``"all"``
      - When to require authentication: ``"none"`` (auth endpoints still available), ``"write"`` (POST/PUT/DELETE only), or ``"all"`` (every request).
    * - ``auth.issuer``
      - string
