@@ -87,12 +87,12 @@ SSEFaultHandler::SSEFaultHandler(HandlerContext & ctx, std::shared_ptr<SSEClient
           return targets;
         }
         for (const auto & endpoint : agg->healthy_peer_endpoints()) {
-          // No Authorization. A relay is one connection shared by every local
-          // client, so there is no single client whose token it could carry,
-          // and sending the one that happened to open it would serve every
-          // later client events fetched with somebody else's credentials.
-          // A peer that requires authentication therefore refuses the relay.
-          targets.push_back(RelayTarget{endpoint.name, endpoint.url, ""});
+          // This gateway's own credential, never a client's. A relay is one
+          // connection shared by every local client, so there is no single
+          // client whose token it could carry, and sending the one that
+          // happened to open it would serve every later client events fetched
+          // with somebody else's credentials.
+          targets.push_back(RelayTarget{endpoint.name, endpoint.url, agg->peer_auth_header()});
         }
         return targets;
       },

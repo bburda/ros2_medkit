@@ -154,6 +154,19 @@ for peer communication.
        ``false`` (default), auth tokens are **never** sent to peers - this
        prevents token leakage to untrusted or mDNS-discovered peers. Only
        enable when all peers are trusted and share the same JWT configuration.
+   * - ``aggregation.peer_auth_header``
+     - string
+     - ``""``
+     - What this gateway presents as ``Authorization`` on connections it opens
+       on its **own** behalf rather than for a request it is serving. The fault
+       stream relay is the one that needs it: an aggregator holds one stream per
+       peer, opened when the first local client attaches and shared by every
+       client after it, so there is no single client whose token it could carry.
+       Leave it empty unless the peers require authentication; while it is
+       empty, such a peer refuses the relay and the aggregator's own
+       ``/faults/stream`` carries local events only. This is separate from
+       ``forward_auth``, which forwards an end user's token per request and has
+       no effect on the relay.
    * - ``aggregation.require_tls``
      - bool
      - ``false``

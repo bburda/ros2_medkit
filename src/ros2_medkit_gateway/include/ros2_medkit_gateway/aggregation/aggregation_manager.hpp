@@ -75,6 +75,18 @@ struct AggregationConfig {
   bool discover{false};
   std::string mdns_service{"_medkit._tcp.local"};
 
+  /// What this gateway presents as Authorization on connections it makes on
+  /// its OWN behalf, rather than on behalf of a request it is serving. Empty
+  /// for none.
+  ///
+  /// The fault-stream relay is the case that needs it: one connection per peer,
+  /// opened when the first local client attaches and shared by every one after
+  /// it. There is no single client whose token it could carry, and carrying the
+  /// opener's would serve everybody else events fetched with those credentials
+  /// and break when that one client's token expired. forward_auth is the wrong
+  /// lever for it - that forwards an end user's token per request.
+  std::string peer_auth_header;
+
   /// Forward the client's Authorization header to peer gateways.
   /// Default: false (safe default - prevents token leakage to untrusted peers).
   bool forward_auth{false};
@@ -219,6 +231,13 @@ class AggregationManager {
   /// form a caller that has to open a connection needs, and it excludes the
   /// unhealthy peers that rendering deliberately includes.
   std::vector<PeerEndpoint> healthy_peer_endpoints() const;
+
+  /// The Authorization value this gateway presents to peers on its own behalf.
+  /// Empty when none is configured, in which case a peer that requires
+  /// authentication refuses the relay.
+  const std::string & peer_auth_header() const {
+    return config_.peer_auth_header;
+  }
 
   /**
    * @brief Fetch entities from all healthy peers, merge with local entities, and build routing table

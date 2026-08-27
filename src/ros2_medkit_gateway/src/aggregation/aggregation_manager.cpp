@@ -215,8 +215,8 @@ AggregationManager::AggregationManager(const AggregationConfig & config, rclcpp:
       }
     }
 
-    peers_.push_back(
-        std::make_shared<PeerClient>(peer_cfg.url, peer_cfg.name, config_.peer_timeouts(), config_.forward_auth));
+    peers_.push_back(std::make_shared<PeerClient>(peer_cfg.url, peer_cfg.name, config_.peer_timeouts(),
+                                                  config_.forward_auth, config_.peer_auth_header));
   }
   static_peer_count_ = peers_.size();
 }
@@ -272,7 +272,8 @@ void AggregationManager::add_discovered_peer(const std::string & url, const std:
     return;
   }
 
-  peers_.push_back(std::make_shared<PeerClient>(url, name, config_.peer_timeouts(), config_.forward_auth));
+  peers_.push_back(
+      std::make_shared<PeerClient>(url, name, config_.peer_timeouts(), config_.forward_auth, config_.peer_auth_header));
 }
 
 void AggregationManager::remove_discovered_peer(const std::string & name) {

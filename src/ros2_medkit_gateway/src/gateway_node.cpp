@@ -252,6 +252,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   declare_parameter("aggregation.mdns_name", std::string(""));  // defaults to hostname
   // Security: forward Authorization header to peers (default: false to prevent token leakage)
   declare_parameter("aggregation.forward_auth", false);
+  declare_parameter("aggregation.peer_auth_header", "");
   // Security: require TLS for all peer URLs (default: false)
   declare_parameter("aggregation.require_tls", false);
   // URL scheme for mDNS-discovered peer URLs (default: "http")
@@ -1189,6 +1190,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     agg_config.discover = get_parameter("aggregation.discover").as_bool();
     agg_config.mdns_service = get_parameter("aggregation.mdns_service").as_string();
     agg_config.forward_auth = get_parameter("aggregation.forward_auth").as_bool();
+    agg_config.peer_auth_header = get_parameter("aggregation.peer_auth_header").as_string();
     agg_config.require_tls = get_parameter("aggregation.require_tls").as_bool();
     agg_config.peer_scheme = get_parameter("aggregation.peer_scheme").as_string();
     if (agg_config.peer_scheme != "http" && agg_config.peer_scheme != "https") {
