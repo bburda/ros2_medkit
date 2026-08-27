@@ -718,6 +718,14 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
   // active-client registry so shutdown() can stop() the in-flight call.
   ScopedClient scoped(*this, url_, timeouts_.metadata_read_ms);
   auto & cli = *scoped;
+  // Fetching the peer's entities is this gateway asking on its own behalf, so
+  // it carries the gateway's own credential. Set once on the client rather
+  // than on each of the requests below - that is also what stops the next
+  // route added here from silently going out unauthenticated and reducing the
+  // peer to "offers no such route".
+  if (!peer_auth_header_.empty()) {
+    cli.set_default_headers({{"Authorization", peer_auth_header_}});
+  }
 
   PeerEntities entities;
   const std::string peer_source = "peer:" + name_;

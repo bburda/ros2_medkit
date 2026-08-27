@@ -42,7 +42,7 @@ void PeerFaultRelay::acquire() {
 }
 
 void PeerFaultRelay::release() {
-  std::vector<std::unique_ptr<SSEStreamProxy>> retired;
+  std::vector<std::pair<StreamKey, std::unique_ptr<SSEStreamProxy>>> retired;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (clients_ == 0) {
@@ -52,9 +52,9 @@ void PeerFaultRelay::release() {
       retired = take_all_locked();
     }
   }
-  // Outside the lock on purpose: each destructor joins a reader thread, and a
-  // reader thread delivering an event is inside the owner's callback.
-  retired.clear();
+  // Outside the lock on purpose: closing joins a reader thread, and a reader
+  // thread delivering an event is inside the owner's callback.
+  retire(std::move(retired));
 }
 
 void PeerFaultRelay::reconcile() {
@@ -83,7 +83,7 @@ void PeerFaultRelay::reconcile_now(bool force) {
   // moved out under the lock and destroyed after it. A reader thread delivering
   // an event calls back into the owner, which locks its own queue; joining that
   // thread while holding this mutex puts the two lock orders against each other.
-  std::vector<std::unique_ptr<SSEStreamProxy>> retired;
+  std::vector<std::pair<StreamKey, std::unique_ptr<SSEStreamProxy>>> retired;
   std::vector<RelayTarget> to_open;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -98,8 +98,7 @@ void PeerFaultRelay::reconcile_now(bool force) {
         ++it;
         continue;
       }
-      cursors_[it->first] = it->second->last_event_id();
-      retired.push_back(std::move(it->second));
+      retired.emplace_back(it->first, std::move(it->second));
       it = streams_.erase(it);
     }
     for (const auto & target : targets) {
@@ -108,7 +107,7 @@ void PeerFaultRelay::reconcile_now(bool force) {
       }
     }
   }
-  retired.clear();
+  retire(std::move(retired));
 
   for (const auto & target : to_open) {
     // X-Medkit-No-Fan-Out is what the collection routes already use to stop a
@@ -147,7 +146,7 @@ std::size_t PeerFaultRelay::open_streams() const {
 }
 
 void PeerFaultRelay::shutdown() {
-  std::vector<std::unique_ptr<SSEStreamProxy>> retired;
+  std::vector<std::pair<StreamKey, std::unique_ptr<SSEStreamProxy>>> retired;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (shut_down_) {
@@ -157,21 +156,53 @@ void PeerFaultRelay::shutdown() {
     clients_ = 0;
     retired = take_all_locked();
   }
-  retired.clear();
+  retire(std::move(retired));
 }
 
-std::vector<std::unique_ptr<SSEStreamProxy>> PeerFaultRelay::take_all_locked() {
-  std::vector<std::unique_ptr<SSEStreamProxy>> retired;
+std::vector<std::pair<PeerFaultRelay::StreamKey, std::unique_ptr<SSEStreamProxy>>> PeerFaultRelay::take_all_locked() {
+  std::vector<std::pair<StreamKey, std::unique_ptr<SSEStreamProxy>>> retired;
   retired.reserve(streams_.size());
   for (auto & [key, proxy] : streams_) {
-    // Read before the proxy leaves: the caller destroys these outside the
-    // lock, and the cursor has to survive so a stream reopened for the same
-    // peer resumes rather than replaying the peer's whole buffer.
-    cursors_[key] = proxy->last_event_id();
-    retired.push_back(std::move(proxy));
+    // The key travels with the proxy so retire() can record where its reader
+    // stopped. The cursor is NOT read here: this runs with the reader still
+    // going, so a value taken now can be one event behind by the time the
+    // reader is stopped, and that event would then be replayed.
+    retired.emplace_back(key, std::move(proxy));
   }
   streams_.clear();
   return retired;
+}
+
+void PeerFaultRelay::retire(std::vector<std::pair<StreamKey, std::unique_ptr<SSEStreamProxy>>> retired) {
+  for (auto & [key, proxy] : retired) {
+    if (!proxy) {
+      continue;
+    }
+    // Stopped BEFORE its cursor is read, so the value recorded is the last
+    // event the reader actually delivered and not a snapshot it has since
+    // moved past.
+    proxy->close();
+    auto cursor = proxy->last_event_id();
+    proxy.reset();
+    if (cursor.empty()) {
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    cursors_[key] = std::move(cursor);
+    trim_cursors_locked();
+  }
+}
+
+void PeerFaultRelay::trim_cursors_locked() {
+  while (cursors_.size() > kMaxCursors) {
+    // Prefer forgetting a peer that has no stream open right now: it is the
+    // one least likely to be resumed, and a peer currently being relayed from
+    // would otherwise lose its resume point while it was still in use.
+    auto victim = std::find_if(cursors_.begin(), cursors_.end(), [this](const auto & entry) {
+      return streams_.find(entry.first) == streams_.end();
+    });
+    cursors_.erase(victim == cursors_.end() ? cursors_.begin() : victim);
+  }
 }
 
 }  // namespace ros2_medkit_gateway

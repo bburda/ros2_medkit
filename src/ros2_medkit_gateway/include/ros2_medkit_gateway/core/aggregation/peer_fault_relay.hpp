@@ -102,10 +102,27 @@ class PeerFaultRelay {
   void shutdown();
 
  private:
+  /// A peer name AND url. A peer keeps its name across an mDNS re-announce
+  /// that moves it to a new address, so a name-only key would keep the dead
+  /// connection and never open the new one.
+  using StreamKey = std::pair<std::string, std::string>;
+
   /// Move every open proxy out of the map. Caller holds mutex_ and destroys
   /// the returned proxies after releasing it - destroying one joins its reader
   /// thread, which calls back into the owner and takes the owner's lock.
-  std::vector<std::unique_ptr<SSEStreamProxy>> take_all_locked();
+  std::vector<std::pair<StreamKey, std::unique_ptr<SSEStreamProxy>>> take_all_locked();
+
+  /// Stop each proxy, record where its reader actually stopped, and destroy it.
+  /// Called with mutex_ RELEASED: closing joins a reader thread, and that
+  /// thread may be inside the owner's callback waiting for a lock this holds.
+  void retire(std::vector<std::pair<StreamKey, std::unique_ptr<SSEStreamProxy>>> retired);
+
+  /// Drop remembered cursors once there are more of them than peers this relay
+  /// could plausibly be talking to. Peers discovered over mDNS come and go
+  /// under names of their own, and a cursor per name that is never released is
+  /// a map that only grows.
+  void trim_cursors_locked();
+  static constexpr std::size_t kMaxCursors = 128;
 
   TargetSupplier targets_;
   std::string path_;
@@ -127,12 +144,12 @@ class PeerFaultRelay {
   /// Open proxies, keyed by peer name AND url. A peer keeps its name across an
   /// mDNS re-announce that moves it to a new address, so a name-only key would
   /// keep the dead connection and never open the new one.
-  std::map<std::pair<std::string, std::string>, std::unique_ptr<SSEStreamProxy>> streams_;
+  std::map<StreamKey, std::unique_ptr<SSEStreamProxy>> streams_;
   /// Last event id reached per peer, kept when its stream is closed so a later
   /// one resumes there instead of asking for the peer's whole buffer. Keyed
   /// like streams_, and it outlives them on purpose: the common case is the
   /// last client leaving and another arriving moments later.
-  std::map<std::pair<std::string, std::string>, std::string> cursors_;
+  std::map<StreamKey, std::string> cursors_;
 };
 
 }  // namespace ros2_medkit_gateway

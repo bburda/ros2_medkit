@@ -157,6 +157,18 @@ class Ros2ParameterTransport : public ParameterTransport {
   /// Convert ROS 2 ParameterValue to JSON.
   json parameter_value_to_json(const rclcpp::ParameterValue & value) const;
 
+  /// The value as the configurations API may show it: the real one, or a
+  /// redaction marker when the parameter's value is a credential.
+  ///
+  /// The configurations route is a read route, and a gateway that answers it
+  /// with the secret that signs its own tokens hands any reader the means to
+  /// mint one. Names are matched exactly, so a parameter that merely mentions
+  /// one of these words keeps showing its value.
+  json parameter_value_for_display(const std::string & name, const rclcpp::ParameterValue & value) const;
+
+  /// Whether this parameter's value is a credential and must never be shown.
+  static bool is_secret_parameter(const std::string & name);
+
   /// Convert JSON value to ROS 2 ParameterValue.
   rclcpp::ParameterValue json_to_parameter_value(const json & value, rclcpp::ParameterType hint_type) const;
 

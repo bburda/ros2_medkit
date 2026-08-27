@@ -652,6 +652,15 @@ Example:
    dependencies. Topic discovery, sampling, publishing, service calls, and
    action operations are implemented in pure C++ using ros2_medkit_serialization.
 
+.. note::
+
+   Parameters whose value is a credential - ``auth.jwt_secret``,
+   ``auth.clients`` and ``aggregation.peer_auth_header`` - are reported by the
+   configurations API as ``***`` rather than their value. The parameter is
+   still listed, with its real type, so it stays discoverable; only the secret
+   is withheld. Set them through the node's configuration, and read them back
+   from there rather than over the API.
+
 SSE (Server-Sent Events)
 ------------------------
 
