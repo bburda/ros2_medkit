@@ -272,8 +272,13 @@ void AggregationManager::add_discovered_peer(const std::string & url, const std:
     return;
   }
 
-  peers_.push_back(
-      std::make_shared<PeerClient>(url, name, config_.peer_timeouts(), config_.forward_auth, config_.peer_auth_header));
+  // A DISCOVERED peer gets no credential. peer_auth_header is presented to
+  // peers the operator named in the configuration; a peer that announced
+  // itself over mDNS is not one of those, and handing it this gateway's
+  // credential is the leak forward_auth already refuses to risk. A discovered
+  // peer that requires authentication therefore stays unreachable, which is
+  // the safe way round.
+  peers_.push_back(std::make_shared<PeerClient>(url, name, config_.peer_timeouts(), config_.forward_auth, ""));
 }
 
 void AggregationManager::remove_discovered_peer(const std::string & name) {

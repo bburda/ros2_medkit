@@ -269,7 +269,7 @@ ParameterResult Ros2ParameterTransport::list_own_parameters() {
     for (const auto & param : params) {
       json param_obj;
       param_obj["name"] = param.get_name();
-      param_obj["value"] = parameter_value_to_json(param.get_parameter_value());
+      param_obj["value"] = parameter_value_for_display(param.get_name(), param.get_parameter_value());
       param_obj["type"] = parameter_type_to_string(param.get_type());
       params_array.push_back(param_obj);
     }
@@ -297,7 +297,7 @@ ParameterResult Ros2ParameterTransport::get_own_parameter(const std::string & pa
 
     json param_obj;
     param_obj["name"] = param.get_name();
-    param_obj["value"] = parameter_value_to_json(param.get_parameter_value());
+    param_obj["value"] = parameter_value_for_display(param.get_name(), param.get_parameter_value());
     param_obj["type"] = parameter_type_to_string(param.get_type());
     param_obj["description"] = descriptor.description;
     param_obj["read_only"] = descriptor.read_only;
@@ -446,7 +446,7 @@ ParameterResult Ros2ParameterTransport::list_parameters(const std::string & node
     for (const auto & param : parameters) {
       json param_obj;
       param_obj["name"] = param.get_name();
-      param_obj["value"] = parameter_value_to_json(param.get_parameter_value());
+      param_obj["value"] = parameter_value_for_display(param.get_name(), param.get_parameter_value());
       param_obj["type"] = parameter_type_to_string(param.get_type());
       params_array.push_back(param_obj);
     }
@@ -596,7 +596,7 @@ ParameterResult Ros2ParameterTransport::get_parameter(const std::string & node_n
 
     json param_obj;
     param_obj["name"] = param.get_name();
-    param_obj["value"] = parameter_value_to_json(param.get_parameter_value());
+    param_obj["value"] = parameter_value_for_display(param.get_name(), param.get_parameter_value());
     param_obj["type"] = parameter_type_to_string(param.get_type());
 
     if (!descriptors.empty()) {
@@ -642,7 +642,7 @@ ParameterResult Ros2ParameterTransport::set_parameter(const std::string & node_n
       }
       json param_obj;
       param_obj["name"] = param_name;
-      param_obj["value"] = parameter_value_to_json(param_value);
+      param_obj["value"] = parameter_value_for_display(param_name, param_value);
       param_obj["type"] = parameter_type_to_string(param_value.get_type());
       result.success = true;
       result.data = param_obj;
@@ -791,7 +791,7 @@ ParameterResult Ros2ParameterTransport::set_parameter(const std::string & node_n
 
     json param_obj;
     param_obj["name"] = param_name;
-    param_obj["value"] = parameter_value_to_json(param_value);
+    param_obj["value"] = parameter_value_for_display(param_name, param_value);
     param_obj["type"] = parameter_type_to_string(param_value.get_type());
 
     result.success = true;
@@ -822,7 +822,7 @@ ParameterResult Ros2ParameterTransport::get_default(const std::string & node_nam
       if (pre_it != node_pre_write->end()) {
         ParameterResult pre_result;
         pre_result.success = true;
-        pre_result.data = parameter_value_to_json(pre_it->second.get_parameter_value());
+        pre_result.data = parameter_value_for_display(param_name, pre_it->second.get_parameter_value());
         return pre_result;
       }
     }
@@ -884,7 +884,7 @@ ParameterResult Ros2ParameterTransport::get_default(const std::string & node_nam
     return result;
   }
   result.success = true;
-  result.data = parameter_value_to_json(param_it->second.get_parameter_value());
+  result.data = parameter_value_for_display(param_name, param_it->second.get_parameter_value());
   return result;
 }
 
@@ -956,7 +956,7 @@ ParameterResult Ros2ParameterTransport::list_defaults(const std::string & node_n
   for (const auto & [name, param] : merged) {
     json entry;
     entry["name"] = name;
-    entry["value"] = parameter_value_to_json(param.get_parameter_value());
+    entry["value"] = parameter_value_for_display(name, param.get_parameter_value());
     entry["type"] = parameter_type_to_string(param.get_type());
     defaults_array.push_back(entry);
   }
@@ -1226,6 +1226,29 @@ bool Ros2ParameterTransport::cache_default_values(const std::string & node_name)
     return true;
   }
   return false;  // defaults cached successfully
+}
+
+bool Ros2ParameterTransport::is_secret_parameter(const std::string & name) {
+  // Exact names, deliberately not a substring match on "secret" or "token":
+  // a substring rule hides ordinary parameters whose names happen to contain
+  // the word, and the operator then cannot read a value that is not a secret.
+  static const std::set<std::string> kSecretParameters{
+      "auth.jwt_secret",              // signs this gateway's tokens
+      "auth.clients",                 // holds client_id:client_secret:role
+      "aggregation.peer_auth_header"  // what this gateway presents to peers
+  };
+  return kSecretParameters.find(name) != kSecretParameters.end();
+}
+
+json Ros2ParameterTransport::parameter_value_for_display(const std::string & name,
+                                                         const rclcpp::ParameterValue & value) const {
+  if (is_secret_parameter(name)) {
+    // A fixed marker rather than the value's own shape. It reads as redaction
+    // in any client, and the entry keeps its declared type so the parameter is
+    // still discoverable - only its value is withheld.
+    return json("***");
+  }
+  return parameter_value_to_json(value);
 }
 
 }  // namespace ros2_medkit_gateway::ros2

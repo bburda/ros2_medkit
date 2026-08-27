@@ -404,6 +404,38 @@ class RelayPeerCredentialTest(unittest.TestCase):
             self._close_stream(authed_res, authed_stop, authed_pump)
             self._close_stream(bare_res, bare_stop, bare_pump)
 
+    def test_c4_the_credential_is_not_readable_through_the_configurations_api(self):
+        """C4: the value that authenticates us to a peer must not be a read.
+
+        The configurations route reports the gateway's own ROS parameters, and
+        the credential is one. A gateway that answers it with the value hands
+        any reader the means to speak to the peer as this gateway - and the
+        same route reports auth.jwt_secret, which signs this gateway's own
+        tokens. Asserted against the raw response text rather than a parsed
+        field, so a value that reaches the client through some other key still
+        fails this.
+        """
+        token = PEER_CREDENTIAL.split(' ', 1)[1]
+        apps = requests.get(f'{AUTHED_AGG_URL}/apps', timeout=10).json().get('items', [])
+        self.assertTrue(apps, 'the aggregator exposed no apps, so this asserts nothing')
+
+        checked = 0
+        for app in apps:
+            body = requests.get(
+                f'{AUTHED_AGG_URL}/apps/{app["id"]}/configurations', timeout=10).text
+            self.assertNotIn(
+                token, body,
+                f'the peer credential is readable through {app["id"]}/configurations')
+            self.assertNotIn(
+                JWT_SECRET, body,
+                f'the JWT signing secret is readable through {app["id"]}/configurations')
+            if 'peer_auth_header' in body:
+                checked += 1
+        self.assertGreater(
+            checked, 0,
+            'no app listed aggregation.peer_auth_header at all, so this test would '
+            'pass even if the value were being served in full')
+
 
 @launch_testing.post_shutdown_test()
 class TestShutdown(unittest.TestCase):

@@ -162,11 +162,22 @@ for peer communication.
        stream relay is the one that needs it: an aggregator holds one stream per
        peer, opened when the first local client attaches and shared by every
        client after it, so there is no single client whose token it could carry.
-       Leave it empty unless the peers require authentication; while it is
-       empty, such a peer refuses the relay and the aggregator's own
-       ``/faults/stream`` carries local events only. This is separate from
-       ``forward_auth``, which forwards an end user's token per request and has
-       no effect on the relay.
+       It is presented on every connection this gateway opens for itself: the
+       peer health check, the entity fetch behind aggregation, the relay, and
+       any forward whose caller sent no credential to pass on. Leave it empty
+       unless the peers require authentication; while it is empty, such a peer
+       answers 401, is recorded as offline, and contributes neither entities
+       nor events.
+
+       Sent **only to peers named in the configuration**. A peer discovered
+       over mDNS never receives it, because it is not one the operator vouched
+       for - so a discovered peer that requires authentication stays
+       unreachable rather than being handed this gateway's credential. The
+       value is redacted from the configurations API, like ``auth.jwt_secret``.
+
+       This is separate from ``forward_auth``, which forwards an end user's
+       token per request. Where both apply, a caller's own token wins, so
+       ``forward_auth`` goes on naming the end user to the peer.
    * - ``aggregation.require_tls``
      - bool
      - ``false``
