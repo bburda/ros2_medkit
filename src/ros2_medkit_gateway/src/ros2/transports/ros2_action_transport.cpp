@@ -183,6 +183,7 @@ ActionSendGoalResult Ros2ActionTransport::send_goal(const std::string & action_p
     // future.wait_for().
     const auto wait_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout);
     if (!clients.send_goal_client->wait_for_service(wait_timeout)) {
+      result.outcome = CallOutcome::kServiceUnavailable;
       result.error_message = "Action server not available: " + action_path;
       return result;
     }
@@ -211,7 +212,11 @@ ActionSendGoalResult Ros2ActionTransport::send_goal(const std::string & action_p
     if (future_status != std::future_status::ready) {
       clients.send_goal_client->remove_pending_request(future_and_id.request_id);
       ros2_medkit_serialization::destroy_ros_message(&ros_request);
-      result.error_message = "Send goal timed out";
+      result.outcome = CallOutcome::kTimeout;
+      // Name the action and the budget. "Send goal timed out" tells a client
+      // neither which action stalled nor what it was measured against, so
+      // there is nothing in it to act on.
+      result.error_message = "Send goal timed out (" + std::to_string(timeout_ms.count()) + "ms): " + action_path;
       return result;
     }
 
@@ -232,6 +237,7 @@ ActionSendGoalResult Ros2ActionTransport::send_goal(const std::string & action_p
     json response = serializer_->to_json(type_info, response_ptr.get());
 
     result.success = true;
+    result.outcome = CallOutcome::kOk;
     result.goal_accepted = response.value("accepted", false);
 
     if (result.goal_accepted) {

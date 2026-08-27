@@ -23,10 +23,27 @@ namespace ros2_medkit_gateway {
 
 using json = nlohmann::json;
 
+/// Why a synchronous round-trip to a ROS 2 endpoint produced no answer.
+///
+/// The same distinction `CancelOutcome` draws for the cancel path: a call that
+/// ran out of time is not a call that failed. The endpoint may be working on it
+/// still, so the two cannot share a status, and a client should not have to
+/// match on the text in `details` to tell them apart.
+enum class CallOutcome : uint8_t {
+  kOk,                  ///< The endpoint answered.
+  kTimeout,             ///< No answer inside the budget - the work may still be running.
+  kServiceUnavailable,  ///< The endpoint is not discoverable on the graph.
+  kTransportError,      ///< Null response, unknown type, serialization failure, exception.
+};
+
 /// Result of a synchronous service call.
 struct ServiceCallResult {
   bool success;
   json response;
+  /// Defaults to kTransportError so an exit path that forgets to classify
+  /// itself reads as a transport failure, never as a timeout - the same
+  /// defensive default `ActionCancelResult::outcome` carries.
+  CallOutcome outcome = CallOutcome::kTransportError;
   std::string error_message;
 };
 
@@ -50,6 +67,8 @@ struct ActionSendGoalResult {
   bool success;
   std::string goal_id;  ///< UUID hex string
   bool goal_accepted;
+  /// Meaningful only when `success` is false; see CallOutcome.
+  CallOutcome outcome = CallOutcome::kTransportError;
   std::string error_message;
 };
 

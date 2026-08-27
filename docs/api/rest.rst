@@ -3201,7 +3201,9 @@ Other extensions beyond SOVD:
 When aggregation is enabled, per-entity resource collection endpoints perform
 real-time fan-out to peer gateways. The affected endpoints are: data,
 operations, faults, configurations, logs, and the global ``GET /api/v1/faults``
-endpoint. The gateway sends the same request to all healthy peers, merges their
+endpoint. ``GET /api/v1/faults/stream`` also reaches every healthy peer, but it
+is not an ``items`` merge: it holds one connection open per peer for as long as
+a client is attached. See the fault-streaming section below. The gateway sends the same request to all healthy peers, merges their
 ``items`` arrays into the local response, and returns the combined result.
 
 If some peer requests fail during fan-out (peer unreachable or non-2xx
@@ -3213,12 +3215,98 @@ response), the response includes vendor metadata indicating partial results:
      "items": [],
      "x-medkit": {
        "partial": true,
-       "failed_peers": ["secondary_gateway"]
+       "failed_peers": ["secondary_gateway"],
+       "peer_failures": [{"peer": "secondary_gateway", "reason": "timeout"}]
      }
    }
 
+``failed_peers`` names which peers contributed nothing. ``peer_failures`` says
+why, one entry per name, with ``reason`` one of:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - ``reason``
+     - Meaning
+   * - ``timeout``
+     - A budget ran out. Which one is named in the message: the connect budget
+       means the peer never accepted the connection, a read or write budget
+       means it did and the gateway stopped waiting.
+   * - ``unreachable``
+     - No usable answer arrived: connection refused, no route, TLS or redirect
+       failure, or the peer died while the answer was arriving.
+   * - ``canceled``
+     - This gateway stopped the call, which happens during its own shutdown.
+   * - ``error-status``
+     - The peer answered with a status outside 2xx.
+   * - ``too-large``
+     - The peer's body passed the peer-response size limit.
+   * - ``invalid-response``
+     - The peer answered with something that is not the JSON the route
+       promises.
+
+Without ``peer_failures`` a client cannot tell a busy subsystem from a dead
+one, which is the whole of what a partial answer is asked.
+
 When all peers respond successfully, these fields are omitted. See the
 :doc:`aggregation configuration guide </config/aggregation>` for setup details.
+
+**A forwarded request that runs out of time.** ``GET``, ``POST``, ``PUT``,
+``DELETE`` and ``PATCH`` on a resource a peer owns are proxied to that peer.
+Two outcomes that used to be one:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 30 58
+
+   * - Status
+     - ``error_code``
+     - When
+   * - ``504``
+     - ``not-responding``
+     - A budget ran out before the peer answered. The message names which one
+       and its value, because the connect, read and write budgets are three
+       different keys and only one of them was the problem. The request may
+       still be running on the peer.
+   * - ``502``
+     - ``vendor-error`` / ``x-medkit-peer-unavailable``
+     - Nothing answered - refused, no route, or the peer died mid-answer.
+
+**A local operation that runs out of time.** ``POST
+/{entity}/operations/{op}/executions`` answers ``504`` ``not-responding`` when
+the backing ROS 2 service or action did not answer inside
+``service_call_timeout_sec``, with a message naming the endpoint and
+the budget; ``503`` when the endpoint is not on the graph at all; and ``500``
+for any other transport failure. Previously all three answered ``500`` with a
+fixed ``"Service call failed"`` / ``"Action execution failed"``, and a client
+had to match on the text in ``parameters.details`` to learn it was a timeout.
+
+**Fault streaming on an aggregating gateway.** ``GET /faults/stream`` on a
+gateway with peers relays their streams into its own. Each relayed event
+carries ``x-medkit.peer`` naming the gateway that raised the fault. The relay
+is open only while a client is attached, because it holds one SSE client slot
+on each peer and ``sse.max_clients`` defaults to 2. Replay via
+``Last-Event-ID`` covers this gateway's own ids: two peers number their events
+independently, so a reconnecting client resumes from what the aggregator has
+buffered rather than from each peer's own history. A request carrying
+``X-Medkit-No-Fan-Out`` is served from the local graph only, which is what
+stops a chain of aggregating gateways relaying one event round the loop.
+
+Because those relayed connections count against the peer's own
+``sse.max_clients``, ``GET /health`` now reports how much of that cap is in
+use:
+
+.. code-block:: json
+
+   {
+     "status": "healthy",
+     "x-medkit-sse": {"connected_clients": 1, "max_clients": 2}
+   }
+
+Without it, an operator refused a stream with ``503`` on a gateway nobody
+appears to be watching has nothing to look at. The object is omitted when the
+gateway has no SSE client tracker.
 
 ``GET /{entity}/configurations`` applies the same honesty to its *local*
 backing nodes. This only arises for entities backed by more than one ROS 2

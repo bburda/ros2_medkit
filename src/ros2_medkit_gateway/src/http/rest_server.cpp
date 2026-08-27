@@ -14,6 +14,8 @@
 
 #include "ros2_medkit_gateway/core/http/rest_server.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <exception>
 #include <limits>
@@ -154,7 +156,13 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   route_registry_ = std::make_unique<openapi::RouteRegistry>();
   route_registry_->set_auth_enabled(auth_config_.enabled);
 
-  health_handlers_ = std::make_unique<handlers::HealthHandlers>(*handler_ctx_, route_registry_.get());
+  // Taken before the handlers that read it: /health reports how much of the
+  // SSE client cap is in use, and a tracker fetched afterwards would reach
+  // HealthHandlers as a null pointer and silently omit the field.
+  sse_client_tracker_ = node_->get_sse_client_tracker();
+
+  health_handlers_ =
+      std::make_unique<handlers::HealthHandlers>(*handler_ctx_, route_registry_.get(), sse_client_tracker_);
   discovery_handlers_ = std::make_unique<handlers::DiscoveryHandlers>(*handler_ctx_);
   data_handlers_ = std::make_unique<handlers::DataHandlers>(*handler_ctx_);
   lifecycle_handlers_ = std::make_unique<handlers::LifecycleHandlers>(
@@ -164,8 +172,19 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   fault_handlers_ = std::make_unique<handlers::FaultHandlers>(*handler_ctx_);
   log_handlers_ = std::make_unique<handlers::LogHandlers>(*handler_ctx_);
   auth_handlers_ = std::make_unique<handlers::AuthHandlers>(*handler_ctx_);
-  sse_client_tracker_ = node_->get_sse_client_tracker();
-  sse_fault_handler_ = std::make_unique<handlers::SSEFaultHandler>(*handler_ctx_, sse_client_tracker_);
+  // Documented range 1-3600 s. Clamped rather than refused, and the clamp is
+  // reported, because a silently corrected value and the config file then
+  // disagree with no way to see it from outside.
+  constexpr int64_t kMinKeepaliveSec = 1;
+  constexpr int64_t kMaxKeepaliveSec = 3600;
+  const int64_t keepalive_raw = node_->get_parameter("sse.keepalive_interval_sec").as_int();
+  const int64_t keepalive_used = std::clamp<int64_t>(keepalive_raw, kMinKeepaliveSec, kMaxKeepaliveSec);
+  if (keepalive_used != keepalive_raw) {
+    RCLCPP_WARN(node_->get_logger(), "sse.keepalive_interval_sec %" PRId64 " clamped to %" PRId64, keepalive_raw,
+                keepalive_used);
+  }
+  sse_fault_handler_ = std::make_unique<handlers::SSEFaultHandler>(*handler_ctx_, sse_client_tracker_,
+                                                                   std::chrono::seconds(keepalive_used));
   bulkdata_handlers_ = std::make_unique<handlers::BulkDataHandlers>(*handler_ctx_);
   // Validated as int64 before narrowing: narrowing first wraps a value above
   // INT_MAX into a small positive one that passes the check, so 4294967300
@@ -671,6 +690,18 @@ void RESTServer::setup_routes() {
         .tag("Operations")
         .summary(std::string("Start operation execution for ") + et.singular)
         .description("Starts a new execution. Returns 200 for synchronous, 202 for asynchronous operations.")
+        // 400/404/500 come from the registry's automatic response-level
+        // GenericError $ref; these two are new answers this route can give and
+        // need their own declarations, or a generated SDK has no branch for a
+        // timeout and treats it as an unknown failure.
+        .response(503,
+                  "The backing ROS 2 service or action is not on the graph "
+                  "(x-medkit-ros2-service-unavailable / x-medkit-ros2-action-unavailable)",
+                  nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
+        .response(504,
+                  "The backing ROS 2 endpoint did not answer inside service_call_timeout_sec "
+                  "(not-responding). The work may still be running.",
+                  nlohmann::json{{"$ref", "#/components/schemas/GenericError"}})
         .operation_id(std::string("execute") + capitalize(et.singular) + "Operation");
 
     reg.get<dto::Collection<dto::ExecutionId>>(

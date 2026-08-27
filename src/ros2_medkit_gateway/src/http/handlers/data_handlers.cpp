@@ -301,6 +301,7 @@ void apply_fan_out_observability(dto::DataListXMedkit & xm, const FanOutResult<d
   if (fan_out.partial) {
     xm.partial = true;
     xm.failed_peers = fan_out.failed_peers;
+    xm.peer_failures = fan_out.peer_failures;
   }
   if (!fan_out.dropped_items.empty()) {
     xm.peer_dropped_items = fan_out.dropped_items;

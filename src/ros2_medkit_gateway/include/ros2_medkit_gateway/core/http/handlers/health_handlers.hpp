@@ -14,6 +14,11 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include "ros2_medkit_gateway/core/http/sse_client_tracker.hpp"
+
 #include "ros2_medkit_gateway/dto/health.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
 #include "ros2_medkit_gateway/http/typed_router.hpp"
@@ -45,8 +50,12 @@ namespace handlers {
  */
 class HealthHandlers {
  public:
-  explicit HealthHandlers(HandlerContext & ctx, const openapi::RouteRegistry * route_registry = nullptr)
-    : ctx_(ctx), route_registry_(route_registry) {
+  /// @param sse_tracker Shared SSE client counter, so /health can report how
+  /// much of `sse.max_clients` is in use. Optional: a gateway built without
+  /// one simply omits the field.
+  explicit HealthHandlers(HandlerContext & ctx, const openapi::RouteRegistry * route_registry = nullptr,
+                          std::shared_ptr<const SSEClientTracker> sse_tracker = nullptr)
+    : ctx_(ctx), route_registry_(route_registry), sse_tracker_(std::move(sse_tracker)) {
   }
 
   /// GET /health - Health check endpoint
@@ -61,6 +70,7 @@ class HealthHandlers {
  private:
   HandlerContext & ctx_;
   const openapi::RouteRegistry * route_registry_{nullptr};
+  std::shared_ptr<const SSEClientTracker> sse_tracker_;
 };
 
 }  // namespace handlers

@@ -216,6 +216,7 @@ inline constexpr std::string_view dto_name<XMedkitFunction> = "XMedkitFunction";
 //   contributors       <- (optional aggregation provenance, included for completeness)
 //   partial            <- true when a fan-out peer request failed
 //   failed_peers       <- list of peer URLs that returned errors
+//   peer_failures      <- why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items <- per-peer items dropped due to malformed JSON
 //                         (observability for invisible drift)
 // ---------------------------------------------------------------------------
@@ -224,6 +225,10 @@ struct XMedkitCollection {
   std::optional<std::vector<std::string>> contributors;
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
@@ -231,6 +236,7 @@ template <>
 inline constexpr auto dto_fields<XMedkitCollection> = std::make_tuple(
     field("total_count", &XMedkitCollection::total_count), field("contributors", &XMedkitCollection::contributors),
     field("partial", &XMedkitCollection::partial), field("failed_peers", &XMedkitCollection::failed_peers),
+    field("peer_failures", &XMedkitCollection::peer_failures),
     field("peer_dropped_items", &XMedkitCollection::peer_dropped_items));
 
 template <>

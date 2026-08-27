@@ -93,6 +93,7 @@ inline constexpr std::string_view dto_name<ConfigurationMetaData> = "Configurati
 //   partial            - true when a fan-out peer request failed OR a local backing
 //                        node did not answer (see unavailable_nodes/failed_nodes)
 //   failed_peers       - list of peer addresses that returned errors
+//   peer_failures      - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items - per-peer items dropped due to malformed JSON
 //                        (observability for invisible drift)
 // =============================================================================
@@ -108,6 +109,10 @@ struct ConfigListXMedkit {
   std::optional<std::vector<std::string>> failed_nodes;
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
@@ -119,7 +124,7 @@ inline constexpr auto dto_fields<ConfigListXMedkit> = std::make_tuple(
     field("source_ids", &ConfigListXMedkit::source_ids), field("queried_nodes", &ConfigListXMedkit::queried_nodes),
     field("unavailable_nodes", &ConfigListXMedkit::unavailable_nodes),
     field("failed_nodes", &ConfigListXMedkit::failed_nodes), field("partial", &ConfigListXMedkit::partial),
-    field("failed_peers", &ConfigListXMedkit::failed_peers),
+    field("failed_peers", &ConfigListXMedkit::failed_peers), field("peer_failures", &ConfigListXMedkit::peer_failures),
     field("peer_dropped_items", &ConfigListXMedkit::peer_dropped_items));
 
 template <>

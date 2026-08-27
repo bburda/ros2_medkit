@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <httplib.h>
 
 #include <atomic>
@@ -52,6 +54,96 @@ struct PeerEntities {
 };
 
 /**
+ * @brief Why a call to a peer produced no usable answer.
+ *
+ * `httplib::Result::operator bool()` is a null check, so a branch on the result
+ * alone renders a peer that ran out of time and a peer that refused the
+ * connection identically. They are not the same event: the first says the peer
+ * is working and this gateway stopped waiting, the second says nothing
+ * answered, and an operator reading "unavailable" about a peer that is serving
+ * the same request in five seconds is being told something false.
+ */
+enum class PeerFailureKind : uint8_t {
+  kNone,             ///< No failure.
+  kTimeout,          ///< A connect, read or write budget ran out. The peer may still be working.
+  kUnreachable,      ///< Nothing answered: refused, no route, DNS or TLS failure.
+  kCanceled,         ///< This gateway stopped the call, which happens during its own shutdown.
+  kErrorStatus,      ///< The peer answered, with a status outside 2xx.
+  kTooLarge,         ///< The body passed the peer-response size limit.
+  kInvalidResponse,  ///< The peer answered with something that is not the JSON the route promises.
+};
+
+/// A peer call that failed, and why. Kept together because every caller that
+/// reports the message also has to decide a status from the kind, and the two
+/// were previously separated by the error being a bare string.
+struct PeerError {
+  PeerFailureKind kind{PeerFailureKind::kUnreachable};
+  std::string message;
+};
+
+/// Classify a cpp-httplib transport error.
+///
+/// cpp-httplib reports both "the read budget ran out" and "the connection
+/// broke while the answer was arriving" as `Error::Read`, so the error alone
+/// cannot tell a peer that is still working from one that died mid-answer.
+/// `elapsed` against `budget` is what separates them: a call that came back
+/// inside its budget did not run out of it, whatever else went wrong.
+/// @param read_budget Budget for the read this call was making.
+/// @param write_budget Budget for pushing the request body.
+/// A write that ran out compares against the WRITE budget, which is its own and
+/// is smaller than the read budget by default; comparing it against the read
+/// budget classifies every write timeout as unreachable.
+PeerFailureKind classify_peer_error(httplib::Error error, std::chrono::milliseconds elapsed,
+                                    std::chrono::milliseconds read_budget, std::chrono::milliseconds write_budget);
+
+/// Which budget a failure was measured against, so a message can name the one
+/// that actually expired. A connect timeout is bounded by the connect budget,
+/// not by the read budget the call was hoping to use.
+enum class PeerBudget : uint8_t { kNone, kConnect, kRead, kWrite };
+
+/// The budget `classify_peer_error` measured this error against.
+PeerBudget peer_budget_for(httplib::Error error);
+
+/// Stable wire token for a failure kind, as carried in
+/// ``x-medkit.peer_failures[].reason``.
+const char * peer_failure_reason(PeerFailureKind kind);
+
+/**
+ * @brief The budgets one peer request runs under.
+ *
+ * Four numbers rather than one, because they bound different things and a
+ * single value can only be right for one of them at a time. A metadata read
+ * that is given a real operation's budget stalls a discovery pass behind a
+ * dead peer; a real operation that is given a metadata read's budget is cut
+ * off while the peer is still working on it.
+ */
+struct PeerTimeouts {
+  /// Connect budget for every call. A peer that will not complete a TCP
+  /// handshake inside this is out of reach whatever the request asks for, so
+  /// this stays short even where the read budget is long.
+  int connect_ms{2000};
+
+  /// Read budget for the peer's description of itself: discovery, health, and
+  /// the collection fan-out a client is waiting on across every peer at once.
+  int metadata_read_ms{2000};
+
+  /// Read budget for a forwarded request, which carries the peer's own work.
+  /// A synchronous service call on the far side runs against that gateway's
+  /// `service_call_timeout_sec`, so a budget below it cannot ever
+  /// see the answer; a large resource needs the transfer on top of that.
+  int forward_read_ms{15000};
+
+  /// Write budget for every call. cpp-httplib defaults this to 5 s.
+  int write_ms{5000};
+
+  /// Every budget set to the same value - the pre-split shape, for a caller
+  /// that is not testing the split.
+  static PeerTimeouts uniform(int ms) {
+    return PeerTimeouts{ms, ms, ms, ms};
+  }
+};
+
+/**
  * @brief HTTP client for communicating with a peer gateway instance
  *
  * PeerClient wraps cpp-httplib to provide typed access to a peer gateway's
@@ -67,9 +159,12 @@ class PeerClient {
    * @brief Construct a PeerClient for a peer gateway
    * @param url Base URL of the peer (e.g., "http://localhost:8081")
    * @param name Human-readable peer name (e.g., "subsystem_b")
-   * @param timeout_ms Connection and read timeout in milliseconds
+   * @param timeouts Per-kind budgets; see PeerTimeouts
    * @param forward_auth Whether to forward Authorization headers to this peer
    */
+  PeerClient(const std::string & url, const std::string & name, PeerTimeouts timeouts, bool forward_auth = false);
+
+  /// Convenience overload giving every budget the same value.
   PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth = false);
 
   /// Get the peer base URL
@@ -143,11 +238,13 @@ class PeerClient {
    * @param auth_header Authorization header value (empty to omit)
    * @param extra_headers Additional headers to include in the request
    *   (e.g., X-Medkit-No-Fan-Out to prevent recursive fan-out loops)
-   * @return Parsed JSON on success, error message on failure
+   * @return Parsed JSON on success, a classified PeerError on failure. The
+   *   kind is what lets a fanned-out collection say WHY a peer contributed
+   *   nothing; the caller used to receive a bare string and drop it.
    */
-  tl::expected<nlohmann::json, std::string> forward_and_get_json(const std::string & method, const std::string & path,
-                                                                 const std::string & auth_header = "",
-                                                                 const httplib::Headers & extra_headers = {});
+  tl::expected<nlohmann::json, PeerError> forward_and_get_json(const std::string & method, const std::string & path,
+                                                               const std::string & auth_header = "",
+                                                               const httplib::Headers & extra_headers = {});
 
   /**
    * @brief Cancel every in-flight HTTP call against this peer.
@@ -174,7 +271,9 @@ class PeerClient {
   /// active_clients_ and calls stop() on each so blocked I/O unwinds.
   class ScopedClient {
    public:
-    ScopedClient(PeerClient & owner, const std::string & url, int timeout_ms);
+    /// @param read_timeout_ms Read budget for this call. Connect and write
+    /// come from the owner's PeerTimeouts, which do not vary per call kind.
+    ScopedClient(PeerClient & owner, const std::string & url, int read_timeout_ms);
     ~ScopedClient();
     ScopedClient(const ScopedClient &) = delete;
     ScopedClient & operator=(const ScopedClient &) = delete;
@@ -198,7 +297,7 @@ class PeerClient {
 
   std::string url_;
   std::string name_;
-  int timeout_ms_;
+  PeerTimeouts timeouts_;
   bool forward_auth_;
   std::atomic<bool> healthy_{false};
   std::atomic<bool> shutdown_requested_{false};

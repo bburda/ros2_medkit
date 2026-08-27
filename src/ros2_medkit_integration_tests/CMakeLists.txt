@@ -75,6 +75,10 @@ add_executable(demo_calibration_service demo_nodes/calibration_service.cpp)
 target_include_directories(demo_calibration_service PRIVATE ${_demo_include_dir})
 medkit_target_dependencies(demo_calibration_service rclcpp rcl_interfaces std_srvs)
 
+add_executable(demo_slow_calibration_service demo_nodes/slow_calibration_service.cpp)
+target_include_directories(demo_slow_calibration_service PRIVATE ${_demo_include_dir})
+medkit_target_dependencies(demo_slow_calibration_service rclcpp rcl_interfaces std_srvs)
+
 add_executable(demo_dual_calibration_service demo_nodes/dual_calibration_service.cpp)
 target_include_directories(demo_dual_calibration_service PRIVATE ${_demo_include_dir})
 medkit_target_dependencies(demo_dual_calibration_service rclcpp rclcpp_action example_interfaces std_srvs)
@@ -122,6 +126,7 @@ install(TARGETS
   demo_brake_actuator
   demo_light_controller
   demo_calibration_service
+  demo_slow_calibration_service
   demo_dual_calibration_service
   demo_long_calibration_action
   demo_shared_leaf
@@ -246,7 +251,9 @@ if(BUILD_TESTING)
     test_aggregate_lock_identity
     test_aggregator_only_configurations
     test_leaf_collision_aggregation
-    test_startup_param_clamp_warnings)
+    test_startup_param_clamp_warnings
+    test_aggregation_time_budgets
+    test_peer_failure_reasons)
   set(_MULTI_GATEWAY_DOMAINS 4)
 
   # Two-gateway tests that need the second gateway isolated from the first and
@@ -256,7 +263,8 @@ if(BUILD_TESTING)
   # otherwise have started alongside it.
   set(_TWO_GATEWAY_TESTS
     test_peer_recovery
-    test_triggers_restore_before_discovery)
+    test_triggers_restore_before_discovery
+    test_aggregator_fault_stream)
   set(_TWO_GATEWAY_DOMAINS 2)
 
   # Tests whose polling budgets do not fit the glob's default timeout. Keyed by
@@ -291,7 +299,27 @@ if(BUILD_TESTING)
   # That window plus two gateway startups and the SSE wait after it exceed the
   # 120s the feature glob assigns, so it gets its own budget rather than have
   # the file killed with no test name in the output.
+  #
+  # test_aggregation_time_budgets holds a peer-owned operation open for four
+  # seconds twice on purpose - a budget cannot be measured against a service
+  # that answers instantly - and reads a lidar scan large enough to break the
+  # tight budget three times over. Three gateway startups on top of that do not
+  # fit the feature glob's 120s.
+  #
+  # test_peer_failure_reasons waits out the peer's own six-second parameter
+  # round trip on the patient aggregator, twice, and then polls after killing
+  # the peer. Two of those plus three gateway startups exceed the default.
+  #
+  # test_aggregator_fault_stream spends most of its budget waiting rather than
+  # working: a closed SSE connection is noticed at the peer's next keepalive,
+  # 30s away, and the test settles the peer's occupancy before each measurement
+  # so an earlier case's closed stream is not attributed to the relay. That is
+  # deliberate - a shorter wait would pass for a gateway that never released
+  # the slot at all.
   set(_MEDKIT_TEST_TIMEOUT_OVERRIDES
+    test_aggregation_time_budgets 300
+    test_peer_failure_reasons 300
+    test_aggregator_fault_stream 420
     test_rosbag_boundary_download 180
     test_rosbag_history_download 180
     test_grouping_entity_aggregation 300

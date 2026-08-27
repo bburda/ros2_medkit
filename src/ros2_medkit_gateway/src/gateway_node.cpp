@@ -112,6 +112,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   declare_parameter("sse.max_clients", 2);
   declare_parameter("sse.max_subscriptions", 100);  // Maximum active cyclic subscriptions across all entities
   declare_parameter("sse.max_duration_sec", 3600);  // Maximum subscription duration in seconds (1 hour default)
+  // Comment interval on an idle SSE stream. It is also how long the server
+  // takes to notice a client has gone, because a closed socket is discovered
+  // on the next write - which on an aggregating gateway is how long a relay
+  // keeps a slot on a peer after nobody is watching. Shorten it behind a proxy
+  // that drops idle connections sooner than 30 s.
+  declare_parameter("sse.keepalive_interval_sec", 30);
 
   // Log management parameters
   declare_parameter("logs.buffer_size",
@@ -238,6 +244,8 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // Aggregation parameters (peer gateway federation)
   declare_parameter("aggregation.enabled", false);
   declare_parameter("aggregation.timeout_ms", 2000);
+  declare_parameter("aggregation.forward_timeout_ms", 15000);
+  declare_parameter("aggregation.write_timeout_ms", 5000);
   declare_parameter("aggregation.announce", false);
   declare_parameter("aggregation.discover", false);
   declare_parameter("aggregation.mdns_service", std::string("_medkit._tcp.local"));
@@ -1149,7 +1157,34 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   if (get_parameter("aggregation.enabled").as_bool()) {
     AggregationConfig agg_config;
     agg_config.enabled = true;
-    agg_config.timeout_ms = static_cast<int>(get_parameter("aggregation.timeout_ms").as_int());
+    // Documented range 100-600000 ms for all three budgets. A ROS parameter is
+    // int64 and `declare_parameter<int>` narrows silently, so a value above
+    // INT_MAX wraps back into the legal band and passes any check made after
+    // the narrowing - clamp on the int64 first, narrow second.
+    auto clamp_budget_ms = [this](const char * key) {
+      constexpr int64_t kMinBudgetMs = 100;
+      constexpr int64_t kMaxBudgetMs = 600000;
+      const int64_t raw = get_parameter(key).as_int();
+      const int64_t used = std::clamp<int64_t>(raw, kMinBudgetMs, kMaxBudgetMs);
+      if (used != raw) {
+        RCLCPP_WARN(get_logger(), "%s %" PRId64 " clamped to %" PRId64, key, raw, used);
+      }
+      return static_cast<int>(used);
+    };
+    agg_config.timeout_ms = clamp_budget_ms("aggregation.timeout_ms");
+    agg_config.forward_timeout_ms = clamp_budget_ms("aggregation.forward_timeout_ms");
+    agg_config.write_timeout_ms = clamp_budget_ms("aggregation.write_timeout_ms");
+    // A forward budget below the metadata budget inverts what the split is for:
+    // the path carrying the peer's real work would be cut off before the path
+    // that only reads its description. Report it rather than serve it, because
+    // the symptom is an operation failing while a listing of it succeeds.
+    if (agg_config.forward_timeout_ms < agg_config.timeout_ms) {
+      RCLCPP_WARN(get_logger(),
+                  "aggregation.forward_timeout_ms %d is below aggregation.timeout_ms %d; raised to %d so a forwarded "
+                  "request is not cut off sooner than a metadata read",
+                  agg_config.forward_timeout_ms, agg_config.timeout_ms, agg_config.timeout_ms);
+      agg_config.forward_timeout_ms = agg_config.timeout_ms;
+    }
     agg_config.announce = get_parameter("aggregation.announce").as_bool();
     agg_config.discover = get_parameter("aggregation.discover").as_bool();
     agg_config.mdns_service = get_parameter("aggregation.mdns_service").as_string();

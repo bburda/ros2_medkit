@@ -366,6 +366,194 @@ TEST(SSEStreamProxyIntegration, close_terminates_reader_thread) {
   EXPECT_GT(event_count.load(), 0);
 }
 
+/// A peer that ends its events with CRLF is delivering valid SSE, and the
+/// framing here has to admit it. parse_sse_data handling CRLF proves nothing
+/// about this: the live reader splits the byte stream itself, and a search for
+/// "\n\n" alone never matches "\r\n\r\n", so such a peer would stream for
+/// ever and yield no event.
+TEST(SSEStreamProxyIntegration, frames_events_from_a_crlf_peer) {
+  httplib::Server svr;
+  std::atomic<bool> stop_stream{false};
+
+  svr.Get("/events", [&stop_stream](const httplib::Request &, httplib::Response & res) {
+    res.set_chunked_content_provider("text/event-stream", [&stop_stream](size_t offset, httplib::DataSink & sink) {
+      if (offset == 0) {
+        std::string event =
+            "event: test\r\n"
+            "id: 7\r\n"
+            "data: {\"value\":42}\r\n"
+            "\r\n";
+        sink.write(event.data(), event.size());
+        return true;
+      }
+      if (stop_stream.load()) {
+        sink.done();
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      return true;
+    });
+  });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  std::thread server_thread([&svr]() {
+    svr.listen_after_bind();
+  });
+  wait_for_server(svr);
+
+  SSEStreamProxy proxy("http://127.0.0.1:" + std::to_string(port), "/events", "crlf_peer");
+  std::vector<StreamEvent> received;
+  std::mutex mtx;
+  std::condition_variable cv;
+  proxy.on_event([&](const StreamEvent & event) {
+    std::lock_guard<std::mutex> lock(mtx);
+    received.push_back(event);
+    cv.notify_one();
+  });
+  proxy.open();
+  {
+    std::unique_lock<std::mutex> lock(mtx);
+    cv.wait_for(lock, std::chrono::seconds(5), [&]() {
+      return !received.empty();
+    });
+  }
+  stop_stream.store(true);
+  proxy.close();
+  svr.stop();
+  server_thread.join();
+
+  ASSERT_FALSE(received.empty()) << "a CRLF-delimited peer produced no event";
+  EXPECT_EQ(received[0].event_type, "test");
+  EXPECT_EQ(received[0].data, "{\"value\":42}");
+  // The cursor has to advance for a CRLF peer too, or a reconnect replays it.
+  EXPECT_EQ(proxy.last_event_id(), "7");
+}
+
+/// The callback is handed a payload the peer wrote, and the handler that reads
+/// it can throw on a shape it did not expect. An exception leaving a
+/// std::thread calls std::terminate, so a peer could end the gateway with one
+/// malformed field. The reader must absorb it and stay on the stream.
+TEST(SSEStreamProxyIntegration, a_throwing_handler_does_not_kill_the_reader) {
+  httplib::Server svr;
+  std::atomic<bool> stop_stream{false};
+
+  svr.Get("/events", [&stop_stream](const httplib::Request &, httplib::Response & res) {
+    res.set_chunked_content_provider("text/event-stream", [&stop_stream](size_t offset, httplib::DataSink & sink) {
+      if (offset == 0) {
+        std::string first = "data: poison\n\n";
+        sink.write(first.data(), first.size());
+        return true;
+      }
+      if (offset > 0 && offset < 100) {
+        std::string second = "data: good\n\n";
+        sink.write(second.data(), second.size());
+        return true;
+      }
+      if (stop_stream.load()) {
+        sink.done();
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      return true;
+    });
+  });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  std::thread server_thread([&svr]() {
+    svr.listen_after_bind();
+  });
+  wait_for_server(svr);
+
+  SSEStreamProxy proxy("http://127.0.0.1:" + std::to_string(port), "/events", "throwing_peer");
+  std::vector<std::string> delivered;
+  std::mutex mtx;
+  std::condition_variable cv;
+  proxy.on_event([&](const StreamEvent & event) {
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      delivered.push_back(event.data);
+    }
+    cv.notify_one();
+    if (event.data == "poison") {
+      throw std::runtime_error("handler cannot read this event");
+    }
+  });
+  proxy.open();
+  {
+    std::unique_lock<std::mutex> lock(mtx);
+    cv.wait_for(lock, std::chrono::seconds(5), [&]() {
+      return delivered.size() >= 2u;
+    });
+  }
+  stop_stream.store(true);
+  proxy.close();
+  svr.stop();
+  server_thread.join();
+
+  ASSERT_GE(delivered.size(), 2u) << "the reader stopped after the handler threw";
+  EXPECT_EQ(delivered[0], "poison");
+  EXPECT_EQ(delivered[1], "good");
+}
+
+/// A stream reopened for a peer resumes where the last one stopped. Without
+/// the hand-off it asks for the peer's whole buffer, and every event in it is
+/// delivered again, as new, to whoever is attached now.
+TEST(SSEStreamProxyIntegration, a_resumed_stream_sends_the_last_event_id) {
+  httplib::Server svr;
+  std::atomic<bool> stop_stream{false};
+  std::string seen_last_event_id;
+  std::mutex header_mtx;
+
+  svr.Get("/events", [&](const httplib::Request & req, httplib::Response & res) {
+    {
+      std::lock_guard<std::mutex> lock(header_mtx);
+      seen_last_event_id = req.get_header_value("Last-Event-ID");
+    }
+    res.set_chunked_content_provider("text/event-stream", [&stop_stream](size_t offset, httplib::DataSink & sink) {
+      if (offset == 0) {
+        std::string event = "id: 12\ndata: resumed\n\n";
+        sink.write(event.data(), event.size());
+        return true;
+      }
+      if (stop_stream.load()) {
+        sink.done();
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      return true;
+    });
+  });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  std::thread server_thread([&svr]() {
+    svr.listen_after_bind();
+  });
+  wait_for_server(svr);
+
+  SSEStreamProxy proxy("http://127.0.0.1:" + std::to_string(port), "/events", "resuming_peer");
+  proxy.set_last_event_id("11");
+  std::atomic<bool> got{false};
+  proxy.on_event([&got](const StreamEvent &) {
+    got.store(true);
+  });
+  proxy.open();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!got.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  stop_stream.store(true);
+  proxy.close();
+  svr.stop();
+  server_thread.join();
+
+  {
+    std::lock_guard<std::mutex> lock(header_mtx);
+    EXPECT_EQ(seen_last_event_id, "11") << "the resume point was not offered to the peer";
+  }
+  // And it moves on to what the peer actually delivered.
+  EXPECT_EQ(proxy.last_event_id(), "12");
+}
+
 TEST(SSEStreamProxyIntegration, buffer_overflow_disconnects) {
   httplib::Server svr;
 

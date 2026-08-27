@@ -452,6 +452,32 @@ namespace detail {
 ///   never issued. Where the underlying ROS 2 mechanism has to be named - a
 ///   stop IS carried out as an action cancel - it is named as the cause, after
 ///   the verb the client used, never in place of it.
+/// One table for both execute paths: what the transport could not do decides
+/// the status, not the fact that it did not do it. `ERR_NOT_RESPONDING` is the
+/// standard code reserved for "no response from the underlying entity in time"
+/// and was previously returned from the cancel path alone, while an execute
+/// that ran out of time answered the same 500 as one that could not serialize
+/// its request.
+ErrorInfo map_call_failure(CallOutcome outcome, const std::string & detail, const char * unavailable_code,
+                           const char * generic_message, json params) {
+  params["details"] = detail;
+  switch (outcome) {
+    case CallOutcome::kTimeout:
+      // The message carries the budget the transport measured against, which
+      // is the one thing a client can act on: raise it, or stop waiting.
+      return make_error(504, ERR_NOT_RESPONDING,
+                        detail.empty() ? std::string("The underlying entity did not answer in time") : detail,
+                        std::move(params));
+    case CallOutcome::kServiceUnavailable:
+      return make_error(503, unavailable_code, detail.empty() ? std::string(generic_message) : detail,
+                        std::move(params));
+    case CallOutcome::kOk:
+    case CallOutcome::kTransportError:
+      break;
+  }
+  return make_error(500, unavailable_code, generic_message, std::move(params));
+}
+
 std::optional<CancelFailure> map_cancel_result(const ActionCancelResult & result, OperationManager & operation_mgr,
                                                const std::string & execution_id, const char * verb) {
   // Derived rather than passed as a second parameter, so no call site can hand
@@ -774,6 +800,7 @@ http::Result<dto::Collection<dto::OperationItem>> OperationHandlers::list_operat
     if (fan_out.partial) {
       xm.partial = true;
       xm.failed_peers = fan_out.failed_peers;
+      xm.peer_failures = fan_out.peer_failures;
     }
     if (!fan_out.dropped_items.empty()) {
       xm.peer_dropped_items = fan_out.dropped_items;
@@ -1077,9 +1104,9 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
                {"operation_id", operation_id},
                {"details", action_result.error_message.empty() ? "Goal rejected" : action_result.error_message}}));
     }
-    return tl::make_unexpected(make_error(
-        500, ERR_X_MEDKIT_ROS2_ACTION_UNAVAILABLE, "Action execution failed",
-        json{{id_field, entity_id}, {"operation_id", operation_id}, {"details", action_result.error_message}}));
+    return tl::make_unexpected(detail::map_call_failure(action_result.outcome, action_result.error_message,
+                                                        ERR_X_MEDKIT_ROS2_ACTION_UNAVAILABLE, "Action execution failed",
+                                                        json{{id_field, entity_id}, {"operation_id", operation_id}}));
   }
 
   // ---- Service (synchronous: 200) ----
@@ -1107,9 +1134,9 @@ OperationHandlers::create_execution(const http::TypedRequest & req, dto::Executi
   }
   // Inline service-error path is replaced with the framework error channel:
   // `make_error` produces a SOVD GenericError that the typed wrapper renders.
-  return tl::make_unexpected(
-      make_error(500, ERR_X_MEDKIT_ROS2_SERVICE_UNAVAILABLE, "Service call failed",
-                 json{{id_field, entity_id}, {"operation_id", operation_id}, {"details", svc_result.error_message}}));
+  return tl::make_unexpected(detail::map_call_failure(svc_result.outcome, svc_result.error_message,
+                                                      ERR_X_MEDKIT_ROS2_SERVICE_UNAVAILABLE, "Service call failed",
+                                                      json{{id_field, entity_id}, {"operation_id", operation_id}}));
 }
 
 // =============================================================================

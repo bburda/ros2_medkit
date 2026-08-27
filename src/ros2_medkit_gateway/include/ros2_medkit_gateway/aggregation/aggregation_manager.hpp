@@ -16,6 +16,7 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -27,15 +28,49 @@
 
 #include "ros2_medkit_gateway/core/aggregation/classification.hpp"
 #include "ros2_medkit_gateway/core/aggregation/peer_client.hpp"
+#include "ros2_medkit_gateway/dto/aggregation.hpp"
 
 namespace ros2_medkit_gateway {
+
+/// A peer's name and where to reach it.
+struct PeerEndpoint {
+  std::string name;
+  std::string url;
+};
 
 /**
  * @brief Configuration for peer aggregation
  */
 struct AggregationConfig {
   bool enabled{false};
+
+  /// Connect budget for every peer call, and the read budget for the peer's
+  /// description of itself: discovery, health and collection fan-out.
   int timeout_ms{2000};
+
+  /// Read budget for a forwarded request. Sized above a peer gateway's own
+  /// `service_call_timeout_sec` default of 10 s, because what a
+  /// forward waits for is the peer doing that work.
+  int forward_timeout_ms{15000};
+
+  /// Write budget for every peer call.
+  int write_timeout_ms{5000};
+
+  /// The three budgets above in the shape PeerClient takes them.
+  ///
+  /// The connect budget is capped at kConnectCapMs rather than following
+  /// `timeout_ms`. A peer that cannot complete a TCP handshake in a second is
+  /// out of reach whatever the request wanted, and the cap also bounds how far
+  /// a `Read` failure can be misattributed: cpp-httplib reports one elapsed
+  /// time for connect plus read, so a handshake that ate most of a read budget
+  /// before the peer died would otherwise read as a timeout. With the cap that
+  /// window is a second instead of the whole metadata budget, and a handshake
+  /// slower than the cap fails as a connect timeout, which is named correctly.
+  PeerTimeouts peer_timeouts() const {
+    constexpr int kConnectCapMs = 1000;
+    return PeerTimeouts{std::min(timeout_ms, kConnectCapMs), timeout_ms, forward_timeout_ms, write_timeout_ms};
+  }
+
   bool announce{false};
   bool discover{false};
   std::string mdns_service{"_medkit._tcp.local"};
@@ -108,6 +143,14 @@ class AggregationManager {
     std::vector<std::string> item_peers;
     bool is_partial{false};                 ///< True if some peers failed
     std::vector<std::string> failed_peers;  ///< Names of peers that failed
+    /// Why each peer in `failed_peers` failed, same peers, one entry each.
+    ///
+    /// A name on its own says a peer contributed nothing and nothing more. A
+    /// peer that ran out of time, one that refused the connection, one that
+    /// answered 500, a body over the size limit and unparseable JSON produce
+    /// the same entry there, so a client cannot tell a busy subsystem from a
+    /// dead one - which is the whole of what a partial answer is asked.
+    std::vector<dto::PeerFailure> peer_failures;
   };
 
   /**
@@ -169,6 +212,13 @@ class AggregationManager {
    * @return Number of peers that report healthy status
    */
   size_t healthy_peer_count() const;
+
+  /// Name and base URL of every peer healthy at the last health check.
+  ///
+  /// `get_peer_status()` renders the same set as JSON for a client; this is the
+  /// form a caller that has to open a connection needs, and it excludes the
+  /// unhealthy peers that rendering deliberately includes.
+  std::vector<PeerEndpoint> healthy_peer_endpoints() const;
 
   /**
    * @brief Fetch entities from all healthy peers, merge with local entities, and build routing table

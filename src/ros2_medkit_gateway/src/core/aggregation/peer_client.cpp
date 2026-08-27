@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <iterator>
 #include <set>
 #include <string>
@@ -511,8 +512,134 @@ SubResponse read_sub_response(const httplib::Result & result, const std::string 
 
 }  // namespace
 
+namespace {
+
+/// Name and value of the budget an error was measured against, for a message a
+/// client can act on. The READ budget differs by call: a forward spends
+/// `aggregation.forward_timeout_ms`, a fan-out spends `aggregation.timeout_ms`,
+/// so the caller names its own rather than have this guess.
+std::string describe_budget(PeerBudget budget, const PeerTimeouts & timeouts, const char * read_key, int read_ms) {
+  switch (budget) {
+    case PeerBudget::kConnect:
+      return "aggregation.timeout_ms (" + std::to_string(timeouts.connect_ms) + "ms, connect)";
+    case PeerBudget::kRead:
+      return std::string(read_key) + " (" + std::to_string(read_ms) + "ms, read)";
+    case PeerBudget::kWrite:
+      return "aggregation.write_timeout_ms (" + std::to_string(timeouts.write_ms) + "ms, write)";
+    case PeerBudget::kNone:
+      break;
+  }
+  return "its budget";
+}
+
+}  // namespace
+
+PeerBudget peer_budget_for(httplib::Error error) {
+  switch (error) {
+    case httplib::Error::ConnectionTimeout:
+      return PeerBudget::kConnect;
+    case httplib::Error::Read:
+      return PeerBudget::kRead;
+    case httplib::Error::Write:
+      return PeerBudget::kWrite;
+    case httplib::Error::Success:
+    case httplib::Error::Unknown:
+    case httplib::Error::Connection:
+    case httplib::Error::BindIPAddress:
+    case httplib::Error::ExceedRedirectCount:
+    case httplib::Error::Canceled:
+    case httplib::Error::SSLConnection:
+    case httplib::Error::SSLLoadingCerts:
+    case httplib::Error::SSLServerVerification:
+    case httplib::Error::UnsupportedMultipartBoundaryChars:
+    case httplib::Error::Compression:
+    case httplib::Error::ProxyConnection:
+    case httplib::Error::SSLPeerCouldBeClosed_:
+      return PeerBudget::kNone;
+  }
+  return PeerBudget::kNone;
+}
+
+PeerFailureKind classify_peer_error(httplib::Error error, std::chrono::milliseconds elapsed,
+                                    std::chrono::milliseconds read_budget, std::chrono::milliseconds write_budget) {
+  // Every enumerator listed rather than a default, because -Wswitch-enum is an
+  // error here: a cpp-httplib upgrade that adds a failure mode has to be
+  // classified deliberately instead of falling into "unreachable" unnoticed.
+  switch (error) {
+    case httplib::Error::ConnectionTimeout:
+      return PeerFailureKind::kTimeout;
+    case httplib::Error::Canceled:
+      return PeerFailureKind::kCanceled;
+    case httplib::Error::Read:
+      // The budget is always set on these clients, so a call that consumed it
+      // ran out of time. One that came back sooner broke for another reason -
+      // most often the peer process dying with the answer half sent - and
+      // reporting that as a timeout would tell an operator to wait for a peer
+      // that is gone.
+      //
+      // `elapsed` covers connect plus read, because cpp-httplib reports no
+      // separate connect-completion time and its socket-options hook runs
+      // BEFORE the connect. A slow handshake therefore counts towards the read
+      // budget. The connect budget is capped well below the read budgets (see
+      // AggregationConfig::peer_timeouts) so that window is bounded by the cap
+      // rather than by the whole metadata budget, and a handshake slower than
+      // the cap fails as ConnectionTimeout instead, which is attributed
+      // correctly. Removing the window entirely needs the vendored client to
+      // expose a post-connect callback.
+      return elapsed >= read_budget ? PeerFailureKind::kTimeout : PeerFailureKind::kUnreachable;
+    case httplib::Error::Write:
+      // Against the WRITE budget, which is its own and smaller than the read
+      // budget by default. Measured against the read budget, a write that ran
+      // out at 5 s inside a 15 s forward budget looks like a peer that died,
+      // and the one key whose whole purpose is bounding a slow upload could
+      // never report its own expiry.
+      return elapsed >= write_budget ? PeerFailureKind::kTimeout : PeerFailureKind::kUnreachable;
+    case httplib::Error::Success:
+      // Not reachable through the callers, which classify only a null result,
+      // but the enumerator exists and "no failure" is the only honest answer.
+      return PeerFailureKind::kNone;
+    case httplib::Error::Unknown:
+    case httplib::Error::Connection:
+    case httplib::Error::BindIPAddress:
+    case httplib::Error::ExceedRedirectCount:
+    case httplib::Error::SSLConnection:
+    case httplib::Error::SSLLoadingCerts:
+    case httplib::Error::SSLServerVerification:
+    case httplib::Error::UnsupportedMultipartBoundaryChars:
+    case httplib::Error::Compression:
+    case httplib::Error::ProxyConnection:
+    case httplib::Error::SSLPeerCouldBeClosed_:
+      return PeerFailureKind::kUnreachable;
+  }
+  return PeerFailureKind::kUnreachable;
+}
+
+const char * peer_failure_reason(PeerFailureKind kind) {
+  switch (kind) {
+    case PeerFailureKind::kNone:
+      return "none";
+    case PeerFailureKind::kTimeout:
+      return "timeout";
+    case PeerFailureKind::kUnreachable:
+      return "unreachable";
+    case PeerFailureKind::kCanceled:
+      return "canceled";
+    case PeerFailureKind::kErrorStatus:
+      return "error-status";
+    case PeerFailureKind::kTooLarge:
+      return "too-large";
+    case PeerFailureKind::kInvalidResponse:
+      return "invalid-response";
+  }
+  return "unreachable";
+}
+
+PeerClient::PeerClient(const std::string & url, const std::string & name, PeerTimeouts timeouts, bool forward_auth)
+  : url_(url), name_(name), timeouts_(timeouts), forward_auth_(forward_auth) {
+}
+
 PeerClient::PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth)
-  : url_(url), name_(name), timeout_ms_(timeout_ms), forward_auth_(forward_auth) {
+  : PeerClient(url, name, PeerTimeouts::uniform(timeout_ms), forward_auth) {
 }
 
 const std::string & PeerClient::url() const {
@@ -547,9 +674,11 @@ void PeerClient::ensure_client() {
     //     bounds shutdown delay to ~5s under TSan, well within the 15s
     //     grace window, without affecting forward semantics (which still
     //     use the configured timeout via ScopedClient).
-    int health_timeout_ms = std::min(timeout_ms_, 1000);
-    client_->set_connection_timeout(health_timeout_ms / 1000, (health_timeout_ms % 1000) * 1000);
+    int health_timeout_ms = std::min(timeouts_.metadata_read_ms, 1000);
+    client_->set_connection_timeout(std::min(timeouts_.connect_ms, health_timeout_ms) / 1000,
+                                    (std::min(timeouts_.connect_ms, health_timeout_ms) % 1000) * 1000);
     client_->set_read_timeout(health_timeout_ms / 1000, (health_timeout_ms % 1000) * 1000);
+    client_->set_write_timeout(timeouts_.write_ms / 1000, (timeouts_.write_ms % 1000) * 1000);
     // Note: cpp-httplib Client does not expose set_payload_max_length (server-only).
     // Response size is enforced post-download in forward_request() and
     // forward_and_get_json() via MAX_PEER_RESPONSE_SIZE body length checks.
@@ -572,7 +701,7 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
   // requests, up to 8s with 2s timeout) to avoid blocking health checks and
   // forwarding on the shared client_mutex_. ScopedClient registers with the
   // active-client registry so shutdown() can stop() the in-flight call.
-  ScopedClient scoped(*this, url_, timeout_ms_);
+  ScopedClient scoped(*this, url_, timeouts_.metadata_read_ms);
   auto & cli = *scoped;
 
   PeerEntities entities;
@@ -869,7 +998,11 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   // during potentially long I/O operations. The shared client_ is reserved for
   // short health checks only. ScopedClient registers with the active-client
   // registry so shutdown() can stop() the in-flight call.
-  ScopedClient scoped(*this, url_, timeout_ms_);
+  //
+  // The forward budget, not the metadata one: what comes back is whatever the
+  // peer had to do to answer, which for a synchronous operation is that
+  // gateway's own service budget and for a large resource is the transfer.
+  ScopedClient scoped(*this, url_, timeouts_.forward_read_ms);
   auto & cli = *scoped;
 
   httplib::Headers headers;
@@ -897,6 +1030,8 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   const std::string path = path_with_query(req);
   const std::string content_type = req.get_header_value("Content-Type");
 
+  const auto started_at = std::chrono::steady_clock::now();
+
   if (req.method == "GET") {
     result = cli.Get(path, headers);
   } else if (req.method == "POST") {
@@ -910,8 +1045,32 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   }
 
   if (!result) {
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at);
+    const auto kind = classify_peer_error(result.error(), elapsed, std::chrono::milliseconds(timeouts_.forward_read_ms),
+                                          std::chrono::milliseconds(timeouts_.write_ms));
+    if (kind == PeerFailureKind::kTimeout) {
+      // The peer is answering someone; this gateway stopped waiting. Saying it
+      // is unavailable describes a different system state and points an
+      // operator at the wrong box.
+      //
+      // The message names the budget that actually expired. A connect timeout
+      // is bounded by aggregation.timeout_ms, not by the forward budget the
+      // call was hoping to spend, and telling an operator to raise the forward
+      // budget would not move a peer that never accepted the connection.
+      const auto expired = describe_budget(peer_budget_for(result.error()), timeouts_, "aggregation.forward_timeout_ms",
+                                           timeouts_.forward_read_ms);
+      res.status = 504;
+      auto error_body =
+          make_error_body(ERR_NOT_RESPONDING, "Peer '" + name_ + "' at " + url_ + " did not answer within " + expired +
+                                                  ". The request may still be running there.");
+      res.set_content(error_body.dump(), "application/json");
+      return;
+    }
     res.status = 502;
-    auto error_body = make_error_body(ERR_VENDOR_ERROR, "Peer '" + name_ + "' at " + url_ + " is unavailable",
+    auto error_body = make_error_body(ERR_VENDOR_ERROR,
+                                      "Peer '" + name_ + "' at " + url_ + " is unavailable (" +
+                                          std::string(peer_failure_reason(kind)) + ")",
                                       ERR_X_MEDKIT_PEER_UNAVAILABLE);
     res.set_content(error_body.dump(), "application/json");
     return;
@@ -951,18 +1110,23 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   }
 }
 
-tl::expected<nlohmann::json, std::string> PeerClient::forward_and_get_json(const std::string & method,
-                                                                           const std::string & path,
-                                                                           const std::string & auth_header,
-                                                                           const httplib::Headers & extra_headers) {
+tl::expected<nlohmann::json, PeerError> PeerClient::forward_and_get_json(const std::string & method,
+                                                                         const std::string & path,
+                                                                         const std::string & auth_header,
+                                                                         const httplib::Headers & extra_headers) {
   if (shutdown_requested_.load(std::memory_order_acquire)) {
-    return tl::unexpected<std::string>("Peer '" + name_ + "': forward_and_get_json skipped, shutdown in progress");
+    return tl::unexpected(PeerError{PeerFailureKind::kCanceled,
+                                    "Peer '" + name_ + "': forward_and_get_json skipped, shutdown in progress"});
   }
   // Create a dedicated client per call to avoid holding client_mutex_ during I/O.
   // The shared client_ is reserved for short health checks only. ScopedClient
   // registers with the active-client registry so shutdown() can stop() the
   // in-flight call.
-  ScopedClient scoped(*this, url_, timeout_ms_);
+  //
+  // The metadata budget: a fan-out runs against every peer at once with a
+  // client waiting on the slowest of them, so this is bounded by what a
+  // listing is worth, not by what one peer's work might cost.
+  ScopedClient scoped(*this, url_, timeouts_.metadata_read_ms);
   auto & cli = *scoped;
 
   httplib::Headers headers;
@@ -993,6 +1157,8 @@ tl::expected<nlohmann::json, std::string> PeerClient::forward_and_get_json(const
 
   httplib::Result result{nullptr, httplib::Error::Unknown};
 
+  const auto started_at = std::chrono::steady_clock::now();
+
   if (method == "GET") {
     result = cli.Get(
         path, headers,
@@ -1013,36 +1179,60 @@ tl::expected<nlohmann::json, std::string> PeerClient::forward_and_get_json(const
   // cpp-httplib does not offer ContentReceiver overloads for all methods.
   bool used_streaming = (method == "GET");
 
+  // The size guard aborts the download from inside the content receiver, which
+  // cpp-httplib surfaces as a cancelled read. Checked before the transport
+  // error so an oversized body is reported as one rather than as a broken
+  // connection.
+  auto transport_failure = [&]() {
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at);
+    const auto kind =
+        classify_peer_error(result.error(), elapsed, std::chrono::milliseconds(timeouts_.metadata_read_ms),
+                            std::chrono::milliseconds(timeouts_.write_ms));
+    std::string message = kind == PeerFailureKind::kTimeout
+                              ? "Peer '" + name_ + "' at " + url_ + " did not answer " + method + " " + path +
+                                    " within " +
+                                    describe_budget(peer_budget_for(result.error()), timeouts_,
+                                                    "aggregation.timeout_ms", timeouts_.metadata_read_ms)
+                              : "Failed to reach peer '" + name_ + "' at " + url_ + " for " + method + " " + path;
+    return PeerError{kind, std::move(message)};
+  };
+
   if (used_streaming) {
     if (size_exceeded) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' exceeds size limit for " + method + " " +
-                                         path);
+      return tl::unexpected(
+          PeerError{PeerFailureKind::kTooLarge,
+                    "Response from peer '" + name_ + "' exceeds size limit for " + method + " " + path});
     }
     if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
+      return tl::unexpected(transport_failure());
     }
     if (response_status < 200 || response_status >= 300) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(response_status) +
-                                         " for " + method + " " + path);
+      return tl::unexpected(PeerError{PeerFailureKind::kErrorStatus, "Peer '" + name_ + "' returned status " +
+                                                                         std::to_string(response_status) + " for " +
+                                                                         method + " " + path});
     }
   } else {
     if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
+      return tl::unexpected(transport_failure());
     }
     if (result->status < 200 || result->status >= 300) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for " + method + " " + path);
+      return tl::unexpected(PeerError{PeerFailureKind::kErrorStatus, "Peer '" + name_ + "' returned status " +
+                                                                         std::to_string(result->status) + " for " +
+                                                                         method + " " + path});
     }
     if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' exceeds size limit for " + method + " " +
-                                         path);
+      return tl::unexpected(
+          PeerError{PeerFailureKind::kTooLarge,
+                    "Response from peer '" + name_ + "' exceeds size limit for " + method + " " + path});
     }
     accumulated_body = std::move(result->body);
   }
 
   auto parsed = nlohmann::json::parse(accumulated_body, nullptr, false);
   if (parsed.is_discarded()) {
-    return tl::unexpected<std::string>("Invalid JSON response from peer '" + name_ + "' for " + method + " " + path);
+    return tl::unexpected(PeerError{PeerFailureKind::kInvalidResponse,
+                                    "Invalid JSON response from peer '" + name_ + "' for " + method + " " + path});
   }
 
   return parsed;
@@ -1089,10 +1279,16 @@ void PeerClient::unregister_active(httplib::Client * cli) {
   active_clients_.erase(cli);
 }
 
-PeerClient::ScopedClient::ScopedClient(PeerClient & owner, const std::string & url, int timeout_ms)
+PeerClient::ScopedClient::ScopedClient(PeerClient & owner, const std::string & url, int read_timeout_ms)
   : owner_(owner), cli_(url) {
-  cli_.set_connection_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
-  cli_.set_read_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
+  const int connect_ms = owner.timeouts_.connect_ms;
+  const int write_ms = owner.timeouts_.write_ms;
+  cli_.set_connection_timeout(connect_ms / 1000, (connect_ms % 1000) * 1000);
+  cli_.set_read_timeout(read_timeout_ms / 1000, (read_timeout_ms % 1000) * 1000);
+  // Without this the write budget is cpp-httplib's own 5 s default and follows
+  // no configured value at all, so a large request body to a slow peer is cut
+  // off however high the read budget is set.
+  cli_.set_write_timeout(write_ms / 1000, (write_ms % 1000) * 1000);
   owner_.register_active(&cli_);
   // If shutdown landed between the timeout setup and registration, pre-stop
   // the client so the first Get/Post returns Error::Canceled immediately.

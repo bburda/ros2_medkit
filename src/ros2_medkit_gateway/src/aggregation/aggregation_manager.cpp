@@ -216,7 +216,7 @@ AggregationManager::AggregationManager(const AggregationConfig & config, rclcpp:
     }
 
     peers_.push_back(
-        std::make_shared<PeerClient>(peer_cfg.url, peer_cfg.name, config_.timeout_ms, config_.forward_auth));
+        std::make_shared<PeerClient>(peer_cfg.url, peer_cfg.name, config_.peer_timeouts(), config_.forward_auth));
   }
   static_peer_count_ = peers_.size();
 }
@@ -272,7 +272,7 @@ void AggregationManager::add_discovered_peer(const std::string & url, const std:
     return;
   }
 
-  peers_.push_back(std::make_shared<PeerClient>(url, name, config_.timeout_ms, config_.forward_auth));
+  peers_.push_back(std::make_shared<PeerClient>(url, name, config_.peer_timeouts(), config_.forward_auth));
 }
 
 void AggregationManager::remove_discovered_peer(const std::string & name) {
@@ -825,6 +825,10 @@ AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::stri
   struct PeerResult {
     std::string peer_name;
     bool success{false};
+    /// Wire token for why this peer failed, from `peer_failure_reason`. Empty
+    /// on success. Built here rather than discarded, which is what left every
+    /// fan-out failure indistinguishable on the wire.
+    std::string failure_reason;
     nlohmann::json items = nlohmann::json::array();
   };
 
@@ -867,6 +871,7 @@ AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::stri
       auto result = peer->forward_and_get_json("GET", path, auth_header, {{"X-Medkit-No-Fan-Out", "1"}});
       if (!result.has_value()) {
         pr.success = false;
+        pr.failure_reason = peer_failure_reason(result.error().kind);
         return pr;
       }
 
@@ -886,6 +891,7 @@ AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::stri
     auto pr = f.get();
     if (!pr.success) {
       fan_out_result.is_partial = true;
+      fan_out_result.peer_failures.push_back(dto::PeerFailure{pr.peer_name, std::move(pr.failure_reason)});
       fan_out_result.failed_peers.push_back(std::move(pr.peer_name));
       continue;
     }
@@ -910,6 +916,17 @@ nlohmann::json AggregationManager::get_peer_status() const {
     status_array.push_back(peer_obj);
   }
   return status_array;
+}
+
+std::vector<PeerEndpoint> AggregationManager::healthy_peer_endpoints() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  std::vector<PeerEndpoint> endpoints;
+  for (const auto & peer : peers_) {
+    if (peer->is_healthy()) {
+      endpoints.push_back(PeerEndpoint{peer->name(), peer->url()});
+    }
+  }
+  return endpoints;
 }
 
 PeerClient * AggregationManager::find_peer(const std::string & name) const {

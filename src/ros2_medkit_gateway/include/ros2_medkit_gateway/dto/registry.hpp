@@ -46,15 +46,15 @@ namespace dto {
 /// The single compile-time list of every named DTO. Each domain header
 /// (Phase 2/3) appends its types here. Order is irrelevant.
 using AllDtos =
-    std::tuple<GenericError, DroppedItem, XMedkitRos2, XMedkitArea, XMedkitComponent, XMedkitApp, XMedkitFunction,
-               XMedkitCollection, AreaListItem, AreaDetail, ComponentListItem, ComponentDetail, AppListItem, AppDetail,
-               FunctionListItem, FunctionDetail, Collection<AreaListItem>, Collection<ComponentListItem>,
-               Collection<AppListItem>, Collection<FunctionListItem>, FaultListItem, Collection<FaultListItem>,
-               FaultListXMedkit, FaultListAggXMedkit, FaultStatus, FaultItem, FaultEnvironmentData, FaultXMedkit,
-               FaultDetail, FaultListResult, FaultDetailResult, FaultClearResult, XMedkitOperationItem,
-               XMedkitOperationExecution, OperationItem, Collection<OperationItem>, OperationDetail, OperationExecution,
-               ExecutionId, Collection<ExecutionId>, ExecutionCreateRequest, ExecutionCreateAsync,
-               ExecutionUpdateRequest, OperationExecutionResult,
+    std::tuple<GenericError, DroppedItem, PeerFailure, XMedkitRos2, XMedkitArea, XMedkitComponent, XMedkitApp,
+               XMedkitFunction, XMedkitCollection, AreaListItem, AreaDetail, ComponentListItem, ComponentDetail,
+               AppListItem, AppDetail, FunctionListItem, FunctionDetail, Collection<AreaListItem>,
+               Collection<ComponentListItem>, Collection<AppListItem>, Collection<FunctionListItem>, FaultListItem,
+               Collection<FaultListItem>, FaultListXMedkit, FaultListAggXMedkit, FaultStatus, FaultItem,
+               FaultEnvironmentData, FaultXMedkit, FaultDetail, FaultListResult, FaultDetailResult, FaultClearResult,
+               XMedkitOperationItem, XMedkitOperationExecution, OperationItem, Collection<OperationItem>,
+               OperationDetail, OperationExecution, ExecutionId, Collection<ExecutionId>, ExecutionCreateRequest,
+               ExecutionCreateAsync, ExecutionUpdateRequest, OperationExecutionResult,
                // Configuration domain DTOs
                ConfigXMedkitItem, ConfigurationMetaData, ConfigListXMedkit,
                Collection<ConfigurationMetaData, ConfigListXMedkit>, ConfigValueXMedkit, ConfigurationReadValue,

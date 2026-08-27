@@ -471,6 +471,7 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
       if (fan_result.is_partial) {
         xm.partial = true;
         xm.failed_peers = fan_result.failed_peers;
+        xm.peer_failures = fan_result.peer_failures;
       }
     }
 

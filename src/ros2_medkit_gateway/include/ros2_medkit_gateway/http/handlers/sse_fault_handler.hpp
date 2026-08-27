@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 
 #include "rclcpp/rclcpp.hpp"
+#include "ros2_medkit_gateway/core/aggregation/peer_fault_relay.hpp"
 #include "ros2_medkit_gateway/core/http/sse_client_tracker.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
 #include "ros2_medkit_gateway/http/response_types.hpp"
@@ -55,6 +56,15 @@ namespace handlers {
  * - Automatic reconnection support via Last-Event-ID header (values above the
  *   newest issued id are clamped to it, so a bogus header cannot starve the
  *   stream or alias the delivery accounting)
+ * - On an aggregating gateway, the peers' streams are relayed into this one.
+ *   An aggregator runs on its own ROS domain with its own fault_manager that
+ *   no producer reports to, so a stream fed from the local graph alone is open,
+ *   valid and silent - which reads to a client exactly like a healthy system.
+ *   Each relayed event carries the peer it came from in ``x-medkit.peer``.
+ *   Replay is over this gateway's OWN ids: two peers number their events
+ *   independently, so a `Last-Event-ID` cannot address a position in a merged
+ *   stream, and a reconnecting client resumes from what this gateway has
+ *   buffered rather than from each peer's own history.
  * - Replay buffer of up to 100 events. Eviction order under overflow:
  *   1. entries every live client has already been sent (free),
  *   2. fault_updated entries superseded by a newer event for the same fault
@@ -133,6 +143,15 @@ class SSEFaultHandler {
   size_t connected_clients() const;
 
   /**
+   * @brief Peer streams this gateway currently has open.
+   *
+   * Zero on a gateway that does not aggregate, and zero on an aggregating one
+   * with no client attached - the relay costs an SSE client slot on every peer
+   * for as long as it is open, and `sse.max_clients` defaults to 2.
+   */
+  std::size_t relayed_peer_streams() const;
+
+  /**
    * @brief Events genuinely lost: evicted while still owed to a live client,
    * except fault_updated entries a newer same-code event supersedes. Includes
    * superseded transitions - their history is gone even though the current
@@ -177,10 +196,18 @@ class SSEFaultHandler {
   /// (typed RouteRegistry path) and `handle_stream` (legacy in-process test
   /// entry). The returned callable is invoked with a `DataSink` and returns
   /// `false` when the client disconnects or `shutdown_flag_` is set.
-  std::function<bool(httplib::DataSink &)> make_stream_loop(uint64_t initial_last_event_id);
+  /// @param relay_peers Open the peers' streams for the lifetime of this
+  /// connection. False when the request carries `X-Medkit-No-Fan-Out`, which
+  /// is what an aggregating gateway sends when relaying from another one -
+  /// without it a chain would relay the same event back round the loop.
+  std::function<bool(httplib::DataSink &)> make_stream_loop(uint64_t initial_last_event_id, bool relay_peers);
 
   /// Callback for fault events from ROS 2 topic
   void on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::ConstSharedPtr & msg);
+
+  /// Callback for an event relayed from a peer's stream. Runs on that peer
+  /// proxy's reader thread.
+  void on_peer_event(const StreamEvent & event);
 
   /// Resolved owning entity for a fault. Populates the ``x-medkit`` SOVD
   /// payload-extension object on outgoing SSE events.
@@ -196,6 +223,16 @@ class SSEFaultHandler {
     uint64_t id;
     ros2_medkit_msgs::msg::FaultEvent event;
     std::optional<EntityContext> entity;
+    /// Name of the peer this event was relayed from; empty when this gateway
+    /// saw the fault on its own graph. Part of the supersede key, because the
+    /// same fault code raised on two gateways names two different faults and
+    /// coalescing them would erase one of the two.
+    std::string peer;
+    /// The peer's own event payload, with `x-medkit.peer` added, ready to go
+    /// out as the `data:` line. Empty for a local event. Carried verbatim
+    /// rather than round-tripped through a FaultEvent message, so a field the
+    /// peer sends that this gateway's schema does not name survives the hop.
+    std::string relayed_payload;
   };
 
   /// Per-connection delivery cursor. Lets the buffer tell "nobody is owed this
@@ -226,12 +263,20 @@ class SSEFaultHandler {
   /// holds queue_mutex_.
   std::deque<QueuedEvent>::iterator find_superseded_locked(bool updates_only);
 
-  /// True when the buffer holds an event newer than last_event_id. Caller
+  /// True when the buffer holds an event newer than last_event_id that this
+  /// client is entitled to. With `relay_peers` false, events relayed from a
+  /// peer do not count: the client asked for the local graph only, so waking
+  /// its loop for one would spin it against events it will never send. Caller
   /// holds queue_mutex_.
-  bool has_pending_locked(uint64_t last_event_id) const;
+  bool has_pending_locked(uint64_t last_event_id, bool relay_peers) const;
 
   /// Record a successful write for this client. Caller holds queue_mutex_.
   void note_progress_locked(const std::shared_ptr<ClientCursor> & cursor, uint64_t delivered_id);
+
+  /// Buffer one event, evict down to capacity and report what that cost.
+  /// Shared by the local subscription and the peer relay so both take the same
+  /// path through the replay buffer.
+  void enqueue(QueuedEvent queued);
 
   /// Format a fault event as SSE message
   static std::string format_sse_event(const QueuedEvent & queued);
@@ -250,6 +295,10 @@ class SSEFaultHandler {
 
   /// Subscription to fault events topic
   rclcpp::Subscription<ros2_medkit_msgs::msg::FaultEvent>::SharedPtr subscription_;
+
+  /// Relays the peers' fault streams into this one on an aggregating gateway.
+  /// Always constructed; it opens nothing when this gateway has no peers.
+  std::unique_ptr<PeerFaultRelay> peer_relay_;
 
   /// Event queue for broadcasting to clients
   mutable std::mutex queue_mutex_;

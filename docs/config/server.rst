@@ -677,6 +677,10 @@ Configure limits for SSE-based streaming (fault events and cyclic subscriptions)
      - int
      - ``3600``
      - Maximum allowed subscription duration in seconds. Requests exceeding this are rejected with HTTP 400. Range: 1 to 2147483647 (the value becomes an ``int``); outside it the value is refused with a warning and ``3600`` is used.
+   * - ``sse.keepalive_interval_sec``
+     - int
+     - ``30``
+     - How often an idle stream writes a keepalive comment. This is also how long a client that has gone away stays counted against ``sse.max_clients``, because a closed connection is only noticed on the next write: a gateway whose clients come and go faster than this interval can refuse a stream for a slot nobody is using. Lower it where streams are short-lived, at the cost of more traffic on idle ones. Range: 1-3600, clamped with a warning.
 
 Example:
 
@@ -688,6 +692,7 @@ Example:
          max_clients: 2
          max_subscriptions: 100
          max_duration_sec: 3600
+         keepalive_interval_sec: 30
 
 Triggers
 --------

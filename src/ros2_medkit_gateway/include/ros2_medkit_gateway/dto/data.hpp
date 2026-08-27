@@ -138,6 +138,7 @@ inline constexpr std::string_view dto_name<DataItem> = "DataItem";
 //   total_count        - total number of items in the response
 //   partial            - true when a fan-out peer request failed
 //   failed_peers       - list of peer addresses that returned errors
+//   peer_failures      - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items - per-peer items dropped due to malformed JSON
 //                        (observability for invisible drift)
 // =============================================================================
@@ -149,6 +150,10 @@ struct DataListXMedkit {
   std::optional<std::size_t> total_count;
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
@@ -159,6 +164,7 @@ inline constexpr auto dto_fields<DataListXMedkit> =
                     field("aggregation_level", &DataListXMedkit::aggregation_level),
                     field("total_count", &DataListXMedkit::total_count), field("partial", &DataListXMedkit::partial),
                     field("failed_peers", &DataListXMedkit::failed_peers),
+                    field("peer_failures", &DataListXMedkit::peer_failures),
                     field("peer_dropped_items", &DataListXMedkit::peer_dropped_items));
 
 template <>
