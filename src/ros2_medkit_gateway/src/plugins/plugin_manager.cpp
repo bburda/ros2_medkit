@@ -57,7 +57,14 @@ PluginManager::~PluginManager() {
   plugins_.clear();
 }
 
-// Called during init only (before HTTP server starts). No lock needed.
+// The plugin list is published to readers as soon as it is written to, so both
+// registration paths take the writer lock. "Registration happens before the
+// HTTP server starts" was true and still is, and it is not enough: the ROS log
+// subscription is already delivering while the gateway constructor runs, and
+// LogManager::on_log_entry reads this list through log_observers(). Those
+// readers hold a shared lock, so an unlocked push_back here is a write racing
+// a read - reported by ThreadSanitizer inside vector's reallocation, where the
+// reader walks a buffer the writer has just freed.
 void PluginManager::add_plugin(std::unique_ptr<GatewayPlugin> plugin) {
   LoadedPlugin lp;
   lp.config = nlohmann::json::object();
@@ -71,6 +78,11 @@ void PluginManager::add_plugin(std::unique_ptr<GatewayPlugin> plugin) {
   lp.operation_provider = dynamic_cast<OperationProvider *>(plugin.get());
   lp.lifecycle_provider = dynamic_cast<LifecycleProvider *>(plugin.get());
   lp.fault_provider = dynamic_cast<FaultProvider *>(plugin.get());
+
+  // Held from the first cached provider through the push_back: the caches and
+  // the list are read together, so publishing one without the other lets a
+  // reader see a provider the list does not yet carry.
+  std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
 
   // Cache first UpdateProvider, warn on duplicates
   if (lp.update_provider) {
@@ -104,7 +116,7 @@ void PluginManager::add_plugin(std::unique_ptr<GatewayPlugin> plugin) {
   plugins_.push_back(std::move(lp));
 }
 
-// Called during init only (before HTTP server starts). No lock needed.
+// Same reasoning as add_plugin: registration is not the only thing running.
 size_t PluginManager::load_plugins(const std::vector<PluginConfig> & configs) {
   size_t loaded = 0;
   for (const auto & cfg : configs) {
@@ -129,6 +141,10 @@ size_t PluginManager::load_plugins(const std::vector<PluginConfig> & configs) {
       // plugin and the host, casting a real provider to null).
       lp.lifecycle_provider = result->lifecycle_provider;
       lp.fault_provider = result->fault_provider;
+
+      // Taken per plugin rather than around the whole loop, so a slow dlopen
+      // for the next one does not hold readers off the ones already loaded.
+      std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
 
       // Cache first UpdateProvider, warn on duplicates
       if (lp.update_provider) {
