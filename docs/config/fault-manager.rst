@@ -75,6 +75,32 @@ The fault manager uses AUTOSAR DEM-style debounce filtering to prevent fault fla
    For immediate fault confirmation (no debounce), set ``confirmation_threshold: 0``.
    Faults with ``SEVERITY_CRITICAL`` always bypass debounce regardless of this setting.
 
+.. important::
+
+   The counter only moves when an event arrives, so ``confirmation_threshold`` and
+   ``healing_threshold`` work only for a reporter that keeps sending FAILED while the condition
+   is still there.
+
+   A reporter that sends one FAILED when a condition appears and one clear when it goes away
+   never sends the second event. ``confirmation_threshold: -3`` then leaves the fault in
+   PREFAILED forever, and the default fault list returns CONFIRMED only, so the fault is never
+   seen. ``healing_threshold: 3`` has the same problem: healing needs
+   ``healing_threshold - confirmation_threshold`` consecutive PASSED events, and only one is
+   sent, so the fault stays CONFIRMED until someone calls ``~/clear_fault``.
+
+   For such a reporter, filter by time instead of by count:
+
+   .. code-block:: yaml
+
+      confirmation_threshold: -2      # first FAILED stays PREFAILED
+      auto_confirm_after_sec: 3.0     # confirm it if it is still there after 3 s
+      healing_enabled: true
+      healing_threshold: 0            # heal on the single PASSED
+
+   Choose ``auto_confirm_after_sec`` from how often the reporter samples, so a condition has to
+   survive a few sampling cycles before it confirms. A glitch that clears in time never reaches
+   CONFIRMED, because the clear takes the fault out of PREFAILED before the timer fires.
+
 Near-Miss Retention
 ~~~~~~~~~~~~~~~~~~~
 
