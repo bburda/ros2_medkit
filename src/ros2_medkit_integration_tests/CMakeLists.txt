@@ -253,7 +253,8 @@ if(BUILD_TESTING)
     test_leaf_collision_aggregation
     test_startup_param_clamp_warnings
     test_aggregation_time_budgets
-    test_peer_failure_reasons)
+    test_peer_failure_reasons
+    test_relay_peer_credential)
   set(_MULTI_GATEWAY_DOMAINS 4)
 
   # Two-gateway tests that need the second gateway isolated from the first and

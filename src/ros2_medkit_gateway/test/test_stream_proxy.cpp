@@ -554,6 +554,62 @@ TEST(SSEStreamProxyIntegration, a_resumed_stream_sends_the_last_event_id) {
   EXPECT_EQ(proxy.last_event_id(), "12");
 }
 
+/// A peer that requires authentication refuses an unauthenticated stream, so
+/// the credential the relay is given has to reach it. Asserting that the relay
+/// merely opened would not show this: an unauthorized stream is also a stream,
+/// and its 401 is only visible on the request the peer actually received.
+TEST(SSEStreamProxyIntegration, presents_the_configured_credential_to_the_peer) {
+  httplib::Server svr;
+  std::atomic<bool> stop_stream{false};
+  std::string seen_authorization;
+  std::mutex header_mtx;
+
+  svr.Get("/events", [&](const httplib::Request & req, httplib::Response & res) {
+    {
+      std::lock_guard<std::mutex> lock(header_mtx);
+      seen_authorization = req.get_header_value("Authorization");
+    }
+    res.set_chunked_content_provider("text/event-stream", [&stop_stream](size_t offset, httplib::DataSink & sink) {
+      if (offset == 0) {
+        std::string event = "data: authorized\n\n";
+        sink.write(event.data(), event.size());
+        return true;
+      }
+      if (stop_stream.load()) {
+        sink.done();
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      return true;
+    });
+  });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  std::thread server_thread([&svr]() {
+    svr.listen_after_bind();
+  });
+  wait_for_server(svr);
+
+  SSEStreamProxy proxy("http://127.0.0.1:" + std::to_string(port), "/events", "authed_peer",
+                       httplib::Headers{{"Authorization", "Bearer relay-token"}});
+  std::atomic<bool> got{false};
+  proxy.on_event([&got](const StreamEvent &) {
+    got.store(true);
+  });
+  proxy.open();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!got.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  stop_stream.store(true);
+  proxy.close();
+  svr.stop();
+  server_thread.join();
+
+  std::lock_guard<std::mutex> lock(header_mtx);
+  EXPECT_EQ(seen_authorization, "Bearer relay-token");
+}
+
 TEST(SSEStreamProxyIntegration, buffer_overflow_disconnects) {
   httplib::Server svr;
 

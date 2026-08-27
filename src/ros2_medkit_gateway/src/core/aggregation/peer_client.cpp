@@ -634,12 +634,18 @@ const char * peer_failure_reason(PeerFailureKind kind) {
   return "unreachable";
 }
 
-PeerClient::PeerClient(const std::string & url, const std::string & name, PeerTimeouts timeouts, bool forward_auth)
-  : url_(url), name_(name), timeouts_(timeouts), forward_auth_(forward_auth) {
+PeerClient::PeerClient(const std::string & url, const std::string & name, PeerTimeouts timeouts, bool forward_auth,
+                       std::string peer_auth_header)
+  : url_(url)
+  , name_(name)
+  , timeouts_(timeouts)
+  , forward_auth_(forward_auth)
+  , peer_auth_header_(std::move(peer_auth_header)) {
 }
 
-PeerClient::PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth)
-  : PeerClient(url, name, PeerTimeouts::uniform(timeout_ms), forward_auth) {
+PeerClient::PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth,
+                       std::string peer_auth_header)
+  : PeerClient(url, name, PeerTimeouts::uniform(timeout_ms), forward_auth, std::move(peer_auth_header)) {
 }
 
 const std::string & PeerClient::url() const {
@@ -689,7 +695,16 @@ void PeerClient::ensure_client() {
 void PeerClient::check_health() {
   std::lock_guard<std::mutex> lock(client_mutex_);
   ensure_client();
-  auto result = client_->Get(std::string(API_PREFIX) + "/health");
+  // The health check is this gateway asking on its own behalf, so it carries
+  // the gateway's own credential. Without it a peer that requires auth on
+  // reads answers 401, is recorded as unhealthy, and then appears in no
+  // fan-out and no relay - the peer is reachable and correctly configured, and
+  // the aggregator reports it as down.
+  httplib::Headers headers;
+  if (!peer_auth_header_.empty()) {
+    headers.emplace("Authorization", peer_auth_header_);
+  }
+  auto result = client_->Get(std::string(API_PREFIX) + "/health", headers);
   healthy_.store(result && result->status == 200);
 }
 
@@ -1010,6 +1025,11 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   // Default is off to prevent token leakage to untrusted/mDNS-discovered peers.
   if (forward_auth_ && req.has_header("Authorization")) {
     headers.emplace("Authorization", req.get_header_value("Authorization"));
+  } else if (!peer_auth_header_.empty()) {
+    // The gateway's own credential, used when there is no client credential to
+    // pass on. A client's own token wins where forwarding is enabled, so
+    // forward_auth keeps naming the end user to the peer.
+    headers.emplace("Authorization", peer_auth_header_);
   }
   // Propagate fan-out suppression header to prevent recursive loops when
   // a forwarded request bounces back to the origin via bidirectional peering.
@@ -1133,6 +1153,8 @@ tl::expected<nlohmann::json, PeerError> PeerClient::forward_and_get_json(const s
   // Only forward auth header when forward_auth is enabled
   if (forward_auth_ && !auth_header.empty()) {
     headers.emplace("Authorization", auth_header);
+  } else if (!peer_auth_header_.empty()) {
+    headers.emplace("Authorization", peer_auth_header_);
   }
   for (const auto & [key, value] : extra_headers) {
     headers.emplace(key, value);

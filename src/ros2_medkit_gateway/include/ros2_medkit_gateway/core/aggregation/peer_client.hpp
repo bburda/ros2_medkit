@@ -162,10 +162,12 @@ class PeerClient {
    * @param timeouts Per-kind budgets; see PeerTimeouts
    * @param forward_auth Whether to forward Authorization headers to this peer
    */
-  PeerClient(const std::string & url, const std::string & name, PeerTimeouts timeouts, bool forward_auth = false);
+  PeerClient(const std::string & url, const std::string & name, PeerTimeouts timeouts, bool forward_auth = false,
+             std::string peer_auth_header = "");
 
   /// Convenience overload giving every budget the same value.
-  PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth = false);
+  PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth = false,
+             std::string peer_auth_header = "");
 
   /// Get the peer base URL
   const std::string & url() const;
@@ -299,6 +301,10 @@ class PeerClient {
   std::string name_;
   PeerTimeouts timeouts_;
   bool forward_auth_;
+  /// What this gateway presents as Authorization when it is acting for itself
+  /// rather than relaying a client's request: the health check, and any
+  /// forward whose caller sent no credential to pass on. Empty for none.
+  std::string peer_auth_header_;
   std::atomic<bool> healthy_{false};
   std::atomic<bool> shutdown_requested_{false};
 
