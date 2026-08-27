@@ -648,6 +648,19 @@ ros2_medkit_gateway:
       # Default: false (safe default - no token forwarding)
       forward_auth: false
 
+      # What this gateway presents as Authorization on connections it opens on
+      # its OWN behalf: the peer health check, the entity fetch, the fault-stream
+      # relay, and any forward whose caller sent no credential to pass on.
+      # Needed against peers that authenticate their reads - while it is empty
+      # such a peer answers 401, is recorded offline, and contributes neither
+      # entities nor events.
+      # Sent ONLY to peers named in peer_urls; a peer discovered over mDNS never
+      # receives it. Redacted from the configurations API, like auth.jwt_secret.
+      # Separate from forward_auth, which forwards an end user's token per
+      # request and has no effect on the relay.
+      # Default: "" (no credential)
+      peer_auth_header: ""
+
       # Security: Require TLS (https://) for all peer communication.
       # When true, peers with http:// URLs are rejected with an error log.
       # When false, http:// peers produce a warning about cleartext traffic.

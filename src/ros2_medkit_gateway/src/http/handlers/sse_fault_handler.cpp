@@ -416,7 +416,7 @@ std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint6
     // Formatting happens under the lock, writing does not: the buffer now
     // erases from the middle to coalesce, so holding an iterator across a
     // write would be a use-after-free.
-    auto collect_pending = [this, &last_event_id, relay_peers]() {
+    auto collect_pending = [this, cursor, &last_event_id, relay_peers]() {
       std::vector<std::pair<uint64_t, std::string>> pending;
       for (const auto & queued : event_queue_) {
         if (queued.id <= last_event_id) {
@@ -430,7 +430,16 @@ std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint6
         if (!relay_peers && !queued.peer.empty()) {
           // Still counts as delivered: the id is not owed to this client, and
           // leaving it behind would hold the watermark down for everyone.
+          //
+          // The cursor is moved with it, not only this loop's own copy. The
+          // shared one is what eviction reads to decide whose unread events it
+          // is discarding, and has_pending_locked applies the same suppression,
+          // so a tail of relayed-only events never wakes this client to correct
+          // it. Left behind, a relayed-fault burst that overflows the buffer
+          // between two keepalives is booked as drops owed to a client that
+          // never asked for those events.
           last_event_id = queued.id;
+          note_progress_locked(cursor, queued.id);
           continue;
         }
         pending.emplace_back(queued.id, format_sse_event(queued));
