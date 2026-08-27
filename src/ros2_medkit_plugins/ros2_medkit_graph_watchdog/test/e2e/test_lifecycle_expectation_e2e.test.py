@@ -216,11 +216,18 @@ SILENT_WINDOW_SEC = 20.0
 # kills and respawns a real OS process (the target node) and needs the gateway's entity
 # cache to actually notice the departure and the return, all comfortably inside the
 # tracker's own absence_grace (a fixed 3 ticks - kDefaultAbsenceGrace in
-# lifecycle_expectation_tracker.hpp, not configurable). A much slower cadence than the
-# other scenarios buys that margin: at 1 s/tick (the shipped production default) the
-# absence budget is a full 3 s, comfortably longer than a SIGTERM + respawn_delay +
-# rediscovery round trip ever needs.
-HEALING_TICK_INTERVAL_MS = 1000
+# lifecycle_expectation_tracker.hpp, not configurable). Since the grace cannot be widened
+# in ticks, the cadence is what buys the margin, and it has to buy enough: the budget is
+# three ticks and a blink is a real SIGTERM plus launch's respawn_delay plus the new
+# process's startup plus DDS rediscovery. Measured on a developer box, that round trip
+# runs 3.5 to 4.0 s, so a 1 s cadence put the budget at 3 s - under the thing it was
+# supposed to contain.
+#
+# Scaled by TIME_SCALE, unlike the other cadences here, because this is the one budget
+# derived from a race against real process startup. Every part of that round trip gets
+# slower under a sanitizer or a loaded runner while a fixed interval would hold the
+# budget still, and the blink then overruns a window that was never about machine speed.
+HEALING_TICK_INTERVAL_MS = int(3000 * TIME_SCALE)
 # kDefaultAbsenceGrace, lifecycle_expectation_tracker.hpp - fixed, not configurable.
 # Mirrored here (not imported - this is a separate Python process) so _blink() can
 # compute the exact wall-clock budget a blink is supposed to stay inside.
@@ -236,11 +243,14 @@ HEALING_REFRESH_DEBOUNCE_MS = 300
 # absence must stay under HEALING_ABSENCE_GRACE_TICKS ticks, or what is being exercised is
 # the ordinary sustained-absence path instead. Both edges are asserted per blink rather
 # than assumed from this constant.
-HEALING_RESPAWN_DELAY_SEC = 1.4
+# DERIVED from the tick interval rather than written beside it: it has to exceed one tick
+# and the budget above is three of them, so a literal here silently breaks the lower edge
+# the moment the cadence changes. 0.4 s over one tick is enough to guarantee a sample.
+HEALING_RESPAWN_DELAY_SEC = (HEALING_TICK_INTERVAL_MS / 1000.0) + 0.4
 # Slept after the SIGTERM before polling for the node's return: gives the respawn_delay
 # above, the new process's own startup, and DDS rediscovery room to finish before the
 # poll below starts, without itself risking the 3 s absence budget.
-HEALING_BLINK_SLEEP_SEC = 1.5
+HEALING_BLINK_SLEEP_SEC = (HEALING_TICK_INTERVAL_MS / 1000.0) + 1.0
 # Two separate blink episodes, matching the scenario this detector's design doc walks
 # through: a node the detector has already reported vanishing and returning twice must
 # never be healed by either one.

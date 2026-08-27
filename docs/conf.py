@@ -153,7 +153,11 @@ plantuml_output_format = 'svg'
 # Retry transient external failures (e.g. docs.ros.org read timeouts) instead of
 # failing the whole build on a single network blip.
 linkcheck_retries = 3
-linkcheck_timeout = 30
+# 60, not 30. docs.ros.org has taken longer than 30 s to answer and exhausted all three
+# retries, failing the whole docs build on a third-party site being slow rather than on
+# anything wrong with a link. Raising the per-attempt budget keeps a genuine 404 failing -
+# which is what this check is for - while a slow host costs time instead of a red build.
+linkcheck_timeout = 60
 linkcheck_ignore = [
     r'http://localhost:\d+',  # Ignore localhost URLs
     r'http://127\.0\.0\.1:\d+',

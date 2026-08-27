@@ -191,8 +191,17 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
         if (static_cast<int>(jobs.size()) < kMaxGetStateSeedsPerTick) {
           jobs.push_back({id, path, true});
         }
-      } else if (it->second.state_label != "active" && it->second.reseeds_remaining > 0 &&
+      } else if (it->second.state_label != "active" &&
+                 (it->second.reseeds_remaining > 0 ||
+                  (it->second.state_label.empty() && it->second.unmeasured_seeds_remaining > 0 &&
+                   tick % LifecycleWatcher::kUnmeasuredSeedInterval == 0)) &&
                  static_cast<int>(jobs.size()) < kMaxGetStateSeedsPerTick) {
+        // The second arm keeps asking for a node that has never been measured at all. Such
+        // a node may never transition again, so a GetState is the only thing that can give
+        // it a label, and the self-heal budget alone left it unmeasurable for the life of
+        // the process. It does NOT hold GRAPH_NODE_UNREADABLE back - see
+        // kUnmeasuredSeedAttempts.
+
         // NOT charged here: the blocking loop below can break on its wall-clock budget before
         // reaching this job, and a job that never issued a GetState must not spend an attempt.
         // One node stuck mid-transition eats the whole 150ms budget on its own timeout, so every
@@ -284,9 +293,11 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
         options);
     auto & tracked = state_->tracked[id];
     tracked.sub = std::move(sub);
-    tracked.reseeds_remaining = LifecycleWatcher::kReseedAttempts;
     const auto seed_it = seeded.find(id);
     tracked.state_label = (seed_it != seeded.end()) ? seed_it->second : "";
+    tracked.reseeds_remaining = LifecycleWatcher::kReseedAttempts;
+    // Set from the label this seed actually produced, so it has to come after it.
+    tracked.unmeasured_seeds_remaining = tracked.state_label.empty() ? LifecycleWatcher::kUnmeasuredSeedAttempts : 0;
     // Captured at first sighting: current_fqns is built from the same snapshot pass
     // that produced current_paths, so an id here is always present in current_fqns too.
     // Together, fqn + get_state_path are the binding identity the drop loop re-checks.
@@ -306,8 +317,14 @@ void LifecycleWatcher::update(const ros2_medkit_gateway::IntrospectionInput & sn
     // loop). A node whose job was cut by the budget keeps its attempts and is re-picked next tick.
     for (const auto & id : reseeds_performed) {
       auto it = state_->tracked.find(id);
-      if (it != state_->tracked.end() && it->second.reseeds_remaining > 0) {
+      if (it == state_->tracked.end()) {
+        continue;
+      }
+      if (it->second.reseeds_remaining > 0) {
         it->second.reseeds_remaining -= 1;
+      }
+      if (it->second.unmeasured_seeds_remaining > 0) {
+        it->second.unmeasured_seeds_remaining -= 1;
       }
     }
     for (const auto & job : jobs) {

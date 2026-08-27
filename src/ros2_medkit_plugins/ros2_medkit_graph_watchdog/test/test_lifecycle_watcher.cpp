@@ -527,19 +527,27 @@ TEST_F(LifecycleWatcherTest, RebindToALiveNodeDropsTheOldLabelAndSeedsTheNewBind
   // Drain the self-heal budget against the OLD (serviceless) binding, so the assertion
   // below cannot be satisfied by a leftover re-seed happening to hit the new path - the
   // re-bind handling itself has to do the healing.
-  for (std::uint64_t tick = 2; w.reseeds_remaining_for_test(id) > 0 && tick < 10; ++tick) {
+  // Bounded by the budget the watcher handed out rather than by a literal tick count: a
+  // node seeded without a label draws the larger unmeasured budget, and a fixed ceiling
+  // here would stop the loop before the drain this row depends on.
+  const std::uint64_t drain_ceiling = 2 + static_cast<std::uint64_t>(fresh_budget) + 2;
+  for (std::uint64_t tick = 2; w.reseeds_remaining_for_test(id) > 0 && tick < drain_ceiling; ++tick) {
     w.update(managed_app_snapshot(id, "/rb_old"), tick);
   }
   ASSERT_EQ(w.reseeds_remaining_for_test(id), 0);
   ASSERT_EQ(w.state_of(id).value_or(""), "inactive");
 
   // The re-bind: same id, now bound to the live "/rb_new" node.
-  w.update(managed_app_snapshot(id, "/rb_new"), /*tick=*/10);
+  w.update(managed_app_snapshot(id, "/rb_new"), drain_ceiling + 1);
   EXPECT_EQ(w.state_of(id).value_or(""), "active")
       << "after a re-bind the id must carry the NEW binding's seeded state, not the old node's label";
   EXPECT_TRUE(w.node_ok(id)) << "the old binding's non-active label must stop gating the id";
-  EXPECT_EQ(w.reseeds_remaining_for_test(id), fresh_budget)
-      << "a re-bound id must be re-seeded as a NEW entry (fresh self-heal budget), not healed in place";
+  // The budget a freshly seeded entry carrying THIS label would get - not the one the old
+  // binding started on, which was seeded without a label and therefore drew the larger
+  // unmeasured budget. What this asserts is that the entry was rebuilt: a budget healed in
+  // place would still read 0 from the drain above.
+  EXPECT_EQ(w.reseeds_remaining_for_test(id), ros2_medkit_graph_watchdog::LifecycleWatcher::kReseedAttempts)
+      << "a re-bound id must be re-seeded as a NEW entry, not healed in place";
 
   // The old subscription must be gone with the old entry: the old node's transitions
   // must no longer reach this id.
@@ -587,10 +595,18 @@ TEST_F(LifecycleWatcherTest, SameBindingAcrossUpdatesIsNeverTreatedAsARebind) {
       << "one update with the same binding must charge exactly one re-seed - a re-created entry "
          "would reset the budget to "
       << fresh_budget;
-  w.update(managed_node_snapshot(fqn), /*tick=*/3);
-  w.update(managed_node_snapshot(fqn), /*tick=*/4);
-  EXPECT_EQ(w.reseeds_remaining_for_test(fqn), 0)
-      << "the budget must drain monotonically across same-binding updates and stay drained";
+  // Driven from the budget the watcher actually handed out rather than from a literal
+  // count of updates: a node whose seed produced no label gets a larger budget than one
+  // that self-heals a stale label, and the invariant under test is the DRAIN, not the
+  // size. Two extra updates past the end prove it stays drained.
+  std::uint64_t tick = 3;
+  for (int charged = 1; charged < fresh_budget; ++charged) {
+    w.update(managed_node_snapshot(fqn), tick++);
+  }
+  EXPECT_EQ(w.reseeds_remaining_for_test(fqn), 0) << "the budget must drain monotonically across same-binding updates";
+  w.update(managed_node_snapshot(fqn), tick++);
+  w.update(managed_node_snapshot(fqn), tick++);
+  EXPECT_EQ(w.reseeds_remaining_for_test(fqn), 0) << "and stay drained - a re-created entry would refill it";
   EXPECT_TRUE(w.state_of(fqn).has_value()) << "the entry itself must survive every same-binding update";
   EXPECT_FALSE(w.departed_state_of(fqn).has_value()) << "an unchanged binding must never be recorded as a departure";
 }

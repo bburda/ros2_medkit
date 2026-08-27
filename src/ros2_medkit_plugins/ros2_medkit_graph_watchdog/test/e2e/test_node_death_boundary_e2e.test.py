@@ -870,17 +870,22 @@ class TestBoundaryInactiveBelowGraceThenGone(unittest.TestCase):
             f'{TARGET_NODE} never reached "inactive" after DEACTIVATE',
         )
 
-        # tracked_nodes becoming 1 is the tracker's own proof that it matched TARGET_NODE at
-        # least once - the earliest moment a kill is guaranteed not to land before the detector
-        # was even permitted to look. B2_GRACE is generous enough that the handful of extra
-        # ticks the DEACTIVATE round trip and this poll's own interval can cost before the kill
+        # settled_inactive_nodes, NOT tracked_nodes. A node enters the tracker's map as
+        # soon as an expectation matches it, before any lifecycle label has been read, so
+        # tracked_nodes == 1 is equally true of a node the watchdog still holds as
+        # unreadable or not-managed. Killing it in that state starts a different clock and
+        # GRAPH_NODE_INACTIVE can never mature, which is a test failure with nothing wrong
+        # in the detector. This counter moves only once the watchdog's OWN measurement
+        # settled on inactive. B2_GRACE is generous enough that the handful of extra ticks
+        # the DEACTIVATE round trip and this poll's own interval can cost before the kill
         # below still leaves the node comfortably below grace.
         self.assertTrue(
             poll_detector_status(
-                PORT, DETECTOR_ID_LIFECYCLE, 'tracked_nodes', 1, timeout=ARM_TIMEOUT_SEC),
-            f'lifecycle_expectation never reported tracking {TARGET_NODE} - it was never '
-            'matched at all, so killing it below would prove nothing about absence maturing '
-            'an unmatured streak',
+                PORT, DETECTOR_ID_LIFECYCLE, 'settled_inactive_nodes', 1,
+                timeout=ARM_TIMEOUT_SEC),
+            f'lifecycle_expectation never measured {TARGET_NODE} as inactive - its own '
+            'clock for the node never started, so killing it below would prove nothing '
+            'about absence maturing an unmatured streak',
         )
 
         # The row's own precondition, read from an observable immediately before the kill - see
@@ -1191,17 +1196,24 @@ class TestBoundaryNeverArmedBelowGraceThenGone(unittest.TestCase):
             'required node that never arms) was never set up',
         )
 
-        # tracked_nodes becoming 1 is the tracker's own proof that it matched TARGET_NODE at
-        # least once - the earliest moment a kill is guaranteed not to land before the
-        # detector was even permitted to look. B6_GRACE is generous enough that the handful
-        # of extra ticks this poll's own interval can cost before the kill below still leaves
-        # the node comfortably below grace.
+        # settled_inactive_nodes, NOT tracked_nodes. The label above was read by the TEST's
+        # own client, which says nothing about what the watchdog has managed to read: it has
+        # its own service client, its own seed queue and a per-tick budget, and leaves the
+        # cached label empty until a seed succeeds. A node is counted in tracked_nodes the
+        # moment an expectation matches it, so that counter is satisfied while the watchdog
+        # still holds the node unreadable - and a kill in that state matures a different
+        # clock, so GRAPH_NODE_INACTIVE never arrives and the failure looks like a broken
+        # detector. This counter moves only once the watchdog's own measurement settled on
+        # inactive. B6_GRACE is generous enough that the handful of extra ticks this poll's
+        # own interval can cost before the kill below still leaves the node below grace.
         self.assertTrue(
             poll_detector_status(
-                PORT, DETECTOR_ID_LIFECYCLE, 'tracked_nodes', 1, timeout=ARM_TIMEOUT_SEC),
-            f'lifecycle_expectation never reported tracking {TARGET_NODE} - it was never '
-            'matched at all, so killing it below would prove nothing about absence maturing '
-            'a violation the presence detector could never have reported',
+                PORT, DETECTOR_ID_LIFECYCLE, 'settled_inactive_nodes', 1,
+                timeout=ARM_TIMEOUT_SEC),
+            f'lifecycle_expectation never measured {TARGET_NODE} as inactive - its own '
+            'clock for the node never started, so killing it below would prove nothing '
+            'about absence maturing a violation the presence detector could never have '
+            'reported',
         )
 
         # The row's own precondition, read from an observable immediately before the kill -
