@@ -151,6 +151,7 @@ inline constexpr std::string_view dto_name<FaultEnvironmentData> = "FaultEnviron
 //   clusters        - detailed cluster list (optional; only if requested)
 //   partial            - true when a fan-out peer request failed (optional)
 //   failed_peers       - list of peer addresses that returned errors (optional)
+//   peer_failures      - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items - per-peer items dropped due to malformed JSON
 //                        (observability for invisible drift; optional)
 // =============================================================================
@@ -164,18 +165,21 @@ struct FaultListXMedkit {
   std::optional<nlohmann::json> clusters;      // free-form: FaultManager output
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
 template <>
-inline constexpr auto dto_fields<FaultListXMedkit> =
-    std::make_tuple(field("count", &FaultListXMedkit::count), field("muted_count", &FaultListXMedkit::muted_count),
-                    field("cluster_count", &FaultListXMedkit::cluster_count),
-                    field("entity_id", &FaultListXMedkit::entity_id), field("source_id", &FaultListXMedkit::source_id),
-                    field("muted_faults", &FaultListXMedkit::muted_faults),
-                    field("clusters", &FaultListXMedkit::clusters), field("partial", &FaultListXMedkit::partial),
-                    field("failed_peers", &FaultListXMedkit::failed_peers),
-                    field("peer_dropped_items", &FaultListXMedkit::peer_dropped_items));
+inline constexpr auto dto_fields<FaultListXMedkit> = std::make_tuple(
+    field("count", &FaultListXMedkit::count), field("muted_count", &FaultListXMedkit::muted_count),
+    field("cluster_count", &FaultListXMedkit::cluster_count), field("entity_id", &FaultListXMedkit::entity_id),
+    field("source_id", &FaultListXMedkit::source_id), field("muted_faults", &FaultListXMedkit::muted_faults),
+    field("clusters", &FaultListXMedkit::clusters), field("partial", &FaultListXMedkit::partial),
+    field("failed_peers", &FaultListXMedkit::failed_peers), field("peer_failures", &FaultListXMedkit::peer_failures),
+    field("peer_dropped_items", &FaultListXMedkit::peer_dropped_items));
 
 template <>
 inline constexpr std::string_view dto_name<FaultListXMedkit> = "FaultListXMedkit";
@@ -195,6 +199,7 @@ inline constexpr std::string_view dto_name<FaultListXMedkit> = "FaultListXMedkit
 //   count               - total items after fan-out merge
 //   partial             - true when a fan-out peer request failed (optional)
 //   failed_peers        - list of peer addresses that returned errors (optional)
+//   peer_failures       - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items  - per-peer items dropped due to malformed JSON
 //                         (observability for invisible drift; optional)
 // =============================================================================
@@ -209,6 +214,10 @@ struct FaultListAggXMedkit {
   int64_t count{0};
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
@@ -223,6 +232,7 @@ inline constexpr auto dto_fields<FaultListAggXMedkit> =
                     field("aggregation_sources", &FaultListAggXMedkit::aggregation_sources),
                     field("count", &FaultListAggXMedkit::count), field("partial", &FaultListAggXMedkit::partial),
                     field("failed_peers", &FaultListAggXMedkit::failed_peers),
+                    field("peer_failures", &FaultListAggXMedkit::peer_failures),
                     field("peer_dropped_items", &FaultListAggXMedkit::peer_dropped_items));
 
 template <>

@@ -149,6 +149,11 @@ inline void merge_peer_items(AggregationManager * agg, const httplib::Request & 
   if (fan_result.is_partial) {
     ext_json["partial"] = true;
     ext_json["failed_peers"] = fan_result.failed_peers;
+    nlohmann::json failures = nlohmann::json::array();
+    for (const auto & failure : fan_result.peer_failures) {
+      failures.push_back({{"peer", failure.peer}, {"reason", failure.reason}});
+    }
+    ext_json["peer_failures"] = std::move(failures);
   }
 }
 
@@ -172,6 +177,8 @@ struct FanOutResult {
   bool partial{false};
   /// Names of peers that failed (matches AggregationManager::FanOutResult.failed_peers).
   std::vector<std::string> failed_peers;
+  /// Why each of those peers failed, one entry per name in `failed_peers`.
+  std::vector<dto::PeerFailure> peer_failures;
   /// Per-item drop records for peer items that failed JsonReader<T> validation.
   /// Surfaces "invisible drift" - malformed peer items used to disappear silently;
   /// now callers can fold these into x-medkit.peer_dropped_items for observability.
@@ -186,7 +193,8 @@ struct FanOutResult {
 ///     short-circuit to an empty result (no fan-out attempted).
 ///   - per-entity paths consult the routing/contributor tables to target only
 ///     the peers that host the entity; global paths fan out to all healthy peers.
-///   - peer failures are surfaced via `partial` + `failed_peers`.
+///   - peer failures are surfaced via `partial` + `failed_peers`, and the
+///     reason for each via `peer_failures`.
 ///
 /// New behavior:
 ///   - peer items are parsed via `dto::JsonReader<T>` rather than copied as
@@ -267,6 +275,7 @@ inline FanOutResult<T> fan_out_collection(AggregationManager * agg, const httpli
   }
   result.partial = fan_result.is_partial;
   result.failed_peers = fan_result.failed_peers;
+  result.peer_failures = fan_result.peer_failures;
   return result;
 }
 

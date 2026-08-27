@@ -17,7 +17,9 @@
 #include <httplib.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -85,8 +87,13 @@ class SSEStreamProxy : public StreamProxy {
    * @param peer_url Base URL of the peer gateway (e.g., "http://localhost:8081")
    * @param path SSE endpoint path (e.g., "/api/v1/components/abc/faults/sse")
    * @param peer_name Human-readable name for the peer (used in StreamEvent::peer_name)
+   * @param headers Headers sent with every connect attempt, including after a
+   *   reconnect. An aggregator relaying a peer's stream sends
+   *   `X-Medkit-No-Fan-Out` here, which is what stops a chain of aggregating
+   *   gateways relaying the same event round the loop.
    */
-  SSEStreamProxy(const std::string & peer_url, const std::string & path, const std::string & peer_name = "");
+  SSEStreamProxy(const std::string & peer_url, const std::string & path, const std::string & peer_name = "",
+                 httplib::Headers headers = {});
 
   ~SSEStreamProxy() override;
 
@@ -99,6 +106,18 @@ class SSEStreamProxy : public StreamProxy {
   void close() override;
   bool is_connected() const override;
   void on_event(std::function<void(const StreamEvent &)> cb) override;
+
+  /// The id of the last event this proxy received, or empty if none has been.
+  ///
+  /// Read by the owner when a stream is retired so a replacement for the same
+  /// peer can resume where this one stopped. Without that hand-off a reopened
+  /// stream asks for the peer's whole buffer and every event in it is
+  /// delivered again, as new, to whoever is attached.
+  std::string last_event_id() const;
+
+  /// Resume from an id a previous proxy for this peer reached. Must be called
+  /// before open().
+  void set_last_event_id(std::string id);
 
   /**
    * @brief Parse raw SSE text/event-stream data into StreamEvent objects
@@ -122,11 +141,57 @@ class SSEStreamProxy : public StreamProxy {
   std::string peer_url_;
   std::string path_;
   std::string peer_name_;
+  httplib::Headers headers_;
   std::atomic<bool> connected_{false};
   std::atomic<bool> should_stop_{false};
   std::atomic<bool> non_sse_content_type_{false};
+  /// Status the peer answered with when it refused the stream, or 0. Recorded
+  /// in the header callback and reported from the reader loop, where a logger
+  /// is reachable. Without it a peer that answers 401, 429 or 503 is retried
+  /// for ever and says nothing, which is the same open-and-silent stream this
+  /// relay exists to remove, one hop up.
+  std::atomic<int> rejected_status_{0};
+
+  /// Newest `id:` this proxy has seen from the peer, sent back as
+  /// `Last-Event-ID` when it reconnects. Without it every reconnect asks the
+  /// peer for its whole replay buffer again, and the aggregator re-emits all of
+  /// it under fresh ids - so a client sees the same faults repeated after every
+  /// backoff cycle, which on a flapping link is continuous. Touched only by the
+  /// reader thread.
+  /// Written by the reader thread, read by the owner from another one.
+  mutable std::mutex cursor_mutex_;
+  std::string last_event_id_;
   std::function<void(const StreamEvent &)> callback_;
   std::thread reader_thread_;
+
+  /// The client the reader thread is currently blocked in, so close() can
+  /// interrupt it. Without this, close() only sets should_stop_, which the
+  /// content callbacks read only when bytes arrive: on a connected but silent
+  /// peer the join waits for the peer's next keepalive, or for the 300 s read
+  /// timeout if the peer has stopped writing entirely. That wait sits on the
+  /// live path through PeerFaultRelay, so an aggregator restarting while a
+  /// peer is quiet can overrun its shutdown budget and be killed.
+  ///
+  /// Signals that reader_loop has returned. close() waits on this instead of
+  /// joining straight away, so it can repeat the socket shutdown: one that
+  /// lands after the socket exists but before connect() returns is a no-op on
+  /// an unconnected socket, and the reader would then park with nothing left
+  /// to wake it.
+  std::mutex finished_mutex_;
+  std::condition_variable finished_cv_;
+  bool reader_finished_{false};
+
+  /// Guarded because the reader thread publishes it and close() reads it.
+  ///
+  /// The socket, NOT the httplib::Client. Calling Client::stop() while another
+  /// thread is inside Get() unlocks one of cpp-httplib's own mutexes from a
+  /// thread that never locked it; TSan reports "unlock of an unlocked mutex
+  /// (or by a wrong thread)" and glibc's pthread debug mode treats it as fatal.
+  /// That is the same hazard PeerClient documents when it explains why it never
+  /// stops its health-check client. Shutting the socket down instead wakes the
+  /// blocked read through the kernel and touches none of the library's state.
+  std::mutex socket_mutex_;
+  int active_socket_{-1};
 };
 
 }  // namespace ros2_medkit_gateway

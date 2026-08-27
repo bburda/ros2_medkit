@@ -86,6 +86,7 @@ ServiceCallResult Ros2ServiceTransport::call(const std::string & service_path, c
     const auto wait_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout);
     if (!client->wait_for_service(wait_timeout)) {
       result.success = false;
+      result.outcome = CallOutcome::kServiceUnavailable;
       result.error_message = "Service not available: " + service_path;
       return result;
     }
@@ -122,6 +123,7 @@ ServiceCallResult Ros2ServiceTransport::call(const std::string & service_path, c
       // Format the wait budget with millisecond precision so a sub-second
       // timeout (e.g. 0.1s) is not silently rendered as "0s".
       const auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout_secs).count();
+      result.outcome = CallOutcome::kTimeout;
       result.error_message = "Service call timed out (" + std::to_string(timeout_ms) + "ms): " + service_path;
       return result;
     }
@@ -135,6 +137,7 @@ ServiceCallResult Ros2ServiceTransport::call(const std::string & service_path, c
         if (type_info != nullptr) {
           result.response = serializer_->to_json(type_info, response_ptr.get());
           result.success = true;
+          result.outcome = CallOutcome::kOk;
           RCLCPP_DEBUG(node_->get_logger(), "Service call succeeded: %s", result.response.dump().c_str());
         } else {
           result.success = false;

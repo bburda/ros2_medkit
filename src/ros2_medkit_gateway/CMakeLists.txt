@@ -1070,6 +1070,10 @@ if(BUILD_TESTING)
   medkit_add_gtest(test_stream_proxy test/test_stream_proxy.cpp)
   target_link_libraries(test_stream_proxy gateway_ros2)
 
+  medkit_add_gtest(test_peer_fault_relay test/test_peer_fault_relay.cpp)
+  target_link_libraries(test_peer_fault_relay gateway_ros2)
+  medkit_test_needs_no_domain(test_peer_fault_relay)
+
   # mDNS discovery tests (aggregation module)
   medkit_add_gtest(test_mdns_discovery test/test_mdns_discovery.cpp)
   target_link_libraries(test_mdns_discovery gateway_ros2)

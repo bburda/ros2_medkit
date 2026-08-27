@@ -144,6 +144,15 @@ http::Result<dto::Health> HealthHandlers::get_health(const http::TypedRequest & 
                {"grew", stats.grew}};
     }
 
+    // How much of the SSE client cap is in use. The cap is small - two by
+    // default - and on an aggregating deployment a peer's slots are consumed
+    // by the aggregator's fault-stream relay rather than by anyone an operator
+    // can see. A 503 on /faults/stream is otherwise unexplainable from outside.
+    if (sse_tracker_) {
+      response.x_medkit_sse =
+          json{{"connected_clients", sse_tracker_->connected_clients()}, {"max_clients", sse_tracker_->max_clients()}};
+    }
+
     // Add peer status when aggregation is active
     if (auto * agg = ctx_.aggregation_manager()) {
       response.peers = agg->get_peer_status();
@@ -323,6 +332,13 @@ http::Result<dto::VersionInfo> HealthHandlers::get_version_info(const http::Type
       if (ext_json.contains("failed_peers")) {
         ext_dto.failed_peers = ext_json["failed_peers"].get<std::vector<std::string>>();
       }
+      if (ext_json.contains("peer_failures") && ext_json["peer_failures"].is_array()) {
+        std::vector<dto::PeerFailure> failures;
+        for (const auto & failure_entry : ext_json["peer_failures"]) {
+          failures.push_back(dto::PeerFailure{failure_entry.value("peer", ""), failure_entry.value("reason", "")});
+        }
+        ext_dto.peer_failures = std::move(failures);
+      }
     }
 
     // Re-parse merged items back into the DTO and attach x-medkit if present
@@ -335,7 +351,7 @@ http::Result<dto::VersionInfo> HealthHandlers::get_version_info(const http::Type
         }
       }
     }
-    if (ext_dto.partial.has_value() || ext_dto.failed_peers.has_value()) {
+    if (ext_dto.partial.has_value() || ext_dto.failed_peers.has_value() || ext_dto.peer_failures.has_value()) {
       response.x_medkit = std::move(ext_dto);
     }
 

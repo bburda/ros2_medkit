@@ -98,6 +98,7 @@ inline constexpr std::string_view dto_name<LogEntry> = "LogEntry";
 //   contributors        - aggregation peer provenance list (peer fan-out)
 //   partial             - true when a peer fan-out request failed
 //   failed_peers        - list of peer addresses that returned errors
+//   peer_failures       - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items  - per-peer items dropped due to malformed JSON
 //                         (observability for invisible drift)
 //
@@ -116,20 +117,23 @@ struct LogListXMedkit {
   std::optional<std::vector<std::string>> contributors;
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
 template <>
-inline constexpr auto dto_fields<LogListXMedkit> =
-    std::make_tuple(field("entity_id", &LogListXMedkit::entity_id),
-                    field_enum("aggregation_level", &LogListXMedkit::aggregation_level, kLogAggregationLevelValues),
-                    field("aggregated", &LogListXMedkit::aggregated), field("host_count", &LogListXMedkit::host_count),
-                    field("component_count", &LogListXMedkit::component_count),
-                    field("app_count", &LogListXMedkit::app_count),
-                    field("aggregation_sources", &LogListXMedkit::aggregation_sources),
-                    field("contributors", &LogListXMedkit::contributors), field("partial", &LogListXMedkit::partial),
-                    field("failed_peers", &LogListXMedkit::failed_peers),
-                    field("peer_dropped_items", &LogListXMedkit::peer_dropped_items));
+inline constexpr auto dto_fields<LogListXMedkit> = std::make_tuple(
+    field("entity_id", &LogListXMedkit::entity_id),
+    field_enum("aggregation_level", &LogListXMedkit::aggregation_level, kLogAggregationLevelValues),
+    field("aggregated", &LogListXMedkit::aggregated), field("host_count", &LogListXMedkit::host_count),
+    field("component_count", &LogListXMedkit::component_count), field("app_count", &LogListXMedkit::app_count),
+    field("aggregation_sources", &LogListXMedkit::aggregation_sources),
+    field("contributors", &LogListXMedkit::contributors), field("partial", &LogListXMedkit::partial),
+    field("failed_peers", &LogListXMedkit::failed_peers), field("peer_failures", &LogListXMedkit::peer_failures),
+    field("peer_dropped_items", &LogListXMedkit::peer_dropped_items));
 
 template <>
 inline constexpr std::string_view dto_name<LogListXMedkit> = "LogListXMedkit";

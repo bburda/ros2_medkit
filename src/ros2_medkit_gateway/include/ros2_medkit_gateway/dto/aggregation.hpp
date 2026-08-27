@@ -53,5 +53,32 @@ inline constexpr auto dto_fields<DroppedItem> =
 template <>
 inline constexpr std::string_view dto_name<DroppedItem> = "DroppedItem";
 
+// ---------------------------------------------------------------------------
+// PeerFailure - why one peer contributed nothing to a fanned-out collection.
+//
+// Carried in the peer_failures field beside failed_peers on every
+// collection-level XMedkit type. failed_peers names WHICH peers failed;
+// without this, a peer that ran out of time, a peer that refused the
+// connection, a peer that answered 500, a body over the size limit and
+// unparseable JSON are all the same entry in that list, and a client cannot
+// tell a slow subsystem from a dead one.
+//
+// Wire keys:
+//   peer   - peer name, matching the entry in failed_peers
+//   reason - one of: timeout, unreachable, canceled, error-status, too-large,
+//            invalid-response
+// ---------------------------------------------------------------------------
+struct PeerFailure {
+  std::string peer;
+  std::string reason;
+};
+
+template <>
+inline constexpr auto dto_fields<PeerFailure> =
+    std::make_tuple(field("peer", &PeerFailure::peer), field("reason", &PeerFailure::reason));
+
+template <>
+inline constexpr std::string_view dto_name<PeerFailure> = "PeerFailure";
+
 }  // namespace dto
 }  // namespace ros2_medkit_gateway

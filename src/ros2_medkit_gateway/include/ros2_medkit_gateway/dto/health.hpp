@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "ros2_medkit_gateway/core/http/warning_codes.hpp"
+#include "ros2_medkit_gateway/dto/aggregation.hpp"
 #include "ros2_medkit_gateway/dto/contract.hpp"
 #include "ros2_medkit_gateway/dto/enums.hpp"
 
@@ -143,6 +144,8 @@ inline constexpr std::string_view dto_name<HealthWarning> = "HealthWarning";
 //                                   (from Ros2TopicDataProvider::x_medkit_stats())
 //   x-medkit-subscription-executor - optional free-form JSON stats object
 //                                    (from Ros2TopicDataProvider::x_medkit_stats())
+//   x-medkit-sse                  - optional free-form JSON object:
+//                                   {connected_clients, max_clients}
 //   peers                         - optional free-form JSON array (agg peer status)
 //   warning_schema_version        - integer warnings-contract version; always
 //                                   emitted, aggregation or not
@@ -161,7 +164,14 @@ struct Health {
   std::optional<nlohmann::json> x_medkit_data_provider;          // wire key: "x-medkit-data-provider"
   std::optional<nlohmann::json> x_medkit_subscription_executor;  // wire key: "x-medkit-subscription-executor"
   std::optional<nlohmann::json> x_medkit_entity_cache;           // wire key: "x-medkit-entity-cache"
-  std::optional<nlohmann::json> peers;                           // free-form array of peer status objects
+  /// How much of `sse.max_clients` is in use. Wire key: "x-medkit-sse".
+  ///
+  /// The cap is small - two by default - and an aggregating gateway now
+  /// consumes one slot on each of its peers for as long as somebody is
+  /// watching its own fault stream. Without this an operator has no way to see
+  /// why a peer refused their stream with 503.
+  std::optional<nlohmann::json> x_medkit_sse;
+  std::optional<nlohmann::json> peers;  // free-form array of peer status objects
   // NOT optional: these two are emitted in every mode, aggregation or not, so
   // the generated schema must list them in `required` and let a typed client
   // read them without a presence check. An empty `warnings` array is the
@@ -175,8 +185,9 @@ inline constexpr auto dto_fields<Health> = std::make_tuple(
     field("status", &Health::status), field("timestamp", &Health::timestamp), field("discovery", &Health::discovery),
     field("x-medkit-data-provider", &Health::x_medkit_data_provider),
     field("x-medkit-subscription-executor", &Health::x_medkit_subscription_executor),
-    field("x-medkit-entity-cache", &Health::x_medkit_entity_cache), field("peers", &Health::peers),
-    field("warning_schema_version", &Health::warning_schema_version), field("warnings", &Health::warnings));
+    field("x-medkit-entity-cache", &Health::x_medkit_entity_cache), field("x-medkit-sse", &Health::x_medkit_sse),
+    field("peers", &Health::peers), field("warning_schema_version", &Health::warning_schema_version),
+    field("warnings", &Health::warnings));
 
 template <>
 inline constexpr std::string_view dto_name<Health> = "HealthStatus";
@@ -231,6 +242,7 @@ inline constexpr std::string_view dto_name<VersionInfoEntry> = "VersionInfoEntry
 // Wire keys (from merge_peer_items in fan_out_helpers.hpp):
 //   partial      - true when one or more peers failed during fan-out (optional)
 //   failed_peers - list of peer addresses that returned errors (optional)
+//   peer_failures - why each of those peers failed (timeout, unreachable, ...)
 //
 // Both fields are optional so the DTO is correctly empty (no "x-medkit" key
 // in the response) when there are no aggregation peers or the fan-out succeeds
@@ -239,11 +251,17 @@ inline constexpr std::string_view dto_name<VersionInfoEntry> = "VersionInfoEntry
 struct XMedkitVersionInfo {
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
 };
 
 template <>
-inline constexpr auto dto_fields<XMedkitVersionInfo> = std::make_tuple(
-    field("partial", &XMedkitVersionInfo::partial), field("failed_peers", &XMedkitVersionInfo::failed_peers));
+inline constexpr auto dto_fields<XMedkitVersionInfo> =
+    std::make_tuple(field("partial", &XMedkitVersionInfo::partial),
+                    field("failed_peers", &XMedkitVersionInfo::failed_peers),
+                    field("peer_failures", &XMedkitVersionInfo::peer_failures));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitVersionInfo> = "XMedkitVersionInfo";

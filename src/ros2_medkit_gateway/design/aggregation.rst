@@ -791,11 +791,40 @@ detection algorithm and the fall-back routing behaviour.
 Stream Proxy
 ~~~~~~~~~~~~
 
-For streaming connections (e.g., SSE fault subscriptions), the ``StreamProxy``
-interface provides transport-agnostic event proxying. The ``SSEStreamProxy``
-implementation connects to a peer's SSE endpoint and relays events back to the
-primary gateway's client. Each ``StreamEvent`` carries the ``peer_name`` so the
+For streaming connections, the ``StreamProxy`` interface provides
+transport-agnostic event proxying. The ``SSEStreamProxy`` implementation
+connects to a peer's SSE endpoint and relays events back to the primary
+gateway's client. Each ``StreamEvent`` carries the ``peer_name`` so the
 aggregator can attribute events to their source.
+
+``GET /faults/stream`` on an aggregating gateway uses it. An aggregator runs on
+its own ROS domain with its own ``fault_manager``, which no producer reports
+to, so a stream fed from the local graph alone is open, valid and silent - and
+a silent stream reads to a client exactly like a healthy system. ``GET
+/faults`` already fans out; ``PeerFaultRelay`` gives the stream the same
+answer.
+
+Lifecycle and the three constraints that shape it:
+
+* **Opened on the first client, closed with the last.** A relayed stream holds
+  one SSE client slot on every peer for as long as it is open, and
+  ``sse.max_clients`` defaults to 2. An aggregator nobody is watching therefore
+  holds none.
+* **Reconciled from the streaming loop.** Peers that appear or go away are
+  picked up on a later wakeup: the loop wakes on every event and at least once
+  per keepalive interval, and reconciliation itself runs at most once a second
+  so a burst of events does not become a burst of lock acquisitions. Only the
+  first attached client forces it immediately. No timer of its own.
+* **Loop suppression is the same mechanism the collections use.** The relay's
+  own request carries ``X-Medkit-No-Fan-Out``, and a stream request carrying
+  that header is served from the local graph only. Without it a chain of
+  aggregating gateways would relay one event round the loop.
+
+Each relayed event goes out under the aggregator's own event id, carrying the
+peer's payload with ``x-medkit.peer`` added. **Replay covers this gateway's own
+ids only.** Two peers number their events independently, so a ``Last-Event-ID``
+cannot address a position in a merged stream; a reconnecting client resumes
+from what the aggregator has buffered, not from each peer's own history.
 
 Deployment Topologies
 ---------------------
@@ -891,7 +920,14 @@ Key Classes
 ``StreamProxy`` / ``SSEStreamProxy``
     Transport-agnostic interface for proxying streaming connections to peers.
     ``SSEStreamProxy`` implements SSE-based event relaying with a background
-    reader thread.
+    reader thread that reconnects with exponential backoff.
+
+``PeerFaultRelay``
+    Holds one ``SSEStreamProxy`` per healthy peer for as long as a client is
+    attached to this gateway's ``/faults/stream``, and hands each event to the
+    handler that owns the local replay buffer. Takes its peer list through a
+    supplier callback rather than from ``AggregationManager`` directly, because
+    it lives in the ROS-neutral core.
 
 ``HostInfoProvider``
     Reads local host system info (hostname, OS, architecture) and produces a

@@ -59,9 +59,40 @@ Core Parameters
    * - ``aggregation.timeout_ms``
      - int
      - ``2000``
-     - HTTP timeout in milliseconds for all peer communication: health checks,
-       entity fetching, and request forwarding. Increase for high-latency
-       networks.
+     - Connect budget for every peer call, and the read budget for reading a
+       peer's description of itself: entity fetching and the collection fan-out
+       a client waits on across every peer at once. Increase for high-latency
+       networks. The health check is the exception: it caps both its budgets at
+       1000 ms, because an unresponsive peer is unhealthy whether the gateway
+       waits one second or five, and the wait bounds how long shutdown takes.
+       Range 100-600000; a value outside it is clamped to the nearest end, and
+       the clamp is logged when aggregation is enabled.
+   * - ``aggregation.forward_timeout_ms``
+     - int
+     - ``15000``
+     - Read budget for a forwarded request - an operation execution, or a read
+       of a large resource - on the gateway that owns it. What this waits for
+       is the peer doing that work, so it is sized above a peer gateway's own
+       ``service_call_timeout_sec`` default of 10 s. A value below
+       ``aggregation.timeout_ms`` is raised to it and the change is logged: a
+       forwarded request must not be cut off sooner than a metadata read.
+       Range 100-600000, clamped and logged as above.
+   * - ``aggregation.write_timeout_ms``
+     - int
+     - ``5000``
+     - Budget for pushing a request body to a peer. Raise it when forwarding
+       large uploads over a slow link. Range 100-600000, clamped and logged as
+       above.
+
+.. note::
+
+   These three are separate because they bound different things. One value
+   serving as connect, metadata read and forward read at once gives an
+   operation on a peer the budget of a listing, and the peer is then reported
+   as unavailable while it is still working. Raising that one value also
+   cannot reach the write budget, which is its own key: before it existed the
+   write timeout stayed at the HTTP client library's default and followed
+   nothing.
 
 mDNS Discovery Parameters
 --------------------------

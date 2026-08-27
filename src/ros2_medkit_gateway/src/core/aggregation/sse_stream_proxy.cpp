@@ -14,6 +14,10 @@
 
 #include "ros2_medkit_gateway/core/aggregation/stream_proxy.hpp"
 
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -25,8 +29,9 @@
 
 namespace ros2_medkit_gateway {
 
-SSEStreamProxy::SSEStreamProxy(const std::string & peer_url, const std::string & path, const std::string & peer_name)
-  : peer_url_(peer_url), path_(path), peer_name_(peer_name) {
+SSEStreamProxy::SSEStreamProxy(const std::string & peer_url, const std::string & path, const std::string & peer_name,
+                               httplib::Headers headers)
+  : peer_url_(peer_url), path_(path), peer_name_(peer_name), headers_(std::move(headers)) {
 }
 
 SSEStreamProxy::~SSEStreamProxy() {
@@ -40,15 +45,51 @@ void SSEStreamProxy::open() {
     return;
   }
   should_stop_.store(false);
+  {
+    std::lock_guard<std::mutex> lock(finished_mutex_);
+    reader_finished_ = false;
+  }
   reader_thread_ = std::thread(&SSEStreamProxy::reader_loop, this);
 }
 
 void SSEStreamProxy::close() {
   should_stop_.store(true);
   connected_.store(false);
-  if (reader_thread_.joinable()) {
-    reader_thread_.join();
+  if (!reader_thread_.joinable()) {
+    return;
   }
+  // Interrupt the read the reader thread is parked in. should_stop_ alone is
+  // only observed when bytes arrive, so a peer that is connected and quiet
+  // would hold this join until its next keepalive.
+  //
+  // Repeated until the reader is actually out, because a single shutdown can
+  // miss: on a socket that exists but has not finished connecting it returns
+  // ENOTCONN and changes nothing, and the reader goes on to connect and park.
+  // Retrying costs one syscall per 100 ms of a teardown that is normally over
+  // in one pass.
+  {
+    std::unique_lock<std::mutex> lock(finished_mutex_);
+    while (!reader_finished_) {
+      {
+        std::lock_guard<std::mutex> socket_lock(socket_mutex_);
+        if (active_socket_ >= 0) {
+          ::shutdown(active_socket_, SHUT_RDWR);
+        }
+      }
+      finished_cv_.wait_for(lock, std::chrono::milliseconds(100));
+    }
+  }
+  reader_thread_.join();
+}
+
+std::string SSEStreamProxy::last_event_id() const {
+  std::lock_guard<std::mutex> lock(cursor_mutex_);
+  return last_event_id_;
+}
+
+void SSEStreamProxy::set_last_event_id(std::string id) {
+  std::lock_guard<std::mutex> lock(cursor_mutex_);
+  last_event_id_ = std::move(id);
 }
 
 bool SSEStreamProxy::is_connected() const {
@@ -69,6 +110,50 @@ void SSEStreamProxy::reader_loop() {
 
   while (!should_stop_.load()) {
     httplib::Client client(peer_url_);
+    // The socket is handed to this callback once cpp-httplib has created it,
+    // which is where close() gets something it can interrupt. The library's own
+    // defaults are applied first so overriding this hook does not drop them.
+    //
+    // A DUPLICATE, not the library's descriptor. cpp-httplib closes its own
+    // inside Get(), and a closed number is free for any other thread in this
+    // process to be handed for an unrelated file - after which close() would
+    // shut down that one instead. Holding a dup keeps the number reserved until
+    // this loop releases it, and shutdown() acts on the socket behind it, so it
+    // still tears down the connection the reader is parked on.
+    client.set_socket_options([this](socket_t sock) {
+      httplib::default_socket_options(sock);
+      // F_DUPFD_CLOEXEC, not dup(): a plain duplicate has FD_CLOEXEC clear, so
+      // it would be inherited by every process this gateway execs - the script
+      // provider runs arbitrary ones - handing them a live socket to a peer.
+      const int held = ::fcntl(sock, F_DUPFD_CLOEXEC, 0);
+      std::lock_guard<std::mutex> lock(socket_mutex_);
+      if (active_socket_ >= 0) {
+        // A second connection inside one Get(). Nothing is parked on the
+        // previous socket any more, and leaving it open would leak a
+        // descriptor per reconnect.
+        ::close(active_socket_);
+      }
+      active_socket_ = held;
+      if (should_stop_.load()) {
+        // close() ran between this loop's stop check and this line, so it took
+        // the mutex while there was still no socket to interrupt and is now
+        // waiting on a join. It set should_stop_ before taking the mutex, so
+        // one of the two orderings always sees the other: do its work here.
+        ::shutdown(active_socket_, SHUT_RDWR);
+      }
+    });
+    // Released on every exit from this iteration, including the early breaks
+    // below. The dup is this class's to close and nothing else's.
+    struct SocketHandleGuard {
+      SSEStreamProxy * self;
+      ~SocketHandleGuard() {
+        std::lock_guard<std::mutex> lock(self->socket_mutex_);
+        if (self->active_socket_ >= 0) {
+          ::close(self->active_socket_);
+          self->active_socket_ = -1;
+        }
+      }
+    } socket_handle_guard{this};
     // SSE read timeout: 300s. If no data (including heartbeat comments) arrives
     // within this window, the connection is considered dead and we reconnect.
     // Peers should send periodic heartbeat comments (": keepalive\n\n") to
@@ -84,11 +169,26 @@ void SSEStreamProxy::reader_loop() {
 
     // Use chunked content receiver to process SSE data as it arrives
     std::string buffer;
+    // Resume where the last connection stopped. A reconnect without this asks
+    // the peer to replay its whole buffer, and every replayed event is emitted
+    // again under a new aggregator id.
+    httplib::Headers attempt_headers = headers_;
+    {
+      std::lock_guard<std::mutex> lock(cursor_mutex_);
+      if (!last_event_id_.empty()) {
+        attempt_headers.emplace("Last-Event-ID", last_event_id_);
+      }
+    }
+
     auto result = client.Get(
-        path_,
+        path_, attempt_headers,
         [this](const httplib::Response & response) {
           // Header callback - check status and content type before processing body
-          if (response.status != 200 || should_stop_.load()) {
+          if (response.status != 200) {
+            rejected_status_.store(response.status);
+            return false;
+          }
+          if (should_stop_.load()) {
             return false;
           }
           // Validate Content-Type is text/event-stream. A non-SSE 200 response
@@ -123,21 +223,51 @@ void SSEStreamProxy::reader_loop() {
             return false;  // Disconnect - peer sending malformed stream
           }
 
-          // Process complete events (delimited by double newline)
+          // Events end at a blank line, which SSE allows to be written either
+          // way round: "\n\n" or "\r\n\r\n". Searching only for "\n\n" never
+          // matches a CRLF stream, because "\r\n\r\n" holds "\n\r\n" and no
+          // "\n\n" - such a peer would deliver bytes for ever and never yield
+          // one event. parse_sse_data already handles CRLF within a block; it
+          // is this boundary search that has to admit both.
           size_t pos = 0;
           while (true) {
             auto boundary = buffer.find("\n\n", pos);
+            size_t boundary_len = 2;
+            const auto crlf_boundary = buffer.find("\r\n\r\n", pos);
+            if (crlf_boundary != std::string::npos && (boundary == std::string::npos || crlf_boundary < boundary)) {
+              boundary = crlf_boundary;
+              boundary_len = 4;
+            }
             if (boundary == std::string::npos) {
               break;
             }
 
             std::string event_block = buffer.substr(pos, boundary - pos + 1);
-            pos = boundary + 2;
+            pos = boundary + boundary_len;
 
             auto events = parse_sse_data(event_block, peer_name_);
-            if (callback_) {
-              for (const auto & event : events) {
-                callback_(event);
+            for (const auto & event : events) {
+              // Recorded before dispatch, so a callback that throws still
+              // leaves the resume point at the last event actually received.
+              if (!event.id.empty()) {
+                std::lock_guard<std::mutex> lock(cursor_mutex_);
+                last_event_id_ = event.id;
+              }
+              if (callback_) {
+                // The callback is given a payload the peer wrote. One that
+                // throws on a shape it did not expect would otherwise leave the
+                // exception to escape this thread, and an exception leaving a
+                // std::thread calls std::terminate - a peer could end the
+                // gateway by sending one malformed field.
+                try {
+                  callback_(event);
+                } catch (const std::exception & e) {
+                  fprintf(stderr, "[SSEStreamProxy] dropping event from peer '%s': handler threw: %s\n",
+                          peer_name_.c_str(), e.what());
+                } catch (...) {
+                  fprintf(stderr, "[SSEStreamProxy] dropping event from peer '%s': handler threw\n",
+                          peer_name_.c_str());
+                }
               }
             }
           }
@@ -152,6 +282,15 @@ void SSEStreamProxy::reader_loop() {
 
     // Connection ended (server closed, timeout, or error) - mark disconnected
     connected_.store(false);
+
+    // A peer that refuses the stream says so once per attempt rather than
+    // never: 401 means this gateway is not authorised to relay, 503 means the
+    // peer is at sse.max_clients, 429 means it is rate limiting. All three are
+    // acted on differently and none of them is visible anywhere else.
+    if (const int rejected = rejected_status_.exchange(0); rejected != 0) {
+      fprintf(stderr, "[SSEStreamProxy] peer '%s' at %s%s refused the stream with status %d; retrying\n",
+              peer_name_.c_str(), peer_url_.c_str(), path_.c_str(), rejected);
+    }
 
     // Log if the peer returned a non-SSE Content-Type (e.g. application/json)
     if (non_sse_content_type_.load()) {
@@ -178,6 +317,15 @@ void SSEStreamProxy::reader_loop() {
 
     backoff_ms = std::min(backoff_ms * 2, kMaxBackoffMs);
   }
+
+  // Announced so close() stops re-arming its shutdown and joins. It waits on
+  // this rather than joining straight away, so it must always be set, on every
+  // way out of the loop above.
+  {
+    std::lock_guard<std::mutex> lock(finished_mutex_);
+    reader_finished_ = true;
+  }
+  finished_cv_.notify_all();
 }
 
 std::vector<StreamEvent> SSEStreamProxy::parse_sse_data(const std::string & raw, const std::string & peer) {

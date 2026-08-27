@@ -224,6 +224,15 @@ ros2_medkit_gateway:
       # Default: 3600 (1 hour)
       max_duration_sec: 3600
 
+      # Comment interval on an idle SSE stream, in seconds. Also how long the
+      # server takes to notice a client has gone: a closed socket is found on
+      # the next write. On an aggregating gateway that is how long a fault-stream
+      # relay keeps a client slot on a peer after nobody is watching.
+      # Shorten it behind a proxy that drops idle connections sooner than 30 s.
+      # Range 1-3600, clamped to the nearest end with a warning.
+      # Default: 30
+      keepalive_interval_sec: 30
+
     # Entity Cache Configuration
     entity_cache:
       # Pre-reserved capacity for the thread-safe entity cache.
@@ -592,10 +601,27 @@ ros2_medkit_gateway:
       # Default: false
       enabled: false
 
-      # HTTP timeout for peer requests (health checks, entity fetching, forwarding)
-      # in milliseconds
+      # Connect budget for every peer request, and the read budget for reading a
+      # peer's description of itself: health checks, entity fetching, and the
+      # collection fan-out a client waits on across every peer at once.
+      # Milliseconds. Range 100-600000, clamped to the nearest end with a warning.
       # Default: 2000
       timeout_ms: 2000
+
+      # Read budget for a forwarded request - an operation execution, or a read
+      # of a large resource - on the gateway that owns it. Sized above a peer
+      # gateway's own service_call_timeout_sec default of 10 s,
+      # because what this waits for is the peer doing that work.
+      # A value below timeout_ms is raised to it, with a warning.
+      # Milliseconds. Range 100-600000, clamped to the nearest end with a warning.
+      # Default: 15000
+      forward_timeout_ms: 15000
+
+      # Budget for pushing a request body to a peer. Raise for large uploads
+      # over a slow link.
+      # Milliseconds. Range 100-600000, clamped to the nearest end with a warning.
+      # Default: 5000
+      write_timeout_ms: 5000
 
       # Announce this gateway's presence via mDNS
       # Default: false (opt-in to avoid surprising network behavior)

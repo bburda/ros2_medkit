@@ -16,7 +16,9 @@
 #include <httplib.h>
 
 #include <algorithm>
+#include <chrono>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -85,6 +87,88 @@ TEST(PeerClient, forward_sets_502_on_connection_error) {
 }
 
 // =============================================================================
+// classify_peer_error - the rule that separates a slow peer from a dead one
+// =============================================================================
+
+// cpp-httplib reports both "the read budget ran out" and "the connection broke
+// mid-answer" as Error::Read, so the error alone cannot tell them apart. These
+// pin the discriminator: the elapsed time against the budget.
+
+TEST(ClassifyPeerError, a_read_that_consumed_its_budget_is_a_timeout) {
+  EXPECT_EQ(classify_peer_error(httplib::Error::Read, std::chrono::milliseconds(2000), std::chrono::milliseconds(2000),
+                                std::chrono::milliseconds(1)),
+            PeerFailureKind::kTimeout);
+}
+
+TEST(ClassifyPeerError, a_read_that_broke_early_is_not_a_timeout) {
+  // The peer died with the answer half sent. Telling an operator to wait for
+  // it, or to raise a budget, points at the wrong box.
+  EXPECT_EQ(classify_peer_error(httplib::Error::Read, std::chrono::milliseconds(120), std::chrono::milliseconds(2000),
+                                std::chrono::milliseconds(1)),
+            PeerFailureKind::kUnreachable);
+}
+
+TEST(ClassifyPeerError, a_write_is_measured_against_the_WRITE_budget) {
+  // The write budget is its own and smaller than the read budget by default
+  // (5000 against 15000). Measured against the read budget, a write that ran
+  // out at its own limit looks like a peer that died, and the key whose whole
+  // purpose is bounding a slow upload could never report its own expiry.
+  EXPECT_EQ(classify_peer_error(httplib::Error::Write, std::chrono::milliseconds(5000),
+                                /*read_budget=*/std::chrono::milliseconds(15000),
+                                /*write_budget=*/std::chrono::milliseconds(5000)),
+            PeerFailureKind::kTimeout);
+  // Below its own budget it is still a broken connection, not a timeout.
+  EXPECT_EQ(classify_peer_error(httplib::Error::Write, std::chrono::milliseconds(120), std::chrono::milliseconds(15000),
+                                std::chrono::milliseconds(5000)),
+            PeerFailureKind::kUnreachable);
+}
+
+TEST(PeerBudgetFor, each_timeout_names_the_budget_that_bounds_it) {
+  // A connect timeout is bounded by the connect budget, not by the read budget
+  // the call was hoping to spend. Naming the wrong one tells an operator to
+  // raise a value that would not have changed the outcome.
+  EXPECT_EQ(peer_budget_for(httplib::Error::ConnectionTimeout), PeerBudget::kConnect);
+  EXPECT_EQ(peer_budget_for(httplib::Error::Read), PeerBudget::kRead);
+  EXPECT_EQ(peer_budget_for(httplib::Error::Write), PeerBudget::kWrite);
+  EXPECT_EQ(peer_budget_for(httplib::Error::Connection), PeerBudget::kNone);
+}
+
+TEST(ClassifyPeerError, a_connect_timeout_is_a_timeout_whatever_the_clock_says) {
+  // The connect budget is its own, and it is not the budget passed here, so
+  // the elapsed comparison must not get a vote.
+  EXPECT_EQ(classify_peer_error(httplib::Error::ConnectionTimeout, std::chrono::milliseconds(1),
+                                std::chrono::milliseconds(60000), std::chrono::milliseconds(1)),
+            PeerFailureKind::kTimeout);
+}
+
+TEST(ClassifyPeerError, a_refused_connection_is_unreachable_however_long_it_took) {
+  EXPECT_EQ(classify_peer_error(httplib::Error::Connection, std::chrono::milliseconds(9999),
+                                std::chrono::milliseconds(1000), std::chrono::milliseconds(1)),
+            PeerFailureKind::kUnreachable);
+}
+
+TEST(ClassifyPeerError, a_call_this_gateway_stopped_is_neither) {
+  EXPECT_EQ(classify_peer_error(httplib::Error::Canceled, std::chrono::milliseconds(9999),
+                                std::chrono::milliseconds(1000), std::chrono::milliseconds(1)),
+            PeerFailureKind::kCanceled);
+}
+
+TEST(PeerFailureReason, every_kind_has_a_distinct_wire_token) {
+  // The tokens are documented in docs/api/rest.rst and read by clients. Two
+  // kinds sharing one token would put the defect back: a client could not tell
+  // those two events apart, which is the whole of what this carries.
+  const PeerFailureKind kinds[] = {PeerFailureKind::kNone,           PeerFailureKind::kTimeout,
+                                   PeerFailureKind::kUnreachable,    PeerFailureKind::kCanceled,
+                                   PeerFailureKind::kErrorStatus,    PeerFailureKind::kTooLarge,
+                                   PeerFailureKind::kInvalidResponse};
+  std::set<std::string> tokens;
+  for (auto kind : kinds) {
+    tokens.insert(peer_failure_reason(kind));
+  }
+  EXPECT_EQ(tokens.size(), sizeof(kinds) / sizeof(kinds[0]));
+}
+
+// =============================================================================
 // forward_and_get_json tests (connection failure path)
 // =============================================================================
 
@@ -94,8 +178,11 @@ TEST(PeerClient, forward_and_get_json_returns_error_on_connection_refused) {
   auto result = client.forward_and_get_json("GET", "/api/v1/health");
 
   ASSERT_FALSE(result.has_value());
-  EXPECT_TRUE(result.error().find("dead_peer") != std::string::npos);
-  EXPECT_TRUE(result.error().find("Failed to connect") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("dead_peer") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("Failed to reach peer") != std::string::npos);
+  // A refused connection is not a budget that ran out. The two get different
+  // HTTP statuses one layer up, so the kind carries as much as the text.
+  EXPECT_EQ(result.error().kind, PeerFailureKind::kUnreachable);
 }
 
 // =============================================================================
@@ -750,8 +837,9 @@ TEST(PeerClientHappyPath, forward_and_get_json_error_on_non_2xx) {
   auto result = client.forward_and_get_json("GET", "/api/v1/missing");
 
   ASSERT_FALSE(result.has_value());
-  EXPECT_TRUE(result.error().find("404") != std::string::npos);
-  EXPECT_TRUE(result.error().find("test_peer") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("404") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("test_peer") != std::string::npos);
+  EXPECT_EQ(result.error().kind, PeerFailureKind::kErrorStatus);
 
   svr.stop();
   t.join();
@@ -818,8 +906,9 @@ TEST(PeerClientHappyPath, forward_and_get_json_rejects_oversized_response) {
   auto result = client.forward_and_get_json("GET", "/api/v1/components/big/data");
 
   ASSERT_FALSE(result.has_value());
-  EXPECT_TRUE(result.error().find("size limit") != std::string::npos);
-  EXPECT_TRUE(result.error().find("big_peer") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("size limit") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("big_peer") != std::string::npos);
+  EXPECT_EQ(result.error().kind, PeerFailureKind::kTooLarge);
 
   svr.stop();
   t.join();
