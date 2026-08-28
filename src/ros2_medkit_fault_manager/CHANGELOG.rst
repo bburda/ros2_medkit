@@ -14,6 +14,7 @@ Changelog for package ros2_medkit_fault_manager
 * The near-miss series survives a fault being cleared, so acknowledging a fault no longer discards the evidence gathered around it (`#629 <https://github.com/selfpatch/ros2_medkit/pull/629>`_)
 * The fault manager's YAML parameter file supports launch substitutions, so a path can be composed at launch time instead of being fixed in the file (`#634 <https://github.com/selfpatch/ros2_medkit/pull/634>`_)
 * Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), every launch test lives under ``test/integration`` and takes a DDS domain at run time (`#628 <https://github.com/selfpatch/ros2_medkit/pull/628>`_, `#551 <https://github.com/selfpatch/ros2_medkit/pull/551>`_, `#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
+* A ``fault_code`` up to the advertised 256 characters is accepted, where the manager previously stopped at 128, and a long code no longer costs the recording: the rosbag filename is truncated with a digest instead of exceeding the filesystem's component limit (`#591 <https://github.com/selfpatch/ros2_medkit/pull/591>`_)
 * Contributors: @bburda, @mfaferek93, @nnarain
 
 0.6.0 (2026-06-22)
