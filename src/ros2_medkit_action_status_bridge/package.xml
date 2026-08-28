@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>ros2_medkit_action_status_bridge</name>
-  <version>0.6.0</version>
+  <version>0.7.0</version>
   <description>Bridge node turning terminal ROS2 action goal states (aborted) into FaultManager faults</description>
 
   <maintainer email="michal.faferek@selfpatch.ai">mfaferek93</maintainer>

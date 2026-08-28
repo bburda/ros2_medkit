@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>ros2_medkit_serialization</name>
-  <version>0.6.0</version>
+  <version>0.7.0</version>
   <description>Runtime JSON to ROS 2 message serialization library</description>
   <maintainer email="bartoszburda93@gmail.com">bburda</maintainer>
   <license>Apache-2.0</license>

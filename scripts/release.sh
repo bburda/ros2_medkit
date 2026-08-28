@@ -98,9 +98,9 @@ cmd_bump() {
     # Update docs/conf.py version and release
     if [ -f "$CONF_PY" ]; then
         local old_conf
-        old_conf=$(grep -oP '^version = "\K[0-9]+\.[0-9]+\.[0-9]+' "$CONF_PY" || echo "unknown")
-        sed -i "s|^version = \"[0-9]\+\.[0-9]\+\.[0-9]\+\"|version = \"${target_version}\"|" "$CONF_PY"
-        sed -i "s|^release = \"[0-9]\+\.[0-9]\+\.[0-9]\+\"|release = \"${target_version}\"|" "$CONF_PY"
+        old_conf=$(grep -oP '^version = ["\x27]\K[0-9]+\.[0-9]+\.[0-9]+' "$CONF_PY" || echo "unknown")
+        sed -i -E "s|^version = [\"'][0-9]+\.[0-9]+\.[0-9]+[\"']|version = '${target_version}'|" "$CONF_PY"
+        sed -i -E "s|^release = [\"'][0-9]+\.[0-9]+\.[0-9]+[\"']|release = '${target_version}'|" "$CONF_PY"
         echo "  docs/conf.py: ${old_conf} -> ${target_version}"
     fi
 
@@ -188,7 +188,7 @@ cmd_verify() {
     # Check docs/conf.py
     if [ -f "$CONF_PY" ]; then
         local conf_version
-        conf_version=$(grep -oP '^version = "\K[0-9]+\.[0-9]+\.[0-9]+' "$CONF_PY" || echo "unknown")
+        conf_version=$(grep -oP '^version = ["\x27]\K[0-9]+\.[0-9]+\.[0-9]+' "$CONF_PY" || echo "unknown")
         if [ -n "$expected_version" ] && [ "$conf_version" != "$expected_version" ]; then
             echo "  MISMATCH: docs/conf.py is ${conf_version}, expected ${expected_version}"
             all_ok=false

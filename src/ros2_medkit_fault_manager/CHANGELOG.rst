@@ -21,6 +21,7 @@ Changelog for package ros2_medkit_fault_manager
 * Bounded concurrent snapshot capture under fault storms with a ``CaptureThreadPool`` and configurable capture pool / queue / overflow-policy parameters. The rosbag leg is serialized and the cooldown map is bounded, so a burst of simultaneous faults can no longer exhaust capture threads or grow memory without limit (`#456 <https://github.com/selfpatch/ros2_medkit/pull/456>`_)
 * Entity-scoped rosbag capture by default (`#431 <https://github.com/selfpatch/ros2_medkit/pull/431>`_)
 * Made rosbag capture enablement crash-safe (`#430 <https://github.com/selfpatch/ros2_medkit/pull/430>`_)
+* The default rosbag storage format moved back from ``mcap`` to ``sqlite3``, which ships with rosbag2 and needs no extra package; ``mcap`` stayed selectable through ``snapshots.rosbag.format``. This came in with the crash-safety fix above and was not recorded at the time (`#430 <https://github.com/selfpatch/ros2_medkit/pull/430>`_)
 * Contributors: @bburda, @mfaferek93
 
 0.5.0 (2026-06-08)
