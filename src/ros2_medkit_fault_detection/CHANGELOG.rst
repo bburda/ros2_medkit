@@ -27,5 +27,5 @@ Changelog for package ros2_medkit_fault_detection
   detection onto this module.
 * Global fault-code uniqueness is enforced across an OPC UA node map, so two rules cannot claim the same code and leave which one raised it undefined (`#486 <https://github.com/selfpatch/ros2_medkit/pull/486>`_)
 * A tracker holds its prior state on an undecidable read instead of clearing a standing fault, and an enum value with no mapping is labelled rather than dropped (`#486 <https://github.com/selfpatch/ros2_medkit/pull/486>`_)
-* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), and its tests take a DDS domain at run time from the shared allocator (`#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
+* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), and its test is registered through the shared macros and opted out of DDS domain allocation, the evaluator being pure logic with no ROS node (`#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
 * Contributors: @mfaferek93, @bburda

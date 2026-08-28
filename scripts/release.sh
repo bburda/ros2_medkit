@@ -37,6 +37,13 @@ DOXYFILE="${REPO_ROOT}/docs/Doxyfile"
 QUALITY_DECL="${REPO_ROOT}/QUALITY_DECLARATION.md"
 REST_RST="${REPO_ROOT}/docs/api/rest.rst"
 
+# Read one assignment out of docs/conf.py. Accepts either quote style and any
+# spacing around "="; the value is anchored to the closing quote so a suffixed
+# version is returned whole rather than truncated to its numeric prefix.
+conf_py_field() {
+    grep -oP "^[[:space:]]*$1[[:space:]]*=[[:space:]]*[\"']\\K[^\"']*(?=[\"'][[:space:]]*\$)" "$CONF_PY" | head -1
+}
+
 usage() {
     echo "Usage: $0 {bump <version>|verify [<version>]}"
     echo ""
@@ -98,9 +105,15 @@ cmd_bump() {
     # Update docs/conf.py version and release
     if [ -f "$CONF_PY" ]; then
         local old_conf
-        old_conf=$(grep -oP '^version = ["\x27]\K[0-9]+\.[0-9]+\.[0-9]+' "$CONF_PY" || echo "unknown")
-        sed -i -E "s|^version = [\"'][0-9]+\.[0-9]+\.[0-9]+[\"']|version = '${target_version}'|" "$CONF_PY"
-        sed -i -E "s|^release = [\"'][0-9]+\.[0-9]+\.[0-9]+[\"']|release = '${target_version}'|" "$CONF_PY"
+        old_conf=$(conf_py_field version || echo "unknown")
+        sed -i -E "s|^([[:space:]]*version[[:space:]]*=[[:space:]]*)[\"'][^\"']*[\"']|\\1'${target_version}'|" "$CONF_PY"
+        sed -i -E "s|^([[:space:]]*release[[:space:]]*=[[:space:]]*)[\"'][^\"']*[\"']|\\1'${target_version}'|" "$CONF_PY"
+        # sed exits 0 whether or not it substituted, so confirm the rewrite landed
+        # rather than reporting a bump the file never received.
+        if [ "$(conf_py_field version)" != "${target_version}" ] || [ "$(conf_py_field release)" != "${target_version}" ]; then
+            echo "  ERROR: docs/conf.py was not rewritten to ${target_version}" >&2
+            return 1
+        fi
         echo "  docs/conf.py: ${old_conf} -> ${target_version}"
     fi
 
@@ -187,10 +200,14 @@ cmd_verify() {
 
     # Check docs/conf.py
     if [ -f "$CONF_PY" ]; then
-        local conf_version
-        conf_version=$(grep -oP '^version = ["\x27]\K[0-9]+\.[0-9]+\.[0-9]+' "$CONF_PY" || echo "unknown")
+        local conf_version conf_release
+        conf_version=$(conf_py_field version || echo "unknown")
+        conf_release=$(conf_py_field release || echo "unknown")
         if [ -n "$expected_version" ] && [ "$conf_version" != "$expected_version" ]; then
-            echo "  MISMATCH: docs/conf.py is ${conf_version}, expected ${expected_version}"
+            echo "  MISMATCH: docs/conf.py version is ${conf_version}, expected ${expected_version}"
+            all_ok=false
+        elif [ "$conf_release" != "$conf_version" ]; then
+            echo "  MISMATCH: docs/conf.py release is ${conf_release}, version is ${conf_version}"
             all_ok=false
         else
             echo "  OK: docs/conf.py = ${conf_version}"

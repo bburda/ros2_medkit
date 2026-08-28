@@ -4,7 +4,7 @@ Changelog for package ros2_medkit_fault_reporter
 
 0.7.0 (2026-08-27)
 ------------------
-* ``FaultReporter`` can now be constructed from an ``rclcpp_lifecycle::LifecycleNode`` (and from a plain ``rclcpp::Node`` reference or explicit node interfaces), enabling use inside lifecycle nodes (`#555 <https://github.com/selfpatch/ros2_medkit/issues/555>`_)
+* ``FaultReporter`` can now be constructed from an ``rclcpp_lifecycle::LifecycleNode`` (and from a plain ``rclcpp::Node`` reference or explicit node interfaces), enabling use inside lifecycle nodes (`#556 <https://github.com/selfpatch/ros2_medkit/pull/556>`_, `#555 <https://github.com/selfpatch/ros2_medkit/issues/555>`_)
 * Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), and every test takes a DDS domain at run time from the shared allocator (`#551 <https://github.com/selfpatch/ros2_medkit/pull/551>`_, `#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
 * Contributors: @bburda, @mfaferek93, @zeerekahmad
 

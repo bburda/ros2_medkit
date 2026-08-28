@@ -4,7 +4,7 @@ Changelog for package ros2_medkit_serialization
 
 0.7.0 (2026-08-27)
 ------------------
-* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), its tests take a DDS domain at run time from the shared allocator (`#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_), and clang-tidy no longer reports findings in vendored headers that the header filter matched
+* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), its ROS-dependent tests take a DDS domain at run time from the shared allocator while the pure-logic ones are opted out (`#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_), and clang-tidy no longer reports findings in vendored headers that the header filter matched
 * Contributors: @bburda, @mfaferek93
 
 0.6.0 (2026-06-22)
