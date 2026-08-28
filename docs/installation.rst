@@ -41,10 +41,25 @@ for your distribution:
    vendored copy as a fallback - no manual installation is needed. The build system
    automatically uses the vendored header when the system package is insufficient.
 
+Installation from Binary Packages
+---------------------------------
+
+ros2_medkit is in the ROS index, so most packages install with ``apt``:
+
+.. code-block:: bash
+
+   sudo apt install ros-jazzy-ros2-medkit-gateway   # or ros-humble- / ros-lyrical-
+   ros2 launch ros2_medkit_gateway bringup.launch.py
+
+Three packages are not in the index yet and have to be built from source:
+``ros2_medkit_opcua``, which is waiting on open62541pp being vendored,
+``ros2_medkit_graph_watchdog``, and ``ros2_medkit_fault_detection``.
+
 Installation from Source
 ------------------------
 
-ros2_medkit is currently distributed as source code. Binary packages will be available in future releases.
+Build from source to get every package, to run against an unreleased version, or
+to develop against the tree.
 
 1. **Create a workspace**
 
