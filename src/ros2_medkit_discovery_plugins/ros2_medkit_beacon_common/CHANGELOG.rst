@@ -2,6 +2,11 @@
 Changelog for package ros2_medkit_beacon_common
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.0 (2026-08-27)
+------------------
+* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), and its tests take a DDS domain at run time from the shared allocator instead of a hand-maintained per-package pool (`#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
+* Contributors: @bburda
+
 0.6.0 (2026-06-22)
 ------------------
 * No functional changes; version bump for the coordinated 0.6.0 release.

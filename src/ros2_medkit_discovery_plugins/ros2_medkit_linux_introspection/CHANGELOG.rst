@@ -2,6 +2,14 @@
 Changelog for package ros2_medkit_linux_introspection
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.0 (2026-08-27)
+------------------
+* Container CPU and memory limits are reported on every common cgroup layout, not just one. The reader parses the cgroup v1 line format alongside v2, and resolves the limit files under both ``cgroupns=host`` and ``cgroupns=private`` - the latter being the Docker default, where the container sees its own cgroup mounted directly at ``/sys/fs/cgroup`` and the previously built path did not exist. A limit that could not be read is now distinguished from a container that genuinely has no limit, instead of both being reported as unlimited (`#637 <https://github.com/selfpatch/ros2_medkit/pull/637>`_, `#604 <https://github.com/selfpatch/ros2_medkit/issues/604>`_)
+* Limits are read from the cgroup that owns them rather than from the process's own leaf, a legacy controller's limit is no longer outranked by a hierarchy that does not set one, and a limit file is read to its end instead of to the first short read (`#637 <https://github.com/selfpatch/ros2_medkit/pull/637>`_)
+* Containers are detected per process rather than once for the whole node, and the ctest suite exercises every supported cgroup layout against synthetic hierarchies (`#637 <https://github.com/selfpatch/ros2_medkit/pull/637>`_)
+* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), and its tests take a DDS domain at run time from the shared allocator (`#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
+* Contributors: @bburda
+
 0.6.0 (2026-06-22)
 ------------------
 * No functional changes; version bump for the coordinated 0.6.0 release.

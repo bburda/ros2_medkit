@@ -2,6 +2,14 @@
 Changelog for package ros2_medkit_diagnostic_bridge
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.0 (2026-08-27)
+------------------
+* The ``hardware_id`` of a diagnostic message is passed through as the fault's source id, so a fault raised from ``/diagnostics`` is attributed to the device the publisher named rather than to the bridge (`#622 <https://github.com/selfpatch/ros2_medkit/pull/622>`_)
+* A fault code can be extracted from a diagnostic message's key/value attributes, so a publisher that already carries its own code no longer has to encode it in the message name (`#527 <https://github.com/selfpatch/ros2_medkit/pull/527>`_)
+* The Humble fallback warning builds again (`#636 <https://github.com/selfpatch/ros2_medkit/pull/636>`_)
+* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), every integration launch test runs on its own DDS domain taken at run time (`#551 <https://github.com/selfpatch/ros2_medkit/pull/551>`_, `#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_), and the suite re-emits and polls until the fault surfaces instead of asserting once against a graph that may not have settled (`#504 <https://github.com/selfpatch/ros2_medkit/pull/504>`_)
+* Contributors: @bburda, @mfaferek93, @nnarain
+
 0.6.0 (2026-06-22)
 ------------------
 * Tests: label ``test_integration`` as an integration test so it runs in the integration suite instead of the unit set (`#443 <https://github.com/selfpatch/ros2_medkit/pull/443>`_)

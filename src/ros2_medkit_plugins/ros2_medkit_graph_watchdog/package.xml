@@ -3,7 +3,7 @@
 <package format="3">
   <name>ros2_medkit_graph_watchdog</name>
   <version>0.6.0</version>
-  <description>Gateway plugin that detects silent faults in the ROS 2 graph: QoS mismatches, topic-name typos, dead nodes, stale transforms, parameter drift, lifecycle expectations and pipeline timing budgets.</description>
+  <description>Gateway plugin that detects silent faults in the ROS 2 graph: QoS mismatches, orphaned topics left by a name typo, dead nodes, parameter drift and unmet lifecycle expectations.</description>
   <maintainer email="bartoszburda93@gmail.com">bburda</maintainer>
   <license>Apache-2.0</license>
 

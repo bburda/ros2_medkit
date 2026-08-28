@@ -1,0 +1,15 @@
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Changelog for package ros2_medkit_graph_watchdog
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+0.7.0 (2026-08-27)
+------------------
+* Initial release of the package: a gateway plugin that raises faults for silent failures in the ROS 2 graph - problems that leave every node alive and every topic present, so nothing in the stack reports them today. The package carries the plugin skeleton, a central reliability gate that holds raises until the graph has quiesced, and a detector registry. Detectors are configured under ``plugins.graph_watchdog.<key>``, each with a ``raise`` / ``advisory`` / ``off`` mode, and an unknown key under ``detectors.<id>`` is reported rather than silently ignored, so a typo cannot quietly disable a check (`#571 <https://github.com/selfpatch/ros2_medkit/pull/571>`_)
+* ``qos_mismatch`` detector: raises ``GRAPH_QOS_MISMATCH`` for a publisher and subscriber whose QoS profiles cannot match, which leaves the connection silently unestablished (`#571 <https://github.com/selfpatch/ros2_medkit/pull/571>`_)
+* ``orphan`` detector: raises ``GRAPH_ORPHAN`` for a topic with a publisher and no subscriber, or a subscriber and no publisher - the shape a name typo leaves behind (`#578 <https://github.com/selfpatch/ros2_medkit/pull/578>`_)
+* ``param_drift`` detector: raises ``GRAPH_PARAM_DRIFT`` when a node's live parameter value diverges from the declared expectation (`#580 <https://github.com/selfpatch/ros2_medkit/pull/580>`_)
+* ``lifecycle_expectation`` detector: raises ``GRAPH_NODE_INACTIVE`` for a node named in ``require_active`` that is not in the ``active`` lifecycle state once its ``grace`` window has passed. A node is matched by its ``App::id``, its full FQN, or the bare leaf of that FQN, and the grace streak is counted per node, so naming one node in two documented forms cannot halve the grace that was configured (`#587 <https://github.com/selfpatch/ros2_medkit/pull/587>`_)
+* ``node_death`` detector: raises ``GRAPH_NODE_DEATH`` for a node that leaves the graph when nothing else is left to report it, with a suppression framework that decides ownership of a departure from knowledge rather than from silence. A node whose lifecycle state was never readable is admitted only provisionally, and is handed back the moment a label arrives saying the departure belonged to the lifecycle detector instead. Zero-config: there is no list of nodes to maintain (`#625 <https://github.com/selfpatch/ros2_medkit/pull/625>`_, `#624 <https://github.com/selfpatch/ros2_medkit/issues/624>`_)
+* Two silent-fault classes are not delivered in this release. ``GRAPH_TF_STALE`` and ``GRAPH_LATENCY_BUDGET`` have their fault codes reserved in the frozen ``GRAPH_*`` namespace and land in later changes, each against its own issue
+* The plugin keeps its ROS entities off the gateway executor, so an entity created and destroyed while the gateway runs cannot have its destructor run on an executor thread concurrently with a create on the same node
+* Contributors: @bburda
