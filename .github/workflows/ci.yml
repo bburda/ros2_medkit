@@ -126,7 +126,7 @@ jobs:
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
-      - name: Check the run completed, and record the margin
+      - name: Check the run completed, and record the environment
         if: always()
         run: |
           # A step killed by its cap is reported as a failure, not a cancellation,
@@ -134,8 +134,14 @@ jobs:
           # overrun reads as one flaky test out of thousands, and the packages
           # queued behind it leave no trace at all.
           ./scripts/ci_test_completeness.sh "${TEST_STEP_START}" 45
+          # A DDS participant killed rather than shut down leaves its segments
+          # behind for the rest of the job, and the installed middleware decides
+          # which transport those segments belong to. Neither is recoverable from
+          # a finished run, so both are recorded rather than assumed.
           df -h /dev/shm
           echo "shm segments: $(ls /dev/shm | wc -l)"
+          ls -la /dev/shm | head -20
+          dpkg -l | grep -E 'rmw-fastrtps|fastdds|cyclonedds' || true
 
       - name: Show test results
         if: always()
