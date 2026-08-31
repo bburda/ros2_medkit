@@ -420,8 +420,41 @@ jobs:
     # ctest -LE linter per package, a superset of the selection here - they do
     # not skip ros2_medkit_opcua - so the asserts are still exercised against
     # unit and integration tests on every PR.
+    #
+    # Sharded because this job reached 89m48s against its 90 minute cap - twelve
+    # seconds - and its test step grew 166% in a month. It is the only test-bearing
+    # job that does not skip ros2_medkit_graph_watchdog, so it alone absorbed the
+    # 24 minute suite the others carved out. Measured test time per package on one
+    # run: integration_tests 1050s, graph_watchdog ~1440s, gateway + fault_manager
+    # 389s, everything else 85s. The shards below follow those numbers.
+    #
+    # Each shard builds the whole workspace, because every package needs its
+    # dependencies built; only the test selection differs. Minutes are free on a
+    # public repository and wall clock is not, so paying for the build four times
+    # to quarter the wall clock is the right trade here.
+    name: coverage (${{ matrix.shard }})
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    strategy:
+      # Mandatory. With fail-fast a single failing shard cancels the others, and a
+      # cancelled job is indistinguishable from one killed by its cap.
+      fail-fast: false
+      matrix:
+        include:
+          - shard: integration
+            select: --packages-select ros2_medkit_integration_tests
+          - shard: graph-watchdog
+            select: --packages-select ros2_medkit_graph_watchdog
+          - shard: gateway
+            select: --packages-select ros2_medkit_gateway ros2_medkit_fault_manager
+          - shard: rest
+            select: >-
+              --packages-skip ros2_medkit_opcua ros2_medkit_integration_tests
+              ros2_medkit_graph_watchdog ros2_medkit_gateway ros2_medkit_fault_manager
+    # Left at 90 deliberately. The measured worst shard should land near 45, but
+    # the first run after this change starts from a cold per-shard ccache, so the
+    # honest sequence is to keep the cap, read the margin the test step now
+    # records, and lower it once there are numbers rather than expectations.
     container:
       image: ubuntu:noble
       # A container gets 64 MB of /dev/shm by default, which is Docker's number and
@@ -460,8 +493,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /root/.cache/ccache
-          key: ccache-coverage-${{ github.sha }}
+          key: ccache-coverage-${{ matrix.shard }}-${{ github.sha }}
           restore-keys: |
+            ccache-coverage-${{ matrix.shard }}-
             ccache-coverage-
 
       - name: Install dependencies
@@ -497,7 +531,7 @@ jobs:
           # build and could not fail CI on a failure - it read as a gate
           # without being one.
           colcon test --return-code-on-test-failure \
-            --packages-skip ros2_medkit_opcua \
+            ${{ matrix.select }} \
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
@@ -538,12 +572,74 @@ jobs:
           fi
 
           lcov --list coverage.info
+
+      # No completeness gate here: a shard only ever exercises its own packages, so
+      # every shard's tracefile is legitimately partial. The gate runs on the
+      # merged report in coverage-merge below, which is the first place the
+      # question "did every package reach the report" can be asked.
+      - name: Upload this shard's tracefile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-tracefile-${{ matrix.shard }}
+          path: coverage.info
+          retention-days: 1
+
+  # The shards each measure their own packages, so no single one of them can
+  # answer "does the report still describe the whole workspace". This job is the
+  # first place that question exists, so the completeness gate, the HTML report
+  # and the Codecov upload all live here rather than being repeated four times
+  # against four partial answers.
+  coverage-merge:
+    name: coverage (merge)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: coverage
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          # gpg is required by the codecov action's dependency check.
+          apt-get install -y git lcov gpg
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download every shard's tracefile
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-tracefile-*
+          path: tracefiles
+
+      - name: Merge the tracefiles
+        run: |
+          # lcov -a sums execution counts for matching file and test names, which
+          # is exactly right here: the shards measure disjoint packages, and any
+          # file two of them both touched should carry the sum of both.
+          mapfile -t files < <(find tracefiles -name coverage.info | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no shard tracefiles were downloaded - the shards produced nothing to merge"
+            exit 1
+          fi
+          echo "merging ${#files[@]} tracefiles"
+          args=()
+          for f in "${files[@]}"; do args+=(-a "$f"); done
+          lcov "${args[@]}" --output-file coverage.info --ignore-errors empty,corrupt
+          lcov --list coverage.info
           genhtml coverage.info --output-directory coverage_html --ignore-errors source
 
       # A package that never gets --coverage emits no .gcda and drops out of the
       # report entirely - out of the numerator and the denominator both, so the
-      # percentage silently stops describing the workspace. Assert the report
-      # still covers every package the source tree says holds production C++.
+      # percentage silently stops describing the workspace. Assert the merged
+      # report still covers every package the source tree says holds production
+      # C++. Sharding makes this stricter, not weaker: a shard that silently
+      # tested nothing now shows up as a package missing from the merge.
       - name: Verify every C++ package reached the coverage report
         run: |
           ./scripts/check_coverage_packages.sh coverage.info \
@@ -556,7 +652,6 @@ jobs:
           path: coverage_html/
 
       - name: Upload coverage to Codecov
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
