@@ -57,6 +57,12 @@ COMMON_ARGS=(--event-handlers console_direct+ --parallel-workers "$(nproc)" --re
 # being able to ask for on its own. The reasoning lives there.
 "$HERE/drop_stale_results.sh" build
 
+# Reclaim shared memory stranded by participants that were killed rather than shut
+# down - the aggregation suites kill peers on purpose, and nothing gives those
+# segments back. Tolerated when it declines: it refuses to sweep while ROS
+# processes are alive, and that refusal must not stop a test run.
+"$HERE/sweep_shm.sh" || true
+
 # Run tests, capture exit code so we always show results even on failure.
 set +e
 case "$PRESET" in

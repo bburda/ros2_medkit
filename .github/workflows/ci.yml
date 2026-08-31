@@ -19,6 +19,13 @@ jobs:
             os_image: ubuntu:resolute
     container:
       image: ${{ matrix.os_image }}
+      # A container gets 64 MB of /dev/shm by default, which is Docker's number and
+      # not a considered one. Fast DDS puts a 512 KB segment plus port files there
+      # per participant - measured at ~0.65 MB - and a participant killed rather
+      # than shut down never gets its segments back. Measured: 15 live
+      # participants take 9.6 MB, and 125 killed ones fill 63 MB. 1g is tmpfs, so
+      # it costs only what is used, against 16 GB of runner memory.
+      options: --shm-size=1g
     # Must stay above the build plus the test step's own budget below, or the job cap kills the
     # run before that step's cap can - which loses the "which step ran long" answer. The build
     # side of this job is around 18 minutes.
@@ -88,6 +95,9 @@ jobs:
           ccache -s
           ./scripts/ccache_report.sh "${{ matrix.ros_distro }}"
 
+      - name: Record the test step start
+        run: echo "TEST_STEP_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Run unit and integration tests
         # The suite keeps outgrowing this budget as packages land, and every overrun so far has
         # been real work finishing rather than a hang: 15 minutes was raised to 25 when lyrical
@@ -115,6 +125,17 @@ jobs:
             --packages-skip ros2_medkit_opcua ros2_medkit_graph_watchdog \
             --ctest-args -LE linter \
             --event-handlers console_direct+
+
+      - name: Check the run completed, and record the margin
+        if: always()
+        run: |
+          # A step killed by its cap is reported as a failure, not a cancellation,
+          # and colcon then names whichever test was in flight. Without this, the
+          # overrun reads as one flaky test out of thousands, and the packages
+          # queued behind it leave no trace at all.
+          ./scripts/ci_test_completeness.sh "${TEST_STEP_START}" 45
+          df -h /dev/shm
+          echo "shm segments: $(ls /dev/shm | wc -l)"
 
       - name: Show test results
         if: always()
@@ -159,6 +180,13 @@ jobs:
             ccache_prefix: ccache-jazzy-test-
     container:
       image: ${{ matrix.os_image }}
+      # A container gets 64 MB of /dev/shm by default, which is Docker's number and
+      # not a considered one. Fast DDS puts a 512 KB segment plus port files there
+      # per participant - measured at ~0.65 MB - and a participant killed rather
+      # than shut down never gets its segments back. Measured: 15 live
+      # participants take 9.6 MB, and 125 killed ones fill 63 MB. 1g is tmpfs, so
+      # it costs only what is used, against 16 GB of runner memory.
+      options: --shm-size=1g
     timeout-minutes: 90
     defaults:
       run:
@@ -270,6 +298,13 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
+      # A container gets 64 MB of /dev/shm by default, which is Docker's number and
+      # not a considered one. Fast DDS puts a 512 KB segment plus port files there
+      # per participant - measured at ~0.65 MB - and a participant killed rather
+      # than shut down never gets its segments back. Measured: 15 live
+      # participants take 9.6 MB, and 125 killed ones fill 63 MB. 1g is tmpfs, so
+      # it costs only what is used, against 16 GB of runner memory.
+      options: --shm-size=1g
     # 90, like build-and-test and graph-watchdog. This job covers both the build
     # and the test phase, a cold ccache makes the build phase the variable one,
     # and at 60 it had been finishing in 54 to 56 minutes on main - close enough
@@ -389,6 +424,13 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
+      # A container gets 64 MB of /dev/shm by default, which is Docker's number and
+      # not a considered one. Fast DDS puts a 512 KB segment plus port files there
+      # per participant - measured at ~0.65 MB - and a participant killed rather
+      # than shut down never gets its segments back. Measured: 15 live
+      # participants take 9.6 MB, and 125 killed ones fill 63 MB. 1g is tmpfs, so
+      # it costs only what is used, against 16 GB of runner memory.
+      options: --shm-size=1g
     timeout-minutes: 90
     defaults:
       run:
