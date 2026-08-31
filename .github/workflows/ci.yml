@@ -605,8 +605,9 @@ jobs:
       - name: Install tools
         run: |
           apt-get update
-          # gpg is required by the codecov action's dependency check.
-          apt-get install -y git lcov gpg
+          # gpg and curl are both required by the codecov action's dependency
+          # check, which fails the step rather than skipping the upload.
+          apt-get install -y git lcov gpg curl
 
       - name: Checkout repository
         uses: actions/checkout@v4
