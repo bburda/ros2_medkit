@@ -116,6 +116,18 @@ jobs:
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
+      - name: Record the DDS environment
+        if: always()
+        run: |
+          # A container gets 64 MB of /dev/shm by default, and a DDS participant
+          # that is killed rather than shut down leaves its segments behind for
+          # the rest of the job. Both numbers are invisible after the fact, so
+          # they are recorded rather than assumed.
+          df -h /dev/shm
+          echo "segments: $(ls /dev/shm | wc -l)"
+          ls -la /dev/shm | head -20
+          dpkg -l | grep -E 'rmw-fastrtps|fastdds|cyclonedds' || true
+
       - name: Show test results
         if: always()
         run: colcon test-result --verbose

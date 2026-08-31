@@ -21,6 +21,8 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include "ros2_medkit_integration_tests/crash_backtrace.hpp"
+
 namespace ros2_medkit_integration_tests {
 
 /**
@@ -67,6 +69,11 @@ namespace ros2_medkit_integration_tests {
  * freely.
  */
 inline int run_demo_node(int argc, char ** argv, const std::function<std::shared_ptr<rclcpp::Node>()> & node_factory) {
+  // Installed first: a fatal signal anywhere below, including inside the DDS
+  // stack while the participant is being created, then names its frames instead
+  // of leaving an exit status and no output.
+  install_crash_backtrace();
+
   sigset_t mask;
   sigset_t old;
   sigemptyset(&mask);

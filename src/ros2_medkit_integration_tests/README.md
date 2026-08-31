@@ -78,6 +78,30 @@ ros2 launch ros2_medkit_integration_tests demo_nodes.launch.py
 | `long_calibration` | `/powertrain/engine` | Action | Fibonacci-based long-running action |
 | `dual_calibration` | `/testrig/dual` | Services + Actions | `left/calibrate` and `right/calibrate`, `left/sweep` and `right/sweep` - one provider carrying each operation short name twice, so the ROS path is the only id that separates the copies |
 
+### Crash reports
+
+Every demo binary goes through `run_demo_node()` in
+`include/ros2_medkit_integration_tests/demo_node_main.hpp`, which installs a
+fatal-signal handler before anything else runs. A node killed by `SIGSEGV`,
+`SIGBUS` or `SIGABRT` writes its stack to stderr, so launch_testing captures it
+with the rest of the process output:
+
+```
+MEDKIT-CRASH signal=SIGSEGV
+/path/to/demo_brake_pressure_sensor(+0x129cb) [0x5603199349cb]
+/opt/ros/<distro>/lib/libfastdds.so.3(...) [0x...]
+MEDKIT-CRASH end
+```
+
+Grep a CI log for `MEDKIT-CRASH` to find one. Frames from our own binaries come
+back as `binary(+0xOFFSET)` because the release build has no exported symbols;
+resolve them with `addr2line -e <binary> <offset>`. The process still dies from
+the original signal, so the exit status a test asserts on is unchanged.
+
+This exists because a node that dies during startup otherwise leaves nothing at
+all: no output, and no core file, since a container cannot set the host's
+`core_pattern`.
+
 ## Writing New Tests
 
 ### Feature Test Template
