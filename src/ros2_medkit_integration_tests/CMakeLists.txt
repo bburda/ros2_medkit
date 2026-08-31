@@ -206,6 +206,15 @@ if(BUILD_TESTING)
   set_tests_properties(test_test_utils_constants PROPERTIES LABELS "unit")
   medkit_test_needs_no_domain(test_test_utils_constants)
 
+  # The crash reporter every demo binary installs. Death tests, because the
+  # behaviour under test only exists in a process that is being killed - a
+  # handler that is merely installed proves nothing about what a crash leaves
+  # behind. ROS-free: it creates no node, only signals.
+  find_package(ament_cmake_gmock REQUIRED)
+  medkit_add_gmock(test_crash_backtrace test/test_crash_backtrace.cpp)
+  target_include_directories(test_crash_backtrace PRIVATE ${_demo_include_dir})
+  medkit_test_needs_no_domain(test_crash_backtrace)
+
   # Configures every launch-test-registering package this file can reach for
   # real, twice each (ordinary workspace conditions and system-package
   # conditions), and compares what each run actually registered. Lives here
@@ -439,6 +448,10 @@ if(BUILD_TESTING)
       endif()
     endforeach()
   endif()
+
+  # gtest/gmock vendor sources are built as subdirectory targets and inherit
+  # this package's promoted warnings, which they do not compile clean under.
+  ros2_medkit_relax_vendor_warnings()
 endif()
 
 ament_package()
