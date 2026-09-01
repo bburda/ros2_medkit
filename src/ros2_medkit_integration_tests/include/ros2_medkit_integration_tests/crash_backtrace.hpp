@@ -15,7 +15,7 @@
 #pragma once
 
 #include <csignal>
-#include <cstring>
+#include <cstddef>
 
 #include <execinfo.h>
 #include <unistd.h>
@@ -49,8 +49,11 @@ inline void ** crash_frame_buffer() {
   return frames;
 }
 
-inline void write_literal(const char * text) {
-  const ssize_t written = ::write(STDERR_FILENO, text, ::strlen(text));
+/// Writes a string literal. The length comes from the type, so nothing in the
+/// handler calls strlen - which POSIX does not list as async-signal-safe.
+template <std::size_t N>
+inline void write_literal(const char (&text)[N]) {
+  const ssize_t written = ::write(STDERR_FILENO, text, N - 1);
   static_cast<void>(written);
 }
 
@@ -59,6 +62,16 @@ inline void write_literal(const char * text) {
 /// the original signal. That keeps the exit status the test harness sees
 /// unchanged: a segfault still reports as -11, now with frames attached.
 inline void crash_handler(int signum) {
+  // Unwinding from a signal handler is not async-signal-safe: backtrace() can
+  // need the loader or an allocator lock, and if the faulting thread already
+  // held one it deadlocks here - in exactly the startup paths this exists to
+  // diagnose. alarm() is async-signal-safe and SIGALRM's disposition is the
+  // default, so a wedged unwinder becomes a dead process after five seconds
+  // instead of a test that hangs to its timeout with nothing to read. The exit
+  // status is then SIGALRM rather than the original signal, which is the
+  // trade: a wrong status beats no output and no status at all.
+  ::alarm(5);
+
   write_literal(kCrashMarker);
   switch (signum) {
     case SIGSEGV:
@@ -106,7 +119,14 @@ inline void install_crash_backtrace() {
 
   struct sigaction action {};
   action.sa_handler = &detail::crash_handler;
+  // The handler writes into one static frame buffer, and SA_RESETHAND only
+  // resets the signal that fired. Without this, a second thread taking a
+  // DIFFERENT fatal signal would re-enter concurrently and interleave the two
+  // reports.
   ::sigemptyset(&action.sa_mask);
+  ::sigaddset(&action.sa_mask, SIGSEGV);
+  ::sigaddset(&action.sa_mask, SIGBUS);
+  ::sigaddset(&action.sa_mask, SIGABRT);
   // SA_RESETHAND restores the default disposition before the handler runs, so
   // returning from it re-raises the signal and the process dies the way it
   // would have without us.

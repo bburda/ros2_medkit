@@ -30,6 +30,10 @@ jobs:
     # run before that step's cap can - which loses the "which step ran long" answer. The build
     # side of this job is around 18 minutes.
     timeout-minutes: 90
+    env:
+      # One source for the test step's cap. The step's timeout-minutes and the
+      # guard that reports the margin both read this.
+      TEST_STEP_CAP_MINUTES: 45
     defaults:
       run:
         shell: bash
@@ -105,7 +109,9 @@ jobs:
         # arrived (lyrical 22m50s before them, jazzy 28m15s after). The jazzy job below caps the
         # whole job instead of this step, so only these two distros can be killed mid-package -
         # which reads as a test failure and hides every test the kill cut off.
-        timeout-minutes: 45
+        # The cap lives in the job's env, referenced here and by the guard below,
+        # so raising one raises the other and they cannot drift apart.
+        timeout-minutes: ${{ env.TEST_STEP_CAP_MINUTES }}
         env:
           # FastRTPS 2.6 on Humble has a known use-after-free in the
           # discovery-teardown path (EDP::unpairWriterProxy) that segfaults
@@ -133,7 +139,14 @@ jobs:
           # and colcon then names whichever test was in flight. Without this, the
           # overrun reads as one flaky test out of thousands, and the packages
           # queued behind it leave no trace at all.
-          ./scripts/ci_test_completeness.sh "${TEST_STEP_START}" 45
+          # The start is missing only when an earlier step failed before it ran.
+          # Say so and carry on to the census, rather than dying on a usage error
+          # and taking the environment evidence down with it.
+          if [ -n "${TEST_STEP_START:-}" ]; then
+            ./scripts/ci_test_completeness.sh "${TEST_STEP_START}" "${TEST_STEP_CAP_MINUTES}" || guard_rc=$?
+          else
+            echo "::notice::no test step start was recorded - the run failed before the tests"
+          fi
           # A DDS participant killed rather than shut down leaves its segments
           # behind for the rest of the job, and the installed middleware decides
           # which transport those segments belong to. Neither is recoverable from
@@ -142,6 +155,7 @@ jobs:
           echo "shm segments: $(ls /dev/shm | wc -l)"
           ls -la /dev/shm | head -20
           dpkg -l | grep -E 'rmw-fastrtps|fastdds|cyclonedds' || true
+          exit "${guard_rc:-0}"
 
       - name: Show test results
         if: always()
@@ -499,9 +513,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /root/.cache/ccache
-          key: ccache-coverage-${{ matrix.shard }}-${{ github.sha }}
+          # One entry for the whole matrix, not one per shard: every shard builds
+          # the same workspace with the same flags, so per-shard entries would
+          # quadruple this cache against a 10 GB repository limit and evict the
+          # very entries that keep the builds warm. Concurrent shards racing to
+          # save the same key is benign - the first wins, the rest log it.
+          key: ccache-coverage-${{ github.sha }}
           restore-keys: |
-            ccache-coverage-${{ matrix.shard }}-
             ccache-coverage-
 
       - name: Install dependencies
@@ -597,7 +615,11 @@ jobs:
   # against four partial answers.
   coverage-merge:
     name: coverage (merge)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # always(), so a failed shard does not take the merged report, the
+    # completeness gate and the Codecov upload down with it. Losing the
+    # diagnostic exactly when a shard broke is the wrong way round; the job
+    # reports what it merged and then fails on the shard's behalf.
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: coverage
     runs-on: ubuntu-latest
     container:
@@ -623,6 +645,9 @@ jobs:
         with:
           pattern: coverage-tracefile-*
           path: tracefiles
+          # A shard that failed uploaded nothing; merge what exists rather than
+          # failing here, so the report still describes the shards that ran.
+          merge-multiple: false
 
       - name: Merge the tracefiles
         run: |
@@ -658,7 +683,17 @@ jobs:
           name: coverage-report
           path: coverage_html/
 
+      # Last, so everything above is recorded first. The merged report is still
+      # worth having when a shard broke - it just does not describe the whole
+      # workspace, and saying so is this job's business.
+      - name: Fail if any shard did not succeed
+        if: needs.coverage.result != 'success'
+        run: |
+          echo "::error::a coverage shard did not succeed (matrix result: ${{ needs.coverage.result }}). The merged report above covers only the shards that finished, so its percentage is a floor, not the workspace figure."
+          exit 1
+
       - name: Upload coverage to Codecov
+        if: needs.coverage.result == 'success'
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

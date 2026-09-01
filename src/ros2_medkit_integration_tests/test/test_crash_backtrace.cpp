@@ -68,10 +68,12 @@ TEST(CrashBacktrace, SegvReportsResolvableFrames) {
     // offsets for this binary's own frames, and the frames worth reading here
     // belong to libraries below us anyway.
     //
-    // glibc's spacing between the offset and the address differs by release
-    // (resolute writes ") [0x", noble writes ")[0x"), so the separator is
-    // matched loosely rather than pinning one distribution's formatting.
-    ASSERT_DEATH(crash_by_null_write(), R"(\(\+0x[0-9a-f]+\) ?\[0x[0-9a-f]+\])");
+    // Two things are matched loosely on purpose. glibc's spacing between the
+    // offset and the address differs by release (resolute writes ") [0x",
+    // noble writes ")[0x"), and a frame carries a symbol name before the "+"
+    // whenever the binary exports its symbols - a link flag away, and not what
+    // this test is about.
+    ASSERT_DEATH(crash_by_null_write(), R"(\([^)]*\+0x[0-9a-fA-F]+\) ?\[0x[0-9a-fA-F]+\])");
   } else {
     EXPECT_FALSE(crash_backtrace_is_active()) << "a sanitizer build must not install the handler";
     ASSERT_DEATH(crash_by_null_write(), ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH")));
@@ -108,12 +110,19 @@ TEST(CrashBacktrace, ProcessStillDiesFromTheOriginalSignal) {
   }
 }
 
+// The crash helper installs the handler itself, so a test that merely calls
+// install twice beforehand proves nothing - the third install inside the child
+// would carry it. The double install has to happen INSIDE the dying process.
 TEST(CrashBacktrace, InstallingTwiceIsHarmless) {
-  install_crash_backtrace();
-  install_crash_backtrace();
+  const auto crash_after_installing_twice = [] {
+    install_crash_backtrace();
+    install_crash_backtrace();
+    volatile int * volatile target = nullptr;
+    *target = 1;
+  };
   if constexpr (kHandlerActive) {
-    ASSERT_DEATH(crash_by_null_write(), "MEDKIT-CRASH signal=SIGSEGV");
+    EXPECT_EXIT(crash_after_installing_twice(), ::testing::KilledBySignal(SIGSEGV), "MEDKIT-CRASH end");
   } else {
-    ASSERT_DEATH(crash_by_null_write(), ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH")));
+    ASSERT_DEATH(crash_after_installing_twice(), ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH")));
   }
 }
