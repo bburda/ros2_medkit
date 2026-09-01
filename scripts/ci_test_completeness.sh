@@ -63,7 +63,11 @@ while IFS= read -r xml; do
   fi
 done < <(find build -path '*/test_results/*' -name '*.xml' 2>/dev/null)
 
-missing=$(find build -path '*/test_results/*' -name '*.missing_result' 2>/dev/null | wc -l)
+# `missing_result` is not a filename. ament writes it as the name attribute of a
+# <testcase> INSIDE the ordinary xunit file, before running the command, so the
+# file exists and is not empty. Measured: across five build trees, zero files are
+# named that, while one tree carried two genuine missing results in its XML.
+missing=$(grep -l 'missing_result' -r build --include='*.xml' 2>/dev/null | wc -l)
 
 printf 'test step: %ds elapsed of a %ds cap (%d%%); results: %d written, %d empty, %d missing_result\n' \
   "${elapsed}" "${cap_seconds}" "$(( elapsed * 100 / cap_seconds ))" "${found}" "${empty}" "${missing}"

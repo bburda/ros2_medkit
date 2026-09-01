@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <climits>
 #include <csignal>
 #include <cstdlib>
+#include <string>
+
+#include <unistd.h>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -27,14 +31,53 @@ namespace {
 
 constexpr bool kHandlerActive = crash_backtrace_is_active();
 
-void crash_by_null_write() {
+// Recursion the optimiser cannot flatten into a loop. Measured across -O0 to
+// -O3: without the escaping address GCC turns this into a loop at -O2 and the
+// process spins forever instead of overflowing, which made an earlier version of
+// the test below hang rather than fail.
+volatile char * stack_probe_sink = nullptr;
+
+__attribute__((noinline)) int recurse_until_the_stack_runs_out(int x) {
+  volatile char pad[4096];
+  pad[0] = static_cast<char>(x);
+  stack_probe_sink = pad;
+  // The barrier is what makes this recurse rather than loop. `noinline` and an
+  // escaping address are not enough inside a translation unit where the
+  // function has internal linkage: measured, GCC still turned it into a loop at
+  // -O2 and the process spun instead of overflowing.
+  asm volatile("" : : "r"(pad) : "memory");
+  return recurse_until_the_stack_runs_out(x + pad[0]) + 1;
+}
+
+/// Faults on an unmapped address that is NOT null.
+///
+/// Null would be simpler, and was what this did first, but UBSan diagnoses a
+/// store through a null pointer before the store happens - so under the ASan job,
+/// which builds `asan,ubsan`, no signal was ever raised and four of the cases
+/// below passed their "no marker" assertion because nothing crashed rather than
+/// because the handler stood down. A non-null unmapped address gives UBSan
+/// nothing to object to and still segfaults.
+///
+/// Both volatile qualifiers are load-bearing and were picked by measuring: a
+/// store through a plain `T * volatile` is deleted at -O2 as an erroneous path
+/// and the process then does not crash at all.
+/// A regex matching a backtrace frame that belongs to this test binary.
+///
+/// The object and offset pair is what addr2line turns back into a location, and
+/// glibc's spacing between the offset and the address differs by release
+/// (resolute writes ") [0x", noble writes ")[0x"), so the separator is loose. A
+/// frame carries a symbol name before the "+" whenever the binary exports its
+/// symbols, which CMake does by default, so that half is loose too.
+std::string own_binary_frame_pattern() {
+  char exe[PATH_MAX] = {};
+  const ssize_t len = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  const std::string self = len > 0 ? std::string(exe, static_cast<std::size_t>(len)) : std::string();
+  return self + R"(\([^)]*\+0x[0-9a-fA-F]+\) ?\[0x[0-9a-fA-F]+\])";
+}
+
+void crash_by_unmapped_write() {
   install_crash_backtrace();
-  // Both qualifiers are load-bearing and were picked by measuring, not by
-  // reasoning: a store through a plain `int * volatile` is deleted at -O2 as an
-  // erroneous path and the process then does not crash at all. Marking the
-  // pointee volatile makes the store itself one the compiler must emit, and
-  // marking the pointer volatile stops it being folded to a known constant.
-  volatile int * volatile target = nullptr;
+  volatile int * volatile target = reinterpret_cast<volatile int *>(0x1000);
   *target = 1;
 }
 
@@ -53,9 +96,10 @@ void crash_by_null_write() {
 // and a test that went quiet under sanitizers would be blind to exactly that.
 TEST(CrashBacktrace, SegvIsReported) {
   if constexpr (kHandlerActive) {
-    ASSERT_DEATH(crash_by_null_write(), "MEDKIT-CRASH signal=SIGSEGV");
+    ASSERT_DEATH(crash_by_unmapped_write(), "MEDKIT-CRASH signal=SIGSEGV");
   } else {
-    ASSERT_DEATH(crash_by_null_write(), ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH")));
+    ASSERT_DEATH(crash_by_unmapped_write(), ::testing::AllOf(::testing::HasSubstr("Sanitizer"),
+                                                             ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH"))));
   }
 }
 
@@ -73,10 +117,32 @@ TEST(CrashBacktrace, SegvReportsResolvableFrames) {
     // noble writes ")[0x"), and a frame carries a symbol name before the "+"
     // whenever the binary exports its symbols - a link flag away, and not what
     // this test is about.
-    ASSERT_DEATH(crash_by_null_write(), R"(\([^)]*\+0x[0-9a-fA-F]+\) ?\[0x[0-9a-fA-F]+\])");
+    // Anchored on THIS binary's own path, read at runtime rather than written
+    // down: a bare offset pattern is satisfied by any frame, and libc's frames
+    // alone would pass it while saying nothing about whether our own frames came
+    // back resolvable. The path is not a name pin - it is whatever the test was
+    // built as.
+    ASSERT_DEATH(crash_by_unmapped_write(), own_binary_frame_pattern());
   } else {
-    EXPECT_FALSE(crash_backtrace_is_active()) << "a sanitizer build must not install the handler";
-    ASSERT_DEATH(crash_by_null_write(), ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH")));
+    ASSERT_DEATH(crash_by_unmapped_write(), ::testing::AllOf(::testing::HasSubstr("Sanitizer"),
+                                                             ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH"))));
+  }
+}
+
+// A stack overflow is the commonest silent SIGSEGV, and it is the one a handler
+// on the ordinary stack cannot report - it needs stack to run and there is none.
+// This case shipped broken until it was measured: the null dereference above
+// produced 452 bytes, and an overflow produced zero.
+TEST(CrashBacktrace, SegvOnAnOverflowedStackIsStillReported) {
+  const auto overflow_the_stack = [] {
+    install_crash_backtrace();
+    static_cast<void>(recurse_until_the_stack_runs_out(1));
+  };
+  if constexpr (kHandlerActive) {
+    ASSERT_DEATH(overflow_the_stack(), "MEDKIT-CRASH signal=SIGSEGV");
+  } else {
+    ASSERT_DEATH(overflow_the_stack(), ::testing::AllOf(::testing::HasSubstr("Sanitizer"),
+                                                        ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH"))));
   }
 }
 
@@ -89,6 +155,9 @@ TEST(CrashBacktrace, AbortIsReportedToo) {
         },
         "MEDKIT-CRASH signal=SIGABRT");
   } else {
+    // Only the absence of our marker here, unlike the SEGV cases: a sanitizer
+    // does not take SIGABRT by default (ASan's handle_abort is off), so there is
+    // no sanitizer report to require - and none for us to have clobbered.
     ASSERT_DEATH(
         {
           install_crash_backtrace();
@@ -102,11 +171,11 @@ TEST(CrashBacktrace, AbortIsReportedToo) {
 // swallowed the signal would turn a crash into a clean exit and hide it.
 TEST(CrashBacktrace, ProcessStillDiesFromTheOriginalSignal) {
   if constexpr (kHandlerActive) {
-    EXPECT_EXIT(crash_by_null_write(), ::testing::KilledBySignal(SIGSEGV), "MEDKIT-CRASH end");
+    EXPECT_EXIT(crash_by_unmapped_write(), ::testing::KilledBySignal(SIGSEGV), "MEDKIT-CRASH end");
   } else {
     // A sanitizer reports first and then exits on its own terms, so the death
     // itself is what stays assertable here.
-    EXPECT_DEATH(crash_by_null_write(), ".*");
+    EXPECT_DEATH(crash_by_unmapped_write(), ".*");
   }
 }
 
@@ -123,6 +192,8 @@ TEST(CrashBacktrace, InstallingTwiceIsHarmless) {
   if constexpr (kHandlerActive) {
     EXPECT_EXIT(crash_after_installing_twice(), ::testing::KilledBySignal(SIGSEGV), "MEDKIT-CRASH end");
   } else {
-    ASSERT_DEATH(crash_after_installing_twice(), ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH")));
+    ASSERT_DEATH(
+        crash_after_installing_twice(),
+        ::testing::AllOf(::testing::HasSubstr("Sanitizer"), ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH"))));
   }
 }

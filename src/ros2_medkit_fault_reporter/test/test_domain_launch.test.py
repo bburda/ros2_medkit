@@ -43,11 +43,15 @@ from std_msgs.msg import String
 
 TOPIC = '/medkit_launch_domain_probe'
 
-# Spinning under a bare `rclpy.spin` lets CPython re-raise SIGINT and die from
-# the signal, which skips the participant's destructor. A DDS participant that
-# is never destroyed leaves its shared-memory segments behind, and a CI
-# container gets 64 MB of /dev/shm for the whole job, so the child shuts itself
-# down instead.
+# The child answers the shutdown signal instead of dying from it, so its exit
+# status is a fact the test can pin rather than a range to tolerate.
+#
+# What this does NOT buy, despite the obvious guess: it strands no shared memory
+# either way. Measured on jazzy, /dev/shm bytes before and after - a bare
+# `rclpy.spin` killed by SIGINT returns to baseline exactly, because CPython
+# finalises the interpreter before re-raising, and the participant is destroyed
+# on the way out. Only SIGKILL strands segments (+0.65 MB, measured), and no
+# handler in this child can affect that.
 CHILD = (
     'import os, signal, sys, rclpy;'
     'from rclpy.node import Node;'
@@ -127,10 +131,9 @@ class TestLaunchTestDomain(unittest.TestCase):
 class TestChildShutdown(unittest.TestCase):
 
     def test_the_child_was_stopped(self, proc_info, child):
-        # Zero, not merely "not a crash": the child handles the shutdown signal
-        # and destroys its participant. Dying from the signal instead would
-        # strand this participant's shared-memory segments for the rest of the
-        # job, which is what this assertion exists to catch.
+        # Zero, not merely "not a crash". A fixture that dies from its shutdown
+        # signal reports the same status whether it shut down or was cut off
+        # mid-flight, so the old range accepted both. Zero distinguishes them.
         self.assertEqual(
             proc_info[child].returncode,
             0,
