@@ -67,7 +67,11 @@ done < <(find build -path '*/test_results/*' -name '*.xml' 2>/dev/null)
 # <testcase> INSIDE the ordinary xunit file, before running the command, so the
 # file exists and is not empty. Measured: across five build trees, zero files are
 # named that, while one tree carried two genuine missing results in its XML.
-missing=$(grep -l 'missing_result' -r build --include='*.xml' 2>/dev/null | wc -l)
+# `|| true` inside the braces, not after the pipe: grep exits 1 when it matches
+# nothing, which is the healthy case, and under `set -e` with `pipefail` that
+# killed this script before it printed anything at all - so a clean run reported
+# nothing and failed the step.
+missing=$( { grep -l 'missing_result' -r build --include='*.xml' 2>/dev/null || true; } | wc -l)
 
 printf 'test step: %ds elapsed of a %ds cap (%d%%); results: %d written, %d empty, %d missing_result\n' \
   "${elapsed}" "${cap_seconds}" "$(( elapsed * 100 / cap_seconds ))" "${found}" "${empty}" "${missing}"
