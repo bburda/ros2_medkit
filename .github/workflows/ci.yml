@@ -111,7 +111,10 @@ jobs:
         # which reads as a test failure and hides every test the kill cut off.
         # The cap lives in the job's env, referenced here and by the guard below,
         # so raising one raises the other and they cannot drift apart.
-        timeout-minutes: ${{ env.TEST_STEP_CAP_MINUTES }}
+        # fromJSON, because an expression yields a string and this key demands a
+        # number: `${{ env.X }}` alone fails the workflow with "Unexpected value
+        # '45'" before any step runs.
+        timeout-minutes: ${{ fromJSON(env.TEST_STEP_CAP_MINUTES) }}
         env:
           # FastRTPS 2.6 on Humble has a known use-after-free in the
           # discovery-teardown path (EDP::unpairWriterProxy) that segfaults
