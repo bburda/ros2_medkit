@@ -35,13 +35,24 @@ case "${1:-}" in
 esac
 
 shm_bytes() {
-  du -sb /dev/shm 2>/dev/null | cut -f1 || echo 0
+  # One value or nothing. An earlier form piped du into cut with `|| echo 0`,
+  # which under pipefail could emit cut's partial output AND the fallback, so the
+  # arithmetic below got a two-line operand and died with a bad math expression.
+  local out
+  if ! out=$(du -sb /dev/shm 2>/dev/null); then
+    echo unknown
+    return
+  fi
+  printf '%s' "${out}" | head -n 1 | cut -f1
 }
 
 if [[ "${FORCE}" -eq 0 ]]; then
   # Match on the command line rather than the process name: colcon runs as
   # python3, and a pattern that also matches this script would match itself.
-  if pgrep -f '[g]ateway_node|[f]ault_manager_node|[c]test' >/dev/null 2>&1; then
+  # demo_ covers the launch fixtures the documented demo workflow starts, which
+  # the earlier pattern missed entirely - a developer running only demo nodes got
+  # a sweep in the middle of live work.
+  if pgrep -f '[g]ateway_node|[f]ault_manager_node|[d]emo_|[c]test|[l]aunch_test|[c]olcon test' >/dev/null 2>&1; then
     echo "sweep_shm: ROS processes are running - refusing to sweep (use --force if you mean it)" >&2
     exit 1
   fi
@@ -57,6 +68,10 @@ else
 fi
 
 after="$(shm_bytes)"
-reclaimed=$((before - after))
 
-printf 'sweep_shm: /dev/shm %s -> %s bytes (reclaimed %s)\n' "${before}" "${after}" "${reclaimed}"
+if [[ "${before}" == unknown || "${after}" == unknown ]]; then
+  echo "sweep_shm: cleaned, but /dev/shm could not be measured (du declined)" >&2
+  exit 0
+fi
+
+printf 'sweep_shm: /dev/shm %s -> %s bytes (reclaimed %s)\n' "${before}" "${after}" "$((before - after))"

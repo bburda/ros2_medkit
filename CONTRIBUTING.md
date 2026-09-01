@@ -89,6 +89,14 @@ is the tally of the run you just started and not of everything tested since the 
 rather than matching a name. Run it on its own with `./scripts/drop_stale_results.sh` if you
 invoke `colcon test` directly.
 
+Every run also reclaims shared memory left behind by DDS participants that were killed
+rather than shut down. The aggregation suites kill peers on purpose, and nothing gives
+those segments back: about 0.65 MB each, and a container's `/dev/shm` is 64 MB by default,
+so they accumulate across runs until something unrelated fails for lack of space. The
+reclaiming is `fastdds shm clean`, the vendor's own tool, which removes a segment only when
+no process holds its lock. Run it on its own with `./scripts/sweep_shm.sh`; it refuses
+while ROS processes are alive, and `--force` overrides that.
+
 #### Pre-commit and Pre-push Hooks
 
 ```bash
@@ -173,6 +181,11 @@ genhtml coverage.info --output-directory coverage_html --ignore-errors source
 
 ./scripts/check_coverage_packages.sh coverage.info --skip ros2_medkit_opcua
 ```
+
+In CI this gate runs in the `coverage (merge)` job rather than alongside the tests: the
+coverage run is sharded by package, so each shard's tracefile is legitimately partial and
+the merged report is the first place the question "did every package reach the report"
+can be asked.
 
 Open `coverage_html/index.html` in your browser.
 

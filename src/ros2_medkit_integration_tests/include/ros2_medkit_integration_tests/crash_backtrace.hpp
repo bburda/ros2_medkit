@@ -49,6 +49,23 @@ inline void ** crash_frame_buffer() {
   return frames;
 }
 
+/// A stack of its own for the handler to run on.
+///
+/// The commonest silent SIGSEGV is a stack overflow, and that is exactly the one
+/// a handler on the ordinary stack cannot report: it needs stack to run, there is
+/// none, so it faults again and - the disposition already reset - the process
+/// dies having written nothing. Measured before this existed: a null dereference
+/// produced 452 bytes and two markers, a stack overflow produced zero of both.
+///
+/// SIGSTKSZ is not a compile-time constant on current glibc, so the size is
+/// fixed here; 64 KB is far more than backtrace_symbols_fd needs.
+inline constexpr std::size_t kAltStackBytes = 64 * 1024;
+
+inline char * crash_alt_stack() {
+  static char storage[kAltStackBytes];
+  return storage;
+}
+
 /// Writes a string literal. The length comes from the type, so nothing in the
 /// handler calls strlen - which POSIX does not list as async-signal-safe.
 template <std::size_t N>
@@ -117,6 +134,16 @@ inline void install_crash_backtrace() {
   void ** frames = detail::crash_frame_buffer();
   static_cast<void>(::backtrace(frames, 1));
 
+  // sigaltstack is per-thread, and this runs on the thread that calls it - the
+  // main thread, where a node is constructed and where the startup crashes this
+  // exists for happen. A stack overflow on a DDS thread is still silent; that is
+  // a real limit, not an oversight.
+  stack_t alt{};
+  alt.ss_sp = detail::crash_alt_stack();
+  alt.ss_size = detail::kAltStackBytes;
+  alt.ss_flags = 0;
+  ::sigaltstack(&alt, nullptr);
+
   struct sigaction action {};
   action.sa_handler = &detail::crash_handler;
   // The handler writes into one static frame buffer, and SA_RESETHAND only
@@ -130,7 +157,9 @@ inline void install_crash_backtrace() {
   // SA_RESETHAND restores the default disposition before the handler runs, so
   // returning from it re-raises the signal and the process dies the way it
   // would have without us.
-  action.sa_flags = SA_RESETHAND;
+  // SA_ONSTACK puts the handler on the alternate stack above, which is what lets
+  // it run at all when the ordinary stack is the thing that overflowed.
+  action.sa_flags = SA_RESETHAND | SA_ONSTACK;
 
   ::sigaction(SIGSEGV, &action, nullptr);
   ::sigaction(SIGBUS, &action, nullptr);
