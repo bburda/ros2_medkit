@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ros2-medkit-docs"
-version = "0.6.0"
+version = "0.7.0"
 description = "Documentation for ROS 2 Medkit"
 authors = [{ name = "bburda", email = "bartoszburda93@gmail.com" }]
 requires-python = ">=3.12"

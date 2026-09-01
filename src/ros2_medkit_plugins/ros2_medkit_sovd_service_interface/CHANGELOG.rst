@@ -2,6 +2,13 @@
 Changelog for package ros2_medkit_sovd_service_interface
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.0 (2026-08-27)
+------------------
+* A cyclic-subscription request naming a resource path the collection cannot stream is refused instead of being accepted and never delivering
+* The sampler declaration stays inside the gateway, so the service interface no longer carries a second copy of it
+* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), and its tests take a DDS domain at run time from the shared allocator (`#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
+* Contributors: @bburda
+
 0.6.0 (2026-06-22)
 ------------------
 * ``list_entity_faults`` handles a fault ``status`` returned as an object (not just a string), supporting peer-fault aggregation across daisy-chained gateways (`#419 <https://github.com/selfpatch/ros2_medkit/pull/419>`_)

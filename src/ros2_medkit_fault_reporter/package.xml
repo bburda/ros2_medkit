@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>ros2_medkit_fault_reporter</name>
-  <version>0.6.0</version>
+  <version>0.7.0</version>
   <description>Client library for easy fault reporting with local filtering</description>
 
   <maintainer email="michal.faferek@selfpatch.ai">mfaferek93</maintainer>

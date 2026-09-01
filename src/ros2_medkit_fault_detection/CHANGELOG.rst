@@ -2,9 +2,9 @@
 Changelog for package ros2_medkit_fault_detection
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-0.6.0 (2026-06-22)
+0.7.0 (2026-08-27)
 ------------------
-* Initial release: shared, protocol-agnostic fault-detection model for medkit
+* Initial release of the package: shared, protocol-agnostic fault-detection model for medkit
   gateway plugins. A single header-only evaluator maps a raw value read from any
   source (OPC UA, S7, Modbus, ADS, ...) into the set of faults it implies, using
   one of three composable detection modes: ``ThresholdRule`` (numeric
@@ -25,4 +25,7 @@ Changelog for package ros2_medkit_fault_detection
 * Shipped as a header-only INTERFACE library (``cxx_std_17``); the ``OPC UA``
   plugin is the first consumer and migrates its threshold / status-bit / enum
   detection onto this module.
+* Global fault-code uniqueness is enforced across an OPC UA node map, so two rules cannot claim the same code and leave which one raised it undefined (`#486 <https://github.com/selfpatch/ros2_medkit/pull/486>`_)
+* A tracker holds its prior state on an undecidable read instead of clearing a standing fault, and an enum value with no mapping is labelled rather than dropped (`#486 <https://github.com/selfpatch/ros2_medkit/pull/486>`_)
+* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), and its test is registered through the shared macros and opted out of DDS domain allocation, the evaluator being pure logic with no ROS node (`#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
 * Contributors: @mfaferek93, @bburda

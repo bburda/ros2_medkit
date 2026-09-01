@@ -2,6 +2,15 @@
 Changelog for package ros2_medkit_integration_tests
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.0 (2026-08-27)
+------------------
+* Every integration launch test runs on its own DDS domain, taken when the test starts and held through an open socket for exactly as long as it runs, so a crash or a SIGKILL releases it the same way an ordinary exit does. This replaces the hand-maintained per-package domain pools, which had to stay pairwise disjoint because colcon runs one ctest per package in parallel and a CTest ``RESOURCE_LOCK`` binds only inside a single ctest run (`#551 <https://github.com/selfpatch/ros2_medkit/pull/551>`_, `#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_)
+* Feature tests are registered by glob: a file dropped into ``test/features/*.test.py`` is registered with its port and domain assigned automatically, so no explicit registration is needed and none can bypass ``GATEWAY_TEST_PORT``
+* Inline gateways and fault managers go through the shared launch helpers rather than each test hand-building its own, which also fixed the SIGKILL these tests hit under coverage instrumentation (`#554 <https://github.com/selfpatch/ros2_medkit/pull/554>`_)
+* The Python in this package is linted (`#598 <https://github.com/selfpatch/ros2_medkit/pull/598>`_), and the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_)
+* Flaky suites are fixed at their cause rather than retried: the OPC UA Alarms and Conditions test, the action-status and diagnostic-bridge fault paths, the operation-handlers fixture, ``type_info`` caching and the documentation linkcheck (`#504 <https://github.com/selfpatch/ros2_medkit/pull/504>`_, `#636 <https://github.com/selfpatch/ros2_medkit/pull/636>`_)
+* Contributors: @bburda, @mfaferek93, @YueBit
+
 0.6.0 (2026-06-22)
 ------------------
 * New suites covering the SOVD entity status endpoints (REQ_INTEROP_076), lifecycle-aware app and component status (`#455 <https://github.com/selfpatch/ros2_medkit/pull/455>`_), and fault-storm capture liveness under bounded concurrency (`#456 <https://github.com/selfpatch/ros2_medkit/pull/456>`_)

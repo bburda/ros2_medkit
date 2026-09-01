@@ -2,7 +2,7 @@
 # Used by Breathe extension to integrate with Sphinx
 
 PROJECT_NAME           = "ros2_medkit"
-PROJECT_NUMBER         = "0.6.0"
+PROJECT_NUMBER         = "0.7.0"
 PROJECT_BRIEF          = "SOVD Gateway for ROS 2"
 
 # Input settings

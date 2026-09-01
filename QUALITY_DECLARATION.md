@@ -33,7 +33,7 @@ All packages in the repository share the same version number.
 
 ### Version Stability [1.ii]
 
-The current version is **0.6.0**.
+The current version is **0.7.0**.
 The package follows semver; the pre-1.0 version reflects that the public API may still evolve
 based on early adopter feedback, not a lack of quality infrastructure.
 The 1.0.0 release is planned after the API has been validated through pilot deployments.
@@ -240,7 +240,7 @@ Security issues can be reported via GitHub Security Advisories on the
 
 | Requirement | Status | Notes |
 |---|---|---|
-| Version policy | Met | Semver, all packages at 0.6.0 |
+| Version policy | Met | Semver, all packages at 0.7.0 |
 | Stable version (>=1.0.0) | Caveat | Pre-1.0; API versioned, 1.0.0 planned post-pilot |
 | Change requests | Met | All changes via PR |
 | CI | Met | Build + test + coverage on every PR |
@@ -252,6 +252,6 @@ Security issues can be reported via GitHub Security Advisories on the
 | Platform support | Met | Ubuntu Noble / ROS 2 Jazzy + Ubuntu Jammy / ROS 2 Humble + Ubuntu Resolute / ROS 2 Lyrical |
 | Security policy | Met | REP-2006 compliant |
 
-**Caveat:** Version is 0.6.0 (pre-1.0.0, requirement 1.ii). The REST API is versioned (`/api/v1/`)
+**Caveat:** Version is 0.7.0 (pre-1.0.0, requirement 1.ii). The REST API is versioned (`/api/v1/`)
 and the package meets all other Level 3 requirements. The 1.0.0 release is planned after
 API validation through pilot deployments.
