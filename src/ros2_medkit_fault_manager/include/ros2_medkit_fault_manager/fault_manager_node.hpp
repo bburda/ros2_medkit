@@ -199,6 +199,7 @@ class FaultManagerNode : public rclcpp::Node {
 
   std::string storage_type_;
   std::string database_path_;
+  std::string database_url_;
   int32_t confirmation_threshold_{-1};
   bool healing_enabled_{false};
   int32_t healing_threshold_{3};

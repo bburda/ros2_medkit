@@ -26,6 +26,7 @@
 #include <sstream>
 
 #include "ros2_medkit_fault_manager/correlation/config_parser.hpp"
+#include "ros2_medkit_fault_manager/postgres_fault_storage.hpp"
 #include "ros2_medkit_fault_manager/sqlite_fault_storage.hpp"
 #include "ros2_medkit_fault_manager/time_utils.hpp"
 #include "ros2_medkit_msgs/msg/cluster_info.hpp"
@@ -118,6 +119,8 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   // Declare and get parameters
   storage_type_ = declare_parameter<std::string>("storage_type", "sqlite");
   database_path_ = declare_parameter<std::string>("database_path", "/var/lib/ros2_medkit/faults.db");
+  database_url_ = declare_parameter<std::string>(
+      "database_url", "postgresql://user:password@localhost:5432/ros2_medkit_faults_database");
 
   auto confirmation_threshold_param = declare_parameter<int>("confirmation_threshold", -1);
   if (confirmation_threshold_param > 0) {
@@ -519,6 +522,11 @@ std::unique_ptr<FaultStorage> FaultManagerNode::create_storage() {
     return std::make_unique<SqliteFaultStorage>(database_path_);
   }
 
+  if (storage_type_ == "postgres") {
+    RCLCPP_INFO(get_logger(), "Using PostgreSQL fault storage: %s", database_url_.c_str());
+    return std::make_unique<PgFaultStorage>(database_url_);
+  }
+
   RCLCPP_ERROR(get_logger(), "Unknown storage_type '%s', falling back to in-memory", storage_type_.c_str());
   return std::make_unique<InMemoryFaultStorage>();
 }
@@ -558,7 +566,7 @@ std::unique_ptr<FaultAuditLog> FaultManagerNode::create_audit_log() {
   }
 
   if (audit_path.empty()) {
-    if (database_path_ == ":memory:" || storage_type_ != "sqlite") {
+    if (database_path_ == ":memory:" || (storage_type_ != "sqlite" && storage_type_ != "postgres")) {
       audit_path = ":memory:";
     } else {
       std::filesystem::path base(database_path_);

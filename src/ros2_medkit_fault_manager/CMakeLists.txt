@@ -32,6 +32,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
 find_package(ros2_medkit_serialization REQUIRED)
+find_package(PostgreSQL REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(nlohmann_json REQUIRED)
 # OpenSSL EVP SHA-256 for the tamper-evident audit log hash chain
@@ -49,6 +50,7 @@ add_library(fault_manager_lib STATIC
   src/capture_thread_pool.cpp
   src/fault_manager_node.cpp
   src/fault_storage.cpp
+  src/postgres_fault_storage.cpp
   src/sqlite_fault_storage.cpp
   src/fault_audit_log.cpp
   src/snapshot_capture.cpp
@@ -76,6 +78,7 @@ medkit_target_dependencies(fault_manager_lib PUBLIC
 target_link_libraries(fault_manager_lib PUBLIC
   SQLite::SQLite3
   nlohmann_json::nlohmann_json
+  pqxx
   yaml-cpp::yaml-cpp
   OpenSSL::Crypto
 )
@@ -135,6 +138,11 @@ if(BUILD_TESTING)
   medkit_add_gtest(test_sqlite_storage test/test_sqlite_storage.cpp)
   target_link_libraries(test_sqlite_storage fault_manager_lib)
   medkit_target_dependencies(test_sqlite_storage rclcpp ros2_medkit_msgs)
+  
+  # PostgreSQL storage tests
+  medkit_add_gtest(test_postgres_storage test/test_postgres_storage.cpp)
+  target_link_libraries(test_postgres_storage fault_manager_lib)
+  medkit_target_dependencies(test_postgres_storage rclcpp ros2_medkit_msgs)
 
   # Rosbag retention parity: every assertion runs against both storage backends.
   medkit_add_gtest(test_rosbag_storage_parity test/test_rosbag_storage_parity.cpp)
