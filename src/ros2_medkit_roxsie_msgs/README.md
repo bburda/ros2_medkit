@@ -51,8 +51,9 @@ ProDiag, GRAPH, motion and security alarms, and `producer` says which one an ent
 from. A module fault or a drive alarm arrives without any extra engineering.
 
 The trade is acknowledgement. The CPU owns the acknowledged state and has no per-alarm
-acknowledge instruction, so setting it for a single alarm needs the panel or OPC UA. We
-mirror it rather than write it.
+acknowledge instruction. `Ack_Alarms` takes no alarm id, `MODE = 1` confirms every pending
+alarm at once, in batches of 100. So the bridge never calls it. Acknowledging one alarm
+needs the panel or OPC UA, and we mirror the state rather than write it.
 
 ## Messages
 
@@ -62,7 +63,7 @@ One alarm, as one entry of the list.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `alarm_id` | uint32 | Numeric alarm identifier from the PLC project |
+| `alarm_id` | uint32 | Numeric alarm identifier from the PLC project, unique within a CPU, keyed with the PLC |
 | `source` | string | Block or instance that declared the alarm |
 | `alarm_class` | string | Alarm class from the project, empty in the bit path |
 | `priority` | uint8 | 0 to 16 as the PLC knows it, higher is more important |
@@ -76,14 +77,18 @@ Two flags rather than one enum, because an alarm that is gone but unacknowledged
 state and stays in the list. Those are the same two bits the CPU alarm system tracks.
 
 Alarm text does not travel. The text belongs to the project, changes with the project, and
-is resolved on the ROS 2 side from a table that ships with the deployment.
+is resolved on the ROS 2 side from a table that ships with the deployment. That table comes
+from a TIA Openness export of the project's PLC alarm text lists, and the bridge mapping is
+generated from the same export.
 
 ### AlarmList.msg
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `stamp` | builtin_interfaces/Time | When this picture was taken |
-| `alarms` | Alarm[] | Alarms active or not yet acknowledged |
+| `catalog_version` | string | Hash of the alarm catalog the list was built from, compared by the bridge against its mapping |
+| `alarms` | Alarm[] | Alarms active or not yet acknowledged, 64 in the current generator, configurable in the next |
+| `truncated` | bool | The CPU had more pending alarms than the block holds |
 
 ### DiagnosticsStatus.msg
 

@@ -65,12 +65,30 @@ entry came from. A module fault or a drive alarm arrives without any extra engin
 which is the strongest argument for this path.
 
 The trade is acknowledgement. The CPU owns the acknowledged state and has no per-alarm
-acknowledge instruction, so setting it for a single alarm needs the panel or OPC UA. We
-mirror it rather than write it.
+acknowledge instruction. ``Ack_Alarms`` takes ``EN``, ``MODE``, ``ERROR`` and ``STATUS``
+and nothing else. ``MODE = 1`` confirms every pending alarm at once, in batches of 100,
+with ``STATUS`` 7001 while more are pending (Siemens, 2026-09-03). So the bridge never
+calls it. Acknowledging one alarm needs the panel or OPC UA, and acknowledgement from the
+ROS 2 side stays a bit-path feature. On this path we mirror the state rather than write it.
 
 One cost worth naming: ``Get_Alarm`` reads from a queue, one entry at a time, while the
 data block has to hold a picture. The generated code has to keep that picture itself. That
 is real work, not a flag.
+
+Alarm Ids Move
+--------------
+
+``alarm_id`` is unique within a CPU, and that is all it promises. Copying a block and
+recompiling can renumber alarms, and two CPUs on the same line can use the same number
+(Siemens, 2026-09-03). So the bridge keys alarms on ``(PLC, alarm_id)`` and never trusts
+the id alone across a project change.
+
+Every ``AlarmList`` carries ``catalog_version``: a hash over the alarm catalog the
+generator built the list from. The bridge keeps the same hash next to its mapping and
+compares on every picture. If they differ, the project was rebuilt and the numbers may
+have moved, so the bridge raises a fault on itself instead of resolving ids against the
+wrong table. A hand-kept mapping fails the other way: it keeps pointing at the wrong alarm
+and nobody notices.
 
 Architecture
 ------------
@@ -149,13 +167,18 @@ Message Definitions
      - One alarm: identity, source, class, priority, producer, active and acknowledged
        flags, PLC timestamp, latched values
    * - ``AlarmList.msg``
-     - The cyclic picture: every alarm active or not yet acknowledged
+     - The cyclic picture: every alarm active or not yet acknowledged, the catalog
+       version it was built from, and whether the block was too small to hold it all
    * - ``DiagnosticsStatus.msg``
      - What the diagnostics side asks of the machine: heartbeat, condition, class bits,
        scope
 
 Alarm text does not travel at runtime. The text belongs to the project, changes with the
 project, and is resolved on the ROS 2 side from a table that ships with the deployment.
+That table comes from a TIA Openness export of the project's PLC alarm text lists: alarm
+instances with texts, info texts, classes and languages, repeatable when the project
+changes. The ``.psc`` export does not carry it (Siemens, 2026-09-03). The bridge mapping is
+generated from the same export, and ``catalog_version`` pins the two together.
 
 Failure Behaviour
 -----------------
@@ -208,20 +231,28 @@ Building it against a concrete consumer beats guessing at a generic one.
 Open Questions
 --------------
 
-#. Is ``alarm_id`` unique per CPU, or only per block? If only per block, the key has to be
-   ``(source, alarm_id)``.
-#. Where does the alarm number to text table come from - the project export the generator
-   already reads, or a separate export?
-#. How many entries can the generated data block hold? The array is fixed size once
-   generated, and a plant can declare hundreds of alarms. If the ceiling is low, the fill
-   has to prioritise and say that it truncated.
-#. Is there any per-alarm acknowledge path in the CPU that we have missed? If not,
-   acknowledgement from the ROS 2 side stays a bit-path feature.
+Answered by Siemens (Manuel Kreutz, 2026-09-03, after tryouts on hardware):
+
+#. ``alarm_id`` is unique within a CPU, so inside one PLC the number is the key and
+   ``(source, alarm_id)`` is not needed. Two CPUs can collide, so the bridge keys on
+   ``(PLC, alarm_id)``. Copying a block and recompiling can change the id, which is why
+   ``AlarmList.catalog_version`` exists.
+#. The alarm number to text table lives in TIA under "PLC alarm text lists". The supported
+   path is a TIA Openness export: alarm instances with texts, info texts, classes and
+   languages, repeatable when the project changes. The ``.psc`` export does not carry it.
+#. The generated data block holds 64 entries in the current generator version. The next
+   version makes the length configurable, bounded only by CPU memory. The generator sizes
+   the array from the export, and ``AlarmList.truncated`` covers the rest.
+#. There is no per-alarm acknowledge in the CPU. ``Ack_Alarms`` takes ``EN``, ``MODE``,
+   ``ERROR`` and ``STATUS``, and ``MODE = 1`` confirms every pending alarm, in batches of
+   100. Acknowledgement from the ROS 2 side stays a bit-path feature. On the ``Get_Alarm``
+   path the bridge mirrors the CPU state and never calls ``Ack_Alarms``.
+
+Still open:
+
 #. Numeric associated values, or typed? Numeric keeps the entry fixed size. Typed carries
    more and brings strings back.
-#. The bridge needs a mapping: which bit or alarm number means which fault code, and which
-   fault classes set which bits going back. Kept by hand, that mapping and the PLC program
-   drift apart, which is the spreadsheet problem all over again. The generator reads the
-   config and the project export already, so it could emit the mapping file alongside the
-   generated code and there would be one source of truth. Does the project export carry the
-   alarm declarations and texts needed for that?
+#. Who emits the bridge mapping. The TIA Openness export carries what the mapping needs,
+   so it can be generated from the export on the ROS 2 side. Whether ROXSIE emits it next
+   to the generated code, so that one tool run produces both and stamps both with the same
+   ``catalog_version``, is for the design phase.

@@ -24,8 +24,10 @@
 
 # Numeric alarm identifier from the PLC project.
 #
-# OPEN QUESTION: unique per CPU, or only per block? If only per block, the key
-# is (source, alarm_id) and a consumer cannot key on the number alone.
+# Unique within one CPU (Siemens, 2026-09-03), so inside one PLC the number is
+# the key. Two CPUs can use the same number, so the bridge keys on
+# (PLC, alarm_id). Not stable: copying a block and recompiling can renumber,
+# which is what AlarmList.catalog_version guards against.
 uint32 alarm_id
 
 # Block or instance that declared the alarm. Static knowledge of the generator.
@@ -57,9 +59,10 @@ bool active
 # a real state and stays in the list. Same two bits the CPU alarm system tracks.
 #
 # Who owns this depends on how the list is filled. Bits: shared, either side can
-# set it. CPU alarm system: the CPU owns it, we mirror it, and setting it for a
-# single alarm needs the panel or OPC UA, because the CPU has no per-alarm
-# acknowledge instruction.
+# set it. CPU alarm system: the CPU owns it and we mirror it. The CPU has no
+# per-alarm acknowledge instruction: Ack_Alarms takes no alarm id, and MODE = 1
+# confirms every pending alarm at once, in batches of 100 (Siemens, 2026-09-03).
+# The bridge never calls it. Acknowledging one alarm needs the panel or OPC UA.
 bool acknowledged
 
 # Time the condition last changed, from the PLC clock, UTC.

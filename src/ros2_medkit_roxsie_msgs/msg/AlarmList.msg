@@ -34,10 +34,21 @@
 # When this picture was taken, from the PLC clock.
 builtin_interfaces/Time stamp
 
+# Version of the alarm catalog this list was built from: a hash over the TIA
+# Openness alarm export (ids, texts, classes), written by the generator. The
+# bridge keeps the same hash next to its mapping and compares on every picture.
+# A mismatch means the project was rebuilt and the ids may have moved, so the
+# bridge raises a fault instead of resolving ids against the wrong table.
+# Empty in the bit path.
+string catalog_version
+
 # Alarms that are active or not yet acknowledged. Order is not significant.
 #
-# OPEN QUESTION: how many entries can the generated data block hold? A plant can
-# declare hundreds of alarms, and the array is fixed size once generated. If the
-# ceiling is low, the fill has to prioritise, and then it also has to say that it
-# truncated.
+# The generated data block holds 64 entries in the current generator version.
+# The next version makes the length configurable, bounded only by CPU memory
+# (Siemens, 2026-09-03), so the generator sizes the array from the export.
 Alarm[] alarms
+
+# True when the CPU had more pending alarms than the block could hold, so this
+# picture is incomplete. The bridge reports that as a fault of its own.
+bool truncated
