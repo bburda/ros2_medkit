@@ -11,7 +11,10 @@ Follows the same plugin pattern as `ros2_medkit_graph_provider`: implements `Gat
   discovers them automatically by browsing the live address space
   (`auto_browse`, see below) - zero node-map config required
 - Exposes PLC values as the `x-plc-data` vendor collection
-- Allows writing setpoints via `x-plc-operations` with type-aware coercion and range validation
+- Ships read-only by default: the shipped binary contains no controller write
+  path at all (see [Read-only and write-capable builds](#read-only-and-write-capable-builds))
+- In a write-capable build, allows writing setpoints via `x-plc-operations` with
+  type-aware coercion and range validation
 - Reports the connection state and poll metrics via `x-plc-status`
 - Maps threshold-based PLC alarms to SOVD faults on the owning entity
 - Optionally publishes numeric PLC values to ROS 2 `std_msgs/Float32` topics
@@ -100,6 +103,44 @@ to `false`) like every other discovery resource - it is a device fingerprint,
 useful for reconnaissance. Enable gateway authentication (`auth.enabled: true`)
 or front the API with an authenticating proxy to gate access to it.
 
+## Read-only and write-capable builds
+
+Whether this box can change a controller is a property of the binary, not of a
+configuration file. `MEDKIT_OPCUA_READ_ONLY` is a CMake cache option and
+defaults to **ON**:
+
+```bash
+# The default: read-only. No OPC-UA write path in the object.
+colcon build --packages-up-to ros2_medkit_opcua
+
+# Write-capable, for development against a PLC you are allowed to drive.
+colcon build --packages-select ros2_medkit_opcua \
+  --cmake-args -DMEDKIT_OPCUA_READ_ONLY=OFF
+```
+
+In the default read-only build:
+
+- `OpcuaClient::write_value` and the open62541pp Write service calls it
+  instantiates are **not compiled**, so no symbol able to put a value on the
+  wire exists in `libros2_medkit_opcua_plugin.so`. The `test_opcua_build_variant`
+  ctest asserts this against the built object with `nm`, in both variants, so
+  the claim is checked rather than configured.
+- No data point is ever `writable`. A node-map entry that says `writable: true`
+  is ignored with one startup warning naming the build property, and the
+  address-space walk never consults the server's `CurrentWrite` bit whatever
+  `infer_writable` says.
+- Nothing advertises a write: no `x-plc-operations` capability on any entity, no
+  `set_<name>` entry in `/operations`, and the `POST .../x-plc-operations/...`
+  route is not registered (it answers 404).
+- `PUT /{type}/{id}/data/{name}` and the value-write half of
+  `POST /{type}/{id}/operations/{name}/executions` answer **403** before any
+  node lookup or client call, with vendor code `x-medkit-plugin-error` and a
+  message naming `MEDKIT_OPCUA_READ_ONLY`. Alarm `acknowledge_fault` /
+  `confirm_fault` are Part 9 condition interactions, not value writes, and stay
+  available in both variants.
+
+A write-capable build restores everything above; nothing else differs.
+
 ## REST API
 
 ### Vendor Endpoints
@@ -108,7 +149,7 @@ or front the API with an authenticating proxy to gate access to it.
 |--------|------|-------------|
 | GET | `/apps/{id}/x-plc-data` | All OPC-UA values for entity (with units, types, timestamps) |
 | GET | `/apps/{id}/x-plc-data/{name}` | Single data point value |
-| POST | `/apps/{id}/x-plc-operations/set_{name}` | Write value to PLC (`{"value": 75.0}`) |
+| POST | `/apps/{id}/x-plc-operations/set_{name}` | Write value to PLC (`{"value": 75.0}`) - write-capable build only; not registered otherwise |
 | GET | `/components/{id}/x-plc-status` | Connection state, poll stats, active alarms |
 
 ### Standard SOVD (provided by gateway)
@@ -137,6 +178,9 @@ GET /api/v1/apps/tank_process/x-plc-data
   ]
 }
 ```
+
+`writable` is `false` on every item in the default read-only build, whatever the
+node map or the server says.
 
 **Write to PLC:**
 ```json
@@ -210,7 +254,9 @@ nodes:
     display_name: Tank Level
     unit: mm
     data_type: float
-    writable: true                # Allow writes via x-plc-operations
+    writable: true                # Allow writes via x-plc-operations. Ignored in
+                                  # the default read-only build (one startup
+                                  # warning, the point stays read-only).
     min_value: 0.0                # Optional: range validation for writes
     max_value: 100.0
     alarm:                        # Optional: numeric threshold -> SOVD fault
@@ -384,10 +430,13 @@ along hierarchical references:
   `Objects` are walked normally. A depth limit and a total-node budget bound
   the walk against a pathological or very large address space; hitting either
   logs an operator warning that the resulting tree may be incomplete.
-- **Read-only.** auto_browse never writes to the server, and every
-  auto-discovered data point loads with `writable: false` - promoting a
-  specific point to writable is a deliberate, reviewed decision made via an
-  explicit `nodes:` entry.
+- **The walk itself never writes to the server.** Whether a discovered point is
+  exposed as writable depends on the build and on `infer_writable`: in the
+  default read-only build every auto-discovered point loads with
+  `writable: false` and the server's `CurrentWrite` bit is never read. In a
+  write-capable build `infer_writable` (default `true`) marks a point writable
+  exactly when the server says this session may write it; set it to `false` to
+  require an explicit `nodes:` entry instead.
 - **Explicit config always wins.** An auto-browsed entry for a NodeId that
   already has a hand-written `nodes:` entry is dropped; auto_browse only fills
   in what the node map does not already cover (or the whole tree, when there
@@ -416,8 +465,14 @@ discovered endpoint go straight to a populated tree with no node-map file:
 
 ```yaml
 plugins.opcua.endpoint_url: "opc.tcp://192.168.1.10:4840"
-plugins.opcua.auto_browse: true   # or the same map form as above
+plugins.opcua.auto_browse.enabled: true
+plugins.opcua.auto_browse.infer_writable: true   # write-capable builds only
 ```
+
+`infer_writable` is accepted only in this ROS-param form - the node-map YAML's
+`auto_browse:` block does not parse it. It defaults to `true` and has no effect
+in a read-only build, which logs one warning at startup and leaves every
+discovered point read-only.
 
 The JSON/ROS-param form takes precedence over whatever the node-map YAML's
 `auto_browse:` block set, mirroring how environment variables override the
@@ -805,7 +860,16 @@ Any PLC with an OPC-UA server works out of the box:
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select ros2_medkit_opcua
 colcon test --packages-select ros2_medkit_opcua
+
+# Write-capable variant (default is read-only)
+colcon build --packages-select ros2_medkit_opcua \
+  --cmake-args -DMEDKIT_OPCUA_READ_ONLY=OFF
+colcon test --packages-select ros2_medkit_opcua
 ```
+
+`test_opcua_build_variant` inspects the built `.so` with `nm` and asserts it
+matches the variant it was configured for, so the same `colcon test` command
+checks the opposite property in each build.
 
 ### Docker Integration Tests
 
@@ -883,6 +947,7 @@ When the value returns below threshold, the fault is automatically cleared.
 - **Type-aware writes** - Plugin reads the OPC-UA node's data type before writing to avoid type mismatches (e.g., writing float32 to a REAL node, not float64).
 - **Node map driven** - All entity mapping is in YAML config, not code. Same plugin binary works with any PLC by changing the config file.
 - **Env var overrides** - `OPCUA_ENDPOINT_URL` and `OPCUA_NODE_MAP_PATH` override YAML config for Docker deployment flexibility.
+- **Read-only is a build property, not a setting** - the shipped binary contains no OPC-UA write path, and CI proves it by inspecting the object rather than by reading a configuration value. A setting can be flipped on a running box; an absent symbol cannot.
 
 ## License
 

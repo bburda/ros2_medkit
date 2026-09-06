@@ -57,7 +57,8 @@ All mapping lives in YAML (``config/tank_demo_nodes.yaml`` is the reference exam
   - ``node_id`` - OPC-UA node identifier (e.g. ``"ns=2;i=1"``)
   - ``entity_id`` - SOVD app the value belongs to
   - ``data_name`` - short name used in REST URLs
-  - ``display_name``, ``unit``, ``data_type``, ``writable`` - metadata
+  - ``display_name``, ``unit``, ``data_type``, ``writable`` - metadata.
+    ``writable`` is ignored in a read-only build (see below)
   - ``min_value`` / ``max_value`` - optional write range check
   - ``alarm`` - optional fault definition (``fault_code``, ``severity``, ``threshold``,
     ``above_threshold`` direction)
@@ -96,8 +97,45 @@ edge-triggered callbacks:
 The plugin keeps per-fault state only long enough to detect edges; the fault manager owns
 persistence and fault lifecycle.
 
-Type-aware writes
-=================
+Read-only is a property of the build
+====================================
+
+Four of the five protocol plugins cannot write to their device at all. OPC UA can,
+and config-less discovery would mark a point writable straight from the server's
+``CurrentWrite`` bit. A plant asking "can this box change a controller" cannot be
+answered by a configuration value, because a configuration value can be changed
+without rebuilding, reviewing or shipping anything. So the answer is carried by the
+binary.
+
+``MEDKIT_OPCUA_READ_ONLY`` is a CMake cache option, default ``ON``. With it on:
+
+- ``OpcuaClient::write_value``, the ``open62541pp`` Write service templates it
+  instantiates, the vendor route handler ``OpcuaPlugin::handle_plc_operations`` and
+  the value-coercion helper are all outside ``#if`` and are never compiled. The
+  object contains no symbol that can reach an OPC-UA Write service call.
+- ``NodeMap::load`` forces ``writable`` to false and warns once when the file asked
+  otherwise; ``AutoBrowser`` does not compile the ``infer_writable`` inference, so
+  the server's ``CurrentWrite`` bit is never read.
+- No entity registers the ``x-plc-operations`` capability, ``list_operations``
+  emits no ``set_<name>`` entry, and ``get_routes`` does not register the write
+  route.
+- ``write_data`` and the value-write half of ``execute_operation`` return 403 as
+  their first statement, before any node lookup, with a message naming the build
+  property. They stay declared because the gateway reaches the plugin through the
+  ``DataProvider`` / ``OperationProvider`` interfaces; the refusal reaches a client
+  as SOVD vendor code ``x-medkit-plugin-error``, which is the code the gateway
+  assigns to every plugin provider error.
+- ``acknowledge_fault`` / ``confirm_fault`` are unaffected. They are OPC-UA Part 9
+  condition method calls, not value writes.
+
+The acceptance is an inspection of the built object, not a reading of the
+configuration: ``test_opcua_build_variant`` runs ``nm`` over the plugin ``.so`` and
+asserts the write symbols are absent and the read symbols present. It runs in both
+variants with opposite expectations, so a symbol list that stopped matching anything
+fails in the write-capable build instead of passing everywhere.
+
+Type-aware writes (write-capable build)
+=======================================
 
 ``POST /apps/{id}/x-plc-operations/{op}`` accepts a JSON body ``{"value": ...}``. The handler:
 
