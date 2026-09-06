@@ -2310,10 +2310,12 @@ void RESTServer::setup_routes() {
           "Cuts the window short: `to` moves to the moment of this request and `ended_early` becomes true. Faults "
           "whose cycle started before that instant stay expected; faults raised after it do not. Answers 200 with "
           "the ended window rather than 204, because the caller needs to be told where `to` landed. A window "
-          "whose end has already passed answers 400 - when a stop finished is not something a later request gets "
-          "to rewrite.")
-      .response(400, "The window has already ended (x-medkit-planned-stop-ended)")
-      .errors({404, 503})
+          "whose end has already passed answers 400 with vendor code `x-medkit-planned-stop-ended` - when a stop "
+          "finished is not something a later request gets to rewrite.")
+      // 400 goes through .errors() like every other refusal, so the document
+      // renders it as a $ref to GenericError. Naming it with .response() instead
+      // publishes an inline schema no generated client can share.
+      .errors({400, 404, 503})
       .operation_id("endPlannedStop");
 
   // === Software Updates ===

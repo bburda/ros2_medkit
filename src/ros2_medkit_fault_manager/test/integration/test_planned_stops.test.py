@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Planned-stop windows against a real fault_manager over SQLite.
+"""
+Planned-stop windows against a real fault_manager over SQLite.
 
 Every case here needs a node whose lifetime the test controls - a different
 retention bound per case, and one case that kills the node and brings it back on
@@ -75,7 +76,8 @@ def to_float(time_msg):
 
 
 class PlannedStopFixture(unittest.TestCase):
-    """One fault_manager per test, under a node name only that test uses.
+    """
+    One fault_manager per test, under a node name only that test uses.
 
     Three lessons are baked into this fixture, each learned by watching this file
     fail. A manager that outlives its test keeps answering /fault_manager/* and
