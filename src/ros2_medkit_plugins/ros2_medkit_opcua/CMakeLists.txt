@@ -95,13 +95,22 @@ foreach(_op62_target open62541pp open62541)
 endforeach()
 
 # One section per function and per object in the vendored library, so
-# --gc-sections below can drop the ones nothing in this module reaches. Without
-# this the whole of open62541 is linked in as a handful of large sections and
-# the garbage collector has nothing to work with: the read-only object would
-# still carry - and, before --exclude-libs, still export - the library's own
-# Write service primitives, which a caller with dlsym could reach even though no
-# route in the plugin can.
-foreach(_op62_target open62541pp open62541)
+# --gc-sections on the module below can drop the ones nothing here reaches.
+# Without it the library arrives as a handful of large sections the collector
+# cannot take apart, and the read-only object keeps carrying open62541's own
+# Write service primitives - __UA_Client_writeAttribute and the rest - even
+# though no route in the plugin reaches them.
+#
+# The list names the OBJECT libraries, not just `open62541`: upstream compiles
+# its C sources in open62541-object and open62541-plugins and assembles
+# `open62541` from $<TARGET_OBJECTS:...>, so options set on `open62541` reach no
+# compilation at all. Upstream does add the same two flags itself, but only for
+# Release and MinSizeRel (its CMakeLists.txt, "Strip release builds"), so a
+# default-type build got neither - measurably: twelve UA_*_write* symbols in the
+# read-only object there against none in Release. Setting them here makes the
+# property independent of CMAKE_BUILD_TYPE; where upstream already set them the
+# repetition is harmless.
+foreach(_op62_target open62541pp open62541 open62541-object open62541-plugins)
   if(TARGET ${_op62_target})
     target_compile_options(${_op62_target} PRIVATE -ffunction-sections -fdata-sections)
   endif()
@@ -252,6 +261,18 @@ if(BUILD_TESTING)
   set_tests_properties(test_opcua_build_variant PROPERTIES TIMEOUT 60)
   # Reads a file with nm; starts no ROS node.
   medkit_test_needs_no_domain(test_opcua_build_variant)
+
+  # A test of that test: it links an object exporting
+  # __UA_Client_writeAttribute alongside the plugin entry points - what a
+  # version script or a visibility slip on the vendored library produces - and
+  # requires the export rule to reject it. The rule used to be a prefix match on
+  # "UA_", which that spelling walks straight past.
+  add_test(NAME test_opcua_build_variant_self_check
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/inspect_build_variant.py"
+            --self-check)
+  set_tests_properties(test_opcua_build_variant_self_check PROPERTIES TIMEOUT 60)
+  medkit_test_needs_no_domain(test_opcua_build_variant_self_check)
 
   # Each test connects to a non-existent OPC UA host and waits ~3.8s for the
   # DNS / TCP failure path; with 13 tests in the suite the run requires ~90s.

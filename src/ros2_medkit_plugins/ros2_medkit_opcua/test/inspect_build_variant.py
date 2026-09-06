@@ -38,9 +38,12 @@ Usage: inspect_build_variant.py <plugin.so> --expect {read-only,write-capable}
 """
 
 import argparse
+from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 # Symbols that exist only when the value-write path is compiled in. Each is on
 # the road from the provider entry points to the wire:
@@ -96,9 +99,25 @@ READ_MARKERS = (
 # Nothing from the OPC-UA stack may appear in the module's dynamic symbol table,
 # in either variant. The gateway dlopens the plugin and needs its extern "C"
 # entry points and nothing else; anything else exported is a dlsym handle on
-# machinery no route exposes. Checked as a prefix match on the demangled name,
-# which covers both the C library (UA_*, __UA_*) and the C++ wrapper (opcua::*).
-EXPORT_DENY = ('UA_', 'opcua::')
+# machinery no route exposes.
+#
+# A regex, not a prefix match on "UA_": open62541's internal entry points are
+# spelled with leading underscores (__UA_Client_writeAttribute,
+# __UA_Client_Service), so a startswith check waves through exactly the symbol
+# that started this - a version script exporting it alongside the six entry
+# points passed a prefix check while handing dlsym a working write primitive.
+# Leading underscores are optional in the match for that reason.
+EXPORT_DENY = re.compile(r'^_*UA_|^opcua::')
+
+# open62541's own Write service primitives, which the plugin never calls: the
+# C++ wrapper reaches the service through opcua::services::write. They must be
+# absent from a read-only object even as LOCAL symbols, not merely unexported -
+# a symbol nothing exports is still a gadget for anything running in the same
+# process, and their presence means the archive member was pulled in, which is
+# the state a link or optimisation change can silently restore. Checked as an
+# absence invariant rather than a variant marker because they are absent from
+# the write-capable object too, so they discriminate nothing between builds.
+WRITE_PRIMITIVES = re.compile(r'_*UA_(Client|Server)_write')
 
 # Symbols the gateway resolves out of the plugin. If a link-time change ever
 # hides these, the plugin still builds and still passes every symbol check above
@@ -135,23 +154,17 @@ def count(lines, marker):
     return sum(1 for line in lines if marker in line)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('plugin', help='path to libros2_medkit_opcua_plugin.so')
-    parser.add_argument('--expect', required=True,
-                        choices=('read-only', 'write-capable'),
-                        help='the write surface this build declares')
-    args = parser.parse_args()
+def symbol_name(line):
+    """Return the demangled name from one nm line, without the address and type."""
+    return line.split(' ', 2)[-1]
 
-    if shutil.which('nm') is None:
-        print('FAIL: nm (binutils) not on PATH - the build inspection cannot run',
-              file=sys.stderr)
-        return 1
 
-    defined = nm(['-C'], args.plugin)
-    exported = nm(['-DC', '--defined-only'], args.plugin)
-    print(f'{args.plugin}: {len(defined)} symbols, {len(exported)} dynamic exports, '
-          f'expecting {args.expect}')
+def check_object(plugin, expect, report):
+    """Check one object against a variant and return the list of failures."""
+    defined = nm(['-C'], plugin)
+    exported = nm(['-DC', '--defined-only'], plugin)
+    report(f'{plugin}: {len(defined)} symbols, {len(exported)} dynamic exports, '
+           f'expecting {expect}')
 
     failures = []
     if len(defined) < MIN_SYMBOLS:
@@ -160,14 +173,14 @@ def main():
 
     for marker in READ_MARKERS:
         n = count(defined, marker)
-        print(f'  read  {n:>4}  {marker}')
+        report(f'  read  {n:>4}  {marker}')
         if n == 0:
             failures.append(f'read path symbol missing: {marker}')
 
-    want_writes = args.expect == 'write-capable'
+    want_writes = expect == 'write-capable'
     for marker in WRITE_MARKERS:
         n = count(defined, marker)
-        print(f'  write {n:>4}  {marker}')
+        report(f'  write {n:>4}  {marker}')
         if want_writes and n == 0:
             failures.append(f'write-capable build is missing: {marker}')
         if not want_writes and n != 0:
@@ -175,19 +188,154 @@ def main():
 
     # The export table is an invariant, not a variant property: neither build
     # may hand dlsym a way into the OPC-UA stack.
-    leaked = [line.split(' ', 2)[-1] for line in exported
-              if any(line.split(' ', 2)[-1].startswith(p) for p in EXPORT_DENY)]
-    print(f'  export {len(leaked):>4}  OPC-UA symbols in the dynamic symbol table')
+    leaked = [symbol_name(line) for line in exported
+              if EXPORT_DENY.search(symbol_name(line))]
+    report(f'  export {len(leaked):>4}  OPC-UA symbols in the dynamic symbol table')
     for name in leaked[:10]:
         failures.append(f'dynamic symbol table exports OPC-UA machinery: {name}')
 
-    export_names = {line.split(' ', 2)[-1] for line in exported}
+    export_names = {symbol_name(line) for line in exported}
     missing = [name for name in REQUIRED_EXPORTS if name not in export_names]
-    print(f'  export {len(REQUIRED_EXPORTS) - len(missing):>4}'
-          f'/{len(REQUIRED_EXPORTS)} plugin entry points')
+    report(f'  export {len(REQUIRED_EXPORTS) - len(missing):>4}'
+           f'/{len(REQUIRED_EXPORTS)} plugin entry points')
     for name in missing:
         failures.append(f'plugin entry point not exported: {name}')
 
+    # And the library's Write primitives must not be in the read-only object at
+    # all, exported or not. Independent of build type: upstream only compiles
+    # with -ffunction-sections for Release and MinSizeRel, so without the flags
+    # this package sets on the object libraries a default-type build kept twelve
+    # of them as local symbols while every other check here still passed.
+    if not want_writes:
+        primitives = [symbol_name(line) for line in defined
+                      if WRITE_PRIMITIVES.search(symbol_name(line))]
+        report(f'  absent {len(primitives):>4}  open62541 UA_*_write* primitives')
+        for name in primitives[:10]:
+            failures.append(f'read-only object still carries a write primitive: {name}')
+
+    return failures
+
+
+# The reviewer's reproducer, kept as a test of the test: a module that exports
+# __UA_Client_writeAttribute next to the six entry points. It is what a version
+# script, or an -fvisibility slip on the vendored library, produces, and the
+# prefix match this check used to do waved it through - the leading underscores
+# meant it did not start with "UA_". The object is otherwise a plausible plugin
+# (the read markers and entry points are there), so a rejection can only come
+# from the export rule under test.
+SELF_CHECK_SOURCE = r"""
+#include <stdio.h>
+#define EXPORT __attribute__((visibility("default")))
+EXPORT int __UA_Client_writeAttribute(void) { return 0; }
+EXPORT void *create_plugin(void) { return 0; }
+EXPORT int plugin_api_version(void) { return 1; }
+EXPORT void *get_introspection_provider(void *p) { return p; }
+EXPORT void *get_data_provider(void *p) { return p; }
+EXPORT void *get_operation_provider(void *p) { return p; }
+EXPORT void *get_fault_provider(void *p) { return p; }
+"""
+
+
+def build_self_check_object(workdir):
+    """Compile the reproducer module; return its path, or None with a reason."""
+    compiler = shutil.which('cc') or shutil.which('gcc')
+    if compiler is None:
+        return None, 'no C compiler on PATH'
+    src = workdir / 'leaky_plugin.c'
+    obj = workdir / 'leaky_plugin.so'
+    src.write_text(SELF_CHECK_SOURCE)
+    out = subprocess.run(
+        [compiler, '-shared', '-fPIC', '-fvisibility=hidden', '-o', str(obj), str(src)],
+        capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        return None, f'compile failed: {out.stderr.strip()}'
+    return obj, ''
+
+
+def self_check():
+    """Prove the rules reject what they are meant to reject. Returns an exit code."""
+    quiet = (lambda *a, **k: None)
+    problems = []
+
+    # The name rules, on symbol lines rather than on a whole object, so the
+    # spellings that matter are pinned one by one.
+    must_deny = ('__UA_Client_writeAttribute', 'UA_Client_writeValueAttribute',
+                 '_UA_Server_write', '__UA_Client_Service',
+                 'opcua::services::write(opcua::Client&, opcua::WriteRequest const&)')
+    must_allow = ('create_plugin', 'plugin_api_version', 'medkit_UA_helper',
+                  'std::__cxx11::basic_string<char>::~basic_string()')
+    for name in must_deny:
+        if not EXPORT_DENY.search(name):
+            problems.append(f'EXPORT_DENY fails to match {name}')
+    for name in must_allow:
+        if EXPORT_DENY.search(name):
+            problems.append(f'EXPORT_DENY wrongly matches {name}')
+
+    must_be_primitives = ('__UA_Client_writeAttribute', 'UA_Client_writeArrayDimensionsAttribute',
+                          'UA_Server_writeValue', '__UA_Server_write')
+    must_not_be_primitives = ('__UA_Client_readAttribute', 'UA_Client_Service_read',
+                              'UA_WriteRequest_init')
+    for name in must_be_primitives:
+        if not WRITE_PRIMITIVES.search(name):
+            problems.append(f'WRITE_PRIMITIVES fails to match {name}')
+    for name in must_not_be_primitives:
+        if WRITE_PRIMITIVES.search(name):
+            problems.append(f'WRITE_PRIMITIVES wrongly matches {name}')
+
+    # And the same rule end to end, on a real object built the way the reviewer
+    # built one. A compiler is present wherever this test runs, because the
+    # package it inspects was just compiled.
+    workdir = Path(tempfile.mkdtemp(prefix='opcua_self_check_'))
+    try:
+        obj, reason = build_self_check_object(workdir)
+        if obj is None:
+            print(f'FAIL: cannot build the reproducer object - {reason}', file=sys.stderr)
+            return 1
+        failures = check_object(str(obj), 'read-only', quiet)
+        leak = [f for f in failures if '__UA_Client_writeAttribute' in f
+                and 'exports OPC-UA machinery' in f]
+        if not leak:
+            problems.append('an object exporting __UA_Client_writeAttribute was not '
+                            'rejected by the export rule')
+        entry_points = [f for f in failures if 'entry point not exported' in f]
+        if entry_points:
+            problems.append('the reproducer object is not shaped like a plugin, so its '
+                            f'rejection proves nothing: {entry_points}')
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    if problems:
+        print('FAIL (self-check):', file=sys.stderr)
+        for p in problems:
+            print(f'  - {p}', file=sys.stderr)
+        return 1
+    print(f'PASS: self-check - {len(must_deny) + len(must_allow)} export-rule cases, '
+          f'{len(must_be_primitives) + len(must_not_be_primitives)} write-primitive cases, '
+          'and a linked object exporting __UA_Client_writeAttribute is rejected')
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('plugin', nargs='?',
+                        help='path to libros2_medkit_opcua_plugin.so')
+    parser.add_argument('--expect', choices=('read-only', 'write-capable'),
+                        help='the write surface this build declares')
+    parser.add_argument('--self-check', action='store_true',
+                        help='check the rules against objects and names built to break them')
+    args = parser.parse_args()
+
+    if args.self_check:
+        return self_check()
+    if not args.plugin or not args.expect:
+        parser.error('a plugin path and --expect are required unless --self-check is given')
+
+    if shutil.which('nm') is None:
+        print('FAIL: nm (binutils) not on PATH - the build inspection cannot run',
+              file=sys.stderr)
+        return 1
+
+    failures = check_object(args.plugin, args.expect, print)
     if failures:
         print(f'FAIL ({args.expect}):', file=sys.stderr)
         for f in failures:

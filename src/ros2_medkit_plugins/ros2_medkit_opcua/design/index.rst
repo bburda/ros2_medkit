@@ -123,6 +123,14 @@ binary.
   linker drop them from the object entirely, because nothing references them once
   the C++ write path is gone. The read-only object exports the six plugin entry
   points and nothing from the OPC-UA stack.
+- The section flags are set on ``open62541-object`` and ``open62541-plugins``,
+  which is where upstream compiles its C sources - ``open62541`` itself is
+  assembled from ``$<TARGET_OBJECTS:...>`` and compiles nothing. Upstream adds the
+  same two flags, but only under ``Release`` and ``MinSizeRel``, so a default-type
+  build previously kept twelve ``UA_*_write*`` symbols in the read-only object as
+  local, unexported code. Setting them here makes the property independent of
+  ``CMAKE_BUILD_TYPE``, and ``test_opcua_build_variant`` asserts the absence of
+  that whole family so the difference cannot come back unnoticed.
 - What is left of open62541 inside the object is the generic service dispatcher
   the read path needs and the generated type descriptors the ``UA_TYPES`` table
   pins. They are data and dispatch, not a write path: nothing exports them and no
