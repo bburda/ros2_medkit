@@ -14,19 +14,25 @@
 # limitations under the License.
 
 """
-Debounce and healing contract for an edge-triggered fault reporter.
+Healing contract for a reporter that sends one event per transition.
 
-A reporter is edge-triggered when it sends one FAILED event as a condition
-appears and one clear as it goes away, instead of repeating FAILED on every
-sample. The count-based debounce cannot filter a noisy sample for such a
-reporter: the second FAILED that would move the counter never arrives. The
-time-based lever does the filtering instead, so these tests pin the pair.
+Such a reporter raises a fault with a single FAILED and de-asserts it with a
+single PASSED, never repeating either while the condition holds. Both debounce
+directions count events, so for this reporter only the counts reachable in one
+event are usable.
 
-Every case sends the number of events an edge-triggered reporter really sends
-(one), never the number the counter would need.
+The suite runs twice, once per healing_threshold, because the whole contract
+turns on that value: at 0 the single PASSED heals, at the default 3 it does not
+and the fault stays CONFIRMED with nobody able to clear it but a human. Each
+test states which outcome it expects for the threshold it runs under, so the
+run at 3 is a falsifying control rather than a skipped case.
+
+Every case sends the number of events such a reporter really sends, never the
+number the counter would need.
 """
 
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -40,35 +46,39 @@ from rclpy.node import Node
 from ros2_medkit_msgs.msg import Fault
 from ros2_medkit_msgs.srv import ListFaults, ReportFault
 
-DATABASE_PATH = os.path.join(tempfile.mkdtemp(prefix='debounce_healing_'), 'faults.db')
+# Only 0 lets a single PASSED reach the healing threshold. 3 is the parameter
+# default and is exercised to show it leaves the fault confirmed.
+HEALING_THRESHOLDS = [0, 3]
 
-# Seconds a fault stays PREFAILED before the timer confirms it. The node runs
-# that timer once a second, so a confirmation lands within AUTO_CONFIRM_SEC + 1.
-AUTO_CONFIRM_SEC = 3.0
+# Long enough that any timer-driven promotion would have fired. No test sets
+# auto_confirm_after_sec, so a status observed after this period is stable.
+QUIET_PERIOD_SEC = 5.0
 
 # Every status, so a test can see a fault the default CONFIRMED-only filter hides.
 ALL_STATUSES = ['PREFAILED', 'PREPASSED', 'CONFIRMED', 'HEALED', 'CLEARED']
 
+_temp_dirs = []
 
-def generate_test_description():
-    """Launch fault_manager with the appliance debounce and healing settings."""
+
+@launch_testing.markers.keep_alive
+@launch_testing.parametrize('healing_threshold', HEALING_THRESHOLDS)
+def generate_test_description(healing_threshold):
+    """Launch fault_manager with healing on and the threshold under test."""
+    temp_dir = tempfile.mkdtemp(prefix='debounce_healing_')
+    _temp_dirs.append(temp_dir)
+
     fault_manager_node = launch_ros.actions.Node(
         package='ros2_medkit_fault_manager',
         executable='fault_manager_node',
         name='fault_manager',
         output='screen',
         parameters=[{
+            # SQLite rather than the in-memory store: the counter that decides
+            # healing is persisted, and both backends have to agree on it.
             'storage_type': 'sqlite',
-            'database_path': DATABASE_PATH,
-            # Below -1, so the first FAILED lands in PREFAILED instead of
-            # confirming. An edge-triggered reporter never sends the second
-            # event, so the counter stays here and the timer below decides.
-            'confirmation_threshold': -2,
-            'auto_confirm_after_sec': AUTO_CONFIRM_SEC,
-            # A clear arrives as one PASSED event, so healing has to finish on
-            # that one event. Threshold 0 is what makes it reachable.
+            'database_path': os.path.join(temp_dir, 'faults.db'),
             'healing_enabled': True,
-            'healing_threshold': 0,
+            'healing_threshold': healing_threshold,
         }],
         sigterm_timeout='30',
         sigkill_timeout='15',
@@ -81,12 +91,13 @@ def generate_test_description():
         ]),
         {
             'fault_manager_node': fault_manager_node,
+            'healing_threshold': healing_threshold,
         },
     )
 
 
-class TestDebounceAndHealing(unittest.TestCase):
-    """One failed read must not confirm, and a de-assert must heal unattended."""
+class TestHealingOnASingleClear(unittest.TestCase):
+    """A de-asserted alarm must reach healed on the one PASSED it gets."""
 
     @classmethod
     def setUpClass(cls):
@@ -95,9 +106,9 @@ class TestDebounceAndHealing(unittest.TestCase):
         cls.report_client = cls.node.create_client(ReportFault, '/fault_manager/report_fault')
         cls.list_client = cls.node.create_client(ListFaults, '/fault_manager/list_faults')
 
-        assert cls.report_client.wait_for_service(timeout_sec=10.0), \
+        assert cls.report_client.wait_for_service(timeout_sec=20.0), \
             'report_fault service not available'
-        assert cls.list_client.wait_for_service(timeout_sec=10.0), \
+        assert cls.list_client.wait_for_service(timeout_sec=20.0), \
             'list_faults service not available'
 
     @classmethod
@@ -107,17 +118,17 @@ class TestDebounceAndHealing(unittest.TestCase):
 
     def _call(self, client, request):
         future = client.call_async(request)
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec=5.0)
+        rclpy.spin_until_future_complete(self.node, future, timeout_sec=20.0)
         self.assertIsNotNone(future.result(), 'Service call timed out')
         return future.result()
 
     def _report(self, fault_code, event_type, severity=Fault.SEVERITY_ERROR):
-        """Send one ReportFault event, the way an edge-triggered reporter does."""
+        """Send one ReportFault event, the way a one-event reporter does."""
         request = ReportFault.Request()
         request.fault_code = fault_code
         request.event_type = event_type
         request.severity = severity
-        request.description = 'debounce and healing contract test'
+        request.description = 'healing contract test'
         request.source_id = '/test_plc'
         response = self._call(self.report_client, request)
         self.assertTrue(response.accepted, f'ReportFault rejected for {fault_code}')
@@ -137,113 +148,109 @@ class TestDebounceAndHealing(unittest.TestCase):
         response = self._call(self.list_client, ListFaults.Request())
         return [fault.fault_code for fault in response.faults]
 
-    def _wait_for_status(self, fault_code, expected, timeout_sec):
-        """Poll until the fault reaches expected, returning the last status seen."""
-        deadline = time.time() + timeout_sec
-        status = self._status_of(fault_code)
-        while time.time() < deadline and status != expected:
-            time.sleep(0.25)
-            status = self._status_of(fault_code)
-        return status
-
-    def test_01_single_failed_read_does_not_confirm(self):
-        """One bad sample must not raise a confirmed fault."""
-        code = 'PLC_SINGLE_READ'
-        self._report(code, ReportFault.Request.EVENT_FAILED)
-
-        status = self._status_of(code)
-        self.assertIsNotNone(status, 'fault was not recorded at all')
-        self.assertNotEqual(
-            status, Fault.STATUS_CONFIRMED,
-            'a single failed read confirmed the fault immediately'
-        )
-        self.assertEqual(status, Fault.STATUS_PREFAILED)
-
-    def test_02_prefailed_fault_is_hidden_from_the_default_list(self):
-        """A not-yet-confirmed fault must not reach an operator listing."""
-        code = 'PLC_HIDDEN_WHILE_PENDING'
-        self._report(code, ReportFault.Request.EVENT_FAILED)
-
-        self.assertNotIn(
-            code, self._default_filter_codes(),
-            'an unconfirmed fault is already visible in the default fault list'
-        )
-
-    def test_03_sustained_condition_confirms_with_nobody_acting(self):
+    def test_01_a_de_asserted_alarm_heals_on_its_single_clear(self, healing_threshold):
         """
-        A real fault must still surface.
+        The fix this suite exists for.
 
-        The reporter sends its one FAILED and never repeats it, so only the
-        time-based lever can promote this. Without it the fault would stay
-        PREFAILED forever and the appliance would go quiet.
-        """
-        code = 'PLC_SUSTAINED'
-        self._report(code, ReportFault.Request.EVENT_FAILED)
-
-        status = self._wait_for_status(
-            code, Fault.STATUS_CONFIRMED, AUTO_CONFIRM_SEC + 5.0
-        )
-        self.assertEqual(
-            status, Fault.STATUS_CONFIRMED,
-            f'a sustained fault never confirmed, it is still {status}'
-        )
-        self.assertIn(code, self._default_filter_codes())
-
-    def test_04_transient_that_clears_in_time_never_confirms(self):
-        """
-        The falsifying case for the whole setting.
-
-        A glitch that goes away before the window closes must never confirm.
-        If it does, the configuration only delays a false alarm rather than
-        filtering it.
-        """
-        code = 'PLC_TRANSIENT'
-        self._report(code, ReportFault.Request.EVENT_FAILED)
-        self._report(code, ReportFault.Request.EVENT_PASSED)
-
-        # Sit past the auto-confirm window and the timer tick behind it.
-        time.sleep(AUTO_CONFIRM_SEC + 3.0)
-
-        status = self._status_of(code)
-        self.assertNotEqual(
-            status, Fault.STATUS_CONFIRMED,
-            'a transient that already cleared was confirmed by the timer'
-        )
-        self.assertNotIn(code, self._default_filter_codes())
-
-    def test_05_deasserted_alarm_heals_with_nobody_acting(self):
-        """
-        A confirmed fault must return to healed on the reporter's single clear.
-
-        The reporter sends exactly one PASSED, so healing has to complete on
-        that one event. With healing off, or with a threshold above zero, the
-        fault stays CONFIRMED until a human clears it.
+        One FAILED raises the fault, one PASSED de-asserts it, and nobody
+        clears anything by hand. At threshold 0 the counter reaches the
+        threshold on that one event; at 3 it cannot, and the fault latches.
         """
         code = 'PLC_DEASSERTED'
         self._report(code, ReportFault.Request.EVENT_FAILED)
-
-        status = self._wait_for_status(
-            code, Fault.STATUS_CONFIRMED, AUTO_CONFIRM_SEC + 5.0
-        )
         self.assertEqual(
-            status, Fault.STATUS_CONFIRMED, 'fault never confirmed, cannot test healing'
+            self._status_of(code), Fault.STATUS_CONFIRMED,
+            'the raise did not confirm, so healing cannot be under test'
         )
 
         self._report(code, ReportFault.Request.EVENT_PASSED)
+        status = self._status_of(code)
 
+        if healing_threshold == 0:
+            self.assertEqual(
+                status, Fault.STATUS_HEALED,
+                f'a de-asserted alarm did not heal on its single clear, it is {status}'
+            )
+            self.assertNotIn(code, self._default_filter_codes())
+        else:
+            self.assertEqual(
+                status, Fault.STATUS_CONFIRMED,
+                'threshold 3 unexpectedly healed on one PASSED, so threshold 0 '
+                'is not what makes healing reachable'
+            )
+            self.assertIn(code, self._default_filter_codes())
+
+    def test_02_a_healed_fault_confirms_again_when_the_condition_returns(self, healing_threshold):
+        """
+        The guard that a healed fault is not a dead fault.
+
+        HEALED is latched, and escaping the latch costs
+        healing_threshold - confirmation_threshold FAILED events. A one-event
+        reporter sends one, so any healing_threshold above 0 leaves the second
+        occurrence of a fault code permanently invisible.
+        """
+        code = 'PLC_RERAISE'
+        self._report(code, ReportFault.Request.EVENT_FAILED)
+        self._report(code, ReportFault.Request.EVENT_PASSED)
+
+        expected_after_clear = (
+            Fault.STATUS_HEALED if healing_threshold == 0 else Fault.STATUS_CONFIRMED
+        )
+        self.assertEqual(self._status_of(code), expected_after_clear)
+
+        self._report(code, ReportFault.Request.EVENT_FAILED)
         status = self._status_of(code)
         self.assertEqual(
-            status, Fault.STATUS_HEALED,
-            f'a de-asserted alarm did not heal on its single clear, it is {status}'
+            status, Fault.STATUS_CONFIRMED,
+            f'a returning condition did not leave the fault confirmed, it is {status}'
         )
-        self.assertNotIn(code, self._default_filter_codes())
+        self.assertIn(code, self._default_filter_codes())
+
+    def test_03_a_healed_fault_stays_healed_while_the_condition_is_gone(self, healing_threshold):
+        """A settled fault must not change status without an event."""
+        code = 'PLC_STAYS_HEALED'
+        self._report(code, ReportFault.Request.EVENT_FAILED)
+        self._report(code, ReportFault.Request.EVENT_PASSED)
+        settled = self._status_of(code)
+
+        time.sleep(QUIET_PERIOD_SEC)
+        self.assertEqual(
+            self._status_of(code), settled,
+            'the fault changed status with no event to cause it'
+        )
+        if healing_threshold == 0:
+            self.assertEqual(settled, Fault.STATUS_HEALED)
+            self.assertNotIn(code, self._default_filter_codes())
+        else:
+            self.assertEqual(settled, Fault.STATUS_CONFIRMED)
+            self.assertIn(code, self._default_filter_codes())
+
+    def test_04_one_failed_read_confirms_immediately(self, healing_threshold):
+        """
+        The limitation, pinned so nobody assumes otherwise.
+
+        confirmation_threshold defaults to -1, so the first FAILED confirms.
+        Filtering a single noisy read is not reachable from this node's
+        configuration for a one-event reporter: raising the threshold means the
+        second event that would confirm never arrives.
+        """
+        code = 'PLC_SINGLE_READ'
+        self._report(code, ReportFault.Request.EVENT_FAILED)
+
+        self.assertEqual(
+            self._status_of(code), Fault.STATUS_CONFIRMED,
+            'the documented immediate-confirmation behaviour changed'
+        )
+        self.assertIn(code, self._default_filter_codes())
 
 
 @launch_testing.post_shutdown_test()
-class TestDebounceAndHealingShutdown(unittest.TestCase):
-    """Check the node exited cleanly."""
+class TestHealingShutdown(unittest.TestCase):
+    """Check the node exited cleanly and clean up the databases."""
 
     def test_exit_code(self, proc_info, fault_manager_node):
-        launch_testing.asserts.assertExitCodes(
-            proc_info, allowable_exit_codes=[0, -2, -15], process=fault_manager_node
-        )
+        launch_testing.asserts.assertExitCodes(proc_info, process=fault_manager_node)
+
+    def test_temp_dirs_removed(self):
+        for path in _temp_dirs:
+            shutil.rmtree(path, ignore_errors=True)

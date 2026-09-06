@@ -72,34 +72,38 @@ The fault manager uses AUTOSAR DEM-style debounce filtering to prevent fault fla
 
 .. tip::
 
-   For immediate fault confirmation (no debounce), set ``confirmation_threshold: 0``.
+   For immediate fault confirmation (no debounce), set ``confirmation_threshold: -1``,
+   which is also the default. ``0`` is rejected: the threshold must be strictly
+   negative, and the node falls back to ``-1`` with a warning.
    Faults with ``SEVERITY_CRITICAL`` always bypass debounce regardless of this setting.
 
 .. important::
 
    The counter only moves when an event arrives, so ``confirmation_threshold`` and
-   ``healing_threshold`` work only for a reporter that keeps sending FAILED while the condition
-   is still there.
+   ``healing_threshold`` are tunable only for a reporter that keeps sending events while a
+   condition holds. Confirmation needs repeated FAILED; healing needs repeated PASSED.
 
    A reporter that sends one FAILED when a condition appears and one clear when it goes away
    never sends the second event. ``confirmation_threshold: -3`` then leaves the fault in
-   PREFAILED forever, and the default fault list returns CONFIRMED only, so the fault is never
-   seen. ``healing_threshold: 3`` has the same problem: healing needs
-   ``healing_threshold - confirmation_threshold`` consecutive PASSED events, and only one is
-   sent, so the fault stays CONFIRMED until someone calls ``~/clear_fault``.
+   PREFAILED, and the default fault list returns CONFIRMED only, so the fault is never seen.
+   Healing has the same shape: it needs ``healing_threshold - confirmation_threshold``
+   consecutive PASSED events counted from where the fault confirmed, and only one is sent.
 
-   For such a reporter, filter by time instead of by count:
+   For such a reporter, leave the confirmation threshold alone and make healing reachable:
 
    .. code-block:: yaml
 
-      confirmation_threshold: -2      # first FAILED stays PREFAILED
-      auto_confirm_after_sec: 3.0     # confirm it if it is still there after 3 s
-      healing_enabled: true
-      healing_threshold: 0            # heal on the single PASSED
+      fault_manager:
+        ros__parameters:
+          confirmation_threshold: -1    # the default; the single FAILED confirms
+          healing_enabled: true
+          healing_threshold: 0          # heal on the single PASSED
 
-   Choose ``auto_confirm_after_sec`` from how often the reporter samples, so a condition has to
-   survive a few sampling cycles before it confirms. A glitch that clears in time never reaches
-   CONFIRMED, because the clear takes the fault out of PREFAILED before the timer fires.
+   ``auto_confirm_after_sec`` promotes a fault that stayed PREFAILED for that long and looks
+   like it would allow a deeper threshold. It does not: HEALED is latched, leaving that latch
+   costs ``healing_threshold - confirmation_threshold`` FAILED events, and a one-event reporter
+   sends one. The second occurrence of a fault code would then never confirm again. Filter
+   noisy samples in the reporter instead, where the samples are.
 
 Near-Miss Retention
 ~~~~~~~~~~~~~~~~~~~

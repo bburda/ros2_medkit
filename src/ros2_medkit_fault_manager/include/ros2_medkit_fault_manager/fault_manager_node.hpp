@@ -172,6 +172,11 @@ class FaultManagerNode : public rclcpp::Node {
   /// @param event_type One of FaultEvent::EVENT_CONFIRMED, EVENT_CLEARED, EVENT_UPDATED
   /// @param fault The fault data associated with this event
   /// @param auto_cleared_codes Optional list of auto-cleared symptom fault codes (for EVENT_CLEARED)
+  /// Enqueue snapshot + rosbag capture for a fault that has just confirmed.
+  /// Shared by the report path and the time-based confirmation timer so a
+  /// confirmation produces the same evidence whichever one produced it.
+  void capture_on_confirm(const std::string & fault_code);
+
   void publish_fault_event(const std::string & event_type, const ros2_medkit_msgs::msg::Fault & fault,
                            const std::vector<std::string> & auto_cleared_codes = {});
 

@@ -236,6 +236,8 @@ For systems that need to filter transient faults, enable debounce filtering by s
 ### Configuration
 
 ```bash
+# For a reporter that repeats its events while a condition holds.
+# See "Choosing the right lever for your reporter" below before copying this.
 ros2 run ros2_medkit_fault_manager fault_manager_node --ros-args \
   -p confirmation_threshold:=-3 \
   -p healing_enabled:=true \
@@ -280,18 +282,22 @@ Pick by how your reporter behaves:
 
 | Reporter repeats FAILED while the condition holds | Reporter sends one event per transition |
 |---|---|
-| `confirmation_threshold: -N` filters N noisy samples | `confirmation_threshold: -2` plus `auto_confirm_after_sec` |
-| `healing_threshold: N` needs N clean samples | `healing_threshold: 0` heals on the single PASSED |
+| `confirmation_threshold: -N` confirms on the Nth FAILED, so it rides out N-1 noisy samples | `confirmation_threshold` cannot filter here; see below |
+| `healing_threshold: N` needs `N - confirmation_threshold` clean samples | `healing_threshold: 0` heals on the single PASSED |
 
-For the second column the filtering is done by time, not by count. `confirmation_threshold: -2`
-keeps the first FAILED in PREFAILED, and `auto_confirm_after_sec` confirms it if it is still there
-when the timeout expires. Choose the timeout from how often the reporter samples, so a condition
-has to survive a few sampling cycles before it confirms. A glitch that clears in time never
-reaches CONFIRMED, because a clear takes the fault out of PREFAILED before the timer fires.
+For the second column, `auto_confirm_after_sec` looks like it fills the gap: it promotes a fault
+that has stayed PREFAILED for that long, without changing the counter. Pairing it with
+`confirmation_threshold: -2` does keep a single FAILED out of CONFIRMED. It also has a trap. HEALED
+is latched, and leaving that latch costs `healing_threshold - confirmation_threshold` FAILED
+events, which at `-2` is two. A reporter that sends one means the SECOND occurrence of a fault code
+never confirms again, and `occurrence_count` does not move either. Prefer leaving
+`confirmation_threshold` at `-1` for such a reporter, and filter noisy samples in the reporter
+itself, where the samples are.
 
-Two settings ignore the counter completely. `SEVERITY_CRITICAL` confirms at once while
-`critical_immediate_confirm` is true, which is the default. `auto_confirm_after_sec` promotes a
-PREFAILED fault without changing its counter.
+Two things ignore the counter. `SEVERITY_CRITICAL` confirms at once unless
+`critical_immediate_confirm` is turned off in the debounce config, and that field is not exposed as
+a ROS parameter. `auto_confirm_after_sec` promotes on elapsed time since the last FAILED, which is
+not the same as observing that the condition is still there.
 
 ### Fault Lifecycle with Debounce
 
