@@ -1052,8 +1052,7 @@ void OpcuaPlugin::on_alarm_change(const std::string & entity_id,
     // link-state event as the connect-time one. Every other code here is the
     // device reporting its condition inactive, which is a real resolution and a
     // one-shot edge, so it keeps the cascade and the buffer treats it as such.
-    send_clear_fault(signal.fault_code,
-                     signal.fault_code == kCommsLostFaultCode ? ClearOrigin::LinkState : ClearOrigin::DeviceAlarm);
+    send_clear_fault(signal.fault_code, clear_origin_for_signal(signal.fault_code));
   }
 }
 
@@ -1311,7 +1310,7 @@ void OpcuaPlugin::clear_comms_lost_on_connect() {
   // not cascade-clear the symptoms the outage produced. It is also the one clear
   // the next reconnect re-derives, so the pending buffer may drop it before
   // anything one-shot.
-  log_info(std::string("OPC-UA connection established; clearing any standing ") + kCommsLostFaultCode);
+  log_info(std::string("OPC-UA connection established, clearing any standing ") + kCommsLostFaultCode);
   send_clear_fault(kCommsLostFaultCode, ClearOrigin::LinkState);
 }
 
@@ -1723,7 +1722,7 @@ std::optional<std::string> OpcuaPlugin::discover_endpoint(const OpcuaDiscoveryCo
 
   const auto subnets = discovery.resolve_subnets();
   if (subnets.empty()) {
-    warn_line("OPC-UA discovery: no subnet configured and could not derive a local /24; nothing to scan.");
+    warn_line("OPC-UA discovery: no subnet configured and could not derive a local /24, nothing to scan.");
     emit();
     return std::nullopt;
   }
@@ -1779,7 +1778,7 @@ std::optional<std::string> OpcuaPlugin::discover_endpoint(const OpcuaDiscoveryCo
   const DiscoveredEndpoint * chosen = NetworkDiscovery::select_auto_endpoint(found, config.anonymous_none_only);
   if (chosen == nullptr) {
     warn_line(
-        "OPC-UA discovery: no auto-connectable None/Anonymous data server found; leaving the endpoint unchanged. "
+        "OPC-UA discovery: no auto-connectable None/Anonymous data server found, leaving the endpoint unchanged. "
         "Secured-only servers require operator credentials.");
     emit();
     return std::nullopt;
@@ -1796,7 +1795,7 @@ void OpcuaPlugin::run_startup_discovery() {
   }
   if (endpoint_configured_) {
     log_info("OPC-UA discovery enabled but endpoint_url is explicitly configured (" + client_config_.endpoint_url +
-             "); skipping auto-discovery to avoid a second session.");
+             "). Skipping auto-discovery to avoid a second session.");
     return;
   }
 
@@ -1824,11 +1823,11 @@ void OpcuaPlugin::run_startup_discovery() {
     // which of the two they configured.
     const int startup_interval_s = effective_rescan_interval_s(discovery_config_, endpoint_configured_);
     if (startup_interval_s > 0) {
-      log_info("OPC-UA discovery: startup scan selected no endpoint; the reconnect loop rescans every " +
+      log_info("OPC-UA discovery: startup scan selected no endpoint. The reconnect loop rescans every " +
                std::to_string(startup_interval_s) + "s while down.");
     } else {
       log_warn(
-          "OPC-UA discovery: startup scan selected no endpoint and re-scanning is off (interval_s: 0); the endpoint "
+          "OPC-UA discovery: startup scan selected no endpoint and re-scanning is off (interval_s: 0). The endpoint "
           "stays at " +
           client_config_.endpoint_url + " until the plugin is restarted.");
     }
@@ -1840,13 +1839,10 @@ void OpcuaPlugin::run_startup_discovery() {
 }
 
 bool OpcuaPlugin::discovery_cancelled() const {
-  // Either stop signal ends a sweep. shutdown() is what ends a RESCAN (it runs
-  // on the poll thread, long after start-up). rclcpp::ok() going false is what
-  // ends the STARTUP sweep, which runs during node construction where shutdown()
-  // is not reachable yet. Checking both in one predicate keeps the two sweeps
-  // from drifting apart, and rclcpp::ok() only reads the default context's
-  // atomic shutdown flag, so it is safe to call from either thread.
-  return shutdown_requested_.load() || !rclcpp::ok();
+  // rclcpp::ok() only reads the default context's atomic shutdown flag, so it is
+  // safe to call from the set_context thread and the poll thread alike. The rule
+  // itself, and why both signals are needed, lives in discovery_cancelled_for.
+  return discovery_cancelled_for(shutdown_requested_.load(), rclcpp::ok());
 }
 
 OpcuaPlugin::DiscoveryReporter OpcuaPlugin::discovery_reporter(std::string * previous_outcome) const {

@@ -45,7 +45,9 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -53,6 +55,8 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <ros2_medkit_msgs/srv/clear_fault.hpp>
+#include <ros2_medkit_msgs/srv/report_fault.hpp>
 
 #include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 
@@ -193,17 +197,28 @@ class AlarmServer {
     if (pipe(pipefd) != 0) {
       return false;
     }
+    int stdin_pipe[2];
+    if (pipe(stdin_pipe) != 0) {
+      close(pipefd[0]);
+      close(pipefd[1]);
+      return false;
+    }
     pid_ = fork();
     if (pid_ < 0) {
       close(pipefd[0]);
       close(pipefd[1]);
+      close(stdin_pipe[0]);
+      close(stdin_pipe[1]);
       return false;
     }
     if (pid_ == 0) {
       dup2(pipefd[1], STDOUT_FILENO);
       dup2(pipefd[1], STDERR_FILENO);
+      dup2(stdin_pipe[0], STDIN_FILENO);
       close(pipefd[0]);
       close(pipefd[1]);
+      close(stdin_pipe[0]);
+      close(stdin_pipe[1]);
       std::string port_str = std::to_string(port);
       std::vector<const char *> argv_vec{binary.c_str(), "--port", port_str.c_str()};
       for (const auto & arg : extra_args) {
@@ -214,11 +229,27 @@ class AlarmServer {
       _exit(127);
     }
     close(pipefd[1]);
+    close(stdin_pipe[0]);
     read_fd_ = pipefd[0];
+    write_fd_ = stdin_pipe[1];
     return wait_for_ready(15000);
   }
 
+  // One CLI command ("fire Overpressure 750", "clear Overpressure", ...). The
+  // fixture reads them line by line off stdin.
+  bool send(const std::string & command) {
+    if (write_fd_ < 0) {
+      return false;
+    }
+    const std::string line = command + "\n";
+    return write(write_fd_, line.c_str(), line.size()) == static_cast<ssize_t>(line.size());
+  }
+
   void stop() {
+    if (write_fd_ >= 0) {
+      close(write_fd_);
+      write_fd_ = -1;
+    }
     if (pid_ > 0) {
       kill(pid_, SIGTERM);
       int status = 0;
@@ -258,6 +289,7 @@ class AlarmServer {
 
   pid_t pid_{-1};
   int read_fd_{-1};
+  int write_fd_{-1};
 };
 
 std::string fixture_binary() {
@@ -629,6 +661,227 @@ TEST_F(OpcuaIdentityE2ETest, SuccessfulConnectClearsCommsLostNeverRaisedHere) {
   EXPECT_EQ(std::find(signals.begin(), signals.end(), std::make_pair(std::string(kCommsLostFaultCode), true)),
             signals.end())
       << "comms-lost must not be raised while the connection is up";
+}
+
+namespace {
+
+// RAII rclcpp init/shutdown, tearing down only what it started.
+struct ScopedRclcpp {
+  const bool owned_;
+  ScopedRclcpp() : owned_(!rclcpp::ok()) {
+    if (owned_) {
+      rclcpp::init(0, nullptr);
+    }
+  }
+  ~ScopedRclcpp() {
+    if (owned_ && rclcpp::ok()) {
+      rclcpp::shutdown();
+    }
+  }
+  ScopedRclcpp(const ScopedRclcpp &) = delete;
+  ScopedRclcpp & operator=(const ScopedRclcpp &) = delete;
+};
+
+// The plugin only builds its fault-service clients when the context hands it a
+// real node, which is what makes the ClearFault request observable on the wire.
+class RealNodePluginContext : public FakePluginContext {
+ public:
+  explicit RealNodePluginContext(rclcpp::Node * node) : node_(node) {
+  }
+  rclcpp::Node * node() const override {
+    return node_;
+  }
+
+ private:
+  rclcpp::Node * node_;
+};
+
+}  // namespace
+
+// The connect-time clear, read off the wire. clear_comms_lost_on_connect() is
+// only reachable through a connect that SUCCEEDS, so it needs the live fixture,
+// and the flag it sets is only observable with a real fault-manager service on
+// the other end. A correlation rule may name PLC_COMMS_LOST as the root cause of
+// every symptom an outage produced, and the link coming back is not an operator
+// resolving those, so this clear must not cascade.
+TEST_F(OpcuaIdentityE2ETest, ConnectTimeCommsLostClearSkipsTheCorrelationCascade) {
+  ScopedRclcpp rclcpp_scope;
+  auto node = std::make_shared<rclcpp::Node>("opcua_identity_connect_clear");
+  auto fault_manager = std::make_shared<rclcpp::Node>("opcua_identity_connect_clear_faultmgr");
+
+  std::mutex received_mutex;
+  std::vector<ros2_medkit_msgs::srv::ClearFault::Request> cleared_requests;
+  auto report_srv = fault_manager->create_service<ros2_medkit_msgs::srv::ReportFault>(
+      "/fault_manager/report_fault", [](const std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Request>,
+                                        std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Response> res) {
+        res->accepted = true;
+      });
+  auto clear_srv = fault_manager->create_service<ros2_medkit_msgs::srv::ClearFault>(
+      "/fault_manager/clear_fault",
+      [&cleared_requests, &received_mutex](const std::shared_ptr<ros2_medkit_msgs::srv::ClearFault::Request> req,
+                                           std::shared_ptr<ros2_medkit_msgs::srv::ClearFault::Response> res) {
+        {
+          std::lock_guard<std::mutex> lock(received_mutex);
+          cleared_requests.push_back(*req);
+        }
+        res->success = true;
+      });
+
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(node);
+  executor.add_node(fault_manager);
+  std::thread spin_thread([&executor]() {
+    executor.spin();
+  });
+
+  const std::string yaml_path = write_minimal_node_map();
+  OpcuaPlugin plugin;
+  nlohmann::json config;
+  config["endpoint_url"] = endpoint_;
+  config["node_map_path"] = yaml_path;
+  config["poll_interval_ms"] = 100;
+  plugin.configure(config);
+
+  RealNodePluginContext ctx(node.get());
+  ctx.entities["tank"] = {SovdEntityType::APP, "tank", "/test_plc", "/test_plc/test_runtime/tank"};
+  // The connect inside set_context() succeeds against the fixture, which is the
+  // only way to reach the connect-time clear.
+  plugin.set_context(ctx);
+
+  // The clear may be buffered until the stub service is DDS-matched. The poll
+  // thread drains the buffer on its next cycle.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  bool delivered = false;
+  while (!delivered && std::chrono::steady_clock::now() < deadline) {
+    {
+      std::lock_guard<std::mutex> lock(received_mutex);
+      delivered = !cleared_requests.empty();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  executor.cancel();
+  if (spin_thread.joinable()) {
+    spin_thread.join();
+  }
+  plugin.shutdown();
+  std::remove(yaml_path.c_str());
+
+  std::lock_guard<std::mutex> lock(received_mutex);
+  ASSERT_FALSE(cleared_requests.empty()) << "a successful connect sent no ClearFault at all";
+  EXPECT_EQ(cleared_requests.front().fault_code, std::string(kCommsLostFaultCode));
+  EXPECT_TRUE(cleared_requests.front().skip_correlation_auto_clear)
+      << "the connect-time clear cascade-cleared the symptoms of the outage it ended";
+}
+
+// The other side of the same rule, also on the wire: when the DEVICE reports its
+// condition inactive, that IS a resolution at the source, so the correlation
+// engine may act on it and the flag stays off. Only a live AlarmCondition
+// lifecycle reaches on_event_alarm's ClearFault arm, so this drives the
+// fixture's own CLI to fire and then clear a condition.
+TEST_F(OpcuaIdentityE2ETest, DeviceReportedAlarmClearKeepsTheCorrelationCascade) {
+  ScopedRclcpp rclcpp_scope;
+  auto node = std::make_shared<rclcpp::Node>("opcua_identity_device_clear");
+  auto fault_manager = std::make_shared<rclcpp::Node>("opcua_identity_device_clear_faultmgr");
+
+  std::mutex received_mutex;
+  std::vector<std::string> reported;
+  std::vector<ros2_medkit_msgs::srv::ClearFault::Request> cleared_requests;
+  auto report_srv = fault_manager->create_service<ros2_medkit_msgs::srv::ReportFault>(
+      "/fault_manager/report_fault",
+      [&reported, &received_mutex](const std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Request> req,
+                                   std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Response> res) {
+        {
+          std::lock_guard<std::mutex> lock(received_mutex);
+          reported.push_back(req->fault_code);
+        }
+        res->accepted = true;
+      });
+  auto clear_srv = fault_manager->create_service<ros2_medkit_msgs::srv::ClearFault>(
+      "/fault_manager/clear_fault",
+      [&cleared_requests, &received_mutex](const std::shared_ptr<ros2_medkit_msgs::srv::ClearFault::Request> req,
+                                           std::shared_ptr<ros2_medkit_msgs::srv::ClearFault::Response> res) {
+        {
+          std::lock_guard<std::mutex> lock(received_mutex);
+          cleared_requests.push_back(*req);
+        }
+        res->success = true;
+      });
+
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(node);
+  executor.add_node(fault_manager);
+  std::thread spin_thread([&executor]() {
+    executor.spin();
+  });
+
+  OpcuaPlugin plugin;
+  nlohmann::json config;
+  config["endpoint_url"] = endpoint_;
+  config["poll_interval_ms"] = 100;
+  // Zero-config native A&C on the Server EventNotifier, with auto_clear so the
+  // condition going inactive clears the fault without an operator ack/confirm.
+  config["auto_alarms"] = nlohmann::json{{"enabled", true}, {"auto_clear", true}};
+  plugin.configure(config);
+
+  RealNodePluginContext ctx(node.get());
+  plugin.set_context(ctx);
+
+  const auto reported_count = [&received_mutex, &reported]() {
+    std::lock_guard<std::mutex> lock(received_mutex);
+    return reported.size();
+  };
+  // The connect-time PLC_COMMS_LOST clear also lands here (this connect
+  // succeeded), so a clear is looked up by the code it names.
+  const auto clear_for = [&received_mutex, &cleared_requests](const std::string & code) -> std::optional<bool> {
+    std::lock_guard<std::mutex> lock(received_mutex);
+    for (const auto & req : cleared_requests) {
+      if (req.fault_code == code) {
+        return req.skip_correlation_auto_clear;
+      }
+    }
+    return std::nullopt;
+  };
+
+  // Fire until the event subscription is up and a report lands. The retry is the
+  // subscription handshake, not flakiness in the assertion: an event fired
+  // before the subscribe simply is not delivered.
+  const auto fire_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (reported_count() == 0 && std::chrono::steady_clock::now() < fire_deadline) {
+    ASSERT_TRUE(server_.send("fire Overpressure 750"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  }
+  ASSERT_GT(reported_count(), 0u) << "the fixture's AlarmCondition never reached the fault manager";
+
+  std::string alarm_code;
+  {
+    std::lock_guard<std::mutex> lock(received_mutex);
+    alarm_code = reported.front();
+  }
+  ASSERT_TRUE(server_.send("clear Overpressure"));
+  const auto clear_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!clear_for(alarm_code).has_value() && std::chrono::steady_clock::now() < clear_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  executor.cancel();
+  if (spin_thread.joinable()) {
+    spin_thread.join();
+  }
+  plugin.shutdown();
+
+  const auto device_clear_skips = clear_for(alarm_code);
+  ASSERT_TRUE(device_clear_skips.has_value())
+      << "the device reporting condition " << alarm_code << " inactive sent no ClearFault";
+  EXPECT_FALSE(*device_clear_skips) << "a clear the device itself reported must keep the correlation cascade";
+
+  // The connect-time clear travelled the same wire in the same test, and it is
+  // the opposite case: not an operator resolving anything, so it does not
+  // cascade. Having both here is what makes the flag above a decision rather
+  // than a constant.
+  const auto link_state_clear_skips = clear_for(kCommsLostFaultCode);
+  ASSERT_TRUE(link_state_clear_skips.has_value()) << "the connect-time clear never arrived";
+  EXPECT_TRUE(*link_state_clear_skips);
 }
 
 }  // namespace ros2_medkit_gateway

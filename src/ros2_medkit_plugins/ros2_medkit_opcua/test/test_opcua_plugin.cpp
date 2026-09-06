@@ -963,10 +963,11 @@ TEST(DiscoverEndpoint, AnUnchangedRescanReportsAtDebugInsteadOfRepeatingItself) 
 }
 
 TEST(DiscoverEndpoint, APredicateThatFlipsMidSweepEndsThePass) {
-  // What a stop signal does to a sweep in progress. The plugin hands
-  // discover_endpoint a predicate that answers for both stop signals (the
-  // shutdown flag and rclcpp::ok()). Here it flips after a handful of probes,
-  // as either would mid-sweep.
+  // What a stop signal does to a sweep in progress. This predicate is the
+  // test's own, standing in for the one the plugin passes: it flips after a
+  // handful of probes, as either of the plugin's two stop signals would
+  // mid-sweep. The plugin's own predicate is pinned separately, by
+  // DiscoveryCancelledFor.
   std::atomic<int> probes{0};
   std::atomic<bool> stop{false};
   auto stopping_scan = [&probes, &stop](const std::string & ip, uint16_t port, int) {
@@ -1114,8 +1115,51 @@ TEST(RederivedComponentIdentity, KeepsTheIdentityWhenNothingChanged) {
 }
 
 // ---------------------------------------------------------------------------
+// The stop signals a discovery sweep watches
+// ---------------------------------------------------------------------------
+
+TEST(DiscoveryCancelledFor, EitherStopSignalEndsASweep) {
+  // The plugin's own predicate is this rule applied to two values it reads off
+  // the process, so this is the whole of it.
+  EXPECT_FALSE(OpcuaPlugin::discovery_cancelled_for(/*shutdown_requested=*/false, /*rclcpp_ok=*/true))
+      << "a running process must not cancel its own sweep";
+  // shutdown() ends a rescan sweep on the poll thread.
+  EXPECT_TRUE(OpcuaPlugin::discovery_cancelled_for(/*shutdown_requested=*/true, /*rclcpp_ok=*/true));
+  // SIGINT / SIGTERM ends the start-up sweep, which runs during node
+  // construction where shutdown() cannot be reached at all.
+  EXPECT_TRUE(OpcuaPlugin::discovery_cancelled_for(/*shutdown_requested=*/false, /*rclcpp_ok=*/false))
+      << "a signal during the start-up sweep left it running";
+  EXPECT_TRUE(OpcuaPlugin::discovery_cancelled_for(true, false));
+}
+
+TEST(DiscoveryCancelledFor, RclcppOkIsTheSignalTheStartUpSweepWatches) {
+  // The second input is not hypothetical: rclcpp's shutdown is what a SIGTERM
+  // turns into, and it is observable exactly this way. A private context keeps
+  // the process-wide default one (which other tests here initialise) untouched.
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  ASSERT_TRUE(rclcpp::ok(context));
+  EXPECT_FALSE(OpcuaPlugin::discovery_cancelled_for(/*shutdown_requested=*/false, rclcpp::ok(context)));
+
+  context->shutdown("simulated SIGTERM");
+  ASSERT_FALSE(rclcpp::ok(context)) << "rclcpp::ok did not follow the shutdown a signal performs";
+  EXPECT_TRUE(OpcuaPlugin::discovery_cancelled_for(/*shutdown_requested=*/false, rclcpp::ok(context)));
+}
+
+// ---------------------------------------------------------------------------
 // ClearFault: only a clear the device itself reported may cascade
 // ---------------------------------------------------------------------------
+
+TEST(ClearOriginForSignal, OnlyTheCommsLostCodeIsALinkStateClear) {
+  // The poller emits its component-scoped comms-lost clear through the same
+  // callback as every device alarm going inactive, so the fault code is the only
+  // thing that tells the two apart on that path.
+  EXPECT_EQ(OpcuaPlugin::clear_origin_for_signal(kCommsLostFaultCode), OpcuaPlugin::ClearOrigin::LinkState);
+  EXPECT_EQ(OpcuaPlugin::clear_origin_for_signal("PLC_TANK_HIGH"), OpcuaPlugin::ClearOrigin::DeviceAlarm);
+  EXPECT_EQ(OpcuaPlugin::clear_origin_for_signal(std::string(kCommsLostFaultCode) + "_UPSTREAM"),
+            OpcuaPlugin::ClearOrigin::DeviceAlarm)
+      << "the match must be the exact code, not a prefix";
+}
 
 TEST(ClearOrigin, OnlyADeviceReportedClearKeepsTheCorrelationCascade) {
   using Origin = OpcuaPlugin::ClearOrigin;
@@ -1851,7 +1895,7 @@ nodes:
   OpcuaPlugin plugin;
   nlohmann::json config;
   config["node_map_path"] = yaml_path;
-  config["endpoint_url"] = "opc.tcp://127.0.0.1:1";  // nothing listening; the fault sink is the subject
+  config["endpoint_url"] = "opc.tcp://127.0.0.1:1";  // nothing listening, the fault sink is the subject
   config["poll_interval_ms"] = 100;
   plugin.configure(config);
 

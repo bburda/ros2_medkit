@@ -283,6 +283,30 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
     return origin == ClearOrigin::LinkState;
   }
 
+  // Whether a discovery sweep must stop now, given the two independent stop
+  // signals. Static and pure so both inputs are testable: the member
+  // ``discovery_cancelled()`` only reads them off the process and hands them
+  // here, so this is the whole rule.
+  //
+  //   - ``shutdown_requested`` is set by shutdown(), which the gateway calls
+  //     after its executor returns. That ends a RESCAN sweep, which runs on the
+  //     poll thread long after start-up.
+  //   - ``rclcpp_ok`` is false once rclcpp's own SIGINT / SIGTERM handler has
+  //     run. The START-UP sweep runs inside set_context(), during node
+  //     construction and before the executor spins, so shutdown() cannot be
+  //     reached while it is in progress and the signal is the only thing that
+  //     can end it.
+  static bool discovery_cancelled_for(bool shutdown_requested, bool rclcpp_ok) {
+    return shutdown_requested || !rclcpp_ok;
+  }
+
+  // Which kind of clear a fault-detection signal going inactive is. The poller
+  // emits the component-scoped ``PLC_COMMS_LOST`` clear through the same
+  // callback as every device alarm, and only that one is a link-state event.
+  static ClearOrigin clear_origin_for_signal(const std::string & fault_code) {
+    return fault_code == kCommsLostFaultCode ? ClearOrigin::LinkState : ClearOrigin::DeviceAlarm;
+  }
+
   // Build the ClearFault request for one fault code.
   // ``skip_correlation_auto_clear`` goes on the wire verbatim (see ClearOrigin
   // for who sets it and why). Static so the wire field is assertable without a
@@ -295,7 +319,7 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   struct PendingFaultDispatch {
     enum class Kind { Report, Clear };
     Kind kind{Kind::Report};
-    std::string fault_code;  ///< dedup key for a Clear; diagnostic for a Report
+    std::string fault_code;  ///< dedup key for a Clear, diagnostic for a Report
     /// Clear only: this dispatch is re-derivable (ClearOrigin::LinkState), so
     /// the buffer may drop it before anything that is not.
     bool link_state{false};
@@ -308,7 +332,8 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
     ReplacedClear,          ///< superseded the pending clear for the same fault code
     EvictedLinkStateClear,  ///< buffer was full: dropped a re-derivable clear to make room
     EvictedOldest,          ///< buffer was full with nothing re-derivable in it: dropped the oldest entry
-    Refused                 ///< buffer was full with nothing re-derivable and the incoming clear was
+    Refused                 ///< buffer was full with nothing re-derivable in it and the incoming
+                            ///< dispatch was itself a re-derivable clear, so it was dropped instead
   };
 
   // Enqueue policy for the bounded pending-dispatch buffer.
@@ -425,16 +450,9 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   // (null to report every pass in full).
   DiscoveryReporter discovery_reporter(std::string * previous_outcome) const;
 
-  // Abort predicate handed to a discovery sweep. Two independent stop signals,
-  // because the two sweeps run at different points in the process lifetime:
-  //   - ``shutdown_requested_`` is set by shutdown(), which the gateway calls
-  //     after its executor returns. That ends a RESCAN sweep, which runs on the
-  //     poll thread long after start-up.
-  //   - ``rclcpp::ok()`` turns false as soon as rclcpp's own SIGINT / SIGTERM
-  //     handler runs. The STARTUP sweep runs inside set_context(), i.e. during
-  //     node construction and before the executor spins, so shutdown() cannot
-  //     be reached while it is in progress and the signal is the only thing
-  //     that can end it.
+  // Abort predicate handed to a discovery sweep: reads the two stop signals off
+  // the process and applies ``discovery_cancelled_for``, which holds the rule
+  // and the reasoning behind it.
   bool discovery_cancelled() const;
 
   // Poll-thread hook bound into PollerConfig::rediscover_endpoint whenever
