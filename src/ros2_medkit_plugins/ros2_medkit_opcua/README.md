@@ -548,7 +548,7 @@ ros2_medkit_gateway:
 | `subscription_interval_ms` | `500` | Publishing interval for OPC-UA subscriptions when `prefer_subscriptions: true` |
 | `condition_replay_strategy` | `auto` | Active-condition replay on reconnect: `method`, `read`, `auto`, `off` (see below) |
 | `require_confirm_for_clear` | `true` | Require both Acknowledge AND Confirm before a native alarm auto-clears. Set `false` for Confirm-less servers (e.g. Siemens S7-1500) so alarms clear on Acknowledge alone (see below) |
-| `comms_lost_fault_enabled` | `true` | Raise a component-scoped `PLC_COMMS_LOST` fault when the connection stays down (issue #496) |
+| `comms_lost_fault_enabled` | `true` | Raise a component-scoped `PLC_COMMS_LOST` fault when the connection stays down, and clear it on every successful connect (issue #496) |
 | `comms_lost_debounce_ms` | `5000` | Continuous down time before `PLC_COMMS_LOST` is raised (debounces reconnect blips; clamped to [0, 3600000] ms) |
 | `comms_lost_severity` | `ERROR` | SOVD severity bucket for the `PLC_COMMS_LOST` fault |
 | `discovery.enabled` | `false` | Opt-in read-only PLC network discovery (auto endpoint). See below |
@@ -604,7 +604,7 @@ plugins.opcua.discovery:
   connect_timeout_ms: 600      # per-port TCP connect timeout
   scan_concurrency: 100        # bounded, polite concurrent connect count
   identify_timeout_ms: 6000    # per GetEndpoints identify
-  interval_s: 0                # 0 = one-shot at startup (periodic re-scan: TODO)
+  interval_s: 0                # re-scan cadence while disconnected (0 = default 30 s)
   anonymous_none_only: true    # only auto-connect None/Anonymous servers
 ```
 
@@ -625,6 +625,15 @@ How it works:
    auto-selects the best None/Anonymous data server (deterministic, lowest
    ip:port) and connects to the **scanned ip:port** - not the advertised
    EndpointUrl, which a server may report as a non-resolvable hostname.
+5. While no session is established, the reconnect loop scans again every
+   `interval_s` (default 30 s) and adopts a newly found server for its next
+   connect attempt, logging the swap at INFO. This is what covers the common
+   race where the gateway and the PLC boot together: the startup scan finds
+   nothing because the PLC is still coming up, and without a re-scan the plugin
+   would retry the fallback endpoint until someone restarted it.
+
+Re-scanning stops as soon as a session is up, and never starts at all when an
+`endpoint_url` is configured.
 
 Safety / OT posture:
 - Everything is read-only: TCP connect + `GetEndpoints` only. No writes, no
@@ -640,9 +649,9 @@ Safety / OT posture:
 Note on passive discovery: a stock Siemens S7-1500 neither multicast-announces
 (mDNS `_opcua-tcp._tcp`) nor registers with an OPC-UA LDS, so passive sources
 find nothing there; the active scan is what discovers it. Passive mDNS / LDS
-`FindServers` sources (useful on Kepware / Prosys / GDS estates) and periodic
-re-scan + multi-endpoint registration are planned follow-ups; this iteration
-delivers the active-scan core and single "auto endpoint" mode.
+`FindServers` sources (useful on Kepware / Prosys / GDS estates) and
+multi-endpoint registration are planned follow-ups. This iteration delivers the
+active-scan core and a single "auto endpoint" mode.
 
 ### Active-condition replay on reconnect (issue #389/#478)
 
@@ -693,6 +702,20 @@ Set `require_confirm_for_clear: false` (or `OPCUA_REQUIRE_CONFIRM_FOR_CLEAR=0`)
 so the alarm clears on `Acknowledge` alone. The default (`true`) is unchanged
 and spec-strict; the relaxed path still requires acknowledgement and needs
 real-S7-1500 validation.
+
+### Connection loss and `PLC_COMMS_LOST` (issue #496)
+
+When the OPC-UA connection stays down for `comms_lost_debounce_ms` continuously,
+the plugin raises one component-scoped `PLC_COMMS_LOST` fault (a shorter blip
+during a normal reconnect does not flap it).
+
+The fault is cleared on **every** successful connect, both the initial one and
+every later reconnect, whether or not this process was the one that raised it.
+The fault manager keys faults by fault code and persists them, so a fault raised
+before a gateway restart is still standing while the new process has no memory
+of it. Clearing only what the running process remembered left exactly that fault
+CONFIRMED for good. The clear is fire-and-forget, so a clear for a fault that is
+not there is harmless.
 
 Node map entries also support an optional `ros2_topic` field to override the auto-generated ROS 2 topic name for the PLC value bridge:
 

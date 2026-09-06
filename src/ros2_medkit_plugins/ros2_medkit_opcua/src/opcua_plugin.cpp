@@ -585,6 +585,7 @@ void OpcuaPlugin::set_context(PluginContext & context) {
   const bool connected = client_->connect(client_config_);
   if (connected) {
     log_info("Connected to OPC-UA server: " + client_config_.endpoint_url);
+    clear_comms_lost_on_connect();
   } else {
     log_warn("Failed to connect to OPC-UA server: " + client_config_.endpoint_url);
   }
@@ -660,6 +661,16 @@ void OpcuaPlugin::set_context(PluginContext & context) {
   poller_config_.report_sink_ready = [this]() {
     return fault_clients_->report && fault_clients_->report->service_is_ready();
   };
+  // Config-less discovery with no configured endpoint: let the poller's
+  // reconnect arm ask for a fresh scan while it is down. Without this the
+  // startup scan is the only one that ever runs, so a gateway that scanned
+  // while its PLC was still booting retries the fallback endpoint forever and
+  // only a restart finds the PLC.
+  if (effective_rescan_interval_s(discovery_config_, endpoint_configured_) > 0) {
+    poller_config_.rediscover_endpoint = [this]() {
+      return rescan_endpoint_for_reconnect();
+    };
+  }
   poller_->start(poller_config_);
   log_info("OPC-UA poller started (mode: " + std::string(poller_->using_subscriptions() ? "subscription" : "poll") +
            ")");
@@ -733,7 +744,11 @@ IntrospectionResult OpcuaPlugin::introspect(const IntrospectionInput & /*input*/
   // Fault scope grants bare-id ownership only to external entities; the poller
   // reports PLC_COMMS_LOST under this component's own id.
   comp.external = true;
-  comp.description = "PLC runtime connected at " + client_config_.endpoint_url;
+  // Read the endpoint off the client, not off client_config_: a reconnect
+  // rescan can adopt a different server after startup, and the client is the
+  // one that holds the endpoint actually being connected to.
+  const std::string live_endpoint = client_ ? client_->endpoint_url() : client_config_.endpoint_url;
+  comp.description = "PLC runtime connected at " + live_endpoint;
 
   // INV2: fill the asset-identity nameplate from the live server's device-info
   // (ServerStatus/BuildInfo + optional OPC-UA DI nameplate). Read once per
@@ -744,7 +759,7 @@ IntrospectionResult OpcuaPlugin::introspect(const IntrospectionInput & /*input*/
   if (client_ && client_->is_connected()) {
     const uint64_t session_generation = client_->connection_generation();
     if (session_generation != device_identity_generation_) {
-      device_identity_ = opcua_device_info_to_identity(client_->read_device_info(), client_config_.endpoint_url);
+      device_identity_ = opcua_device_info_to_identity(client_->read_device_info(), live_endpoint);
       device_identity_generation_ = session_generation;
       if (!device_identity_.empty()) {
         log_info("Populated asset identity from OPC-UA device-info (manufacturer='" + device_identity_.manufacturer +
@@ -1253,6 +1268,17 @@ void OpcuaPlugin::send_clear_fault(const std::string & fault_code) {
   });
 }
 
+void OpcuaPlugin::clear_comms_lost_on_connect() {
+  if (!poller_config_.comms_lost_fault_enabled) {
+    return;
+  }
+  // ClearFault is idempotent from this side: send_clear_fault is
+  // fire-and-forget, so a "Fault not found" answer for a code that was never
+  // raised costs nothing here and is the normal case on a healthy start.
+  log_info(std::string("OPC-UA connection established; clearing any standing ") + kCommsLostFaultCode);
+  send_clear_fault(kCommsLostFaultCode);
+}
+
 void OpcuaPlugin::send_or_buffer(std::function<void()> dispatch) {
   // Bound the buffer so a deployment with no fault_manager cannot grow it
   // without limit; drop the oldest (least relevant) pending dispatch.
@@ -1466,35 +1492,39 @@ void OpcuaPlugin::log_security_profile() const {
   }
 }
 
-void OpcuaPlugin::run_startup_discovery() {
-  if (!discovery_config_.enabled) {
-    return;
+int OpcuaPlugin::effective_rescan_interval_s(const OpcuaDiscoveryConfig & config, bool endpoint_configured) {
+  if (!config.enabled || endpoint_configured) {
+    return 0;
+  }
+  return config.interval_s > 0 ? config.interval_s : kDefaultRescanIntervalS;
+}
+
+std::optional<std::string> OpcuaPlugin::discover_endpoint(const OpcuaDiscoveryConfig & config, bool endpoint_configured,
+                                                          const PortScanFn & scan, const IdentifyFn & identify,
+                                                          const std::function<void(const std::string &)> & log_info,
+                                                          const std::function<void(const std::string &)> & log_warn) {
+  if (!config.enabled) {
+    return std::nullopt;
   }
   // Never override an explicitly configured endpoint: discovery must not open a
   // second session on a PLC the operator already targets (and already polls).
-  if (endpoint_configured_) {
-    log_info("OPC-UA discovery enabled but endpoint_url is explicitly configured (" + client_config_.endpoint_url +
-             "); skipping auto-discovery to avoid a second session.");
-    return;
-  }
-  if (discovery_config_.interval_s > 0) {
-    log_warn("OPC-UA discovery interval_s=" + std::to_string(discovery_config_.interval_s) +
-             " set, but periodic re-scan is not implemented yet; running a one-shot scan at startup.");
+  if (endpoint_configured) {
+    return std::nullopt;
   }
 
-  NetworkDiscovery discovery(discovery_config_, discovery_scan_fn_, discovery_identify_fn_);
+  NetworkDiscovery discovery(config, scan, identify);
 
   const auto subnets = discovery.resolve_subnets();
   if (subnets.empty()) {
     log_warn("OPC-UA discovery: no subnet configured and could not derive a local /24; nothing to scan.");
-    return;
+    return std::nullopt;
   }
   std::string subnet_list;
   for (const auto & s : subnets) {
     subnet_list += (subnet_list.empty() ? "" : ", ") + s;
   }
   log_info("OPC-UA discovery: read-only active scan of [" + subnet_list + "] on " +
-           std::to_string(discovery_config_.ports.size()) + " port(s)...");
+           std::to_string(config.ports.size()) + " port(s)...");
 
   const std::vector<DiscoveredEndpoint> found = discovery.run();
 
@@ -1528,18 +1558,92 @@ void OpcuaPlugin::run_startup_discovery() {
            std::to_string(discovery_servers) + " discovery server(s)/LDS, " + std::to_string(secured_only) +
            " secured-only (need credentials), " + std::to_string(leads) + " non-OPC-UA/unidentified lead(s).");
 
-  const DiscoveredEndpoint * chosen =
-      NetworkDiscovery::select_auto_endpoint(found, discovery_config_.anonymous_none_only);
+  const DiscoveredEndpoint * chosen = NetworkDiscovery::select_auto_endpoint(found, config.anonymous_none_only);
   if (chosen == nullptr) {
     log_warn(
-        "OPC-UA discovery: no auto-connectable None/Anonymous data server found; leaving endpoint at default. "
+        "OPC-UA discovery: no auto-connectable None/Anonymous data server found; leaving the endpoint unchanged. "
         "Secured-only servers require operator credentials.");
+    return std::nullopt;
+  }
+
+  log_info("OPC-UA discovery: selected endpoint " + chosen->endpoint_url + " (uri='" + chosen->application_uri + "')");
+  return chosen->endpoint_url;
+}
+
+void OpcuaPlugin::run_startup_discovery() {
+  if (!discovery_config_.enabled) {
+    return;
+  }
+  if (endpoint_configured_) {
+    log_info("OPC-UA discovery enabled but endpoint_url is explicitly configured (" + client_config_.endpoint_url +
+             "); skipping auto-discovery to avoid a second session.");
     return;
   }
 
-  client_config_.endpoint_url = chosen->endpoint_url;
-  log_info("OPC-UA discovery: auto-selected endpoint " + chosen->endpoint_url + " (uri='" + chosen->application_uri +
-           "') - handing to the connect + introspect path.");
+  // Stamp the scan before running it: the rescan cadence measures the gap
+  // between the START of two sweeps, so a slow sweep does not immediately earn
+  // another one.
+  last_discovery_scan_ = std::chrono::steady_clock::now();
+  const auto chosen = discover_endpoint(
+      discovery_config_, endpoint_configured_, discovery_scan_fn_, discovery_identify_fn_,
+      [this](const std::string & m) {
+        log_info(m);
+      },
+      [this](const std::string & m) {
+        log_warn(m);
+      });
+
+  if (!chosen) {
+    // The startup scan can legitimately find nothing - a gateway that boots
+    // alongside its PLC routinely scans while the PLC is still coming up. The
+    // endpoint stays at its default and the poller's reconnect arm rescans on
+    // the cadence below, so this is a delay rather than a dead end.
+    log_info("OPC-UA discovery: startup scan selected no endpoint; the reconnect loop rescans every " +
+             std::to_string(effective_rescan_interval_s(discovery_config_, endpoint_configured_)) + "s while down.");
+    return;
+  }
+
+  client_config_.endpoint_url = *chosen;
+  log_info("OPC-UA discovery: auto-selected endpoint " + *chosen + " - handing to the connect + introspect path.");
+}
+
+std::optional<std::string> OpcuaPlugin::rescan_endpoint_for_reconnect() {
+  // A sweep is a bounded but multi-second blocking call on the poll thread, and
+  // stop() has to wait for whatever it is in the middle of. Do not start one the
+  // shutdown is going to throw away.
+  if (shutdown_requested_.load()) {
+    return std::nullopt;
+  }
+  const int interval_s = effective_rescan_interval_s(discovery_config_, endpoint_configured_);
+  if (interval_s <= 0) {
+    return std::nullopt;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_discovery_scan_ < std::chrono::seconds(interval_s)) {
+    return std::nullopt;
+  }
+  last_discovery_scan_ = now;
+
+  const auto chosen = discover_endpoint(
+      discovery_config_, endpoint_configured_, discovery_scan_fn_, discovery_identify_fn_,
+      [this](const std::string & m) {
+        log_info(m);
+      },
+      [this](const std::string & m) {
+        log_warn(m);
+      });
+  // The live client config, not client_config_: this runs on the poll thread
+  // and client_config_ is read by the refresh thread in introspect(). The
+  // client owns the endpoint once connect() has been called with it, and its
+  // accessors are mutex-guarded.
+  const std::string current = client_ ? client_->endpoint_url() : client_config_.endpoint_url;
+  if (!chosen || *chosen == current) {
+    return std::nullopt;
+  }
+
+  log_info("OPC-UA discovery: rescan while disconnected adopted endpoint " + *chosen + " (was " + current + ")");
+  return chosen;
 }
 
 nlohmann::json OpcuaPlugin::build_data_response(const std::string & entity_id) const {

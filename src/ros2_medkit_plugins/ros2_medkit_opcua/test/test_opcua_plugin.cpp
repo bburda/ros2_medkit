@@ -27,7 +27,11 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <functional>
+#include <map>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -636,6 +640,143 @@ TEST(CommsLostShouldRaise, IdempotentAndDisabled) {
   EXPECT_FALSE(OpcuaPoller::comms_lost_should_raise(true, /*already_raised=*/true, t0, late, debounce));
   // Disabled -> never raise.
   EXPECT_FALSE(OpcuaPoller::comms_lost_should_raise(/*enabled=*/false, false, t0, late, debounce));
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint rediscovery while disconnected (config-less discovery)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Fake port scanner backed by a set of open "ip:port" hosts.
+PortScanFn fake_scan(std::set<std::string> open) {
+  return [open = std::move(open)](const std::string & ip, uint16_t port, int) {
+    return open.count(ip + ":" + std::to_string(port)) > 0;
+  };
+}
+
+// Fake GetEndpoints identify keyed by connect URL. Anything else is unreachable.
+IdentifyFn fake_identify(std::map<std::string, IdentifyResult> table) {
+  return [table = std::move(table)](const std::string & url, int) -> IdentifyResult {
+    const auto it = table.find(url);
+    if (it != table.end()) {
+      return it->second;
+    }
+    IdentifyResult r;
+    r.error = "unreachable";
+    return r;
+  };
+}
+
+IdentifyResult plc_identity() {
+  IdentifyResult r;
+  r.ok = true;
+  r.advertised_url = "opc.tcp://192.168.1.10:4840";
+  r.application_uri = "urn:SIMATIC.S7-1500.OPC-UA.Application:Software PLC_1";
+  r.product_uri = "https://www.siemens.com/s7-1500";
+  r.application_name = "SIMATIC.S7-1500";
+  r.application_type = 0;  // Server
+  r.security_policies = {{"None", 1}};
+  r.anonymous_none_available = true;
+  return r;
+}
+
+OpcuaDiscoveryConfig rescan_cfg() {
+  OpcuaDiscoveryConfig cfg;
+  cfg.enabled = true;
+  cfg.subnets = {"192.168.1.0/24"};  // explicit, so no local-interface derivation
+  cfg.ports = {4840};
+  return cfg;
+}
+
+// Discards log output. The tests assert on the selected endpoint, not the text.
+const std::function<void(const std::string &)> kSilent = [](const std::string &) {};
+
+}  // namespace
+
+TEST(DiscoverEndpoint, ScanBeforeThePlcIsUpSelectsNothingAndALaterRescanAdoptsIt) {
+  // The field race: the gateway scans 2 s after start while the PLC is still
+  // booting. Nothing answers, so nothing is selected and the caller keeps the
+  // default endpoint.
+  const auto empty_pass = OpcuaPlugin::discover_endpoint(rescan_cfg(), /*endpoint_configured=*/false, fake_scan({}),
+                                                         fake_identify({}), kSilent, kSilent);
+  EXPECT_FALSE(empty_pass.has_value());
+
+  // The PLC finishes booting. The same call with the same config now finds it,
+  // which is what the reconnect arm applies to the next connect attempt.
+  const auto later_pass = OpcuaPlugin::discover_endpoint(
+      rescan_cfg(), /*endpoint_configured=*/false, fake_scan({"192.168.1.10:4840"}),
+      fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), kSilent, kSilent);
+  ASSERT_TRUE(later_pass.has_value());
+  EXPECT_EQ(*later_pass, "opc.tcp://192.168.1.10:4840");
+}
+
+TEST(DiscoverEndpoint, AnExplicitEndpointIsNeverRescanned) {
+  // Positive control: the very scan that DOES find a server above finds the
+  // same server here, and is still refused because the operator pinned an
+  // endpoint. Discovery must not open a second session on a polled PLC.
+  const auto chosen = OpcuaPlugin::discover_endpoint(
+      rescan_cfg(), /*endpoint_configured=*/true, fake_scan({"192.168.1.10:4840"}),
+      fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), kSilent, kSilent);
+  EXPECT_FALSE(chosen.has_value());
+}
+
+TEST(DiscoverEndpoint, DisabledDiscoveryScansNothing) {
+  OpcuaDiscoveryConfig cfg = rescan_cfg();
+  cfg.enabled = false;
+  bool scanned = false;
+  auto counting_scan = [&scanned](const std::string &, uint16_t, int) {
+    scanned = true;
+    return true;
+  };
+  const auto chosen = OpcuaPlugin::discover_endpoint(cfg, /*endpoint_configured=*/false, counting_scan,
+                                                     fake_identify({}), kSilent, kSilent);
+  EXPECT_FALSE(chosen.has_value());
+  EXPECT_FALSE(scanned) << "a disabled discovery must not touch the network";
+}
+
+TEST(EffectiveRescanInterval, DefaultsWhenDiscoveryIsOnWithNoCadenceAndIsOffOtherwise) {
+  OpcuaDiscoveryConfig cfg = rescan_cfg();
+  // Config-less: discovery on, no interval stated -> the built-in cadence, not
+  // "never rescan". This is the deployment that most needs the rescan.
+  EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(cfg, /*endpoint_configured=*/false),
+            OpcuaPlugin::kDefaultRescanIntervalS);
+  // An operator-stated cadence wins.
+  cfg.interval_s = 120;
+  EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(cfg, false), 120);
+  // An explicit endpoint, or discovery off, means no rescan at all.
+  EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(cfg, /*endpoint_configured=*/true), 0);
+  cfg.enabled = false;
+  EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(cfg, false), 0);
+}
+
+TEST(AdoptRediscoveredEndpoint, AdoptsOnlyADifferentNonEmptyUrl) {
+  const std::string current = "opc.tcp://localhost:4840";
+
+  // No callback bound (an explicit endpoint, or discovery off) -> keep current.
+  EXPECT_FALSE(OpcuaPoller::adopt_rediscovered_endpoint(current, nullptr).has_value());
+
+  // Rescan not due, or found nothing -> keep current.
+  EXPECT_FALSE(OpcuaPoller::adopt_rediscovered_endpoint(current, [] {
+                 return std::optional<std::string>{};
+               }).has_value());
+
+  // Same server as before -> nothing to adopt, so no needless reconnect churn.
+  EXPECT_FALSE(OpcuaPoller::adopt_rediscovered_endpoint(current, [&current] {
+                 return std::optional<std::string>{current};
+               }).has_value());
+
+  // An empty URL is not an endpoint.
+  EXPECT_FALSE(OpcuaPoller::adopt_rediscovered_endpoint(current, [] {
+                 return std::optional<std::string>{""};
+               }).has_value());
+
+  // A different server -> adopt it for the next connect attempt.
+  const auto adopted = OpcuaPoller::adopt_rediscovered_endpoint(current, [] {
+    return std::optional<std::string>{"opc.tcp://192.168.1.10:4840"};
+  });
+  ASSERT_TRUE(adopted.has_value());
+  EXPECT_EQ(*adopted, "opc.tcp://192.168.1.10:4840");
 }
 
 // Issue #478 safety-gate: an empty scan from a source that has NEVER yielded a

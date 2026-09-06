@@ -105,9 +105,13 @@ struct OpcuaDiscoveryConfig {
   int scan_concurrency{100};    ///< bounded, polite concurrent connect count
   int identify_timeout_ms{6000};
 
-  /// Re-scan cadence. 0 = one-shot at startup (the only mode implemented in
-  /// this iteration); a positive value is accepted and validated but periodic
-  /// re-scan is a documented follow-up.
+  /// Re-scan cadence, in seconds, while no OPC-UA session is established. 0
+  /// selects the built-in default (see OpcuaPlugin::effective_rescan_interval_s).
+  /// The startup scan always runs once. The cadence only governs how often the
+  /// disconnected reconnect loop scans again, so a gateway that started before
+  /// its PLC finished booting adopts the PLC when it appears instead of retrying
+  /// the fallback endpoint forever. Never used once an endpoint is configured
+  /// explicitly, and never while a session is up.
   int interval_s{0};
 
   /// Only auto-register endpoints that expose a None + Anonymous endpoint (what

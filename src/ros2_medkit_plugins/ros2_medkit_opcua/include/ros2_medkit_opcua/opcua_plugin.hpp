@@ -31,10 +31,12 @@
 #include <ros2_medkit_gateway/plugins/ros_plugin_context.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -141,6 +143,42 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   static void apply_auto_alarms_param(const nlohmann::json & value, AutoAlarmsConfig & cfg,
                                       const std::function<void(const std::string &)> & warn);
 
+  // Run one read-only discovery pass and return the endpoint URL to adopt.
+  //
+  // Returns nullopt - meaning "keep the endpoint you have" - when discovery is
+  // disabled, when an endpoint was configured explicitly, when no subnet could
+  // be resolved, or when the pass found no auto-connectable None/Anonymous data
+  // server. Both the startup scan and the reconnect rescan go through here, so
+  // the two cannot drift apart. Static with injected probes and log sinks so
+  // both are unit-testable without a network.
+  //
+  // @param config discovery configuration (subnets, ports, timeouts, ...)
+  // @param endpoint_configured true when the operator pinned endpoint_url, so
+  //        discovery then selects nothing and can neither override the
+  //        operator's target nor open a second session on an already polled PLC
+  // @param scan injected TCP port probe
+  // @param identify injected OPC-UA GetEndpoints identify
+  // @param log_info operator-visible info sink
+  // @param log_warn operator-visible warning sink
+  static std::optional<std::string> discover_endpoint(const OpcuaDiscoveryConfig & config, bool endpoint_configured,
+                                                      const PortScanFn & scan, const IdentifyFn & identify,
+                                                      const std::function<void(const std::string &)> & log_info,
+                                                      const std::function<void(const std::string &)> & log_warn);
+
+  // Seconds between reconnect rescans, or 0 when the reconnect loop must never
+  // rescan (discovery disabled, or an endpoint configured explicitly). A
+  // configured ``interval_s`` wins. interval_s = 0 means "discovery is on but no
+  // cadence was stated" and takes the built-in default rather than never
+  // rescanning: a config-less deployment is the one that cannot name a cadence
+  // and the one that most needs its PLC adopted once it finishes booting.
+  static int effective_rescan_interval_s(const OpcuaDiscoveryConfig & config, bool endpoint_configured);
+
+  // Default reconnect rescan cadence, in seconds, when discovery is enabled with
+  // no explicit ``interval_s``. Long enough that a bounded subnet sweep stays a
+  // background cost on the poll thread, short enough that a PLC finishing its
+  // boot is picked up in well under a minute.
+  static constexpr int kDefaultRescanIntervalS = 30;
+
  private:
   // Route handlers
   void handle_plc_data(const ros2_medkit_gateway::PluginRequest & req, ros2_medkit_gateway::PluginResponse & res);
@@ -159,6 +197,14 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   void send_report_fault(const std::string & entity_id, const std::string & fault_code,
                          const std::string & severity_str, const std::string & message);
   void send_clear_fault(const std::string & fault_code);
+
+  // Clear PLC_COMMS_LOST after the initial connect in set_context() succeeded.
+  // Unconditional on purpose: the fault manager keys faults by fault_code and
+  // persists them, so a comms-lost fault raised before a gateway restart is
+  // still standing in the store while this process has no memory of raising it.
+  // The poller's own reconnect clear can never reach that case, because a
+  // successful first connect means the reconnect arm is never entered.
+  void clear_comms_lost_on_connect();
 
   // Dispatch now if the fault_manager service is matched, else buffer the
   // dispatch (bounded, order-preserving) to be flushed once it appears.
@@ -206,6 +252,14 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   // an endpoint is already configured.
   void run_startup_discovery();
 
+  // Poll-thread hook bound into PollerConfig::rediscover_endpoint whenever
+  // discovery runs without a configured endpoint. Called from the poller's
+  // reconnect arm, so only while no session is up, and rate-limited to one scan
+  // per effective_rescan_interval_s(). Returns the newly selected endpoint when
+  // a rescan found a different server (and logs the swap at INFO), nullopt when
+  // the rescan is not due yet or changed nothing.
+  std::optional<std::string> rescan_endpoint_for_reconnect();
+
   // Build JSON response for data endpoint
   nlohmann::json build_data_response(const std::string & entity_id) const;
 
@@ -231,6 +285,10 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   // a network. Set in configure(), consumed in run_startup_discovery().
   PortScanFn discovery_scan_fn_;
   IdentifyFn discovery_identify_fn_;
+  // When the last discovery pass ran, so the reconnect rescan honours the
+  // cadence instead of sweeping the subnet on every reconnect attempt. Stamped
+  // by the startup scan, then only ever read/written on the poll thread.
+  std::chrono::steady_clock::time_point last_discovery_scan_{};
 
   std::unique_ptr<OpcuaClient> client_;
   NodeMap node_map_;

@@ -12,15 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// INV2 end-to-end (no HW): boot the test_alarm_server OPC-UA fixture, connect,
-// and prove the asset-identity nameplate is filled from the server's device-info
-// (ServerStatus/BuildInfo + the OPC-UA DI DeviceSet nameplate) with no manual
-// entry. Exercises both the raw OpcuaClient::read_device_info read and the full
-// OpcuaPlugin::introspect() path that lands identity on the SOVD Component.
+// End-to-end against a live OPC-UA server (no HW): boot the test_alarm_server
+// fixture and exercise the paths that only a real session can reach.
+//
+// INV2 identity: prove the asset-identity nameplate is filled from the server's
+// device-info (ServerStatus/BuildInfo + the OPC-UA DI DeviceSet nameplate) with
+// no manual entry, through both the raw OpcuaClient::read_device_info read and
+// the full OpcuaPlugin::introspect() path that lands identity on the SOVD
+// Component.
+//
+// Connection lifecycle: prove a successful connect clears the standing
+// PLC_COMMS_LOST fault, which needs a connect that actually succeeds.
 
 #include "ros2_medkit_opcua/device_identity.hpp"
 #include "ros2_medkit_opcua/opcua_client.hpp"
 #include "ros2_medkit_opcua/opcua_plugin.hpp"
+#include "ros2_medkit_opcua/opcua_poller.hpp"
 
 #include <gtest/gtest.h>
 
@@ -33,13 +40,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -557,6 +567,68 @@ TEST_F(OpcuaIdentityE2ETest, DiNameplateReadFollowsBrowseContinuationPoints) {
   EXPECT_EQ(info.di_software_revision, "SW-3.4.5");
   EXPECT_EQ(info.di_order_number, "6ES7 672-5SC11-0YA0");
   client.disconnect();
+}
+
+// A gateway that restarts after a comms outage never raised PLC_COMMS_LOST in
+// THIS process, yet the fault manager keys faults by fault_code alone and
+// persists them, so the fault raised before the restart is still standing.
+// The reconnect arm used to clear only when its own in-memory
+// ``comms_lost_raised_`` flag was set, which no restart can satisfy, so the
+// fault stayed CONFIRMED for good. The clear now goes out on every successful
+// connect. Driven against the live fixture because the arm can only be reached
+// by a connect that actually succeeds.
+TEST_F(OpcuaIdentityE2ETest, SuccessfulConnectClearsCommsLostNeverRaisedHere) {
+  OpcuaClient client;
+  OpcuaClientConfig config;
+  config.endpoint_url = endpoint_;
+  config.connect_timeout = std::chrono::milliseconds(5000);
+  // Connect once to seed the client's stored config (what the poller reconnects
+  // with), then drop the session so the poll loop starts in its reconnect arm -
+  // the state a freshly started gateway is in while the PLC is already up.
+  ASSERT_TRUE(client.connect(config));
+  client.disconnect();
+  ASSERT_FALSE(client.is_connected());
+
+  NodeMap node_map;  // config-less: no entries, nothing to poll
+  OpcuaPoller poller(client, node_map);
+
+  std::mutex signals_mutex;
+  std::vector<std::pair<std::string, bool>> signals;  // (fault_code, active)
+  poller.set_alarm_callback(
+      [&signals_mutex, &signals](const std::string &, const ros2_medkit::fault_detection::FaultSignal & signal) {
+        std::lock_guard<std::mutex> lock(signals_mutex);
+        signals.emplace_back(signal.fault_code, signal.active);
+      });
+
+  PollerConfig poller_config;
+  poller_config.poll_interval = std::chrono::milliseconds(100);
+  poller_config.reconnect_interval = std::chrono::milliseconds(100);
+  poller_config.comms_lost_fault_enabled = true;
+  poller.start(poller_config);
+
+  bool cleared = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (!cleared && std::chrono::steady_clock::now() < deadline) {
+    {
+      std::lock_guard<std::mutex> lock(signals_mutex);
+      cleared = std::find(signals.begin(), signals.end(), std::make_pair(std::string(kCommsLostFaultCode), false)) !=
+                signals.end();
+    }
+    if (!cleared) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  }
+  poller.stop();
+
+  EXPECT_TRUE(cleared) << "a successful connect must clear PLC_COMMS_LOST even when this process never raised it";
+
+  // Absence control on the same harness: the connect succeeded, so nothing may
+  // have RAISED the fault. Without this a clear-everything-always regression
+  // would still pass the assertion above.
+  std::lock_guard<std::mutex> lock(signals_mutex);
+  EXPECT_EQ(std::find(signals.begin(), signals.end(), std::make_pair(std::string(kCommsLostFaultCode), true)),
+            signals.end())
+      << "comms-lost must not be raised while the connection is up";
 }
 
 }  // namespace ros2_medkit_gateway
