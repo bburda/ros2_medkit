@@ -198,6 +198,11 @@ if(BUILD_TESTING)
   medkit_add_launch_test(test_debounce_and_healing test/integration/test_debounce_and_healing.test.py
     TIMEOUT 120 LABELS "integration")
 
+  # Time-based confirmation has to reach the event stream, not just the store:
+  # the SSE feed and every capture path key off the published event.
+  medkit_add_launch_test(test_auto_confirm_visibility test/integration/test_auto_confirm_visibility.test.py
+    TIMEOUT 120 LABELS "integration")
+
   medkit_add_launch_test(test_rosbag_entity_scope test/integration/test_rosbag_entity_scope.test.py TIMEOUT 120
     LABELS "integration")
 
