@@ -317,8 +317,26 @@ void RESTServer::setup_pre_routing_handler() {
         }
       }
 
-      // 2. Handle preflight OPTIONS requests
-      if (req.method == "OPTIONS") {
+      // 2. Handle preflight OPTIONS requests.
+      //
+      // This is answered WITHOUT a credential, and it has to be. A browser
+      // never puts Authorization on a preflight - asking permission before
+      // sending the real request, headers included, is the entire purpose of
+      // the mechanism - so requiring one here does not harden the gateway, it
+      // makes every browser client impossible.
+      //
+      // It is safe because a preflight discloses nothing about the system: the
+      // response is the CORS policy for an origin the operator configured, with
+      // no body, and the real request that follows is authenticated normally.
+      // Treat this as a third named exemption alongside GET /health and
+      // /auth/*, not as an oversight.
+      // A real preflight carries Access-Control-Request-Method; the browser
+      // sends it to ask whether the method it is about to use is allowed.
+      // Requiring it keeps the exemption to the case that genuinely cannot
+      // authenticate. Without that check a plain anonymous OPTIONS with an
+      // allowed Origin took the same early return, which widens a narrow,
+      // necessary exemption into "OPTIONS is public".
+      if (req.method == "OPTIONS" && req.has_header("Access-Control-Request-Method")) {
         if (origin_allowed) {
           res.set_header("Access-Control-Max-Age", std::to_string(cors_config_.max_age_seconds));
           res.status = 204;
@@ -329,26 +347,28 @@ void RESTServer::setup_pre_routing_handler() {
       }
     }
 
-    // 3. Rate limiting check. If rejected, return Handled (CORS headers already set)
-    if (rate_limiter_ && rate_limiter_->is_enabled() && req.method != "OPTIONS") {
-      auto rl_result = rate_limiter_->check(req.remote_addr, req.path);
-      RateLimiter::apply_headers(rl_result, res);
-      if (!rl_result.allowed) {
-        RateLimiter::apply_rejection(rl_result, res);
-        return handled(req, res);
-      }
-    }
-
-    // 1. Handle CORS (existing logic)
-
-    // Handle Authentication if enabled
+    // 3. Authentication, before the rate limiter.
+    //
+    // This half of the order was wrong. The limiter also returns Handled, so an
+    // anonymous caller who exhausted the allowance used to get 429 from a
+    // protected route instead of 401 - an answer, and a small disclosure of
+    // limiter state, without any credential.
     if (auth_middleware_ && auth_middleware_->is_enabled()) {
-      // Use AuthMiddleware to process the request
       auto auth_request = AuthMiddleware::from_httplib_request(req);
       auto result = auth_middleware_->process(auth_request);
 
       if (!result.allowed) {
         AuthMiddleware::apply_to_response(result, res);
+        return handled(req, res);
+      }
+    }
+
+    // 4. Rate limiting check. If rejected, return Handled (CORS headers already set)
+    if (rate_limiter_ && rate_limiter_->is_enabled() && req.method != "OPTIONS") {
+      auto rl_result = rate_limiter_->check(req.remote_addr, req.path);
+      RateLimiter::apply_headers(rl_result, res);
+      if (!rl_result.allowed) {
+        RateLimiter::apply_rejection(rl_result, res);
         return handled(req, res);
       }
     }

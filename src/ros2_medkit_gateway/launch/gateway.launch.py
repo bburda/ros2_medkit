@@ -105,7 +105,7 @@ def generate_launch_description():
             'pass auth_enabled:=false explicitly.'))
 
     declare_auth_enabled_arg = DeclareLaunchArgument(
-        'auth_enabled', default_value='true',
+        'auth_enabled', default_value='',
         description=(
             'Require a credential. On by default, matching the shipped '
             'config. Turning it off makes the entity tree, the fault history '
@@ -119,7 +119,7 @@ def generate_launch_description():
             'a token from /auth/token.'))
 
     declare_tls_enabled_arg = DeclareLaunchArgument(
-        'tls_enabled', default_value='true',
+        'tls_enabled', default_value='',
         description=(
             'Serve HTTPS. On by default, matching the shipped config. Needs '
             'cert_file and key_file; the gateway refuses to start with TLS on '
@@ -168,14 +168,25 @@ def generate_launch_description():
             LaunchConfiguration('cors_allowed_origins').perform(context),
             LaunchConfiguration('config_file').perform(context), default_config))
 
-        tls_enabled = LaunchConfiguration('tls_enabled').perform(context).lower() in (
-            'true', '1', 'yes')
-        # Environment override read BEFORE the value is used: the container
-        # image serves plain HTTP behind whatever terminates TLS for it, and it
-        # has no certificate of its own to offer.
-        if os.environ.get('MEDKIT_TLS_DISABLED') == '1':
+        # Precedence: an explicit launch argument, then the environment, then
+        # whatever the config file says. Unset means "do not touch it", which
+        # matters because this launch file is included by others and is used
+        # with config_file: re-asserting a default here would silently override
+        # a value someone put in their own file on purpose.
+        tls_arg = LaunchConfiguration('tls_enabled').perform(context).strip().lower()
+        if tls_arg:
+            tls_enabled = tls_arg in ('true', '1', 'yes')
+            param_overrides['server.tls.enabled'] = tls_enabled
+        elif os.environ.get('MEDKIT_TLS_DISABLED') == '1':
+            # The container image serves plain HTTP behind whatever terminates
+            # TLS for it, and has no certificate of its own. An explicit
+            # tls_enabled:= above still wins over this.
             tls_enabled = False
-        param_overrides['server.tls.enabled'] = tls_enabled
+            param_overrides['server.tls.enabled'] = False
+        else:
+            # Nothing said otherwise, so the shipped config decides. It has TLS
+            # on, and the warning below still applies to that case.
+            tls_enabled = True
         cert_file = (LaunchConfiguration('cert_file').perform(context)
                      or os.environ.get('MEDKIT_TLS_CERT_FILE', ''))
         key_file = (LaunchConfiguration('key_file').perform(context)
@@ -193,15 +204,20 @@ def generate_launch_description():
                   'or pass tls_enabled:=false to serve plain HTTP. '
                   'scripts/generate_dev_certs.sh makes a self-signed pair for a first run.')
 
-        # Launch argument first, then the environment. The environment path is
-        # what makes the container image work: its entrypoint generates a
-        # per-container credential and exports it, and `ros2 launch` inside that
-        # container has no other way to receive it.
-        auth_enabled = LaunchConfiguration('auth_enabled').perform(context).lower() in (
-            'true', '1', 'yes')
-        if os.environ.get('MEDKIT_AUTH_DISABLED') == '1':
+        # Same precedence as TLS above: explicit argument, then environment,
+        # then the config file. The environment path is what makes the container
+        # image work - its entrypoint generates a per-container credential and
+        # exports it, and `ros2 launch` inside that container has no other way
+        # to receive it.
+        auth_arg = LaunchConfiguration('auth_enabled').perform(context).strip().lower()
+        if auth_arg:
+            auth_enabled = auth_arg in ('true', '1', 'yes')
+            param_overrides['auth.enabled'] = auth_enabled
+        elif os.environ.get('MEDKIT_AUTH_DISABLED') == '1':
             auth_enabled = False
-        param_overrides['auth.enabled'] = auth_enabled
+            param_overrides['auth.enabled'] = False
+        else:
+            auth_enabled = True
         jwt_secret = (LaunchConfiguration('jwt_secret').perform(context)
                       or os.environ.get('MEDKIT_JWT_SECRET', ''))
         clients = (LaunchConfiguration('auth_clients').perform(context)

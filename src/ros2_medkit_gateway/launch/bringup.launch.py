@@ -83,9 +83,10 @@ def generate_launch_description():
         # makes `ros2 launch ... bringup.launch.py tls_enabled:=false ...` a
         # complete command rather than a dead end.
         DeclareLaunchArgument(
-            'tls_enabled', default_value='true',
-            description='Serve HTTPS. Needs cert_file and key_file; pass false to serve '
-                        'plain HTTP on a host nothing else can reach.'),
+            'tls_enabled', default_value='',
+            description='Serve HTTPS. Empty means leave it to the config file, which '
+                        'has it on. Pass false to serve plain HTTP on a host nothing '
+                        'else can reach; needs cert_file and key_file when on.'),
         DeclareLaunchArgument(
             'cert_file', default_value='',
             description='PEM certificate for HTTPS. Required while tls_enabled is true.'),
@@ -93,8 +94,9 @@ def generate_launch_description():
             'key_file', default_value='',
             description='PEM private key matching cert_file.'),
         DeclareLaunchArgument(
-            'auth_enabled', default_value='true',
-            description='Require a credential on every request.'),
+            'auth_enabled', default_value='',
+            description='Require a credential on every request. Empty means leave it '
+                        'to the config file, which has it on.'),
         DeclareLaunchArgument(
             'jwt_secret', default_value='',
             description='HS256 signing secret, at least 32 characters. Required while '

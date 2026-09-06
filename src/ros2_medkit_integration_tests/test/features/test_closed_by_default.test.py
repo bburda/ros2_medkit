@@ -47,8 +47,13 @@ from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_gateway_node
 
 CLOSED_PORT = get_test_port()
+CORS_PORT = get_test_port(1)
 CLOSED_BASE_URL = f'http://127.0.0.1:{CLOSED_PORT}{API_BASE_PATH}'
 CLOSED_ROOT = f'http://127.0.0.1:{CLOSED_PORT}'
+CORS_BASE_URL = f'http://127.0.0.1:{CORS_PORT}{API_BASE_PATH}'
+RL_PORT = get_test_port(2)
+RL_BASE_URL = f'http://127.0.0.1:{RL_PORT}{API_BASE_PATH}'
+ALLOWED_ORIGIN = 'https://ui.example'
 
 # At least 32 characters, or the gateway refuses to start under HS256.
 JWT_SECRET = 'closed_by_default_integration_secret_key_0123456789'
@@ -80,10 +85,48 @@ def generate_test_description():
         },
     )
 
+    cors_gateway = create_gateway_node(
+        port=CORS_PORT,
+        name='gateway_with_cors',
+        extra_params={
+            'server.host': '127.0.0.1',
+            'auth.enabled': True,
+            'auth.require_auth_for': 'all',
+            'auth.issuer': 'ros2_medkit_gateway',
+            'auth.jwt_secret': JWT_SECRET,
+            'auth.clients': [f'{CLIENT_ID}:{CLIENT_SECRET}:admin'],
+            # The configuration where the hole lived.
+            'cors.allowed_origins': [ALLOWED_ORIGIN],
+        },
+    )
+
+    # Rate limiting on, and tight, so the limiter can actually be exhausted
+    # inside a test. Without a gateway in this state the ordering between the
+    # limiter and authentication is unobservable, which is how it went
+    # unnoticed in the first place.
+    rl_gateway = create_gateway_node(
+        port=RL_PORT,
+        name='gateway_with_rate_limit',
+        extra_params={
+            'server.host': '127.0.0.1',
+            'auth.enabled': True,
+            'auth.require_auth_for': 'all',
+            'auth.issuer': 'ros2_medkit_gateway',
+            'auth.jwt_secret': JWT_SECRET,
+            'auth.clients': [f'{CLIENT_ID}:{CLIENT_SECRET}:admin'],
+            'rate_limiting.enabled': True,
+            'rate_limiting.global_requests_per_minute': 2,
+            'rate_limiting.client_requests_per_minute': 2,
+        },
+    )
+
     return launch.LaunchDescription([
         gateway_node,
+        cors_gateway,
+        rl_gateway,
         launch_testing.actions.ReadyToTest(),
-    ]), {'gateway_node': gateway_node}
+    ]), {'gateway_node': gateway_node, 'cors_gateway': cors_gateway,
+         'rl_gateway': rl_gateway}
 
 
 def _is_exempt(method, path):
@@ -321,11 +364,160 @@ class TestClosedByDefault(GatewayTestCase):
                 )
 
 
+class TestNothingAnswersBeforeAuth(GatewayTestCase):
+    """What the CORS preflight may and may not do without a credential.
+
+    Preflight is answered anonymously on purpose, and it is the third named
+    exemption after GET /health and /auth/*. A browser never puts Authorization
+    on a preflight - asking permission before sending the real request is the
+    whole point of the mechanism - so demanding one would not harden anything,
+    it would make browser clients impossible. An earlier version of this branch
+    did exactly that, and the control below is what caught it.
+
+    What must hold instead: the preflight discloses only CORS policy, and the
+    REAL request that follows is still refused without a credential.
+
+    This gateway enables CORS for a real origin, which the rest of the file
+    deliberately does not, because that is the configuration in which any of
+    this is reachable at all.
+    """
+
+    BASE_URL = CORS_BASE_URL
+
+    def _preflight(self, extra=None):
+        headers = {'Origin': ALLOWED_ORIGIN, 'Access-Control-Request-Method': 'GET'}
+        headers.update(extra or {})
+        return requests.options(f'{CORS_BASE_URL}/apps', headers=headers, timeout=15)
+
+    def test_01_an_anonymous_preflight_is_answered(self):
+        """The exemption, stated as a test rather than left implicit.
+
+        This is the control that failed when the branch briefly required a
+        credential here: a browser cannot send one, so a 401 or 403 means no
+        browser client can reach this gateway at all.
+        """
+        resp = self._preflight()
+        self.assertEqual(
+            resp.status_code, 204,
+            f'an anonymous preflight got {resp.status_code}; a browser cannot '
+            'authenticate a preflight, so this makes browser clients impossible'
+        )
+        self.assertEqual(resp.headers.get('Access-Control-Allow-Origin'), ALLOWED_ORIGIN)
+
+    def test_02_the_preflight_discloses_only_cors_policy(self):
+        """Why the exemption is safe: there is nothing in the response.
+
+        If a preflight ever grew a body, the exemption would start leaking and
+        this fails rather than letting it pass unnoticed.
+        """
+        resp = self._preflight()
+        self.assertEqual(
+            resp.content, b'',
+            f'the preflight returned a body: {resp.content[:200]!r}'
+        )
+
+    def test_03_a_preflight_from_an_unknown_origin_is_refused(self):
+        """The exemption is scoped to origins the operator configured."""
+        resp = requests.options(
+            f'{CORS_BASE_URL}/apps',
+            headers={'Origin': 'https://not-configured.example',
+                     'Access-Control-Request-Method': 'GET'},
+            timeout=15,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_04_the_real_request_after_a_preflight_still_needs_a_credential(self):
+        """The property that actually matters.
+
+        A preflight being answered must not carry any implication for the GET
+        that follows it, which is where the data is.
+        """
+        resp = requests.get(
+            f'{CORS_BASE_URL}/apps', headers={'Origin': ALLOWED_ORIGIN}, timeout=15
+        )
+        self.assertIn(
+            resp.status_code, (401, 403),
+            f'a cross-origin GET got {resp.status_code} with no credential'
+        )
+
+    def test_04b_a_plain_options_without_the_preflight_header_is_refused(self):
+        """The exemption is for preflights, not for the OPTIONS method.
+
+        A browser preflight always carries Access-Control-Request-Method. An
+        OPTIONS without it is an ordinary request that any client could send,
+        and it has no reason to skip the credential check. The helper above
+        always sends both headers, so this boundary needs its own case.
+        """
+        resp = requests.options(
+            f'{CORS_BASE_URL}/apps',
+            headers={'Origin': ALLOWED_ORIGIN},
+            timeout=15,
+        )
+        self.assertIn(
+            resp.status_code, (401, 403),
+            f'a plain OPTIONS with no Access-Control-Request-Method got '
+            f'{resp.status_code}; the preflight exemption is too wide'
+        )
+
+    def test_05_an_authenticated_cross_origin_request_works(self):
+        """The mirror: CORS is live and a credentialed browser call succeeds."""
+        headers = {'Origin': ALLOWED_ORIGIN}
+        headers.update(self.cors_auth)
+        resp = requests.get(f'{CORS_BASE_URL}/apps', headers=headers, timeout=15)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get('Access-Control-Allow-Origin'), ALLOWED_ORIGIN)
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        resp = requests.post(
+            f'{CORS_BASE_URL}/auth/authorize',
+            json={
+                'grant_type': 'client_credentials',
+                'client_id': CLIENT_ID,
+                'client_secret': CLIENT_SECRET,
+            },
+            timeout=30,
+        )
+        assert resp.status_code == 200, f'token request failed: {resp.status_code}'
+        cls.cors_auth = {'Authorization': f'Bearer {resp.json()["access_token"]}'}
+
+
+class TestRateLimiterDoesNotAnswerBeforeAuth(GatewayTestCase):
+    """An anonymous caller gets 401, never 429.
+
+    The rate limiter runs in the same pre-routing handler and also returns
+    "handled". With it ordered before authentication, a caller with no
+    credential who exhausted the allowance received 429 from a protected route:
+    an answer, plus a small disclosure of limiter state, without ever presenting
+    anything. The limit here is deliberately tiny so the exhausted state is
+    reachable in a test at all.
+    """
+
+    BASE_URL = RL_BASE_URL
+
+    def test_01_an_exhausted_anonymous_caller_still_gets_401(self):
+        seen = []
+        # Comfortably past a limit of 2/minute.
+        for _ in range(8):
+            seen.append(requests.get(f'{RL_BASE_URL}/apps', timeout=15).status_code)
+
+        self.assertNotIn(
+            429, seen,
+            f'an anonymous caller was rate-limited instead of refused: {seen}'
+        )
+        self.assertTrue(
+            all(code in (401, 403) for code in seen),
+            f'expected only 401/403 for an uncredentialed caller, got {seen}'
+        )
+
+
 @launch_testing.post_shutdown_test()
 class TestClosedByDefaultShutdown(unittest.TestCase):
     """Gateway exits cleanly."""
 
-    def test_exit_codes(self, proc_info, gateway_node):
-        launch_testing.asserts.assertExitCodes(
-            proc_info, allowable_exit_codes=ALLOWED_EXIT_CODES, process=gateway_node
-        )
+    def test_exit_codes(self, proc_info, gateway_node, cors_gateway, rl_gateway):
+        for proc in (gateway_node, cors_gateway, rl_gateway):
+            launch_testing.asserts.assertExitCodes(
+                proc_info, allowable_exit_codes=ALLOWED_EXIT_CODES, process=proc
+            )
