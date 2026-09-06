@@ -342,3 +342,91 @@ jobs:
       - name: Show test results
         if: always()
         run: colcon test-result --verbose
+
+  write-capable-build:
+    # The shipped plugin is read-only; MEDKIT_OPCUA_READ_ONLY=OFF is the
+    # development variant. Nothing else in CI configures it, so without this job
+    # the write path and its tests would rot unnoticed behind an #if until
+    # someone needed them. It is also the control for the build-inspection test:
+    # test_opcua_build_variant asserts the write symbols are PRESENT here, which
+    # is what keeps its symbol list from decaying into one that matches nothing
+    # and passes everywhere.
+    name: Write-capable build (jazzy)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Git
+        run: |
+          apt-get update
+          apt-get install -y git
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pre-install ROS 2 apt source
+        uses: ./.github/actions/ros-apt-source
+
+      - name: Set up ROS 2 Jazzy
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: jazzy
+
+      - name: Install ccache
+        run: apt-get install -y ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/ccache
+          key: ccache-opcua-write-capable-${{ github.sha }}
+          restore-keys: |
+            ccache-opcua-write-capable-
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y ros-jazzy-test-msgs libyaml-cpp-dev libssl-dev
+          source /opt/ros/jazzy/setup.bash
+          rosdep update
+          rosdep install --from-paths src --ignore-src -y \
+            --skip-keys='nav2_msgs ament_cmake_clang_format ament_cmake_clang_tidy'
+
+      - name: Build ros2_medkit_opcua write-capable
+        env:
+          CCACHE_DIR: /root/.cache/ccache
+          CCACHE_MAXSIZE: 500M
+          CCACHE_SLOPPINESS: pch_defines,time_macros
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          # Two passes so MEDKIT_OPCUA_READ_ONLY reaches only the package that
+          # defines it. Passed to the whole chain instead, CMake reports it as a
+          # manually-specified variable nobody used in each of the other ten
+          # packages, and the resulting stderr would hide any real one.
+          colcon build --symlink-install \
+            --packages-up-to ros2_medkit_opcua --packages-skip ros2_medkit_opcua \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release \
+            --event-handlers console_direct+
+          colcon build --symlink-install \
+            --packages-select ros2_medkit_opcua \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release -DMEDKIT_OPCUA_READ_ONLY=OFF \
+            --event-handlers console_direct+
+          ccache -s
+
+      - name: Run tests
+        timeout-minutes: 20
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          colcon test --return-code-on-test-failure \
+            --packages-select ros2_medkit_opcua \
+            --ctest-args -LE linter \
+            --event-handlers console_direct+
+
+      - name: Show test results
+        if: always()
+        run: colcon test-result --verbose
