@@ -44,6 +44,8 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include "ros2_medkit_integration_tests/crash_backtrace.hpp"
+
 class UnresponsiveParamNode : public rclcpp::Node {
  public:
   UnresponsiveParamNode() : Node("unresponsive_param_node", rclcpp::NodeOptions().start_parameter_services(false)) {
@@ -114,6 +116,10 @@ class UnresponsiveParamNode : public rclcpp::Node {
 };
 
 int main(int argc, char ** argv) {
+  // This node does not go through run_demo_node(), so it installs the
+  // crash reporter itself - otherwise it would be the one demo binary that
+  // still dies without leaving a stack behind.
+  ros2_medkit_integration_tests::install_crash_backtrace();
   // Deliberately NOT ros2_medkit_integration_tests::run_demo_node(): that
   // helper calls rclcpp::shutdown() only after executor.spin() has already
   // returned, which works for every other demo node but would deadlock this

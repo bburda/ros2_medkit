@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <cstddef>
 
@@ -47,6 +48,17 @@ inline constexpr int kMaxFrames = 64;
 inline void ** crash_frame_buffer() {
   static void * frames[kMaxFrames];
   return frames;
+}
+
+/// Lets exactly one thread write a report.
+///
+/// sa_mask does NOT do this: it blocks signals for the thread running the
+/// handler only. Thread A faulting on SIGSEGV while thread B takes SIGBUS gives
+/// two concurrent handlers writing one static frame buffer and interleaving
+/// their output. The second entrant says so in one line and gets out of the way.
+inline std::atomic_flag & crash_reporting_flag() {
+  static std::atomic_flag reporting = ATOMIC_FLAG_INIT;
+  return reporting;
 }
 
 /// A stack of its own for the handler to run on.
@@ -89,6 +101,13 @@ inline void crash_handler(int signum) {
   // trade: a wrong status beats no output and no status at all.
   ::alarm(5);
 
+  if (crash_reporting_flag().test_and_set()) {
+    write_literal(kCrashMarker);
+    write_literal(" second thread also faulted; its frames are not reported\n");
+    ::raise(signum);
+    return;
+  }
+
   write_literal(kCrashMarker);
   switch (signum) {
     case SIGSEGV:
@@ -112,6 +131,16 @@ inline void crash_handler(int signum) {
   ::backtrace_symbols_fd(frames, depth, STDERR_FILENO);
   write_literal(kCrashMarker);
   write_literal(" end\n");
+
+  // Explicit, not implicit. Returning re-executes the faulting instruction,
+  // which re-raises a genuine SIGSEGV or SIGBUS - but a signal delivered by
+  // kill(), raise() or pthread_kill() has no instruction to retry, so the
+  // process would simply resume and then be killed by the alarm above five
+  // seconds later, reporting SIGALRM instead of the signal that happened.
+  // Measured before this line existed: raise(SIGSEGV) gave exit status 142, not
+  // 139. SA_RESETHAND has already restored the default disposition, so this
+  // terminates the process with the right status in both cases.
+  ::raise(signum);
 }
 
 }  // namespace detail
@@ -146,10 +175,9 @@ inline void install_crash_backtrace() {
 
   struct sigaction action {};
   action.sa_handler = &detail::crash_handler;
-  // The handler writes into one static frame buffer, and SA_RESETHAND only
-  // resets the signal that fired. Without this, a second thread taking a
-  // DIFFERENT fatal signal would re-enter concurrently and interleave the two
-  // reports.
+  // Blocks the other fatal signals for the duration of the handler ON THIS
+  // THREAD. That is all sa_mask can do - the cross-thread case is what
+  // crash_reporting_flag() above is for.
   ::sigemptyset(&action.sa_mask);
   ::sigaddset(&action.sa_mask, SIGSEGV);
   ::sigaddset(&action.sa_mask, SIGBUS);
@@ -159,7 +187,10 @@ inline void install_crash_backtrace() {
   // would have without us.
   // SA_ONSTACK puts the handler on the alternate stack above, which is what lets
   // it run at all when the ordinary stack is the thing that overflowed.
-  action.sa_flags = SA_RESETHAND | SA_ONSTACK;
+  // static_cast, because these constants are unsigned and sa_flags is int:
+  // -Wsign-conversion, which this workspace builds with, reports the change of
+  // value once per translation unit that includes this header.
+  action.sa_flags = static_cast<int>(SA_RESETHAND | SA_ONSTACK);
 
   ::sigaction(SIGSEGV, &action, nullptr);
   ::sigaction(SIGBUS, &action, nullptr);

@@ -80,9 +80,11 @@ ros2 launch ros2_medkit_integration_tests demo_nodes.launch.py
 
 ### Crash reports
 
-Every demo binary goes through `run_demo_node()` in
-`include/ros2_medkit_integration_tests/demo_node_main.hpp`, which installs a
-fatal-signal handler before anything else runs. A node killed by `SIGSEGV`,
+Every demo binary installs a fatal-signal handler before anything else runs.
+Most get it from `run_demo_node()` in
+`include/ros2_medkit_integration_tests/demo_node_main.hpp`; the two that cannot
+use that helper - `unresponsive_param_node` and `managed_lifecycle_node`, which
+own their shutdown sequence - call `install_crash_backtrace()` themselves. A node killed by `SIGSEGV`,
 `SIGBUS` or `SIGABRT` writes its stack to stderr, so launch_testing captures it
 with the rest of the process output:
 

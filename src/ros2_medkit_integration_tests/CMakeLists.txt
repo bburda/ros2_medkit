@@ -104,6 +104,7 @@ target_include_directories(demo_param_beacon_node PRIVATE ${_demo_include_dir})
 medkit_target_dependencies(demo_param_beacon_node rclcpp)
 
 add_executable(managed_lifecycle demo_nodes/managed_lifecycle_node.cpp)
+target_include_directories(managed_lifecycle PRIVATE ${_demo_include_dir})
 medkit_target_dependencies(managed_lifecycle rclcpp rclcpp_lifecycle)
 
 # Proof fixture for GRAPH_NODE_UNREADABLE (see the file doc): a plain rclcpp::Node that

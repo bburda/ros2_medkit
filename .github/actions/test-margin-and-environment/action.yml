@@ -1,0 +1,43 @@
+name: Record the test margin and the DDS environment
+description: >-
+  Says plainly whether a test step ran out of time, and records what /dev/shm and
+  the installed middleware looked like afterwards. Both are invisible once a run
+  has finished, and a step killed by its cap is reported by the runner as an
+  ordinary failure naming whichever test was in flight.
+
+inputs:
+  start:
+    description: Epoch seconds recorded immediately before the test step.
+    required: true
+  cap-minutes:
+    description: >-
+      The cap the guard measures against. Pass the step's timeout-minutes where
+      the step has one; where only the job is capped, pass the job's - the
+      overrun branch cannot fire there, because a job-level kill stops every
+      remaining step, but the margin warning still arrives in time to act on.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        # The start is missing only when an earlier step failed before it ran.
+        # Say so and carry on to the census, rather than dying on a usage error
+        # and taking the environment evidence down with it.
+        if [ -n "${{ inputs.start }}" ]; then
+          ./scripts/ci_test_completeness.sh "${{ inputs.start }}" "${{ inputs.cap-minutes }}" || guard_rc=$?
+        else
+          echo "::notice::no test step start was recorded - the run failed before the tests"
+        fi
+        # A DDS participant killed rather than shut down leaves its segments
+        # behind for the rest of the job, and the installed middleware decides
+        # which transport those segments belong to.
+        df -h /dev/shm
+        echo "shm segments: $(ls /dev/shm | wc -l)"
+        # No `head` in this pipeline: it closes the pipe early, SIGPIPEs `ls`, and
+        # the step's `pipefail` would then kill the census exactly when there are
+        # enough segments to be worth listing.
+        ls -la /dev/shm | tail -n +1
+        dpkg -l | grep -E 'rmw-fastrtps|fastdds|cyclonedds' || true
+        exit "${guard_rc:-0}"
