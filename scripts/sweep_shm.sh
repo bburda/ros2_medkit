@@ -50,9 +50,15 @@ if [[ "${FORCE}" -eq 0 ]]; then
   # Match on the command line rather than the process name: colcon runs as
   # python3, and a pattern that also matches this script would match itself.
   # demo_ covers the launch fixtures the documented demo workflow starts, which
-  # the earlier pattern missed entirely - a developer running only demo nodes got
+  # an earlier pattern missed entirely - a developer running only demo nodes got
   # a sweep in the middle of live work.
-  if pgrep -f '[g]ateway_node|[f]ault_manager_node|[d]emo_|[c]test|[l]aunch_test|[c]olcon test' >/dev/null 2>&1; then
+  #
+  # Our own process and our caller are excluded, because the caller's command
+  # line is often a match by itself: `./scripts/test.sh test_demo_lifecycle`
+  # contains demo_, so every single-test preset refused to sweep and the only
+  # symptom was a puzzling message.
+  if pgrep -f '[g]ateway_node|[f]ault_manager_node|[d]emo_|[c]test|[l]aunch_test|[c]olcon test' 2>/dev/null |
+      grep -qvE "^($$|${PPID})$"; then
     echo "sweep_shm: ROS processes are running - refusing to sweep (use --force if you mean it)" >&2
     exit 1
   fi

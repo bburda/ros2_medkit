@@ -137,31 +137,10 @@ jobs:
 
       - name: Check the run completed, and record the environment
         if: always()
-        run: |
-          # A step killed by its cap is reported as a failure, not a cancellation,
-          # and colcon then names whichever test was in flight. Without this, the
-          # overrun reads as one flaky test out of thousands, and the packages
-          # queued behind it leave no trace at all.
-          # The start is missing only when an earlier step failed before it ran.
-          # Say so and carry on to the census, rather than dying on a usage error
-          # and taking the environment evidence down with it.
-          if [ -n "${TEST_STEP_START:-}" ]; then
-            ./scripts/ci_test_completeness.sh "${TEST_STEP_START}" "${TEST_STEP_CAP_MINUTES}" || guard_rc=$?
-          else
-            echo "::notice::no test step start was recorded - the run failed before the tests"
-          fi
-          # A DDS participant killed rather than shut down leaves its segments
-          # behind for the rest of the job, and the installed middleware decides
-          # which transport those segments belong to. Neither is recoverable from
-          # a finished run, so both are recorded rather than assumed.
-          df -h /dev/shm
-          echo "shm segments: $(ls /dev/shm | wc -l)"
-          # No `head` in this pipeline: it closes the pipe early, SIGPIPEs `ls`, and
-          # the step's `pipefail` would then kill the census exactly when there are
-          # enough segments to be worth listing.
-          ls -la /dev/shm | tail -n +1
-          dpkg -l | grep -E 'rmw-fastrtps|fastdds|cyclonedds' || true
-          exit "${guard_rc:-0}"
+        uses: ./.github/actions/test-margin-and-environment
+        with:
+          start: ${{ env.TEST_STEP_START }}
+          cap-minutes: ${{ env.TEST_STEP_CAP_MINUTES }}
 
       - name: Show test results
         if: always()
@@ -283,6 +262,9 @@ jobs:
           ccache -s
           ./scripts/ccache_report.sh "${{ matrix.ros_distro }}-graph-watchdog"
 
+      - name: Record the test step start
+        run: echo "TEST_STEP_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Run graph_watchdog tests
         timeout-minutes: 45
         env:
@@ -297,6 +279,13 @@ jobs:
             --packages-select ros2_medkit_graph_watchdog \
             --ctest-args -LE linter \
             --event-handlers console_direct+
+
+      - name: Check the run completed, and record the environment
+        if: always()
+        uses: ./.github/actions/test-margin-and-environment
+        with:
+          start: ${{ env.TEST_STEP_START }}
+          cap-minutes: '45'
 
       - name: Show test results
         if: always()
@@ -400,6 +389,9 @@ jobs:
           ccache -s
           ./scripts/ccache_report.sh jazzy-test
 
+      - name: Record the test step start
+        run: echo "TEST_STEP_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Run unit and integration tests
         env:
           # FastRTPS has a known use-after-free in discovery-teardown that
@@ -415,6 +407,13 @@ jobs:
             --packages-skip ros2_medkit_opcua ros2_medkit_graph_watchdog \
             --ctest-args -LE linter \
             --event-handlers console_direct+
+
+      - name: Check the run completed, and record the environment
+        if: always()
+        uses: ./.github/actions/test-margin-and-environment
+        with:
+          start: ${{ env.TEST_STEP_START }}
+          cap-minutes: '90'
 
       - name: Show test results
         if: always()
@@ -571,16 +570,22 @@ jobs:
           # colcon WARNS and exits 0 on a --packages-select name that does not
           # exist, so a rename would leave this shard testing nothing while the
           # merged report still looked complete - another shard's tests execute
-          # the same installed code and put it back in the report. Name-aware,
-          # because a shard selecting two packages still produces results when
-          # only one of the names rotted.
-          for pkg in ${{ matrix.select }}; do
-            case "${pkg}" in --*) continue ;; esac
-            if [ -z "$(find "build/${pkg}/test_results" -type f -name '*.xml' 2>/dev/null | head -n 1)" ]; then
-              echo "::error::shard '${{ matrix.shard }}' selected ${pkg} but it produced no test results - the name may have rotted"
-              exit 1
-            fi
-          done
+          # the same installed code and put it back in the report.
+          #
+          # Only for --packages-select. The catch-all shard uses --packages-skip,
+          # where the names that follow are the packages it must NOT test - the
+          # first of them is ros2_medkit_opcua, which this job never builds, so
+          # checking them would fail that shard on every run.
+          set -- ${{ matrix.select }}
+          if [ "$1" = "--packages-select" ]; then
+            shift
+            for pkg in "$@"; do
+              if [ -z "$(find "build/${pkg}/test_results" -type f -name '*.xml' 2>/dev/null | head -n 1)" ]; then
+                echo "::error::shard '${{ matrix.shard }}' selected ${pkg} but it produced no test results - the name may have rotted"
+                exit 1
+              fi
+            done
+          fi
 
       - name: Generate coverage report
         run: |
@@ -703,12 +708,18 @@ jobs:
       # report still covers every package the source tree says holds production
       # C++. Sharding makes this stricter, not weaker: a shard that silently
       # tested nothing now shows up as a package missing from the merge.
+      # always(), like the merge above: when a shard fails this gate reports a
+      # missing package, and without this the HTML upload and the step that names
+      # the real cause would both be skipped - leaving "package X missing" as the
+      # only visible message for "shard Y failed".
       - name: Verify every C++ package reached the coverage report
+        if: always()
         run: |
           ./scripts/check_coverage_packages.sh coverage.info \
             --skip ros2_medkit_opcua
 
       - name: Upload coverage HTML report as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
@@ -718,7 +729,7 @@ jobs:
       # worth having when a shard broke - it just does not describe the whole
       # workspace, and saying so is this job's business.
       - name: Fail if any shard did not succeed
-        if: needs.coverage.result != 'success'
+        if: always() && needs.coverage.result != 'success'
         run: |
           echo "::error::a coverage shard did not succeed (matrix result: ${{ needs.coverage.result }}). The merged report above covers only the shards that finished, so its percentage is a floor, not the workspace figure."
           exit 1

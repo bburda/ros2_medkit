@@ -24,12 +24,9 @@
 
 #include "ros2_medkit_integration_tests/crash_backtrace.hpp"
 
-using ros2_medkit_integration_tests::crash_backtrace_is_active;
 using ros2_medkit_integration_tests::install_crash_backtrace;
 
 namespace {
-
-constexpr bool kHandlerActive = crash_backtrace_is_active();
 
 // Recursion the optimiser cannot flatten into a loop. Measured across -O0 to
 // -O3: without the escaping address GCC turns this into a loop at -O2 and the
@@ -37,6 +34,12 @@ constexpr bool kHandlerActive = crash_backtrace_is_active();
 // the test below hang rather than fail.
 volatile char * stack_probe_sink = nullptr;
 
+// The recursion is the point of this function, so the compiler's warning about
+// it is noise.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winfinite-recursion"
+#endif
 __attribute__((noinline)) int recurse_until_the_stack_runs_out(int x) {
   volatile char pad[4096];
   pad[0] = static_cast<char>(x);
@@ -48,6 +51,9 @@ __attribute__((noinline)) int recurse_until_the_stack_runs_out(int x) {
   asm volatile("" : : "r"(pad) : "memory");
   return recurse_until_the_stack_runs_out(x + pad[0]) + 1;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 /// Faults on an unmapped address that is NOT null.
 ///
@@ -63,16 +69,18 @@ __attribute__((noinline)) int recurse_until_the_stack_runs_out(int x) {
 /// and the process then does not crash at all.
 /// A regex matching a backtrace frame that belongs to this test binary.
 ///
-/// The object and offset pair is what addr2line turns back into a location, and
+/// Anchored on the basename, not on /proc/self/exe: glibc prints argv[0] for the
+/// main executable rather than its resolved path, so a symlinked workspace or a
+/// plain `./test_crash_backtrace` would not match a realpath and the test would
+/// fail on a perfectly good report.
+///
+/// The object and offset pair is what addr2line turns back into a location.
 /// glibc's spacing between the offset and the address differs by release
-/// (resolute writes ") [0x", noble writes ")[0x"), so the separator is loose. A
-/// frame carries a symbol name before the "+" whenever the binary exports its
-/// symbols, which CMake does by default, so that half is loose too.
-std::string own_binary_frame_pattern() {
-  char exe[PATH_MAX] = {};
-  const ssize_t len = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-  const std::string self = len > 0 ? std::string(exe, static_cast<std::size_t>(len)) : std::string();
-  return self + R"(\([^)]*\+0x[0-9a-fA-F]+\) ?\[0x[0-9a-fA-F]+\])";
+/// (resolute writes ") [0x", noble writes ")[0x"), and a frame carries a symbol
+/// name before the "+" whenever the binary exports its symbols, which CMake does
+/// by default - so both of those are matched loosely.
+const char * own_binary_frame_pattern() {
+  return R"(test_crash_backtrace\([^)]*\+0x[0-9a-fA-F]+\) ?\[0x[0-9a-fA-F]+\])";
 }
 
 void crash_by_unmapped_write() {
@@ -88,45 +96,37 @@ void crash_by_unmapped_write() {
 // which is what a death test does: the body runs in a forked child and the
 // assertion matches that child's stderr.
 //
-// Every case asserts in both build configurations rather than standing down
-// under one of them. In a sanitizer build the promise is the opposite one - the
-// sanitizer owns the fatal signals and this handler must stay out of its way -
-// so the absence of our marker is the thing worth pinning there. Replacing a
-// sanitizer's report with a plainer stack is the way this file could do harm,
-// and a test that went quiet under sanitizers would be blind to exactly that.
+// These cases cover the configuration this package is built in, and only that
+// one. The header also stands down under a sanitizer so it cannot replace a
+// sanitizer's own report - but sanitizers are opt-in per package here, through
+// include(ROS2MedkitSanitizers), and this package does not opt in. So
+// __SANITIZE_ADDRESS__ is never defined for this translation unit, the
+// stand-down never engages, and a test written for it would assert against a
+// branch that cannot be reached. The stand-down stays in the header for the day
+// this package does opt in; it is not claimed to be tested.
 TEST(CrashBacktrace, SegvIsReported) {
-  if constexpr (kHandlerActive) {
-    ASSERT_DEATH(crash_by_unmapped_write(), "MEDKIT-CRASH signal=SIGSEGV");
-  } else {
-    ASSERT_DEATH(crash_by_unmapped_write(), ::testing::AllOf(::testing::HasSubstr("Sanitizer"),
-                                                             ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH"))));
-  }
+  ASSERT_DEATH(crash_by_unmapped_write(), "MEDKIT-CRASH signal=SIGSEGV");
 }
 
 TEST(CrashBacktrace, SegvReportsResolvableFrames) {
-  if constexpr (kHandlerActive) {
-    // The marker alone would be satisfied by an empty stack. What makes a
-    // report useful is a frame carrying an object and an offset, because that
-    // pair is what addr2line turns back into a location. Asserting on a symbol
-    // NAME would pin the wrong thing: a release build without -rdynamic reports
-    // offsets for this binary's own frames, and the frames worth reading here
-    // belong to libraries below us anyway.
-    //
-    // Two things are matched loosely on purpose. glibc's spacing between the
-    // offset and the address differs by release (resolute writes ") [0x",
-    // noble writes ")[0x"), and a frame carries a symbol name before the "+"
-    // whenever the binary exports its symbols - a link flag away, and not what
-    // this test is about.
-    // Anchored on THIS binary's own path, read at runtime rather than written
-    // down: a bare offset pattern is satisfied by any frame, and libc's frames
-    // alone would pass it while saying nothing about whether our own frames came
-    // back resolvable. The path is not a name pin - it is whatever the test was
-    // built as.
-    ASSERT_DEATH(crash_by_unmapped_write(), own_binary_frame_pattern());
-  } else {
-    ASSERT_DEATH(crash_by_unmapped_write(), ::testing::AllOf(::testing::HasSubstr("Sanitizer"),
-                                                             ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH"))));
-  }
+  // The marker alone would be satisfied by an empty stack. What makes a
+  // report useful is a frame carrying an object and an offset, because that
+  // pair is what addr2line turns back into a location. Asserting on a symbol
+  // NAME would pin the wrong thing: a release build without -rdynamic reports
+  // offsets for this binary's own frames, and the frames worth reading here
+  // belong to libraries below us anyway.
+  //
+  // Two things are matched loosely on purpose. glibc's spacing between the
+  // offset and the address differs by release (resolute writes ") [0x",
+  // noble writes ")[0x"), and a frame carries a symbol name before the "+"
+  // whenever the binary exports its symbols - a link flag away, and not what
+  // this test is about.
+  // Anchored on THIS binary's own path, read at runtime rather than written
+  // down: a bare offset pattern is satisfied by any frame, and libc's frames
+  // alone would pass it while saying nothing about whether our own frames came
+  // back resolvable. The path is not a name pin - it is whatever the test was
+  // built as.
+  ASSERT_DEATH(crash_by_unmapped_write(), own_binary_frame_pattern());
 }
 
 // A stack overflow is the commonest silent SIGSEGV, and it is the one a handler
@@ -138,45 +138,22 @@ TEST(CrashBacktrace, SegvOnAnOverflowedStackIsStillReported) {
     install_crash_backtrace();
     static_cast<void>(recurse_until_the_stack_runs_out(1));
   };
-  if constexpr (kHandlerActive) {
-    ASSERT_DEATH(overflow_the_stack(), "MEDKIT-CRASH signal=SIGSEGV");
-  } else {
-    ASSERT_DEATH(overflow_the_stack(), ::testing::AllOf(::testing::HasSubstr("Sanitizer"),
-                                                        ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH"))));
-  }
+  ASSERT_DEATH(overflow_the_stack(), "MEDKIT-CRASH signal=SIGSEGV");
 }
 
 TEST(CrashBacktrace, AbortIsReportedToo) {
-  if constexpr (kHandlerActive) {
-    ASSERT_DEATH(
-        {
-          install_crash_backtrace();
-          std::abort();
-        },
-        "MEDKIT-CRASH signal=SIGABRT");
-  } else {
-    // Only the absence of our marker here, unlike the SEGV cases: a sanitizer
-    // does not take SIGABRT by default (ASan's handle_abort is off), so there is
-    // no sanitizer report to require - and none for us to have clobbered.
-    ASSERT_DEATH(
-        {
-          install_crash_backtrace();
-          std::abort();
-        },
-        ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH")));
-  }
+  ASSERT_DEATH(
+      {
+        install_crash_backtrace();
+        std::abort();
+      },
+      "MEDKIT-CRASH signal=SIGABRT");
 }
 
 // Exit status is what ctest and launch_testing report, and a handler that
 // swallowed the signal would turn a crash into a clean exit and hide it.
 TEST(CrashBacktrace, ProcessStillDiesFromTheOriginalSignal) {
-  if constexpr (kHandlerActive) {
-    EXPECT_EXIT(crash_by_unmapped_write(), ::testing::KilledBySignal(SIGSEGV), "MEDKIT-CRASH end");
-  } else {
-    // A sanitizer reports first and then exits on its own terms, so the death
-    // itself is what stays assertable here.
-    EXPECT_DEATH(crash_by_unmapped_write(), ".*");
-  }
+  EXPECT_EXIT(crash_by_unmapped_write(), ::testing::KilledBySignal(SIGSEGV), "MEDKIT-CRASH end");
 }
 
 // The crash helper installs the handler itself, so a test that merely calls
@@ -189,11 +166,5 @@ TEST(CrashBacktrace, InstallingTwiceIsHarmless) {
     volatile int * volatile target = nullptr;
     *target = 1;
   };
-  if constexpr (kHandlerActive) {
-    EXPECT_EXIT(crash_after_installing_twice(), ::testing::KilledBySignal(SIGSEGV), "MEDKIT-CRASH end");
-  } else {
-    ASSERT_DEATH(
-        crash_after_installing_twice(),
-        ::testing::AllOf(::testing::HasSubstr("Sanitizer"), ::testing::Not(::testing::HasSubstr("MEDKIT-CRASH"))));
-  }
+  EXPECT_EXIT(crash_after_installing_twice(), ::testing::KilledBySignal(SIGSEGV), "MEDKIT-CRASH end");
 }

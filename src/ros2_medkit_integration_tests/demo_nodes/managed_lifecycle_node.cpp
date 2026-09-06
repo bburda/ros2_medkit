@@ -19,6 +19,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 
+#include "ros2_medkit_integration_tests/crash_backtrace.hpp"
+
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
 // A managed lifecycle node for status integration tests. It DEFAULTS to staying
@@ -62,6 +64,10 @@ class ManagedLifecycleNode : public rclcpp_lifecycle::LifecycleNode {
 };
 
 int main(int argc, char ** argv) {
+  // This node does not go through run_demo_node(), so it installs the
+  // crash reporter itself - otherwise it would be the one demo binary that
+  // still dies without leaving a stack behind.
+  ros2_medkit_integration_tests::install_crash_backtrace();
   // Wrap the body so no exception escapes main (bugprone-exception-escape): the
   // run_demo_node helper used by the other demo nodes only accepts an
   // rclcpp::Node, so a LifecycleNode needs its own main.
