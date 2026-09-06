@@ -31,11 +31,14 @@
 #include "ros2_medkit_fault_manager/snapshot_capture.hpp"
 #include "ros2_medkit_msgs/msg/fault_event.hpp"
 #include "ros2_medkit_msgs/srv/clear_fault.hpp"
+#include "ros2_medkit_msgs/srv/declare_planned_stop.hpp"
+#include "ros2_medkit_msgs/srv/end_planned_stop.hpp"
 #include "ros2_medkit_msgs/srv/get_fault.hpp"
 #include "ros2_medkit_msgs/srv/get_rosbag.hpp"
 #include "ros2_medkit_msgs/srv/get_snapshots.hpp"
 #include "ros2_medkit_msgs/srv/list_faults.hpp"
 #include "ros2_medkit_msgs/srv/list_faults_for_entity.hpp"
+#include "ros2_medkit_msgs/srv/list_planned_stops.hpp"
 #include "ros2_medkit_msgs/srv/list_rosbags.hpp"
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
 
@@ -156,6 +159,19 @@ class FaultManagerNode : public rclcpp::Node {
   handle_list_faults_for_entity(const std::shared_ptr<ros2_medkit_msgs::srv::ListFaultsForEntity::Request> & request,
                                 const std::shared_ptr<ros2_medkit_msgs::srv::ListFaultsForEntity::Response> & response);
 
+  /// Handle DeclarePlannedStop service request
+  void
+  handle_declare_planned_stop(const std::shared_ptr<ros2_medkit_msgs::srv::DeclarePlannedStop::Request> & request,
+                              const std::shared_ptr<ros2_medkit_msgs::srv::DeclarePlannedStop::Response> & response);
+
+  /// Handle EndPlannedStop service request
+  void handle_end_planned_stop(const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Request> & request,
+                               const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Response> & response);
+
+  /// Handle ListPlannedStops service request
+  void handle_list_planned_stops(const std::shared_ptr<ros2_medkit_msgs::srv::ListPlannedStops::Request> & request,
+                                 const std::shared_ptr<ros2_medkit_msgs::srv::ListPlannedStops::Response> & response);
+
   /// Create snapshot configuration from parameters
   SnapshotConfig create_snapshot_config();
 
@@ -231,6 +247,14 @@ class FaultManagerNode : public rclcpp::Node {
   rclcpp::Service<ros2_medkit_msgs::srv::GetRosbag>::SharedPtr get_rosbag_srv_;
   rclcpp::Service<ros2_medkit_msgs::srv::ListRosbags>::SharedPtr list_rosbags_srv_;
   rclcpp::Service<ros2_medkit_msgs::srv::ListFaultsForEntity>::SharedPtr list_faults_for_entity_srv_;
+  rclcpp::Service<ros2_medkit_msgs::srv::DeclarePlannedStop>::SharedPtr declare_planned_stop_srv_;
+  rclcpp::Service<ros2_medkit_msgs::srv::EndPlannedStop>::SharedPtr end_planned_stop_srv_;
+  rclcpp::Service<ros2_medkit_msgs::srv::ListPlannedStops>::SharedPtr list_planned_stops_srv_;
+
+  /// Serial number behind the id of each declared window. Ids are
+  /// "<declared_at_ns>-<counter>", which is unique within a fault manager and
+  /// sorts by declaration without a UUID dependency.
+  std::atomic<uint64_t> planned_stop_seq_{0};
   rclcpp::TimerBase::SharedPtr auto_confirm_timer_;
 
   /// Timer for periodic cleanup of expired correlation data

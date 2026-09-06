@@ -136,6 +136,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_sqlite_storage fault_manager_lib)
   medkit_target_dependencies(test_sqlite_storage rclcpp ros2_medkit_msgs)
 
+  # Planned-stop windows: every behavioural assertion runs against both storage
+  # backends, plus the SQLite-only reopen and schema cases.
+  medkit_add_gtest(test_planned_stops test/test_planned_stops.cpp)
+  target_link_libraries(test_planned_stops fault_manager_lib)
+  medkit_target_dependencies(test_planned_stops rclcpp ros2_medkit_msgs)
+
   # Rosbag retention parity: every assertion runs against both storage backends.
   medkit_add_gtest(test_rosbag_storage_parity test/test_rosbag_storage_parity.cpp)
   target_link_libraries(test_rosbag_storage_parity fault_manager_lib)
@@ -191,6 +197,11 @@ if(BUILD_TESTING)
 
   medkit_add_launch_test(test_entity_thresholds_integration test/integration/test_entity_thresholds_integration.test.py
     TIMEOUT 60 LABELS "integration")
+
+  # Planned-stop windows over SQLite: each case spawns its own fault_manager so it
+  # can pick a retention bound, and one of them kills the node and brings it back.
+  medkit_add_launch_test(test_planned_stops_integration test/integration/test_planned_stops.test.py
+    TIMEOUT 240 LABELS "integration")
 
   medkit_add_launch_test(test_rosbag_entity_scope test/integration/test_rosbag_entity_scope.test.py TIMEOUT 120
     LABELS "integration")

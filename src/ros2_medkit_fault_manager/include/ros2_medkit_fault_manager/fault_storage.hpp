@@ -195,6 +195,85 @@ struct RosbagFileInfo {
   int64_t created_at_ns{0};  ///< Timestamp when bag was created
 };
 
+/// One declared planned-stop window: an interval of wall-clock time during which
+/// faults are expected.
+///
+/// Nothing in the fault pipeline reads a window. A fault whose cycle starts
+/// inside one confirms, heals, clears, is captured and is audited exactly as any
+/// other fault; the window only lets a reader tell an expected fault from a
+/// surprise. Keeping the two apart in storage rather than in the transition
+/// logic is what makes the evidence chain describe the plant that existed.
+struct PlannedStopWindow {
+  std::string id;
+  int64_t starts_at_ns{0};
+  int64_t ends_at_ns{0};
+  std::string reason;
+  std::string declared_by;
+
+  /// When the declaration was recorded. Retention orders by this and not by
+  /// starts_at_ns: a window may be declared after the stop it describes.
+  int64_t declared_at_ns{0};
+
+  /// True when an operator cut the window short, which moved ends_at_ns to the
+  /// moment of that request.
+  bool ended_early{false};
+
+  /// Whether @p when_ns falls inside the window. The interval is CLOSED at both
+  /// ends, and the gateway derives its `expected` flag from the same rule, so a
+  /// fault reported at the instant a window opens or closes is inside it in both
+  /// places.
+  bool covers(int64_t when_ns) const {
+    return when_ns >= starts_at_ns && when_ns <= ends_at_ns;
+  }
+
+  /// Whether the window is still running at @p now_ns. Retention never prunes a
+  /// window for which this is true.
+  bool active_at(int64_t now_ns) const {
+    return now_ns < ends_at_ns;
+  }
+};
+
+/// Why an end-early request did or did not change a window. The three cases carry
+/// different HTTP answers (200 / 404 / 400), so they are distinguished
+/// structurally rather than by inspecting a message string.
+enum class EndPlannedStopOutcome : uint8_t {
+  Ended,        ///< The window was running and now ends at the requested instant
+  NotFound,     ///< No window with that id
+  AlreadyEnded  ///< The window's end had already passed; it is not moved again
+};
+
+/// Result of an end-early request. `window` is the window as stored afterwards
+/// and is meaningful only when `outcome` is Ended.
+struct EndPlannedStopResult {
+  EndPlannedStopOutcome outcome{EndPlannedStopOutcome::NotFound};
+  PlannedStopWindow window;
+};
+
+/// Bounds on the configured number of retained planned-stop windows.
+/// One is the smallest useful store (an operator can still declare a stop);
+/// ten thousand is well past any plant's yearly count and keeps the table from
+/// growing for the life of a deployment.
+constexpr int64_t kMinPlannedStopWindows = 1;
+constexpr int64_t kMaxPlannedStopWindows = 10000;
+constexpr int64_t kDefaultPlannedStopWindows = 100;
+
+/// Bring a configured window bound into [kMinPlannedStopWindows,
+/// kMaxPlannedStopWindows], reporting through @p clamped whether it had to move.
+///
+/// Takes int64_t because that is what a ROS parameter is. Narrowing first would
+/// let a value above INT_MAX wrap back into the legal band and pass the check
+/// unnoticed, which is how a documented cap silently stops existing.
+inline int64_t clamp_planned_stop_windows(int64_t requested, bool & clamped) {
+  clamped = !(requested >= kMinPlannedStopWindows && requested <= kMaxPlannedStopWindows);
+  if (requested < kMinPlannedStopWindows) {
+    return kMinPlannedStopWindows;
+  }
+  if (requested > kMaxPlannedStopWindows) {
+    return kMaxPlannedStopWindows;
+  }
+  return requested;
+}
+
 /// Abstract interface for fault storage backends
 class FaultStorage {
  public:
@@ -450,6 +529,32 @@ class FaultStorage {
   /// so a HEALED row left by a previous (healing-enabled) run does not behave inconsistently under
   /// the latch. Default is a no-op (in-memory storage starts empty).
   /// @return fault codes of the reclassified faults, so the caller can audit each transition
+  /// Store a planned-stop window. Returns false when a window with that id
+  /// already exists; the stored one is left untouched. Applies the retention
+  /// bound afterwards using the new window's declared_at_ns as "now".
+  virtual bool declare_planned_stop(const PlannedStopWindow & window) = 0;
+
+  /// Cut a window short at @p at_ns: ends_at_ns moves there and ended_early is
+  /// set. Refused when the window's end has already passed, so that the record
+  /// of when a stop actually finished cannot be rewritten after the fact.
+  virtual EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns) = 0;
+
+  /// One window by id, or nothing when no window carries that id.
+  virtual std::optional<PlannedStopWindow> get_planned_stop(const std::string & id) const = 0;
+
+  /// Every stored window, newest declaration first.
+  virtual std::vector<PlannedStopWindow> list_planned_stops() const = 0;
+
+  /// Bound the number of stored windows and apply the bound now. Returns how
+  /// many stored windows the bound dropped.
+  ///
+  /// Only windows that have already ended at @p now_ns are candidates, oldest
+  /// declaration first; a window still running is never pruned. The stored count
+  /// can therefore exceed @p max_count while more than that many windows are
+  /// live, which is deliberate - a live window must not vanish under the
+  /// operator who declared it.
+  virtual size_t set_max_planned_stops(size_t max_count, int64_t now_ns) = 0;
+
   virtual std::vector<std::string> reclassify_healed_as_cleared() {
     return {};
   }
@@ -520,6 +625,12 @@ class InMemoryFaultStorage : public FaultStorage {
   std::vector<ros2_medkit_msgs::msg::Fault> get_all_faults() const override;
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
+  bool declare_planned_stop(const PlannedStopWindow & window) override;
+  EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns) override;
+  std::optional<PlannedStopWindow> get_planned_stop(const std::string & id) const override;
+  std::vector<PlannedStopWindow> list_planned_stops() const override;
+  size_t set_max_planned_stops(size_t max_count, int64_t now_ns) override;
+
  private:
   /// Update fault status based on debounce counter and given config
   void update_status(FaultState & state, const DebounceConfig & config);
@@ -535,6 +646,10 @@ class InMemoryFaultStorage : public FaultStorage {
 
   /// Whether any row at all still references @p file_path. Caller holds mutex_.
   bool path_referenced(const std::string & file_path) const;
+
+  /// Drop ended windows, oldest declaration first, until at most
+  /// max_planned_stops_ remain. Returns how many went. Caller holds mutex_.
+  size_t prune_planned_stops_locked(int64_t now_ns);
 
   mutable std::mutex mutex_;
   std::map<std::string, FaultState> faults_;
@@ -564,6 +679,12 @@ class InMemoryFaultStorage : public FaultStorage {
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
   bool retain_snapshots_on_clear_{false};
   size_t max_near_misses_per_fault_{0};  ///< 0 = unlimited
+
+  /// Declared windows in insertion order. A vector rather than a map keyed by id
+  /// because retention walks them by declared_at_ns and the store is bounded to
+  /// a few hundred rows.
+  std::vector<PlannedStopWindow> planned_stops_;
+  size_t max_planned_stops_{static_cast<size_t>(kDefaultPlannedStopWindows)};
 };
 
 }  // namespace ros2_medkit_fault_manager

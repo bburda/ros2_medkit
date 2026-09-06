@@ -875,4 +875,112 @@ std::vector<std::string> InMemoryFaultStorage::reclassify_healed_as_cleared() {
   return reclassified;
 }
 
+// ---------------------------------------------------------------------------
+// Planned-stop windows
+// ---------------------------------------------------------------------------
+
+bool InMemoryFaultStorage::declare_planned_stop(const PlannedStopWindow & window) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  const bool exists = std::any_of(planned_stops_.begin(), planned_stops_.end(), [&window](const PlannedStopWindow & w) {
+    return w.id == window.id;
+  });
+  if (exists) {
+    return false;
+  }
+
+  planned_stops_.push_back(window);
+  prune_planned_stops_locked(window.declared_at_ns);
+  return true;
+}
+
+EndPlannedStopResult InMemoryFaultStorage::end_planned_stop(const std::string & id, int64_t at_ns) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto it = std::find_if(planned_stops_.begin(), planned_stops_.end(), [&id](const PlannedStopWindow & w) {
+    return w.id == id;
+  });
+  if (it == planned_stops_.end()) {
+    return EndPlannedStopResult{EndPlannedStopOutcome::NotFound, {}};
+  }
+  if (!it->active_at(at_ns)) {
+    return EndPlannedStopResult{EndPlannedStopOutcome::AlreadyEnded, *it};
+  }
+
+  it->ends_at_ns = at_ns;
+  it->ended_early = true;
+  return EndPlannedStopResult{EndPlannedStopOutcome::Ended, *it};
+}
+
+std::optional<PlannedStopWindow> InMemoryFaultStorage::get_planned_stop(const std::string & id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto it = std::find_if(planned_stops_.begin(), planned_stops_.end(), [&id](const PlannedStopWindow & w) {
+    return w.id == id;
+  });
+  if (it == planned_stops_.end()) {
+    return std::nullopt;
+  }
+  return *it;
+}
+
+std::vector<PlannedStopWindow> InMemoryFaultStorage::list_planned_stops() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::vector<PlannedStopWindow> out(planned_stops_.begin(), planned_stops_.end());
+  // Newest declaration first, ties broken by id so two windows declared in the
+  // same nanosecond do not order differently from one call to the next.
+  std::stable_sort(out.begin(), out.end(), [](const PlannedStopWindow & a, const PlannedStopWindow & b) {
+    if (a.declared_at_ns != b.declared_at_ns) {
+      return a.declared_at_ns > b.declared_at_ns;
+    }
+    return a.id > b.id;
+  });
+  return out;
+}
+
+size_t InMemoryFaultStorage::set_max_planned_stops(size_t max_count, int64_t now_ns) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  max_planned_stops_ = max_count;
+  return prune_planned_stops_locked(now_ns);
+}
+
+size_t InMemoryFaultStorage::prune_planned_stops_locked(int64_t now_ns) {
+  if (max_planned_stops_ == 0 || planned_stops_.size() <= max_planned_stops_) {
+    return 0;
+  }
+
+  // Prune candidates: windows that have already ended, oldest declaration first.
+  std::vector<size_t> candidates;
+  candidates.reserve(planned_stops_.size());
+  for (size_t i = 0; i < planned_stops_.size(); ++i) {
+    if (!planned_stops_[i].active_at(now_ns)) {
+      candidates.push_back(i);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(), [this](size_t a, size_t b) {
+    if (planned_stops_[a].declared_at_ns != planned_stops_[b].declared_at_ns) {
+      return planned_stops_[a].declared_at_ns < planned_stops_[b].declared_at_ns;
+    }
+    return planned_stops_[a].id < planned_stops_[b].id;
+  });
+
+  const size_t over = planned_stops_.size() - max_planned_stops_;
+  const size_t to_drop = std::min(over, candidates.size());
+  if (to_drop == 0) {
+    return 0;
+  }
+
+  std::set<std::string> doomed;
+  for (size_t i = 0; i < to_drop; ++i) {
+    doomed.insert(planned_stops_[candidates[i]].id);
+  }
+  planned_stops_.erase(std::remove_if(planned_stops_.begin(), planned_stops_.end(),
+                                      [&doomed](const PlannedStopWindow & w) {
+                                        return doomed.count(w.id) > 0;
+                                      }),
+                       planned_stops_.end());
+  return to_drop;
+}
+
 }  // namespace ros2_medkit_fault_manager

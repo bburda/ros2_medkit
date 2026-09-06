@@ -43,6 +43,9 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 | `~/list_faults` | `ros2_medkit_msgs/srv/ListFaults` | Query faults with filtering |
 | `~/clear_fault` | `ros2_medkit_msgs/srv/ClearFault` | Clear/acknowledge a fault |
 | `~/get_snapshots` | `ros2_medkit_msgs/srv/GetSnapshots` | Get topic snapshots for a fault |
+| `~/declare_planned_stop` | `ros2_medkit_msgs/srv/DeclarePlannedStop` | Declare a window during which faults are expected |
+| `~/end_planned_stop` | `ros2_medkit_msgs/srv/EndPlannedStop` | Cut a planned-stop window short |
+| `~/list_planned_stops` | `ros2_medkit_msgs/srv/ListPlannedStops` | List declared windows, optionally only the active ones |
 
 ## Features
 
@@ -54,6 +57,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 - **Snapshot capture**: Captures topic data when faults are confirmed for debugging (snapshots are deleted when fault is cleared)
 - **Near-miss series**: Appends one entry per FAILED report that moved the debounce counter without confirming, bounded per fault code and retained when the fault is cleared
 - **Freeze-frame retention**: One compact JSON freeze-frame per fault code, retained across `clear_fault` (see below)
+- **Planned stops**: Windows of wall-clock time during which faults are expected. Marked, never suppressed - an expected fault takes exactly the same path through storage, debounce, capture and the audit log
 - **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear
 - **Tamper-evident audit log** (optional): Append-only, hash-chained record of fault state transitions for verifiable history
 
@@ -69,6 +73,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 | `auto_confirm_after_sec` | double | `0.0` | Auto-confirm PREFAILED faults after timeout (0 = disabled) |
 | `entity_thresholds.config_file` | string | `""` | Path to YAML file with per-entity debounce threshold overrides |
 | `near_miss.max_per_fault` | int | `200` | Near-miss entries retained per fault code, oldest evicted first (0 = unlimited) |
+| `planned_stop.max_windows` | int | `100` | Declared planned-stop windows retained, oldest **ended** one dropped first; a running window is never dropped. Clamped to `[1, 10000]` |
 
 ### Snapshot Parameters
 
@@ -189,6 +194,34 @@ The series lives in the `near_misses` table of the fault database and is read th
 API (`FaultStorage::get_near_misses`). A database written by an earlier build gains the table on
 first open. **There is no service or REST surface for it yet** - reading it means going through the
 storage API or the database file.
+
+## Planned Stops
+
+A **planned stop** is a window of wall-clock time during which faults are expected: a changeover, a maintenance weekend, a line move. An operator declares one at runtime; the fault manager stores it and serves it.
+
+Declaring a window changes nothing about how faults are handled. A fault whose cycle starts inside one is confirmed, healed, cleared, captured and audited exactly as any other fault. The window only lets a reader tell an expected fault from a surprise - the gateway derives that flag and serves it as `x-medkit.expected` on the fault list and the event stream.
+
+```bash
+# Declare a four-hour changeover starting now (a zero start means "now")
+ros2 service call /fault_manager/declare_planned_stop ros2_medkit_msgs/srv/DeclarePlannedStop \
+  "{starts_at: {sec: 0, nanosec: 0}, ends_at: {sec: 1788800000, nanosec: 0}, reason: 'line changeover', declared_by: 'shift_lead'}"
+
+# List the windows that contain this instant
+ros2 service call /fault_manager/list_planned_stops ros2_medkit_msgs/srv/ListPlannedStops \
+  "{active_only: true, now: {sec: 0, nanosec: 0}}"
+
+# Cut a window short
+ros2 service call /fault_manager/end_planned_stop ros2_medkit_msgs/srv/EndPlannedStop \
+  "{id: '1788716982473405798-1', at: {sec: 0, nanosec: 0}}"
+```
+
+Behaviour worth knowing before relying on it:
+
+- A fault belongs to a window when its `first_occurred` lies in `[starts_at, ends_at]`, inclusive at both ends. `first_occurred` is the start of the current **cycle**, so a code that fails inside a window and fails again after it was cleared is expected for the first cycle and unexpected for the second.
+- Windows may overlap, and may be declared **after** the stop they describe: a stop is a fact about the plant, not about when someone typed it in.
+- Ending a window early moves `ends_at` to that instant. Faults raised before it stay expected; faults raised after it do not. A window whose end has already passed cannot be ended again.
+- Windows are stored in the `planned_stops` table and survive a restart. A database written by an earlier build gains the table on first open.
+- Retention is by count (`planned_stop.max_windows`), never by age, and never drops a running window.
 
 ## Advanced: Tamper-Evident Audit Log
 

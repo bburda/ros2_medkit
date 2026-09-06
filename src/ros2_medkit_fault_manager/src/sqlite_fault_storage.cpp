@@ -14,6 +14,7 @@
 
 #include "ros2_medkit_fault_manager/sqlite_fault_storage.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <limits>
 #include <set>
@@ -293,6 +294,33 @@ void SqliteFaultStorage::initialize_schema() {
     std::string error = err_msg ? err_msg : "Unknown error";
     sqlite3_free(err_msg);
     throw std::runtime_error("Failed to create near_misses table: " + error);
+  }
+
+  // Create planned_stops table: one row per declared window during which faults
+  // are expected. Nothing in the fault pipeline reads it - it exists so a reader
+  // can tell an expected fault from a surprise, and it lives next to the faults
+  // it describes so a window survives a restart along with them.
+  //
+  // starts_at_ns / ends_at_ns rather than from / to because those are not column
+  // names anyone can write without quoting, and because the ROS message uses the
+  // same pair.
+  const char * create_planned_stops_table_sql = R"(
+    CREATE TABLE IF NOT EXISTS planned_stops (
+      id TEXT PRIMARY KEY,
+      starts_at_ns INTEGER NOT NULL,
+      ends_at_ns INTEGER NOT NULL,
+      reason TEXT NOT NULL DEFAULT '',
+      declared_by TEXT NOT NULL DEFAULT '',
+      declared_at_ns INTEGER NOT NULL,
+      ended_early INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_planned_stops_declared_at ON planned_stops(declared_at_ns);
+  )";
+
+  if (sqlite3_exec(db_, create_planned_stops_table_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = err_msg ? err_msg : "Unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create planned_stops table: " + error);
   }
 
   // Migration: rows written before resulting_status existed keep their data; the column arrives
@@ -1863,6 +1891,161 @@ std::vector<ros2_medkit_msgs::msg::Fault> SqliteFaultStorage::get_all_faults() c
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Planned-stop windows
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Read one planned_stops row in the column order every query below selects.
+PlannedStopWindow read_planned_stop_row(SqliteStatement & stmt) {
+  PlannedStopWindow w;
+  w.id = stmt.column_text(0);
+  w.starts_at_ns = stmt.column_int64(1);
+  w.ends_at_ns = stmt.column_int64(2);
+  w.reason = stmt.column_text(3);
+  w.declared_by = stmt.column_text(4);
+  w.declared_at_ns = stmt.column_int64(5);
+  w.ended_early = stmt.column_int64(6) != 0;
+  return w;
+}
+
+constexpr const char * kPlannedStopColumns =
+    "id, starts_at_ns, ends_at_ns, reason, declared_by, declared_at_ns, ended_early";
+
+}  // namespace
+
+bool SqliteFaultStorage::declare_planned_stop(const PlannedStopWindow & window) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  {
+    SqliteStatement exists(db_, "SELECT 1 FROM planned_stops WHERE id = ?");
+    exists.bind_text(1, window.id);
+    if (exists.step() == SQLITE_ROW) {
+      return false;
+    }
+  }
+
+  SqliteStatement stmt(db_,
+                       "INSERT INTO planned_stops "
+                       "(id, starts_at_ns, ends_at_ns, reason, declared_by, declared_at_ns, ended_early) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)");
+  stmt.bind_text(1, window.id);
+  stmt.bind_int64(2, window.starts_at_ns);
+  stmt.bind_int64(3, window.ends_at_ns);
+  stmt.bind_text(4, window.reason);
+  stmt.bind_text(5, window.declared_by);
+  stmt.bind_int64(6, window.declared_at_ns);
+  stmt.bind_int64(7, window.ended_early ? 1 : 0);
+  if (stmt.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to insert planned stop: ") + sqlite3_errmsg(db_));
+  }
+
+  prune_planned_stops_locked(window.declared_at_ns);
+  return true;
+}
+
+EndPlannedStopResult SqliteFaultStorage::end_planned_stop(const std::string & id, int64_t at_ns) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  PlannedStopWindow current;
+  {
+    SqliteStatement stmt(
+        db_, std::string("SELECT ").append(kPlannedStopColumns).append(" FROM planned_stops WHERE id = ?").c_str());
+    stmt.bind_text(1, id);
+    if (stmt.step() != SQLITE_ROW) {
+      return EndPlannedStopResult{EndPlannedStopOutcome::NotFound, {}};
+    }
+    current = read_planned_stop_row(stmt);
+  }
+
+  if (!current.active_at(at_ns)) {
+    return EndPlannedStopResult{EndPlannedStopOutcome::AlreadyEnded, current};
+  }
+
+  SqliteStatement update(db_, "UPDATE planned_stops SET ends_at_ns = ?, ended_early = 1 WHERE id = ?");
+  update.bind_int64(1, at_ns);
+  update.bind_text(2, id);
+  if (update.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to end planned stop: ") + sqlite3_errmsg(db_));
+  }
+
+  current.ends_at_ns = at_ns;
+  current.ended_early = true;
+  return EndPlannedStopResult{EndPlannedStopOutcome::Ended, current};
+}
+
+std::optional<PlannedStopWindow> SqliteFaultStorage::get_planned_stop(const std::string & id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  SqliteStatement stmt(
+      db_, std::string("SELECT ").append(kPlannedStopColumns).append(" FROM planned_stops WHERE id = ?").c_str());
+  stmt.bind_text(1, id);
+  if (stmt.step() != SQLITE_ROW) {
+    return std::nullopt;
+  }
+  return read_planned_stop_row(stmt);
+}
+
+std::vector<PlannedStopWindow> SqliteFaultStorage::list_planned_stops() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Ties on declared_at_ns are broken by id DESC, matching the in-memory backend:
+  // two windows declared in the same nanosecond must not order differently
+  // between the two backends or between two calls.
+  SqliteStatement stmt(db_, std::string("SELECT ")
+                                .append(kPlannedStopColumns)
+                                .append(" FROM planned_stops ORDER BY declared_at_ns DESC, id DESC")
+                                .c_str());
+  std::vector<PlannedStopWindow> out;
+  while (stmt.step() == SQLITE_ROW) {
+    out.push_back(read_planned_stop_row(stmt));
+  }
+  return out;
+}
+
+size_t SqliteFaultStorage::set_max_planned_stops(size_t max_count, int64_t now_ns) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  max_planned_stops_ = max_count;
+  return prune_planned_stops_locked(now_ns);
+}
+
+size_t SqliteFaultStorage::prune_planned_stops_locked(int64_t now_ns) {
+  if (max_planned_stops_ == 0) {
+    return 0;
+  }
+
+  size_t total = 0;
+  {
+    SqliteStatement count(db_, "SELECT COUNT(*) FROM planned_stops");
+    if (count.step() == SQLITE_ROW) {
+      total = static_cast<size_t>(std::max<int64_t>(0, count.column_int64(0)));
+    }
+  }
+  if (total <= max_planned_stops_) {
+    return 0;
+  }
+
+  const size_t over = total - max_planned_stops_;
+  if (over > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return 0;
+  }
+
+  // Only windows whose end has passed are candidates; a running window is never
+  // pruned, so the row count can stay above the bound while many are live.
+  SqliteStatement del(db_,
+                      "DELETE FROM planned_stops WHERE id IN ("
+                      "  SELECT id FROM planned_stops WHERE ends_at_ns <= ?"
+                      "  ORDER BY declared_at_ns ASC, id ASC LIMIT ?"
+                      ")");
+  del.bind_int64(1, now_ns);
+  del.bind_int64(2, static_cast<int64_t>(over));
+  if (del.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to prune planned stops: ") + sqlite3_errmsg(db_));
+  }
+  return static_cast<size_t>(std::max(0, sqlite3_changes(db_)));
 }
 
 }  // namespace ros2_medkit_fault_manager

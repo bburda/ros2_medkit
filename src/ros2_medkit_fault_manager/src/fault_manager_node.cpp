@@ -32,6 +32,7 @@
 #include "ros2_medkit_msgs/msg/environment_data.hpp"
 #include "ros2_medkit_msgs/msg/extended_data_records.hpp"
 #include "ros2_medkit_msgs/msg/muted_fault_info.hpp"
+#include "ros2_medkit_msgs/msg/planned_stop.hpp"
 #include "ros2_medkit_msgs/msg/snapshot.hpp"
 
 namespace ros2_medkit_fault_manager {
@@ -213,6 +214,19 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
     max_near_misses = kDefaultMaxNearMissesPerFault;
   }
 
+  // Planned-stop retention. Bounded by COUNT rather than by age: a window that
+  // has ended is still the reason a fault from last month reads as expected, so
+  // it cannot be dropped for being old, only for being one of too many.
+  // declare_parameter<int64_t> deliberately: <int> narrows silently, so a value
+  // above INT_MAX would wrap back into the legal band and pass the range check.
+  bool planned_stop_bound_clamped = false;
+  const int64_t max_planned_stops = clamp_planned_stop_windows(
+      declare_parameter<int64_t>("planned_stop.max_windows", kDefaultPlannedStopWindows), planned_stop_bound_clamped);
+  if (planned_stop_bound_clamped) {
+    RCLCPP_WARN(get_logger(), "planned_stop.max_windows must be in [%ld, %ld]. Using %ld.", kMinPlannedStopWindows,
+                kMaxPlannedStopWindows, max_planned_stops);
+  }
+
   // Create storage backend
   storage_ = create_storage();
 
@@ -235,6 +249,17 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
                 "near_miss.max_per_fault=%ld dropped %zu stored near-miss entries that exceeded the bound. "
                 "Raise the bound or set it to 0 before restarting if that history was needed.",
                 max_near_misses, evicted_near_misses);
+  }
+
+  // Apply the planned-stop bound. Applying it also trims what a previous run left
+  // over a now-smaller bound, which deletes declarations for good, so say when it does.
+  const size_t evicted_windows =
+      storage_->set_max_planned_stops(static_cast<size_t>(max_planned_stops), get_wall_clock_ns());
+  if (evicted_windows > 0) {
+    RCLCPP_WARN(get_logger(),
+                "planned_stop.max_windows=%ld dropped %zu stored planned-stop windows that exceeded the bound. "
+                "Faults whose cycle started inside a dropped window no longer read as expected.",
+                max_planned_stops, evicted_windows);
   }
 
   // Create event publisher for SSE streaming
@@ -362,6 +387,26 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
       [this](const std::shared_ptr<ros2_medkit_msgs::srv::ListFaultsForEntity::Request> & request,
              const std::shared_ptr<ros2_medkit_msgs::srv::ListFaultsForEntity::Response> & response) {
         handle_list_faults_for_entity(request, response);
+      });
+
+  declare_planned_stop_srv_ = create_service<ros2_medkit_msgs::srv::DeclarePlannedStop>(
+      "~/declare_planned_stop",
+      [this](const std::shared_ptr<ros2_medkit_msgs::srv::DeclarePlannedStop::Request> & request,
+             const std::shared_ptr<ros2_medkit_msgs::srv::DeclarePlannedStop::Response> & response) {
+        handle_declare_planned_stop(request, response);
+      });
+
+  end_planned_stop_srv_ = create_service<ros2_medkit_msgs::srv::EndPlannedStop>(
+      "~/end_planned_stop", [this](const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Request> & request,
+                                   const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Response> & response) {
+        handle_end_planned_stop(request, response);
+      });
+
+  list_planned_stops_srv_ = create_service<ros2_medkit_msgs::srv::ListPlannedStops>(
+      "~/list_planned_stops",
+      [this](const std::shared_ptr<ros2_medkit_msgs::srv::ListPlannedStops::Request> & request,
+             const std::shared_ptr<ros2_medkit_msgs::srv::ListPlannedStops::Response> & response) {
+        handle_list_planned_stops(request, response);
       });
 
   // Initialize snapshot capture
@@ -1605,6 +1650,123 @@ void FaultManagerNode::handle_list_rosbags(
   response->success = true;
   RCLCPP_DEBUG(get_logger(), "ListRosbags returned %zu rosbags for entity '%s'", response->fault_codes.size(),
                request->entity_fqn.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Planned-stop windows
+//
+// These three handlers are the only code in the fault manager that touches a
+// window. Nothing on the report / confirm / heal / clear path consults them: an
+// expected fault takes exactly the same journey through storage, debounce,
+// capture and the audit log as any other, and the window only lets a reader tell
+// the two apart afterwards.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// builtin_interfaces/Time -> nanoseconds since the Unix epoch.
+int64_t time_msg_to_ns(const builtin_interfaces::msg::Time & t) {
+  return static_cast<int64_t>(t.sec) * 1000000000LL + static_cast<int64_t>(t.nanosec);
+}
+
+/// nanoseconds since the Unix epoch -> builtin_interfaces/Time.
+builtin_interfaces::msg::Time ns_to_time_msg(int64_t ns) {
+  builtin_interfaces::msg::Time t;
+  const int64_t sec = ns / 1000000000LL;
+  const int64_t nsec = ns % 1000000000LL;
+  t.sec = static_cast<int32_t>(sec);
+  t.nanosec = static_cast<uint32_t>(nsec);
+  return t;
+}
+
+ros2_medkit_msgs::msg::PlannedStop window_to_msg(const PlannedStopWindow & w) {
+  ros2_medkit_msgs::msg::PlannedStop msg;
+  msg.id = w.id;
+  msg.starts_at = ns_to_time_msg(w.starts_at_ns);
+  msg.ends_at = ns_to_time_msg(w.ends_at_ns);
+  msg.reason = w.reason;
+  msg.declared_by = w.declared_by;
+  msg.declared_at = ns_to_time_msg(w.declared_at_ns);
+  msg.ended_early = w.ended_early;
+  return msg;
+}
+
+}  // namespace
+
+void FaultManagerNode::handle_declare_planned_stop(
+    const std::shared_ptr<ros2_medkit_msgs::srv::DeclarePlannedStop::Request> & request,
+    const std::shared_ptr<ros2_medkit_msgs::srv::DeclarePlannedStop::Response> & response) {
+  const int64_t now_ns = get_wall_clock_ns();
+
+  PlannedStopWindow window;
+  // A zero start means "now": declaring a stop as it begins is the common case
+  // and typing the current instant into the request would only add a race.
+  const int64_t requested_start = time_msg_to_ns(request->starts_at);
+  window.starts_at_ns = requested_start == 0 ? now_ns : requested_start;
+  window.ends_at_ns = time_msg_to_ns(request->ends_at);
+  window.reason = request->reason;
+  window.declared_by = request->declared_by.empty() ? std::string("anonymous") : request->declared_by;
+  window.declared_at_ns = now_ns;
+
+  if (window.ends_at_ns <= window.starts_at_ns) {
+    response->success = false;
+    response->message = "ends_at must be strictly after starts_at";
+    return;
+  }
+
+  window.id = std::to_string(now_ns) + "-" + std::to_string(planned_stop_seq_.fetch_add(1) + 1);
+
+  if (!storage_->declare_planned_stop(window)) {
+    response->success = false;
+    response->message = "a planned stop with id '" + window.id + "' already exists";
+    return;
+  }
+
+  auto stored = storage_->get_planned_stop(window.id);
+  response->success = true;
+  response->stop = window_to_msg(stored.value_or(window));
+  RCLCPP_INFO(get_logger(), "Planned stop '%s' declared by '%s': %s", window.id.c_str(), window.declared_by.c_str(),
+              window.reason.c_str());
+}
+
+void FaultManagerNode::handle_end_planned_stop(
+    const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Request> & request,
+    const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Response> & response) {
+  const int64_t requested_at = time_msg_to_ns(request->at);
+  const int64_t at_ns = requested_at == 0 ? get_wall_clock_ns() : requested_at;
+
+  const auto result = storage_->end_planned_stop(request->id, at_ns);
+  switch (result.outcome) {
+    case EndPlannedStopOutcome::Ended:
+      response->success = true;
+      response->stop = window_to_msg(result.window);
+      RCLCPP_INFO(get_logger(), "Planned stop '%s' ended early", request->id.c_str());
+      return;
+    case EndPlannedStopOutcome::AlreadyEnded:
+      response->success = false;
+      response->message = "planned stop '" + request->id + "' has already ended";
+      response->stop = window_to_msg(result.window);
+      return;
+    case EndPlannedStopOutcome::NotFound:
+    default:
+      response->success = false;
+      response->message = "no planned stop with id '" + request->id + "'";
+      return;
+  }
+}
+
+void FaultManagerNode::handle_list_planned_stops(
+    const std::shared_ptr<ros2_medkit_msgs::srv::ListPlannedStops::Request> & request,
+    const std::shared_ptr<ros2_medkit_msgs::srv::ListPlannedStops::Response> & response) {
+  const int64_t requested_now = time_msg_to_ns(request->now);
+  const int64_t now_ns = requested_now == 0 ? get_wall_clock_ns() : requested_now;
+
+  for (const auto & window : storage_->list_planned_stops()) {
+    if (request->active_only && !window.covers(now_ns)) {
+      continue;
+    }
+    response->stops.push_back(window_to_msg(window));
+  }
 }
 
 void FaultManagerNode::handle_list_faults_for_entity(

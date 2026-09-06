@@ -122,6 +122,45 @@ fault cycle must not erase how often that code approached confirmation across cy
    storage API (``FaultStorage::get_near_misses``). A database written by an earlier build gains
    the table on first open. There is no service or REST surface for it yet.
 
+Planned Stops
+~~~~~~~~~~~~~
+
+A **planned stop** is a window of wall-clock time during which faults are expected: a changeover, a
+maintenance weekend, a line move. An operator declares one at runtime through the fault manager's
+``~/declare_planned_stop`` service or through the gateway's ``/x-medkit-planned-stops`` routes.
+
+Declaring a window changes nothing about how faults are handled. A fault whose cycle starts inside
+one is confirmed, healed, cleared, captured and audited exactly as any other fault - the window only
+lets a reader tell an expected fault from a surprise, which the gateway serves as
+``x-medkit.expected`` on the fault list and on the event stream.
+
+Windows may overlap, may be declared after the stop they describe, and have no maximum duration.
+They are stored in the ``planned_stops`` table of the fault database and survive a restart; a
+database written by an earlier build gains the table on first open.
+
+.. code-block:: yaml
+
+   fault_manager:
+     ros__parameters:
+       planned_stop:
+         max_windows: 100                  # Declared windows retained (clamped to [1, 10000])
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 12 58
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``planned_stop.max_windows``
+     - ``100``
+     - Declared windows retained. Bounded by **count**, not by age: a window that has ended is
+       still the reason a fault from last month reads as expected. When the bound is reached the
+       **oldest ended** windows are dropped first; a window that is still running is never dropped,
+       so the stored count can exceed the bound while more than that many windows are live. Values
+       outside ``[1, 10000]`` are clamped and the clamp is logged at startup. Lowering the bound
+       deletes stored declarations on the next start, which is also logged.
+
 Per-Entity Thresholds
 ~~~~~~~~~~~~~~~~~~~~~
 

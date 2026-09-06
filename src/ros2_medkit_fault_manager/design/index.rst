@@ -186,6 +186,19 @@ Clears (acknowledges) a fault by setting its status to CLEARED.
 - **Idempotent**: Clearing an already-cleared fault succeeds
 - **Returns**: ``success=true`` if fault existed, ``success=false`` if not found
 
+~/declare_planned_stop, ~/end_planned_stop, ~/list_planned_stops
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Declare, cut short and list the windows of wall-clock time during which faults are expected.
+
+- **Declare**: refuses a window that is not an interval (``ends_at <= starts_at``); a zero
+  ``starts_at`` means "now". Windows may overlap and may lie wholly in the past.
+- **End**: moves ``ends_at`` to the given instant (zero means "now") and sets ``ended_early``.
+  Refused for an unknown id and for a window whose end has already passed, and the message
+  distinguishes the two so a caller can map them onto different answers.
+- **List**: newest declaration first; ``active_only`` keeps the windows containing ``now``.
+- **Returns**: the stored ``PlannedStop`` in every success case.
+
 Design Decisions
 ----------------
 
@@ -245,6 +258,32 @@ means heal on a single PASSED event); the node validates the
 merged per-entity config at startup, logs a warning, and falls back to safe defaults if not. When
 healing is disabled, any HEALED row left by a previous (healing-enabled) run is reclassified to
 CLEARED once at startup so it does not behave inconsistently under the latch.
+
+Planned Stops Are Marked, Never Suppressed
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A planned-stop window records that an operator expected faults during an interval. **No code on
+the report, confirm, heal, clear, capture or audit path reads a window.** A fault whose cycle
+starts inside one takes exactly the same journey as any other fault: the same debounce, the same
+rows, the same rosbag, the same audit transitions, the same ``occurrence_count``. The three
+services above are the only place in the package that touches the ``planned_stops`` table.
+
+That is deliberate rather than incidental. The evidence chain has to describe the plant that
+existed, and a window is a statement about intent, not about what the machines did. A reader that
+wants to separate the two derives the flag from the window and the fault's ``first_occurred``; the
+gateway does exactly this and serves it as ``x-medkit.expected`` on the fault list and the event
+stream.
+
+The cycle boundary is ``first_occurred``, which is set on a new fault and reset when a FAILED event
+raises a CLEARED fault again - so a fault code that fails inside a window and fails again outside it
+is expected for the first cycle and unexpected for the second, which is what an operator asking
+"did anything break outside the stop" means.
+
+Windows are bounded by count rather than by age (``planned_stop.max_windows``). A window that has
+ended is still the reason a fault from last month reads as expected, so it cannot be dropped for
+being old - only for being one of too many. Retention prunes ended windows, oldest declaration
+first, and **never** a window that is still running: a live window vanishing under the operator who
+declared it would be the one failure mode with no recovery.
 
 Rosbag Black-Box Recording
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

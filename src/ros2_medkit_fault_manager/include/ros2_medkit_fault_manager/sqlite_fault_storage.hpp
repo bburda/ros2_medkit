@@ -95,6 +95,12 @@ class SqliteFaultStorage : public FaultStorage {
   std::vector<ros2_medkit_msgs::msg::Fault> get_all_faults() const override;
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
+  bool declare_planned_stop(const PlannedStopWindow & window) override;
+  EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns) override;
+  std::optional<PlannedStopWindow> get_planned_stop(const std::string & id) const override;
+  std::vector<PlannedStopWindow> list_planned_stops() const override;
+  size_t set_max_planned_stops(size_t max_count, int64_t now_ns) override;
+
   /// Get the database path
   const std::string & db_path() const {
     return db_path_;
@@ -126,6 +132,11 @@ class SqliteFaultStorage : public FaultStorage {
 
   /// Whether any fault at all still references @p file_path. Caller holds mutex_.
   bool path_referenced(const std::string & file_path) const;
+
+  /// Delete ended windows, oldest declaration first, until at most
+  /// max_planned_stops_ rows remain. Returns how many rows went. Caller holds
+  /// mutex_.
+  size_t prune_planned_stops_locked(int64_t now_ns);
 
   /// store_rosbag_file body without taking mutex_. Caller holds mutex_ and
   /// unlinks the returned replaced-bag path once the row change is durable.
@@ -172,6 +183,7 @@ class SqliteFaultStorage : public FaultStorage {
   /// Defaults to 1, the pre-#620 behaviour: a new recording replaces the old one.
   /// 0 = unlimited, bounded only by max_total_storage_mb.
   size_t max_rosbags_per_fault_{1};
+  size_t max_planned_stops_{static_cast<size_t>(kDefaultPlannedStopWindows)};
 };
 
 }  // namespace ros2_medkit_fault_manager
