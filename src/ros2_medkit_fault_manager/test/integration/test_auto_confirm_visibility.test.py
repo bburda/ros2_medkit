@@ -56,6 +56,8 @@ CONFIRM_WAIT_SEC = AUTO_CONFIRM_SEC + 12.0
 # code is expected to capture that topic.
 SNAPSHOT_FAULT_CODE = 'TEST_SNAPSHOT_FAULT'
 
+EVENT_TOPIC = '/fault_manager/events'
+
 _temp_dirs = []
 
 
@@ -115,7 +117,7 @@ class TestAutoConfirmVisibility(unittest.TestCase):
             cls.events = []
             cls.events_lock = threading.Lock()
             cls.event_sub = cls.node.create_subscription(
-                FaultEvent, '/fault_manager/events', cls._on_event, 100
+                FaultEvent, EVENT_TOPIC, cls._on_event, 100
             )
 
             assert cls.report_client.wait_for_service(timeout_sec=30.0), \
@@ -126,10 +128,12 @@ class TestAutoConfirmVisibility(unittest.TestCase):
             # The publisher uses volatile durability, so an event sent before the
             # subscription matches is lost. Without this wait an assertion that
             # no event arrived could pass because nothing was listening yet.
-            deadline = time.time() + 30.0
-            while time.time() < deadline and cls.event_sub.get_publisher_count() == 0:
+            # Node.count_publishers rather than Subscription.get_publisher_count:
+            # the latter does not exist in rclpy on every supported distro.
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline and cls.node.count_publishers(EVENT_TOPIC) == 0:
                 rclpy.spin_once(cls.node, timeout_sec=0.1)
-            assert cls.event_sub.get_publisher_count() > 0, \
+            assert cls.node.count_publishers(EVENT_TOPIC) > 0, \
                 'fault event publisher never matched; absence assertions would be meaningless'
         except Exception:
             rclpy.shutdown()
