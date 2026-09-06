@@ -306,12 +306,29 @@ TEST(OpcuaClientTest, RemoveEventMonitoredItemUnknownIdDoesNotBumpGeneration) {
   EXPECT_EQ(client.current_generation(), before);
 }
 
+// call_method itself is in both builds: ConditionRefresh rides on it and asks
+// the server to replay conditions rather than changing any.
 TEST(OpcuaClientTest, CallMethodWhenDisconnected) {
   OpcuaClient client;
   auto result = client.call_method(opcua::NodeId(0, UA_NS0ID_SERVER), opcua::NodeId(0, 11489), {});
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, OpcuaClient::MethodError::NotConnected);
 }
+
+#if !MEDKIT_OPCUA_READ_ONLY
+// Acknowledge / Confirm change condition state on the controller, so the entry
+// point that issues them exists only in a write-capable build - the same rule
+// write_value follows, and what test_opcua_build_variant checks on the object.
+TEST(OpcuaClientTest, CallConditionMethodWhenDisconnected) {
+  OpcuaClient client;
+  constexpr uint32_t kAcknowledgeMethodId = 9111;
+  auto result =
+      client.call_condition_method(opcua::NodeId(2, "Alarms.Overpressure"), opcua::NodeId(0, kAcknowledgeMethodId),
+                                   opcua::ByteString("event-id"), "comment");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, OpcuaClient::MethodError::NotConnected);
+}
+#endif  // !MEDKIT_OPCUA_READ_ONLY
 
 TEST(OpcuaClientTest, GenerationBumpsOnDisconnect) {
   OpcuaClient client;

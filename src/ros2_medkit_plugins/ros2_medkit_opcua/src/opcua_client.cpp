@@ -1827,6 +1827,23 @@ OpcuaClient::classify_call_result(uint32_t overall_status_code, const std::vecto
   return {};
 }
 
+#if !MEDKIT_OPCUA_READ_ONLY
+// The Part 9 Acknowledge / Confirm entry point. It builds the two arguments
+// those methods take and hands them to the generic Call service. A read-only
+// build does not compile it: acknowledging an alarm changes condition state on
+// the controller, which is a write, and the object must carry no way to make
+// one. ConditionRefresh keeps using call_method below - it asks the server to
+// replay what it already holds.
+tl::expected<std::vector<opcua::Variant>, OpcuaClient::MethodErrorInfo>
+OpcuaClient::call_condition_method(const opcua::NodeId & condition_id, const opcua::NodeId & method_id,
+                                   const opcua::ByteString & event_id, const std::string & comment) {
+  std::vector<opcua::Variant> args;
+  args.push_back(opcua::Variant::fromScalar(event_id));
+  args.push_back(opcua::Variant::fromScalar(opcua::LocalizedText("", comment)));
+  return call_method(condition_id, method_id, args);
+}
+#endif  // !MEDKIT_OPCUA_READ_ONLY
+
 tl::expected<std::vector<opcua::Variant>, OpcuaClient::MethodErrorInfo>
 OpcuaClient::call_method(const opcua::NodeId & object_id, const opcua::NodeId & method_id,
                          const std::vector<opcua::Variant> & input_args) {

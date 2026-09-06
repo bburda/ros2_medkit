@@ -53,7 +53,15 @@ import tempfile
 #   - Node<Client>::writeValueScalar / writeValue are the open62541pp templates
 #     where the value is encoded for the Write service;
 #   - services::write / services::writeAttribute<Client> are the layer beneath
-#     them, the last C++ frame before open62541's own client machinery.
+#     them, the last C++ frame before open62541's own client machinery;
+#   - call_condition_method issues the Part 9 Acknowledge / Confirm calls, which
+#     change alarm state on the controller and are a write like any other.
+#
+# call_method and opcua::services::call are deliberately NOT markers even though
+# the acknowledge path runs through them: ConditionRefresh runs through them
+# too, asking the server to replay conditions it already holds, and that is a
+# read the shipped build keeps. Measured 3/3 and 1/1 across the two variants -
+# they discriminate nothing.
 #
 # Every marker is verified to discriminate in an OPTIMIZED build, which is what
 # CI and every release produce. That rules out opcua::services::writeValue and
@@ -82,6 +90,7 @@ WRITE_MARKERS = (
     'opcua::Node<opcua::Client>::writeValue(opcua::Variant const&)',
     'opcua::services::write(opcua::Client&, opcua::WriteRequest const&)',
     'opcua::services::writeAttribute<opcua::Client>',
+    'ros2_medkit_gateway::OpcuaClient::call_condition_method(',
 )
 
 # The read path the plugin needs in every variant. Present in both builds, so a
@@ -94,6 +103,7 @@ READ_MARKERS = (
     'ros2_medkit_gateway::OpcuaClient::read_values(',
     'ros2_medkit_gateway::OpcuaClient::read_access_level(',
     'ros2_medkit_gateway::OpcuaClient::browse_detailed(',
+    'ros2_medkit_gateway::OpcuaClient::call_method(',
 )
 
 # Nothing from the OPC-UA stack may appear in the module's dynamic symbol table,

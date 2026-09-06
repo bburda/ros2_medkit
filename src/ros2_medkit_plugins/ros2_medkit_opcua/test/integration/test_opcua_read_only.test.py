@@ -24,6 +24,9 @@ every claim is checked at the wire, not in a mock:
   * the ``infer_writable`` sweep (true / false / absent) over the address-space
     walk, against the same node;
   * the SOVD write endpoints and the vendor write route;
+  * the Part 9 alarm acknowledge, against a condition the fixture really
+    raises - acknowledging changes condition state on the controller, so it is
+    a write and a read-only build neither offers nor performs it;
   * what the entity tree advertises;
   * and a reconnect, so the answer does not change when the address space is
     walked a second time.
@@ -57,6 +60,7 @@ READ_ONLY_NODE = 'ns=2;s=Tank.Level'
 SECOND_WRITABLE_NODE = 'ns=2;s=FaultCode'
 
 ENTITY = 'plc_app'
+ALARM_CODE = 'PLC_OVERPRESSURE'
 COMPONENT = 'read_only_runtime'
 
 # The vendor code the gateway puts on the wire for any plugin provider refusal
@@ -183,7 +187,7 @@ def start_server(server_bin, port, log_path):
     log = open(log_path, 'w')
     proc = subprocess.Popen(
         [str(server_bin), '--port', str(port)],
-        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
         text=True, start_new_session=True,
     )
     proc._log = log
@@ -191,6 +195,18 @@ def start_server(server_bin, port, log_path):
         terminate(proc)
         return None
     return proc
+
+
+def send_cmd(server, cmd):
+    """Write one alarm-CLI command to the fixture; False when it is already gone."""
+    if server.poll() is not None or server.stdin is None:
+        return False
+    try:
+        server.stdin.write(cmd + '\n')
+        server.stdin.flush()
+    except (BrokenPipeError, ValueError):
+        return False
+    return True
 
 
 def write_params(path, *, port, plugin, server_port, node_map, manifest, auto_browse):
@@ -374,6 +390,79 @@ def run_node_map_leg(workdir, env, plugin, server_port, manifest, read_only):
         terminate(gw)
 
 
+def alarm_map_text():
+    """Map one of the fixture's AlarmConditionType sources onto an entity."""
+    return (
+        'area_id: plc_systems\n'
+        f'component_id: {COMPONENT}\n'
+        'nodes:\n'
+        f'  - node_id: "{READ_ONLY_NODE}"\n'
+        f'    entity_id: {ENTITY}\n'
+        '    data_name: tank_level\n'
+        '    data_type: float\n'
+        'event_alarms:\n'
+        '  - alarm_source: "ns=2;s=Alarms.Overpressure"\n'
+        f'    entity_id: {ENTITY}\n'
+        f'    fault_code: {ALARM_CODE}\n'
+    )
+
+
+def run_alarm_leg(workdir, env, plugin, server, server_port, manifest, read_only):
+    """Acknowledge is a controller state change, so it follows the same rule."""
+    print('--- alarm acknowledge / confirm leg ---')
+    node_map = workdir / 'alarm_nodes.yaml'
+    node_map.write_text(alarm_map_text())
+    port = free_port()
+    params = workdir / 'gateway_alarm.yaml'
+    write_params(params, port=port, plugin=plugin, server_port=server_port,
+                 node_map=node_map, manifest=manifest, auto_browse=None)
+    log = workdir / 'gateway_alarm.log'
+    gw = start_gateway(params, log, env)
+    try:
+        base = f'http://127.0.0.1:{port}/api/v1'
+        status = wait_json(f'{base}/components/{COMPONENT}/x-plc-status',
+                           lambda j: j.get('connected') is True, deadline=90)
+        if not check(bool(status) and status.get('connected') is True,
+                     'the gateway connected for the alarm leg'):
+            print(log.read_text(errors='replace')[-3000:], file=sys.stderr)
+            return
+
+        # 1. What the entity offers.
+        _s, ops = http(f'{base}/apps/{ENTITY}/operations')
+        op_ids = {o.get('id') for o in (ops or {}).get('items', [])}
+        for op in ('acknowledge_fault', 'confirm_fault'):
+            check((op in op_ids) is not read_only,
+                  f'{op} offered: {not read_only} (got {sorted(op_ids)})')
+
+        # 2. Raise a real condition, so the write-capable call has something
+        #    live to act on and the read-only refusal is not just "not found".
+        if not check(send_cmd(server[0], 'fire Overpressure 750'),
+                     'fired an alarm on the fixture server'):
+            return
+        exec_url = f'{base}/apps/{ENTITY}/operations/acknowledge_fault/executions'
+        body = {'fault_code': ALARM_CODE, 'comment': 'acked by the integration test'}
+        if read_only:
+            status, payload = http(exec_url, 'POST', body)
+            refusal_is_the_build(status, payload, 'POST acknowledge_fault')
+        else:
+            # The condition has to reach the poller's registry first; the
+            # subscription delivers it a moment after the server emits it.
+            got = None
+            for _ in range(30):
+                status, payload = http(exec_url, 'POST', body)
+                if status in (200, 202):
+                    got = payload
+                    break
+                time.sleep(2)
+            check(got is not None,
+                  f'POST acknowledge_fault succeeds (last: {status} {payload!r})')
+            if got is not None:
+                check(got.get('status') == 'ok' and got.get('fault_code') == ALARM_CODE,
+                      f'the acknowledge reached the server ({got!r})')
+    finally:
+        terminate(gw)
+
+
 def auto_browse_writable(base, deadline=90):
     """Return the writable flag of the auto-browsed StatusWord point, or None."""
     payload = wait_json(f'{base}/apps', lambda j: j.get('items'), deadline=deadline)
@@ -482,6 +571,7 @@ def main():
             return 1
 
         run_node_map_leg(workdir, env, plugin, server_port, manifest, read_only)
+        run_alarm_leg(workdir, env, plugin, server, server_port, manifest, read_only)
         for infer_writable, rebrowse in (('absent', True), ('true', False), ('false', False)):
             run_auto_browse_leg(workdir, env, plugin, server_bin, server, server_port,
                                 manifest, read_only, infer_writable, rebrowse)

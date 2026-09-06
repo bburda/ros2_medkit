@@ -148,12 +148,18 @@ In the default read-only build:
 - Nothing advertises a write: no `x-plc-operations` capability on any entity, no
   `set_<name>` entry in `/operations`, and the `POST .../x-plc-operations/...`
   route is not registered (it answers 404).
-- `PUT /{type}/{id}/data/{name}` and the value-write half of
+- **Alarm `acknowledge_fault` and `confirm_fault` are gone too.** A method call
+  that changes alarm state on the server is a write to the controller, and the
+  read-only build forbids every write path, not only value writes. The
+  `OpcuaClient` entry point that issues the Part 9 Acknowledge / Confirm calls
+  is not compiled, neither operation is listed on an event-alarm entity, and a
+  client that posts one anyway is refused. `ConditionRefresh` is unaffected and
+  stays in both variants: it asks the server to replay conditions it already
+  holds and changes nothing.
+- `PUT /{type}/{id}/data/{name}` and
   `POST /{type}/{id}/operations/{name}/executions` answer **403** before any
-  node lookup or client call, with vendor code `x-medkit-plugin-error` and a
-  message naming `MEDKIT_OPCUA_READ_ONLY`. Alarm `acknowledge_fault` /
-  `confirm_fault` are Part 9 condition interactions, not value writes, and stay
-  available in both variants.
+  node lookup, condition lookup or client call, with vendor code
+  `x-medkit-plugin-error` and a message naming `MEDKIT_OPCUA_READ_ONLY`.
 
 A write-capable build restores everything above; nothing else differs.
 
@@ -404,8 +410,11 @@ that catch-all code is never raised for it (see "System messages" under
 `auto_alarms` below). A mapping-level `severity_override` / `message` overrides
 the source-level one; otherwise the source-level value is inherited.
 
-The plugin auto-registers `acknowledge_fault` and `confirm_fault` operations
-on every entity that has at least one `event_alarms` entry. Invoke them with:
+In a write-capable build the plugin auto-registers `acknowledge_fault` and
+`confirm_fault` operations on every entity that has at least one `event_alarms`
+entry. The default read-only build offers neither and refuses both - see
+[Read-only and write-capable builds](#read-only-and-write-capable-builds).
+Invoke them with:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/apps/tank_process/operations/acknowledge_fault/executions \

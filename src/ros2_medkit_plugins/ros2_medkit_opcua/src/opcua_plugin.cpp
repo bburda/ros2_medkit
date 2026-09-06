@@ -1800,10 +1800,15 @@ OpcuaPlugin::list_operations(const std::string & entity_id) {
       collection.items.push_back(std::move(item));
     }
 
+#if !MEDKIT_OPCUA_READ_ONLY
     // Issue #386: emit acknowledge_fault / confirm_fault when the entity
     // has at least one native AlarmConditionType event subscription. The
     // fault_code parameter (passed in operation execution body) discriminates
     // which condition the operator is acting on.
+    //
+    // Not offered by a read-only build. Acknowledging or confirming a condition
+    // changes alarm state on the controller, so it is a write like any other,
+    // and the tree must not advertise what the binary cannot do.
     bool has_event_alarms = std::any_of(node_map_.event_alarms().begin(), node_map_.event_alarms().end(),
                                         [&entity_id](const AlarmEventConfig & cfg) {
                                           return cfg.entity_id == entity_id;
@@ -1823,6 +1828,7 @@ OpcuaPlugin::list_operations(const std::string & entity_id) {
       confirm.asynchronous_execution = false;
       collection.items.push_back(std::move(confirm));
     }
+#endif
 
     return collection;
   }
@@ -1839,6 +1845,22 @@ OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string 
         OperationProviderErrorInfo{OperationProviderError::Internal, "plugin not initialized", 503});
   }
 
+#if MEDKIT_OPCUA_READ_ONLY
+  // Neither branch below reads these: every operation is refused on its name
+  // alone, before any entity lookup or parameter parsing.
+  (void)entity_id;
+  (void)parameters;
+
+  // Acknowledge and Confirm change alarm state on the controller, so they are
+  // write paths and this build carries neither. Refused before any condition
+  // lookup or client call, with the same answer a value write gets - nothing
+  // advertises them either, so this is the backstop for a client that posts the
+  // operation id directly.
+  if (operation_name == "acknowledge_fault" || operation_name == "confirm_fault") {
+    return tl::make_unexpected(
+        OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, 403});
+  }
+#else
   // Issue #386: acknowledge_fault and confirm_fault dispatch to OPC-UA
   // Method calls on the live ConditionId. AcknowledgeableConditionType
   // declares Acknowledge as method i=9111 and Confirm as method i=9113;
@@ -1883,10 +1905,6 @@ OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string 
     constexpr uint32_t kConfirmMethodId = 9113;
     opcua::NodeId method_id(0, operation_name == "acknowledge_fault" ? kAcknowledgeMethodId : kConfirmMethodId);
 
-    std::vector<opcua::Variant> args;
-    args.push_back(opcua::Variant::fromScalar(runtime->latest_event_id));
-    args.push_back(opcua::Variant::fromScalar(opcua::LocalizedText("", comment)));
-
     if (plugin_debug_enabled()) {
       std::ostringstream hex_oss;
       const auto * bytes = runtime->latest_event_id.data();
@@ -1900,7 +1918,7 @@ OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string 
                                                                 << " conditionId=" << runtime->condition_id.toString());
     }
 
-    auto result = client_->call_method(runtime->condition_id, method_id, args);
+    auto result = client_->call_condition_method(runtime->condition_id, method_id, runtime->latest_event_id, comment);
     if (!result.has_value()) {
       auto code = result.error().code;
       int http = 502;
@@ -1929,14 +1947,14 @@ OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string 
     out["condition_id"] = runtime->condition_id.toString();
     return dto::OperationExecutionResult{std::move(out)};
   }
+#endif  // MEDKIT_OPCUA_READ_ONLY
 
 #if MEDKIT_OPCUA_READ_ONLY
-  // Everything past the acknowledge / confirm branch above is the value-write
-  // path, and this build does not contain it. Nothing advertised reaches here -
-  // a read-only build marks no point writable, so list_operations emits no
-  // set_* entry - and a request aimed straight at one is refused before any
-  // node lookup or client call. Acknowledging an alarm is a Part 9 condition
-  // interaction, not a value write, and stays available.
+  // Everything past the branch above is the value-write path, and this build
+  // does not contain it either. Nothing advertised reaches here - a read-only
+  // build marks no point writable, so list_operations emits no set_* entry -
+  // and a request aimed straight at one is refused before any node lookup or
+  // client call.
   return tl::make_unexpected(OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, 403});
 #else
   std::string data_name;

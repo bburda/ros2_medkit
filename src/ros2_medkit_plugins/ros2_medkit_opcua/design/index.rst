@@ -149,8 +149,21 @@ binary.
   ``DataProvider`` / ``OperationProvider`` interfaces; the refusal reaches a client
   as SOVD vendor code ``x-medkit-plugin-error``, which is the code the gateway
   assigns to every plugin provider error.
-- ``acknowledge_fault`` / ``confirm_fault`` are unaffected. They are OPC-UA Part 9
-  condition method calls, not value writes.
+- ``acknowledge_fault`` / ``confirm_fault`` go the same way. A method call that
+  changes alarm state on the server is a write to the controller, and the rule is
+  that a read-only build carries no write path at all, not merely no value writes.
+  ``OpcuaClient::call_condition_method`` - the entry point that issues the Part 9
+  Acknowledge (i=9111) and Confirm (i=9113) calls - is compiled only in a
+  write-capable build, ``list_operations`` offers neither operation on an
+  event-alarm entity, and ``execute_operation`` refuses both by name before any
+  condition lookup.
+- ``ConditionRefresh`` stays, and so does the generic ``OpcuaClient::call_method``
+  it rides on. Part 9 5.5.7 makes it a request for the server to replay the
+  conditions it already holds to the calling subscription; it changes nothing on
+  the controller, and without it a restart loses the active fault set. That is why
+  the guard sits on the condition-method entry point rather than on ``call_method``,
+  and why neither ``call_method`` nor ``opcua::services::call`` is a write marker -
+  measured, they are present in both variants.
 
 The acceptance is an inspection of the built object, not a reading of the
 configuration: ``test_opcua_build_variant`` runs ``nm`` over the plugin ``.so`` and
@@ -429,7 +442,9 @@ Acknowledge / Confirm round-trip
 --------------------------------
 
 Two SOVD operations appear on every entity that has at least one event-mode
-alarm declared:
+alarm declared, in a write-capable build. Both change condition state on the
+controller, so the default read-only build neither lists nor performs them (see
+"Read-only is a property of the build" above):
 
 - ``POST /apps/{entity}/operations/acknowledge_fault/executions``
 - ``POST /apps/{entity}/operations/confirm_fault/executions``

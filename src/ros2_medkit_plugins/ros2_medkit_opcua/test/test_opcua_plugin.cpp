@@ -417,8 +417,10 @@ TEST_F(OpcuaPluginTest, HasOperationsFalseForUnknownEntity) {
 // that posts the operation id directly still has to be refused, and refused for
 // the reason that is true.
 TEST_F(OpcuaPluginTest, ExecuteOperationRefusedOnAReadOnlyBuild) {
-  const std::vector<std::string> ops{"set_level", "set_pressure", "set_nonexistent"};
-  const std::vector<nlohmann::json> params_list{nlohmann::json{{"value", 5.0}}, nlohmann::json{{"not_value", 42}}};
+  const std::vector<std::string> ops{"set_level", "set_pressure", "set_nonexistent", "acknowledge_fault",
+                                     "confirm_fault"};
+  const std::vector<nlohmann::json> params_list{nlohmann::json{{"value", 5.0}}, nlohmann::json{{"not_value", 42}},
+                                                nlohmann::json{{"fault_code", "PLC_OVERPRESSURE"}}};
   for (const auto & op : ops) {
     for (const auto & params : params_list) {
       auto result = plugin_.execute_operation("tank", op, params);
@@ -443,6 +445,76 @@ TEST_F(OpcuaPluginTest, ExecuteOperationReadOnly) {
   auto result = plugin_.execute_operation("tank", "set_pressure", params);
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, OperationProviderError::Rejected);
+}
+#endif
+
+// -- Condition operations (acknowledge / confirm) per build variant --------
+//
+// Acknowledging an alarm changes condition state on the controller, so a
+// read-only build neither offers nor performs it. An entity with an
+// event_alarms source is the only one those operations are ever offered on.
+
+class OpcuaPluginEventAlarmsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    yaml_path_ = "/tmp/test_opcua_plugin_event_alarms_nodemap.yaml";
+    std::ofstream f(yaml_path_);
+    f << R"(
+area_id: test_plc
+component_id: test_runtime
+nodes:
+  - node_id: "ns=2;i=1"
+    entity_id: tank
+    data_name: level
+    data_type: float
+event_alarms:
+  - alarm_source: "ns=2;s=Alarms.Overpressure"
+    entity_id: tank
+    fault_code: PLC_OVERPRESSURE
+)";
+    f.close();
+
+    nlohmann::json config;
+    config["node_map_path"] = yaml_path_;
+    config["endpoint_url"] = "opc.tcp://nonexistent:4840";
+    plugin_.configure(config);
+    ctx_.entities["tank"] = {SovdEntityType::APP, "tank", "/test_plc", "/test_plc/test_runtime/tank"};
+    plugin_.set_context(ctx_);
+  }
+
+  std::string yaml_path_;
+  OpcuaPlugin plugin_;
+  FakePluginContext ctx_;
+};
+
+TEST_F(OpcuaPluginEventAlarmsTest, ConditionOperationsOfferedOnlyWhenTheBuildCanPerformThem) {
+  auto result = plugin_.list_operations("tank");
+  ASSERT_TRUE(result.has_value());
+  std::vector<std::string> ids;
+  for (const auto & item : result->items) {
+    ids.push_back(item.id);
+  }
+  const bool has_ack = std::find(ids.begin(), ids.end(), "acknowledge_fault") != ids.end();
+  const bool has_confirm = std::find(ids.begin(), ids.end(), "confirm_fault") != ids.end();
+#if MEDKIT_OPCUA_READ_ONLY
+  EXPECT_FALSE(has_ack) << "a read-only build must not advertise an alarm acknowledge";
+  EXPECT_FALSE(has_confirm) << "a read-only build must not advertise an alarm confirm";
+#else
+  EXPECT_TRUE(has_ack);
+  EXPECT_TRUE(has_confirm);
+#endif
+}
+
+#if MEDKIT_OPCUA_READ_ONLY
+TEST_F(OpcuaPluginEventAlarmsTest, ConditionOperationsRefusedOnAReadOnlyBuild) {
+  for (const auto & op : {std::string("acknowledge_fault"), std::string("confirm_fault")}) {
+    auto result = plugin_.execute_operation("tank", op, nlohmann::json{{"fault_code", "PLC_OVERPRESSURE"}});
+    ASSERT_FALSE(result.has_value()) << op;
+    EXPECT_EQ(result.error().code, OperationProviderError::Rejected);
+    EXPECT_EQ(result.error().http_status, 403);
+    EXPECT_NE(result.error().message.find("MEDKIT_OPCUA_READ_ONLY"), std::string::npos)
+        << "the refusal must name the build property, got: " << result.error().message;
+  }
 }
 #endif
 
