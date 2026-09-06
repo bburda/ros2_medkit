@@ -850,6 +850,16 @@ bash scripts/run_integration_tests.sh
 bash scripts/stop.sh
 ```
 
+A separate scenario covers the config-less discovery start-up race, which the
+suite above cannot see because it pins `OPCUA_ENDPOINT_URL` and so
+short-circuits discovery. It starts the gateway before any server, with
+discovery on and no endpoint configured, then brings a server up and asserts
+the gateway adopts it without a restart:
+
+```bash
+bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/run_discovery_race_test.sh
+```
+
 ### Test Coverage
 
 | Category | Tests | What it validates |
