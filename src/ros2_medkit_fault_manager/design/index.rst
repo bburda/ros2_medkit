@@ -187,7 +187,7 @@ Clears (acknowledges) a fault by setting its status to CLEARED.
 - **Returns**: ``success=true`` if fault existed, ``success=false`` if not found
 
 ~/declare_planned_stop, ~/end_planned_stop, ~/list_planned_stops
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Declare, cut short and list the windows of wall-clock time during which faults are expected.
 
@@ -260,7 +260,7 @@ healing is disabled, any HEALED row left by a previous (healing-enabled) run is 
 CLEARED once at startup so it does not behave inconsistently under the latch.
 
 Planned Stops Are Marked, Never Suppressed
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A planned-stop window records that an operator expected faults during an interval. **No code on
 the report, confirm, heal, clear, capture or audit path reads a window.** A fault whose cycle
