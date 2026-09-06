@@ -413,12 +413,102 @@ class TestPlannedStops(PlannedStopFixture):
         self.assertFalse(missing.success)
         self.assertIn('no planned stop', missing.message)
 
+    def test_the_service_refuses_an_unset_start(self):
+        """R14: zero is what an unset Time reads as, not a request for "now"."""
+        self._start_manager()
+
+        request = DeclarePlannedStop.Request()
+        request.starts_at = Time()  # unset
+        request.ends_at = to_time(time.time() + 600.0)
+        request.reason = 'no start given'
+        response = self._call(
+            self._client(DeclarePlannedStop, 'declare_planned_stop'), request
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(
+            response.outcome,
+            DeclarePlannedStop.Response.OUTCOME_INVALID_INSTANT,
+        )
+        self.assertIn('epoch', response.message)
+        self.assertEqual(len(self._list_stops().stops), 0)
+
+    def test_a_declaration_reported_as_stored_is_there_afterwards(self):
+        """A cap filled by a window that cannot be pruned must not eat the new one."""
+        self._start_manager({'planned_stop.max_windows': 1})
+
+        now = time.time()
+        live = self._declare(now - 10.0, now + 3600.0, reason='running')
+        self.assertTrue(live.success, live.message)
+
+        ended = self._declare(now - 500.0, now - 400.0, reason='already over')
+        self.assertTrue(ended.success, ended.message)
+        self.assertEqual(ended.outcome, DeclarePlannedStop.Response.OUTCOME_STORED)
+
+        ids = [stop.id for stop in self._list_stops().stops]
+        self.assertIn(
+            ended.stop.id, ids,
+            'the declaration answered success and then was not there'
+        )
+        self.assertIn(live.stop.id, ids, 'and a running window is still never pruned')
+
+    def test_a_window_that_never_started_is_cancelled(self):
+        """R12: it marked nothing, so it is removed rather than inverted."""
+        self._start_manager()
+
+        now = time.time()
+        future = self._declare(now + 3600.0, now + 7200.0, reason='next weekend')
+        self.assertTrue(future.success, future.message)
+
+        request = EndPlannedStop.Request()
+        request.id = future.stop.id
+        request.at = Time()  # now, which is before the window starts
+        response = self._call(self._client(EndPlannedStop, 'end_planned_stop'), request)
+
+        self.assertTrue(response.success, response.message)
+        self.assertEqual(response.outcome, EndPlannedStop.Response.OUTCOME_CANCELLED)
+        self.assertTrue(response.stop.cancelled)
+        self.assertFalse(response.stop.ended_early)
+        self.assertNotIn(
+            future.stop.id, [stop.id for stop in self._list_stops().stops],
+            'a cancelled window is gone, not stored with an inverted interval'
+        )
+
+    def test_a_backdated_end_cannot_rewrite_when_a_stop_finished(self):
+        self._start_manager()
+
+        now = time.time()
+        window = self._declare(now - 600.0, now + 600.0, reason='running')
+        self.assertTrue(window.success, window.message)
+
+        first = EndPlannedStop.Request()
+        first.id = window.stop.id
+        first.at = to_time(now)
+        ended = self._call(self._client(EndPlannedStop, 'end_planned_stop'), first)
+        self.assertTrue(ended.success, ended.message)
+        self.assertEqual(ended.outcome, EndPlannedStop.Response.OUTCOME_ENDED)
+        settled_end = to_float(ended.stop.ends_at)
+
+        backdated = EndPlannedStop.Request()
+        backdated.id = window.stop.id
+        backdated.at = to_time(now - 300.0)
+        again = self._call(self._client(EndPlannedStop, 'end_planned_stop'), backdated)
+        self.assertFalse(again.success)
+        self.assertEqual(again.outcome, EndPlannedStop.Response.OUTCOME_ALREADY_ENDED)
+
+        stored = next(
+            stop for stop in self._list_stops().stops if stop.id == window.stop.id
+        )
+        self.assertAlmostEqual(to_float(stored.ends_at), settled_end, places=6)
+
     def test_a_window_that_is_not_an_interval_is_refused(self):
         self._start_manager()
 
         now = time.time()
         equal = self._declare(now, now)
         self.assertFalse(equal.success, 'a zero-length window is not an interval')
+        self.assertEqual(
+            equal.outcome, DeclarePlannedStop.Response.OUTCOME_INVALID_INTERVAL
+        )
         self.assertIn('strictly after', equal.message)
 
         reversed_window = self._declare(now + 60.0, now)

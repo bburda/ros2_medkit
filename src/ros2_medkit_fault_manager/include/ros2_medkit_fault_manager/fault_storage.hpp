@@ -218,6 +218,11 @@ struct PlannedStopWindow {
   /// moment of that request.
   bool ended_early{false};
 
+  /// True on the window returned by a cancellation - a window removed before it
+  /// ever started. Never stored: a cancelled window is gone, and the field is
+  /// how the answer says which of the two things happened to it.
+  bool cancelled{false};
+
   /// Whether @p when_ns falls inside the window. The interval is CLOSED at both
   /// ends, and the gateway derives its `expected` flag from the same rule, so a
   /// fault reported at the instant a window opens or closes is inside it in both
@@ -238,8 +243,9 @@ struct PlannedStopWindow {
 /// structurally rather than by inspecting a message string.
 enum class EndPlannedStopOutcome : uint8_t {
   Ended,        ///< The window was running and now ends at the requested instant
+  Cancelled,    ///< The window had not started yet, so it was removed instead
   NotFound,     ///< No window with that id
-  AlreadyEnded  ///< The window's end had already passed; it is not moved again
+  AlreadyEnded  ///< The window had already ended, early or on its own; it is not moved again
 };
 
 /// Result of an end-early request. `window` is the window as stored afterwards
@@ -531,12 +537,23 @@ class FaultStorage {
   /// @return fault codes of the reclassified faults, so the caller can audit each transition
   /// Store a planned-stop window. Returns false when a window with that id
   /// already exists; the stored one is left untouched. Applies the retention
-  /// bound afterwards using the new window's declared_at_ns as "now".
+  /// bound afterwards using the new window's declared_at_ns as "now", with the
+  /// window just declared EXEMPT: a declaration that is reported as stored has
+  /// to still be there afterwards, and without the exemption a cap already
+  /// filled by an unprunable (running) window made the new row the only
+  /// candidate for its own eviction.
   virtual bool declare_planned_stop(const PlannedStopWindow & window) = 0;
 
-  /// Cut a window short at @p at_ns: ends_at_ns moves there and ended_early is
-  /// set. Refused when the window's end has already passed, so that the record
-  /// of when a stop actually finished cannot be rewritten after the fact.
+  /// Stop a window at @p at_ns.
+  ///
+  /// Three answers, because there are three situations. A window still running
+  /// at that instant is CUT SHORT: ends_at_ns moves there and ended_early is
+  /// set. A window that has not STARTED by then is CANCELLED - removed, with
+  /// `cancelled` set on the returned copy - because it marked nothing and
+  /// storing ends_at <= starts_at would contradict the message's own promise.
+  /// A window that has already ended, early or on its own, is refused: when a
+  /// stop actually finished is not something a later request gets to rewrite,
+  /// backdated `at` included.
   virtual EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns) = 0;
 
   /// One window by id, or nothing when no window carries that id.
@@ -648,8 +665,9 @@ class InMemoryFaultStorage : public FaultStorage {
   bool path_referenced(const std::string & file_path) const;
 
   /// Drop ended windows, oldest declaration first, until at most
-  /// max_planned_stops_ remain. Returns how many went. Caller holds mutex_.
-  size_t prune_planned_stops_locked(int64_t now_ns);
+  /// max_planned_stops_ remain. Returns how many went. @p exempt_id is never
+  /// dropped. Caller holds mutex_.
+  size_t prune_planned_stops_locked(int64_t now_ns, const std::string & exempt_id = {});
 
   mutable std::mutex mutex_;
   std::map<std::string, FaultState> faults_;

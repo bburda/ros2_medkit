@@ -1943,7 +1943,7 @@ bool SqliteFaultStorage::declare_planned_stop(const PlannedStopWindow & window) 
     throw std::runtime_error(std::string("Failed to insert planned stop: ") + sqlite3_errmsg(db_));
   }
 
-  prune_planned_stops_locked(window.declared_at_ns);
+  prune_planned_stops_locked(window.declared_at_ns, window.id);
   return true;
 }
 
@@ -1961,7 +1961,17 @@ EndPlannedStopResult SqliteFaultStorage::end_planned_stop(const std::string & id
     current = read_planned_stop_row(stmt);
   }
 
-  if (!current.active_at(at_ns)) {
+  if (at_ns < current.starts_at_ns) {
+    // It never started: cancelled, not ended early.
+    SqliteStatement remove(db_, "DELETE FROM planned_stops WHERE id = ?");
+    remove.bind_text(1, id);
+    if (remove.step() != SQLITE_DONE) {
+      throw std::runtime_error(std::string("Failed to cancel planned stop: ") + sqlite3_errmsg(db_));
+    }
+    current.cancelled = true;
+    return EndPlannedStopResult{EndPlannedStopOutcome::Cancelled, current};
+  }
+  if (current.ended_early || !current.active_at(at_ns)) {
     return EndPlannedStopResult{EndPlannedStopOutcome::AlreadyEnded, current};
   }
 
@@ -2012,7 +2022,7 @@ size_t SqliteFaultStorage::set_max_planned_stops(size_t max_count, int64_t now_n
   return prune_planned_stops_locked(now_ns);
 }
 
-size_t SqliteFaultStorage::prune_planned_stops_locked(int64_t now_ns) {
+size_t SqliteFaultStorage::prune_planned_stops_locked(int64_t now_ns, const std::string & exempt_id) {
   if (max_planned_stops_ == 0) {
     return 0;
   }
@@ -2037,11 +2047,12 @@ size_t SqliteFaultStorage::prune_planned_stops_locked(int64_t now_ns) {
   // pruned, so the row count can stay above the bound while many are live.
   SqliteStatement del(db_,
                       "DELETE FROM planned_stops WHERE id IN ("
-                      "  SELECT id FROM planned_stops WHERE ends_at_ns <= ?"
+                      "  SELECT id FROM planned_stops WHERE ends_at_ns <= ? AND id != ?"
                       "  ORDER BY declared_at_ns ASC, id ASC LIMIT ?"
                       ")");
   del.bind_int64(1, now_ns);
-  del.bind_int64(2, static_cast<int64_t>(over));
+  del.bind_text(2, exempt_id);
+  del.bind_int64(3, static_cast<int64_t>(over));
   if (del.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to prune planned stops: ") + sqlite3_errmsg(db_));
   }

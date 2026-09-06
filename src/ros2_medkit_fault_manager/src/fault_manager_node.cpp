@@ -1677,6 +1677,7 @@ ros2_medkit_msgs::msg::PlannedStop window_to_msg(const PlannedStopWindow & w) {
   msg.declared_by = w.declared_by;
   msg.declared_at = ns_to_time_msg(w.declared_at_ns);
   msg.ended_early = w.ended_early;
+  msg.cancelled = w.cancelled;
   return msg;
 }
 
@@ -1685,20 +1686,31 @@ ros2_medkit_msgs::msg::PlannedStop window_to_msg(const PlannedStopWindow & w) {
 void FaultManagerNode::handle_declare_planned_stop(
     const std::shared_ptr<ros2_medkit_msgs::srv::DeclarePlannedStop::Request> & request,
     const std::shared_ptr<ros2_medkit_msgs::srv::DeclarePlannedStop::Response> & response) {
+  using Response = ros2_medkit_msgs::srv::DeclarePlannedStop::Response;
   const int64_t now_ns = get_wall_clock_ns();
 
   PlannedStopWindow window;
-  // A zero start means "now": declaring a stop as it begins is the common case
-  // and typing the current instant into the request would only add a race.
-  const int64_t requested_start = time_msg_to_ns(request->starts_at);
-  window.starts_at_ns = requested_start == 0 ? now_ns : requested_start;
+  window.starts_at_ns = time_msg_to_ns(request->starts_at);
   window.ends_at_ns = time_msg_to_ns(request->ends_at);
   window.reason = request->reason;
   window.declared_by = request->declared_by.empty() ? std::string("anonymous") : request->declared_by;
   window.declared_at_ns = now_ns;
 
+  // Zero is NOT "now". It is what an unset builtin_interfaces/Time reads as, and
+  // a sentinel that is also a legal value cannot tell a caller who meant the
+  // epoch from one who filled in nothing. A caller who wants the current instant
+  // sends the current instant; the gateway does exactly that when a REST body
+  // omits `from`.
+  if (window.starts_at_ns <= 0 || window.ends_at_ns <= 0) {
+    response->success = false;
+    response->outcome = Response::OUTCOME_INVALID_INSTANT;
+    response->message = "starts_at and ends_at must be after the Unix epoch";
+    return;
+  }
+
   if (window.ends_at_ns <= window.starts_at_ns) {
     response->success = false;
+    response->outcome = Response::OUTCOME_INVALID_INTERVAL;
     response->message = "ends_at must be strictly after starts_at";
     return;
   }
@@ -1707,13 +1719,28 @@ void FaultManagerNode::handle_declare_planned_stop(
 
   if (!storage_->declare_planned_stop(window)) {
     response->success = false;
+    response->outcome = Response::OUTCOME_DUPLICATE_ID;
     response->message = "a planned stop with id '" + window.id + "' already exists";
     return;
   }
 
+  // Read back rather than assume. The declaration is exempt from the pruning it
+  // triggers, so this should never fire - but "should never" is exactly the
+  // claim that once let the service answer success with a window that was
+  // inserted, immediately evicted, and then answered 404 on its own Location.
   auto stored = storage_->get_planned_stop(window.id);
+  if (!stored.has_value()) {
+    response->success = false;
+    response->outcome = Response::OUTCOME_NOT_RETAINED;
+    response->message = "planned stop '" + window.id + "' was not retained by the configured bound";
+    RCLCPP_WARN(get_logger(), "Planned stop '%s' was not retained; planned_stop.max_windows may be too small",
+                window.id.c_str());
+    return;
+  }
+
   response->success = true;
-  response->stop = window_to_msg(stored.value_or(window));
+  response->outcome = Response::OUTCOME_STORED;
+  response->stop = window_to_msg(*stored);
   RCLCPP_INFO(get_logger(), "Planned stop '%s' declared by '%s': %s", window.id.c_str(), window.declared_by.c_str(),
               window.reason.c_str());
 }
@@ -1721,24 +1748,45 @@ void FaultManagerNode::handle_declare_planned_stop(
 void FaultManagerNode::handle_end_planned_stop(
     const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Request> & request,
     const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Response> & response) {
+  using Response = ros2_medkit_msgs::srv::EndPlannedStop::Response;
   const int64_t requested_at = time_msg_to_ns(request->at);
+
+  // Zero here means "the fault manager's own wall clock", and unlike a window
+  // BOUND that is not a value anyone can mean: `at` names the moment of this
+  // request, and the clock that moment has to be measured against is the one the
+  // fault timestamps come from. A negative instant is still refused.
+  if (requested_at < 0) {
+    response->success = false;
+    response->outcome = Response::OUTCOME_NOT_FOUND;
+    response->message = "at must not be before the Unix epoch";
+    return;
+  }
   const int64_t at_ns = requested_at == 0 ? get_wall_clock_ns() : requested_at;
 
   const auto result = storage_->end_planned_stop(request->id, at_ns);
   switch (result.outcome) {
     case EndPlannedStopOutcome::Ended:
       response->success = true;
+      response->outcome = Response::OUTCOME_ENDED;
       response->stop = window_to_msg(result.window);
       RCLCPP_INFO(get_logger(), "Planned stop '%s' ended early", request->id.c_str());
       return;
+    case EndPlannedStopOutcome::Cancelled:
+      response->success = true;
+      response->outcome = Response::OUTCOME_CANCELLED;
+      response->stop = window_to_msg(result.window);
+      RCLCPP_INFO(get_logger(), "Planned stop '%s' cancelled before it started", request->id.c_str());
+      return;
     case EndPlannedStopOutcome::AlreadyEnded:
       response->success = false;
+      response->outcome = Response::OUTCOME_ALREADY_ENDED;
       response->message = "planned stop '" + request->id + "' has already ended";
       response->stop = window_to_msg(result.window);
       return;
     case EndPlannedStopOutcome::NotFound:
     default:
       response->success = false;
+      response->outcome = Response::OUTCOME_NOT_FOUND;
       response->message = "no planned stop with id '" + request->id + "'";
       return;
   }

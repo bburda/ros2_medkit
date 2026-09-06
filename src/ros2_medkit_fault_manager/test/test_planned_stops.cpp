@@ -176,6 +176,68 @@ TEST_P(PlannedStopStorageTest, EndEarlyKeepsCoveringWhatCameBeforeTheEnd) {
   EXPECT_FALSE(stored->covers(40 * kSec)) << "a fault raised after the early end is not expected";
 }
 
+// R12: a window that has not started has marked nothing, and storing
+// ends_at <= starts_at would contradict the message's own promise. It is
+// cancelled - removed - rather than "ended early".
+TEST_P(PlannedStopStorageTest, AWindowThatHasNotStartedIsCancelledNotEnded) {
+  ASSERT_TRUE(storage_->declare_planned_stop(make_window("future", 100 * kSec, 200 * kSec, 50 * kSec)));
+
+  auto result = storage_->end_planned_stop("future", 60 * kSec);
+  ASSERT_EQ(result.outcome, EndPlannedStopOutcome::Cancelled);
+  EXPECT_TRUE(result.window.cancelled);
+  EXPECT_FALSE(result.window.ended_early) << "it never ran, so it did not end early";
+  EXPECT_EQ(result.window.starts_at_ns, 100 * kSec) << "the window is returned as it was";
+  EXPECT_EQ(result.window.ends_at_ns, 200 * kSec);
+
+  EXPECT_FALSE(storage_->get_planned_stop("future").has_value()) << "a cancelled window is gone, not stored inverted";
+}
+
+TEST_P(PlannedStopStorageTest, NoStoredWindowEverHasAnEndAtOrBeforeItsStart) {
+  // The message promises ends_at is strictly after starts_at. Every path that
+  // can move ends_at is driven here, and the invariant is asserted over the
+  // whole store afterwards.
+  ASSERT_TRUE(storage_->declare_planned_stop(make_window("running", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_TRUE(storage_->declare_planned_stop(make_window("future", 100 * kSec, 200 * kSec, 5 * kSec)));
+  ASSERT_TRUE(storage_->declare_planned_stop(make_window("past", 1 * kSec, 2 * kSec, 1 * kSec)));
+
+  storage_->end_planned_stop("running", 30 * kSec);  // ends early
+  storage_->end_planned_stop("future", 60 * kSec);   // cancels
+  storage_->end_planned_stop("past", 1 * kSec + 1);  // refused: already over
+  storage_->end_planned_stop("running", 15 * kSec);  // refused: already ended
+
+  for (const auto & window : storage_->list_planned_stops()) {
+    EXPECT_GT(window.ends_at_ns, window.starts_at_ns) << "window " << window.id;
+  }
+}
+
+// A backdated `at` used to walk the end BACKWARDS on a window that had already
+// finished, rewriting when the stop actually stopped.
+TEST_P(PlannedStopStorageTest, ABackdatedEndCannotMoveAnEndThatAlreadyPassed) {
+  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(storage_->end_planned_stop("w", 50 * kSec).outcome, EndPlannedStopOutcome::Ended);
+
+  auto backdated = storage_->end_planned_stop("w", 20 * kSec);
+  EXPECT_EQ(backdated.outcome, EndPlannedStopOutcome::AlreadyEnded);
+
+  auto stored = storage_->get_planned_stop("w");
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(stored->ends_at_ns, 50 * kSec) << "the record of when the stop finished is not rewritable";
+}
+
+TEST_P(PlannedStopStorageTest, ABackdatedEndCannotReopenAWindowThatRanOut) {
+  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w", 10 * kSec, 20 * kSec, 5 * kSec)));
+
+  // 15 s is inside the window but the window's own end has passed in wall-clock
+  // terms; the guard is the stored end, not the caller's instant.
+  auto backdated = storage_->end_planned_stop("w", 15 * kSec);
+  EXPECT_EQ(backdated.outcome, EndPlannedStopOutcome::Ended)
+      << "a window still running at the requested instant may be ended there";
+
+  auto again = storage_->end_planned_stop("w", 12 * kSec);
+  EXPECT_EQ(again.outcome, EndPlannedStopOutcome::AlreadyEnded);
+  EXPECT_EQ(storage_->get_planned_stop("w")->ends_at_ns, 15 * kSec);
+}
+
 TEST_P(PlannedStopStorageTest, EndUnknownIdIsNotFound) {
   auto result = storage_->end_planned_stop("never_declared", 30 * kSec);
   EXPECT_EQ(result.outcome, EndPlannedStopOutcome::NotFound);
@@ -250,6 +312,21 @@ TEST_P(PlannedStopStorageTest, RetentionNeverPrunesAnActiveWindowEvenPastTheCap)
 }
 
 // CONFIG SWEEP at the storage boundary: a cap of one keeps exactly the newest.
+// The window being declared is exempt from the pruning its own declaration
+// triggers. Without that, a cap already filled by a window that cannot be pruned
+// (a live one) made the NEW row the only candidate: it was inserted, deleted,
+// and reported as stored.
+TEST_P(PlannedStopStorageTest, ADeclarationSurvivesThePruningItTriggers) {
+  const int64_t now = 1000 * kSec;
+  storage_->set_max_planned_stops(1, now);
+  ASSERT_TRUE(storage_->declare_planned_stop(make_window("live", now - kSec, now + 500 * kSec, now - kSec)));
+
+  ASSERT_TRUE(storage_->declare_planned_stop(make_window("just_declared", 1 * kSec, 2 * kSec, now)));
+  EXPECT_TRUE(storage_->get_planned_stop("just_declared").has_value())
+      << "a declaration reported as stored must be there afterwards";
+  EXPECT_TRUE(storage_->get_planned_stop("live").has_value()) << "and a running window is still never pruned";
+}
+
 TEST_P(PlannedStopStorageTest, RetentionOfOneKeepsOnlyTheNewestEndedWindow) {
   const int64_t now = 1000 * kSec;
   storage_->set_max_planned_stops(1, now);

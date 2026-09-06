@@ -18,7 +18,9 @@
 # the plant, not about when someone typed it in. The only refusal is a window
 # that does not describe an interval (ends_at <= starts_at).
 
-# Start of the window (wall clock, UTC)
+# Start of the window (wall clock, UTC). Must be after the Unix epoch: zero is
+# what an unset Time reads as and is not a sentinel for "now", so a caller that
+# wants the current instant sends the current instant.
 builtin_interfaces/Time starts_at
 
 # End of the window (wall clock, UTC); must be strictly after starts_at
@@ -38,3 +40,12 @@ string message
 
 # The stored window, including its assigned id. Meaningful only when success.
 PlannedStop stop
+
+# Which of the refusals this was, so a caller can answer differently without
+# reading the message prose, which this service is free to reword.
+uint8 outcome
+uint8 OUTCOME_STORED = 0
+uint8 OUTCOME_INVALID_INTERVAL = 1
+uint8 OUTCOME_INVALID_INSTANT = 2
+uint8 OUTCOME_DUPLICATE_ID = 3
+uint8 OUTCOME_NOT_RETAINED = 4

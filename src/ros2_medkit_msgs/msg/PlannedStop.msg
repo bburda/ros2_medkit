@@ -48,3 +48,8 @@ builtin_interfaces/Time declared_at
 # True when an operator cut the window short, which moved ends_at to the moment
 # of that request. False for a window that ran or is running to its declared end.
 bool ended_early
+
+# True on the copy returned when a window was CANCELLED: stopped before it ever
+# started, and therefore removed rather than shortened. Never true on a stored
+# window - a cancelled one is gone - so a listing never carries it.
+bool cancelled

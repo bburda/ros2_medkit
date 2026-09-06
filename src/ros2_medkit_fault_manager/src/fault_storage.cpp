@@ -890,7 +890,7 @@ bool InMemoryFaultStorage::declare_planned_stop(const PlannedStopWindow & window
   }
 
   planned_stops_.push_back(window);
-  prune_planned_stops_locked(window.declared_at_ns);
+  prune_planned_stops_locked(window.declared_at_ns, window.id);
   return true;
 }
 
@@ -903,7 +903,14 @@ EndPlannedStopResult InMemoryFaultStorage::end_planned_stop(const std::string & 
   if (it == planned_stops_.end()) {
     return EndPlannedStopResult{EndPlannedStopOutcome::NotFound, {}};
   }
-  if (!it->active_at(at_ns)) {
+  if (at_ns < it->starts_at_ns) {
+    // It never started: cancelled, not ended early.
+    PlannedStopWindow cancelled = *it;
+    cancelled.cancelled = true;
+    planned_stops_.erase(it);
+    return EndPlannedStopResult{EndPlannedStopOutcome::Cancelled, cancelled};
+  }
+  if (it->ended_early || !it->active_at(at_ns)) {
     return EndPlannedStopResult{EndPlannedStopOutcome::AlreadyEnded, *it};
   }
 
@@ -945,7 +952,7 @@ size_t InMemoryFaultStorage::set_max_planned_stops(size_t max_count, int64_t now
   return prune_planned_stops_locked(now_ns);
 }
 
-size_t InMemoryFaultStorage::prune_planned_stops_locked(int64_t now_ns) {
+size_t InMemoryFaultStorage::prune_planned_stops_locked(int64_t now_ns, const std::string & exempt_id) {
   if (max_planned_stops_ == 0 || planned_stops_.size() <= max_planned_stops_) {
     return 0;
   }
@@ -954,7 +961,7 @@ size_t InMemoryFaultStorage::prune_planned_stops_locked(int64_t now_ns) {
   std::vector<size_t> candidates;
   candidates.reserve(planned_stops_.size());
   for (size_t i = 0; i < planned_stops_.size(); ++i) {
-    if (!planned_stops_[i].active_at(now_ns)) {
+    if (!planned_stops_[i].active_at(now_ns) && planned_stops_[i].id != exempt_id) {
       candidates.push_back(i);
     }
   }

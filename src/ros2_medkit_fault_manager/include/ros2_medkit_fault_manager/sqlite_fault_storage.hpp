@@ -134,9 +134,9 @@ class SqliteFaultStorage : public FaultStorage {
   bool path_referenced(const std::string & file_path) const;
 
   /// Delete ended windows, oldest declaration first, until at most
-  /// max_planned_stops_ rows remain. Returns how many rows went. Caller holds
-  /// mutex_.
-  size_t prune_planned_stops_locked(int64_t now_ns);
+  /// max_planned_stops_ rows remain. Returns how many rows went. @p exempt_id is
+  /// never deleted. Caller holds mutex_.
+  size_t prune_planned_stops_locked(int64_t now_ns, const std::string & exempt_id = {});
 
   /// store_rosbag_file body without taking mutex_. Caller holds mutex_ and
   /// unlinks the returned replaced-bag path once the row change is durable.
