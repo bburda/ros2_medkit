@@ -94,6 +94,19 @@ foreach(_op62_target open62541pp open62541)
   endif()
 endforeach()
 
+# One section per function and per object in the vendored library, so
+# --gc-sections below can drop the ones nothing in this module reaches. Without
+# this the whole of open62541 is linked in as a handful of large sections and
+# the garbage collector has nothing to work with: the read-only object would
+# still carry - and, before --exclude-libs, still export - the library's own
+# Write service primitives, which a caller with dlsym could reach even though no
+# route in the plugin can.
+foreach(_op62_target open62541pp open62541)
+  if(TARGET ${_op62_target})
+    target_compile_options(${_op62_target} PRIVATE -ffunction-sections -fdata-sections)
+  endif()
+endforeach()
+
 # ---- Read-only build ----
 # Whether this box can change a controller is a property of the binary, not of
 # a configuration file: ON compiles the OPC-UA value-write path out entirely,
@@ -148,6 +161,10 @@ target_include_directories(ros2_medkit_opcua_plugin PRIVATE
 target_compile_options(ros2_medkit_opcua_plugin PRIVATE
   -fvisibility=hidden
   -fvisibility-inlines-hidden
+  # Paired with --gc-sections on the link, so an unreachable function is not
+  # merely hidden but absent.
+  -ffunction-sections
+  -fdata-sections
 )
 
 medkit_target_dependencies(ros2_medkit_opcua_plugin
@@ -158,9 +175,22 @@ medkit_target_dependencies(ros2_medkit_opcua_plugin
   std_msgs
 )
 
-# Allow unresolved symbols - they resolve from the host process at runtime
 target_link_options(ros2_medkit_opcua_plugin PRIVATE
+  # Allow unresolved symbols - they resolve from the host process at runtime.
   -Wl,--unresolved-symbols=ignore-all
+  # -fvisibility=hidden covers the sources compiled into this module, but not
+  # the static archives it links. Without this, every global in the vendored
+  # open62541 lands in the module's dynamic symbol table, so the read-only
+  # object exported the library's own Write primitives and dlsym reached them
+  # even though no route did. ALL, not a list: the same holds for every archive
+  # the module happens to pull in. The plugin's extern "C" entry points come
+  # from object files, not archives, and keep their GATEWAY_PLUGIN_EXPORT
+  # visibility.
+  -Wl,--exclude-libs,ALL
+  # Then actually drop what nothing reaches. Retention starts from the dynamic
+  # symbol table, so this only becomes effective once --exclude-libs has emptied
+  # it of the library's globals - the two belong together.
+  -Wl,--gc-sections
 )
 
 target_link_libraries(ros2_medkit_opcua_plugin

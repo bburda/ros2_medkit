@@ -120,11 +120,27 @@ colcon build --packages-select ros2_medkit_opcua \
 
 In the default read-only build:
 
-- `OpcuaClient::write_value` and the open62541pp Write service calls it
-  instantiates are **not compiled**, so no symbol able to put a value on the
-  wire exists in `libros2_medkit_opcua_plugin.so`. The `test_opcua_build_variant`
-  ctest asserts this against the built object with `nm`, in both variants, so
-  the claim is checked rather than configured.
+- `OpcuaClient::write_value`, the vendor route handler, and the open62541pp
+  Write service functions and templates they reach are **not compiled**. On top
+  of that the plugin links with `-Wl,--exclude-libs,ALL` and `-Wl,--gc-sections`
+  (over `-ffunction-sections -fdata-sections`), which drops open62541's own
+  `UA_Client_write*` primitives from the object as well - nothing references
+  them once the C++ write path is gone. So `libros2_medkit_opcua_plugin.so`
+  contains **no code that can issue an OPC-UA Write**, and its dynamic symbol
+  table exports the six plugin entry points and nothing from the OPC-UA stack,
+  so `dlsym` has no handle on any of it either.
+
+  Precisely, because a claim of this kind should be exact rather than sweeping:
+  what does remain inside the object is open62541's generic service dispatcher,
+  which the read path needs, and the generated type descriptors for the Write
+  request and response messages, which the library's `UA_TYPES` table keeps
+  alive whatever the linker does. Neither is exported, neither is reachable from
+  any route, and no function in the object composes a Write request out of them.
+
+  `test_opcua_build_variant` asserts all of this against the built object with
+  `nm`, in both variants: absent write symbols and an OPC-UA-free export table
+  in the read-only build, present write symbols in the write-capable one, and
+  the six entry points exported in both.
 - No data point is ever `writable`. A node-map entry that says `writable: true`
   is ignored with one startup warning naming the build property, and the
   address-space walk never consults the server's `CurrentWrite` bit whatever

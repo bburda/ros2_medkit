@@ -48,22 +48,37 @@ import sys
 #   - OpcuaPlugin::handle_plc_operations is the vendor route that reaches it;
 #   - parse_coerce_validate is the value coercion the three write paths share;
 #   - Node<Client>::writeValueScalar / writeValue are the open62541pp templates
-#     where the value is actually encoded for the Write service.
+#     where the value is encoded for the Write service;
+#   - services::write / services::writeAttribute<Client> are the layer beneath
+#     them, the last C++ frame before open62541's own client machinery.
 #
 # Every marker is verified to discriminate in an OPTIMIZED build, which is what
-# CI and every release produce. That rules out the layer underneath the two
-# templates - opcua::services::writeValue and writeAttributeImpl<AttributeId 13,
-# Client> - which are fully inlined at -O2 and emit no symbol in either variant:
-# a marker like that reads as "the write path is gone" in both builds and proves
-# nothing. The open62541 C entry points (__UA_Client_writeAttribute and friends)
-# are excluded for the opposite reason: they sit in the same statically linked
-# translation unit as the read entry points, so the linker keeps them either way.
+# CI and every release produce. That rules out opcua::services::writeValue and
+# writeAttributeImpl<AttributeId 13, Client>: they are fully inlined at -O2 and
+# emit no symbol in either variant, so they would read as "the write path is
+# gone" in both builds and prove nothing.
+#
+# open62541's own primitives - __UA_Client_writeAttribute and the rest of the
+# UA_Client_write* family - are absent from BOTH objects and therefore cannot
+# discriminate either. They used to be present, and exported, in both: nothing
+# in the plugin referenced them (open62541pp reaches the Write service through
+# services::write, not through them), but the whole archive member was linked in
+# and -fvisibility=hidden does not reach a static archive, so dlsym could call
+# one and drive a controller the REST contract never exposed.
+# -Wl,--exclude-libs,ALL plus -ffunction-sections/-fdata-sections and
+# -Wl,--gc-sections removed them from the object outright. EXPORT_DENY below is
+# what keeps that true: what remains of open62541 in a read-only object - the
+# generic __UA_Client_Service dispatcher the read path needs, and the generated
+# type descriptors the UA_TYPES table pins - is unreachable precisely because
+# the module exports none of it.
 WRITE_MARKERS = (
     'ros2_medkit_gateway::OpcuaClient::write_value(',
     'ros2_medkit_gateway::OpcuaPlugin::handle_plc_operations(',
     'parse_coerce_validate(',
     'opcua::Node<opcua::Client>::writeValueScalar<',
     'opcua::Node<opcua::Client>::writeValue(opcua::Variant const&)',
+    'opcua::services::write(opcua::Client&, opcua::WriteRequest const&)',
+    'opcua::services::writeAttribute<opcua::Client>',
 )
 
 # The read path the plugin needs in every variant. Present in both builds, so a
@@ -76,6 +91,26 @@ READ_MARKERS = (
     'ros2_medkit_gateway::OpcuaClient::read_values(',
     'ros2_medkit_gateway::OpcuaClient::read_access_level(',
     'ros2_medkit_gateway::OpcuaClient::browse_detailed(',
+)
+
+# Nothing from the OPC-UA stack may appear in the module's dynamic symbol table,
+# in either variant. The gateway dlopens the plugin and needs its extern "C"
+# entry points and nothing else; anything else exported is a dlsym handle on
+# machinery no route exposes. Checked as a prefix match on the demangled name,
+# which covers both the C library (UA_*, __UA_*) and the C++ wrapper (opcua::*).
+EXPORT_DENY = ('UA_', 'opcua::')
+
+# Symbols the gateway resolves out of the plugin. If a link-time change ever
+# hides these, the plugin still builds and still passes every symbol check above
+# while failing to load at runtime, so they are asserted here rather than left
+# to an integration test to discover.
+REQUIRED_EXPORTS = (
+    'create_plugin',
+    'plugin_api_version',
+    'get_introspection_provider',
+    'get_data_provider',
+    'get_operation_provider',
+    'get_fault_provider',
 )
 
 # An optimized plugin object still carries a few thousand symbols. Anything near
@@ -114,14 +149,9 @@ def main():
         return 1
 
     defined = nm(['-C'], args.plugin)
-    # Recorded for the operator reading a failure: the imported half of the
-    # object. open62541 is linked statically, so both the read and the write
-    # implementations are defined inside the plugin and this list holds only
-    # libc/OpenSSL/gateway ABI names - it never discriminates the two variants
-    # on its own, which is why the verdict below is taken from `nm -C`.
-    undefined = nm(['-DC', '--undefined-only'], args.plugin)
-    print(f'{args.plugin}: {len(defined)} defined symbols, '
-          f'{len(undefined)} undefined dynamic symbols, expecting {args.expect}')
+    exported = nm(['-DC', '--defined-only'], args.plugin)
+    print(f'{args.plugin}: {len(defined)} symbols, {len(exported)} dynamic exports, '
+          f'expecting {args.expect}')
 
     failures = []
     if len(defined) < MIN_SYMBOLS:
@@ -142,6 +172,21 @@ def main():
             failures.append(f'write-capable build is missing: {marker}')
         if not want_writes and n != 0:
             failures.append(f'read-only build still contains {n} x: {marker}')
+
+    # The export table is an invariant, not a variant property: neither build
+    # may hand dlsym a way into the OPC-UA stack.
+    leaked = [line.split(' ', 2)[-1] for line in exported
+              if any(line.split(' ', 2)[-1].startswith(p) for p in EXPORT_DENY)]
+    print(f'  export {len(leaked):>4}  OPC-UA symbols in the dynamic symbol table')
+    for name in leaked[:10]:
+        failures.append(f'dynamic symbol table exports OPC-UA machinery: {name}')
+
+    export_names = {line.split(' ', 2)[-1] for line in exported}
+    missing = [name for name in REQUIRED_EXPORTS if name not in export_names]
+    print(f'  export {len(REQUIRED_EXPORTS) - len(missing):>4}'
+          f'/{len(REQUIRED_EXPORTS)} plugin entry points')
+    for name in missing:
+        failures.append(f'plugin entry point not exported: {name}')
 
     if failures:
         print(f'FAIL ({args.expect}):', file=sys.stderr)

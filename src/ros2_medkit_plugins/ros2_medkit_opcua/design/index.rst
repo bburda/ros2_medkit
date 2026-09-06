@@ -109,10 +109,26 @@ binary.
 
 ``MEDKIT_OPCUA_READ_ONLY`` is a CMake cache option, default ``ON``. With it on:
 
-- ``OpcuaClient::write_value``, the ``open62541pp`` Write service templates it
-  instantiates, the vendor route handler ``OpcuaPlugin::handle_plc_operations`` and
-  the value-coercion helper are all outside ``#if`` and are never compiled. The
-  object contains no symbol that can reach an OPC-UA Write service call.
+- ``OpcuaClient::write_value``, the ``open62541pp`` Write service functions and
+  templates it reaches, the vendor route handler
+  ``OpcuaPlugin::handle_plc_operations`` and the value-coercion helper are all
+  outside ``#if`` and are never compiled.
+- The link then removes what the compiler alone could not. ``-fvisibility=hidden``
+  covers the sources compiled into the module but not the static archives it
+  links, so open62541's own ``UA_Client_write*`` primitives used to sit in the
+  object *and* in its dynamic symbol table: no route reached them, but a caller
+  holding the ``.so`` could ``dlsym`` one and drive a controller with it.
+  ``-Wl,--exclude-libs,ALL`` takes the archives out of the export table, and
+  ``-ffunction-sections -fdata-sections`` plus ``-Wl,--gc-sections`` then let the
+  linker drop them from the object entirely, because nothing references them once
+  the C++ write path is gone. The read-only object exports the six plugin entry
+  points and nothing from the OPC-UA stack.
+- What is left of open62541 inside the object is the generic service dispatcher
+  the read path needs and the generated type descriptors the ``UA_TYPES`` table
+  pins. They are data and dispatch, not a write path: nothing exports them and no
+  function in the object composes a Write request from them. The claim the package
+  makes is therefore the exact one - no code able to issue a Write, and no export
+  to reach the library through - not a sweeping "no OPC-UA symbols at all".
 - ``NodeMap::load`` forces ``writable`` to false and warns once when the file asked
   otherwise; ``AutoBrowser`` does not compile the ``infer_writable`` inference, so
   the server's ``CurrentWrite`` bit is never read.
@@ -130,9 +146,10 @@ binary.
 
 The acceptance is an inspection of the built object, not a reading of the
 configuration: ``test_opcua_build_variant`` runs ``nm`` over the plugin ``.so`` and
-asserts the write symbols are absent and the read symbols present. It runs in both
-variants with opposite expectations, so a symbol list that stopped matching anything
-fails in the write-capable build instead of passing everywhere.
+asserts the write symbols are absent, the read symbols present, the dynamic symbol
+table free of OPC-UA machinery, and the six plugin entry points still exported. It
+runs in both variants with opposite expectations, so a symbol list that stopped
+matching anything fails in the write-capable build instead of passing everywhere.
 
 Type-aware writes (write-capable build)
 =======================================
