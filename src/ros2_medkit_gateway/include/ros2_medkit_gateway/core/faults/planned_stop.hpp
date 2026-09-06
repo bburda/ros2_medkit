@@ -74,6 +74,22 @@ std::optional<int64_t> parse_iso8601_utc_ns(const std::string & text);
 /// nanoseconds since the Unix epoch.
 int64_t seconds_to_ns(double seconds);
 
+/// The range of instants a window can actually be stored at.
+///
+/// `builtin_interfaces/Time` carries its seconds in an int32, so the
+/// representable range runs from the Unix epoch to January 2038. An instant
+/// outside it must be REFUSED rather than converted: the narrowing wraps, and a
+/// window asked for in 2099 comes back with a negative end, covering nothing,
+/// while the operator is told it was accepted.
+constexpr int64_t kMinRepresentableNs = 0;
+constexpr int64_t kMaxRepresentableNs = static_cast<int64_t>(2147483647) * 1000000000LL + 999999999LL;
+
+/// Whether @p ns can be carried by a builtin_interfaces/Time. Written as a
+/// positive range test on purpose.
+inline bool is_representable_instant(int64_t ns) {
+  return ns >= kMinRepresentableNs && ns <= kMaxRepresentableNs;
+}
+
 /// Which window covers the fault carried in @p fault_json, or nullptr.
 ///
 /// Reads `first_occurred` - seconds since the Unix epoch, the shape

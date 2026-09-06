@@ -2772,6 +2772,143 @@ silent. Once the entity has been discovered, the budget applies as usual and a
 resource path that still cannot be resolved to a topic is given up on with a
 warning naming the trigger.
 
+Planned Stops
+-------------
+
+A **planned stop** is a window of wall-clock time during which faults are expected: a
+changeover, a maintenance weekend, a line move. An operator declares one at runtime and the
+gateway then reports every fault whose current cycle started inside it with
+``x-medkit.expected`` - on ``GET /faults``, on the per-entity fault lists, on a fault's detail
+document and on the ``/faults/stream`` frames.
+
+Declaring a window changes **nothing** about how faults are handled. An expected fault is
+confirmed, healed, cleared, captured and audited exactly as any other; no code path in the
+fault manager consults a window. The flag is there so a reader can tell an expected fault from
+a surprise, and the evidence chain still describes the plant that existed.
+
+The windows live in the fault manager, next to the faults they describe, and survive a
+restart. Retention is bounded by count (``planned_stop.max_windows``), never by age, and never
+drops a window that is still running.
+
+What makes a fault expected
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A fault is expected when its ``first_occurred`` lies in ``[from, to]``, inclusive at both ends.
+``first_occurred`` is the start of the fault's **current cycle**, not its first report ever: it
+is reset when a FAILED event raises a CLEARED fault again. A code that failed during a
+changeover and failed again after it was acknowledged is therefore expected for the first cycle
+and a surprise for the second - which is what an operator asking "did anything break outside
+the stop" means.
+
+When several windows cover a fault, ``planned_stop_id`` names the **earliest-starting** one, so
+the fault list and the event stream never disagree about which window applies.
+
+In an aggregated deployment the windows are per fault manager. Each peer's gateway derives the
+flag for its own faults and the aggregator relays what the peer said; there is no cross-peer
+window logic.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 12 54
+
+   * - Endpoint
+     - Role
+     - Description
+   * - ``POST /api/v1/x-medkit-planned-stops``
+     - operator
+     - Declare a window. ``201`` with the stored window and a ``Location`` header
+   * - ``GET /api/v1/x-medkit-planned-stops``
+     - viewer
+     - List windows, newest declaration first. ``?active=true`` keeps only the ones containing
+       now
+   * - ``GET /api/v1/x-medkit-planned-stops/{planned_stop_id}``
+     - viewer
+     - One window
+   * - ``DELETE /api/v1/x-medkit-planned-stops/{planned_stop_id}``
+     - operator
+     - End a window early. ``200`` with the ended window, not ``204``: the caller has to be told
+       where ``to`` landed
+
+Declaring a window
+~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8080/api/v1/x-medkit-planned-stops \
+     -H 'Content-Type: application/json' \
+     -d '{"from": "2026-09-06T18:00:00Z", "to": "2026-09-06T22:00:00Z", "reason": "line changeover"}'
+
+.. code-block:: json
+
+   {
+     "id": "1788716982473405798-1",
+     "from": "2026-09-06T18:00:00.000Z",
+     "to": "2026-09-06T22:00:00.000Z",
+     "reason": "line changeover",
+     "declared_by": "shift_lead",
+     "declared_at": "2026-09-06T17:58:12.004Z",
+     "ended_early": false
+   }
+
+Request fields:
+
+- ``from`` (optional) - ISO 8601 in UTC (``Z`` or ``+00:00``). Omit it for a stop that starts
+  now. A window wholly in the past is accepted and marks the faults it covers: a stop is a fact
+  about the plant, not about when someone typed it in.
+- ``to`` (required) - ISO 8601 in UTC, strictly after ``from``. There is no maximum duration.
+- ``reason`` (required) - carried verbatim on every fault the window marks.
+- ``declared_by`` (optional) - defaults to the authenticated client id, or ``anonymous`` when
+  authentication is off.
+
+Windows may overlap. Refusals are all ``400``: ``to`` at or before ``from``, a time that is not
+ISO 8601 in UTC (a real offset such as ``+02:00`` is refused rather than converted), and an
+instant outside ``1970-01-01T00:00:00Z`` to ``2038-01-19T03:14:07Z``, which is the range a
+``builtin_interfaces/Time`` can carry.
+
+Ending a window early
+~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   curl -X DELETE http://localhost:8080/api/v1/x-medkit-planned-stops/1788716982473405798-1
+
+``to`` moves to the moment of the request and ``ended_early`` becomes true. Faults whose cycle
+started before that instant stay expected; faults raised after it do not. A window whose end
+has already passed answers ``400`` with vendor code ``x-medkit-planned-stop-ended`` - when a
+stop actually finished is not something a later request gets to rewrite. An unknown id answers
+``404``.
+
+Reading the flag
+~~~~~~~~~~~~~~~~
+
+``GET /api/v1/faults`` (and every per-entity fault list) carries the flag on each item and the
+tally beside them:
+
+.. code-block:: json
+
+   {
+     "items": [
+       {
+         "fault_code": "MOTOR_STALL",
+         "status": "CONFIRMED",
+         "first_occurred": 1788716990.12,
+         "x-medkit": {"expected": true, "planned_stop_id": "1788716982473405798-1"}
+       }
+     ],
+     "x-medkit": {"count": 1, "expected_count": 1}
+   }
+
+``planned_stop_id`` is present only when ``expected`` is true. ``expected_count`` counts the
+items this gateway derived a flag for; items merged from an aggregated peer carry the peer's
+own flag and are not recounted.
+
+Both fault lists take ``?expected=true|false|all``. Omitting it means ``all``: the flag is extra
+information about a fault, never a reason to hide it by default.
+
+The ``/faults/stream`` frames carry the same pair inside their ``x-medkit`` object, alongside
+the ``entity_type`` / ``entity_id`` hint. ``expected`` is sent as an explicit ``false`` rather
+than omitted, so a consumer can tell "not expected" from "this gateway could not say".
+
 Fault Triggers (threshold rules)
 --------------------------------
 

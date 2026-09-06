@@ -149,6 +149,13 @@ loaded plugin mounts, provided it exports `describe_plugin_routes`; those carry
 
 `GET /status` always returns a response. For apps, the status is read from the ROS 2 lifecycle `GetState` service when the node is a managed lifecycle node (`active` -> `ready`; any other state, or an unreachable/timed-out read, -> `notReady`); plain (unmanaged) nodes fall back to graph presence (`is_online`). For components, the host component is `ready` while the gateway is reachable; any other local component is `notReady` when it hosts apps and all of them are offline, and `ready` otherwise (including when it hosts no apps). `PUT /status/{action}` returns `501 Not Implemented` until a substrate plugin registers a `LifecycleProvider` for the entity. Accepted transitions return `202` with a `Location` header pointing back to `GET /status`.
 
+### Planned-Stop Endpoints
+
+- `POST /api/v1/x-medkit-planned-stops` - Declare a window during which faults are expected (operator)
+- `GET /api/v1/x-medkit-planned-stops` - List declared windows; `?active=true` keeps only the ones containing now
+- `GET /api/v1/x-medkit-planned-stops/{planned_stop_id}` - Read one window
+- `DELETE /api/v1/x-medkit-planned-stops/{planned_stop_id}` - End a window early (operator)
+
 ### Vendor Extension Endpoints
 
 - `GET /api/v1/{entity}/{id}/x-medkit-topic-beacon` - Topic beacon metadata
@@ -993,12 +1000,19 @@ List all faults across the system. This is a convenience API for dashboards and 
 
 **Query Parameters:**
 - `status` - Filter by fault status: `pending`, `confirmed`, `cleared`, `all` (default: `pending` + `confirmed`)
+- `expected` - Filter by planned stop: `true` (only faults whose cycle started inside a declared window), `false` (only the rest), `all` (default)
 
 **Example:**
 ```bash
 curl http://localhost:8080/api/v1/faults
 curl http://localhost:8080/api/v1/faults?status=all
+curl "http://localhost:8080/api/v1/faults?status=all&expected=false"   # what broke outside the stop
 ```
+
+Each item carries `x-medkit.expected`, and `x-medkit.planned_stop_id` when it is true; the
+list's own `x-medkit.expected_count` is the tally. The same pair rides every
+`GET /api/v1/faults/stream` frame. See "Planned Stops" in `docs/api/rest.rst` for how a window
+is declared and what makes a fault fall inside one.
 
 **Response (200 OK):**
 ```json

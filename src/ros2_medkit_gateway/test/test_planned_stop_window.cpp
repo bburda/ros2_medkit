@@ -266,6 +266,31 @@ TEST(PlannedStopAnnotation, WindowForFaultAgreesWithTheAnnotationAtTheBoundary) 
   EXPECT_EQ(window_for_fault(windows, just_after), nullptr);
 }
 
+// --- what a builtin_interfaces/Time can carry --------------------------------
+
+TEST(PlannedStopRepresentableInstant, AcceptsTheWholeInt32SecondRange) {
+  using ros2_medkit_gateway::faults::is_representable_instant;
+  using ros2_medkit_gateway::faults::kMaxRepresentableNs;
+  using ros2_medkit_gateway::faults::kMinRepresentableNs;
+
+  EXPECT_TRUE(is_representable_instant(kMinRepresentableNs));
+  EXPECT_TRUE(is_representable_instant(kMaxRepresentableNs));
+  EXPECT_TRUE(is_representable_instant(1788698096LL * kSec));
+
+  EXPECT_FALSE(is_representable_instant(kMinRepresentableNs - 1)) << "one nanosecond before the epoch";
+  EXPECT_FALSE(is_representable_instant(kMaxRepresentableNs + 1)) << "one nanosecond past the int32 second limit";
+
+  // A window asked for in 2099. Its second count does not fit an int32, so the
+  // narrowing would wrap it negative and hand back a window covering nothing.
+  const auto in_2099 = parse_iso8601_utc_ns("2099-01-01T00:00:00Z");
+  ASSERT_TRUE(in_2099.has_value()) << "the parse is fine; it is the storage that cannot hold it";
+  EXPECT_FALSE(is_representable_instant(*in_2099));
+
+  const auto before_the_epoch = parse_iso8601_utc_ns("1960-01-01T00:00:00Z");
+  ASSERT_TRUE(before_the_epoch.has_value());
+  EXPECT_FALSE(is_representable_instant(*before_the_epoch));
+}
+
 // --- the cache the event path reads -----------------------------------------
 
 TEST(PlannedStopCacheTest, StartsEmptyAndDueForARefresh) {

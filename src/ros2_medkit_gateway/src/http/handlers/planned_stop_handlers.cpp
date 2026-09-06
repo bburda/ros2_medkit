@@ -95,11 +95,23 @@ PlannedStopHandlers::declare_stop(const http::TypedRequest & req, dto::PlannedSt
                                          json{{"parameter", "from"}, {"value", *body.from}}));
       }
       from_ns = *parsed;
+      if (!faults::is_representable_instant(from_ns)) {
+        return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER,
+                                         "from is outside the range a planned stop can be stored at "
+                                         "(1970-01-01T00:00:00Z to 2038-01-19T03:14:07Z)",
+                                         json{{"parameter", "from"}, {"value", *body.from}}));
+      }
     }
 
     const auto to_ns = faults::parse_iso8601_utc_ns(body.to);
     if (!to_ns) {
       return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER, "to is not an ISO 8601 instant in UTC",
+                                       json{{"parameter", "to"}, {"value", body.to}}));
+    }
+    if (!faults::is_representable_instant(*to_ns)) {
+      return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER,
+                                       "to is outside the range a planned stop can be stored at "
+                                       "(1970-01-01T00:00:00Z to 2038-01-19T03:14:07Z)",
                                        json{{"parameter", "to"}, {"value", body.to}}));
     }
     // Checked here as well as in the fault manager so a caller who spelled the
