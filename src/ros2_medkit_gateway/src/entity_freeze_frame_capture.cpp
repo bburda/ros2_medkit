@@ -188,13 +188,14 @@ EntityFreezeFrameCapture::standing_faults_from_list_reply(const nlohmann::json &
 
 std::optional<EntityFreezeFrameCapture::Frame>
 EntityFreezeFrameCapture::frame_from_content(const std::string & entity_id, const std::string & fault_code,
-                                             const nlohmann::json & content) {
+                                             const nlohmann::json & content, const std::string & source) {
   if (!content_has_live_data(content)) {
     log_fallback_failure_once(fault_code, "entity '" + entity_id + "' returned no data items");
     return std::nullopt;
   }
   Frame frame;
   frame.entity_id = entity_id;
+  frame.source = source;
   frame.values = values_from_list_content(content);
   if (!values_have_data(frame.values)) {
     // Items present but nothing usable in them (all-null values, or no usable
@@ -228,7 +229,7 @@ EntityFreezeFrameCapture::capture_via_route(const std::string & entity_id, const
   if (!content) {
     return std::nullopt;  // not plugin-owned, no x-plc-data route, or handler error
   }
-  return frame_from_content(entity_id, fault_code, *content);
+  return frame_from_content(entity_id, fault_code, *content, kSourceXPlcDataRoute);
 }
 
 void EntityFreezeFrameCapture::log_fallback_failure_once(const std::string & fault_code, const std::string & message) {
@@ -410,7 +411,7 @@ bool EntityFreezeFrameCapture::capture_for_event(const ros2_medkit_msgs::msg::Fa
         log_fallback_failure_once(fault_code, "list_data('" + source + "') failed: " + result.error().message);
         continue;
       }
-      if (auto frame = frame_from_content(source, fault_code, result->content)) {
+      if (auto frame = frame_from_content(source, fault_code, result->content, kSourceDataProvider)) {
         frames.push_back(std::move(*frame));
       }
     } catch (const std::exception & e) {

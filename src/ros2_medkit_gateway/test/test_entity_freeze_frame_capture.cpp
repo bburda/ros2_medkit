@@ -787,6 +787,37 @@ TEST(MergeEntityFreezeFrames, AppendsWhenNoConfiguredFreezeFrame) {
   EXPECT_FALSE(snap.contains("capture_origin"));  // confirm-edge frames carry no marker
 }
 
+TEST(MergeEntityFreezeFrames, CarriesCapturePathAsSource) {
+  // An entity frame has no ROS topic, so topic/message_type are necessarily
+  // empty, so "source" is the only field left saying where they came from.
+  json env_data = {{"snapshots", json::array()}};
+  EntityFreezeFrameCapture::Frame frame;
+  frame.entity_id = "plc_app";
+  frame.values = {{"temperature", 42.5}};
+  frame.captured_at_ns = 1234;
+  frame.source = EntityFreezeFrameCapture::kSourceXPlcDataRoute;
+
+  auto merged = FaultHandlers::merge_entity_freeze_frames(env_data, {frame});
+  ASSERT_EQ(merged["snapshots"].size(), 1u);
+  const auto & snap = merged["snapshots"][0];
+  EXPECT_EQ(snap["source"], EntityFreezeFrameCapture::kSourceXPlcDataRoute);
+  EXPECT_EQ(snap["topic"], "");
+  EXPECT_EQ(snap["message_type"], "");
+}
+
+TEST(MergeEntityFreezeFrames, OmitsSourceWhenTheCaptureNamedNoPath) {
+  // Absence control for the test above, on the same harness: a frame whose
+  // capture path is unknown must not have one invented for it.
+  json env_data = {{"snapshots", json::array()}};
+  EntityFreezeFrameCapture::Frame frame;
+  frame.entity_id = "plc_app";
+  frame.values = {{"temperature", 42.5}};
+
+  auto merged = FaultHandlers::merge_entity_freeze_frames(env_data, {frame});
+  ASSERT_EQ(merged["snapshots"].size(), 1u);
+  EXPECT_FALSE(merged["snapshots"][0].contains("source"));
+}
+
 TEST(MergeEntityFreezeFrames, StartupCatchUpFrameCarriesCaptureOrigin) {
   json env_data = {{"snapshots", json::array()}};
   EntityFreezeFrameCapture::Frame frame;

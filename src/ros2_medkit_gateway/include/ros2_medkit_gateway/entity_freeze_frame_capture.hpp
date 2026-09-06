@@ -60,6 +60,13 @@ namespace ros2_medkit_gateway {
  */
 class EntityFreezeFrameCapture {
  public:
+  /// Capture-path identifiers stored in Frame::source and served as
+  /// ``x-medkit.source``. The plugin's own DataProvider, and the in-process
+  /// dispatch of the plugin's `x-plc-data` route for plugins that export no
+  /// DataProvider.
+  static constexpr const char * kSourceDataProvider = "plugin_data_provider";
+  static constexpr const char * kSourceXPlcDataRoute = "plugin_x_plc_data_route";
+
   /// One captured frame: the entity's data values at fault-confirm time.
   /// captured_at_ns dates the capture, not the values - a disconnected entity
   /// serves its last known values, whose age is bounded only by the outage.
@@ -72,6 +79,13 @@ class EntityFreezeFrameCapture {
     bool startup_catchup{false};
     std::optional<bool> connected;    ///< payload's top-level link flag, when reported
     nlohmann::json source_timestamp;  ///< payload's own "timestamp" field verbatim (null when absent)
+    /// Which capture path read the values (kSourceDataProvider /
+    /// kSourceXPlcDataRoute), served as ``x-medkit.source``. These values are
+    /// entity data, not a ROS message, so ``topic`` and ``message_type`` are
+    /// empty on the wire and would otherwise leave a consumer with nothing at
+    /// all saying where the numbers came from. Empty when the caller named no
+    /// path.
+    std::string source;
   };
 
   /// Resolves an entity id to its owning plugin's DataProvider (nullptr when
@@ -187,9 +201,10 @@ class EntityFreezeFrameCapture {
   bool capture_for_event(const ros2_medkit_msgs::msg::FaultEvent & event, bool startup_catchup = false);
 
   /// Build a frame from list-data-shaped content, enforcing the shared
-  /// no-row-of-nulls invariant on both capture paths.
+  /// no-row-of-nulls invariant on both capture paths. @p source names the path
+  /// that read the content and is stored verbatim in Frame::source.
   std::optional<Frame> frame_from_content(const std::string & entity_id, const std::string & fault_code,
-                                          const nlohmann::json & content);
+                                          const nlohmann::json & content, const std::string & source);
 
   /// Capture via the plugin's own x-plc-data route (no DataProvider exported).
   /// Returns nullopt when the route yields nothing usable.

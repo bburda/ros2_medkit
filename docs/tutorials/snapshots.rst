@@ -216,6 +216,26 @@ with:
    ros2 run ros2_medkit_gateway gateway_node --ros-args \
      -p entity_freeze_frame.enabled:=false
 
+A plugin entity's values are not a ROS message, so ``topic`` and
+``message_type`` are empty on these frames. ``x-medkit.source`` names the
+capture path instead, so a consumer can still tell where the values came
+from:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - ``x-medkit.source``
+     - Meaning
+   * - ``plugin_data_provider``
+     - Read through the owning plugin's ``DataProvider::list_data``.
+   * - ``plugin_x_plc_data_route``
+     - Read by dispatching the owning plugin's own ``x-plc-data`` route
+       in-process (plugins that export no ``DataProvider``).
+
+The field is absent on freeze-frames captured by the fault manager from a ROS
+topic. Those carry a real ``topic`` and ``message_type`` instead.
+
 Example plugin-entity freeze-frame in the fault response:
 
 .. code-block:: json
@@ -227,6 +247,7 @@ Example plugin-entity freeze-frame in the fault response:
      "x-medkit": {
        "topic": "",
        "message_type": "",
+       "source": "plugin_x_plc_data_route",
        "full_data": {"tank_level": 87.5, "pump_running": true},
        "captured_at": "2026-07-14T12:00:00.000Z"
      }
