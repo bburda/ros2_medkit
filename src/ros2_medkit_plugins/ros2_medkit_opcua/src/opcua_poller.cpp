@@ -1155,6 +1155,11 @@ OpcuaPoller::adopt_rediscovered_endpoint(const std::string & current,
   return found;
 }
 
+std::chrono::milliseconds OpcuaPoller::next_reconnect_wait(std::chrono::milliseconds current,
+                                                           std::chrono::milliseconds max_wait) {
+  return std::min(current * 2, max_wait);
+}
+
 void OpcuaPoller::emit_comms_lost(bool active) {
   ros2_medkit::fault_detection::FaultSignal signal;
   signal.fault_code = kCommsLostFaultCode;
@@ -1170,7 +1175,6 @@ void OpcuaPoller::emit_comms_lost(bool active) {
 
 void OpcuaPoller::poll_loop() {
   auto reconnect_wait = config_.reconnect_interval;
-  constexpr auto max_reconnect_wait = std::chrono::milliseconds(60000);
 
   while (running_.load()) {
     // Handle reconnection
@@ -1244,14 +1248,16 @@ void OpcuaPoller::poll_loop() {
             comms_lost_raised_ = true;
           }
         }
-        // Exponential backoff capped at 60s. condition_variable so stop() wakes immediately.
+        // Exponential backoff, capped at config_.max_reconnect_interval (60 s by
+        // default, the rescan cadence while the reconnect arm also rescans).
+        // condition_variable so stop() wakes immediately.
         {
           std::unique_lock<std::mutex> lock(stop_mutex_);
           stop_cv_.wait_for(lock, reconnect_wait, [this] {
             return !running_.load();
           });
         }
-        reconnect_wait = std::min(reconnect_wait * 2, max_reconnect_wait);
+        reconnect_wait = next_reconnect_wait(reconnect_wait, config_.max_reconnect_interval);
         continue;
       }
     }

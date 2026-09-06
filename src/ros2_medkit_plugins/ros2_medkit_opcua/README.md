@@ -604,12 +604,18 @@ plugins.opcua.discovery:
   connect_timeout_ms: 600      # per-port TCP connect timeout
   scan_concurrency: 100        # bounded, polite concurrent connect count
   identify_timeout_ms: 6000    # per GetEndpoints identify
-  interval_s: 0                # re-scan cadence while disconnected (0 = default 30 s)
+  # re-scan cadence while disconnected. Omit the key for the built-in 30 s;
+  # set it to 0 to keep discovery on but never re-scan (start-up scan only).
+  interval_s: 30
   anonymous_none_only: true    # only auto-connect None/Anonymous servers
 ```
 
 Environment overrides (Docker / appliance): `OPCUA_DISCOVERY_ENABLED`,
 `OPCUA_DISCOVERY_SUBNETS` (comma-separated CIDRs), `OPCUA_DISCOVERY_INTERVAL_S`.
+Leaving `interval_s` (and `OPCUA_DISCOVERY_INTERVAL_S`) unset means "no cadence
+stated" and takes the 30 s default; an explicit `0` is honoured as written and
+turns the recurring sweep off. A negative value is refused with a warning and
+leaves the cadence unset.
 
 How it works:
 1. Bounded concurrent TCP connect sweep of the configured ports across the
@@ -626,11 +632,19 @@ How it works:
    ip:port) and connects to the **scanned ip:port** - not the advertised
    EndpointUrl, which a server may report as a non-resolvable hostname.
 5. While no session is established, the reconnect loop scans again every
-   `interval_s` (default 30 s) and adopts a newly found server for its next
-   connect attempt, logging the swap at INFO. This is what covers the common
-   race where the gateway and the PLC boot together: the startup scan finds
-   nothing because the PLC is still coming up, and without a re-scan the plugin
-   would retry the fallback endpoint until someone restarted it.
+   `interval_s` (default 30 s), measured from the END of the previous sweep, and
+   adopts a newly found server for its next connect attempt, logging the swap at
+   INFO. The re-scan is consulted once per reconnect attempt, and those are
+   spaced by an exponential backoff, so the backoff ceiling is capped at
+   `interval_s` while discovery is re-scanning - otherwise the real cadence
+   would be `max(interval_s, backoff)` rather than the stated one. This covers
+   the common race where the gateway and the PLC boot together: the startup scan
+   finds nothing because the PLC is still coming up, and without a re-scan the
+   plugin would retry the fallback endpoint until someone restarted it.
+6. On the first session after such an adoption, a config-less deployment (no
+   node map) re-derives the SOVD component identity from the device itself, so
+   the component stops being served under the provisional `opcua-<host>` name it
+   got when nothing answered. The change is logged at INFO.
 
 Re-scanning stops as soon as a session is up, and never starts at all when an
 `endpoint_url` is configured.
@@ -638,11 +652,19 @@ Re-scanning stops as soon as a session is up, and never starts at all when an
 Safety / OT posture:
 - Everything is read-only: TCP connect + `GetEndpoints` only. No writes, no
   subscriptions, no second long-lived session.
+- The scan is NOT one-shot: while the plugin has no session it repeats every
+  `interval_s` (default 30 s) for as long as it stays disconnected. Set
+  `interval_s: 0` (or `OPCUA_DISCOVERY_INTERVAL_S=0`) to keep discovery on with
+  the start-up scan only, or `enabled: false` to switch it off entirely.
+- A sweep is cancelled when the plugin shuts down, so a stop does not have to
+  wait out a subnet the size of a /16.
 - An explicitly configured `endpoint_url` (or `OPCUA_ENDPOINT_URL`) always wins;
   discovery then does nothing, so it never opens a second session on a PLC the
   plugin already polls.
-- Secured-only servers (no None/Anonymous endpoint) are surfaced in the startup
-  log as leads requiring operator credentials - never auto-connected or probed.
+- Secured-only servers (no None/Anonymous endpoint) are surfaced in the log as
+  leads requiring operator credentials - never auto-connected or probed. A
+  re-scan whose outcome has not changed reports at DEBUG instead of repeating
+  the whole report, so a recurring sweep does not bury the rest of the log.
 - The scan is bounded (short connect timeout, capped concurrency) and CIDRs
   wider than /16 are rejected to prevent an accidental broad sweep.
 

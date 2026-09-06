@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -105,14 +106,17 @@ struct OpcuaDiscoveryConfig {
   int scan_concurrency{100};    ///< bounded, polite concurrent connect count
   int identify_timeout_ms{6000};
 
-  /// Re-scan cadence, in seconds, while no OPC-UA session is established. 0
-  /// selects the built-in default (see OpcuaPlugin::effective_rescan_interval_s).
+  /// Re-scan cadence, in seconds, while no OPC-UA session is established.
+  /// Unset (the key absent) selects the built-in default, an explicit 0 turns
+  /// re-scanning off and keeps the startup scan one-shot - the two are
+  /// deliberately distinct, so a deployment can keep discovery on and still
+  /// stop the recurring sweep (see OpcuaPlugin::effective_rescan_interval_s).
   /// The startup scan always runs once. The cadence only governs how often the
   /// disconnected reconnect loop scans again, so a gateway that started before
   /// its PLC finished booting adopts the PLC when it appears instead of retrying
   /// the fallback endpoint forever. Never used once an endpoint is configured
   /// explicitly, and never while a session is up.
-  int interval_s{0};
+  std::optional<int> interval_s;
 
   /// Only auto-register endpoints that expose a None + Anonymous endpoint (what
   /// the plugin connects with today). Secured-only servers are surfaced as
@@ -158,7 +162,15 @@ class NetworkDiscovery {
   /// Run one full discovery pass (blocking). Read-only: TCP connect +
   /// GetEndpoints only. Deduplicated by ApplicationUri (fallback ip:port),
   /// sorted deterministically by ip:port.
-  std::vector<DiscoveredEndpoint> run();
+  ///
+  /// @param cancelled optional abort predicate, polled before every probe and
+  ///        between the sweep and identify phases. A sweep of a legal /16 is
+  ///        tens of thousands of probes and takes minutes, and the caller runs
+  ///        it on the poll thread that a shutdown has to join, so without this
+  ///        a ``docker stop`` grace period would expire mid-sweep. A pass still
+  ///        cancelled at the next phase boundary returns an empty result rather
+  ///        than a partial one, within one in-flight probe per worker.
+  std::vector<DiscoveredEndpoint> run(const std::function<bool()> & cancelled = {});
 
   /// Resolve the subnets to scan: configured ``subnets`` if any, else the
   /// derived local /24. Exposed for logging / tests.

@@ -103,6 +103,13 @@ struct PollerConfig {
   double subscription_interval_ms{500.0};
   std::chrono::milliseconds poll_interval{1000};
   std::chrono::milliseconds reconnect_interval{5000};
+  /// Ceiling for the exponential reconnect backoff (it doubles from
+  /// ``reconnect_interval`` up to this). A plugin whose reconnect arm also
+  /// rescans for a new endpoint lowers this to the rescan cadence: the rescan is
+  /// consulted once per reconnect attempt, so a backoff longer than the cadence
+  /// would silently stretch the documented "re-scan every interval_s" to the
+  /// backoff instead (see OpcuaPlugin::effective_max_reconnect_wait).
+  std::chrono::milliseconds max_reconnect_interval{60000};
   /// Active-condition replay strategy on (re)subscribe (issue #389).
   /// Default Auto: ConditionRefresh with a read-based fallback so hardened
   /// servers that reject the method still recover their active alarms.
@@ -261,6 +268,13 @@ class OpcuaPoller {
   static std::optional<std::string>
   adopt_rediscovered_endpoint(const std::string & current,
                               const std::function<std::optional<std::string>()> & rediscover);
+
+  /// Wait before the next reconnect attempt: the current wait doubled, clamped
+  /// to ``max_wait`` (a wait already above the cap comes back down to it). Pure
+  /// and static so the backoff - and the cap that keeps a rescanning reconnect
+  /// loop on its documented cadence - is unit-testable.
+  static std::chrono::milliseconds next_reconnect_wait(std::chrono::milliseconds current,
+                                                       std::chrono::milliseconds max_wait);
 
   /// Zero-config native A&C (``auto_alarms``): the alarm sources that should
   /// actually be subscribed / replayed, i.e. every explicit ``event_alarms``
@@ -455,7 +469,10 @@ class OpcuaPoller {
   // Issue #496: comms-lost debounce state, touched only on the poll thread.
   // ``comms_down_since_`` is set the first poll iteration the connection is
   // observed down and cleared on reconnect; ``comms_lost_raised_`` guards the
-  // one-shot raise / matching clear so the fault is idempotent.
+  // one-shot RAISE only. The clear is deliberately not guarded by it: it is sent
+  // on every successful reconnect, because the fault manager persists faults by
+  // fault_code and a comms-lost fault raised before a restart is standing in the
+  // store with nothing in this process's memory to remember it.
   std::optional<std::chrono::steady_clock::time_point> comms_down_since_;
   bool comms_lost_raised_{false};
 

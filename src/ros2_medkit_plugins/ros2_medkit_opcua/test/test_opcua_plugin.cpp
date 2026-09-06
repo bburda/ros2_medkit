@@ -692,6 +692,15 @@ OpcuaDiscoveryConfig rescan_cfg() {
 // Discards log output. The tests assert on the selected endpoint, not the text.
 const std::function<void(const std::string &)> kSilent = [](const std::string &) {};
 
+// Silent reporter: no repeat-suppression memory, so every pass reports in full
+// (into the void). Tests that assert on the log build their own.
+OpcuaPlugin::DiscoveryReporter silent_reporter() {
+  OpcuaPlugin::DiscoveryReporter reporter;
+  reporter.info = kSilent;
+  reporter.warn = kSilent;
+  return reporter;
+}
+
 }  // namespace
 
 TEST(DiscoverEndpoint, ScanBeforeThePlcIsUpSelectsNothingAndALaterRescanAdoptsIt) {
@@ -699,14 +708,14 @@ TEST(DiscoverEndpoint, ScanBeforeThePlcIsUpSelectsNothingAndALaterRescanAdoptsIt
   // booting. Nothing answers, so nothing is selected and the caller keeps the
   // default endpoint.
   const auto empty_pass = OpcuaPlugin::discover_endpoint(rescan_cfg(), /*endpoint_configured=*/false, fake_scan({}),
-                                                         fake_identify({}), kSilent, kSilent);
+                                                         fake_identify({}), silent_reporter());
   EXPECT_FALSE(empty_pass.has_value());
 
   // The PLC finishes booting. The same call with the same config now finds it,
   // which is what the reconnect arm applies to the next connect attempt.
   const auto later_pass = OpcuaPlugin::discover_endpoint(
       rescan_cfg(), /*endpoint_configured=*/false, fake_scan({"192.168.1.10:4840"}),
-      fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), kSilent, kSilent);
+      fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), silent_reporter());
   ASSERT_TRUE(later_pass.has_value());
   EXPECT_EQ(*later_pass, "opc.tcp://192.168.1.10:4840");
 }
@@ -717,7 +726,7 @@ TEST(DiscoverEndpoint, AnExplicitEndpointIsNeverRescanned) {
   // endpoint. Discovery must not open a second session on a polled PLC.
   const auto chosen = OpcuaPlugin::discover_endpoint(
       rescan_cfg(), /*endpoint_configured=*/true, fake_scan({"192.168.1.10:4840"}),
-      fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), kSilent, kSilent);
+      fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), silent_reporter());
   EXPECT_FALSE(chosen.has_value());
 }
 
@@ -730,7 +739,7 @@ TEST(DiscoverEndpoint, DisabledDiscoveryScansNothing) {
     return true;
   };
   const auto chosen = OpcuaPlugin::discover_endpoint(cfg, /*endpoint_configured=*/false, counting_scan,
-                                                     fake_identify({}), kSilent, kSilent);
+                                                     fake_identify({}), silent_reporter());
   EXPECT_FALSE(chosen.has_value());
   EXPECT_FALSE(scanned) << "a disabled discovery must not touch the network";
 }
@@ -748,6 +757,372 @@ TEST(EffectiveRescanInterval, DefaultsWhenDiscoveryIsOnWithNoCadenceAndIsOffOthe
   EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(cfg, /*endpoint_configured=*/true), 0);
   cfg.enabled = false;
   EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(cfg, false), 0);
+}
+
+TEST(EffectiveRescanInterval, ExplicitZeroKeepsDiscoveryOnAndStopsRescanning) {
+  // The three states an operator can be in, all with discovery enabled and no
+  // endpoint pinned.
+  OpcuaDiscoveryConfig unset = rescan_cfg();  // (1) unset -> the built-in cadence
+  EXPECT_FALSE(unset.interval_s.has_value());
+  EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(unset, false), OpcuaPlugin::kDefaultRescanIntervalS);
+
+  OpcuaDiscoveryConfig explicit_zero = rescan_cfg();  // (2) explicit 0 -> one-shot
+  explicit_zero.interval_s = 0;
+  EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(explicit_zero, false), 0)
+      << "an explicit interval_s: 0 must stop the rescan, not fall back to the default";
+
+  // (3) A negative value never reaches here: the parse warns and leaves the
+  // cadence unset, so what arrives is case (1).
+  std::vector<std::string> warnings;
+  const auto parsed =
+      parse_discovery_config(nlohmann::json{{"enabled", true}, {"interval_s", -1}}, [&warnings](const std::string & m) {
+        warnings.push_back(m);
+      });
+  EXPECT_EQ(warnings.size(), 1u);
+  EXPECT_EQ(OpcuaPlugin::effective_rescan_interval_s(parsed, false), OpcuaPlugin::kDefaultRescanIntervalS);
+}
+
+// ---------------------------------------------------------------------------
+// Rescan cadence: measured from the END of the previous sweep
+// ---------------------------------------------------------------------------
+
+TEST(RescanStep, SpacesSweepsFromTheEndOfThePreviousOne) {
+  // A legal /16 sweep runs for minutes. With the cadence stamped at the START,
+  // the next sweep is due the instant the current one returns, so the poll
+  // thread sweeps back to back and the reconnect attempt drops to one a sweep.
+  const auto t0 = std::chrono::steady_clock::time_point{};
+  const auto sweep_duration = std::chrono::seconds(390);  // a /16 at the defaults
+  auto clock_now = t0;
+  const auto now = [&clock_now]() {
+    return clock_now;
+  };
+
+  int sweeps = 0;
+  const auto sweep = [&sweeps, &clock_now, sweep_duration]() -> std::optional<std::string> {
+    ++sweeps;
+    clock_now += sweep_duration;  // the sweep blocks for its whole duration
+    return std::nullopt;
+  };
+
+  auto last_end = t0;
+  clock_now = t0 + std::chrono::seconds(30);
+  OpcuaPlugin::rescan_step(30, now, &last_end, sweep);
+  ASSERT_EQ(sweeps, 1);
+  EXPECT_EQ(last_end, clock_now) << "the cadence must be stamped when the sweep finished";
+
+  // One second after the sweep returned: not due, even though it STARTED 391 s
+  // ago.
+  clock_now += std::chrono::seconds(1);
+  OpcuaPlugin::rescan_step(30, now, &last_end, sweep);
+  EXPECT_EQ(sweeps, 1) << "a rescan ran less than one interval after the previous sweep ended";
+
+  // A full interval after the end: due again.
+  clock_now += std::chrono::seconds(29);
+  OpcuaPlugin::rescan_step(30, now, &last_end, sweep);
+  EXPECT_EQ(sweeps, 2);
+}
+
+TEST(RescanStep, DoesNothingWithoutACadence) {
+  const auto t0 = std::chrono::steady_clock::time_point{};
+  auto last_end = t0;
+  int sweeps = 0;
+  const auto now = [t0]() {
+    return t0 + std::chrono::hours(1);
+  };
+  const auto sweep = [&sweeps]() -> std::optional<std::string> {
+    ++sweeps;
+    return std::string("opc.tcp://192.168.1.10:4840");
+  };
+  // 0 is the operator's "do not re-scan" (and also discovery off / endpoint
+  // pinned, both of which effective_rescan_interval_s maps to 0).
+  EXPECT_FALSE(OpcuaPlugin::rescan_step(0, now, &last_end, sweep).has_value());
+  EXPECT_EQ(sweeps, 0);
+  // Positive control on the same harness: with a cadence the very same call
+  // sweeps and hands the endpoint back.
+  const auto adopted = OpcuaPlugin::rescan_step(30, now, &last_end, sweep);
+  ASSERT_TRUE(adopted.has_value());
+  EXPECT_EQ(*adopted, "opc.tcp://192.168.1.10:4840");
+  EXPECT_EQ(sweeps, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect backoff ceiling while the reconnect arm also rescans
+// ---------------------------------------------------------------------------
+
+TEST(EffectiveMaxReconnectWait, CapsTheBackoffAtTheRescanCadence) {
+  using namespace std::chrono_literals;
+  // No rescan: the plain 60 s ceiling.
+  EXPECT_EQ(OpcuaPlugin::effective_max_reconnect_wait(5000ms, 60000ms, /*rescan_interval_s=*/0), 60000ms);
+  // Rescanning every 30 s: an uncapped backoff would make the real adoption
+  // cadence max(30 s, 60 s), not the documented 30 s.
+  EXPECT_EQ(OpcuaPlugin::effective_max_reconnect_wait(5000ms, 60000ms, 30), 30000ms);
+  // A cadence longer than the ceiling does not raise the ceiling.
+  EXPECT_EQ(OpcuaPlugin::effective_max_reconnect_wait(5000ms, 60000ms, 900), 60000ms);
+  // A cadence shorter than the configured reconnect interval does not turn the
+  // backoff into a hot retry loop.
+  EXPECT_EQ(OpcuaPlugin::effective_max_reconnect_wait(5000ms, 60000ms, 1), 5000ms);
+}
+
+TEST(NextReconnectWait, DoublesUpToTheCeiling) {
+  using namespace std::chrono_literals;
+  EXPECT_EQ(OpcuaPoller::next_reconnect_wait(5000ms, 60000ms), 10000ms);
+  EXPECT_EQ(OpcuaPoller::next_reconnect_wait(40000ms, 60000ms), 60000ms);
+  EXPECT_EQ(OpcuaPoller::next_reconnect_wait(60000ms, 60000ms), 60000ms);
+  // Capped at a 30 s rescan cadence: the wait never exceeds it, so the rescan is
+  // consulted every cadence instead of every max(cadence, backoff).
+  EXPECT_EQ(OpcuaPoller::next_reconnect_wait(20000ms, 30000ms), 30000ms);
+  EXPECT_EQ(OpcuaPoller::next_reconnect_wait(30000ms, 30000ms), 30000ms);
+}
+
+// ---------------------------------------------------------------------------
+// Discovery report: quiet while the outcome does not change
+// ---------------------------------------------------------------------------
+
+TEST(DiscoverEndpoint, AnUnchangedRescanReportsAtDebugInsteadOfRepeatingItself) {
+  // A secured-only site rescans for the life of the process and would otherwise
+  // log the whole report - scan line, per-server line, summary and the
+  // "no auto-connectable server" WARN - every interval_s.
+  IdentifyResult secured = plc_identity();
+  secured.anonymous_none_available = false;
+
+  std::vector<std::string> info;
+  std::vector<std::string> warn;
+  std::vector<std::string> debug;
+  std::string outcome;
+  OpcuaPlugin::DiscoveryReporter reporter;
+  reporter.info = [&info](const std::string & m) {
+    info.push_back(m);
+  };
+  reporter.warn = [&warn](const std::string & m) {
+    warn.push_back(m);
+  };
+  reporter.debug = [&debug](const std::string & m) {
+    debug.push_back(m);
+  };
+  reporter.previous_outcome = &outcome;
+
+  const auto pass = [&]() {
+    return OpcuaPlugin::discover_endpoint(rescan_cfg(), /*endpoint_configured=*/false, fake_scan({"192.168.1.10:4840"}),
+                                          fake_identify({{"opc.tcp://192.168.1.10:4840", secured}}), reporter);
+  };
+
+  EXPECT_FALSE(pass().has_value());
+  const size_t first_info = info.size();
+  const size_t first_warn = warn.size();
+  EXPECT_GT(first_info, 0u);
+  EXPECT_EQ(first_warn, 1u) << "the first pass always reports the secured-only outcome";
+  EXPECT_TRUE(debug.empty());
+
+  // Same network, same outcome: nothing new at INFO/WARN, the report goes to
+  // the debug logger instead.
+  EXPECT_FALSE(pass().has_value());
+  EXPECT_EQ(info.size(), first_info) << "an unchanged rescan repeated its report at INFO";
+  EXPECT_EQ(warn.size(), first_warn) << "an unchanged rescan repeated its WARN";
+  EXPECT_EQ(debug.size(), first_info + first_warn) << "the repeated report must still be traceable at DEBUG";
+
+  // The server opens up an anonymous endpoint: the outcome changed, so the
+  // operator hears about it at INFO again.
+  const auto chosen =
+      OpcuaPlugin::discover_endpoint(rescan_cfg(), /*endpoint_configured=*/false, fake_scan({"192.168.1.10:4840"}),
+                                     fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), reporter);
+  ASSERT_TRUE(chosen.has_value());
+  EXPECT_GT(info.size(), first_info) << "a changed outcome must be reported at INFO";
+}
+
+TEST(DiscoverEndpoint, WithNoRepeatMemoryEveryPassIsReported) {
+  // Positive control for the test above: the same two identical passes with no
+  // previous_outcome (the startup scan's own reporter) report in full twice, so
+  // the silence above is the suppression and not a dead sink.
+  std::vector<std::string> info;
+  OpcuaPlugin::DiscoveryReporter reporter;
+  reporter.info = [&info](const std::string & m) {
+    info.push_back(m);
+  };
+  reporter.warn = kSilent;
+
+  const auto pass = [&]() {
+    return OpcuaPlugin::discover_endpoint(rescan_cfg(), /*endpoint_configured=*/false, fake_scan({"192.168.1.10:4840"}),
+                                          fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), reporter);
+  };
+  EXPECT_TRUE(pass().has_value());
+  const size_t first = info.size();
+  EXPECT_GT(first, 0u);
+  EXPECT_TRUE(pass().has_value());
+  EXPECT_EQ(info.size(), 2 * first);
+}
+
+// ---------------------------------------------------------------------------
+// Config-less component identity across an adoption
+// ---------------------------------------------------------------------------
+
+TEST(RederivedComponentIdentity, AdoptionReplacesTheProvisionalEndpointDerivedId) {
+  // The config-less race, end to end over the derivation path: the gateway
+  // starts before the PLC, its start-up scan finds nothing, and the identity is
+  // derived from the fallback endpoint plus an empty DeviceInfo.
+  const auto startup_pass = OpcuaPlugin::discover_endpoint(rescan_cfg(), /*endpoint_configured=*/false, fake_scan({}),
+                                                           fake_identify({}), silent_reporter());
+  ASSERT_FALSE(startup_pass.has_value());
+  const std::string fallback_endpoint = "opc.tcp://localhost:4840";  // OpcuaClientConfig's default
+  const ComponentIdentity provisional = derive_component_identity(OpcuaClient::DeviceInfo{}, fallback_endpoint);
+  EXPECT_EQ(provisional.id, "opcua-localhost");
+
+  // The PLC finishes booting and the rescan adopts it.
+  const auto adopted = OpcuaPlugin::discover_endpoint(
+      rescan_cfg(), /*endpoint_configured=*/false, fake_scan({"192.168.1.10:4840"}),
+      fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), silent_reporter());
+  ASSERT_TRUE(adopted.has_value());
+
+  // The session is up, so the device can finally name itself: the component
+  // must stop being served under the placeholder.
+  OpcuaClient::DeviceInfo info;
+  info.di_manufacturer = "Siemens AG";
+  info.di_model = "CPU 1505SP F";
+  const auto rederived = OpcuaPlugin::rederived_component_identity(provisional.id, info, *adopted);
+  ASSERT_TRUE(rederived.has_value()) << "an adopted device with a nameplate must replace opcua-localhost";
+  EXPECT_EQ(rederived->id, "siemens_ag_cpu_1505sp_f");
+  EXPECT_EQ(rederived->name, "Siemens AG CPU 1505SP F");
+}
+
+TEST(RederivedComponentIdentity, KeepsTheIdentityWhenNothingChanged) {
+  // Same device on a later reconnect: no rename, so no entity churn and no INFO
+  // line claiming an identity change that did not happen.
+  OpcuaClient::DeviceInfo info;
+  info.di_manufacturer = "Siemens AG";
+  info.di_model = "CPU 1505SP F";
+  EXPECT_FALSE(OpcuaPlugin::rederived_component_identity("siemens_ag_cpu_1505sp_f", info, "opc.tcp://192.168.1.10:4840")
+                   .has_value());
+
+  // A nameplate-less server on an adopted endpoint still moves off the
+  // fallback host it was provisionally named after.
+  const auto host_derived = OpcuaPlugin::rederived_component_identity("opcua-localhost", OpcuaClient::DeviceInfo{},
+                                                                      "opc.tcp://192.168.1.10:4840");
+  ASSERT_TRUE(host_derived.has_value());
+  EXPECT_EQ(host_derived->id, "opcua-192_168_1_10");
+}
+
+// ---------------------------------------------------------------------------
+// ClearFault: a link-state clear does not cascade
+// ---------------------------------------------------------------------------
+
+TEST(MakeClearFaultRequest, LinkStateClearSkipsTheCorrelationCascade) {
+  // The connect-time PLC_COMMS_LOST clear says the link came back. A
+  // correlation rule may name PLC_COMMS_LOST as the root cause of every symptom
+  // the outage produced, and clearing those is an operator's call, not a link
+  // event's.
+  const auto link_state = OpcuaPlugin::make_clear_fault_request(kCommsLostFaultCode, /*link_state=*/true);
+  EXPECT_EQ(link_state.fault_code, kCommsLostFaultCode);
+  EXPECT_TRUE(link_state.skip_correlation_auto_clear);
+
+  // Positive control on the same request builder: an operator-driven clear (the
+  // SOVD DELETE route) leaves the cascade alone, so the flag above is the
+  // link-state rule and not a hardcoded true.
+  const auto operator_clear = OpcuaPlugin::make_clear_fault_request("PLC_TANK_HIGH", /*link_state=*/false);
+  EXPECT_EQ(operator_clear.fault_code, "PLC_TANK_HIGH");
+  EXPECT_FALSE(operator_clear.skip_correlation_auto_clear);
+}
+
+// ---------------------------------------------------------------------------
+// Pending fault dispatch buffer: reports outrank clears
+// ---------------------------------------------------------------------------
+
+namespace {
+
+OpcuaPlugin::PendingFaultDispatch report_entry(const std::string & code) {
+  return {OpcuaPlugin::PendingFaultDispatch::Kind::Report, code, []() {}};
+}
+
+OpcuaPlugin::PendingFaultDispatch clear_entry(const std::string & code) {
+  return {OpcuaPlugin::PendingFaultDispatch::Kind::Clear, code, []() {}};
+}
+
+size_t count_kind(const std::vector<OpcuaPlugin::PendingFaultDispatch> & buffer,
+                  OpcuaPlugin::PendingFaultDispatch::Kind kind) {
+  return static_cast<size_t>(
+      std::count_if(buffer.begin(), buffer.end(), [kind](const OpcuaPlugin::PendingFaultDispatch & entry) {
+        return entry.kind == kind;
+      }));
+}
+
+}  // namespace
+
+TEST(EnqueuePendingDispatch, ReconnectClearsNeverEvictABufferedAlarmReport) {
+  // A flapping link with no fault_manager: 300 reconnects, each enqueueing a
+  // connect-time clear, while ten real alarm reports wait to be flushed. The
+  // reports are one-shot edges from the PLC; the clears are re-derivable.
+  std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
+  for (int i = 0; i < 10; ++i) {
+    OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                          report_entry("PLC_ALARM_" + std::to_string(i)));
+  }
+  for (int i = 0; i < 300; ++i) {
+    OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry(kCommsLostFaultCode));
+  }
+
+  EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Report), 10u)
+      << "connect-time clears evicted buffered alarm reports";
+  EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Clear), 1u)
+      << "at most one clear per fault code may be pending";
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_EQ(buffer[static_cast<size_t>(i)].fault_code, "PLC_ALARM_" + std::to_string(i));
+  }
+}
+
+TEST(EnqueuePendingDispatch, AFullReportBufferRefusesAClearInsteadOfDroppingAReport) {
+  std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
+  for (size_t i = 0; i < OpcuaPlugin::kMaxPendingDispatches; ++i) {
+    OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                          report_entry("PLC_ALARM_" + std::to_string(i)));
+  }
+  ASSERT_EQ(buffer.size(), OpcuaPlugin::kMaxPendingDispatches);
+
+  EXPECT_EQ(OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                                  clear_entry(kCommsLostFaultCode)),
+            OpcuaPlugin::PendingEnqueueOutcome::Refused);
+  EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Report), OpcuaPlugin::kMaxPendingDispatches);
+  EXPECT_EQ(buffer.front().fault_code, "PLC_ALARM_0") << "the oldest report must survive an incoming clear";
+
+  // A report arriving at a full buffer still drops the oldest one: reports do
+  // not outrank each other, so the bound still holds.
+  EXPECT_EQ(
+      OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, report_entry("PLC_ALARM_NEW")),
+      OpcuaPlugin::PendingEnqueueOutcome::EvictedReport);
+  EXPECT_EQ(buffer.size(), OpcuaPlugin::kMaxPendingDispatches);
+  EXPECT_EQ(buffer.front().fault_code, "PLC_ALARM_1");
+  EXPECT_EQ(buffer.back().fault_code, "PLC_ALARM_NEW");
+}
+
+TEST(EnqueuePendingDispatch, AFullBufferGivesUpAPendingClearBeforeAReport) {
+  std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry("PLC_OLD_CLEAR"));
+  for (size_t i = 1; i < OpcuaPlugin::kMaxPendingDispatches; ++i) {
+    OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                          report_entry("PLC_ALARM_" + std::to_string(i)));
+  }
+  ASSERT_EQ(buffer.size(), OpcuaPlugin::kMaxPendingDispatches);
+
+  EXPECT_EQ(
+      OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, report_entry("PLC_ALARM_NEW")),
+      OpcuaPlugin::PendingEnqueueOutcome::EvictedClear);
+  EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Clear), 0u);
+  EXPECT_EQ(buffer.front().fault_code, "PLC_ALARM_1") << "the clear went, not the oldest report";
+}
+
+TEST(EnqueuePendingDispatch, ARequeuedClearMovesToTheBackSoOrderStillHolds) {
+  // Report-then-clear for one code must still flush in that order after the
+  // clear is re-enqueued, or the flush would leave the fault standing.
+  std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry("PLC_FLAP"));
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, report_entry("PLC_FLAP"));
+  EXPECT_EQ(OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry("PLC_FLAP")),
+            OpcuaPlugin::PendingEnqueueOutcome::ReplacedClear);
+
+  ASSERT_EQ(buffer.size(), 2u);
+  EXPECT_EQ(buffer[0].kind, OpcuaPlugin::PendingFaultDispatch::Kind::Report);
+  EXPECT_EQ(buffer[1].kind, OpcuaPlugin::PendingFaultDispatch::Kind::Clear)
+      << "the newest clear must flush after the report it supersedes";
+  // Clears for DIFFERENT codes are independent.
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry("PLC_OTHER"));
+  EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Clear), 2u);
 }
 
 TEST(AdoptRediscoveredEndpoint, AdoptsOnlyADifferentNonEmptyUrl) {
