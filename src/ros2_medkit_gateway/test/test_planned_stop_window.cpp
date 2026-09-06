@@ -30,6 +30,7 @@
 
 using ros2_medkit_gateway::faults::annotate_fault_with_planned_stop;
 using ros2_medkit_gateway::faults::find_covering_window;
+using ros2_medkit_gateway::faults::floor_to_ms_ns;
 using ros2_medkit_gateway::faults::parse_iso8601_utc_ns;
 using ros2_medkit_gateway::faults::PlannedStopCache;
 using ros2_medkit_gateway::faults::PlannedStopWindow;
@@ -66,8 +67,9 @@ TEST(PlannedStopCoverage, TheIntervalIsClosedAtBothEnds) {
   ASSERT_NE(find_covering_window(windows, 10 * kSec), nullptr) << "exactly at from";
   ASSERT_NE(find_covering_window(windows, 20 * kSec), nullptr) << "exactly at to";
   ASSERT_NE(find_covering_window(windows, 15 * kSec), nullptr);
-  EXPECT_EQ(find_covering_window(windows, 10 * kSec - 1), nullptr) << "one nanosecond before from";
-  EXPECT_EQ(find_covering_window(windows, 20 * kSec + 1), nullptr) << "one nanosecond after to";
+  // A millisecond, not a nanosecond: see PlannedStopCoverage.TheBoundaryIsAMillisecondWide.
+  EXPECT_EQ(find_covering_window(windows, 10 * kSec - 1'000'000), nullptr) << "one millisecond before from";
+  EXPECT_EQ(find_covering_window(windows, 20 * kSec + 1'000'000), nullptr) << "one millisecond after to";
 }
 
 TEST(PlannedStopCoverage, OverlappingWindowsPickTheEarliestStarting) {
@@ -141,13 +143,13 @@ TEST(PlannedStopTimeParsing, KeepsFractionalSecondsToNanosecondResolution) {
 
   parsed = parse_iso8601_utc_ns("1970-01-01T00:00:00.000000001Z");
   ASSERT_TRUE(parsed.has_value());
-  EXPECT_EQ(*parsed, 1) << "one nanosecond must survive the parse";
+  EXPECT_EQ(*parsed, 0) << "a fraction finer than a millisecond floors to the millisecond";
 
-  // More digits than nanoseconds can hold are truncated, not rejected: the
-  // instant is still unambiguous.
+  // More digits than the API carries are truncated, not rejected: the instant is
+  // still unambiguous.
   parsed = parse_iso8601_utc_ns("1970-01-01T00:00:00.1234567891Z");
   ASSERT_TRUE(parsed.has_value());
-  EXPECT_EQ(*parsed, 123'456'789);
+  EXPECT_EQ(*parsed, 123'000'000);
 }
 
 TEST(PlannedStopTimeParsing, AcceptsAnExplicitZeroOffset) {
@@ -159,6 +161,34 @@ TEST(PlannedStopTimeParsing, AcceptsAnExplicitZeroOffset) {
   ASSERT_TRUE(minus.has_value());
   EXPECT_EQ(*plus, *z);
   EXPECT_EQ(*minus, *z);
+}
+
+TEST(PlannedStopTimeParsing, RefusesAYearWhoseNanosecondCountCannotBeCounted) {
+  // int64 nanoseconds run out in April 2262. Multiplying first wrapped a year
+  // past that back INTO the accepted range, so a stop declared for 2600 was
+  // stored as one in 2015 and answered 201.
+  for (const char * text :
+       {"2262-04-12T00:00:00Z", "2555-01-01T00:00:00Z", "2600-01-01T00:00:00Z", "9999-12-31T23:59:59Z"}) {
+    EXPECT_FALSE(parse_iso8601_utc_ns(text).has_value()) << "accepted: " << text;
+  }
+
+  // A year between the int32-second limit and the int64-nanosecond one parses
+  // to a REAL value, which the representable-instant guard then refuses. That is
+  // the split the fix depends on: the parser must not be the thing that hides it.
+  const auto in_2100 = parse_iso8601_utc_ns("2100-01-01T00:00:00Z");
+  ASSERT_TRUE(in_2100.has_value());
+  EXPECT_GT(*in_2100, ros2_medkit_gateway::faults::kMaxRepresentableNs);
+}
+
+TEST(PlannedStopTimeParsing, RefusesAnInstantAtOrBeforeTheEpoch) {
+  // The epoch is not a sentinel for "now" anywhere in this API, so it cannot be
+  // a legal window bound either.
+  const auto epoch = parse_iso8601_utc_ns("1970-01-01T00:00:00Z");
+  ASSERT_TRUE(epoch.has_value()) << "the text is a valid instant; it is the value that is refused";
+  EXPECT_EQ(*epoch, 0);
+  EXPECT_FALSE(ros2_medkit_gateway::faults::is_representable_instant(*epoch));
+  EXPECT_TRUE(ros2_medkit_gateway::faults::is_representable_instant(1'000'000))
+      << "one millisecond after the epoch is a real instant";
 }
 
 TEST(PlannedStopTimeParsing, RefusesWhatItCannotReadAsAnInstantInUtc) {
@@ -266,6 +296,67 @@ TEST(PlannedStopAnnotation, WindowForFaultAgreesWithTheAnnotationAtTheBoundary) 
   EXPECT_EQ(window_for_fault(windows, just_after), nullptr);
 }
 
+// --- the resolution the API works at ----------------------------------------
+//
+// One millisecond, end to end (parse, storage, comparison, formatting). The
+// reason is in the header: an operator declares a stop at minute or second
+// precision, and the REST fault item carries first_occurred as a double whose
+// resolution at today's epoch is about a quarter of a microsecond, so a boundary
+// defined more finely than the data can express is a boundary nobody can rely
+// on.
+
+TEST(PlannedStopResolution, FloorToMillisecondIsATrueFloor) {
+  EXPECT_EQ(floor_to_ms_ns(0), 0);
+  EXPECT_EQ(floor_to_ms_ns(999'999), 0);
+  EXPECT_EQ(floor_to_ms_ns(1'000'000), 1'000'000);
+  EXPECT_EQ(floor_to_ms_ns(1'999'999), 1'000'000);
+  EXPECT_EQ(floor_to_ms_ns(kSec + 123'456'789), kSec + 123'000'000);
+  // Negative instants are refused by the API, but the helper is used on values
+  // that arrive from outside it, so it must not round towards zero there.
+  EXPECT_EQ(floor_to_ms_ns(-1), -1'000'000);
+  EXPECT_EQ(floor_to_ms_ns(-1'000'000), -1'000'000);
+  EXPECT_EQ(floor_to_ms_ns(-1'000'001), -2'000'000);
+}
+
+TEST(PlannedStopTimeParsing, RoundsAFinerFractionDownToTheMillisecond) {
+  auto parsed = parse_iso8601_utc_ns("2026-09-06T12:34:56.123456789Z");
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(*parsed % 1'000'000, 0) << "the parse must not keep what the API cannot carry";
+  EXPECT_EQ(*parsed, 1788698096LL * kSec + 123'000'000);
+
+  parsed = parse_iso8601_utc_ns("2026-09-06T12:34:56.999999Z");
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(*parsed, 1788698096LL * kSec + 999'000'000) << "down, never to the nearest";
+}
+
+TEST(PlannedStopCoverage, TheBoundaryIsAMillisecondWide) {
+  const int64_t from_ns = 10 * kSec;
+  const int64_t to_ns = 20 * kSec;
+  const std::vector<PlannedStopWindow> windows{window("w", from_ns, to_ns)};
+
+  // Exactly at the end, and anywhere inside that same millisecond, is covered.
+  EXPECT_NE(find_covering_window(windows, to_ns), nullptr);
+  EXPECT_NE(find_covering_window(windows, to_ns + 999'999), nullptr)
+      << "a fault inside the closing millisecond is inside the window";
+  EXPECT_EQ(find_covering_window(windows, to_ns + 1'000'000), nullptr) << "one millisecond after the end";
+
+  EXPECT_NE(find_covering_window(windows, from_ns), nullptr);
+  EXPECT_EQ(find_covering_window(windows, from_ns - 1'000'000), nullptr) << "one millisecond before the start";
+  EXPECT_EQ(find_covering_window(windows, from_ns - 1), nullptr)
+      << "the millisecond before the start is outside it, whole";
+}
+
+TEST(PlannedStopAnnotation, TheFaultSideOfTheComparisonIsFlooredTheSameWay) {
+  const std::vector<PlannedStopWindow> windows{window("w", 10 * kSec, 20 * kSec)};
+
+  // first_occurred arrives as a double. 20.0009 s lands inside the closing
+  // millisecond of the window; 20.0011 s does not.
+  nlohmann::json inside{{"first_occurred", 20.0009}};
+  nlohmann::json outside{{"first_occurred", 20.0011}};
+  EXPECT_TRUE(annotate_fault_with_planned_stop(inside, windows));
+  EXPECT_FALSE(annotate_fault_with_planned_stop(outside, windows));
+}
+
 // --- what a builtin_interfaces/Time can carry --------------------------------
 
 TEST(PlannedStopRepresentableInstant, AcceptsTheWholeInt32SecondRange) {
@@ -277,7 +368,8 @@ TEST(PlannedStopRepresentableInstant, AcceptsTheWholeInt32SecondRange) {
   EXPECT_TRUE(is_representable_instant(kMaxRepresentableNs));
   EXPECT_TRUE(is_representable_instant(1788698096LL * kSec));
 
-  EXPECT_FALSE(is_representable_instant(kMinRepresentableNs - 1)) << "one nanosecond before the epoch";
+  EXPECT_FALSE(is_representable_instant(kMinRepresentableNs - 1)) << "the epoch itself is not a window bound";
+  EXPECT_FALSE(is_representable_instant(0));
   EXPECT_FALSE(is_representable_instant(kMaxRepresentableNs + 1)) << "one nanosecond past the int32 second limit";
 
   // A window asked for in 2099. Its second count does not fit an int32, so the

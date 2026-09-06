@@ -512,16 +512,11 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
 
 namespace {
 
-int64_t time_msg_to_ns(const builtin_interfaces::msg::Time & t) {
-  return static_cast<int64_t>(t.sec) * 1000000000LL + static_cast<int64_t>(t.nanosec);
-}
-
-builtin_interfaces::msg::Time ns_to_time_msg(int64_t ns) {
-  builtin_interfaces::msg::Time t;
-  t.sec = static_cast<int32_t>(ns / 1000000000LL);
-  t.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
-  return t;
-}
+// time_msg_to_ns / ns_to_time_msg come from fault_msg_conversions.hpp: the
+// conversion has to be floor division for an instant before the epoch, and one
+// copy of that rule is easier to keep right than two.
+using conversions::ns_to_time_msg;
+using conversions::time_msg_to_ns;
 
 faults::PlannedStopWindow window_from_msg(const ros2_medkit_msgs::msg::PlannedStop & msg) {
   faults::PlannedStopWindow w;

@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <limits>
 #include <utility>
 
 namespace ros2_medkit_gateway {
@@ -152,6 +153,16 @@ std::optional<int64_t> parse_iso8601_utc_ns(const std::string & text) {
   if (seconds == static_cast<std::time_t>(-1)) {
     return std::nullopt;
   }
+  // Bounded BEFORE the multiply. int64 nanoseconds run out in April 2262, and
+  // seconds * kNsPerSecond wraps silently past that - a stop declared for the
+  // year 2600 came back as one in 2015, inside the accepted range, and was
+  // stored. Refusing here leaves the representable-instant guard downstream
+  // looking at a real value rather than at wreckage.
+  constexpr int64_t kMaxSecondsInInt64Ns = std::numeric_limits<int64_t>::max() / kNsPerSecond;
+  const auto seconds_i64 = static_cast<int64_t>(seconds);
+  if (seconds_i64 > kMaxSecondsInInt64Ns || seconds_i64 < -kMaxSecondsInInt64Ns) {
+    return std::nullopt;
+  }
   // timegm normalises, so a day that does not exist in that month (31 April)
   // comes back as the first of the next one. Refusing it here keeps the parse
   // total rather than creative.
@@ -159,7 +170,9 @@ std::optional<int64_t> parse_iso8601_utc_ns(const std::string & text) {
     return std::nullopt;
   }
 
-  return static_cast<int64_t>(seconds) * kNsPerSecond + fraction_ns;
+  // Rounded down to the API's resolution here rather than at every reader, so
+  // what is stored, what is compared and what is served are the same number.
+  return floor_to_ms_ns(seconds_i64 * kNsPerSecond + fraction_ns);
 }
 
 int64_t seconds_to_ns(double seconds) {

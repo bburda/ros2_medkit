@@ -721,3 +721,42 @@ TEST(ClassifyFaultFailureTest, UnavailableIsAServerError) {
     EXPECT_EQ(err.params["details"], message);
   }
 }
+
+// =============================================================================
+// nanoseconds <-> builtin_interfaces/Time
+//
+// The gateway sends window bounds to the fault manager through this pair. The
+// API refuses an instant before the epoch long before it gets here, so these
+// cases are about the helper being total rather than about a reachable request:
+// a conversion that can emit nanosec >= 1e9 is one refactor away from doing it.
+// =============================================================================
+
+TEST(TimeMsgConversion, NegativeInstantsStayWellFormed) {
+  using ros2_medkit_gateway::ros2::conversions::ns_to_time_msg;
+  using ros2_medkit_gateway::ros2::conversions::time_msg_to_ns;
+
+  auto t = ns_to_time_msg(-1);
+  EXPECT_EQ(t.sec, -1);
+  EXPECT_EQ(t.nanosec, 999999999u);
+  EXPECT_EQ(time_msg_to_ns(t), -1);
+
+  t = ns_to_time_msg(-1500000000LL);
+  EXPECT_EQ(t.sec, -2);
+  EXPECT_EQ(t.nanosec, 500000000u);
+  EXPECT_EQ(time_msg_to_ns(t), -1500000000LL);
+
+  t = ns_to_time_msg(std::numeric_limits<int64_t>::min());
+  EXPECT_LT(t.nanosec, 1000000000u);
+}
+
+TEST(TimeMsgConversion, PositiveInstantsRoundTrip) {
+  using ros2_medkit_gateway::ros2::conversions::ns_to_time_msg;
+  using ros2_medkit_gateway::ros2::conversions::time_msg_to_ns;
+
+  const int64_t samples[] = {0, 1, 1000000000LL, 1999999999LL, 1788698096000000000LL};
+  for (int64_t ns : samples) {
+    const auto t = ns_to_time_msg(ns);
+    EXPECT_LT(t.nanosec, 1000000000u) << "for " << ns;
+    EXPECT_EQ(time_msg_to_ns(t), ns);
+  }
+}

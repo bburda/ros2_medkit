@@ -14,6 +14,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+
+#include <builtin_interfaces/msg/time.hpp>
 #include <nlohmann/json.hpp>
 
 #include "ros2_medkit_msgs/msg/environment_data.hpp"
@@ -33,6 +38,35 @@ namespace ros2_medkit_gateway::ros2::conversions {
 /// FaultEvent topic directly), and the trigger fault subscriber. Keeping the
 /// helper free standing avoids code duplication while preserving the neutral
 /// FaultManager contract.
+/// builtin_interfaces/Time -> nanoseconds since the Unix epoch.
+inline int64_t time_msg_to_ns(const builtin_interfaces::msg::Time & t) {
+  return static_cast<int64_t>(t.sec) * 1000000000LL + static_cast<int64_t>(t.nanosec);
+}
+
+/// Nanoseconds since the Unix epoch -> builtin_interfaces/Time.
+///
+/// Floor division, not C's truncation towards zero. `nanosec` is UNSIGNED, so
+/// for an instant before the epoch the remainder is negative and casting it
+/// yields nanosec near 4e9 - a message that is not a time at all. -1 ns is
+/// second -1 plus 999999999 ns, and that is what this returns. The seconds
+/// saturate at the int32 field's range rather than wrapping an absurd input
+/// into a plausible-looking instant.
+inline builtin_interfaces::msg::Time ns_to_time_msg(int64_t ns) {
+  constexpr int64_t kNsPerSec = 1000000000LL;
+  int64_t sec = ns / kNsPerSec;
+  int64_t nsec = ns % kNsPerSec;
+  if (nsec < 0) {
+    nsec += kNsPerSec;
+    --sec;
+  }
+
+  builtin_interfaces::msg::Time t;
+  t.sec = static_cast<int32_t>(
+      std::clamp<int64_t>(sec, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max()));
+  t.nanosec = static_cast<uint32_t>(nsec);
+  return t;
+}
+
 nlohmann::json fault_to_json(const ros2_medkit_msgs::msg::Fault & fault);
 
 /// Convert a ros2_medkit_msgs::msg::EnvironmentData to JSON.

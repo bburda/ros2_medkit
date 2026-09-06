@@ -25,6 +25,25 @@
 namespace ros2_medkit_gateway {
 namespace faults {
 
+/// The resolution the planned-stop API works at, end to end: the parser rounds
+/// down to it, storage keeps that value, responses return it unchanged (so a GET
+/// equals the POST that made it), and the covering test floors both sides to it.
+///
+/// One millisecond rather than one nanosecond because an operator declares a
+/// stop at minute or second precision, and the REST fault item carries
+/// `first_occurred` as a double whose resolution at today's epoch is about a
+/// quarter of a microsecond. A boundary defined more finely than the data can
+/// express is a boundary nobody can rely on.
+constexpr int64_t kNsPerMillisecond = 1000000;
+
+/// Round @p ns DOWN to a whole millisecond. A true floor, not a truncation: it
+/// must not round towards zero for a negative instant, or the boundary would sit
+/// on the wrong side of it.
+inline int64_t floor_to_ms_ns(int64_t ns) {
+  const int64_t remainder = ns % kNsPerMillisecond;
+  return remainder < 0 ? ns - remainder - kNsPerMillisecond : ns - remainder;
+}
+
 /// A window of wall-clock time during which faults are expected, as the gateway
 /// holds it.
 ///
@@ -40,11 +59,13 @@ struct PlannedStopWindow {
   int64_t declared_at_ns{0};
   bool ended_early{false};
 
-  /// Whether @p when_ns falls inside the window. CLOSED at both ends, matching
-  /// PlannedStopWindow::covers in the fault manager: a fault reported at the
-  /// instant a window opens or closes must read the same on both sides.
+  /// Whether @p when_ns falls inside the window. CLOSED at both ends, and
+  /// compared at MILLISECOND resolution on both sides (see kNsPerMillisecond):
+  /// a fault reported anywhere inside the millisecond a window opens or closes
+  /// is inside the window.
   bool covers(int64_t when_ns) const {
-    return when_ns >= from_ns && when_ns <= to_ns;
+    const int64_t when_ms = floor_to_ms_ns(when_ns);
+    return when_ms >= floor_to_ms_ns(from_ns) && when_ms <= floor_to_ms_ns(to_ns);
   }
 };
 
@@ -76,12 +97,18 @@ int64_t seconds_to_ns(double seconds);
 
 /// The range of instants a window can actually be stored at.
 ///
-/// `builtin_interfaces/Time` carries its seconds in an int32, so the
-/// representable range runs from the Unix epoch to January 2038. An instant
-/// outside it must be REFUSED rather than converted: the narrowing wraps, and a
-/// window asked for in 2099 comes back with a negative end, covering nothing,
-/// while the operator is told it was accepted.
-constexpr int64_t kMinRepresentableNs = 0;
+/// The upper bound is `builtin_interfaces/Time`, whose seconds are an int32, so
+/// the range ends in January 2038. An instant past it must be REFUSED rather
+/// than converted: the narrowing wraps, and a window asked for in 2099 comes
+/// back with a negative end, covering nothing, while the operator is told it was
+/// accepted.
+///
+/// The lower bound is one millisecond after the Unix epoch, not the epoch
+/// itself. Zero is what an omitted or unset `builtin_interfaces/Time` reads as,
+/// and a sentinel that is also a legal value is two bugs waiting: a window
+/// declared to start at the epoch would be indistinguishable from one whose
+/// start nobody set.
+constexpr int64_t kMinRepresentableNs = kNsPerMillisecond;
 constexpr int64_t kMaxRepresentableNs = static_cast<int64_t>(2147483647) * 1000000000LL + 999999999LL;
 
 /// Whether @p ns can be carried by a builtin_interfaces/Time. Written as a

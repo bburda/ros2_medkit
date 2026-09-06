@@ -1664,20 +1664,9 @@ void FaultManagerNode::handle_list_rosbags(
 
 namespace {
 
-/// builtin_interfaces/Time -> nanoseconds since the Unix epoch.
-int64_t time_msg_to_ns(const builtin_interfaces::msg::Time & t) {
-  return static_cast<int64_t>(t.sec) * 1000000000LL + static_cast<int64_t>(t.nanosec);
-}
-
-/// nanoseconds since the Unix epoch -> builtin_interfaces/Time.
-builtin_interfaces::msg::Time ns_to_time_msg(int64_t ns) {
-  builtin_interfaces::msg::Time t;
-  const int64_t sec = ns / 1000000000LL;
-  const int64_t nsec = ns % 1000000000LL;
-  t.sec = static_cast<int32_t>(sec);
-  t.nanosec = static_cast<uint32_t>(nsec);
-  return t;
-}
+// time_msg_to_ns / ns_to_time_msg live in time_utils.hpp: the conversion has to
+// be floor division for an instant before the epoch, and one copy of that rule
+// is easier to keep right than two.
 
 ros2_medkit_msgs::msg::PlannedStop window_to_msg(const PlannedStopWindow & w) {
   ros2_medkit_msgs::msg::PlannedStop msg;

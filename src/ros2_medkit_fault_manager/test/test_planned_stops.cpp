@@ -32,6 +32,7 @@
 
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
 #include "ros2_medkit_fault_manager/sqlite_fault_storage.hpp"
+#include "ros2_medkit_fault_manager/time_utils.hpp"
 
 using ros2_medkit_fault_manager::clamp_planned_stop_windows;
 using ros2_medkit_fault_manager::EndPlannedStopOutcome;
@@ -334,6 +335,47 @@ TEST_F(SqlitePlannedStopTest, OpeningADatabaseWithoutThePlannedStopsTableAddsIt)
   EXPECT_TRUE(reopened.list_planned_stops().empty());
   EXPECT_TRUE(reopened.declare_planned_stop(make_window("post", 3 * kSec, 4 * kSec, 3 * kSec)));
   EXPECT_TRUE(reopened.get_planned_stop("post").has_value());
+}
+
+// --- nanoseconds <-> builtin_interfaces/Time ---------------------------------
+
+TEST(TimeMsgConversion, NegativeInstantsStayWellFormed) {
+  using ros2_medkit_fault_manager::ns_to_time_msg;
+  using ros2_medkit_fault_manager::time_msg_to_ns;
+
+  // builtin_interfaces/Time carries `nanosec` as an UNSIGNED field, so the
+  // conversion has to floor rather than truncate towards zero: -1 ns is one
+  // nanosecond before the epoch, which is second -1 plus 999999999 ns. C's
+  // remainder gives -1 there, and casting that to uint32 produced 4294967295 -
+  // a message no reader can interpret.
+  auto t = ns_to_time_msg(-1);
+  EXPECT_EQ(t.sec, -1);
+  EXPECT_EQ(t.nanosec, 999999999u);
+  EXPECT_LT(t.nanosec, 1000000000u);
+  EXPECT_EQ(time_msg_to_ns(t), -1) << "and the round trip must come back";
+
+  t = ns_to_time_msg(-1500000000LL);
+  EXPECT_EQ(t.sec, -2);
+  EXPECT_EQ(t.nanosec, 500000000u);
+  EXPECT_EQ(time_msg_to_ns(t), -1500000000LL);
+
+  // INT64_MIN cannot be carried by an int32 second field at all. The conversion
+  // must not wrap into a plausible-looking instant; it saturates, and the API
+  // refuses such a value long before it gets here.
+  t = ns_to_time_msg(std::numeric_limits<int64_t>::min());
+  EXPECT_LT(t.nanosec, 1000000000u) << "whatever it saturates to must still be a legal Time";
+}
+
+TEST(TimeMsgConversion, PositiveInstantsRoundTrip) {
+  using ros2_medkit_fault_manager::ns_to_time_msg;
+  using ros2_medkit_fault_manager::time_msg_to_ns;
+
+  const int64_t samples[] = {0, 1, kSec, kSec + 999999999LL, 1788698096LL * kSec};
+  for (int64_t ns : samples) {
+    const auto t = ns_to_time_msg(ns);
+    EXPECT_LT(t.nanosec, 1000000000u) << "for " << ns;
+    EXPECT_EQ(time_msg_to_ns(t), ns);
+  }
 }
 
 // --- The configured bound, swept across its whole declared range ------------
