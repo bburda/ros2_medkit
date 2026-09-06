@@ -514,7 +514,7 @@ class GatewayNode : public rclcpp::Node {
  * `<fqn>_monitor` or `<fqn>2`, and dropping a real node is the worse error.
  *
  * @param node_fqn Fully qualified node name to test ("/ns/node")
- * @param self_fqn The gateway node's own FQN; an empty value matches nothing
+ * @param self_fqn The gateway node's own FQN. An empty value matches nothing
  */
 bool is_own_gateway_node(const std::string & node_fqn, const std::string & self_fqn);
 
@@ -533,7 +533,7 @@ bool is_own_gateway_node(const std::string & node_fqn, const std::string & self_
  *
  * @param apps App vector to filter in place
  * @param peer_routing_table Maps entity_id -> peer_name for remote entities
- * @param self_fqn The gateway node's own FQN; empty disables the self check
+ * @param self_fqn The gateway node's own FQN. Empty disables the self check
  * @return Number of apps removed
  */
 size_t filter_internal_node_apps(std::vector<App> & apps,

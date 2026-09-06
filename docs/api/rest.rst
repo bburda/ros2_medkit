@@ -1509,7 +1509,7 @@ Query and manage faults.
      ``source`` is the only field saying where the numbers came from. For a
      plugin-backed entity that reports its link down, the values are the
      plugin's last known ones and may predate the confirmation by the length of
-     the outage; such entries carry ``connected`` (the payload's link flag,
+     the outage. Such entries carry ``connected`` (the payload's link flag,
      ``false`` for the loss-of-comms case) and ``source_timestamp`` (the
      payload's own timestamp, verbatim) in ``x-medkit``, both only when the
      plugin's payload reports them. ``captured_at`` always dates the capture,

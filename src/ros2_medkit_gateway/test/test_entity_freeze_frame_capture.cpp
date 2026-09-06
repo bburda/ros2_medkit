@@ -574,7 +574,7 @@ TEST_F(EntityFreezeFrameCaptureTest, DisconnectedEntityWithLastKnownValuesIsCapt
   EXPECT_FALSE(*frames[0].connected);
   EXPECT_EQ(frames[0].source_timestamp, 1234567890);
   // Which path read the values. This capture had no DataProvider and went
-  // through the route fallback, so the frame must name that path; the
+  // through the route fallback, so the frame must name that path. The
   // DataProvider flavour of the same case asserts the other constant, which is
   // what stops the two from being swapped at their call sites unnoticed.
   EXPECT_EQ(frames[0].source, EntityFreezeFrameCapture::kSourceXPlcDataRoute);

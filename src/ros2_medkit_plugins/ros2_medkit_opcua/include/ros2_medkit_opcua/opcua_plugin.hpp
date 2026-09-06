@@ -148,14 +148,19 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
 
   // Where one discovery pass reports to, plus the memory that keeps a repeated
   // identical pass quiet. A rescan runs every ``interval_s`` for the life of a
-  // disconnected process, so re-emitting the same scan line, per-server lines,
-  // summary and "no auto-connectable server" WARN each time buries every other
-  // message in the log. ``previous_outcome`` is owned by the caller (the plugin
-  // keeps one across rescans): when it is non-null and the pass reaches the same
-  // outcome as the pass before it, the whole report goes to ``debug`` instead.
-  // The first pass, and every pass whose outcome changed, is always reported at
-  // info/warn. A null ``previous_outcome`` (the startup scan, and tests that do
-  // not care) reports every pass.
+  // disconnected process, so re-emitting the same per-server lines, summary and
+  // "no auto-connectable server" WARN each time buries every other message in
+  // the log. ``previous_outcome`` is owned by the caller (the plugin keeps one
+  // across rescans): when it is non-null and the pass reaches the same outcome
+  // as the pass before it, the whole report goes to ``debug`` instead. The first
+  // pass, and every pass whose outcome changed, is always reported at info/warn.
+  // A null ``previous_outcome`` (tests that do not care) reports every pass.
+  //
+  // The "scanning [subnets]" announcement is NOT part of that report. It is sent
+  // before the sweep runs, because a wide subnet takes minutes and an operator
+  // watching start-up has to see the gateway working rather than hung. It says
+  // what the pass is about to do rather than what it found, so it carries the
+  // same first-pass / rescan levelling on its own.
   struct DiscoveryReporter {
     std::function<void(const std::string &)> info;
     std::function<void(const std::string &)> warn;
@@ -243,15 +248,47 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
                                                                        const OpcuaClient::DeviceInfo & info,
                                                                        const std::string & endpoint_url);
 
-  // Build the ClearFault request for one fault code. ``link_state`` marks a
-  // clear that only reports the OPC-UA link came back (the connect-time
-  // ``PLC_COMMS_LOST`` clear). Such a clear must not cascade: a correlation rule
-  // may name PLC_COMMS_LOST as the root cause of every symptom the outage
-  // produced, and the link returning is not an operator resolving those. An
-  // operator-driven clear (the SOVD DELETE route) leaves the flag off and keeps
-  // the cascade. Static so the wire field is assertable without a fault manager.
+  // Why a ClearFault is being sent. Two properties follow from it and nothing
+  // else does, so the origin travels instead of a pair of loose booleans:
+  //   - whether the correlation cascade must be skipped
+  //     (``clear_skips_correlation``), which goes on the wire, and
+  //   - whether the clear is re-derivable (``clear_is_link_state``), which is
+  //     what the pending buffer may give up first under pressure.
+  enum class ClearOrigin {
+    /// The device reported the condition inactive (an ``event_alarms`` /
+    /// ``auto_alarms`` condition, or a threshold rule going false). A one-shot
+    /// edge nothing will re-send, and a real resolution, so the cascade stands.
+    DeviceAlarm,
+    /// The OPC-UA session came back, so ``PLC_COMMS_LOST`` no longer holds.
+    /// Re-derived on the next reconnect if it is lost, and not an operator
+    /// resolving a root cause, so it must not cascade.
+    LinkState,
+    /// The SOVD per-entity ``DELETE /{entity}/faults/{code}`` route reached
+    /// FaultProvider::clear_fault. An operator scoped to one entity must not
+    /// cascade-clear symptoms reported by apps in other entities, which is the
+    /// same rule the gateway applies on its own (non-plugin) branch of that
+    /// route. One-shot: nothing re-derives an operator's decision.
+    ScopedOperator
+  };
+
+  // Whether this clear must leave the correlation engine's auto_clear_with_root
+  // cascade alone. True for everything except a device-reported clear.
+  static bool clear_skips_correlation(ClearOrigin origin) {
+    return origin != ClearOrigin::DeviceAlarm;
+  }
+
+  // Whether this clear will be re-derived if it is dropped. Only the link-state
+  // clear will: the next reconnect sends it again.
+  static bool clear_is_link_state(ClearOrigin origin) {
+    return origin == ClearOrigin::LinkState;
+  }
+
+  // Build the ClearFault request for one fault code.
+  // ``skip_correlation_auto_clear`` goes on the wire verbatim (see ClearOrigin
+  // for who sets it and why). Static so the wire field is assertable without a
+  // fault manager.
   static ros2_medkit_msgs::srv::ClearFault::Request make_clear_fault_request(const std::string & fault_code,
-                                                                             bool link_state);
+                                                                             bool skip_correlation_auto_clear);
 
   // One entry in the bounded buffer of fault dispatches held while the
   // fault_manager service is unmatched.
@@ -259,28 +296,37 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
     enum class Kind { Report, Clear };
     Kind kind{Kind::Report};
     std::string fault_code;  ///< dedup key for a Clear; diagnostic for a Report
+    /// Clear only: this dispatch is re-derivable (ClearOrigin::LinkState), so
+    /// the buffer may drop it before anything that is not.
+    bool link_state{false};
     std::function<void()> dispatch;
   };
 
   // What ``enqueue_pending_dispatch`` did, so the caller can log it.
   enum class PendingEnqueueOutcome {
-    Buffered,       ///< appended, nothing lost
-    ReplacedClear,  ///< superseded the pending clear for the same fault code
-    EvictedClear,   ///< buffer was full: dropped a pending clear to make room
-    EvictedReport,  ///< buffer was full of reports and a report arrived
-    Refused         ///< buffer was full of reports and a clear arrived
+    Buffered,               ///< appended, nothing lost
+    ReplacedClear,          ///< superseded the pending clear for the same fault code
+    EvictedLinkStateClear,  ///< buffer was full: dropped a re-derivable clear to make room
+    EvictedOldest,          ///< buffer was full with nothing re-derivable in it: dropped the oldest entry
+    Refused                 ///< buffer was full with nothing re-derivable and the incoming clear was
   };
 
   // Enqueue policy for the bounded pending-dispatch buffer.
   //
-  // Reports outrank clears. A report is a one-shot edge from the PLC that
-  // nothing will re-send, while a clear is re-derivable: the link state is
-  // re-observed on the next reconnect. So at most ONE clear per fault code is
-  // ever pending (a newer one moves to the back, keeping report-then-clear
-  // order), a full buffer gives up its oldest pending clear first, and a clear
-  // arriving at a buffer full of reports is refused rather than evicting one.
-  // Without this a flapping link enqueued one connect-time clear per reconnect
-  // attempt and pushed real alarm reports out of the buffer.
+  // Only a link-state clear is re-derivable: the next reconnect sends it again.
+  // Everything else in the buffer is a one-shot edge nothing will re-send - a
+  // report, a device alarm going inactive, an operator's scoped clear - so those
+  // rank together and age out oldest-first, exactly as the buffer behaved before
+  // any of this. A link-state clear is what a full buffer gives up first, and an
+  // incoming one is refused rather than pushing a one-shot dispatch out. At most
+  // ONE clear per fault code is pending at a time (a newer one moves to the
+  // back, so an interleaved report-then-clear still flushes in that order).
+  //
+  // Without the link-state ranking a flapping link enqueued one connect-time
+  // clear per reconnect attempt and pushed real alarm reports out of the buffer.
+  // Without the "only link-state" part, a device alarm's inactive edge was
+  // evicted ahead of an older report and the flush replayed the raise with no
+  // clear behind it, leaving the fault standing while the device said inactive.
   static PendingEnqueueOutcome enqueue_pending_dispatch(std::vector<PendingFaultDispatch> & buffer, size_t max_size,
                                                         PendingFaultDispatch entry);
 
@@ -305,9 +351,9 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   // Report/clear fault via ROS 2 service (private helpers, not the FaultProvider overrides)
   void send_report_fault(const std::string & entity_id, const std::string & fault_code,
                          const std::string & severity_str, const std::string & message);
-  // ``link_state`` marks a clear that reports the OPC-UA link came back rather
-  // than an operator resolving a root cause; see make_clear_fault_request.
-  void send_clear_fault(const std::string & fault_code, bool link_state = false);
+  // ``origin`` says why the clear is being sent, which decides both the wire
+  // flag and how the pending buffer ranks it. See ClearOrigin.
+  void send_clear_fault(const std::string & fault_code, ClearOrigin origin = ClearOrigin::DeviceAlarm);
 
   // Clear PLC_COMMS_LOST after the initial connect in set_context() succeeded.
   // Unconditional on purpose: the fault manager keys faults by fault_code and
@@ -378,6 +424,18 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   // back to. ``previous_outcome`` is the caller's repeat-suppression memory
   // (null to report every pass in full).
   DiscoveryReporter discovery_reporter(std::string * previous_outcome) const;
+
+  // Abort predicate handed to a discovery sweep. Two independent stop signals,
+  // because the two sweeps run at different points in the process lifetime:
+  //   - ``shutdown_requested_`` is set by shutdown(), which the gateway calls
+  //     after its executor returns. That ends a RESCAN sweep, which runs on the
+  //     poll thread long after start-up.
+  //   - ``rclcpp::ok()`` turns false as soon as rclcpp's own SIGINT / SIGTERM
+  //     handler runs. The STARTUP sweep runs inside set_context(), i.e. during
+  //     node construction and before the executor spins, so shutdown() cannot
+  //     be reached while it is in progress and the signal is the only thing
+  //     that can end it.
+  bool discovery_cancelled() const;
 
   // Poll-thread hook bound into PollerConfig::rediscover_endpoint whenever
   // discovery runs without a configured endpoint. Called from the poller's

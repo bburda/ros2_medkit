@@ -37,8 +37,8 @@ CONFIG_DIR=/tmp/discovery_race_config
 # The fallback the plugin keeps when a scan selects nothing (OpcuaClientConfig).
 FALLBACK_ENDPOINT="opc.tcp://localhost:4840"
 # Config-less naming: with no node map the component id is derived from the
-# device. Before any server exists that can only be the fallback endpoint's host;
-# after adoption it is the test server's DI nameplate (Manufacturer "SelfPatch
+# device. Before any server exists that can only be the fallback endpoint's
+# host. After adoption it is the test server's DI nameplate (Manufacturer "SelfPatch
 # Devices" + Model "SPX-1000"), slugified.
 FALLBACK_COMPONENT_ID="opcua-localhost"
 DEVICE_COMPONENT_ID="selfpatch_devices_spx_1000"
@@ -62,8 +62,8 @@ fail() {
   exit 1
 }
 
-# x-plc-status of a named component (the node-map pass pins the id; the
-# config-less pass has to look it up first).
+# x-plc-status of a named component. The node-map pass pins the id, the
+# config-less pass has to look it up first.
 status_json_for() {
   curl -sf "http://localhost:${GATEWAY_PORT}/api/v1/components/$1/x-plc-status" || echo '{}'
 }

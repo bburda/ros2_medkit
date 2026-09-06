@@ -408,8 +408,8 @@ TEST(NetworkDiscoveryRun, IdentifyFailureRecordedAsLead) {
 // run(cancelled): a shutdown must not wait out a whole sweep
 // --------------------------------------------------------------------------- //
 TEST(NetworkDiscoveryRun, CancelStopsTheSweepInsteadOfProbingEveryHost) {
-  // A /24 is 254 probes and a legal /16 is 65k; the caller runs them on the poll
-  // thread a shutdown has to join. With scan_concurrency 1 the sweep is
+  // A /24 is 254 probes and a legal /16 is 65k, and the caller runs them on the
+  // poll thread a shutdown has to join. With scan_concurrency 1 the sweep is
   // sequential, so the probe count is exactly what the cancel predicate allowed.
   std::atomic<int> probes{0};
   std::atomic<bool> stop{false};

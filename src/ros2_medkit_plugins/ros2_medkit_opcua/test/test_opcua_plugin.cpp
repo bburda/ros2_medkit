@@ -822,6 +822,39 @@ TEST(RescanStep, SpacesSweepsFromTheEndOfThePreviousOne) {
   EXPECT_EQ(sweeps, 2);
 }
 
+TEST(RescanStep, AThrowingSweepStillStampsTheCadence) {
+  // A sweep that throws still consumed its minutes. If the stamp were owed only
+  // on the normal path, the next poll iteration would find the cadence due and
+  // start another sweep immediately, so a server that makes the identify throw
+  // would turn the poll thread into a continuous scanner.
+  const auto t0 = std::chrono::steady_clock::time_point{};
+  auto clock_now = t0 + std::chrono::seconds(30);
+  const auto now = [&clock_now]() {
+    return clock_now;
+  };
+  int sweeps = 0;
+  const auto throwing_sweep = [&sweeps, &clock_now]() -> std::optional<std::string> {
+    ++sweeps;
+    clock_now += std::chrono::seconds(120);
+    throw std::runtime_error("identify blew up mid-sweep");
+  };
+
+  auto last_end = t0;
+  EXPECT_THROW(OpcuaPlugin::rescan_step(30, now, &last_end, throwing_sweep), std::runtime_error);
+  EXPECT_EQ(sweeps, 1);
+  EXPECT_EQ(last_end, clock_now) << "a sweep that threw still has to stamp the cadence";
+
+  // Inside the interval after that failed sweep: not due, so no second sweep.
+  clock_now += std::chrono::seconds(29);
+  EXPECT_NO_THROW(OpcuaPlugin::rescan_step(30, now, &last_end, throwing_sweep));
+  EXPECT_EQ(sweeps, 1) << "a failed sweep let the next one start inside the interval";
+
+  // Positive control: one full interval later it is due again (and throws again).
+  clock_now += std::chrono::seconds(1);
+  EXPECT_THROW(OpcuaPlugin::rescan_step(30, now, &last_end, throwing_sweep), std::runtime_error);
+  EXPECT_EQ(sweeps, 2);
+}
+
 TEST(RescanStep, DoesNothingWithoutACadence) {
   const auto t0 = std::chrono::steady_clock::time_point{};
   auto last_end = t0;
@@ -929,6 +962,86 @@ TEST(DiscoverEndpoint, AnUnchangedRescanReportsAtDebugInsteadOfRepeatingItself) 
   EXPECT_GT(info.size(), first_info) << "a changed outcome must be reported at INFO";
 }
 
+TEST(DiscoverEndpoint, APredicateThatFlipsMidSweepEndsThePass) {
+  // What a stop signal does to a sweep in progress. The plugin hands
+  // discover_endpoint a predicate that answers for both stop signals (the
+  // shutdown flag and rclcpp::ok()). Here it flips after a handful of probes,
+  // as either would mid-sweep.
+  std::atomic<int> probes{0};
+  std::atomic<bool> stop{false};
+  auto stopping_scan = [&probes, &stop](const std::string & ip, uint16_t port, int) {
+    if (probes.fetch_add(1) + 1 >= 5) {
+      stop.store(true);
+    }
+    return ip == "192.168.1.10" && port == 4840;  // the PLC IS there to be found
+  };
+
+  OpcuaDiscoveryConfig cfg = rescan_cfg();
+  cfg.scan_concurrency = 1;  // sequential, so the probe count is the predicate's doing
+  const auto chosen = OpcuaPlugin::discover_endpoint(cfg, /*endpoint_configured=*/false, stopping_scan,
+                                                     fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}),
+                                                     silent_reporter(), [&stop]() {
+                                                       return stop.load();
+                                                     });
+
+  EXPECT_FALSE(chosen.has_value()) << "a cancelled pass must not hand back a partial result";
+  EXPECT_LE(probes.load(), 6) << "the sweep ran on after the stop signal";
+
+  // Positive control on the same fakes: without the predicate the very same
+  // sweep visits all 254 hosts and selects the PLC.
+  probes.store(0);
+  stop.store(false);
+  const auto uncancelled = OpcuaPlugin::discover_endpoint(
+      cfg, /*endpoint_configured=*/false,
+      [&probes](const std::string & ip, uint16_t port, int) {
+        probes.fetch_add(1);
+        return ip == "192.168.1.10" && port == 4840;
+      },
+      fake_identify({{"opc.tcp://192.168.1.10:4840", plc_identity()}}), silent_reporter());
+  ASSERT_TRUE(uncancelled.has_value());
+  EXPECT_EQ(*uncancelled, "opc.tcp://192.168.1.10:4840");
+  EXPECT_EQ(probes.load(), 254);
+}
+
+TEST(DiscoverEndpoint, TheScanIsAnnouncedBeforeTheSweepRuns) {
+  // A /16 sweep runs for minutes. If the announcement waited for the report at
+  // the end of the pass, start-up would log nothing while it swept and an
+  // operator would read that as a hung gateway.
+  std::vector<std::string> info;
+  std::vector<std::string> debug;
+  std::string announced_before_first_probe;
+  std::string outcome;
+  OpcuaPlugin::DiscoveryReporter reporter;
+  reporter.info = [&info](const std::string & m) {
+    info.push_back(m);
+  };
+  reporter.warn = kSilent;
+  reporter.debug = [&debug](const std::string & m) {
+    debug.push_back(m);
+  };
+  reporter.previous_outcome = &outcome;
+
+  auto scan_recording_the_log = [&info, &announced_before_first_probe](const std::string &, uint16_t, int) {
+    if (announced_before_first_probe.empty() && !info.empty()) {
+      announced_before_first_probe = info.front();
+    }
+    return false;
+  };
+  OpcuaPlugin::discover_endpoint(rescan_cfg(), /*endpoint_configured=*/false, scan_recording_the_log, fake_identify({}),
+                                 reporter);
+  EXPECT_NE(announced_before_first_probe.find("read-only active scan of"), std::string::npos)
+      << "the sweep started before the operator was told anything (first INFO line: '"
+      << (info.empty() ? std::string("<none>") : info.front()) << "')";
+
+  // On a rescan the announcement drops to DEBUG: the sweep repeats every
+  // interval_s for the life of the outage and must not narrate every pass.
+  const size_t info_after_first = info.size();
+  OpcuaPlugin::discover_endpoint(rescan_cfg(), /*endpoint_configured=*/false, fake_scan({}), fake_identify({}),
+                                 reporter);
+  EXPECT_EQ(info.size(), info_after_first) << "the rescan announced itself at INFO again";
+  EXPECT_FALSE(debug.empty());
+}
+
 TEST(DiscoverEndpoint, WithNoRepeatMemoryEveryPassIsReported) {
   // Positive control for the test above: the same two identical passes with no
   // previous_outcome (the startup scan's own reporter) report in full twice, so
@@ -1001,38 +1114,61 @@ TEST(RederivedComponentIdentity, KeepsTheIdentityWhenNothingChanged) {
 }
 
 // ---------------------------------------------------------------------------
-// ClearFault: a link-state clear does not cascade
+// ClearFault: only a clear the device itself reported may cascade
 // ---------------------------------------------------------------------------
 
-TEST(MakeClearFaultRequest, LinkStateClearSkipsTheCorrelationCascade) {
-  // The connect-time PLC_COMMS_LOST clear says the link came back. A
-  // correlation rule may name PLC_COMMS_LOST as the root cause of every symptom
-  // the outage produced, and clearing those is an operator's call, not a link
-  // event's.
-  const auto link_state = OpcuaPlugin::make_clear_fault_request(kCommsLostFaultCode, /*link_state=*/true);
-  EXPECT_EQ(link_state.fault_code, kCommsLostFaultCode);
-  EXPECT_TRUE(link_state.skip_correlation_auto_clear);
+TEST(ClearOrigin, OnlyADeviceReportedClearKeepsTheCorrelationCascade) {
+  using Origin = OpcuaPlugin::ClearOrigin;
+  // The link coming back is not an operator resolving a root cause, and neither
+  // is an operator scoped to ONE entity: a correlation rule naming
+  // PLC_COMMS_LOST as the root cause would otherwise clear symptom faults
+  // reported by apps in entities that operator cannot even see. The gateway
+  // applies exactly this rule on its own branch of the same DELETE route.
+  EXPECT_TRUE(OpcuaPlugin::clear_skips_correlation(Origin::LinkState));
+  EXPECT_TRUE(OpcuaPlugin::clear_skips_correlation(Origin::ScopedOperator));
+  // Positive control on the same predicate: the device reporting its own
+  // condition inactive IS a resolution at the source, so that clear cascades.
+  // Without this case the rule above would be indistinguishable from a
+  // hardcoded true.
+  EXPECT_FALSE(OpcuaPlugin::clear_skips_correlation(Origin::DeviceAlarm));
 
-  // Positive control on the same request builder: an operator-driven clear (the
-  // SOVD DELETE route) leaves the cascade alone, so the flag above is the
-  // link-state rule and not a hardcoded true.
-  const auto operator_clear = OpcuaPlugin::make_clear_fault_request("PLC_TANK_HIGH", /*link_state=*/false);
-  EXPECT_EQ(operator_clear.fault_code, "PLC_TANK_HIGH");
-  EXPECT_FALSE(operator_clear.skip_correlation_auto_clear);
+  // The buffer's ranking is a different question from the wire flag: only the
+  // link-state clear is re-derivable, the operator's scoped clear is as
+  // one-shot as an alarm report.
+  EXPECT_TRUE(OpcuaPlugin::clear_is_link_state(Origin::LinkState));
+  EXPECT_FALSE(OpcuaPlugin::clear_is_link_state(Origin::ScopedOperator));
+  EXPECT_FALSE(OpcuaPlugin::clear_is_link_state(Origin::DeviceAlarm));
+}
+
+TEST(MakeClearFaultRequest, CarriesTheSkipFlagAndCodeVerbatim) {
+  const auto skipping = OpcuaPlugin::make_clear_fault_request(kCommsLostFaultCode, true);
+  EXPECT_EQ(skipping.fault_code, kCommsLostFaultCode);
+  EXPECT_TRUE(skipping.skip_correlation_auto_clear);
+
+  const auto cascading = OpcuaPlugin::make_clear_fault_request("PLC_TANK_HIGH", false);
+  EXPECT_EQ(cascading.fault_code, "PLC_TANK_HIGH");
+  EXPECT_FALSE(cascading.skip_correlation_auto_clear);
 }
 
 // ---------------------------------------------------------------------------
-// Pending fault dispatch buffer: reports outrank clears
+// Pending fault dispatch buffer: only what is re-derivable may be dropped first
 // ---------------------------------------------------------------------------
 
 namespace {
 
 OpcuaPlugin::PendingFaultDispatch report_entry(const std::string & code) {
-  return {OpcuaPlugin::PendingFaultDispatch::Kind::Report, code, []() {}};
+  return {OpcuaPlugin::PendingFaultDispatch::Kind::Report, code, /*link_state=*/false, []() {}};
 }
 
-OpcuaPlugin::PendingFaultDispatch clear_entry(const std::string & code) {
-  return {OpcuaPlugin::PendingFaultDispatch::Kind::Clear, code, []() {}};
+// A clear the next reconnect will send again (PLC_COMMS_LOST).
+OpcuaPlugin::PendingFaultDispatch link_state_clear_entry(const std::string & code) {
+  return {OpcuaPlugin::PendingFaultDispatch::Kind::Clear, code, /*link_state=*/true, []() {}};
+}
+
+// A clear nothing will re-send: the device reported its condition inactive, or
+// an operator cleared through the scoped SOVD route.
+OpcuaPlugin::PendingFaultDispatch device_clear_entry(const std::string & code) {
+  return {OpcuaPlugin::PendingFaultDispatch::Kind::Clear, code, /*link_state=*/false, []() {}};
 }
 
 size_t count_kind(const std::vector<OpcuaPlugin::PendingFaultDispatch> & buffer,
@@ -1048,14 +1184,15 @@ size_t count_kind(const std::vector<OpcuaPlugin::PendingFaultDispatch> & buffer,
 TEST(EnqueuePendingDispatch, ReconnectClearsNeverEvictABufferedAlarmReport) {
   // A flapping link with no fault_manager: 300 reconnects, each enqueueing a
   // connect-time clear, while ten real alarm reports wait to be flushed. The
-  // reports are one-shot edges from the PLC; the clears are re-derivable.
+  // reports are one-shot edges from the PLC, the clears are re-derivable.
   std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
   for (int i = 0; i < 10; ++i) {
     OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
                                           report_entry("PLC_ALARM_" + std::to_string(i)));
   }
   for (int i = 0; i < 300; ++i) {
-    OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry(kCommsLostFaultCode));
+    OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                          link_state_clear_entry(kCommsLostFaultCode));
   }
 
   EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Report), 10u)
@@ -1067,7 +1204,7 @@ TEST(EnqueuePendingDispatch, ReconnectClearsNeverEvictABufferedAlarmReport) {
   }
 }
 
-TEST(EnqueuePendingDispatch, AFullReportBufferRefusesAClearInsteadOfDroppingAReport) {
+TEST(EnqueuePendingDispatch, AFullOneShotBufferRefusesALinkStateClearInsteadOfDroppingOne) {
   std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
   for (size_t i = 0; i < OpcuaPlugin::kMaxPendingDispatches; ++i) {
     OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
@@ -1076,24 +1213,25 @@ TEST(EnqueuePendingDispatch, AFullReportBufferRefusesAClearInsteadOfDroppingARep
   ASSERT_EQ(buffer.size(), OpcuaPlugin::kMaxPendingDispatches);
 
   EXPECT_EQ(OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
-                                                  clear_entry(kCommsLostFaultCode)),
+                                                  link_state_clear_entry(kCommsLostFaultCode)),
             OpcuaPlugin::PendingEnqueueOutcome::Refused);
   EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Report), OpcuaPlugin::kMaxPendingDispatches);
-  EXPECT_EQ(buffer.front().fault_code, "PLC_ALARM_0") << "the oldest report must survive an incoming clear";
+  EXPECT_EQ(buffer.front().fault_code, "PLC_ALARM_0") << "the oldest report must survive an incoming link-state clear";
 
-  // A report arriving at a full buffer still drops the oldest one: reports do
-  // not outrank each other, so the bound still holds.
+  // A report arriving at the same full buffer still drops the oldest entry:
+  // one-shot dispatches do not outrank each other, so the bound still holds.
   EXPECT_EQ(
       OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, report_entry("PLC_ALARM_NEW")),
-      OpcuaPlugin::PendingEnqueueOutcome::EvictedReport);
+      OpcuaPlugin::PendingEnqueueOutcome::EvictedOldest);
   EXPECT_EQ(buffer.size(), OpcuaPlugin::kMaxPendingDispatches);
   EXPECT_EQ(buffer.front().fault_code, "PLC_ALARM_1");
   EXPECT_EQ(buffer.back().fault_code, "PLC_ALARM_NEW");
 }
 
-TEST(EnqueuePendingDispatch, AFullBufferGivesUpAPendingClearBeforeAReport) {
+TEST(EnqueuePendingDispatch, AFullBufferGivesUpALinkStateClearBeforeAReport) {
   std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
-  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry("PLC_OLD_CLEAR"));
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                        link_state_clear_entry(kCommsLostFaultCode));
   for (size_t i = 1; i < OpcuaPlugin::kMaxPendingDispatches; ++i) {
     OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
                                           report_entry("PLC_ALARM_" + std::to_string(i)));
@@ -1102,18 +1240,55 @@ TEST(EnqueuePendingDispatch, AFullBufferGivesUpAPendingClearBeforeAReport) {
 
   EXPECT_EQ(
       OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, report_entry("PLC_ALARM_NEW")),
-      OpcuaPlugin::PendingEnqueueOutcome::EvictedClear);
+      OpcuaPlugin::PendingEnqueueOutcome::EvictedLinkStateClear);
   EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Clear), 0u);
-  EXPECT_EQ(buffer.front().fault_code, "PLC_ALARM_1") << "the clear went, not the oldest report";
+  EXPECT_EQ(buffer.front().fault_code, "PLC_ALARM_1") << "the re-derivable clear went, not the oldest report";
+}
+
+TEST(EnqueuePendingDispatch, ADeviceAlarmClearIsNotEvictedAheadOfAnOlderReport) {
+  // The device says an alarm went inactive while the fault_manager is
+  // unreachable. That edge is as one-shot as the raise: drop it and the flush
+  // replays the raise with nothing behind it, so the fault stands while the
+  // device reports it clear. Only the link-state clear is re-derivable.
+  std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
+  for (int i = 0; i < 100; ++i) {
+    OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                          report_entry("PLC_ALARM_" + std::to_string(i)));
+  }
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, report_entry("PLC_TANK_HIGH"));
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                        device_clear_entry("PLC_TANK_HIGH"));
+  for (size_t i = buffer.size(); i < OpcuaPlugin::kMaxPendingDispatches; ++i) {
+    OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                          report_entry("PLC_FILLER_" + std::to_string(i)));
+  }
+  ASSERT_EQ(buffer.size(), OpcuaPlugin::kMaxPendingDispatches);
+
+  EXPECT_EQ(
+      OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, report_entry("PLC_ALARM_NEW")),
+      OpcuaPlugin::PendingEnqueueOutcome::EvictedOldest);
+  EXPECT_NE(buffer.front().fault_code, "PLC_ALARM_0") << "the oldest entry is what ages out";
+  const auto device_clear =
+      std::find_if(buffer.begin(), buffer.end(), [](const OpcuaPlugin::PendingFaultDispatch & entry) {
+        return entry.kind == OpcuaPlugin::PendingFaultDispatch::Kind::Clear && entry.fault_code == "PLC_TANK_HIGH";
+      });
+  ASSERT_NE(device_clear, buffer.end()) << "a device alarm's inactive edge was evicted ahead of an older report";
+  // ... and it still flushes after the raise it supersedes.
+  const auto raise = std::find_if(buffer.begin(), buffer.end(), [](const OpcuaPlugin::PendingFaultDispatch & entry) {
+    return entry.kind == OpcuaPlugin::PendingFaultDispatch::Kind::Report && entry.fault_code == "PLC_TANK_HIGH";
+  });
+  ASSERT_NE(raise, buffer.end());
+  EXPECT_LT(raise - buffer.begin(), device_clear - buffer.begin());
 }
 
 TEST(EnqueuePendingDispatch, ARequeuedClearMovesToTheBackSoOrderStillHolds) {
   // Report-then-clear for one code must still flush in that order after the
   // clear is re-enqueued, or the flush would leave the fault standing.
   std::vector<OpcuaPlugin::PendingFaultDispatch> buffer;
-  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry("PLC_FLAP"));
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, link_state_clear_entry("PLC_FLAP"));
   OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, report_entry("PLC_FLAP"));
-  EXPECT_EQ(OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry("PLC_FLAP")),
+  EXPECT_EQ(OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches,
+                                                  link_state_clear_entry("PLC_FLAP")),
             OpcuaPlugin::PendingEnqueueOutcome::ReplacedClear);
 
   ASSERT_EQ(buffer.size(), 2u);
@@ -1121,7 +1296,7 @@ TEST(EnqueuePendingDispatch, ARequeuedClearMovesToTheBackSoOrderStillHolds) {
   EXPECT_EQ(buffer[1].kind, OpcuaPlugin::PendingFaultDispatch::Kind::Clear)
       << "the newest clear must flush after the report it supersedes";
   // Clears for DIFFERENT codes are independent.
-  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, clear_entry("PLC_OTHER"));
+  OpcuaPlugin::enqueue_pending_dispatch(buffer, OpcuaPlugin::kMaxPendingDispatches, device_clear_entry("PLC_OTHER"));
   EXPECT_EQ(count_kind(buffer, OpcuaPlugin::PendingFaultDispatch::Kind::Clear), 2u);
 }
 
@@ -1627,6 +1802,94 @@ nodes:
   // unmatched sink): the buffer was swapped out and dispatched to the server.
   EXPECT_GT(cleared_received.load(std::memory_order_relaxed), 0)
       << "flush_pending_reports never dispatched - swap-vs-push path not covered";
+}
+
+// The SOVD per-entity route DELETE /{entity}/faults/{code} lands on
+// FaultProvider::clear_fault for a plugin-owned entity, which is the branch the
+// gateway takes INSTEAD of its own (where it sets skip_correlation_auto_clear
+// itself). So the flag has to be set here or the documented guarantee - an
+// operator scoped to one entity cannot cascade-clear symptoms reported by apps
+// in other entities - has a hole exactly where a PLC is involved. This drives
+// the real route entry point and reads the field off the wire.
+TEST(OpcuaPluginScopedClear, SovdDeleteSkipsTheCorrelationCascade) {
+  ScopedRclcpp rclcpp_scope;
+  auto node = std::make_shared<rclcpp::Node>("opcua_scoped_clear_flag");
+  auto fault_manager = std::make_shared<rclcpp::Node>("opcua_scoped_clear_faultmgr");
+
+  std::mutex received_mutex;
+  std::vector<ros2_medkit_msgs::srv::ClearFault::Request> received;
+  auto report_srv = fault_manager->create_service<ros2_medkit_msgs::srv::ReportFault>(
+      "/fault_manager/report_fault", [](const std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Request>,
+                                        std::shared_ptr<ros2_medkit_msgs::srv::ReportFault::Response> res) {
+        res->accepted = true;
+      });
+  auto clear_srv = fault_manager->create_service<ros2_medkit_msgs::srv::ClearFault>(
+      "/fault_manager/clear_fault",
+      [&received, &received_mutex](const std::shared_ptr<ros2_medkit_msgs::srv::ClearFault::Request> req,
+                                   std::shared_ptr<ros2_medkit_msgs::srv::ClearFault::Response> res) {
+        {
+          std::lock_guard<std::mutex> lock(received_mutex);
+          received.push_back(*req);
+        }
+        res->success = true;
+      });
+
+  const std::string yaml_path = "/tmp/test_opcua_scoped_clear_nodemap.yaml";
+  {
+    std::ofstream f(yaml_path);
+    f << R"(
+area_id: scoped_plc
+component_id: scoped_runtime
+nodes:
+  - node_id: "ns=2;i=1"
+    entity_id: tank
+    data_name: level
+    data_type: float
+)";
+  }
+
+  OpcuaPlugin plugin;
+  nlohmann::json config;
+  config["node_map_path"] = yaml_path;
+  config["endpoint_url"] = "opc.tcp://127.0.0.1:1";  // nothing listening; the fault sink is the subject
+  config["poll_interval_ms"] = 100;
+  plugin.configure(config);
+
+  RealNodePluginContext ctx(node.get());
+  ctx.entities["tank"] = {SovdEntityType::APP, "tank", "/scoped_plc", "/scoped_plc/scoped_runtime/tank"};
+  plugin.set_context(ctx);
+
+  ScopedExecutorSpin spinner({node, fault_manager});
+  auto probe = node->create_client<ros2_medkit_msgs::srv::ClearFault>("/fault_manager/clear_fault");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!probe->service_is_ready() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_TRUE(probe->service_is_ready()) << "stub ClearFault server never became discoverable";
+
+  // The route's own entry point, not a helper it happens to call.
+  const auto result = plugin.clear_fault("tank", "PLC_TANK_HIGH");
+  ASSERT_TRUE(result.has_value());
+
+  const auto flush_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  bool delivered = false;
+  while (!delivered && std::chrono::steady_clock::now() < flush_deadline) {
+    {
+      std::lock_guard<std::mutex> lock(received_mutex);
+      delivered = !received.empty();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  spinner.stop();
+  plugin.shutdown();
+  std::remove(yaml_path.c_str());
+
+  std::lock_guard<std::mutex> lock(received_mutex);
+  ASSERT_FALSE(received.empty()) << "the scoped DELETE never reached the fault manager";
+  EXPECT_EQ(received.front().fault_code, "PLC_TANK_HIGH");
+  EXPECT_TRUE(received.front().skip_correlation_auto_clear)
+      << "a per-entity DELETE served by the plugin cascade-cleared correlated symptoms";
 }
 
 }  // namespace ros2_medkit_gateway

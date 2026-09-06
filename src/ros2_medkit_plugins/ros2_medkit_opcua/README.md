@@ -604,8 +604,8 @@ plugins.opcua.discovery:
   connect_timeout_ms: 600      # per-port TCP connect timeout
   scan_concurrency: 100        # bounded, polite concurrent connect count
   identify_timeout_ms: 6000    # per GetEndpoints identify
-  # re-scan cadence while disconnected. Omit the key for the built-in 30 s;
-  # set it to 0 to keep discovery on but never re-scan (start-up scan only).
+  # re-scan cadence while disconnected. Omit the key for the built-in 30 s,
+  # or set it to 0 to keep discovery on but never re-scan (start-up scan only).
   interval_s: 30
   anonymous_none_only: true    # only auto-connect None/Anonymous servers
 ```
@@ -613,7 +613,7 @@ plugins.opcua.discovery:
 Environment overrides (Docker / appliance): `OPCUA_DISCOVERY_ENABLED`,
 `OPCUA_DISCOVERY_SUBNETS` (comma-separated CIDRs), `OPCUA_DISCOVERY_INTERVAL_S`.
 Leaving `interval_s` (and `OPCUA_DISCOVERY_INTERVAL_S`) unset means "no cadence
-stated" and takes the 30 s default; an explicit `0` is honoured as written and
+stated" and takes the 30 s default. An explicit `0` is honoured as written and
 turns the recurring sweep off. A negative value is refused with a warning and
 leaves the cadence unset.
 
@@ -656,8 +656,11 @@ Safety / OT posture:
   `interval_s` (default 30 s) for as long as it stays disconnected. Set
   `interval_s: 0` (or `OPCUA_DISCOVERY_INTERVAL_S=0`) to keep discovery on with
   the start-up scan only, or `enabled: false` to switch it off entirely.
-- A sweep is cancelled when the plugin shuts down, so a stop does not have to
-  wait out a subnet the size of a /16.
+- A sweep is cancellable, so a stop does not have to wait out a subnet the size
+  of a /16. The start-up sweep runs while the gateway node is still being
+  constructed, so what ends it is `SIGINT` / `SIGTERM`, which the plugin sees
+  through `rclcpp::ok()`. A re-scan sweep runs on the poll thread and is ended
+  by either that or the plugin's own `shutdown()`.
 - An explicitly configured `endpoint_url` (or `OPCUA_ENDPOINT_URL`) always wins;
   discovery then does nothing, so it never opens a second session on a PLC the
   plugin already polls.
