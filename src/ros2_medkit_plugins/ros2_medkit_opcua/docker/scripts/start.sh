@@ -2,7 +2,20 @@
 # Start OpenPLC + medkit gateway for manual testing.
 # Usage: from the ros2_medkit repo root, run
 #     bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/start.sh
+#
+# MEDKIT_OPCUA_VARIANT=write-capable brings up an image with the OPC-UA write
+# path compiled in. The default, read-only, is what ships.
 set -eo pipefail
+
+VARIANT="${MEDKIT_OPCUA_VARIANT:-read-only}"
+if [ "$VARIANT" = "read-only" ]; then
+    READ_ONLY=ON
+elif [ "$VARIANT" = "write-capable" ]; then
+    READ_ONLY=OFF
+else
+    echo "MEDKIT_OPCUA_VARIANT must be read-only or write-capable (got '$VARIANT')" >&2
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER_DIR="$(dirname "$SCRIPT_DIR")"
@@ -15,9 +28,10 @@ echo "=== Building OpenPLC ==="
 docker build -t openplc-tank "$DOCKER_DIR/openplc" 2>&1 | tail -3
 
 echo ""
-echo "=== Building gateway + OPC-UA plugin ==="
+echo "=== Building gateway + OPC-UA plugin ($VARIANT) ==="
 cd "$REPO_ROOT"
-docker build -f "$DOCKER_DIR/Dockerfile.gateway" -t gateway-opcua . 2>&1 | tail -5
+docker build --build-arg "MEDKIT_OPCUA_READ_ONLY=$READ_ONLY" \
+    -f "$DOCKER_DIR/Dockerfile.gateway" -t gateway-opcua . 2>&1 | tail -5
 
 echo ""
 echo "=== Starting containers ==="

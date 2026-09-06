@@ -125,9 +125,21 @@ jobs:
         run: colcon test-result --verbose
 
   integration:
-    name: Integration (OpenPLC)
+    name: Integration (OpenPLC, ${{ matrix.variant }})
+    # Both write surfaces are exercised against the same real PLC. The
+    # read-only leg is the shipped image: it proves the refusal, its vendor
+    # code, and that the tag on the PLC did not move. The write-capable leg
+    # keeps proving that a write reaches OpenPLC and reads back.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: read-only
+            read_only: 'ON'
+          - variant: write-capable
+            read_only: 'OFF'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -141,6 +153,7 @@ jobs:
       - name: Build gateway + OPC-UA plugin image
         run: |
           docker build \
+            --build-arg MEDKIT_OPCUA_READ_ONLY=${{ matrix.read_only }} \
             -f src/ros2_medkit_plugins/ros2_medkit_opcua/docker/Dockerfile.gateway \
             -t gateway-opcua .
 
@@ -212,6 +225,8 @@ jobs:
           docker logs gateway 2>&1 | tail -10
 
       - name: Run integration tests
+        env:
+          MEDKIT_OPCUA_VARIANT: ${{ matrix.variant }}
         run: bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/run_integration_tests.sh
 
       - name: Dump gateway logs on failure

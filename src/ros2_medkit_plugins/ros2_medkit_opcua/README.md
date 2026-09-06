@@ -891,17 +891,26 @@ checks the opposite property in each build.
 
 The plugin ships a self-contained OpenPLC tank demo in `docker/` that exercises the full stack end-to-end. CI runs this suite on every PR that touches the plugin; it is also runnable locally from any developer laptop.
 
+`MEDKIT_OPCUA_VARIANT` selects the write surface of the image under test and
+the expectations applied to it, so the two cannot drift. CI runs both legs.
+
 ```bash
 cd src/ros2_medkit_plugins/ros2_medkit_opcua/docker
 
-# Start OpenPLC + gateway (builds everything)
+# Start OpenPLC + gateway (builds everything). Default: the read-only image.
 bash scripts/start.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/start.sh
 
 # Manual testing
 curl -s http://localhost:8080/api/v1/apps/tank_process/x-plc-data | jq .
 
-# Automated tests (16 assertions)
+# Automated tests against a running pair
 bash scripts/run_integration_tests.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/run_integration_tests.sh
+
+# Build, start, test and clean up in one go
+bash scripts/test_all.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/test_all.sh
 
 # Stop
 bash scripts/stop.sh
@@ -909,14 +918,16 @@ bash scripts/stop.sh
 
 ### Test Coverage
 
-| Category | Tests | What it validates |
-|----------|-------|-------------------|
-| Entity discovery | 5 | Areas, components, apps from PLC node map |
-| PLC connection | 2 | OPC-UA connected, zero errors |
-| Live data | 3 | Tank level, temperature, pressure have values |
-| Write control | 2 | Pump speed, valve position written to PLC |
-| Error handling | 3 | Unknown entity, unknown operation, invalid JSON |
-| **Total** | **16** | |
+| Category | read-only | write-capable | What it validates |
+|----------|-----------|---------------|-------------------|
+| Entity discovery | 5 | 5 | Areas, components, apps from PLC node map |
+| PLC connection | 2 | 2 | OPC-UA connected, zero errors |
+| Live data | 3 | 3 | Tank level, temperature, pressure have values |
+| Advertised write surface | 2 | 2 | x-plc-operations capability and the set_* operation, absent / present |
+| Write control | 6 | 3 | read-only: the vendor route 404s, the SOVD write is refused with the vendor code and a message naming the build property, and both tags read back unchanged on the PLC. write-capable: pump speed and valve position written, pump speed read back |
+| Error handling | 3 | 3 | Unknown entity, unknown operation, invalid JSON |
+| SOVD /data | 2 | 2 | The standard data collection serves the same points |
+| **Total** | **23** | **20** | |
 
 ## Security
 

@@ -3,7 +3,22 @@
 # assertions against the OpenPLC tank demo, then clean up.
 # Usage: from the ros2_medkit repo root, run
 #     bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/test_all.sh
+#
+# MEDKIT_OPCUA_VARIANT selects the write surface of the image under test
+# (read-only, the default and what ships, or write-capable). It drives both the
+# image build and the expectations the suite applies, so the two cannot drift.
 set -eo pipefail
+
+VARIANT="${MEDKIT_OPCUA_VARIANT:-read-only}"
+if [ "$VARIANT" = "read-only" ]; then
+    READ_ONLY=ON
+elif [ "$VARIANT" = "write-capable" ]; then
+    READ_ONLY=OFF
+else
+    echo "MEDKIT_OPCUA_VARIANT must be read-only or write-capable (got '$VARIANT')" >&2
+    exit 2
+fi
+export MEDKIT_OPCUA_VARIANT="$VARIANT"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER_DIR="$(dirname "$SCRIPT_DIR")"
@@ -27,9 +42,10 @@ echo -e "${YELLOW}Step 1: Build OpenPLC container${NC}"
 docker build -t openplc-tank "$DOCKER_DIR/openplc" 2>&1 | tail -3
 
 # 2. Build gateway image (includes ros2_medkit_opcua plugin)
-echo -e "\n${YELLOW}Step 2: Build gateway + OPC-UA plugin image${NC}"
+echo -e "\n${YELLOW}Step 2: Build gateway + OPC-UA plugin image (${VARIANT})${NC}"
 cd "$REPO_ROOT"
-docker build -f "$DOCKER_DIR/Dockerfile.gateway" -t gateway-opcua . 2>&1 | tail -5
+docker build --build-arg "MEDKIT_OPCUA_READ_ONLY=$READ_ONLY" \
+    -f "$DOCKER_DIR/Dockerfile.gateway" -t gateway-opcua . 2>&1 | tail -5
 
 # 3. Start containers on isolated network
 echo -e "\n${YELLOW}Step 3: Start containers${NC}"
