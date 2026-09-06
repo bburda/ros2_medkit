@@ -290,7 +290,13 @@ TEST_F(OpcuaPluginTest, ReadDataReturnsValue) {
   EXPECT_EQ(result->content["id"], "level");
   EXPECT_EQ(result->content["unit"], "mm");
   EXPECT_EQ(result->content["data_type"], "float");
+#if MEDKIT_OPCUA_READ_ONLY
+  // The fixture map says writable: true. A read-only build ignores that, and
+  // the value it reports has to match what it will actually do.
+  EXPECT_EQ(result->content["writable"], false);
+#else
   EXPECT_EQ(result->content["writable"], true);
+#endif
 }
 
 TEST_F(OpcuaPluginTest, ReadDataNotFound) {
@@ -299,6 +305,35 @@ TEST_F(OpcuaPluginTest, ReadDataNotFound) {
   EXPECT_EQ(result.error().code, DataProviderError::ResourceNotFound);
 }
 
+#if MEDKIT_OPCUA_READ_ONLY
+// A read-only build refuses every write before it looks anything up, so the
+// point being writable, read-only or absent, and the body being well formed or
+// not, all reach the same answer: 403 and a message naming the build property.
+TEST_F(OpcuaPluginTest, WriteDataRefusedOnAReadOnlyBuild) {
+  const std::vector<std::string> resources{"level", "pressure", "nonexistent"};
+  const std::vector<nlohmann::json> bodies{nlohmann::json{{"value", 5.0}}, nlohmann::json{{"not_value", 42}},
+                                           nlohmann::json::object()};
+  for (const auto & resource : resources) {
+    for (const auto & body : bodies) {
+      auto result = plugin_.write_data("tank", resource, body);
+      ASSERT_FALSE(result.has_value()) << resource << " / " << body.dump();
+      EXPECT_EQ(result.error().code, DataProviderError::ReadOnly);
+      EXPECT_EQ(result.error().http_status, 403);
+      EXPECT_NE(result.error().message.find("MEDKIT_OPCUA_READ_ONLY"), std::string::npos)
+          << "the refusal must name the build property, got: " << result.error().message;
+    }
+  }
+}
+
+// The refusal is not entity-scoped either: an entity this plugin does not own
+// is refused the same way rather than answering 404, which would suggest some
+// other entity could be written.
+TEST_F(OpcuaPluginTest, WriteDataRefusedForUnknownEntityOnAReadOnlyBuild) {
+  auto result = plugin_.write_data("nonexistent", "level", nlohmann::json{{"value", 5.0}});
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 403);
+}
+#else
 TEST_F(OpcuaPluginTest, WriteDataReadOnly) {
   nlohmann::json body = {{"value", 5.0}};
   auto result = plugin_.write_data("tank", "pressure", body);
@@ -313,6 +348,7 @@ TEST_F(OpcuaPluginTest, WriteDataMissingValue) {
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, DataProviderError::InvalidValue);
 }
+#endif
 
 // has_data gates PluginManager::get_data_provider_for_entity (and, through
 // it, the gateway's `data` capability advertisement) at entity granularity -
@@ -334,6 +370,15 @@ TEST_F(OpcuaPluginTest, HasDataFalseForUnknownEntity) {
 
 // -- OperationProvider tests --
 
+#if MEDKIT_OPCUA_READ_ONLY
+// The tree must not advertise what the box cannot do: with no writable point
+// there is no set_* operation to offer, even though the map asks for one.
+TEST_F(OpcuaPluginTest, ListOperationsOffersNoWriteOnAReadOnlyBuild) {
+  auto result = plugin_.list_operations("tank");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->items.empty());
+}
+#else
 TEST_F(OpcuaPluginTest, ListOperationsOnlyWritable) {
   auto result = plugin_.list_operations("tank");
   ASSERT_TRUE(result.has_value());
@@ -341,6 +386,7 @@ TEST_F(OpcuaPluginTest, ListOperationsOnlyWritable) {
   EXPECT_EQ(result->items.size(), 1u);
   EXPECT_EQ(result->items[0].id, "set_level");
 }
+#endif
 
 TEST_F(OpcuaPluginTest, ListOperationsEntityNotFound) {
   auto result = plugin_.list_operations("nonexistent");
@@ -366,6 +412,25 @@ TEST_F(OpcuaPluginTest, HasOperationsFalseForUnknownEntity) {
   EXPECT_FALSE(plugin_.has_operations("nonexistent"));
 }
 
+#if MEDKIT_OPCUA_READ_ONLY
+// Nothing routes to the value-write branch on a read-only build, but a client
+// that posts the operation id directly still has to be refused, and refused for
+// the reason that is true.
+TEST_F(OpcuaPluginTest, ExecuteOperationRefusedOnAReadOnlyBuild) {
+  const std::vector<std::string> ops{"set_level", "set_pressure", "set_nonexistent"};
+  const std::vector<nlohmann::json> params_list{nlohmann::json{{"value", 5.0}}, nlohmann::json{{"not_value", 42}}};
+  for (const auto & op : ops) {
+    for (const auto & params : params_list) {
+      auto result = plugin_.execute_operation("tank", op, params);
+      ASSERT_FALSE(result.has_value()) << op << " / " << params.dump();
+      EXPECT_EQ(result.error().code, OperationProviderError::Rejected);
+      EXPECT_EQ(result.error().http_status, 403);
+      EXPECT_NE(result.error().message.find("MEDKIT_OPCUA_READ_ONLY"), std::string::npos)
+          << "the refusal must name the build property, got: " << result.error().message;
+    }
+  }
+}
+#else
 TEST_F(OpcuaPluginTest, ExecuteOperationMissingValue) {
   nlohmann::json params = {{"not_value", 42}};
   auto result = plugin_.execute_operation("tank", "set_level", params);
@@ -379,6 +444,7 @@ TEST_F(OpcuaPluginTest, ExecuteOperationReadOnly) {
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, OperationProviderError::Rejected);
 }
+#endif
 
 // -- auto_alarms fallback entity: has data/operations fitness + introspect
 // -- capability registration --

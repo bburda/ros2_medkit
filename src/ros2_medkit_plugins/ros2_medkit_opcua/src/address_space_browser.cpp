@@ -229,7 +229,14 @@ void AutoBrowser::visit_object(const opcua::NodeId & node, const std::vector<std
       // CurrentWrite bit is set for this session. A failed attribute read (or
       // infer_writable disabled) keeps the safe read-only default; an explicit
       // node_map `nodes:` entry still takes precedence downstream.
+      //
+      // A read-only build has no write path at all, so the inference is not
+      // compiled in and the server's CurrentWrite bit is never consulted: every
+      // discovered point stays read-only whatever infer_writable says. The
+      // operator hears about the ignored setting once, at startup, from
+      // OpcuaPlugin::set_context.
       entry.writable = false;
+#if !MEDKIT_OPCUA_READ_ONLY
       if (config_.infer_writable) {
         const std::optional<bool> writable = source_.read_writable(child.node_id);
         if (writable.has_value()) {
@@ -238,6 +245,7 @@ void AutoBrowser::visit_object(const opcua::NodeId & node, const std::vector<std
         RCLCPP_DEBUG(auto_browse_logger(), "auto_browse: %s (%s) writable=%s", child.node_id.toString().c_str(),
                      display.c_str(), entry.writable ? "true" : (writable.has_value() ? "false" : "unknown"));
       }
+#endif
       local_entries.push_back(std::move(entry));
     }
     // Other node classes cannot reach here - browse_children already

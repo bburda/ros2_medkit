@@ -77,11 +77,6 @@ TEST(OpcuaClientTest, ReadSourceConditionsReportsScanFailureWhenDisconnected) {
   EXPECT_FALSE(scan_ok);
 }
 
-TEST(OpcuaClientTest, WriteWhenDisconnected) {
-  OpcuaClient client;
-  EXPECT_FALSE(client.write_value({1, "SomeNode"}, 42.0));
-}
-
 TEST(OpcuaClientTest, CreateSubscriptionWhenDisconnected) {
   OpcuaClient client;
   auto id = client.create_subscription(500.0, [](const std::string &, const OpcuaValue &) {});
@@ -92,6 +87,16 @@ TEST(OpcuaClientTest, RemoveSubscriptionsWhenEmpty) {
   OpcuaClient client;
   // Should not crash
   client.remove_subscriptions();
+}
+
+#if !MEDKIT_OPCUA_READ_ONLY
+// OpcuaClient::write_value exists only in a write-capable build
+// (-DMEDKIT_OPCUA_READ_ONLY=OFF). A read-only build has no declaration for
+// these three to call, which is the source-level half of the property
+// test_opcua_build_variant asserts on the built object.
+TEST(OpcuaClientTest, WriteWhenDisconnected) {
+  OpcuaClient client;
+  EXPECT_FALSE(client.write_value({1, "SomeNode"}, 42.0));
 }
 
 TEST(OpcuaClientTest, WriteValueReturnsNotConnected) {
@@ -109,6 +114,7 @@ TEST(OpcuaClientTest, WriteValueWithTypeHintDisconnected) {
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, OpcuaClient::WriteError::NotConnected);
 }
+#endif  // !MEDKIT_OPCUA_READ_ONLY
 
 // ---------------------------------------------------------------------------
 // Issue #389: OPC-UA client security config parsing (pure helpers, no server).

@@ -196,6 +196,9 @@ opcua::ByteString read_file_bytes(const std::string & path) {
   return opcua::ByteString(std::string_view(data));
 }
 
+#if !MEDKIT_OPCUA_READ_ONLY
+// Only the value-write path builds an outgoing Variant; a read-only build
+// decodes incoming ones and never encodes one.
 opcua::Variant value_to_variant(const OpcuaValue & val) {
   return std::visit(
       [](auto && v) -> opcua::Variant {
@@ -218,6 +221,7 @@ opcua::Variant value_to_variant(const OpcuaValue & val) {
       },
       val);
 }
+#endif  // !MEDKIT_OPCUA_READ_ONLY
 
 }  // namespace
 
@@ -812,6 +816,10 @@ std::vector<ReadResult> OpcuaClient::read_values(const std::vector<opcua::NodeId
   return results;
 }
 
+#if !MEDKIT_OPCUA_READ_ONLY
+// The whole value-write path, compiled in only by -DMEDKIT_OPCUA_READ_ONLY=OFF.
+// The read-only build emits none of it, so the object carries no symbol that
+// can reach an OPC-UA Write service call.
 tl::expected<void, OpcuaClient::WriteErrorInfo>
 OpcuaClient::write_value(const opcua::NodeId & node_id, const OpcuaValue & value, const std::string & data_type_hint) {
   std::lock_guard<std::mutex> lock(impl_->client_mutex);
@@ -987,6 +995,7 @@ OpcuaClient::write_value(const opcua::NodeId & node_id, const OpcuaValue & value
     return tl::make_unexpected(WriteErrorInfo{WriteError::TransportError, e.what()});
   }
 }
+#endif  // !MEDKIT_OPCUA_READ_ONLY
 
 uint32_t OpcuaClient::create_subscription(double publish_interval_ms, DataChangeCallback callback) {
   std::lock_guard<std::mutex> lock(impl_->client_mutex);

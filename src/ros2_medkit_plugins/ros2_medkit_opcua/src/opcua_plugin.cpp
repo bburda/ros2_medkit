@@ -94,6 +94,15 @@ UserAuthMode require_user_auth_mode(const std::string & value) {
   return parsed;
 }
 
+#if MEDKIT_OPCUA_READ_ONLY
+/// One sentence for every refusal on the value-write path. It names the build
+/// property rather than a permission, because that is the difference an
+/// operator reading the HTTP body needs: no credential and no configuration
+/// change makes this binary write to a controller.
+constexpr const char * kReadOnlyBuildRefusal =
+    "This OPC UA plugin was built read-only (MEDKIT_OPCUA_READ_ONLY=ON) and contains no controller write path; "
+    "rebuild with -DMEDKIT_OPCUA_READ_ONLY=OFF for a write-capable plugin";
+#else
 /// Parse a JSON "value" field, coerce to the node's declared data_type, and
 /// validate against the optional min/max range. Shared by handle_plc_operations,
 /// DataProvider::write_data, and OperationProvider::execute_operation to keep
@@ -133,6 +142,7 @@ tl::expected<OpcuaValue, std::string> parse_coerce_validate(const nlohmann::json
 
   return val;
 }
+#endif  // MEDKIT_OPCUA_READ_ONLY
 
 bool is_valid_path_segment(const std::string & s) {
   if (s.empty() || s.size() > 256) {
@@ -582,6 +592,19 @@ void OpcuaPlugin::set_context(PluginContext & context) {
 
   log_security_profile();
 
+#if MEDKIT_OPCUA_READ_ONLY
+  // One line, once, when the operator asked the address-space walk to take its
+  // writability from the server's CurrentWrite bit. The inference is not in
+  // this binary, so the setting has no effect and saying so at startup beats
+  // leaving someone to wonder why every discovered point reads back read-only.
+  if (node_map_.auto_browse_config().enabled && node_map_.auto_browse_config().infer_writable) {
+    log_warn(
+        "auto_browse infer_writable is ignored: this plugin was built with MEDKIT_OPCUA_READ_ONLY=ON and carries "
+        "no write path, so every discovered data point stays read-only. Rebuild with "
+        "-DMEDKIT_OPCUA_READ_ONLY=OFF for a write-capable plugin.");
+  }
+#endif
+
   const bool connected = client_->connect(client_config_);
   if (connected) {
     log_info("Connected to OPC-UA server: " + client_config_.endpoint_url);
@@ -675,10 +698,12 @@ std::vector<GatewayPlugin::PluginRoute> OpcuaPlugin::get_routes() {
        [this](const PluginRequest & req, PluginResponse & res) {
          handle_plc_data_single(req, res);
        }},
+#if !MEDKIT_OPCUA_READ_ONLY
       {"POST", R"(apps/([^/]+)/x-plc-operations/([^/]+))",
        [this](const PluginRequest & req, PluginResponse & res) {
          handle_plc_operations(req, res);
        }},
+#endif
       {"GET", R"(components/([^/]+)/x-plc-status)",
        [this](const PluginRequest & req, PluginResponse & res) {
          handle_plc_status(req, res);
@@ -798,9 +823,11 @@ IntrospectionResult OpcuaPlugin::introspect(const IntrospectionInput & /*input*/
       if (!def.data_names.empty()) {
         ctx_->register_entity_capability(def.id, "x-plc-data");
       }
+#if !MEDKIT_OPCUA_READ_ONLY
       if (!def.writable_names.empty()) {
         ctx_->register_entity_capability(def.id, "x-plc-operations");
       }
+#endif
     }
   }
 
@@ -887,6 +914,7 @@ void OpcuaPlugin::handle_plc_data_single(const PluginRequest & req, PluginRespon
   res.send_json(j);
 }
 
+#if !MEDKIT_OPCUA_READ_ONLY
 void OpcuaPlugin::handle_plc_operations(const PluginRequest & req, PluginResponse & res) {
   if (!ctx_ || !poller_ || shutdown_requested_.load()) {
     res.send_error(503, ERR_SERVICE_UNAVAILABLE, "OPC-UA plugin not initialized");
@@ -967,6 +995,7 @@ void OpcuaPlugin::handle_plc_operations(const PluginRequest & req, PluginRespons
 
   res.send_json(response);
 }
+#endif  // !MEDKIT_OPCUA_READ_ONLY
 
 void OpcuaPlugin::handle_plc_status(const PluginRequest & req, PluginResponse & res) {
   if (!ctx_ || !poller_ || shutdown_requested_.load()) {
@@ -1678,6 +1707,16 @@ tl::expected<dto::DataValue, DataProviderErrorInfo> OpcuaPlugin::read_data(const
 tl::expected<dto::DataWriteResult, DataProviderErrorInfo> OpcuaPlugin::write_data(const std::string & entity_id,
                                                                                   const std::string & resource_name,
                                                                                   const nlohmann::json & value) {
+#if MEDKIT_OPCUA_READ_ONLY
+  // First statement in the function: the refusal precedes every lookup, so no
+  // request reaches the OPC-UA client, and 403 says the server understood the
+  // request and will not carry it out. The gateway renders provider errors as
+  // the x-medkit-plugin-error vendor code with this message verbatim.
+  (void)entity_id;
+  (void)resource_name;
+  (void)value;
+  return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::ReadOnly, kReadOnlyBuildRefusal, 403});
+#else
   if (!ctx_ || !poller_) {
     return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::Internal, "plugin not initialized", 503});
   }
@@ -1728,6 +1767,7 @@ tl::expected<dto::DataWriteResult, DataProviderErrorInfo> OpcuaPlugin::write_dat
       },
       *parsed);
   return dto::DataWriteResult{std::move(result)};
+#endif  // MEDKIT_OPCUA_READ_ONLY
 }
 
 bool OpcuaPlugin::has_data(const std::string & entity_id) const {
@@ -1890,6 +1930,15 @@ OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string 
     return dto::OperationExecutionResult{std::move(out)};
   }
 
+#if MEDKIT_OPCUA_READ_ONLY
+  // Everything past the acknowledge / confirm branch above is the value-write
+  // path, and this build does not contain it. Nothing advertised reaches here -
+  // a read-only build marks no point writable, so list_operations emits no
+  // set_* entry - and a request aimed straight at one is refused before any
+  // node lookup or client call. Acknowledging an alarm is a Part 9 condition
+  // interaction, not a value write, and stays available.
+  return tl::make_unexpected(OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, 403});
+#else
   std::string data_name;
   if (operation_name.substr(0, 4) == "set_") {
     data_name = operation_name.substr(4);
@@ -1945,6 +1994,7 @@ OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string 
       },
       *parsed);
   return dto::OperationExecutionResult{std::move(result)};
+#endif  // MEDKIT_OPCUA_READ_ONLY
 }
 
 bool OpcuaPlugin::has_operations(const std::string & entity_id) const {

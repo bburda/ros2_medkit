@@ -392,6 +392,9 @@ bool NodeMap::load(const std::string & yaml_path) {
       }
     }
 
+#if MEDKIT_OPCUA_READ_ONLY
+    size_t writable_ignored = 0;
+#endif
     for (size_t i = 0; has_nodes && i < nodes.size(); ++i) {
       const auto & n = nodes[i];
 
@@ -449,7 +452,17 @@ bool NodeMap::load(const std::string & yaml_path) {
         continue;
       }
 
+#if MEDKIT_OPCUA_READ_ONLY
+      // A read-only build has no write path in the binary, so a map entry
+      // claiming a point is writable would advertise a surface that does not
+      // exist. The request is counted and reported once after the loop.
+      if (n["writable"].as<bool>(false)) {
+        ++writable_ignored;
+      }
+      entry.writable = false;
+#else
       entry.writable = n["writable"].as<bool>(false);
+#endif
       if (n["min_value"]) {
         entry.min_value = n["min_value"].as<double>();
       }
@@ -662,6 +675,17 @@ bool NodeMap::load(const std::string & yaml_path) {
       entity_index_[entry.entity_id].push_back(idx);
       entries_.push_back(std::move(entry));
     }
+
+#if MEDKIT_OPCUA_READ_ONLY
+    if (writable_ignored > 0) {
+      RCLCPP_WARN(rclcpp::get_logger("opcua.node_map"),
+                  "%zu node map entries request writable: true - ignored, every point stays "
+                  "read-only. This plugin was built with MEDKIT_OPCUA_READ_ONLY=ON and carries "
+                  "no write path; rebuild with -DMEDKIT_OPCUA_READ_ONLY=OFF for a write-capable "
+                  "plugin.",
+                  writable_ignored);
+    }
+#endif
 
     // Issue #386: native AlarmConditionType event subscriptions. Loaded from
     // top-level ``event_alarms:`` (sibling of ``nodes:``). Each entry must

@@ -69,6 +69,14 @@ namespace ros2_medkit_gateway {
 ///   GET  /apps/{id}/x-plc-data/{node}   - Single node value
 ///   POST /apps/{id}/x-plc-operations/{op} - Write value to PLC
 ///   GET  /components/{id}/x-plc-status  - Connection state and stats
+///
+/// Whether a value can be written at all is a property of the build, not of a
+/// setting. ``MEDKIT_OPCUA_READ_ONLY`` defaults to ON: the OPC-UA write path is
+/// then absent from the object, no data point is ever marked writable, neither
+/// the x-plc-operations capability nor its POST route is registered, and
+/// write_data / the value-write half of execute_operation refuse with 403
+/// before reaching the client. ``-DMEDKIT_OPCUA_READ_ONLY=OFF`` builds the
+/// write-capable plugin.
 class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
                     public ros2_medkit_gateway::IntrospectionProvider,
                     public ros2_medkit_gateway::DataProvider,
@@ -146,7 +154,11 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   void handle_plc_data(const ros2_medkit_gateway::PluginRequest & req, ros2_medkit_gateway::PluginResponse & res);
   void handle_plc_data_single(const ros2_medkit_gateway::PluginRequest & req,
                               ros2_medkit_gateway::PluginResponse & res);
+#if !MEDKIT_OPCUA_READ_ONLY
+  /// Route handler for the vendor write endpoint. Declared and registered only
+  /// in a write-capable build; a read-only build serves no such route.
   void handle_plc_operations(const ros2_medkit_gateway::PluginRequest & req, ros2_medkit_gateway::PluginResponse & res);
+#endif
   void handle_plc_status(const ros2_medkit_gateway::PluginRequest & req, ros2_medkit_gateway::PluginResponse & res);
 
   // Fault-detection signal (threshold / status-bit / enum) -> Fault bridge

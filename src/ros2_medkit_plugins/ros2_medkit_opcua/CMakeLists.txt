@@ -94,6 +94,32 @@ foreach(_op62_target open62541pp open62541)
   endif()
 endforeach()
 
+# ---- Read-only build ----
+# Whether this box can change a controller is a property of the binary, not of
+# a configuration file: ON compiles the OPC-UA value-write path out entirely,
+# so no symbol able to put a value on the wire is emitted and no data point can
+# be marked writable. A write-capable build exists for development and is
+# selected explicitly.
+option(MEDKIT_OPCUA_READ_ONLY
+  "Build the OPC-UA plugin without any controller write path" ON)
+if(MEDKIT_OPCUA_READ_ONLY)
+  set(_medkit_opcua_read_only 1)
+  set(_medkit_opcua_variant "read-only")
+else()
+  set(_medkit_opcua_read_only 0)
+  set(_medkit_opcua_variant "write-capable")
+endif()
+message(STATUS "ros2_medkit_opcua: ${_medkit_opcua_variant} build "
+  "(MEDKIT_OPCUA_READ_ONLY=${MEDKIT_OPCUA_READ_ONLY})")
+
+# Directory scope, and placed after the FetchContent block above: the macro
+# guards headers shared by the plugin and every test target, so all of them
+# must compile against one value or the one-definition rule is broken, while
+# open62541pp - added as a subdirectory before this point - must not see it.
+# Always defined to 0 or 1 so `#if MEDKIT_OPCUA_READ_ONLY` cannot silently read
+# as false because of a misspelt macro name.
+add_compile_definitions(MEDKIT_OPCUA_READ_ONLY=${_medkit_opcua_read_only})
+
 # ---- MODULE target: loaded via dlopen at runtime by PluginManager ----
 # Symbols from ros2_medkit_gateway are resolved from the host process at runtime.
 add_library(ros2_medkit_opcua_plugin MODULE
@@ -179,6 +205,23 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
 
   include(ROS2MedkitTestDomain)
+
+  # ---- Build inspection: does the object match the variant it declares? ----
+  # The acceptance for a read-only build is the built object, not a setting, so
+  # this reads the object with nm. It runs in BOTH variants with opposite
+  # expectations: asserting only "no write symbols" would also pass for a
+  # symbol list that matches nothing at all, and the write-capable direction is
+  # what catches that. The .so comes from a generator expression - a hard-coded
+  # build path would let the check pass against a stale file.
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME test_opcua_build_variant
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/inspect_build_variant.py"
+            "$<TARGET_FILE:ros2_medkit_opcua_plugin>"
+            --expect "${_medkit_opcua_variant}")
+  set_tests_properties(test_opcua_build_variant PROPERTIES TIMEOUT 60)
+  # Reads a file with nm; starts no ROS node.
+  medkit_test_needs_no_domain(test_opcua_build_variant)
 
   # Each test connects to a non-existent OPC UA host and waits ~3.8s for the
   # DNS / TCP failure path; with 13 tests in the suite the run requires ~90s.
@@ -455,7 +498,25 @@ if(BUILD_TESTING)
     install(PROGRAMS
       test/integration/gen_test_certs.sh
       test/integration/test_opcua_secured.test.py
+      test/integration/test_opcua_read_only.test.py
       DESTINATION lib/${PROJECT_NAME})
+
+    # ---- Read-only / write-capable behaviour over real HTTP ----------------
+    # The build-inspection test proves the write symbols are gone; this proves
+    # what the running system then does with a node that the fixture server
+    # genuinely permits writing. The variant is passed from CMake so the test
+    # cannot be told at run time which build it is looking at.
+    medkit_add_wrapped_test(test_opcua_read_only
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/test/integration/test_opcua_read_only.test.py"
+              "${CMAKE_BINARY_DIR}/test_alarm_server"
+              "${_medkit_opcua_variant}")
+    # Four gateways, each waiting on an OPC-UA connect, plus a server restart;
+    # the timeout has to exceed the sum of the script's own wait deadlines so a
+    # slow failing run still reaches its own diagnostics.
+    set_tests_properties(test_opcua_read_only PROPERTIES
+      LABELS "integration"
+      TIMEOUT 900)
     # This one boots a real gateway and fault manager, so it needs a domain, and
     # it builds its own command line - hence the generic wrapper rather than an
     # ament test runner.

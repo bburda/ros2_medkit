@@ -174,6 +174,13 @@ class OpcuaClient {
   /// Read multiple values
   std::vector<ReadResult> read_values(const std::vector<opcua::NodeId> & node_ids);
 
+#if !MEDKIT_OPCUA_READ_ONLY
+  /// The value-write surface, present only in a write-capable build
+  /// (``-DMEDKIT_OPCUA_READ_ONLY=OFF``). A read-only build has no declaration
+  /// and no definition, so nothing in the plugin can reach an OPC-UA Write
+  /// service call - see the package README on why that is a build property and
+  /// not a setting.
+
   /// OPC-UA write error classification
   enum class WriteError { NotConnected, TypeMismatch, AccessDenied, NodeNotFound, TransportError };
 
@@ -190,6 +197,7 @@ class OpcuaClient {
   /// @return void on success, WriteErrorInfo on failure with specific error code
   tl::expected<void, WriteErrorInfo> write_value(const opcua::NodeId & node_id, const OpcuaValue & value,
                                                  const std::string & data_type_hint = "");
+#endif
 
   /// The AccessLevel / UserAccessLevel bits of a Variable node, read straight
   /// from the server. ``ok`` is false when not connected or the attribute read
