@@ -65,4 +65,59 @@ bool FaultManager::wait_for_services(std::chrono::duration<double> timeout) {
   return transport_->wait_for_services(timeout);
 }
 
+// ---------------------------------------------------------------------------
+// Planned-stop windows
+// ---------------------------------------------------------------------------
+
+PlannedStopResult FaultManager::declare_planned_stop(int64_t from_ns, int64_t to_ns, const std::string & reason,
+                                                     const std::string & declared_by) {
+  faults::PlannedStopWindow request;
+  request.from_ns = from_ns;
+  request.to_ns = to_ns;
+  request.reason = reason;
+  request.declared_by = declared_by;
+
+  auto result = transport_->declare_planned_stop(request);
+  if (result.success) {
+    planned_stop_cache_.invalidate();
+  }
+  return result;
+}
+
+PlannedStopResult FaultManager::end_planned_stop(const std::string & id) {
+  auto result = transport_->end_planned_stop(id);
+  if (result.success) {
+    planned_stop_cache_.invalidate();
+  }
+  return result;
+}
+
+PlannedStopResult FaultManager::list_planned_stops(bool active_only) {
+  return transport_->list_planned_stops(active_only);
+}
+
+std::vector<faults::PlannedStopWindow> FaultManager::planned_stop_windows(bool force_refresh) {
+  const auto ttl = planned_stop_cache_.last_refresh_failed() ? kPlannedStopFailureBackoff : kPlannedStopCacheTtl;
+  if (force_refresh || planned_stop_cache_.is_stale(ttl)) {
+    // Checked before the call, not instead of it: list_planned_stops blocks for
+    // the transport's whole timeout when the services are absent, and this read
+    // sits on the fault-stream formatting path.
+    auto fetched =
+        transport_->is_available() ? transport_->list_planned_stops(/*active_only=*/false) : PlannedStopResult{};
+    if (fetched.success) {
+      planned_stop_cache_.store(std::move(fetched.stops));
+    } else {
+      // Keep what is known - a fault that briefly loses its flag reads as a
+      // surprise, and a surprise is the one thing an expected fault must not
+      // look like - but stop asking for a while.
+      planned_stop_cache_.note_failed_refresh();
+    }
+  }
+  return planned_stop_cache_.snapshot();
+}
+
+void FaultManager::invalidate_planned_stop_cache() {
+  planned_stop_cache_.invalidate();
+}
+
 }  // namespace ros2_medkit_gateway

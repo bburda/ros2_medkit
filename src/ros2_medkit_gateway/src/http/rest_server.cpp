@@ -29,6 +29,7 @@
 #include "ros2_medkit_gateway/core/http/parameter_error_classification.hpp"
 #include "ros2_medkit_gateway/core/thread_pool_config.hpp"
 #include "ros2_medkit_gateway/dto/fault_triggers.hpp"
+#include "ros2_medkit_gateway/dto/planned_stops.hpp"
 #include "ros2_medkit_gateway/dto/sse_frames.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/detail/status_recorder.hpp"
@@ -188,6 +189,7 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   operation_handlers_ = std::make_unique<handlers::OperationHandlers>(*handler_ctx_);
   config_handlers_ = std::make_unique<handlers::ConfigHandlers>(*handler_ctx_);
   fault_handlers_ = std::make_unique<handlers::FaultHandlers>(*handler_ctx_);
+  planned_stop_handlers_ = std::make_unique<handlers::PlannedStopHandlers>(*handler_ctx_);
   log_handlers_ = std::make_unique<handlers::LogHandlers>(*handler_ctx_);
   auth_handlers_ = std::make_unique<handlers::AuthHandlers>(*handler_ctx_);
   // Documented range 1-3600 s. Clamped rather than refused, and the clamp is
@@ -2239,6 +2241,80 @@ void RESTServer::setup_routes() {
       .errors({503})
       .operation_id("clearAllFaults")
       .query<dto::FaultClearQuery>();
+
+  // === Planned stops ===
+  //
+  // A vendor extension, so the path carries the `/x-medkit-` prefix the
+  // convention reserves for one. The windows themselves live in the fault
+  // manager; these four routes are the operator's side of declaring them, and
+  // the flag they produce shows up on `GET /faults` and `/faults/stream` rather
+  // than here.
+  reg.post<dto::PlannedStopCreateRequest, http::Created<dto::PlannedStop>>(
+         "/x-medkit-planned-stops",
+         [this](http::TypedRequest req, dto::PlannedStopCreateRequest body)
+             -> http::Result<std::pair<http::Created<dto::PlannedStop>, http::ResponseAttachments>> {
+           return planned_stop_handlers_->declare_stop(req, std::move(body));
+         })
+      .tag("PlannedStops")
+      .requires_role(UserRole::OPERATOR)
+      .summary("Declare a planned stop")
+      .description(
+          "Declares a window during which faults are expected. Faults whose current cycle starts inside it are "
+          "reported with `x-medkit.expected` on `GET /faults` and on the fault stream. Nothing else changes: an "
+          "expected fault is still confirmed, healed, cleared, captured and audited exactly as any other, which "
+          "is what keeps the evidence describing the plant that existed. Windows may overlap and may be declared "
+          "after the stop they describe.")
+      .body_example(nlohmann::json{
+          {"from", "2026-09-06T18:00:00Z"}, {"to", "2026-09-06T22:00:00Z"}, {"reason", "line changeover"}})
+      .success_description("Planned stop declared")
+      // 503 when the fault manager cannot be reached - the windows are stored
+      // there, so there is nowhere else to put the declaration.
+      .errors({503})
+      .operation_id("declarePlannedStop");
+
+  reg.get<dto::Collection<dto::PlannedStop>>(
+         "/x-medkit-planned-stops",
+         [this](http::TypedRequest req) -> http::Result<dto::Collection<dto::PlannedStop>> {
+           return planned_stop_handlers_->list_stops(req);
+         })
+      .tag("PlannedStops")
+      .requires_role(UserRole::VIEWER)
+      .summary("List planned stops")
+      .description(
+          "Every declared window, newest declaration first. Ended windows are included by default - they are the "
+          "reason older faults read as expected. In an aggregated deployment this lists only THIS gateway's fault "
+          "manager: each peer keeps its own windows and its own gateway derives the flag for its own faults.")
+      .errors({503})
+      .operation_id("listPlannedStops")
+      .query<dto::PlannedStopListQuery>();
+
+  reg.get<dto::PlannedStop>("/x-medkit-planned-stops/{planned_stop_id}",
+                            [this](http::TypedRequest req) -> http::Result<dto::PlannedStop> {
+                              return planned_stop_handlers_->get_stop(req);
+                            })
+      .tag("PlannedStops")
+      .requires_role(UserRole::VIEWER)
+      .summary("Get a planned stop")
+      .description("The window `x-medkit.planned_stop_id` on a fault names.")
+      .errors({404, 503})
+      .operation_id("getPlannedStop");
+
+  reg.del<dto::PlannedStop>("/x-medkit-planned-stops/{planned_stop_id}",
+                            [this](http::TypedRequest req) -> http::Result<dto::PlannedStop> {
+                              return planned_stop_handlers_->end_stop(req);
+                            })
+      .tag("PlannedStops")
+      .requires_role(UserRole::OPERATOR)
+      .summary("End a planned stop early")
+      .description(
+          "Cuts the window short: `to` moves to the moment of this request and `ended_early` becomes true. Faults "
+          "whose cycle started before that instant stay expected; faults raised after it do not. Answers 200 with "
+          "the ended window rather than 204, because the caller needs to be told where `to` landed. A window "
+          "whose end has already passed answers 400 - when a stop finished is not something a later request gets "
+          "to rewrite.")
+      .response(400, "The window has already ended (x-medkit-planned-stop-ended)")
+      .errors({404, 503})
+      .operation_id("endPlannedStop");
 
   // === Software Updates ===
   //

@@ -17,6 +17,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "ros2_medkit_gateway/core/faults/fault_types.hpp"
 #include "ros2_medkit_gateway/core/managers/fault_manager.hpp"
@@ -130,6 +131,50 @@ class MockFaultServiceTransport : public FaultServiceTransport {
     return r;
   }
 
+  PlannedStopResult declare_planned_stop(const faults::PlannedStopWindow & request) override {
+    last_declare_ = request;
+    ++declare_calls_;
+    PlannedStopResult r;
+    r.success = planned_stop_success_;
+    r.error_message = planned_stop_error_;
+    r.failure = planned_stop_failure_;
+    if (planned_stop_success_) {
+      auto stored = request;
+      stored.id = "declared-1";
+      r.stops.push_back(stored);
+    }
+    return r;
+  }
+
+  PlannedStopResult end_planned_stop(const std::string & id) override {
+    last_end_id_ = id;
+    ++end_calls_;
+    PlannedStopResult r;
+    r.success = planned_stop_success_;
+    r.error_message = planned_stop_error_;
+    r.failure = planned_stop_failure_;
+    if (planned_stop_success_) {
+      faults::PlannedStopWindow ended;
+      ended.id = id;
+      ended.ended_early = true;
+      r.stops.push_back(ended);
+    }
+    return r;
+  }
+
+  PlannedStopResult list_planned_stops(bool active_only) override {
+    last_active_only_ = active_only;
+    ++list_stops_calls_;
+    PlannedStopResult r;
+    r.success = planned_stop_success_;
+    r.error_message = planned_stop_error_;
+    r.failure = planned_stop_failure_;
+    if (planned_stop_success_) {
+      r.stops = planned_stops_;
+    }
+    return r;
+  }
+
   bool wait_for_services(std::chrono::duration<double> timeout) override {
     last_wait_timeout_ = timeout.count();
     ++wait_calls_;
@@ -209,6 +254,18 @@ class MockFaultServiceTransport : public FaultServiceTransport {
 
   bool is_available_ = true;
   mutable int availability_calls_ = 0;
+  // Planned-stop state. Kept beside the fault state so a test can make the
+  // planned-stop half fail without disturbing the rest.
+  faults::PlannedStopWindow last_declare_{};
+  std::string last_end_id_;
+  bool last_active_only_{false};
+  std::vector<faults::PlannedStopWindow> planned_stops_;
+  bool planned_stop_success_{true};
+  std::string planned_stop_error_;
+  FaultFailure planned_stop_failure_{FaultFailure::Declined};
+  int declare_calls_{0};
+  int end_calls_{0};
+  int list_stops_calls_{0};
 };
 
 }  // namespace

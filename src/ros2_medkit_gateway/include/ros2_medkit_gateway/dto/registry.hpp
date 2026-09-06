@@ -36,6 +36,7 @@
 #include "ros2_medkit_gateway/dto/locks.hpp"
 #include "ros2_medkit_gateway/dto/logs.hpp"
 #include "ros2_medkit_gateway/dto/operations.hpp"
+#include "ros2_medkit_gateway/dto/planned_stops.hpp"
 #include "ros2_medkit_gateway/dto/schema_writer.hpp"
 #include "ros2_medkit_gateway/dto/scripts.hpp"
 #include "ros2_medkit_gateway/dto/sse_frames.hpp"
@@ -74,6 +75,8 @@ using AllDtos =
                DataListResult, DataValue,
                // Lock domain DTOs
                Lock, Collection<Lock>, AcquireLockRequest, ExtendLockRequest,
+               // Planned-stop domain DTOs
+               PlannedStop, Collection<PlannedStop>, PlannedStopCreateRequest,
                // Trigger domain DTOs
                Trigger, Collection<Trigger>, TriggerCreateRequest, TriggerUpdateRequest,
                // Cyclic subscription domain DTOs

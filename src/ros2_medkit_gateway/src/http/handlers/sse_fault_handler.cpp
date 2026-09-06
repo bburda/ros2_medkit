@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "ros2_medkit_gateway/http/handlers/sse_fault_handler.hpp"
+#include "ros2_medkit_gateway/core/faults/planned_stop.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -638,7 +639,7 @@ uint64_t SSEFaultHandler::events_received() const {
   return next_event_id_.load(std::memory_order_relaxed) - 1;
 }
 
-std::string SSEFaultHandler::format_sse_event(const QueuedEvent & queued) {
+std::string SSEFaultHandler::format_sse_event(const QueuedEvent & queued) const {
   const auto sanitized_event_type = sanitize_sse_event_type(queued.event.event_type);
 
   // A relayed event is the peer's own payload. It is emitted under THIS
@@ -680,6 +681,24 @@ std::string SSEFaultHandler::format_sse_event(const QueuedEvent & queued) {
   // codes, not payload fields.
   if (queued.entity) {
     json_event["x-medkit"] = {{"entity_type", queued.entity->type}, {"entity_id", queued.entity->id}};
+  }
+
+  // Planned-stop flag. Emitted on every event, entity or no entity, so a stream
+  // consumer sees the same truth as a reader of `GET /faults` - and emitted as
+  // an explicit `false` rather than by omission, because "not expected" and "the
+  // gateway could not tell" are different things to react to. The x-medkit
+  // object is created here when the entity did not resolve, which is why the
+  // two fields it may otherwise carry are optional in the frame's schema.
+  if (auto * fault_mgr = ctx_.node()->get_fault_manager(); fault_mgr != nullptr) {
+    const auto windows = fault_mgr->planned_stop_windows();
+    const auto * covering = faults::window_for_fault(windows, json_event["fault"]);
+    if (!json_event["x-medkit"].is_object()) {
+      json_event["x-medkit"] = nlohmann::json::object();
+    }
+    json_event["x-medkit"]["expected"] = covering != nullptr;
+    if (covering != nullptr) {
+      json_event["x-medkit"]["planned_stop_id"] = covering->id;
+    }
   }
 
   std::ostringstream sse;

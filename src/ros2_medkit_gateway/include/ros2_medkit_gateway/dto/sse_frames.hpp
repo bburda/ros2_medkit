@@ -103,16 +103,26 @@ inline constexpr std::string_view dto_name<TriggerEventFrame> = "TriggerEventFra
 // lexicographically first.
 // -----------------------------------------------------------------------------
 struct FaultStreamXMedkit {
-  std::string entity_type;
-  std::string entity_id;
+  std::optional<std::string> entity_type;
+  std::optional<std::string> entity_id;
+  std::optional<bool> expected;
+  std::optional<std::string> planned_stop_id;
 };
 
 template <>
 inline constexpr auto dto_fields<FaultStreamXMedkit> = std::make_tuple(
-    field("entity_type", &FaultStreamXMedkit::entity_type, "`areas`, `components`, `apps` or `functions`."),
+    field("entity_type", &FaultStreamXMedkit::entity_type,
+          "`areas`, `components`, `apps` or `functions`. Absent when the reporting source resolves to no known "
+          "entity - the object itself is still sent, because it also carries the planned-stop flag."),
     field("entity_id", &FaultStreamXMedkit::entity_id,
           "Entity to address for this fault's rosbag: "
-          "`GET /{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}`."));
+          "`GET /{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}`."),
+    field("expected", &FaultStreamXMedkit::expected,
+          "Whether the fault's current cycle started inside a declared planned-stop window. Sent as an explicit "
+          "`false` rather than omitted, so a consumer can tell \"not expected\" from \"this gateway could not "
+          "say\"."),
+    field("planned_stop_id", &FaultStreamXMedkit::planned_stop_id,
+          "Which window made it expected. Present only when `expected` is true."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultStreamXMedkit> = "FaultStreamXMedkit";
@@ -145,8 +155,8 @@ inline constexpr auto dto_fields<FaultStreamEvent> = std::make_tuple(
           "Event time as seconds since the Unix epoch, with nanosecond precision in the fraction. Note this "
           "is a number, where the subscription and trigger frames send an ISO 8601 string."),
     field("x-medkit", &FaultStreamEvent::x_medkit,
-          "Where to fetch this fault's bulk-data. Absent when the reporting source resolves to no known "
-          "entity."));
+          "Vendor extension: where to fetch this fault's bulk-data, and whether the fault was expected. Absent "
+          "only on a frame relayed from a peer, which carries the peer's own payload verbatim."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultStreamEvent> = "FaultStreamEvent";

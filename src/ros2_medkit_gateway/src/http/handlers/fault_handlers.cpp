@@ -28,6 +28,7 @@
 
 #include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
 #include "ros2_medkit_gateway/core/faults/fault_scope.hpp"
+#include "ros2_medkit_gateway/core/faults/planned_stop.hpp"
 #include "ros2_medkit_gateway/core/http/entity_path_utils.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
@@ -196,6 +197,57 @@ json extract_primary_value(const std::string & message_type, const json & full_d
   return full_data;
 }
 
+/// How the `expected` query parameter narrows a fault list.
+enum class ExpectedFilter : uint8_t { All, OnlyExpected, OnlyUnexpected };
+
+tl::expected<ExpectedFilter, ErrorInfo> read_expected_filter(const std::optional<std::string> & value,
+                                                             json params = json::object()) {
+  if (!value.has_value() || value->empty() || *value == "all") {
+    return ExpectedFilter::All;
+  }
+  if (*value == "true") {
+    return ExpectedFilter::OnlyExpected;
+  }
+  if (*value == "false") {
+    return ExpectedFilter::OnlyUnexpected;
+  }
+  params["parameter"] = "expected";
+  params["value"] = *value;
+  return tl::make_unexpected(
+      make_error(400, ERR_INVALID_PARAMETER, "expected must be one of: true, false, all", std::move(params)));
+}
+
+/// Mark each item with the planned-stop flag, drop what the filter excludes, and
+/// report how many of the survivors were expected.
+///
+/// Runs on the LOCAL items only, before any peer merge: a peer's gateway derives
+/// its own flag from its own fault manager's windows, and this gateway has no
+/// business re-deciding it from windows the peer never saw.
+int64_t apply_planned_stops(json & items, FaultManager & fault_mgr, ExpectedFilter filter) {
+  if (!items.is_array()) {
+    return 0;
+  }
+  const auto windows = fault_mgr.planned_stop_windows();
+
+  json kept = json::array();
+  int64_t expected_count = 0;
+  for (auto & item : items) {
+    const bool expected = faults::annotate_fault_with_planned_stop(item, windows);
+    if (filter == ExpectedFilter::OnlyExpected && !expected) {
+      continue;
+    }
+    if (filter == ExpectedFilter::OnlyUnexpected && expected) {
+      continue;
+    }
+    if (expected) {
+      ++expected_count;
+    }
+    kept.push_back(item);
+  }
+  items = std::move(kept);
+  return expected_count;
+}
+
 /// Wrap a built JSON list payload in a typed FaultListResult envelope.
 dto::FaultListResult wrap_list_result(json payload) {
   dto::FaultListResult out;
@@ -287,8 +339,10 @@ json FaultHandlers::merge_entity_freeze_frames(json env_data,
 // The transport adapter performs ros2_medkit_msgs -> JSON translation; the
 // handler post-processes the intermediate snapshot shape (freeze_frame parse,
 // rosbag bulk_data_uri) using the entity_path it has at request time.
-dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_json, const json & env_data_json,
-                                                          const std::string & entity_path) {
+dto::FaultDetail
+FaultHandlers::build_sovd_fault_response(const json & fault_json, const json & env_data_json,
+                                         const std::string & entity_path,
+                                         const std::vector<faults::PlannedStopWindow> & planned_stops) {
   const std::string fault_code = fault_json.value("fault_code", "");
   const std::string status = fault_json.value("status", "");
   const uint8_t severity = fault_json.value("severity", static_cast<uint8_t>(0));
@@ -424,6 +478,12 @@ dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_jso
   }
   xm.severity_label = severity_to_label(severity);
   xm.status_raw = status;
+  if (const auto * covering = faults::window_for_fault(planned_stops, fault_json)) {
+    xm.expected = true;
+    xm.planned_stop_id = covering->id;
+  } else {
+    xm.expected = false;
+  }
   detail.x_medkit = std::move(xm);
 
   return detail;
@@ -442,6 +502,12 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
     }
     const auto filter = *filter_result;
 
+    auto expected_result = read_expected_filter(q.expected);
+    if (!expected_result) {
+      return tl::make_unexpected(expected_result.error());
+    }
+    const auto expected_filter = *expected_result;
+
     auto fault_mgr = ctx_.node()->get_fault_manager();
     // Empty source_id = no filtering, return all faults
     auto result = fault_mgr->list_faults("", filter.include_pending, filter.include_confirmed, filter.include_cleared,
@@ -453,10 +519,12 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
 
     // Format: items array at top level
     json response = {{"items", result.data["faults"]}};
+    const int64_t expected_count = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
 
     // x-medkit extension for ros2_medkit-specific fields (typed DTO)
     dto::FaultListXMedkit xm;
-    xm.count = result.data.value("count", static_cast<int64_t>(0));
+    xm.count = static_cast<int64_t>(response["items"].size());
+    xm.expected_count = expected_count;
     xm.muted_count = result.data.value("muted_count", static_cast<int64_t>(0));
     xm.cluster_count = result.data.value("cluster_count", static_cast<int64_t>(0));
 
@@ -532,6 +600,22 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
             return tl::make_unexpected(
                 make_plugin_error(result.error().http_status, result.error().message, json{{"entity_id", entity_id}}));
           }
+          // The plugin's records describe faults on the same plant, so they get
+          // the same derivation. Reaching into the returned JSON rather than
+          // asking the plugin keeps the flag a gateway concern: no FaultProvider
+          // has to know that planned stops exist.
+          auto plugin_query = req.query<dto::FaultEntityListQuery>();
+          auto plugin_filter = read_expected_filter(plugin_query.expected, json{{"entity_id", entity_id}});
+          if (!plugin_filter) {
+            return tl::make_unexpected(plugin_filter.error());
+          }
+          if (result->content.is_object() && result->content.contains("items")) {
+            const int64_t plugin_expected =
+                apply_planned_stops(result->content["items"], *ctx_.node()->get_fault_manager(), *plugin_filter);
+            if (result->content["x-medkit"].is_object()) {
+              result->content["x-medkit"]["expected_count"] = plugin_expected;
+            }
+          }
           return std::move(*result);
         } catch (const std::exception & e) {
           RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw for entity '%s': %s", entity_id.c_str(),
@@ -560,6 +644,12 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
       return tl::make_unexpected(filter_result.error());
     }
     const auto filter = *filter_result;
+
+    auto expected_result = read_expected_filter(q.expected, json{{entity_info.id_field, entity_id}});
+    if (!expected_result) {
+      return tl::make_unexpected(expected_result.error());
+    }
+    const auto expected_filter = *expected_result;
 
     // Note: the per-entity query DTO (FaultEntityListQuery) deliberately omits
     // include_muted / include_clusters - the underlying service returns
@@ -592,10 +682,12 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
 
       json filtered_faults = faults::filter_faults_by_sources(result.data["faults"], source_fqns);
       json response = {{"items", filtered_faults}};
+      const int64_t expected_count = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
 
       // x-medkit extension (typed DTO)
       dto::FaultListAggXMedkit xm;
       xm.entity_id = entity_id;
+      xm.expected_count = expected_count;
       const bool is_function = entity_info.type == EntityType::FUNCTION;
       xm.aggregation_level = is_function ? "function" : "component";
       xm.aggregated = true;
@@ -639,9 +731,11 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
 
       json filtered_faults = faults::filter_faults_by_sources(result.data["faults"], app_fqns);
       json response = {{"items", filtered_faults}};
+      const int64_t expected_count = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
 
       dto::FaultListAggXMedkit xm;
       xm.entity_id = entity_id;
+      xm.expected_count = expected_count;
       xm.aggregation_level = "area";
       xm.aggregated = true;
       xm.component_count = static_cast<int64_t>(cache.get_components_for_area(entity_id).size());
@@ -678,10 +772,12 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
 
     json filtered_faults = faults::filter_faults_by_sources(result.data["faults"], app_fqns);
     json response = {{"items", filtered_faults}};
+    const int64_t expected_count = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
 
     // x-medkit extension for ros2_medkit-specific fields (typed DTO)
     dto::FaultListXMedkit xm;
     xm.entity_id = entity_id;
+    xm.expected_count = expected_count;
     xm.source_id = entity_info.namespace_path;
 
     if (result.data.contains("muted_faults")) {
@@ -772,7 +868,8 @@ http::Result<dto::FaultDetailResult> FaultHandlers::get_fault(const http::TypedR
               if (auto * capture = ctx_.node()->get_entity_freeze_frame_capture()) {
                 env_data_json = merge_entity_freeze_frames(std::move(env_data_json), capture->frames_for(fault_code));
               }
-              auto detail = build_sovd_fault_response(owned_fault_json, env_data_json, entity_path_info->entity_path);
+              auto detail = build_sovd_fault_response(owned_fault_json, env_data_json, entity_path_info->entity_path,
+                                                      fault_mgr->planned_stop_windows());
               return wrap_detail_result(dto::JsonWriter<dto::FaultDetail>::write(detail));
             }
           }
@@ -826,7 +923,8 @@ http::Result<dto::FaultDetailResult> FaultHandlers::get_fault(const http::TypedR
     if (auto * capture = ctx_.node()->get_entity_freeze_frame_capture()) {
       env_data_json = merge_entity_freeze_frames(std::move(env_data_json), capture->frames_for(fault_code));
     }
-    auto detail = build_sovd_fault_response(fault_json, env_data_json, entity_path_info->entity_path);
+    auto detail = build_sovd_fault_response(fault_json, env_data_json, entity_path_info->entity_path,
+                                            fault_mgr->planned_stop_windows());
 
     return wrap_detail_result(dto::JsonWriter<dto::FaultDetail>::write(detail));
   } catch (const std::exception & e) {

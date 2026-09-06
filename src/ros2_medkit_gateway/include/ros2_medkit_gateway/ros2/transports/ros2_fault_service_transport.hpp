@@ -23,10 +23,13 @@
 
 #include "ros2_medkit_gateway/core/transports/fault_service_transport.hpp"
 #include "ros2_medkit_msgs/srv/clear_fault.hpp"
+#include "ros2_medkit_msgs/srv/declare_planned_stop.hpp"
+#include "ros2_medkit_msgs/srv/end_planned_stop.hpp"
 #include "ros2_medkit_msgs/srv/get_fault.hpp"
 #include "ros2_medkit_msgs/srv/get_rosbag.hpp"
 #include "ros2_medkit_msgs/srv/get_snapshots.hpp"
 #include "ros2_medkit_msgs/srv/list_faults.hpp"
+#include "ros2_medkit_msgs/srv/list_planned_stops.hpp"
 #include "ros2_medkit_msgs/srv/list_rosbags.hpp"
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
 
@@ -82,6 +85,12 @@ class Ros2FaultServiceTransport : public FaultServiceTransport {
 
   FaultResult list_rosbags(const std::string & entity_fqn) override;
 
+  PlannedStopResult declare_planned_stop(const faults::PlannedStopWindow & request) override;
+
+  PlannedStopResult end_planned_stop(const std::string & id) override;
+
+  PlannedStopResult list_planned_stops(bool active_only) override;
+
   bool wait_for_services(std::chrono::duration<double> timeout) override;
 
   bool is_available() const override;
@@ -105,6 +114,9 @@ class Ros2FaultServiceTransport : public FaultServiceTransport {
   rclcpp::Client<ros2_medkit_msgs::srv::GetSnapshots>::SharedPtr get_snapshots_client_;
   rclcpp::Client<ros2_medkit_msgs::srv::GetRosbag>::SharedPtr get_rosbag_client_;
   rclcpp::Client<ros2_medkit_msgs::srv::ListRosbags>::SharedPtr list_rosbags_client_;
+  rclcpp::Client<ros2_medkit_msgs::srv::DeclarePlannedStop>::SharedPtr declare_planned_stop_client_;
+  rclcpp::Client<ros2_medkit_msgs::srv::EndPlannedStop>::SharedPtr end_planned_stop_client_;
+  rclcpp::Client<ros2_medkit_msgs::srv::ListPlannedStops>::SharedPtr list_planned_stops_client_;
 
   double service_timeout_sec_{5.0};
   std::string fault_manager_base_path_{"/fault_manager"};

@@ -193,6 +193,21 @@ class FakeFaultTransport : public ros2_medkit_gateway::FaultServiceTransport {
   ros2_medkit_gateway::FaultResult list_rosbags(const std::string & /*entity_fqn*/) override {
     return {false, json::object(), "not implemented"};
   }
+  ros2_medkit_gateway::PlannedStopResult
+  declare_planned_stop(const ros2_medkit_gateway::faults::PlannedStopWindow & /*request*/) override {
+    return {};
+  }
+  ros2_medkit_gateway::PlannedStopResult end_planned_stop(const std::string & /*id*/) override {
+    return {};
+  }
+  /// Succeeds with no windows, so a fault list built through this fake carries
+  /// `expected: false` rather than no flag at all - the shape a gateway with a
+  /// reachable fault manager and nothing declared actually serves.
+  ros2_medkit_gateway::PlannedStopResult list_planned_stops(bool /*active_only*/) override {
+    ros2_medkit_gateway::PlannedStopResult r;
+    r.success = true;
+    return r;
+  }
   bool wait_for_services(std::chrono::duration<double> /*timeout*/) override {
     return true;
   }

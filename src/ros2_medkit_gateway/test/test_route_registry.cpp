@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <functional>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -203,8 +204,8 @@ TEST_F(RouteRegistryTest, TypedQueryDeclaresParametersFromDto) {
     }
   }
 
-  // status + include_muted + include_clusters.
-  EXPECT_EQ(query_count, 3u);
+  // status + include_muted + include_clusters + expected.
+  EXPECT_EQ(query_count, 4u);
   ASSERT_NE(status, nullptr);
   EXPECT_EQ((*status)["in"], "query");
   EXPECT_FALSE((*status)["required"].get<bool>());  // optional<std::string> -> not required
@@ -215,11 +216,13 @@ TEST_F(RouteRegistryTest, TypedQueryDeclaresParametersFromDto) {
 }
 
 // @verifies REQ_INTEROP_002
-TEST_F(RouteRegistryTest, PerEntityFaultsQueryAdvertisesStatusOnly) {
+TEST_F(RouteRegistryTest, PerEntityFaultsQueryOmitsTheCorrelationFlags) {
   // The per-entity /faults route uses the narrower FaultEntityListQuery so the
-  // spec advertises exactly what the handler reads: status only. The
-  // correlation flags (include_muted / include_clusters) are global-only, so
-  // they must NOT appear on the per-entity route.
+  // spec advertises exactly what the handler reads. The correlation flags
+  // (include_muted / include_clusters) are global-only, because their metadata
+  // is computed across the whole fault manager and a scoped response carrying it
+  // would leak cross-entity data, so they must NOT appear here. `expected` is
+  // not in that class - the flag is derived per fault - so it does appear.
   seed_get(registry_, "/apps/{app_id}/faults").tag("Faults").query<FaultEntityListQuery>();
 
   auto paths = registry_.to_openapi_paths();
@@ -234,8 +237,8 @@ TEST_F(RouteRegistryTest, PerEntityFaultsQueryAdvertisesStatusOnly) {
     }
   }
 
-  ASSERT_EQ(query_names.size(), 1u);
-  EXPECT_EQ(query_names[0], "status");
+  std::sort(query_names.begin(), query_names.end());
+  EXPECT_EQ(query_names, (std::vector<std::string>{"expected", "status"}));
 }
 
 // =============================================================================

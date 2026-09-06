@@ -20,7 +20,10 @@
 #include <nlohmann/json.hpp>
 #include <string>
 
+#include <vector>
+
 #include "ros2_medkit_gateway/core/faults/fault_types.hpp"
+#include "ros2_medkit_gateway/core/faults/planned_stop.hpp"
 #include "ros2_medkit_gateway/core/transports/fault_service_transport.hpp"
 
 namespace ros2_medkit_gateway {
@@ -93,6 +96,46 @@ class FaultManager {
   /// Get all rosbag files for an entity (batch operation).
   FaultResult list_rosbags(const std::string & entity_fqn);
 
+  /// Declare a planned-stop window. `from_ns` of 0 asks the fault manager for
+  /// its own wall clock, which is the clock the fault timestamps come from.
+  PlannedStopResult declare_planned_stop(int64_t from_ns, int64_t to_ns, const std::string & reason,
+                                         const std::string & declared_by);
+
+  /// Cut a window short. Refused for an unknown id and for one that has ended.
+  PlannedStopResult end_planned_stop(const std::string & id);
+
+  /// The declared windows, straight from the fault manager.
+  PlannedStopResult list_planned_stops(bool active_only = false);
+
+  /// The windows to derive `expected` from, served from a cache the read path
+  /// refreshes at most once per kPlannedStopCacheTtl.
+  ///
+  /// Never fails and never blocks longer than one transport timeout: a fault
+  /// manager that did not answer leaves the last known windows in place and the
+  /// next attempt waits out kPlannedStopFailureBackoff, not the normal time to
+  /// live. Without that back-off an unreachable fault manager costs the
+  /// transport's timeout on every single event of the fault stream, which stalls
+  /// the stream rather than degrading it. Callers that must see their own write
+  /// pass force_refresh, or call invalidate_planned_stop_cache() first.
+  std::vector<faults::PlannedStopWindow> planned_stop_windows(bool force_refresh = false);
+
+  /// Ask the next planned_stop_windows() to re-read. Called after this gateway
+  /// writes a window so an operator never watches their own declaration take
+  /// effect a cache lifetime late.
+  void invalidate_planned_stop_cache();
+
+  /// How long the derived flag may lag a window declared straight through the
+  /// ROS service. Short enough that a stop declared elsewhere shows up while an
+  /// operator is still looking, long enough that a busy event stream does not
+  /// turn into one service call per event.
+  static constexpr std::chrono::seconds kPlannedStopCacheTtl{2};
+
+  /// How long to wait after a refresh that got no answer. Longer than the normal
+  /// time to live because the cost of finding out is the transport's timeout,
+  /// and paying it every couple of seconds on a busy stream is a worse outage
+  /// than a flag that lags.
+  static constexpr std::chrono::seconds kPlannedStopFailureBackoff{30};
+
   /// Check if fault manager services are available.
   bool is_available() const;
 
@@ -101,6 +144,7 @@ class FaultManager {
 
  private:
   std::shared_ptr<FaultServiceTransport> transport_;
+  faults::PlannedStopCache planned_stop_cache_;
 };
 
 }  // namespace ros2_medkit_gateway

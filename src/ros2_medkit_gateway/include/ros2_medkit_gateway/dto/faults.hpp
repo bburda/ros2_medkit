@@ -37,6 +37,40 @@ namespace ros2_medkit_gateway {
 namespace dto {
 
 // =============================================================================
+// FaultXMedkit - x-medkit vendor extension carried both inside FaultDetail and
+// on each item of a fault list. Declared ahead of FaultListItem because that
+// struct holds one by value.
+//
+// Wire keys (from build_sovd_fault_response):
+//   occurrence_count, reporting_sources, severity_label, status_raw
+// =============================================================================
+struct FaultXMedkit {
+  std::optional<int64_t> occurrence_count;
+  std::optional<std::vector<std::string>> reporting_sources;
+  std::optional<std::string> severity_label;
+  std::optional<std::string> status_raw;
+  std::optional<bool> expected;
+  std::optional<std::string> planned_stop_id;
+};
+
+template <>
+inline constexpr auto dto_fields<FaultXMedkit> = std::make_tuple(
+    field("occurrence_count", &FaultXMedkit::occurrence_count),
+    field("reporting_sources", &FaultXMedkit::reporting_sources),
+    field("severity_label", &FaultXMedkit::severity_label), field("status_raw", &FaultXMedkit::status_raw),
+    field("expected", &FaultXMedkit::expected,
+          "Whether this fault's current cycle started inside a declared planned-stop window. Derived from "
+          "`first_occurred`, so a code that failed during a stop and failed again afterwards is expected for "
+          "the first cycle and not for the second. The flag changes nothing about the fault: it was confirmed, "
+          "healed, cleared, captured and audited exactly as any other."),
+    field("planned_stop_id", &FaultXMedkit::planned_stop_id,
+          "Which window made it expected - the earliest-starting one covering the fault when several overlap. "
+          "Present only when `expected` is true; read it back with `GET /x-medkit-planned-stops/{id}`."));
+
+template <>
+inline constexpr std::string_view dto_name<FaultXMedkit> = "FaultXMedkit";
+
+// =============================================================================
 // FaultListItem - flat fault list item emitted by fault_msg_conversions.cpp
 // (fault_to_json shape), wrapped in Collection<FaultListItem> for list endpoints.
 //
@@ -56,6 +90,11 @@ struct FaultListItem {
   std::string status;
   std::optional<std::vector<std::string>> reporting_sources;
   std::optional<std::string> severity_label;  // enum: INFO|WARN|ERROR|CRITICAL|UNKNOWN
+
+  /// Vendor extension on the item itself, carrying the planned-stop flag. Absent
+  /// on a fault the gateway could not derive a flag for - which is not the same
+  /// as `expected: false`, and is why it is an object rather than a bare bool.
+  std::optional<FaultXMedkit> x_medkit;  // wire key: "x-medkit"
 };
 
 template <>
@@ -65,7 +104,10 @@ inline constexpr auto dto_fields<FaultListItem> = std::make_tuple(
     field("last_occurred", &FaultListItem::last_occurred), field("last_passed", &FaultListItem::last_passed),
     field("occurrence_count", &FaultListItem::occurrence_count), field("status", &FaultListItem::status),
     field("reporting_sources", &FaultListItem::reporting_sources),
-    field_enum("severity_label", &FaultListItem::severity_label, kFaultSeverityLabelValues));
+    field_enum("severity_label", &FaultListItem::severity_label, kFaultSeverityLabelValues),
+    field("x-medkit", &FaultListItem::x_medkit,
+          "Vendor extension carrying `expected` and `planned_stop_id` for this fault. Absent when the gateway "
+          "could not read the planned-stop windows, which is not the same as the fault being unexpected."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultListItem> = "FaultListItem";
@@ -170,6 +212,11 @@ struct FaultListXMedkit {
   /// existing client already reads.
   std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
+
+  /// How many of the items were expected. A sibling of `count`, not a
+  /// replacement: "three faults, two of them during the changeover" is the
+  /// sentence an operator wants, and it needs both numbers.
+  std::optional<int64_t> expected_count;
 };
 
 template <>
@@ -179,7 +226,11 @@ inline constexpr auto dto_fields<FaultListXMedkit> = std::make_tuple(
     field("source_id", &FaultListXMedkit::source_id), field("muted_faults", &FaultListXMedkit::muted_faults),
     field("clusters", &FaultListXMedkit::clusters), field("partial", &FaultListXMedkit::partial),
     field("failed_peers", &FaultListXMedkit::failed_peers), field("peer_failures", &FaultListXMedkit::peer_failures),
-    field("peer_dropped_items", &FaultListXMedkit::peer_dropped_items));
+    field("peer_dropped_items", &FaultListXMedkit::peer_dropped_items),
+    field("expected_count", &FaultListXMedkit::expected_count,
+          "How many of the returned items started their current cycle inside a planned-stop window. Counts the "
+          "items this gateway derived a flag for; items merged from a peer carry the peer's own flag and are "
+          "not recounted here."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultListXMedkit> = "FaultListXMedkit";
@@ -219,6 +270,9 @@ struct FaultListAggXMedkit {
   /// existing client already reads.
   std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
+
+  /// How many of the items were expected; see FaultListXMedkit::expected_count.
+  std::optional<int64_t> expected_count;
 };
 
 template <>
@@ -233,33 +287,13 @@ inline constexpr auto dto_fields<FaultListAggXMedkit> =
                     field("count", &FaultListAggXMedkit::count), field("partial", &FaultListAggXMedkit::partial),
                     field("failed_peers", &FaultListAggXMedkit::failed_peers),
                     field("peer_failures", &FaultListAggXMedkit::peer_failures),
-                    field("peer_dropped_items", &FaultListAggXMedkit::peer_dropped_items));
+                    field("peer_dropped_items", &FaultListAggXMedkit::peer_dropped_items),
+                    field("expected_count", &FaultListAggXMedkit::expected_count,
+                          "How many of the returned items started their current cycle inside a planned-stop "
+                          "window."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultListAggXMedkit> = "FaultListAggXMedkit";
-
-// =============================================================================
-// FaultXMedkit - x-medkit vendor extension inside FaultDetail
-//
-// Wire keys (from build_sovd_fault_response):
-//   occurrence_count, reporting_sources, severity_label, status_raw
-// =============================================================================
-struct FaultXMedkit {
-  std::optional<int64_t> occurrence_count;
-  std::optional<std::vector<std::string>> reporting_sources;
-  std::optional<std::string> severity_label;
-  std::optional<std::string> status_raw;
-};
-
-template <>
-inline constexpr auto dto_fields<FaultXMedkit> =
-    std::make_tuple(field("occurrence_count", &FaultXMedkit::occurrence_count),
-                    field("reporting_sources", &FaultXMedkit::reporting_sources),
-                    field("severity_label", &FaultXMedkit::severity_label),
-                    field("status_raw", &FaultXMedkit::status_raw));
-
-template <>
-inline constexpr std::string_view dto_name<FaultXMedkit> = "FaultXMedkit";
 
 // =============================================================================
 // FaultDetail - SOVD nested fault detail response
@@ -540,6 +574,7 @@ struct FaultListQuery {
   std::optional<std::string> status;
   bool include_muted = false;
   bool include_clusters = false;
+  std::optional<std::string> expected;
 };
 
 template <>
@@ -548,7 +583,10 @@ inline constexpr auto dto_fields<FaultListQuery> = std::make_tuple(
                "Filter by fault status: pending, confirmed, cleared, healed, or all"),
     field("include_muted", &FaultListQuery::include_muted, Presence::kOptional, "Include muted faults in the response"),
     field("include_clusters", &FaultListQuery::include_clusters, Presence::kOptional,
-          "Include fault clusters in the response"));
+          "Include fault clusters in the response"),
+    field_enum("expected", &FaultListQuery::expected, kFaultExpectedFilterValues,
+               "Keep only faults whose current cycle started inside a planned-stop window (`true`), only those "
+               "that did not (`false`), or both, which is what omitting it means (`all`)."));
 
 // FaultEntityListQuery - query parameters for the per-entity GET /{entity}/faults
 // route. Only `status` applies: include_muted / include_clusters are honored
@@ -558,12 +596,16 @@ inline constexpr auto dto_fields<FaultListQuery> = std::make_tuple(
 // exactly what the handler reads (no spec-vs-runtime drift on the declared axis).
 struct FaultEntityListQuery {
   std::optional<std::string> status;
+  std::optional<std::string> expected;
 };
 
 template <>
-inline constexpr auto dto_fields<FaultEntityListQuery> =
-    std::make_tuple(field_enum("status", &FaultEntityListQuery::status, kFaultStatusFilterValues,
-                               "Filter by fault status: pending, confirmed, cleared, healed, or all"));
+inline constexpr auto dto_fields<FaultEntityListQuery> = std::make_tuple(
+    field_enum("status", &FaultEntityListQuery::status, kFaultStatusFilterValues,
+               "Filter by fault status: pending, confirmed, cleared, healed, or all"),
+    field_enum("expected", &FaultEntityListQuery::expected, kFaultExpectedFilterValues,
+               "Keep only faults whose current cycle started inside a planned-stop window (`true`), only those "
+               "that did not (`false`), or both, which is what omitting it means (`all`)."));
 
 // FaultClearQuery - query parameters for DELETE /faults (clear all). Only the
 // status filter applies; the correlation flags are list-only.

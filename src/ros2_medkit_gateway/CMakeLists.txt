@@ -194,6 +194,7 @@ add_library(gateway_ros2 STATIC
   src/http/handlers/lock_handlers.cpp
   src/http/handlers/log_handlers.cpp
   src/http/handlers/operation_handlers.cpp
+  src/http/handlers/planned_stop_handlers.cpp
   src/http/handlers/script_handlers.cpp
   src/http/handlers/sse_fault_handler.cpp
   src/http/handlers/sse_transport_provider.cpp
@@ -411,6 +412,23 @@ if(BUILD_TESTING)
   set_tests_properties(gateway_core_smoke PROPERTIES LABELS "unit")
   # gateway_core only, no rclcpp on the link line, so no ROS entity to isolate.
   medkit_test_needs_no_domain(gateway_core_smoke)
+
+  # ─── Planned-stop window predicate (gateway_core only) ─────────────────────
+  # Pure logic: which window covers an instant, and how an ISO 8601 string on the
+  # wire becomes a nanosecond count. No rclcpp on the link line.
+  add_executable(test_planned_stop_window test/test_planned_stop_window.cpp)
+  target_link_libraries(test_planned_stop_window
+    PRIVATE
+      gateway_core
+      GTest::gtest
+      GTest::gtest_main
+  )
+  add_test(
+    NAME planned_stop_window
+    COMMAND $<TARGET_FILE:test_planned_stop_window>
+  )
+  set_tests_properties(planned_stop_window PROPERTIES LABELS "unit")
+  medkit_test_needs_no_domain(planned_stop_window)
 
   # ─── DataAccessManager routing test (gateway_core only) ────────────────────
   # Mock-transport coverage proving the manager body compiles + links against

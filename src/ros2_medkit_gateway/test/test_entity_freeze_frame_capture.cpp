@@ -32,6 +32,10 @@
 #include "ros2_medkit_gateway/ros2_common/ros2_subscription_executor.hpp"
 #include "ros2_medkit_msgs/msg/fault_event.hpp"
 
+/// No planned-stop windows declared: every fault in these cases is a surprise,
+/// which is what a gateway with an empty planned_stops table serves.
+static const std::vector<ros2_medkit_gateway::faults::PlannedStopWindow> kNoPlannedStops;
+
 using json = nlohmann::json;
 using namespace std::chrono_literals;
 using ros2_medkit_gateway::DataProvider;
@@ -865,7 +869,7 @@ TEST(MergeEntityFreezeFrames, CarriesLinkStateAndSourceTimestampWhenKnown) {
 
   // And onto the wire: build_sovd_fault_response surfaces them in x-medkit.
   const auto detail = FaultHandlers::build_sovd_fault_response(
-      json{{"fault_code", "PLC_COMMS_LOST"}, {"status", "CONFIRMED"}}, merged, "/apps/plc_app");
+      json{{"fault_code", "PLC_COMMS_LOST"}, {"status", "CONFIRMED"}}, merged, "/apps/plc_app", kNoPlannedStops);
   ASSERT_TRUE(detail.environment_data.snapshots.has_value());
   const auto & wire = *detail.environment_data.snapshots;
   ASSERT_EQ(wire.size(), 2u);

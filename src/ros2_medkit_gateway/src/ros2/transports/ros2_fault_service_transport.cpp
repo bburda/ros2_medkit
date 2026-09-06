@@ -24,6 +24,7 @@
 #include "ros2_medkit_gateway/ros2/conversions/fault_msg_conversions.hpp"
 #include "ros2_medkit_msgs/msg/environment_data.hpp"
 #include "ros2_medkit_msgs/msg/fault.hpp"
+#include "ros2_medkit_msgs/msg/planned_stop.hpp"
 
 namespace ros2_medkit_gateway::ros2 {
 
@@ -119,6 +120,12 @@ Ros2FaultServiceTransport::Ros2FaultServiceTransport(rclcpp::Node * node) : node
       client_node_->create_client<ros2_medkit_msgs::srv::GetRosbag>(fault_manager_base_path_ + "/get_rosbag");
   list_rosbags_client_ =
       client_node_->create_client<ros2_medkit_msgs::srv::ListRosbags>(fault_manager_base_path_ + "/list_rosbags");
+  declare_planned_stop_client_ = client_node_->create_client<ros2_medkit_msgs::srv::DeclarePlannedStop>(
+      fault_manager_base_path_ + "/declare_planned_stop");
+  end_planned_stop_client_ = client_node_->create_client<ros2_medkit_msgs::srv::EndPlannedStop>(
+      fault_manager_base_path_ + "/end_planned_stop");
+  list_planned_stops_client_ = client_node_->create_client<ros2_medkit_msgs::srv::ListPlannedStops>(
+      fault_manager_base_path_ + "/list_planned_stops");
 
   RCLCPP_INFO(node_->get_logger(), "Ros2FaultServiceTransport initialized (base_path=%s, timeout=%.1fs)",
               fault_manager_base_path_.c_str(), service_timeout_sec_);
@@ -137,6 +144,9 @@ Ros2FaultServiceTransport::~Ros2FaultServiceTransport() {
   get_snapshots_client_.reset();
   get_rosbag_client_.reset();
   list_rosbags_client_.reset();
+  declare_planned_stop_client_.reset();
+  end_planned_stop_client_.reset();
+  list_planned_stops_client_.reset();
 
   executor_.reset();
   client_node_.reset();
@@ -493,6 +503,114 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
     result.error_message = response->error_message;
   }
 
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Planned-stop windows
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int64_t time_msg_to_ns(const builtin_interfaces::msg::Time & t) {
+  return static_cast<int64_t>(t.sec) * 1000000000LL + static_cast<int64_t>(t.nanosec);
+}
+
+builtin_interfaces::msg::Time ns_to_time_msg(int64_t ns) {
+  builtin_interfaces::msg::Time t;
+  t.sec = static_cast<int32_t>(ns / 1000000000LL);
+  t.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
+  return t;
+}
+
+faults::PlannedStopWindow window_from_msg(const ros2_medkit_msgs::msg::PlannedStop & msg) {
+  faults::PlannedStopWindow w;
+  w.id = msg.id;
+  w.from_ns = time_msg_to_ns(msg.starts_at);
+  w.to_ns = time_msg_to_ns(msg.ends_at);
+  w.reason = msg.reason;
+  w.declared_by = msg.declared_by;
+  w.declared_at_ns = time_msg_to_ns(msg.declared_at);
+  w.ended_early = msg.ended_early;
+  return w;
+}
+
+}  // namespace
+
+PlannedStopResult Ros2FaultServiceTransport::declare_planned_stop(const faults::PlannedStopWindow & window) {
+  PlannedStopResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::DeclarePlannedStop::Request>();
+  request->starts_at = ns_to_time_msg(window.from_ns);
+  request->ends_at = ns_to_time_msg(window.to_ns);
+  request->reason = window.reason;
+  request->declared_by = window.declared_by;
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::DeclarePlannedStop>(
+      declare_planned_stop_client_, request, executor_, executor_mutex_,
+      std::chrono::duration<double>(service_timeout_sec_), "DeclarePlannedStop", result.error_message);
+  if (!response) {
+    result.failure = FaultFailure::Unavailable;
+    return result;
+  }
+
+  result.success = response->success;
+  if (!response->success) {
+    result.error_message = response->message;
+    return result;
+  }
+  result.stops.push_back(window_from_msg(response->stop));
+  return result;
+}
+
+PlannedStopResult Ros2FaultServiceTransport::end_planned_stop(const std::string & id) {
+  PlannedStopResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::EndPlannedStop::Request>();
+  request->id = id;
+  // A zero instant asks the fault manager for its own wall clock. Sending the
+  // gateway's would put the two clocks' difference into the record of when the
+  // stop finished, and the fault timestamps it will be compared against come
+  // from the fault manager's clock.
+  request->at = builtin_interfaces::msg::Time();
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::EndPlannedStop>(
+      end_planned_stop_client_, request, executor_, executor_mutex_,
+      std::chrono::duration<double>(service_timeout_sec_), "EndPlannedStop", result.error_message);
+  if (!response) {
+    result.failure = FaultFailure::Unavailable;
+    return result;
+  }
+
+  result.success = response->success;
+  if (!response->success) {
+    result.error_message = response->message;
+    return result;
+  }
+  result.stops.push_back(window_from_msg(response->stop));
+  return result;
+}
+
+PlannedStopResult Ros2FaultServiceTransport::list_planned_stops(bool active_only) {
+  PlannedStopResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::ListPlannedStops::Request>();
+  request->active_only = active_only;
+  request->now = builtin_interfaces::msg::Time();
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::ListPlannedStops>(
+      list_planned_stops_client_, request, executor_, executor_mutex_,
+      std::chrono::duration<double>(service_timeout_sec_), "ListPlannedStops", result.error_message);
+  if (!response) {
+    result.failure = FaultFailure::Unavailable;
+    return result;
+  }
+
+  result.success = true;
+  result.stops.reserve(response->stops.size());
+  for (const auto & stop : response->stops) {
+    result.stops.push_back(window_from_msg(stop));
+  }
   return result;
 }
 

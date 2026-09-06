@@ -134,6 +134,7 @@ class RESTServer {
   std::unique_ptr<handlers::OperationHandlers> operation_handlers_;
   std::unique_ptr<handlers::ConfigHandlers> config_handlers_;
   std::unique_ptr<handlers::FaultHandlers> fault_handlers_;
+  std::unique_ptr<handlers::PlannedStopHandlers> planned_stop_handlers_;
   std::unique_ptr<handlers::AuthHandlers> auth_handlers_;
   std::shared_ptr<SSEClientTracker> sse_client_tracker_;
   std::unique_ptr<handlers::SSEFaultHandler> sse_fault_handler_;

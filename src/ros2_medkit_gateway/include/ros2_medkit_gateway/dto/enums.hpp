@@ -37,6 +37,12 @@ inline constexpr std::string_view kFaultAggregatedStatusValues[] = {"active", "p
 /// handler-accepted value (the OpenAPI callability test sends enum[0]).
 inline constexpr std::string_view kFaultStatusFilterValues[] = {"pending", "confirmed", "cleared", "healed", "all"};
 
+/// Planned-stop filter on the fault lists. "all" is what an omitted parameter
+/// means: the flag is extra information about a fault, never a reason to hide it
+/// by default. The leading entry must be a handler-accepted value (the OpenAPI
+/// callability test sends enum[0]).
+inline constexpr std::string_view kFaultExpectedFilterValues[] = {"all", "true", "false"};
+
 /// Log aggregation level (log_entry_list_schema - x-medkit.aggregation_level).
 inline constexpr std::string_view kLogAggregationLevelValues[] = {"function", "area", "component"};
 

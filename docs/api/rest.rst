@@ -3470,6 +3470,11 @@ Vendor-specific ``x-medkit-*`` codes are enveloped: the response carries
    * - ``x-medkit-unsupported-protocol``
      - 400
      - The requested subscription ``protocol`` has no registered transport
+   * - ``x-medkit-planned-stop-ended``
+     - 400
+     - The planned-stop window has already ended and cannot be ended again. Distinct from a 404 on an
+       unknown id: the window is there, and when the stop actually finished is not something a later
+       request gets to rewrite
 
 The table is kept complete by a check rather than by review:
 ``scripts/check_error_codes_documented.py`` (ctest

@@ -26,6 +26,10 @@
 #include "ros2_medkit_msgs/msg/fault.hpp"
 #include "ros2_medkit_msgs/msg/snapshot.hpp"
 
+/// No planned-stop windows declared: every fault in these cases is a surprise,
+/// which is what a gateway with an empty planned_stops table serves.
+static const std::vector<ros2_medkit_gateway::faults::PlannedStopWindow> kNoPlannedStops;
+
 using json = nlohmann::json;
 using ros2_medkit_gateway::handlers::FaultHandlers;
 namespace conversions = ros2_medkit_gateway::ros2::conversions;
@@ -68,8 +72,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseBasicFields) {
   env_data.extended_data_records.first_occurrence_ns = 1707044400000000000;
   env_data.extended_data_records.last_occurrence_ns = 1707044460000000000;
 
-  auto response = to_json(
-      FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/motor_controller"));
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data),
+                                                                   "/apps/motor_controller", kNoPlannedStops));
 
   // Verify item structure
   EXPECT_EQ(response["item"]["code"], "TEST_FAULT");
@@ -106,8 +110,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseWithFreezeFrame) {
   freeze_frame.captured_at_ns = 1707044400000000000;
   env_data.snapshots.push_back(freeze_frame);
 
-  auto response =
-      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/motor"));
+  auto response = to_json(
+      FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/motor", kNoPlannedStops));
 
   auto & snap = response["environment_data"]["snapshots"][0];
   EXPECT_EQ(snap["type"], "freeze_frame");
@@ -135,7 +139,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponsePropagatesCaptureOrigin) {
                                                {"captured_at_ns", 1234},
                                                {"capture_origin", "startup"}}})}};
 
-  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_data, "/apps/plc_app"));
+  auto response =
+      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_data, "/apps/plc_app", kNoPlannedStops));
 
   auto & snap = response["environment_data"]["snapshots"][0];
   EXPECT_EQ(snap["type"], "freeze_frame");
@@ -188,8 +193,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseWithRosbag) {
   rosbag.format = "mcap";
   env_data.snapshots.push_back(rosbag);
 
-  auto response = to_json(
-      FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/motor_controller"));
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data),
+                                                                   "/apps/motor_controller", kNoPlannedStops));
 
   auto & snap = response["environment_data"]["snapshots"][0];
   EXPECT_EQ(snap["type"], "rosbag");
@@ -210,8 +215,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseNestedEntityPath) {
   rosbag.bulk_data_id = "NESTED_FAULT";
   env_data.snapshots.push_back(rosbag);
 
-  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data),
-                                                                   "/areas/perception/subareas/lidar"));
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(
+      fault_json(fault), env_json(env_data), "/areas/perception/subareas/lidar", kNoPlannedStops));
 
   auto & snap = response["environment_data"]["snapshots"][0];
   EXPECT_EQ(snap["bulk_data_uri"], "/areas/perception/subareas/lidar/bulk-data/rosbags/NESTED_FAULT");
@@ -225,8 +230,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseStatusCleared) {
 
   ros2_medkit_msgs::msg::EnvironmentData env_data;
 
-  auto response =
-      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+  auto response = to_json(
+      FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
 
   auto status = response["item"]["status"];
   EXPECT_EQ(status["aggregatedStatus"], "cleared");
@@ -243,8 +248,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseStatusPassive) {
 
   ros2_medkit_msgs::msg::EnvironmentData env_data;
 
-  auto response =
-      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+  auto response = to_json(
+      FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
 
   auto status = response["item"]["status"];
   EXPECT_EQ(status["aggregatedStatus"], "passive");
@@ -261,40 +266,40 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseSeverityLabels) {
   {
     ros2_medkit_msgs::msg::Fault fault;
     fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_INFO;
-    auto response =
-        to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+    auto response = to_json(
+        FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
     EXPECT_EQ(response["x-medkit"]["severity_label"], "INFO");
   }
   // Test WARN (1)
   {
     ros2_medkit_msgs::msg::Fault fault;
     fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_WARN;
-    auto response =
-        to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+    auto response = to_json(
+        FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
     EXPECT_EQ(response["x-medkit"]["severity_label"], "WARN");
   }
   // Test ERROR (2)
   {
     ros2_medkit_msgs::msg::Fault fault;
     fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
-    auto response =
-        to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+    auto response = to_json(
+        FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
     EXPECT_EQ(response["x-medkit"]["severity_label"], "ERROR");
   }
   // Test CRITICAL (3)
   {
     ros2_medkit_msgs::msg::Fault fault;
     fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_CRITICAL;
-    auto response =
-        to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+    auto response = to_json(
+        FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
     EXPECT_EQ(response["x-medkit"]["severity_label"], "CRITICAL");
   }
   // Test UNKNOWN (255) - any value outside the SEVERITY_* range
   {
     ros2_medkit_msgs::msg::Fault fault;
     fault.severity = 255;
-    auto response =
-        to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+    auto response = to_json(
+        FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
     EXPECT_EQ(response["x-medkit"]["severity_label"], "UNKNOWN");
   }
 }
@@ -313,8 +318,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseWithInvalidJson) {
   freeze_frame.message_type = "std_msgs/msg/String";
   env_data.snapshots.push_back(freeze_frame);
 
-  auto response =
-      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+  auto response = to_json(
+      FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
 
   auto & snap = response["environment_data"]["snapshots"][0];
   EXPECT_EQ(snap["data"], "not valid json {");  // Raw data returned
@@ -330,8 +335,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseExtendedDataRecords) {
   env_data.extended_data_records.first_occurrence_ns = 1770458400000000000;  // 2026-02-08
   env_data.extended_data_records.last_occurrence_ns = 1770458460000000000;
 
-  auto response =
-      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+  auto response = to_json(
+      FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
 
   auto & edr = response["environment_data"]["extended_data_records"];
   std::string first = edr["first_occurrence"].get<std::string>();
@@ -358,8 +363,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponsePrimaryValueExtraction) {
     env_data.snapshots.clear();
     env_data.snapshots.push_back(snap);
 
-    auto response =
-        to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+    auto response = to_json(
+        FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
     EXPECT_DOUBLE_EQ(response["environment_data"]["snapshots"][0]["data"].get<double>(), 42.5);
   }
 
@@ -373,8 +378,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponsePrimaryValueExtraction) {
     env_data.snapshots.clear();
     env_data.snapshots.push_back(snap);
 
-    auto response =
-        to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+    auto response = to_json(
+        FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
     auto data = response["environment_data"]["snapshots"][0]["data"];
     EXPECT_EQ(data["foo"], "bar");
     EXPECT_EQ(data["baz"], 123);
@@ -389,8 +394,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseMultipleSources) {
 
   ros2_medkit_msgs::msg::EnvironmentData env_data;
 
-  auto response =
-      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test"));
+  auto response = to_json(
+      FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/test", kNoPlannedStops));
 
   auto sources = response["x-medkit"]["reporting_sources"];
   ASSERT_EQ(sources.size(), 3);
@@ -423,8 +428,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseMixedSnapshots) {
   rosbag.format = "mcap";
   env_data.snapshots.push_back(rosbag);
 
-  auto response =
-      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/components/motor"));
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data),
+                                                                   "/components/motor", kNoPlannedStops));
 
   ASSERT_EQ(response["environment_data"]["snapshots"].size(), 2);
 
@@ -589,8 +594,8 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseExternalEntityFreezeFrame) {
   freeze_frame.captured_at_ns = 1707044400000000000;
   env_data.snapshots.push_back(freeze_frame);
 
-  auto response =
-      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/process"));
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data),
+                                                                   "/apps/process", kNoPlannedStops));
 
   auto & snap = response["environment_data"]["snapshots"][0];
   EXPECT_EQ(snap["type"], "freeze_frame");

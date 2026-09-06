@@ -143,6 +143,12 @@ constexpr const char * ERR_X_MEDKIT_ENTITY_MISMATCH = "x-medkit-entity-mismatch"
 /// Vendor-specific: unsupported subscription protocol
 constexpr const char * ERR_X_MEDKIT_UNSUPPORTED_PROTOCOL = "x-medkit-unsupported-protocol";
 
+/// Vendor: a planned-stop window whose end has already passed cannot be ended
+/// again (400). Distinct from a 404 on an unknown id: the window is there, and
+/// the record of when the stop actually finished is not something a later
+/// request gets to rewrite.
+constexpr const char * ERR_X_MEDKIT_PLANNED_STOP_ENDED = "x-medkit-planned-stop-ended";
+
 /// SOVD standard: client's lock was broken by another client (409)
 constexpr const char * ERR_LOCK_BROKEN = "lock-broken";
 

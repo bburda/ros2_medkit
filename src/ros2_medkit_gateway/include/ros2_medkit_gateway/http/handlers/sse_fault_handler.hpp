@@ -278,8 +278,14 @@ class SSEFaultHandler {
   /// path through the replay buffer.
   void enqueue(QueuedEvent queued);
 
-  /// Format a fault event as SSE message
-  static std::string format_sse_event(const QueuedEvent & queued);
+  /// Format a fault event as SSE message.
+  ///
+  /// Not static any more: the frame carries `x-medkit.expected`, which is
+  /// derived from the planned-stop windows this gateway holds. A window can be
+  /// declared straight through the ROS service, so the windows are re-read on a
+  /// short time to live rather than assumed unchanged - see
+  /// FaultManager::planned_stop_windows.
+  std::string format_sse_event(const QueuedEvent & queued) const;
 
   /// Resolve the owning entity for a fault, snapshotting the cache. Manifest
   /// / hybrid mode uses the cache's node-to-app index; runtime mode falls

@@ -600,11 +600,12 @@ TEST_F(SSEFaultHandlerTest, NonPositiveKeepaliveOverrideLogsWarning) {
   EXPECT_NE(logs.find("Non-positive SSE keepalive override"), std::string::npos);
 }
 
-TEST_F(SSEFaultHandlerTest, StreamOmitsXMedkitWhenNoMatchingApp) {
+TEST_F(SSEFaultHandlerTest, StreamOmitsTheEntityHintWhenNoMatchingApp) {
   // Empty cache: reporting source ("/apps/temp_sensor") has no manifest mapping
-  // and no App with id "temp_sensor" exists in runtime cache, so the
-  // ``x-medkit`` payload extension is not emitted (consumer falls back to
-  // discovery).
+  // and no App with id "temp_sensor" exists in the runtime cache, so the entity
+  // hint is not emitted and a consumer falls back to discovery. The ``x-medkit``
+  // object itself IS emitted: it also carries the planned-stop flag, which is a
+  // property of the fault rather than of any entity.
   enqueue_event(make_fault_event(FaultEvent::EVENT_CONFIRMED, "NO_OWNER", 10));
 
   auto req = make_stream_request("127.0.0.1");
@@ -614,7 +615,12 @@ TEST_F(SSEFaultHandlerTest, StreamOmitsXMedkitWhenNoMatchingApp) {
   auto output = read_stream_once(res, 1);
   auto payload = parse_sse_payload(output);
 
-  EXPECT_FALSE(payload.contains("x-medkit"));
+  ASSERT_TRUE(payload.contains("x-medkit"));
+  EXPECT_FALSE(payload["x-medkit"].contains("entity_type"));
+  EXPECT_FALSE(payload["x-medkit"].contains("entity_id"));
+  EXPECT_TRUE(payload["x-medkit"].contains("expected"));
+  EXPECT_FALSE(payload["x-medkit"]["expected"].get<bool>())
+      << "no fault manager answers in this fixture, so no window can cover the fault";
 
   release_stream(res);
 }
@@ -816,7 +822,7 @@ TEST_F(SSEFaultHandlerTest, StreamResolvesRuntimeCollisionRenamedApp) {
   release_stream(res);
 }
 
-TEST_F(SSEFaultHandlerTest, StreamOmitsXMedkitWhenReportingSourcesEmpty) {
+TEST_F(SSEFaultHandlerTest, StreamOmitsTheEntityHintWhenReportingSourcesEmpty) {
   auto event = make_fault_event(FaultEvent::EVENT_CONFIRMED, "ORPHAN", 40);
   event.fault.reporting_sources.clear();
   enqueue_event(event);
@@ -828,7 +834,12 @@ TEST_F(SSEFaultHandlerTest, StreamOmitsXMedkitWhenReportingSourcesEmpty) {
   auto output = read_stream_once(res, 1);
   auto payload = parse_sse_payload(output);
 
-  EXPECT_FALSE(payload.contains("x-medkit"));
+  // A fault with no reporting source resolves to no entity, but it is still a
+  // fault, and a stream consumer still has to be told whether it was expected.
+  ASSERT_TRUE(payload.contains("x-medkit"));
+  EXPECT_FALSE(payload["x-medkit"].contains("entity_id"));
+  EXPECT_FALSE(payload["x-medkit"]["expected"].get<bool>());
+  EXPECT_FALSE(payload["x-medkit"].contains("planned_stop_id"));
 
   release_stream(res);
 }

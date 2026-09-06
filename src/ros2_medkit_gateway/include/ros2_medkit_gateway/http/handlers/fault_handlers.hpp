@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "ros2_medkit_gateway/core/faults/fault_types.hpp"
+#include "ros2_medkit_gateway/core/faults/planned_stop.hpp"
 #include "ros2_medkit_gateway/dto/faults.hpp"
 #include "ros2_medkit_gateway/entity_freeze_frame_capture.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
@@ -145,11 +146,17 @@ class FaultHandlers {
    * @param fault_json Per-fault JSON (as produced by the transport adapter).
    * @param env_data_json Environment-data JSON (as produced by the transport).
    * @param entity_path Entity path used to construct rosbag bulk_data_uri.
+   * @param planned_stops Declared planned-stop windows, used to derive
+   *        `x-medkit.expected`. Pass an empty vector and the flag reads false,
+   *        which is the honest answer for a gateway with no windows; the detail
+   *        and the list derive it from the same data so a UI that opens a fault
+   *        it just saw flagged does not find the flag gone.
    * @return SOVD-compliant FaultDetail DTO
    */
   static dto::FaultDetail build_sovd_fault_response(const nlohmann::json & fault_json,
                                                     const nlohmann::json & env_data_json,
-                                                    const std::string & entity_path);
+                                                    const std::string & entity_path,
+                                                    const std::vector<faults::PlannedStopWindow> & planned_stops);
 
   /**
    * @brief Scope check used by per-entity fault routes.

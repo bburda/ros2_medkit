@@ -43,4 +43,5 @@
 #include "ros2_medkit_gateway/http/handlers/cyclic_subscription_handlers.hpp"
 #include "ros2_medkit_gateway/http/handlers/fault_handlers.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
+#include "ros2_medkit_gateway/http/handlers/planned_stop_handlers.hpp"
 #include "ros2_medkit_gateway/http/handlers/sse_fault_handler.hpp"
