@@ -18,8 +18,14 @@ fault_manager:
 
     # Healing OFF by default: a recovery signal (e.g. action SUCCEEDED) does not
     # auto-clear the fault until this is enabled.
+    #
+    # Threshold 0, so that turning healing on here works. Healing costs
+    # healing_threshold minus the counter the fault confirmed at, and a reporter
+    # that signals recovery once - the action bridge sends one PASSED - cannot
+    # move the counter further than that. Any higher value leaves the fault
+    # CONFIRMED after it has recovered.
     healing_enabled: false
-    healing_threshold: 3
+    healing_threshold: 0
 
     # Black-box rosbag capture OFF by default (opt-in). When enabled it defaults
     # to entity-scoped capture and is crash-safe (falls back / self-disables if no

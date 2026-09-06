@@ -60,8 +60,11 @@ ALL_STATUSES = ['PREFAILED', 'PREPASSED', 'CONFIRMED', 'HEALED', 'CLEARED']
 _temp_dirs = []
 
 
-@launch_testing.markers.keep_alive
+# keep_alive below parametrize: parametrize rebuilds the description with
+# functools.update_wrapper against the undecorated function, so a marker set on
+# the outer wrapper never reaches the per-parameter run.
 @launch_testing.parametrize('healing_threshold', HEALING_THRESHOLDS)
+@launch_testing.markers.keep_alive
 def generate_test_description(healing_threshold):
     """Launch fault_manager with healing on and the threshold under test."""
     temp_dir = tempfile.mkdtemp(prefix='debounce_healing_')
@@ -102,13 +105,21 @@ class TestHealingOnASingleClear(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         rclpy.init()
+        try:
+            cls._setup_clients()
+        except Exception:
+            rclpy.shutdown()
+            raise
+
+    @classmethod
+    def _setup_clients(cls):
         cls.node = Node('test_debounce_healing_client')
         cls.report_client = cls.node.create_client(ReportFault, '/fault_manager/report_fault')
         cls.list_client = cls.node.create_client(ListFaults, '/fault_manager/list_faults')
 
-        assert cls.report_client.wait_for_service(timeout_sec=20.0), \
+        assert cls.report_client.wait_for_service(timeout_sec=30.0), \
             'report_fault service not available'
-        assert cls.list_client.wait_for_service(timeout_sec=20.0), \
+        assert cls.list_client.wait_for_service(timeout_sec=30.0), \
             'list_faults service not available'
 
     @classmethod
@@ -118,7 +129,7 @@ class TestHealingOnASingleClear(unittest.TestCase):
 
     def _call(self, client, request):
         future = client.call_async(request)
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec=20.0)
+        rclpy.spin_until_future_complete(self.node, future, timeout_sec=10.0)
         self.assertIsNotNone(future.result(), 'Service call timed out')
         return future.result()
 
@@ -206,6 +217,12 @@ class TestHealingOnASingleClear(unittest.TestCase):
         )
         self.assertIn(code, self._default_filter_codes())
 
+        # At 0 the fault genuinely left CONFIRMED and came back, which is the
+        # case the latch could swallow. At 3 it never left, so this run only
+        # shows that a repeat FAILED does not disturb a confirmed fault.
+        if healing_threshold == 0:
+            self.assertEqual(expected_after_clear, Fault.STATUS_HEALED)
+
     def test_03_a_healed_fault_stays_healed_while_the_condition_is_gone(self, healing_threshold):
         """A settled fault must not change status without an event."""
         code = 'PLC_STAYS_HEALED'
@@ -252,5 +269,9 @@ class TestHealingShutdown(unittest.TestCase):
         launch_testing.asserts.assertExitCodes(proc_info, process=fault_manager_node)
 
     def test_temp_dirs_removed(self):
+        # Idempotent: the parametrized suite runs this once per launch and the
+        # list is module-level, so a directory may already be gone. The contract
+        # is the end state, not that this call did the removing.
         for path in _temp_dirs:
             shutil.rmtree(path, ignore_errors=True)
+            self.assertFalse(os.path.exists(path), f'{path} survived cleanup')

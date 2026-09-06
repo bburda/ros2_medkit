@@ -65,7 +65,9 @@ The fault manager uses AUTOSAR DEM-style debounce filtering to prevent fault fla
      - When true, PASSED events can heal confirmed faults.
    * - ``healing_threshold``
      - ``3``
-     - Number of PASSED events to transition from CONFIRMED to HEALED.
+     - Counter value at which a fault heals, not a number of events. Healing costs
+       ``healing_threshold`` minus the counter the fault confirmed at, so with the
+       default ``-1`` it takes four PASSED events.
    * - ``auto_confirm_after_sec``
      - ``0.0``
      - Auto-confirm prefailed faults after this duration. Set to 0 to disable.
@@ -560,7 +562,7 @@ by default: with it off there is no table, no file and no write cost.
      - Turn the audit log on.
    * - ``audit_log.transitions``
      - ``"all"``
-     - Which transitions are recorded: ``all`` (occurred, confirmed, cleared) or
+     - Which transitions are recorded: ``all`` (occurred, confirmed, healed, cleared) or
        ``confirmed_only``. Any other value falls back to ``all`` with a warning.
    * - ``audit_log.retention_max_records``
      - ``0``
@@ -623,11 +625,13 @@ Complete Example
        storage_type: "sqlite"
        database_path: "/var/lib/ros2_medkit/faults.db"
 
-       # Debounce (require 3 FAILED events to confirm)
+       # Debounce for a reporter that repeats its events while a condition holds:
+       # three FAILED events confirm, and four PASSED events heal from there.
+       # For a reporter that sends one event per transition, use -1 with
+       # healing_threshold 0 instead - see the note under Debounce Settings.
        confirmation_threshold: -3
        healing_enabled: true
        healing_threshold: 3
-       auto_confirm_after_sec: 30.0
 
        # Per-entity debounce overrides
        entity_thresholds:

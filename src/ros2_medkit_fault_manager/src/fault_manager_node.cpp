@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cinttypes>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -121,8 +122,7 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
 
   auto confirmation_threshold_param = declare_parameter<int>("confirmation_threshold", -1);
   if (confirmation_threshold_param > 0) {
-    RCLCPP_WARN(get_logger(),
-                "confirmation_threshold should be <= 0 (0 or -1 = immediate confirmation), got %d. Using %d.",
+    RCLCPP_WARN(get_logger(), "confirmation_threshold should be < 0 (-1 = immediate confirmation), got %d. Using %d.",
                 static_cast<int>(confirmation_threshold_param), static_cast<int>(-confirmation_threshold_param));
     confirmation_threshold_param = -confirmation_threshold_param;
   }
@@ -140,20 +140,27 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
 
   // Time-based auto-confirmation parameter
   auto_confirm_after_sec_ = declare_parameter<double>("auto_confirm_after_sec", 0.0);
-  // Positive test, then negated: every comparison against NaN is false, so a
-  // plain `< 0.0` accepts NaN and the timer is then never created either, which
-  // disables time-based confirmation with nothing logged. clang-tidy's
+  // Every double parameter in this node is range-checked in this shape, tested
+  // positively and then negated, because every comparison against NaN is false:
+  // a plain `< 0.0` accepts NaN, and the guard that would have caught it later
+  // (`> 0.0` before creating the timer) is false for NaN too, so the feature
+  // switches itself off with nothing logged. clang-tidy's
   // readability-simplify-boolean-expr suggests the DeMorgan rewrite that puts
   // that back - leave this form alone.
-  if (!(std::isfinite(auto_confirm_after_sec_) && auto_confirm_after_sec_ >= 0.0)) {
-    RCLCPP_WARN(get_logger(), "auto_confirm_after_sec must be a finite value >= 0, got %.2f. Disabling.",
-                auto_confirm_after_sec_);
+  // Upper bound as well as lower: the SQLite backend evaluates the window as
+  // static_cast<int64_t>(auto_confirm_after_sec * 1e9), which is undefined once
+  // the product leaves the int64 range.
+  constexpr double kMaxAutoConfirmSec = 9.0e9;
+  if (!(std::isfinite(auto_confirm_after_sec_) && auto_confirm_after_sec_ >= 0.0 &&
+        auto_confirm_after_sec_ <= kMaxAutoConfirmSec)) {
+    RCLCPP_WARN(get_logger(), "auto_confirm_after_sec must be a finite value in [0, %.1e], got %.2f. Disabling.",
+                kMaxAutoConfirmSec, auto_confirm_after_sec_);
     auto_confirm_after_sec_ = 0.0;
   }
 
   // Capture cooldown parameters (gates both snapshot and rosbag capture)
   snapshot_recapture_cooldown_sec_ = declare_parameter<double>("snapshots.recapture_cooldown_sec", 60.0);
-  if (snapshot_recapture_cooldown_sec_ < 0.0) {
+  if (!(std::isfinite(snapshot_recapture_cooldown_sec_) && snapshot_recapture_cooldown_sec_ >= 0.0)) {
     RCLCPP_WARN(get_logger(), "snapshots.recapture_cooldown_sec should be >= 0, got %.2f. Disabling.",
                 snapshot_recapture_cooldown_sec_);
     snapshot_recapture_cooldown_sec_ = 0.0;
@@ -426,7 +433,7 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   // Create correlation cleanup timer if correlation is enabled
   if (correlation_engine_) {
     auto cleanup_interval_sec = declare_parameter<double>("correlation.cleanup_interval_sec", 5.0);
-    if (cleanup_interval_sec <= 0.0) {
+    if (!(std::isfinite(cleanup_interval_sec) && cleanup_interval_sec > 0.0)) {
       RCLCPP_WARN(get_logger(), "correlation.cleanup_interval_sec must be positive, got %.2f. Using default 5.0s",
                   cleanup_interval_sec);
       cleanup_interval_sec = 5.0;
@@ -454,7 +461,15 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
           // A timer-driven confirmation is a confirmation: it has to reach the
           // event stream and the black box exactly like one raised by a report,
           // or subscribers see no alarm and no recording is ever made for it.
-          publish_fault_event(ros2_medkit_msgs::msg::FaultEvent::EVENT_CONFIRMED, *fault);
+          //
+          // Muting is checked for the same reason the report path checks it: a
+          // symptom suppressed by a root cause must not be announced, or SSE and
+          // the trigger subscribers see an alarm that the fault list hides.
+          // Capture is deliberately not gated, matching the report path, where
+          // just_confirmed is set regardless of muting.
+          if (!correlation_engine_ || !correlation_engine_->is_muted(fault_code)) {
+            publish_fault_event(ros2_medkit_msgs::msg::FaultEvent::EVENT_CONFIRMED, *fault);
+          }
           capture_on_confirm(fault_code);
         }
       }
@@ -462,13 +477,16 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
     });
     RCLCPP_INFO(get_logger(),
                 "FaultManager node started (storage=%s, confirmation_threshold=%d, "
-                "healing=%s, auto_confirm_after=%.1fs)",
+                "healing=%s, healing_threshold=%d, auto_confirm_after=%.1fs)",
                 storage_type_.c_str(), global_config_.confirmation_threshold,
-                global_config_.healing_enabled ? "enabled" : "disabled", auto_confirm_after_sec_);
+                global_config_.healing_enabled ? "enabled" : "disabled", global_config_.healing_threshold,
+                auto_confirm_after_sec_);
   } else {
-    RCLCPP_INFO(get_logger(), "FaultManager node started (storage=%s, confirmation_threshold=%d, healing=%s)",
+    RCLCPP_INFO(get_logger(),
+                "FaultManager node started (storage=%s, confirmation_threshold=%d, healing=%s, "
+                "healing_threshold=%d)",
                 storage_type_.c_str(), global_config_.confirmation_threshold,
-                global_config_.healing_enabled ? "enabled" : "disabled");
+                global_config_.healing_enabled ? "enabled" : "disabled", global_config_.healing_threshold);
   }
 }
 
@@ -538,7 +556,7 @@ std::unique_ptr<FaultStorage> FaultManagerNode::create_storage() {
 std::unique_ptr<FaultAuditLog> FaultManagerNode::create_audit_log() {
   const bool enabled = declare_parameter<bool>("audit_log.enabled", false);
 
-  // Which transitions to record: "all" (occurred/confirmed/cleared) or
+  // Which transitions to record: "all" (occurred/confirmed/healed/cleared) or
   // "confirmed_only".
   const std::string transitions = declare_parameter<std::string>("audit_log.transitions", "all");
   audit_confirmed_only_ = (transitions == "confirmed_only");
@@ -670,6 +688,12 @@ void FaultManagerNode::audit_transition(const char * transition, const ros2_medk
 }
 
 void FaultManagerNode::capture_on_confirm(const std::string & fault_code) {
+  // Capture snapshots/rosbag when a fault confirms, via the bounded pool.
+  // Both callers - the report handler and the auto-confirm timer - run on the
+  // node's single-threaded executor, so confirmations are already serialized;
+  // last_capture_mutex_ only guards last_capture_times_ itself (the cooldown
+  // check, the update below, and the expired-entry sweep). It is taken solely
+  // when the cooldown is enabled, since the map is otherwise never touched.
   if (!capture_pool_) {
     return;
   }
@@ -875,11 +899,6 @@ void FaultManagerNode::handle_report_fault(
       audit_transition(kTransitionHealed, *fault_after, "auto_heal", event_time.nanoseconds());
     }
 
-    // Capture snapshots/rosbag when a fault confirms via the bounded pool (issue #441).
-    // handle_report_fault runs on the single-threaded executor, so confirmations are
-    // already serialized; last_capture_mutex_ only guards last_capture_times_ itself
-    // (the cooldown check, the update below, and the expired-entry sweep). It is taken
-    // solely when the cooldown is enabled, since the map is otherwise never touched.
     if (just_confirmed) {
       capture_on_confirm(request->fault_code);
     }
@@ -1174,7 +1193,7 @@ SnapshotConfig FaultManagerNode::create_snapshot_config() {
 
   // Validate timeout_sec (must be positive)
   config.timeout_sec = declare_parameter<double>("snapshots.timeout_sec", 1.0);
-  if (config.timeout_sec <= 0.0) {
+  if (!(std::isfinite(config.timeout_sec) && config.timeout_sec > 0.0)) {
     RCLCPP_WARN(get_logger(), "snapshots.timeout_sec must be positive, got %.2f. Using default 1.0s",
                 config.timeout_sec);
     config.timeout_sec = 1.0;
@@ -1211,14 +1230,14 @@ SnapshotConfig FaultManagerNode::create_snapshot_config() {
   config.rosbag.enabled = declare_parameter<bool>("snapshots.rosbag.enabled", false);
   if (config.rosbag.enabled) {
     config.rosbag.duration_sec = declare_parameter<double>("snapshots.rosbag.duration_sec", 5.0);
-    if (config.rosbag.duration_sec <= 0.0) {
+    if (!(std::isfinite(config.rosbag.duration_sec) && config.rosbag.duration_sec > 0.0)) {
       RCLCPP_WARN(get_logger(), "snapshots.rosbag.duration_sec must be positive, got %.2f. Using default 5.0s",
                   config.rosbag.duration_sec);
       config.rosbag.duration_sec = 5.0;
     }
 
     config.rosbag.duration_after_sec = declare_parameter<double>("snapshots.rosbag.duration_after_sec", 1.0);
-    if (config.rosbag.duration_after_sec < 0.0) {
+    if (!(std::isfinite(config.rosbag.duration_after_sec) && config.rosbag.duration_after_sec >= 0.0)) {
       RCLCPP_WARN(get_logger(), "snapshots.rosbag.duration_after_sec must be non-negative, got %.2f. Using 0.0s",
                   config.rosbag.duration_after_sec);
       config.rosbag.duration_after_sec = 0.0;

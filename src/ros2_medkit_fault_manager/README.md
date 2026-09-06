@@ -47,7 +47,8 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 ## Features
 
 - **Multi-source aggregation**: Same `fault_code` from different sources creates a single fault
-- **Occurrence tracking**: Counts total reports and tracks all reporting sources
+- **Occurrence tracking**: Counts outages, not reports - the count starts at one and rises only
+  when a cleared fault is raised again - and tracks all reporting sources
 - **Severity escalation**: Fault severity is updated if a higher severity is reported
 - **Persistent storage**: SQLite backend ensures faults survive node restarts
 - **Debounce filtering** (optional): AUTOSAR DEM-style counter-based fault confirmation with per-entity threshold overrides
@@ -256,7 +257,9 @@ The fault manager uses an AUTOSAR DEM-style debounce model:
 The counter is always clamped to `[confirmation_threshold, healing_threshold]`, so a long run of
 one-sided events cannot push it out to the integer limits and delay the opposite transition.
 `confirmation_threshold < 0 <= healing_threshold` is required (`healing_threshold = 0` heals on a
-single PASSED event); invalid thresholds fall back to safe defaults with a warning.
+single PASSED event). A positive confirmation threshold or a negative healing threshold is
+sign-flipped with a warning, so `5` becomes `-5`; a confirmation threshold of `0` is then
+rejected and falls back to `-1`.
 
 `CONFIRMED` and `HEALED` are **latched** (hysteresis): once reached, the status holds until the
 counter reaches the opposite threshold, so a single opposite-direction event cannot flip it. As a
@@ -320,7 +323,7 @@ PREFAILED -----> CONFIRMED -----> HEALED (retained)
 
 | Status | Description |
 |--------|-------------|
-| `PREFAILED` | Debounce counter < 0, not yet confirmed |
+| `PREFAILED` | Not yet confirmed. Usually a negative counter, but a fault that returns to 0 keeps the status it had |
 | `CONFIRMED` | Fault is active and verified |
 | `HEALED` | Resolved via PASSED events (if healing enabled) |
 | `CLEARED` | Manually acknowledged via `~/clear_fault` |
@@ -504,9 +507,10 @@ names automatically via the `fault_manager.namespace` parameter:
 
 ```yaml
 # gateway_params.yaml
-fault_manager:
-  namespace: "robot1"          # -> /robot1/fault_manager/list_faults
-  service_timeout_sec: 5.0
+ros2_medkit_gateway:
+  ros__parameters:
+    fault_manager.namespace: "robot1"      # -> /robot1/fault_manager/list_faults
+    fault_manager.service_timeout_sec: 5.0
 ```
 
 Launch the fault manager in a namespace:
