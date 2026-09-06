@@ -39,7 +39,7 @@ import launch_testing.markers
 import rclpy
 from rclpy.node import Node
 from ros2_medkit_msgs.msg import Fault, FaultEvent
-from ros2_medkit_msgs.srv import GetSnapshots, ReportFault
+from ros2_medkit_msgs.srv import GetSnapshots, ListFaults, ReportFault
 from sensor_msgs.msg import Temperature
 
 # Below -1 so the first FAILED lands in PREFAILED and only the timer can promote it.
@@ -69,6 +69,7 @@ def generate_test_description():
 
     pkg_share = get_package_share_directory('ros2_medkit_fault_manager')
     snapshot_config = os.path.join(pkg_share, 'test', 'test_snapshots.yaml')
+    correlation_config = os.path.join(pkg_share, 'test', 'test_correlation.yaml')
 
     fault_manager_node = launch_ros.actions.Node(
         package='ros2_medkit_fault_manager',
@@ -84,6 +85,9 @@ def generate_test_description():
             'snapshots.config_file': snapshot_config,
             'snapshots.timeout_sec': 3.0,
             'snapshots.background_capture': False,
+            # Carries a hierarchical rule with mute_symptoms, so a symptom of
+            # ESTOP_001 is muted while the timer still confirms it.
+            'correlation.config_file': correlation_config,
         }],
         sigterm_timeout='30',
         sigkill_timeout='15',
@@ -112,6 +116,7 @@ class TestAutoConfirmVisibility(unittest.TestCase):
             cls.snapshot_client = cls.node.create_client(
                 GetSnapshots, '/fault_manager/get_snapshots'
             )
+            cls.list_client = cls.node.create_client(ListFaults, '/fault_manager/list_faults')
             cls.temp_publisher = cls.node.create_publisher(Temperature, '/test/temperature', 10)
 
             cls.events = []
@@ -124,6 +129,8 @@ class TestAutoConfirmVisibility(unittest.TestCase):
                 'report_fault service not available'
             assert cls.snapshot_client.wait_for_service(timeout_sec=30.0), \
                 'get_snapshots service not available'
+            assert cls.list_client.wait_for_service(timeout_sec=30.0), \
+                'list_faults service not available'
 
             # The publisher uses volatile durability, so an event sent before the
             # subscription matches is lost. Without this wait an assertion that
@@ -266,6 +273,52 @@ class TestAutoConfirmVisibility(unittest.TestCase):
         self.assertIn(
             '/test/temperature', parsed['topics'],
             f'the configured topic was not captured, only {list(parsed["topics"])}'
+        )
+
+    def test_04_a_muted_symptom_is_confirmed_but_not_announced(self):
+        """
+        The gate the report path has and the timer used to be missing.
+
+        Correlation mutes a symptom so that only its root cause is announced.
+        The report path wraps every confirmation publish in that check; the
+        timer did not, so a symptom promoted by the timer reached subscribers
+        while the default fault list still hid it. The symptom must still
+        confirm in the store: it is the announcement that is suppressed, not
+        the confirmation.
+        """
+        root = 'ESTOP_001'
+        symptom = 'MOTOR_COMM_1'
+
+        # Root first, then the symptom inside the rule's window, so correlation
+        # sees the second as caused by the first.
+        self._report_failed(root)
+        self._report_failed(symptom)
+
+        root_event = self._wait_for_confirmed_event(root, CONFIRM_WAIT_SEC)
+        self.assertIsNotNone(root_event, 'the root cause was never announced')
+
+        # Give the timer a full further window: if the symptom were going to be
+        # announced, it would have been by now.
+        self._spin_for(AUTO_CONFIRM_SEC + 2.0)
+        announced = [
+            e for e in self._events_for(symptom) if e.event_type == FaultEvent.EVENT_CONFIRMED
+        ]
+        self.assertEqual(
+            [], announced,
+            'a muted symptom was announced as confirmed, which is what muting exists to prevent'
+        )
+
+        request = ListFaults.Request()
+        request.statuses = ['CONFIRMED']
+        request.include_muted = True
+        future = self.list_client.call_async(request)
+        rclpy.spin_until_future_complete(self.node, future, timeout_sec=30.0)
+        self.assertIsNotNone(future.result(), 'ListFaults timed out')
+        confirmed = [f.fault_code for f in future.result().faults]
+        self.assertIn(
+            symptom, confirmed,
+            'the symptom never confirmed, so this run does not show that muting is what '
+            'suppressed the event'
         )
 
     def _wait_for_snapshot(self, fault_code, timeout_sec):
