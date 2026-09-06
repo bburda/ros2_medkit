@@ -1,0 +1,37 @@
+# Copyright 2026 bburda
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# EndPlannedStop.srv - cut a planned-stop window short.
+#
+# Ending a window moves its ends_at to the given instant and marks it
+# ended_early. Faults whose cycle started before that instant stay expected;
+# faults raised after it do not. A window whose ends_at has already passed
+# cannot be ended again.
+
+# Identifier of the window to end
+string id
+
+# Instant the window should end at (wall clock, UTC). Zero means "now", which
+# is what an operator pressing stop means.
+builtin_interfaces/Time at
+---
+# True when the window was ended
+bool success
+
+# Why the request was refused; empty on success. Distinguishes an unknown id
+# from a window that has already ended.
+string message
+
+# The window as stored after the request. Meaningful only when success.
+PlannedStop stop

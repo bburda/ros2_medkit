@@ -32,6 +32,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/EnvironmentData.msg"
   "msg/MedkitDiscoveryHint.msg"
   "msg/EntityInfo.msg"
+  "msg/PlannedStop.msg"
   "srv/ReportFault.srv"
   "srv/ListFaults.srv"
   "srv/GetFault.srv"
@@ -43,6 +44,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ListEntities.srv"
   "srv/GetEntityData.srv"
   "srv/GetCapabilities.srv"
+  "srv/DeclarePlannedStop.srv"
+  "srv/EndPlannedStop.srv"
+  "srv/ListPlannedStops.srv"
   DEPENDENCIES builtin_interfaces diagnostic_msgs
 )
 

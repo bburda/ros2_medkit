@@ -1,0 +1,40 @@
+# Copyright 2026 bburda
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# DeclarePlannedStop.srv - declare a window during which faults are expected.
+#
+# Windows may overlap and may lie wholly in the past: a stop is a fact about
+# the plant, not about when someone typed it in. The only refusal is a window
+# that does not describe an interval (ends_at <= starts_at).
+
+# Start of the window (wall clock, UTC)
+builtin_interfaces/Time starts_at
+
+# End of the window (wall clock, UTC); must be strictly after starts_at
+builtin_interfaces/Time ends_at
+
+# Why the plant is stopping
+string reason
+
+# Who is declaring it; empty means the caller did not say
+string declared_by
+---
+# True when the window was stored
+bool success
+
+# Why the declaration was refused; empty on success
+string message
+
+# The stored window, including its assigned id. Meaningful only when success.
+PlannedStop stop

@@ -73,6 +73,22 @@ Real-time fault event notification for SSE streaming (published on `/fault_manag
 | `EVENT_CLEARED` | Fault ends: CLEARED via ClearFault, or HEALED by PASSED events (`fault.status` tells which) |
 | `EVENT_UPDATED` | Fault data changes without status transition |
 
+### PlannedStop.msg
+
+A window of wall-clock time during which faults are expected. An operator declares the window at runtime; the fault manager stores it and serves it. Nothing in the fault pipeline consults a window - a fault whose cycle starts inside one is confirmed, healed, cleared, captured, published and audited exactly as any other fault. The window only lets a reader tell the two apart.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Server-assigned identifier, unique within one fault manager |
+| `starts_at` | builtin_interfaces/Time | Start of the window (wall clock, UTC) |
+| `ends_at` | builtin_interfaces/Time | End of the window (wall clock, UTC); always strictly after `starts_at` |
+| `reason` | string | Why the plant is stopping |
+| `declared_by` | string | Authenticated client id, or `anonymous` |
+| `declared_at` | builtin_interfaces/Time | When the declaration was recorded; retention orders by this field |
+| `ended_early` | bool | True when an operator cut the window short |
+
+A fault is expected when its `first_occurred` lies in `[starts_at, ends_at]`. The fields are named `starts_at` / `ends_at` rather than `from` / `to` because a message field named `from` is a Python keyword and rosidl cannot generate a binding for it; the gateway's REST representation of the same window uses `from` and `to`.
+
 ## Services
 
 ### ReportFault.srv
@@ -137,6 +153,55 @@ Clear/acknowledge a fault. Cleared faults are retained and queryable with `statu
 | `auto_cleared_codes` | string[] | Symptom fault codes auto-cleared with the root cause (empty when `skip_correlation_auto_clear=true`) |
 
 > **Note:** `skip_correlation_auto_clear` was added in `ros2_medkit_msgs` post-0.4.0. Adding a request field changes the service type hash, so out-of-tree callers that invoke `/fault_manager/clear_fault` directly (via `ros2 service call` or a generated client) must rebuild against the new `ros2_medkit_msgs` release to keep talking to `fault_manager`.
+
+### DeclarePlannedStop.srv
+
+Declare a window during which faults are expected. Windows may overlap and may lie wholly in the past.
+
+**Request:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `starts_at` | builtin_interfaces/Time | Start of the window (wall clock, UTC) |
+| `ends_at` | builtin_interfaces/Time | End of the window; must be strictly after `starts_at` |
+| `reason` | string | Why the plant is stopping |
+| `declared_by` | string | Who is declaring it; empty means the caller did not say |
+
+**Response:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | bool | True when the window was stored |
+| `message` | string | Why the declaration was refused; empty on success |
+| `stop` | PlannedStop | The stored window, including its assigned id |
+
+### EndPlannedStop.srv
+
+Cut a window short: `ends_at` moves to the given instant and `ended_early` becomes true. Faults whose cycle started before that instant stay expected; faults raised after it do not. A window whose `ends_at` has already passed cannot be ended again.
+
+**Request:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Identifier of the window to end |
+| `at` | builtin_interfaces/Time | Instant to end at; zero means the fault manager's own wall clock |
+
+**Response:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | bool | True when the window was ended |
+| `message` | string | Why the request was refused; distinguishes an unknown id from an already-ended window |
+| `stop` | PlannedStop | The window as stored after the request |
+
+### ListPlannedStops.srv
+
+**Request:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `active_only` | bool | When true, return only the windows containing `now` |
+| `now` | builtin_interfaces/Time | The instant `active_only` is evaluated against; zero means the fault manager's own wall clock |
+
+**Response:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `stops` | PlannedStop[] | Every stored window, newest declaration first |
 
 ## Usage
 
