@@ -573,6 +573,15 @@ TEST_F(EntityFreezeFrameCaptureTest, DisconnectedEntityWithLastKnownValuesIsCapt
   ASSERT_TRUE(frames[0].connected.has_value());
   EXPECT_FALSE(*frames[0].connected);
   EXPECT_EQ(frames[0].source_timestamp, 1234567890);
+  // Which path read the values. This capture had no DataProvider and went
+  // through the route fallback, so the frame must name that path; the
+  // DataProvider flavour of the same case asserts the other constant, which is
+  // what stops the two from being swapped at their call sites unnoticed.
+  EXPECT_EQ(frames[0].source, EntityFreezeFrameCapture::kSourceXPlcDataRoute);
+  // The wire value itself, not just the symbol: swapping what the two constants
+  // hold is an API break for every consumer of x-medkit.source, and comparing
+  // symbol against symbol would not see it.
+  EXPECT_EQ(frames[0].source, "plugin_x_plc_data_route");
 }
 
 /// @verifies REQ_INTEROP_088
@@ -642,6 +651,11 @@ TEST_F(EntityFreezeFrameCaptureTest, DisconnectedDataProviderWithLastKnownValues
   ASSERT_TRUE(frames[0].connected.has_value());
   EXPECT_FALSE(*frames[0].connected);
   EXPECT_TRUE(frames[0].source_timestamp.is_null());  // provider content has no timestamp field
+  // The provider path names itself, and the route path (same case, above) names
+  // the other constant: the pair is what makes a swap of the two call sites
+  // visible. The literal pins the wire value the API reference documents.
+  EXPECT_EQ(frames[0].source, EntityFreezeFrameCapture::kSourceDataProvider);
+  EXPECT_EQ(frames[0].source, "plugin_data_provider");
 }
 
 /// @verifies REQ_INTEROP_088
@@ -805,9 +819,12 @@ TEST(MergeEntityFreezeFrames, CarriesCapturePathAsSource) {
   EXPECT_EQ(snap["message_type"], "");
 }
 
-TEST(MergeEntityFreezeFrames, OmitsSourceWhenTheCaptureNamedNoPath) {
-  // Absence control for the test above, on the same harness: a frame whose
-  // capture path is unknown must not have one invented for it.
+TEST(MergeEntityFreezeFrames, OmitsSourceForAFrameThatNamesNoPath) {
+  // A merge-helper contract, not a control for the capture tests: both capture
+  // paths always name themselves (asserted from real captures in
+  // Disconnected{Entity,DataProvider}WithLastKnownValuesIsCaptured), so this
+  // frame is one only a caller can build. The helper must then leave the key
+  // out rather than invent a provenance the wire consumer would trust.
   json env_data = {{"snapshots", json::array()}};
   EntityFreezeFrameCapture::Frame frame;
   frame.entity_id = "plc_app";

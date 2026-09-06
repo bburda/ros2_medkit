@@ -1058,10 +1058,14 @@ TEST(GatewayStartupSummary, CountPeerNodesExcludesOwnAndHidden) {
 }
 
 TEST(GatewayStartupSummary, CountPeerNodesZeroWhenOnlyOwnNodes) {
+  // Every helper the gateway creates inside its own process. A gateway alone on
+  // the graph must report zero peers, so each helper has to be recognized -
+  // including the lifecycle reader, which the list previously omitted.
   const std::vector<std::pair<std::string, std::string>> nodes = {
       {"ros2_medkit_gateway", "/"},
       {"ros2_medkit_gateway_sub", "/"},
       {"ros2_medkit_gateway_fault_clients", "/"},
+      {"ros2_medkit_gateway_lifecycle_state_reader", "/"},
   };
   // Zero peers is the condition that triggers the empty-graph warning.
   EXPECT_EQ(ros2_medkit_gateway::GatewayNode::count_peer_nodes(nodes, "/ros2_medkit_gateway"), 0u);
