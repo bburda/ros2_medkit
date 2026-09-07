@@ -146,7 +146,7 @@ Declare, or withdraw, a planned stop on the FaultManager.
 | Field | Type | Description |
 |-------|------|-------------|
 | `active` | bool | `true` declares a planned stop, `false` withdraws it |
-| `reason` | string | Why the plant is stopped; recorded in the audit log and served by `GetPlannedStop` |
+| `reason` | string | Why the plant is stopped; recorded in the audit log and served by `GetPlannedStop`, including after the withdrawal |
 | `declared_by` | string | Who declared the transition; recorded as the audit record's source |
 
 **Response:**
@@ -156,25 +156,34 @@ Declare, or withdraw, a planned stop on the FaultManager.
 | `message` | string | Status or error message |
 | `was_active` | bool | The state of the switch before this request |
 
-While a planned stop is on, a fault whose cycle starts is reported, debounced, confirmed,
-captured and audited unchanged, and is marked as muted: absent from the default
-`ListFaults` response, counted in `muted_count`, listed under `muted_faults` with
-`rule_id = "planned_stop"` when `include_muted` is set, and never published as a
-`FaultEvent`. Withdrawing the stop unmutes every fault it muted that is still active and
-publishes one `EVENT_CONFIRMED` for each of those that is CONFIRMED. A request asking for
-the state the switch is already in succeeds, changes nothing, and writes no audit record.
+While a planned stop is on, a fault whose cycle *starts* is reported, debounced,
+confirmed, captured and audited unchanged, and is marked as muted: absent from the default
+`ListFaults` response, counted in `muted_count`, and listed under `muted_faults` with
+`rule_id = "planned_stop"` when `include_muted` is set. A cycle that started *before* the
+stop is untouched - reporters re-send FAILED for as long as a condition holds, and that
+fault's confirmation has already been announced.
+
+Publication matches a rule-muted symptom exactly: `EVENT_CONFIRMED` and `EVENT_UPDATED`
+are withheld, `EVENT_CLEARED` is published as usual. Withdrawing the stop unmutes every
+fault it alone was muting and publishes one `EVENT_CONFIRMED` for each of those that is
+CONFIRMED. A request asking for the state the switch is already in succeeds, changes
+nothing, and writes no audit record; a request the store cannot record answers
+`success: false` and changes nothing. Audit records exist only when `audit_log.enabled`
+is set, which it is not by default.
 
 ### GetPlannedStop.srv
 
-Read the planned-stop declaration. The request carries no fields.
+Read the planned-stop declaration, or - once it has been withdrawn - the last one there
+was. The request carries no fields.
 
 **Response:**
 | Field | Type | Description |
 |-------|------|-------------|
 | `active` | bool | Whether a planned stop is declared |
-| `reason` | string | The reason given when it was declared; empty while none is |
-| `declared_by` | string | Who declared it; empty while none is declared |
-| `since` | builtin_interfaces/Time | When it was declared, wall clock; zero while none is |
+| `reason` | string | The reason given when it was declared; retained after the withdrawal |
+| `declared_by` | string | Who declared it; retained after the withdrawal |
+| `since` | builtin_interfaces/Time | When it was declared, wall clock |
+| `ended_at` | builtin_interfaces/Time | When it was withdrawn; zero while one is in force |
 
 ## Usage
 
