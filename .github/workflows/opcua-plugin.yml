@@ -244,13 +244,24 @@ jobs:
           docker network rm plc-demo 2>/dev/null || true
 
   integration-alarms:
-    name: Integration (AlarmConditionType)
+    name: Integration (AlarmConditionType, ${{ matrix.variant }})
     # Issue #386: tests the native OPC-UA AlarmCondition subscription bridge
     # against the test_alarm_server fixture (open62541 with FULL ns0 + alarms
     # ON). Independent of the OpenPLC threshold-mode integration above; runs
     # in parallel.
+    #
+    # Both write surfaces, like the OpenPLC job: acknowledging a condition
+    # changes its state on the controller, so the read-only leg asserts the
+    # refusal and that the condition stays unacknowledged on the server, and the
+    # write-capable leg asserts the acknowledge reaches it. The script builds the
+    # gateway image itself and derives the build arg from the same variable, so
+    # the image and the expectations cannot drift apart.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [read-only, write-capable]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -262,6 +273,8 @@ jobs:
           pip3 install --break-system-packages asyncua
 
       - name: Run alarm integration suite
+        env:
+          MEDKIT_OPCUA_VARIANT: ${{ matrix.variant }}
         run: bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/run_alarm_tests.sh
 
       - name: Dump container logs on failure
