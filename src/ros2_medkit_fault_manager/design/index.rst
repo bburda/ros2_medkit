@@ -186,6 +186,17 @@ Clears (acknowledges) a fault by setting its status to CLEARED.
 - **Idempotent**: Clearing an already-cleared fault succeeds
 - **Returns**: ``success=true`` if fault existed, ``success=false`` if not found
 
+~/set_planned_stop and ~/get_planned_stop
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Declares, withdraws and reads the planned stop.
+
+- **One declaration per manager**: the stop is a fact about the installation, not about a fault
+- **Idempotent**: a request for the state the switch is already in succeeds, changes nothing and writes no audit record; ``was_active`` tells the caller which of the two happened
+- **Audited**: each real transition appends ``planned_stop_started`` / ``planned_stop_ended`` with the reason and the declarer
+- **Persisted**: stored in the fault store, so the declaration outlives the process (SQLite backend)
+- **Returns**: ``success``, a message, and the state the switch was in before the call
+
 Design Decisions
 ----------------
 
@@ -245,6 +256,34 @@ means heal on a single PASSED event); the node validates the
 merged per-entity config at startup, logs a warning, and falls back to safe defaults if not. When
 healing is disabled, any HEALED row left by a previous (healing-enabled) run is reclassified to
 CLEARED once at startup so it does not behave inconsistently under the latch.
+
+Planned Stop as a Second Mute Source
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Maintenance produces faults that are real, correctly detected, and not news. The
+planned stop marks them instead of dropping them: while it stands, a fault whose
+cycle starts is registered in the correlation engine as muted with
+``rule_id = "planned_stop"`` and the pseudo root cause ``PLANNED_STOP``, and
+everything else about it - debounce, confirmation, snapshot and rosbag capture,
+the audit records - happens exactly as it would otherwise. Dropping the report
+instead was rejected because the bridges send one FAILED per transition: a fault
+that outlived the stop would never be raised again.
+
+The engine keeps the codes the stop muted in a set of its own, separate from the
+mute map, and that set is what makes the two sources compose. A code leaves it the
+moment a rule claims the mute, so withdrawing the stop cannot release a symptom a
+rule is still holding down; and it leaves on ``process_clear``, so a fault
+acknowledged inside the stop is not handed back at the withdrawal.
+
+Withdrawing releases the rest and publishes ``EVENT_CONFIRMED`` once for each
+released fault that is CONFIRMED. That republication is the point of marking
+rather than dropping: the confirmation happened behind the mute, no consumer of
+the event stream ever heard it, and the condition still stands on the machine.
+
+The switch is a service rather than a parameter because it carries a reason and a
+declarer and produces an audit record, none of which a parameter can do; and it is
+not a new HTTP route because the gateway already exposes a node's services as SOVD
+operations on its App entity.
 
 Rosbag Black-Box Recording
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

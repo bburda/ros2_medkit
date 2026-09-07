@@ -294,6 +294,40 @@ Retrieve diagnostic snapshots captured at fault occurrence time.
 
 See :doc:`/tutorials/snapshots` for detailed usage.
 
+SetPlannedStop.srv / GetPlannedStop.srv
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Declare, withdraw and read a planned stop on the fault manager.
+
+.. code-block:: text
+
+   # SetPlannedStop.srv
+   bool active          # true declares a planned stop, false withdraws it
+   string reason        # why the plant is stopped
+   string declared_by   # who declared the transition
+   ---
+   bool success         # true when the request was applied
+   string message       # status or error description
+   bool was_active      # the state of the switch before this request
+
+   # GetPlannedStop.srv
+   ---
+   bool active                    # whether a planned stop is declared
+   string reason                  # the reason given; empty while none is declared
+   string declared_by             # who declared it; empty while none is declared
+   builtin_interfaces/Time since  # when it was declared; zero while none is
+
+While a planned stop is on, a fault whose cycle starts is reported, debounced,
+confirmed, captured and audited unchanged, and is marked as muted: absent from
+the default ``ListFaults`` response, counted in ``muted_count``, listed under
+``muted_faults`` with ``rule_id: planned_stop`` when ``include_muted`` is set,
+and never published as a ``FaultEvent``. Withdrawing the stop releases every
+fault it alone was muting and publishes one ``EVENT_CONFIRMED`` per released
+fault that is CONFIRMED.
+
+See :doc:`/config/fault-manager` for the configuration that decides whether the
+declaration survives a restart and whether the transitions are audited.
+
 MedkitDiscoveryHint.msg
 ~~~~~~~~~~~~~~~~~~~~~~~
 

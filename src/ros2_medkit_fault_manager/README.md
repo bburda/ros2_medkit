@@ -43,6 +43,72 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 | `~/list_faults` | `ros2_medkit_msgs/srv/ListFaults` | Query faults with filtering |
 | `~/clear_fault` | `ros2_medkit_msgs/srv/ClearFault` | Clear/acknowledge a fault |
 | `~/get_snapshots` | `ros2_medkit_msgs/srv/GetSnapshots` | Get topic snapshots for a fault |
+| `~/set_planned_stop` | `ros2_medkit_msgs/srv/SetPlannedStop` | Declare or withdraw a planned stop |
+| `~/get_planned_stop` | `ros2_medkit_msgs/srv/GetPlannedStop` | Read the planned-stop declaration |
+
+## Planned Stop
+
+Maintenance produces faults that nobody wants paged: a robot on a bench raises
+`NODE_UNREACHABLE` for every peer it can no longer see, and the alarm reaches
+whoever is on call. The planned stop is the operator saying "this is us, not the
+plant".
+
+```bash
+ros2 service call /fault_manager/set_planned_stop ros2_medkit_msgs/srv/SetPlannedStop \
+  "{active: true, reason: 'line 3 quarterly maintenance', declared_by: 'shift_lead'}"
+
+ros2 service call /fault_manager/get_planned_stop ros2_medkit_msgs/srv/GetPlannedStop "{}"
+```
+
+**Marked, never dropped.** While the stop stands, a fault whose cycle starts goes
+through report, debounce, confirmation, snapshot and rosbag capture and the audit
+log exactly as it would otherwise. What changes is only how it is *shown*: it is
+registered as muted with `rule_id: planned_stop` and the pseudo root cause
+`PLANNED_STOP`, so it is absent from the default `~/list_faults` response,
+counted in `muted_count`, listed under `muted_faults` when `include_muted` is
+set, and never published on `~/events`.
+
+**Withdrawing releases the survivors.** Every fault the stop alone was muting and
+that is still active is unmuted, and each one that is CONFIRMED publishes a single
+`EVENT_CONFIRMED` - that confirmation happened behind the mute and was never
+announced, while the condition it reports still stands on the machine. A fault
+still short of confirmation announces nothing (there is nothing yet to announce),
+and one acknowledged during the stop announces nothing either.
+
+**Correlation rules and the stop compose.** A fault a rule mutes stays muted by
+that rule, and withdrawing the stop does not release it. A fault the stop muted
+that a rule later claims likewise stays muted after the withdrawal: two
+independent reasons to be quiet, and one of them going away is not both.
+
+**Both transitions are audited** as `planned_stop_started` and
+`planned_stop_ended`, carrying the reason in `description` and the declarer in
+`source_id`, with an empty `fault_code` because the transition is about the
+installation rather than one fault. They are recorded whatever
+`audit_log.transitions` says, like the log's own activation markers. A request
+asking for the state the switch is already in succeeds, changes nothing and
+records nothing, so a retried call cannot manufacture evidence of a stop that
+never started.
+
+**The declaration survives a restart** when the SQLite backend is in use: it is a
+row in the fault store, so a stop declared on Friday still mutes on Monday. The
+in-memory backend has no file behind it and starts every process with no
+declaration. Faults muted *before* a restart are not restored - their mute lived
+in the process that is gone - so a restart inside a stop makes those visible
+again while every fault reported after it is muted afresh.
+
+**Over SOVD.** The gateway maps a node's services to operations on its App entity,
+so an operator reaches the switch without any new route:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/apps/fault_manager/operations/set_planned_stop/executions \
+  -H 'Content-Type: application/json' \
+  -d '{"parameters": {"active": true, "reason": "line 3 maintenance", "declared_by": "shift_lead"}}'
+```
+
+That works out of the box in `runtime_only` discovery, where every node is an
+App. In `hybrid` or `manifest_only` discovery the fault manager has to be
+declared in the manifest like any other entity, or there is no `fault_manager`
+entity to address.
 
 ## Features
 
@@ -55,6 +121,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 - **Snapshot capture**: Captures topic data when faults are confirmed for debugging (snapshots are deleted when fault is cleared)
 - **Near-miss series**: Appends one entry per FAILED report that moved the debounce counter without confirming, bounded per fault code and retained when the fault is cleared
 - **Freeze-frame retention**: One compact JSON freeze-frame per fault code, retained across `clear_fault` (see below)
+- **Planned stop**: An operator declares the plant deliberately down, and faults raised while it stands are marked rather than announced (see below)
 - **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear
 - **Tamper-evident audit log** (optional): Append-only, hash-chained record of fault state transitions for verifiable history
 
