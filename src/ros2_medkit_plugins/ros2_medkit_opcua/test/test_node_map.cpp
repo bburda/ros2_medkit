@@ -115,8 +115,15 @@ TEST_F(NodeMapTest, WritableEntries) {
   ASSERT_TRUE(map.load(yaml_path_));
 
   auto writable = map.writable_entries_for_entity("fill_pump");
+#if MEDKIT_OPCUA_READ_ONLY
+  // The fixture map declares pump_speed as writable: true. A read-only build
+  // has no write path, so the request is ignored and no entity has a writable
+  // entry, whatever the file says.
+  EXPECT_TRUE(writable.empty());
+#else
   EXPECT_EQ(writable.size(), 1u);
   EXPECT_EQ(writable[0]->data_name, "pump_speed");
+#endif
 
   auto tank_writable = map.writable_entries_for_entity("tank_process");
   EXPECT_TRUE(tank_writable.empty());
@@ -142,7 +149,11 @@ TEST_F(NodeMapTest, FindByNodeId) {
   auto * entry = map.find_by_node_id("ns=1;s=PumpSpeed");
   ASSERT_NE(entry, nullptr);
   EXPECT_EQ(entry->entity_id, "fill_pump");
+#if MEDKIT_OPCUA_READ_ONLY
+  EXPECT_FALSE(entry->writable) << "writable: true in the file must not survive a read-only build";
+#else
   EXPECT_TRUE(entry->writable);
+#endif
 }
 
 TEST_F(NodeMapTest, AlarmEntries) {
@@ -199,7 +210,13 @@ TEST_F(NodeMapTest, EntityDefs) {
 
   ASSERT_NE(pump_def, nullptr);
   EXPECT_EQ(pump_def->data_names.size(), 2u);
+#if MEDKIT_OPCUA_READ_ONLY
+  // No writable entry means no set_* operation and no x-plc-operations
+  // capability: the tree cannot advertise a write this build cannot perform.
+  EXPECT_TRUE(pump_def->writable_names.empty());
+#else
   EXPECT_EQ(pump_def->writable_names.size(), 1u);
+#endif
   EXPECT_FALSE(pump_def->has_faults);
 }
 

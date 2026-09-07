@@ -77,11 +77,6 @@ TEST(OpcuaClientTest, ReadSourceConditionsReportsScanFailureWhenDisconnected) {
   EXPECT_FALSE(scan_ok);
 }
 
-TEST(OpcuaClientTest, WriteWhenDisconnected) {
-  OpcuaClient client;
-  EXPECT_FALSE(client.write_value({1, "SomeNode"}, 42.0));
-}
-
 TEST(OpcuaClientTest, CreateSubscriptionWhenDisconnected) {
   OpcuaClient client;
   auto id = client.create_subscription(500.0, [](const std::string &, const OpcuaValue &) {});
@@ -92,6 +87,16 @@ TEST(OpcuaClientTest, RemoveSubscriptionsWhenEmpty) {
   OpcuaClient client;
   // Should not crash
   client.remove_subscriptions();
+}
+
+#if !MEDKIT_OPCUA_READ_ONLY
+// OpcuaClient::write_value exists only in a write-capable build
+// (-DMEDKIT_OPCUA_READ_ONLY=OFF). A read-only build has no declaration for
+// these three to call, which is the source-level half of the property
+// test_opcua_build_variant asserts on the built object.
+TEST(OpcuaClientTest, WriteWhenDisconnected) {
+  OpcuaClient client;
+  EXPECT_FALSE(client.write_value({1, "SomeNode"}, 42.0));
 }
 
 TEST(OpcuaClientTest, WriteValueReturnsNotConnected) {
@@ -109,6 +114,7 @@ TEST(OpcuaClientTest, WriteValueWithTypeHintDisconnected) {
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, OpcuaClient::WriteError::NotConnected);
 }
+#endif  // !MEDKIT_OPCUA_READ_ONLY
 
 // ---------------------------------------------------------------------------
 // Issue #389: OPC-UA client security config parsing (pure helpers, no server).
@@ -300,12 +306,29 @@ TEST(OpcuaClientTest, RemoveEventMonitoredItemUnknownIdDoesNotBumpGeneration) {
   EXPECT_EQ(client.current_generation(), before);
 }
 
+// call_method itself is in both builds: ConditionRefresh rides on it and asks
+// the server to replay conditions rather than changing any.
 TEST(OpcuaClientTest, CallMethodWhenDisconnected) {
   OpcuaClient client;
   auto result = client.call_method(opcua::NodeId(0, UA_NS0ID_SERVER), opcua::NodeId(0, 11489), {});
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, OpcuaClient::MethodError::NotConnected);
 }
+
+#if !MEDKIT_OPCUA_READ_ONLY
+// Acknowledge / Confirm change condition state on the controller, so the entry
+// point that issues them exists only in a write-capable build - the same rule
+// write_value follows, and what test_opcua_build_variant checks on the object.
+TEST(OpcuaClientTest, CallConditionMethodWhenDisconnected) {
+  OpcuaClient client;
+  constexpr uint32_t kAcknowledgeMethodId = 9111;
+  auto result =
+      client.call_condition_method(opcua::NodeId(2, "Alarms.Overpressure"), opcua::NodeId(0, kAcknowledgeMethodId),
+                                   opcua::ByteString("event-id"), "comment");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, OpcuaClient::MethodError::NotConnected);
+}
+#endif  // !MEDKIT_OPCUA_READ_ONLY
 
 TEST(OpcuaClientTest, GenerationBumpsOnDisconnect) {
   OpcuaClient client;

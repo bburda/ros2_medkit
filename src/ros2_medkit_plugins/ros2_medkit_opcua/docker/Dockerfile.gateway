@@ -7,8 +7,16 @@ FROM ros:jazzy-ros-base AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 ENV COLCON_WS=/root/ws
 
+# apt-get update fetches package indexes from the distribution mirrors and
+# rosdep update fetches the distribution index from raw.githubusercontent.com.
+# Both are network reads that a reset connection fails outright, and both run
+# before anything of ours compiles, so a blip fails the whole build for a reason
+# that has nothing to do with the change under test. Three attempts, five
+# seconds apart; each attempt's own error text goes to stderr, so the last
+# failure is what a reader sees.
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN retry() { n=1; while :; do "$@" && return 0; [ "$n" -ge 3 ] && return 1; echo "attempt $n of 3 failed: $*" >&2; n=$((n+1)); sleep 5; done; }; \
+    retry apt-get update && apt-get install -y --no-install-recommends \
     python3-colcon-common-extensions nlohmann-json3-dev libcpp-httplib-dev \
     sqlite3 libsqlite3-dev libsystemd-dev libssl-dev libyaml-cpp-dev \
     pkg-config git ros-jazzy-ament-cmake-gtest ros-jazzy-yaml-cpp-vendor \
@@ -29,14 +37,24 @@ WORKDIR ${COLCON_WS}
 # test_depend and which rosdep tries to install even with BUILD_TESTING=OFF).
 # This was previously masked by Docker layer cache hits on CI; cold builds
 # always failed.
-RUN bash -c "source /opt/ros/jazzy/setup.bash && \
-    apt-get update && \
-    rosdep update && \
+# Same retry as above, for the same two commands. This is the RUN where a
+# reset connection to raw.githubusercontent.com aborts the build.
+RUN bash -c 'retry() { n=1; while :; do "$@" && return 0; [ "$n" -ge 3 ] && return 1; \
+      echo "attempt $n of 3 failed: $*" >&2; n=$((n+1)); sleep 5; done; }; \
+    source /opt/ros/jazzy/setup.bash && \
+    retry apt-get update && \
+    retry rosdep update && \
     rosdep install --from-paths src --ignore-src -r -y \
-      --skip-keys='ament_cmake_clang_format ament_cmake_clang_tidy test_msgs sqlite3 ros2_medkit_graph_provider python3-requests launch_testing_ament_cmake launch_testing launch_ros ament_index_python ros2_medkit_param_beacon nav2_msgs' && \
+      --skip-keys="ament_cmake_clang_format ament_cmake_clang_tidy test_msgs sqlite3 ros2_medkit_graph_provider python3-requests launch_testing_ament_cmake launch_testing launch_ros ament_index_python ros2_medkit_param_beacon nav2_msgs" && \
     rm -rf /var/lib/apt/lists/* && \
     colcon build --cmake-args -DBUILD_TESTING=OFF \
-      --packages-skip vda5050_agent ros2_medkit_vda5050_msgs ros2_medkit_opcua"
+      --packages-skip vda5050_agent ros2_medkit_vda5050_msgs ros2_medkit_opcua'
+
+# Which write surface the image ships. ON is the default the plugin itself
+# defaults to: no controller write path in the object. OFF builds the
+# write-capable image the OpenPLC suite uses to prove the write side still
+# works; it is not a deployment configuration.
+ARG MEDKIT_OPCUA_READ_ONLY=ON
 
 # Build the plugin separately so it picks up headers from the installed
 # ros2_medkit_gateway from the previous step. BUILD_TESTING=OFF avoids
@@ -45,7 +63,8 @@ RUN bash -c "source /opt/ros/jazzy/setup.bash && \
 RUN bash -c "source /opt/ros/jazzy/setup.bash && \
     source ${COLCON_WS}/install/setup.bash && \
     colcon build --packages-select ros2_medkit_opcua \
-      --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF"
+      --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+        -DMEDKIT_OPCUA_READ_ONLY=${MEDKIT_OPCUA_READ_ONLY}"
 
 # Stage 2: Runtime
 FROM ros:jazzy-ros-base
@@ -54,7 +73,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV COLCON_WS=/root/ws
 
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN retry() { n=1; while :; do "$@" && return 0; [ "$n" -ge 3 ] && return 1; echo "attempt $n of 3 failed: $*" >&2; n=$((n+1)); sleep 5; done; }; \
+    retry apt-get update && apt-get install -y --no-install-recommends \
     ros-jazzy-yaml-cpp-vendor ros-jazzy-example-interfaces \
     nlohmann-json3-dev libcpp-httplib-dev sqlite3 libsqlite3-dev curl jq \
     && rm -rf /var/lib/apt/lists/*

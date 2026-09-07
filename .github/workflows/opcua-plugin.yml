@@ -125,9 +125,21 @@ jobs:
         run: colcon test-result --verbose
 
   integration:
-    name: Integration (OpenPLC)
+    name: Integration (OpenPLC, ${{ matrix.variant }})
+    # Both write surfaces are exercised against the same real PLC. The
+    # read-only leg is the shipped image: it proves the refusal, its vendor
+    # code, and that the tag on the PLC did not move. The write-capable leg
+    # keeps proving that a write reaches OpenPLC and reads back.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: read-only
+            read_only: 'ON'
+          - variant: write-capable
+            read_only: 'OFF'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -141,8 +153,25 @@ jobs:
       - name: Build gateway + OPC-UA plugin image
         run: |
           docker build \
+            --build-arg MEDKIT_OPCUA_READ_ONLY=${{ matrix.read_only }} \
             -f src/ros2_medkit_plugins/ros2_medkit_opcua/docker/Dockerfile.gateway \
             -t gateway-opcua .
+
+      - name: Inspect the plugin object inside the built image
+        # The image is what ships, and Dockerfile.gateway builds it with
+        # BUILD_TESTING=OFF, so the inspection ctest does not exist inside the
+        # container. Pull the object out and run the same check on the runner:
+        # without this the image is only proven by its behaviour, and a
+        # build-arg or Dockerfile drift that shipped the wrong variant would be
+        # caught by the integration assertions rather than by the inspection.
+        run: |
+          cid=$(docker create gateway-opcua)
+          docker cp "$cid:$(docker run --rm --entrypoint sh gateway-opcua -c \
+            "find /root/ws/install -name libros2_medkit_opcua_plugin.so | head -1")" \
+            ./plugin-from-image.so
+          docker rm -v "$cid" >/dev/null
+          python3 src/ros2_medkit_plugins/ros2_medkit_opcua/test/inspect_build_variant.py \
+            ./plugin-from-image.so --expect ${{ matrix.variant }}
 
       - name: Start OpenPLC
         timeout-minutes: 3
@@ -212,6 +241,8 @@ jobs:
           docker logs gateway 2>&1 | tail -10
 
       - name: Run integration tests
+        env:
+          MEDKIT_OPCUA_VARIANT: ${{ matrix.variant }}
         run: bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/run_integration_tests.sh
 
       - name: Dump gateway logs on failure
@@ -229,13 +260,24 @@ jobs:
           docker network rm plc-demo 2>/dev/null || true
 
   integration-alarms:
-    name: Integration (AlarmConditionType)
+    name: Integration (AlarmConditionType, ${{ matrix.variant }})
     # Issue #386: tests the native OPC-UA AlarmCondition subscription bridge
     # against the test_alarm_server fixture (open62541 with FULL ns0 + alarms
     # ON). Independent of the OpenPLC threshold-mode integration above; runs
     # in parallel.
+    #
+    # Both write surfaces, like the OpenPLC job: acknowledging a condition
+    # changes its state on the controller, so the read-only leg asserts the
+    # refusal and that the condition stays unacknowledged on the server, and the
+    # write-capable leg asserts the acknowledge reaches it. The script builds the
+    # gateway image itself and derives the build arg from the same variable, so
+    # the image and the expectations cannot drift apart.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [read-only, write-capable]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -247,7 +289,21 @@ jobs:
           pip3 install --break-system-packages asyncua
 
       - name: Run alarm integration suite
+        env:
+          MEDKIT_OPCUA_VARIANT: ${{ matrix.variant }}
         run: bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/run_alarm_tests.sh
+
+      - name: Inspect the plugin object inside the built image
+        # Same reason as the OpenPLC job. This suite builds its own image, so
+        # the step runs after it; the tag is the one run_alarm_tests.sh builds.
+        run: |
+          cid=$(docker create gateway-opcua:alarm-test)
+          docker cp "$cid:$(docker run --rm --entrypoint sh gateway-opcua:alarm-test -c \
+            "find /root/ws/install -name libros2_medkit_opcua_plugin.so | head -1")" \
+            ./plugin-from-image.so
+          docker rm -v "$cid" >/dev/null
+          python3 src/ros2_medkit_plugins/ros2_medkit_opcua/test/inspect_build_variant.py \
+            ./plugin-from-image.so --expect ${{ matrix.variant }}
 
       - name: Dump container logs on failure
         if: failure()
@@ -337,6 +393,94 @@ jobs:
           colcon test --return-code-on-test-failure \
             --packages-select ros2_medkit_opcua \
             --ctest-args -R test_opcua_secured \
+            --event-handlers console_direct+
+
+      - name: Show test results
+        if: always()
+        run: colcon test-result --verbose
+
+  write-capable-build:
+    # The shipped plugin is read-only; MEDKIT_OPCUA_READ_ONLY=OFF is the
+    # development variant. Nothing else in CI configures it, so without this job
+    # the write path and its tests would rot unnoticed behind an #if until
+    # someone needed them. It is also the control for the build-inspection test:
+    # test_opcua_build_variant asserts the write symbols are PRESENT here, which
+    # is what keeps its symbol list from decaying into one that matches nothing
+    # and passes everywhere.
+    name: Write-capable build (jazzy)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Git
+        run: |
+          apt-get update
+          apt-get install -y git
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pre-install ROS 2 apt source
+        uses: ./.github/actions/ros-apt-source
+
+      - name: Set up ROS 2 Jazzy
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: jazzy
+
+      - name: Install ccache
+        run: apt-get install -y ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /root/.cache/ccache
+          key: ccache-opcua-write-capable-${{ github.sha }}
+          restore-keys: |
+            ccache-opcua-write-capable-
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y ros-jazzy-test-msgs libyaml-cpp-dev libssl-dev
+          source /opt/ros/jazzy/setup.bash
+          rosdep update
+          rosdep install --from-paths src --ignore-src -y \
+            --skip-keys='nav2_msgs ament_cmake_clang_format ament_cmake_clang_tidy'
+
+      - name: Build ros2_medkit_opcua write-capable
+        env:
+          CCACHE_DIR: /root/.cache/ccache
+          CCACHE_MAXSIZE: 500M
+          CCACHE_SLOPPINESS: pch_defines,time_macros
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          # Two passes so MEDKIT_OPCUA_READ_ONLY reaches only the package that
+          # defines it. Passed to the whole chain instead, CMake reports it as a
+          # manually-specified variable nobody used in each of the other ten
+          # packages, and the resulting stderr would hide any real one.
+          colcon build --symlink-install \
+            --packages-up-to ros2_medkit_opcua --packages-skip ros2_medkit_opcua \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release \
+            --event-handlers console_direct+
+          colcon build --symlink-install \
+            --packages-select ros2_medkit_opcua \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release -DMEDKIT_OPCUA_READ_ONLY=OFF \
+            --event-handlers console_direct+
+          ccache -s
+
+      - name: Run tests
+        timeout-minutes: 20
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          colcon test --return-code-on-test-failure \
+            --packages-select ros2_medkit_opcua \
+            --ctest-args -LE linter \
             --event-handlers console_direct+
 
       - name: Show test results

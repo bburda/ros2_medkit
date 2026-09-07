@@ -183,7 +183,14 @@ TEST(AutoBrowserTest, MapsObjectHierarchyToEntityAndVariablesToDataPoints) {
   EXPECT_EQ(running_entry->entity_id, "plc_1_db_test");
   EXPECT_EQ(running_entry->data_name, "running");
   EXPECT_EQ(running_entry->data_type, "bool");
+#if MEDKIT_OPCUA_READ_ONLY
+  // A read-only build never consults the server's CurrentWrite bit: the
+  // inference is not compiled in, so a point the server would let us write
+  // still comes back read-only.
+  EXPECT_FALSE(running_entry->writable);
+#else
   EXPECT_TRUE(running_entry->writable);  // server: CurrentWrite set
+#endif
 
   EXPECT_FALSE(result.node_cap_hit);
   EXPECT_FALSE(result.depth_cap_hit);
@@ -212,10 +219,60 @@ TEST(AutoBrowserTest, WritableInferredFromServerAccessLevel) {
   auto result = browser.browse();
 
   ASSERT_EQ(result.entries.size(), 3u);
+#if MEDKIT_OPCUA_READ_ONLY
+  EXPECT_FALSE(find_entry(result.entries, rw.toString())->writable)
+      << "infer_writable must not produce a writable point in a read-only build";
+#else
   EXPECT_TRUE(find_entry(result.entries, rw.toString())->writable);
+#endif
   EXPECT_FALSE(find_entry(result.entries, ro.toString())->writable);
   // AccessLevel read failed -> safe read-only default, never a false-positive.
   EXPECT_FALSE(find_entry(result.entries, unk.toString())->writable);
+}
+
+// Whether infer_writable was ASKED FOR is separate from what it evaluates to:
+// it defaults to true, so a read-only build that warned on the value would warn
+// on every auto_browse deployment. The source string is what tells the two
+// apart, and it has to come from either spelling of the key.
+TEST(NodeMapAutoBrowseConfigTest, InferWritableSourceRecordsTheNodeMapSpelling) {
+  NodeMap node_map;
+  const TempYamlFile yaml_file(R"(
+component_id: test_plc
+auto_browse:
+  enabled: true
+  infer_writable: true
+)");
+  ASSERT_TRUE(node_map.load(yaml_file.path()));
+  EXPECT_TRUE(node_map.auto_browse_config().infer_writable);
+  EXPECT_EQ(node_map.auto_browse_config().infer_writable_source, "the node map's auto_browse.infer_writable");
+}
+
+TEST(NodeMapAutoBrowseConfigTest, InferWritableSourceStaysEmptyWhenTheKeyIsAbsent) {
+  NodeMap node_map;
+  const TempYamlFile yaml_file(R"(
+component_id: test_plc
+auto_browse:
+  enabled: true
+)");
+  ASSERT_TRUE(node_map.load(yaml_file.path()));
+  // The default is still true - only nobody asked for it.
+  EXPECT_TRUE(node_map.auto_browse_config().infer_writable);
+  EXPECT_TRUE(node_map.auto_browse_config().infer_writable_source.empty());
+}
+
+// The node-map spelling is parsed rather than dropped as an unknown key, so a
+// value written there takes effect on a write-capable build.
+TEST(NodeMapAutoBrowseConfigTest, InferWritableFalseFromTheNodeMapIsHonoured) {
+  NodeMap node_map;
+  const TempYamlFile yaml_file(R"(
+component_id: test_plc
+auto_browse:
+  enabled: true
+  infer_writable: false
+)");
+  ASSERT_TRUE(node_map.load(yaml_file.path()));
+  EXPECT_FALSE(node_map.auto_browse_config().infer_writable);
+  EXPECT_EQ(node_map.auto_browse_config().infer_writable_source, "the node map's auto_browse.infer_writable");
 }
 
 TEST(AutoBrowserTest, InferWritableDisabledKeepsEverythingReadOnly) {
@@ -619,7 +676,11 @@ nodes:
   ASSERT_NE(level, nullptr);
   EXPECT_EQ(level->entity_id, "hand_authored_entity");
   EXPECT_EQ(level->data_name, "hand_authored_name");
+#if MEDKIT_OPCUA_READ_ONLY
+  EXPECT_FALSE(level->writable);
+#else
   EXPECT_TRUE(level->writable);
+#endif
 
   const auto * running = node_map.find_by_node_id("ns=2;s=DB_Test.Running");
   ASSERT_NE(running, nullptr);

@@ -263,6 +263,12 @@ struct AutoBrowseConfig {
   /// permits it. When false, every auto-browsed point stays read-only and only
   /// an explicit node_map ``nodes:`` entry can promote it (legacy behaviour).
   bool infer_writable{true};
+
+  /// Where an explicit ``infer_writable`` came from, for a message that can
+  /// point at the setting to change. Empty when nobody wrote the key, which is
+  /// what separates "the operator asked for this" from "this is the default" -
+  /// a read-only build says nothing about a key that was never set.
+  std::string infer_writable_source;
 };
 
 /// SOVD entity definition derived from the node map

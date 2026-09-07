@@ -174,6 +174,13 @@ class OpcuaClient {
   /// Read multiple values
   std::vector<ReadResult> read_values(const std::vector<opcua::NodeId> & node_ids);
 
+#if !MEDKIT_OPCUA_READ_ONLY
+  /// The value-write surface, present only in a write-capable build
+  /// (``-DMEDKIT_OPCUA_READ_ONLY=OFF``). A read-only build has no declaration
+  /// and no definition, so nothing in the plugin can reach an OPC-UA Write
+  /// service call - see the package README on why that is a build property and
+  /// not a setting.
+
   /// OPC-UA write error classification
   enum class WriteError { NotConnected, TypeMismatch, AccessDenied, NodeNotFound, TransportError };
 
@@ -190,6 +197,7 @@ class OpcuaClient {
   /// @return void on success, WriteErrorInfo on failure with specific error code
   tl::expected<void, WriteErrorInfo> write_value(const opcua::NodeId & node_id, const OpcuaValue & value,
                                                  const std::string & data_type_hint = "");
+#endif
 
   /// The AccessLevel / UserAccessLevel bits of a Variable node, read straight
   /// from the server. ``ok`` is false when not connected or the attribute read
@@ -295,12 +303,33 @@ class OpcuaClient {
   };
 
   /// Synchronously call an OPC-UA Method on a target object.
-  /// Used by ConditionRefresh, Acknowledge, and Confirm operations on
-  /// AlarmConditionType nodes (issue #386).
+  /// The read path uses it for ConditionRefresh, which asks the server to
+  /// replay active conditions to this subscription and changes nothing on the
+  /// controller (Part 9 5.5.7).
   /// @return Output arguments on success, MethodErrorInfo on failure.
   tl::expected<std::vector<opcua::Variant>, MethodErrorInfo>
   call_method(const opcua::NodeId & object_id, const opcua::NodeId & method_id,
               const std::vector<opcua::Variant> & input_args);
+
+#if !MEDKIT_OPCUA_READ_ONLY
+  /// Acknowledge or Confirm a live condition (Part 9 Acknowledge i=9111,
+  /// Confirm i=9113), present only in a write-capable build.
+  ///
+  /// Separate from ``call_method`` because it is a different kind of call: it
+  /// changes alarm state on the server, and a read-only build forbids every
+  /// write path, not only value writes. ``call_method`` itself stays, because
+  /// ConditionRefresh rides on it and asks the server for a replay rather than
+  /// changing anything.
+  ///
+  /// @param condition_id ConditionId of the live instance to act on.
+  /// @param method_id Acknowledge or Confirm on AcknowledgeableConditionType.
+  /// @param event_id EventId of the event being acknowledged.
+  /// @param comment Operator comment, forwarded as a LocalizedText.
+  tl::expected<std::vector<opcua::Variant>, MethodErrorInfo> call_condition_method(const opcua::NodeId & condition_id,
+                                                                                   const opcua::NodeId & method_id,
+                                                                                   const opcua::ByteString & event_id,
+                                                                                   const std::string & comment);
+#endif
 
   /// Map an OPC-UA StatusCode (from an attempted method call or a
   /// per-argument validation result) to a ``MethodError`` category.

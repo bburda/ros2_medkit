@@ -8,11 +8,34 @@
 #
 # Acknowledge / Confirm round-trips go through the SOVD HTTP path
 # (POST /apps/{entity}/operations/{op}/executions) so that the medkit
-# implementation - lookup_condition + EventId tracking + call_method on the
-# inherited AcknowledgeableConditionType methods - is exercised end-to-end,
-# not bypassed via the server stdin shortcuts.
+# implementation - lookup_condition + EventId tracking + the condition-method
+# call on the inherited AcknowledgeableConditionType methods - is exercised
+# end-to-end, not bypassed via the server stdin shortcuts.
+#
+# MEDKIT_OPCUA_VARIANT selects the write surface of the image under test and
+# has to match how it was built (docker build --build-arg
+# MEDKIT_OPCUA_READ_ONLY=ON|OFF); this script builds the image itself, so it
+# derives the build arg from the variable and the two cannot drift. It defaults
+# to read-only, which is what the plugin and the Dockerfile default to.
+# Acknowledging a condition changes its state on the controller, so a read-only
+# image refuses it: that leg asserts the refusal and that the condition is still
+# unacknowledged on the server, then drives the same lifecycle through the
+# server's own CLI so every downstream expectation still runs.
 
 set -euo pipefail
+
+VARIANT="${MEDKIT_OPCUA_VARIANT:-read-only}"
+# SOVD spells "the entity does not support this" as 501; 403 is reserved for a
+# valid token with insufficient permissions, which no credential can fix here.
+REFUSAL_STATUS=501
+if [[ "${VARIANT}" == "read-only" ]]; then
+  READ_ONLY=ON
+elif [[ "${VARIANT}" == "write-capable" ]]; then
+  READ_ONLY=OFF
+else
+  echo "MEDKIT_OPCUA_VARIANT must be read-only or write-capable (got '${VARIANT}')" >&2
+  exit 2
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../../../.." && pwd)"
 NET_NAME=alarm-test-net
@@ -52,7 +75,7 @@ trap cleanup EXIT
 # existing run_integration_tests.sh convention; never sleeps blindly.
 wait_for() {
   local url="$1" expr="$2" deadline="${3:-60}"
-  for i in $(seq 1 "${deadline}"); do
+  for _ in $(seq 1 "${deadline}"); do
     if curl -sf "${url}" 2>/dev/null | jq -e "${expr}" >/dev/null 2>&1; then
       return 0
     fi
@@ -71,7 +94,7 @@ wait_for() {
 wait_no_fault() {
   local fault_code="$1" deadline="${2:-30}"
   local url="http://localhost:${GATEWAY_PORT}/api/v1/faults"
-  for i in $(seq 1 "${deadline}"); do
+  for _ in $(seq 1 "${deadline}"); do
     local status
     status=$(curl -sf "${url}" 2>/dev/null \
              | jq -r --arg code "${fault_code}" \
@@ -101,12 +124,26 @@ assert_status() {
   echo "  OK ${fault_code}: ${actual}"
 }
 
+assert_fault_present() {
+  local fault_code="$1"
+  local status
+  status=$(curl -sf "http://localhost:${GATEWAY_PORT}/api/v1/faults" \
+             | jq -r --arg code "${fault_code}" \
+               '.items[] | select(.fault_code == $code) | .status' \
+             | head -1)
+  if [[ -z "${status}" || "${status}" == "CLEARED" ]]; then
+    echo "ASSERT FAILED: ${fault_code} expected still raised, got '${status:-absent}'" >&2
+    return 1
+  fi
+  echo "  OK ${fault_code} still raised (${status})"
+}
+
 # Poll the global ``/api/v1/faults`` list until the named fault has the
 # expected status. Mirrors ``wait_for`` but specialized for the fault list
 # shape so callers do not need to construct jq filters per scenario.
 wait_until_status() {
   local fault_code="$1" expected="$2" deadline="${3:-30}"
-  for i in $(seq 1 "${deadline}"); do
+  for _ in $(seq 1 "${deadline}"); do
     local actual
     actual=$(curl -sf "http://localhost:${GATEWAY_PORT}/api/v1/faults" 2>/dev/null \
              | jq -r --arg code "${fault_code}" \
@@ -129,7 +166,7 @@ wait_until_status() {
 # corresponding state on the OPC-UA server.
 assert_server_state() {
   local condition="$1" key="$2" expected="$3" deadline="${4:-30}"
-  for i in $(seq 1 "${deadline}"); do
+  for _ in $(seq 1 "${deadline}"); do
     local line
     line=$(docker logs "${SERVER_NAME}" 2>&1 | grep -E "^STATE ${condition} " | tail -1 || true)
     if [[ "${line}" == *"${key}=${expected}"* ]]; then
@@ -157,6 +194,56 @@ sovd_post_op() {
   echo "  OK POST ${op} -> ${code}"
 }
 
+# The read-only counterpart: the same POST has to come back as the plugin's
+# refusal, not as a transport error or a 404, and the body has to name the build
+# property so an operator reading it knows no credential will help.
+sovd_post_op_refused() {
+  local op="$1" body="$2"
+  local url="http://localhost:${GATEWAY_PORT}/api/v1/apps/tank_process/operations/${op}/executions"
+  local code
+  code=$(curl -s -o /tmp/alarm_test_resp.json -w '%{http_code}' \
+              -X POST -H 'Content-Type: application/json' -d "${body}" "${url}")
+  if [[ "${code}" != "${REFUSAL_STATUS}" ]]; then
+    echo "ASSERT FAILED: POST ${op} expected HTTP ${REFUSAL_STATUS}, got ${code}" >&2
+    cat /tmp/alarm_test_resp.json >&2 || true
+    return 1
+  fi
+  if ! jq -e '.vendor_code == "x-medkit-plugin-error"' /tmp/alarm_test_resp.json >/dev/null; then
+    echo "ASSERT FAILED: POST ${op} refusal carries no x-medkit-plugin-error vendor code" >&2
+    cat /tmp/alarm_test_resp.json >&2 || true
+    return 1
+  fi
+  if ! jq -e '.message | test("MEDKIT_OPCUA_READ_ONLY")' /tmp/alarm_test_resp.json >/dev/null; then
+    echo "ASSERT FAILED: POST ${op} refusal does not name MEDKIT_OPCUA_READ_ONLY" >&2
+    cat /tmp/alarm_test_resp.json >&2 || true
+    return 1
+  fi
+  echo "  OK POST ${op} refused ${REFUSAL_STATUS} x-medkit-plugin-error naming MEDKIT_OPCUA_READ_ONLY"
+}
+
+# What the tree advertises: a read-only image must not offer an operation it
+# will refuse, and a write-capable one must offer both.
+assert_operations_offered() {
+  local url="http://localhost:${GATEWAY_PORT}/api/v1/apps/tank_process/operations"
+  local ids
+  ids=$(curl -s "${url}" | jq -c '[.items[].id]')
+  for op in acknowledge_fault confirm_fault; do
+    if [[ "${VARIANT}" == "read-only" ]]; then
+      if jq -e --arg op "${op}" 'contains([$op])' <<<"${ids}" >/dev/null; then
+        echo "ASSERT FAILED: read-only image advertises ${op} (${ids})" >&2
+        return 1
+      fi
+      echo "  OK ${op} not advertised"
+    else
+      if ! jq -e --arg op "${op}" 'contains([$op])' <<<"${ids}" >/dev/null; then
+        echo "ASSERT FAILED: write-capable image does not advertise ${op} (${ids})" >&2
+        return 1
+      fi
+      echo "  OK ${op} advertised"
+    fi
+  done
+}
+
 # Poll the gateway's docker logs until <pattern> appears. Required because the
 # AlarmConditionType subscription has a 500 ms server-side publishing interval -
 # new events from method calls or stdin commands take up to that long to arrive
@@ -165,7 +252,7 @@ sovd_post_op() {
 # rejects stale IDs with BadEventIdUnknown).
 wait_gateway_log() {
   local pattern="$1" deadline="${2:-30}"
-  for i in $(seq 1 "${deadline}"); do
+  for _ in $(seq 1 "${deadline}"); do
     if docker logs "${GATEWAY_NAME}" 2>&1 | grep -q -- "${pattern}"; then
       return 0
     fi
@@ -190,8 +277,9 @@ docker build --network=host \
   -f src/ros2_medkit_plugins/ros2_medkit_opcua/docker/test_alarm_server/Dockerfile \
   -t ros2_medkit_alarm_test_server:dev . >/dev/null
 
-echo "[2/5] Build gateway-opcua image (re-uses existing Dockerfile.gateway)"
+echo "[2/5] Build gateway-opcua image (${VARIANT}, re-uses existing Dockerfile.gateway)"
 docker build --network=host \
+  --build-arg "MEDKIT_OPCUA_READ_ONLY=${READ_ONLY}" \
   -f src/ros2_medkit_plugins/ros2_medkit_opcua/docker/Dockerfile.gateway \
   -t gateway-opcua:alarm-test . >/dev/null
 
@@ -215,7 +303,7 @@ docker run --rm --name "${SERVER_NAME}" --network "${NET_NAME}" \
   <&3 >/dev/null 2>&1 &
 SERVER_DOCKER_PID=$!
 # Wait for server to bind; the binary prints "READY ..." after listen.
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   if docker logs "${SERVER_NAME}" 2>&1 | grep -q '^READY '; then
     break
   fi
@@ -299,7 +387,7 @@ docker run -d --name "${GATEWAY_NAME}" --network "${NET_NAME}" \
     # sometimes too short, leaving the gateway to come up before the
     # service was discoverable. ``ros2 service list`` is the cheapest
     # ROS-native availability signal.
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
       if ros2 service list 2>/dev/null | grep -q "/fault_manager/report_fault"; then
         break
       fi
@@ -320,7 +408,8 @@ wait_for "http://localhost:${GATEWAY_PORT}/api/v1/apps" \
 
 echo "[5/5] Run alarm scenarios"
 
-echo "  [scenario] fire / SOVD ack / latch / SOVD confirm / clear lifecycle"
+echo "  [scenario] fire / ack / latch / confirm / clear lifecycle (${VARIANT})"
+assert_operations_offered
 echo "fire Overpressure 750" >&3
 wait_until_status PLC_OVERPRESSURE CONFIRMED 30
 
@@ -332,31 +421,56 @@ wait_until_status PLC_OVERPRESSURE CONFIRMED 30
 # HEALED verb - we deliberately do not flip fault_manager into PASSED-debounce
 # territory). The lifecycle proof is therefore ``wait_no_fault`` after the
 # follow-up SOVD confirm + the OPC-UA event with all three states cleared.
-sovd_post_op acknowledge_fault \
-  '{"fault_code":"PLC_OVERPRESSURE","comment":"e2e ack via SOVD"}'
+if [[ "${VARIANT}" == "read-only" ]]; then
+  # The image carries no way to acknowledge or confirm, so both calls are
+  # refused. Proving they never reached the server needs a consequence rather
+  # than a STATE line: the fixture prints those only from its own stdin CLI, so
+  # a condition acknowledged over OPC-UA looks identical to one that was not.
+  # The consequence used here is that the fault does not clear - had both calls
+  # landed, the latch below would have driven it to cleared - and the CLI-driven
+  # ack + confirm afterwards does clear it, which is what makes the negative
+  # meaningful instead of a symptom of a stalled pipeline.
+  sovd_post_op_refused acknowledge_fault \
+    '{"fault_code":"PLC_OVERPRESSURE","comment":"e2e ack via SOVD"}'
+  sovd_post_op_refused confirm_fault \
+    '{"fault_code":"PLC_OVERPRESSURE","comment":"e2e confirm via SOVD"}'
 
-# Latch flips ActiveState=false on the server. Combined with the AckedState=
-# true set by the SOVD ack above, the next AlarmCondition event payload has
-# active=false, acked=true, confirmed=false -> SovdAlarmStatus::Healed
-# (state machine internal), action=ReportHealed (no-op for fault_manager).
-# /faults still shows CONFIRMED here, by design.
-echo "latch Overpressure" >&3
+  echo "latch Overpressure" >&3
+  wait_gateway_log "AlarmCondition HEALED.*PLC_OVERPRESSURE" 20
+  assert_fault_present PLC_OVERPRESSURE
+  echo "  OK the refused acknowledge never reached the server"
 
-# Wait for the gateway to actually receive and process the latch event before
-# issuing SOVD confirm. Without this, the gateway still has the EventId from
-# the original fire payload and the OPC-UA Confirm method on the server
-# returns BadEventIdUnknown (the server's branch->lastEventId has been
-# superseded by the Acknowledge auto-emit and the latch trigger).
-wait_gateway_log "AlarmCondition HEALED.*PLC_OVERPRESSURE" 20
+  echo "ack Overpressure" >&3
+  echo "confirm Overpressure" >&3
+  wait_no_fault PLC_OVERPRESSURE 30
+  echo "  OK PLC_OVERPRESSURE cleared once the server itself acked and confirmed"
+else
+  sovd_post_op acknowledge_fault \
+    '{"fault_code":"PLC_OVERPRESSURE","comment":"e2e ack via SOVD"}'
 
-# Real SOVD confirm - exercises call_method(i=9113) + EventId. After this
-# ConfirmedState=true on the server; the resulting event has all three of
-# Active=false, Acked=true, Confirmed=true and the state machine emits
-# ClearFault, removing the entry from /faults.
-sovd_post_op confirm_fault \
-  '{"fault_code":"PLC_OVERPRESSURE","comment":"e2e confirm via SOVD"}'
-wait_no_fault PLC_OVERPRESSURE 30
-echo "  OK PLC_OVERPRESSURE cleared after SOVD ack + latch + SOVD confirm"
+  # Latch flips ActiveState=false on the server. Combined with the AckedState=
+  # true set by the SOVD ack above, the next AlarmCondition event payload has
+  # active=false, acked=true, confirmed=false -> SovdAlarmStatus::Healed
+  # (state machine internal), action=ReportHealed (no-op for fault_manager).
+  # /faults still shows CONFIRMED here, by design.
+  echo "latch Overpressure" >&3
+
+  # Wait for the gateway to actually receive and process the latch event before
+  # issuing SOVD confirm. Without this, the gateway still has the EventId from
+  # the original fire payload and the OPC-UA Confirm method on the server
+  # returns BadEventIdUnknown (the server's branch->lastEventId has been
+  # superseded by the Acknowledge auto-emit and the latch trigger).
+  wait_gateway_log "AlarmCondition HEALED.*PLC_OVERPRESSURE" 20
+
+  # Real SOVD confirm - exercises call_method(i=9113) + EventId. After this
+  # ConfirmedState=true on the server; the resulting event has all three of
+  # Active=false, Acked=true, Confirmed=true and the state machine emits
+  # ClearFault, removing the entry from /faults.
+  sovd_post_op confirm_fault \
+    '{"fault_code":"PLC_OVERPRESSURE","comment":"e2e confirm via SOVD"}'
+  wait_no_fault PLC_OVERPRESSURE 30
+  echo "  OK PLC_OVERPRESSURE cleared after SOVD ack + latch + SOVD confirm"
+fi
 
 echo "  [scenario] shelving suppression"
 echo "fire Overheat 600" >&3
@@ -434,7 +548,7 @@ docker run --rm --name "${SERVER_NAME}" --network "${NET_NAME}" \
   -i ros2_medkit_alarm_test_server:dev --port "${SERVER_PORT}" \
   <&3 >/dev/null 2>&1 &
 SERVER_DOCKER_PID=$!
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   if docker logs "${SERVER_NAME}" 2>&1 | grep -q '^READY '; then
     break
   fi

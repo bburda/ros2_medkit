@@ -57,7 +57,8 @@ All mapping lives in YAML (``config/tank_demo_nodes.yaml`` is the reference exam
   - ``node_id`` - OPC-UA node identifier (e.g. ``"ns=2;i=1"``)
   - ``entity_id`` - SOVD app the value belongs to
   - ``data_name`` - short name used in REST URLs
-  - ``display_name``, ``unit``, ``data_type``, ``writable`` - metadata
+  - ``display_name``, ``unit``, ``data_type``, ``writable`` - metadata.
+    ``writable`` is ignored in a read-only build (see below)
   - ``min_value`` / ``max_value`` - optional write range check
   - ``alarm`` - optional fault definition (``fault_code``, ``severity``, ``threshold``,
     ``above_threshold`` direction)
@@ -96,8 +97,103 @@ edge-triggered callbacks:
 The plugin keeps per-fault state only long enough to detect edges; the fault manager owns
 persistence and fault lifecycle.
 
-Type-aware writes
-=================
+Read-only is a property of the build
+====================================
+
+Four of the five protocol plugins cannot write to their device at all. OPC UA can,
+and config-less discovery would mark a point writable straight from the server's
+``CurrentWrite`` bit. A plant asking "can this box change a controller" cannot be
+answered by a configuration value, because a configuration value can be changed
+without rebuilding or shipping anything. So the answer is carried by the
+binary.
+
+``MEDKIT_OPCUA_READ_ONLY`` is a CMake cache option, default ``ON``. With it on:
+
+- ``OpcuaClient::write_value``, the ``open62541pp`` Write service functions and
+  templates it reaches, the vendor route handler
+  ``OpcuaPlugin::handle_plc_operations`` and the value-coercion helper are all
+  outside ``#if`` and are never compiled.
+- The link removes what the compiler alone cannot. ``-fvisibility=hidden`` covers
+  the sources compiled into the module but not the static archives it links, so
+  without further flags open62541's own ``UA_Client_write*`` primitives sit in the
+  object *and* in its dynamic symbol table, where a caller holding the ``.so``
+  can ``dlsym`` one and drive a controller with it even though no route reaches
+  it. ``-Wl,--exclude-libs,ALL`` takes the archives out of the export table, and
+  ``-ffunction-sections -fdata-sections`` plus ``-Wl,--gc-sections`` then let the
+  linker drop them from the object entirely, because nothing references them once
+  the C++ write path is gone. The read-only object exports the six plugin entry
+  points and nothing from the OPC-UA stack.
+- The section flags are set on ``open62541-object`` and ``open62541-plugins``,
+  which is where upstream compiles its C sources - ``open62541`` itself is
+  assembled from ``$<TARGET_OBJECTS:...>`` and compiles nothing. Upstream adds the
+  same two flags, but only under ``Release`` and ``MinSizeRel``, so a default-type
+  build previously kept twelve ``UA_*_write*`` symbols in the read-only object as
+  local, unexported code. Setting them here makes the property independent of
+  ``CMAKE_BUILD_TYPE``, and ``test_opcua_build_variant`` asserts the absence of
+  that whole family so the difference cannot come back unnoticed.
+- What is left of open62541 inside the object is one shared transport, not a
+  write path. open62541 is a single static library, so removing the write code
+  does not remove what it shared with the read code: the generic dispatcher
+  ``__UA_Client_Service`` (used by read, browse and ConditionRefresh), the binary
+  encoders (23 ``*_encodeBinary`` symbols), and the generated ``UA_TYPES``
+  descriptors, which the table references as a whole so the linker cannot drop
+  individual entries. Measured on the read-only object, those descriptors include
+  ``WriteRequest``, ``WriteValue``, ``WriteResponse``, ``AddNodes``,
+  ``DeleteNodes``, ``AddReferences``, ``SetMonitoringMode``,
+  ``SetPublishingMode`` and ``TransferSubscriptions``; ``HistoryUpdate`` is
+  absent.
+
+  Descriptors are data. What makes them unreachable is that no function in the
+  object composes any of those requests, none of these symbols is exported, and a
+  read-only build registers three GET routes - no route, node-map key or config
+  key supplies a NodeId, a method id or an attribute id. So the claim the package
+  makes is the exact one: every C++ path that composes a Write or a condition
+  method call is absent, and no OPC UA symbol is exported. Not "no OPC UA
+  machinery at all", which would be false.
+
+- Subscription and monitored-item creation stay in both variants. They change
+  server-side session state, which is not controller data, and the read path
+  cannot receive values or alarms without them.
+- ``NodeMap::load`` forces ``writable`` to false and warns once when the file asked
+  otherwise; ``AutoBrowser`` does not compile the ``infer_writable`` inference, so
+  the server's ``CurrentWrite`` bit is never read.
+- No entity registers the ``x-plc-operations`` capability, ``list_operations``
+  emits no ``set_<name>`` entry, and ``get_routes`` does not register the write
+  route.
+- ``write_data`` and the value-write half of ``execute_operation`` return 501 as
+  their first statement, before any node lookup, with a message naming the build
+  property. SOVD spells "the entity does not support this" as 501 (fault
+  deletion, data lists, subscriptions and triggers all use it); 403 is defined
+  once, for a valid token with insufficient permissions, which is the one reading
+  that is wrong here - no credential reaches a path that is not in the binary. They stay declared because the gateway reaches the plugin through the
+  ``DataProvider`` / ``OperationProvider`` interfaces; the refusal reaches a client
+  as SOVD vendor code ``x-medkit-plugin-error``, which is the code the gateway
+  assigns to every plugin provider error.
+- ``acknowledge_fault`` / ``confirm_fault`` go the same way. A method call that
+  changes alarm state on the server is a write to the controller, and the rule is
+  that a read-only build carries no write path at all, not merely no value writes.
+  ``OpcuaClient::call_condition_method`` - the entry point that issues the Part 9
+  Acknowledge (i=9111) and Confirm (i=9113) calls - is compiled only in a
+  write-capable build, ``list_operations`` offers neither operation on an
+  event-alarm entity, and ``execute_operation`` refuses both by name before any
+  condition lookup.
+- ``ConditionRefresh`` stays, and so does the generic ``OpcuaClient::call_method``
+  it rides on. Part 9 5.5.7 makes it a request for the server to replay the
+  conditions it already holds to the calling subscription; it changes nothing on
+  the controller, and without it a restart loses the active fault set. That is why
+  the guard sits on the condition-method entry point rather than on ``call_method``,
+  and why neither ``call_method`` nor ``opcua::services::call`` is a write marker -
+  measured, they are present in both variants.
+
+The acceptance is an inspection of the built object, not a reading of the
+configuration: ``test_opcua_build_variant`` runs ``nm`` over the plugin ``.so`` and
+asserts the write symbols are absent, the read symbols present, the dynamic symbol
+table free of OPC-UA machinery, and the six plugin entry points still exported. It
+runs in both variants with opposite expectations, so a symbol list that stopped
+matching anything fails in the write-capable build instead of passing everywhere.
+
+Type-aware writes (write-capable build)
+=======================================
 
 ``POST /apps/{id}/x-plc-operations/{op}`` accepts a JSON body ``{"value": ...}``. The handler:
 
@@ -366,7 +462,9 @@ Acknowledge / Confirm round-trip
 --------------------------------
 
 Two SOVD operations appear on every entity that has at least one event-mode
-alarm declared:
+alarm declared, in a write-capable build. Both change condition state on the
+controller, so the default read-only build neither lists nor performs them (see
+"Read-only is a property of the build" above):
 
 - ``POST /apps/{entity}/operations/acknowledge_fault/executions``
 - ``POST /apps/{entity}/operations/confirm_fault/executions``

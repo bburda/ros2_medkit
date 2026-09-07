@@ -11,7 +11,11 @@ Follows the same plugin pattern as `ros2_medkit_graph_provider`: implements `Gat
   discovers them automatically by browsing the live address space
   (`auto_browse`, see below) - zero node-map config required
 - Exposes PLC values as the `x-plc-data` vendor collection
-- Allows writing setpoints via `x-plc-operations` with type-aware coercion and range validation
+- Ships read-only by default: the shipped binary contains no compiled path that
+  writes a value or acknowledges a condition, and exports nothing from the OPC UA
+  stack (see [Read-only and write-capable builds](#read-only-and-write-capable-builds))
+- In a write-capable build, allows writing setpoints via `x-plc-operations` with
+  type-aware coercion and range validation
 - Reports the connection state and poll metrics via `x-plc-status`
 - Maps threshold-based PLC alarms to SOVD faults on the owning entity
 - Optionally publishes numeric PLC values to ROS 2 `std_msgs/Float32` topics
@@ -100,6 +104,85 @@ to `false`) like every other discovery resource - it is a device fingerprint,
 useful for reconnaissance. Enable gateway authentication (`auth.enabled: true`)
 or front the API with an authenticating proxy to gate access to it.
 
+## Read-only and write-capable builds
+
+Whether this box can change a controller is a property of the binary, not of a
+configuration file. `MEDKIT_OPCUA_READ_ONLY` is a CMake cache option and
+defaults to **ON**:
+
+```bash
+# The default: read-only. No OPC-UA write path in the object.
+colcon build --packages-up-to ros2_medkit_opcua
+
+# Write-capable, for development against a PLC you are allowed to drive.
+colcon build --packages-select ros2_medkit_opcua \
+  --cmake-args -DMEDKIT_OPCUA_READ_ONLY=OFF
+```
+
+In the default read-only build:
+
+- **What is absent from the object**, each name asserted by `nm` in
+  `test_opcua_build_variant`:
+  - every C++ function that composes an OPC UA Write - `OpcuaClient::write_value`,
+    the vendor route handler `OpcuaPlugin::handle_plc_operations`, the value
+    coercion they share, and the `open62541pp` templates and service functions
+    they reach (`Node<Client>::writeValueScalar`, `Node<Client>::writeValue`,
+    `services::write`, `services::writeAttribute<Client>`);
+  - the entry point that issues a Part 9 condition method,
+    `OpcuaClient::call_condition_method`;
+  - open62541's own `UA_Client_write*` / `UA_Server_write*` primitives, dropped
+    by `-Wl,--exclude-libs,ALL` and `-Wl,--gc-sections` over
+    `-ffunction-sections -fdata-sections` because nothing references them once
+    the C++ write path is gone;
+  - every OPC UA symbol in the dynamic symbol table. The module exports the six
+    plugin entry points and C++ vague-linkage symbols, and nothing matching
+    `UA_*` or `opcua::*`, so `dlsym` reaches none of the machinery below.
+
+- **What remains inside the object, and why no route reaches it.** open62541 is
+  one static library, so removing the write path does not remove the transport
+  it shared. Still present: the generic request dispatcher
+  `__UA_Client_Service`, which the read, browse and ConditionRefresh paths all
+  use; the binary encoders (23 `*_encodeBinary` symbols), which serialize every
+  message type including the ones below; and the generated `UA_TYPES`
+  descriptors, which the table references as a whole so the linker cannot drop
+  individual entries - among them `WriteRequest`, `WriteValue`, `WriteResponse`,
+  `AddNodes`, `DeleteNodes`, `AddReferences`, `SetMonitoringMode`,
+  `SetPublishingMode` and `TransferSubscriptions` (`HistoryUpdate`: absent).
+  Descriptors are data, not a code path: no function in the object builds any of
+  those requests, none of these symbols is exported, and the plugin registers
+  three GET routes in a read-only build, so nothing in the REST contract
+  supplies a NodeId, a method id or an attribute id to reach them.
+
+- Two OPC UA calls that do change server-side state are deliberately **kept** in
+  both variants, because they change no controller data: `ConditionRefresh`,
+  which asks the server to replay conditions it already holds, and subscription
+  and monitored-item creation, which the read path needs to receive values and
+  alarms at all.
+- No data point is ever `writable`. A node-map entry that says `writable: true`
+  is ignored with one startup warning naming the build property, and the
+  address-space walk never consults the server's `CurrentWrite` bit whatever
+  `infer_writable` says.
+- Nothing advertises a write: no `x-plc-operations` capability on any entity, no
+  `set_<name>` entry in `/operations`, and the `POST .../x-plc-operations/...`
+  route is not registered (it answers 404).
+- **Alarm `acknowledge_fault` and `confirm_fault` are gone too.** A method call
+  that changes alarm state on the server is a write to the controller, and the
+  read-only build forbids every write path, not only value writes. The
+  `OpcuaClient` entry point that issues the Part 9 Acknowledge / Confirm calls
+  is not compiled, neither operation is listed on an event-alarm entity, and a
+  client that posts one anyway is refused. `ConditionRefresh` is unaffected and
+  stays in both variants: it asks the server to replay conditions it already
+  holds and changes nothing.
+- `PUT /{type}/{id}/data/{name}` and
+  `POST /{type}/{id}/operations/{name}/executions` answer **501** before any
+  node lookup, condition lookup or client call, with vendor code
+  `x-medkit-plugin-error` and a message naming `MEDKIT_OPCUA_READ_ONLY`. 501 is
+  the status SOVD uses for an operation the entity does not support; 403 is
+  reserved for a valid token with insufficient permissions, and no credential
+  reaches a write path that is not in the binary.
+
+A write-capable build restores everything above; nothing else differs.
+
 ## REST API
 
 ### Vendor Endpoints
@@ -108,7 +191,7 @@ or front the API with an authenticating proxy to gate access to it.
 |--------|------|-------------|
 | GET | `/apps/{id}/x-plc-data` | All OPC-UA values for entity (with units, types, timestamps) |
 | GET | `/apps/{id}/x-plc-data/{name}` | Single data point value |
-| POST | `/apps/{id}/x-plc-operations/set_{name}` | Write value to PLC (`{"value": 75.0}`) |
+| POST | `/apps/{id}/x-plc-operations/set_{name}` | Write value to PLC (`{"value": 75.0}`) - write-capable build only; not registered otherwise |
 | GET | `/components/{id}/x-plc-status` | Connection state, poll stats, active alarms |
 
 ### Standard SOVD (provided by gateway)
@@ -137,6 +220,9 @@ GET /api/v1/apps/tank_process/x-plc-data
   ]
 }
 ```
+
+`writable` is `false` on every item in the default read-only build, whatever the
+node map or the server says.
 
 **Write to PLC:**
 ```json
@@ -210,7 +296,9 @@ nodes:
     display_name: Tank Level
     unit: mm
     data_type: float
-    writable: true                # Allow writes via x-plc-operations
+    writable: true                # Allow writes via x-plc-operations. Ignored in
+                                  # the default read-only build (one startup
+                                  # warning, the point stays read-only).
     min_value: 0.0                # Optional: range validation for writes
     max_value: 100.0
     alarm:                        # Optional: numeric threshold -> SOVD fault
@@ -342,8 +430,11 @@ that catch-all code is never raised for it (see "System messages" under
 `auto_alarms` below). A mapping-level `severity_override` / `message` overrides
 the source-level one; otherwise the source-level value is inherited.
 
-The plugin auto-registers `acknowledge_fault` and `confirm_fault` operations
-on every entity that has at least one `event_alarms` entry. Invoke them with:
+In a write-capable build the plugin auto-registers `acknowledge_fault` and
+`confirm_fault` operations on every entity that has at least one `event_alarms`
+entry. The default read-only build offers neither and refuses both - see
+[Read-only and write-capable builds](#read-only-and-write-capable-builds).
+Invoke them with:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/apps/tank_process/operations/acknowledge_fault/executions \
@@ -384,10 +475,13 @@ along hierarchical references:
   `Objects` are walked normally. A depth limit and a total-node budget bound
   the walk against a pathological or very large address space; hitting either
   logs an operator warning that the resulting tree may be incomplete.
-- **Read-only.** auto_browse never writes to the server, and every
-  auto-discovered data point loads with `writable: false` - promoting a
-  specific point to writable is a deliberate, reviewed decision made via an
-  explicit `nodes:` entry.
+- **The walk itself never writes to the server.** Whether a discovered point is
+  exposed as writable depends on the build and on `infer_writable`: in the
+  default read-only build every auto-discovered point loads with
+  `writable: false` and the server's `CurrentWrite` bit is never read. In a
+  write-capable build `infer_writable` (default `true`) marks a point writable
+  exactly when the server says this session may write it; set it to `false` to
+  require an explicit `nodes:` entry instead.
 - **Explicit config always wins.** An auto-browsed entry for a NodeId that
   already has a hand-written `nodes:` entry is dropped; auto_browse only fills
   in what the node map does not already cover (or the whole tree, when there
@@ -416,8 +510,16 @@ discovered endpoint go straight to a populated tree with no node-map file:
 
 ```yaml
 plugins.opcua.endpoint_url: "opc.tcp://192.168.1.10:4840"
-plugins.opcua.auto_browse: true   # or the same map form as above
+plugins.opcua.auto_browse.enabled: true
+plugins.opcua.auto_browse.infer_writable: true   # write-capable builds only
 ```
+
+`infer_writable` is accepted in both forms - the node-map YAML's `auto_browse:`
+block and the ROS param above. It defaults to `true`, and in a read-only build
+it has no effect: every discovered point stays read-only. Setting it explicitly
+there logs one startup warning naming the setting, so it can be found and
+removed; leaving the key alone logs nothing, because the default is not a
+request anybody made.
 
 The JSON/ROS-param form takes precedence over whatever the node-map YAML's
 `auto_browse:` block set, mirroring how environment variables override the
@@ -805,23 +907,41 @@ Any PLC with an OPC-UA server works out of the box:
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select ros2_medkit_opcua
 colcon test --packages-select ros2_medkit_opcua
+
+# Write-capable variant (default is read-only)
+colcon build --packages-select ros2_medkit_opcua \
+  --cmake-args -DMEDKIT_OPCUA_READ_ONLY=OFF
+colcon test --packages-select ros2_medkit_opcua
 ```
+
+`test_opcua_build_variant` inspects the built `.so` with `nm` and asserts it
+matches the variant it was configured for, so the same `colcon test` command
+checks the opposite property in each build.
 
 ### Docker Integration Tests
 
 The plugin ships a self-contained OpenPLC tank demo in `docker/` that exercises the full stack end-to-end. CI runs this suite on every PR that touches the plugin; it is also runnable locally from any developer laptop.
 
+`MEDKIT_OPCUA_VARIANT` selects the write surface of the image under test and
+the expectations applied to it, so the two cannot drift. CI runs both legs.
+
 ```bash
 cd src/ros2_medkit_plugins/ros2_medkit_opcua/docker
 
-# Start OpenPLC + gateway (builds everything)
+# Start OpenPLC + gateway (builds everything). Default: the read-only image.
 bash scripts/start.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/start.sh
 
 # Manual testing
 curl -s http://localhost:8080/api/v1/apps/tank_process/x-plc-data | jq .
 
-# Automated tests (16 assertions)
+# Automated tests against a running pair
 bash scripts/run_integration_tests.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/run_integration_tests.sh
+
+# Build, start, test and clean up in one go
+bash scripts/test_all.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/test_all.sh
 
 # Stop
 bash scripts/stop.sh
@@ -829,14 +949,16 @@ bash scripts/stop.sh
 
 ### Test Coverage
 
-| Category | Tests | What it validates |
-|----------|-------|-------------------|
-| Entity discovery | 5 | Areas, components, apps from PLC node map |
-| PLC connection | 2 | OPC-UA connected, zero errors |
-| Live data | 3 | Tank level, temperature, pressure have values |
-| Write control | 2 | Pump speed, valve position written to PLC |
-| Error handling | 3 | Unknown entity, unknown operation, invalid JSON |
-| **Total** | **16** | |
+| Category | read-only | write-capable | What it validates |
+|----------|-----------|---------------|-------------------|
+| Entity discovery | 5 | 5 | Areas, components, apps from PLC node map |
+| PLC connection | 2 | 2 | OPC-UA connected, zero errors |
+| Live data | 3 | 3 | Tank level, temperature, pressure have values |
+| Advertised write surface | 2 | 2 | x-plc-operations capability and the set_* operation, absent / present |
+| Write control | 6 | 3 | read-only: the vendor route 404s, the SOVD write is refused with the vendor code and a message naming the build property, and both tags read back unchanged on the PLC. write-capable: pump speed and valve position written, pump speed read back |
+| Error handling | 3 | 3 | Unknown entity, unknown operation, invalid JSON |
+| SOVD /data | 2 | 2 | The standard data collection serves the same points |
+| **Total** | **23** | **20** | |
 
 ## Security
 
@@ -883,6 +1005,7 @@ When the value returns below threshold, the fault is automatically cleared.
 - **Type-aware writes** - Plugin reads the OPC-UA node's data type before writing to avoid type mismatches (e.g., writing float32 to a REAL node, not float64).
 - **Node map driven** - All entity mapping is in YAML config, not code. Same plugin binary works with any PLC by changing the config file.
 - **Env var overrides** - `OPCUA_ENDPOINT_URL` and `OPCUA_NODE_MAP_PATH` override YAML config for Docker deployment flexibility.
+- **Read-only is a build property, not a setting** - the shipped binary contains no OPC-UA write path, and CI proves it by inspecting the object rather than by reading a configuration value. A setting can be flipped on a running box; an absent symbol cannot.
 
 ## License
 
