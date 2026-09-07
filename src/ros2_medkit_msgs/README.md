@@ -86,8 +86,9 @@ A window of wall-clock time during which faults are expected. An operator declar
 | `declared_by` | string | Authenticated client id, or `anonymous` |
 | `declared_at` | builtin_interfaces/Time | When the declaration was recorded; retention orders by this field |
 | `ended_early` | bool | True when an operator cut the window short |
+| `cancelled` | bool | True on the copy returned when a window was stopped before it ever started, and therefore removed. Never true on a stored window |
 
-A fault is expected when its `first_occurred` lies in `[starts_at, ends_at]`. The fields are named `starts_at` / `ends_at` rather than `from` / `to` because a message field named `from` is a Python keyword and rosidl cannot generate a binding for it; the gateway's REST representation of the same window uses `from` and `to`.
+A fault is expected when its `first_occurred` lies in `[starts_at, ends_at]`, compared at millisecond resolution. The fields are named `starts_at` / `ends_at` rather than `from` / `to` because a message field named `from` is a Python keyword and rosidl cannot generate a binding for it; the gateway's REST representation of the same window uses `from` and `to`.
 
 ## Services
 
@@ -161,7 +162,7 @@ Declare a window during which faults are expected. Windows may overlap and may l
 **Request:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `starts_at` | builtin_interfaces/Time | Start of the window (wall clock, UTC) |
+| `starts_at` | builtin_interfaces/Time | Start of the window (wall clock, UTC). Must be after the Unix epoch: zero is what an unset Time reads as, never a request for "now" |
 | `ends_at` | builtin_interfaces/Time | End of the window; must be strictly after `starts_at` |
 | `reason` | string | Why the plant is stopping |
 | `declared_by` | string | Who is declaring it; empty means the caller did not say |
@@ -172,10 +173,11 @@ Declare a window during which faults are expected. Windows may overlap and may l
 | `success` | bool | True when the window was stored |
 | `message` | string | Why the declaration was refused; empty on success |
 | `stop` | PlannedStop | The stored window, including its assigned id |
+| `outcome` | uint8 | `OUTCOME_STORED`, `OUTCOME_INVALID_INTERVAL`, `OUTCOME_INVALID_INSTANT`, `OUTCOME_DUPLICATE_ID` or `OUTCOME_NOT_RETAINED`. A caller maps a refusal onto its own answer from this, never from the message prose |
 
 ### EndPlannedStop.srv
 
-Cut a window short: `ends_at` moves to the given instant and `ended_early` becomes true. Faults whose cycle started before that instant stay expected; faults raised after it do not. A window whose `ends_at` has already passed cannot be ended again.
+Stop a window. A window still **running** at the given instant is cut short: `ends_at` moves there and `ended_early` becomes true, so faults whose cycle started before it stay expected and faults raised after it do not. A window that has **not started** by then is cancelled - removed, with `cancelled` set on the copy returned - because it marked nothing and storing `ends_at <= starts_at` would contradict the message's own promise. A window that has **already ended** cannot be ended again, and a backdated instant cannot walk its end backwards.
 
 **Request:**
 | Field | Type | Description |
@@ -186,9 +188,10 @@ Cut a window short: `ends_at` moves to the given instant and `ended_early` becom
 **Response:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `success` | bool | True when the window was ended |
-| `message` | string | Why the request was refused; distinguishes an unknown id from an already-ended window |
-| `stop` | PlannedStop | The window as stored after the request |
+| `success` | bool | True when the window was ended or cancelled |
+| `message` | string | Why the request was refused |
+| `stop` | PlannedStop | The window after the request: cut short, or as it was for a cancellation |
+| `outcome` | uint8 | `OUTCOME_ENDED`, `OUTCOME_CANCELLED`, `OUTCOME_NOT_FOUND` or `OUTCOME_ALREADY_ENDED` |
 
 ### ListPlannedStops.srv
 

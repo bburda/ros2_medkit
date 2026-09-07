@@ -154,7 +154,7 @@ loaded plugin mounts, provided it exports `describe_plugin_routes`; those carry
 - `POST /api/v1/x-medkit-planned-stops` - Declare a window during which faults are expected (operator)
 - `GET /api/v1/x-medkit-planned-stops` - List declared windows; `?active=true` keeps only the ones containing now
 - `GET /api/v1/x-medkit-planned-stops/{planned_stop_id}` - Read one window
-- `DELETE /api/v1/x-medkit-planned-stops/{planned_stop_id}` - End a window early (operator)
+- `DELETE /api/v1/x-medkit-planned-stops/{planned_stop_id}` - End a running window early, or cancel one that has not started (operator)
 
 ### Vendor Extension Endpoints
 
@@ -1010,9 +1010,11 @@ curl "http://localhost:8080/api/v1/faults?status=all&expected=false"   # what br
 ```
 
 Each item carries `x-medkit.expected`, and `x-medkit.planned_stop_id` when it is true; the
-list's own `x-medkit.expected_count` is the tally. The same pair rides every
-`GET /api/v1/faults/stream` frame. See "Planned Stops" in `docs/api/rest.rst` for how a window
-is declared and what makes a fault fall inside one.
+list's own `x-medkit.expected_count` is the tally, counted after any peer merge. The same pair
+rides every `GET /api/v1/faults/stream` frame - except while the gateway has never managed to
+read the declared windows, when the frame carries no `expected` key rather than claiming the
+fault was unexpected. See "Planned Stops" in `docs/api/rest.rst` for how a window is declared,
+what makes a fault fall inside one, and why the comparison is at millisecond resolution.
 
 **Response (200 OK):**
 ```json

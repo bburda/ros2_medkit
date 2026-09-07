@@ -191,11 +191,17 @@ Clears (acknowledges) a fault by setting its status to CLEARED.
 
 Declare, cut short and list the windows of wall-clock time during which faults are expected.
 
-- **Declare**: refuses a window that is not an interval (``ends_at <= starts_at``); a zero
-  ``starts_at`` means "now". Windows may overlap and may lie wholly in the past.
-- **End**: moves ``ends_at`` to the given instant (zero means "now") and sets ``ended_early``.
-  Refused for an unknown id and for a window whose end has already passed, and the message
-  distinguishes the two so a caller can map them onto different answers.
+- **Declare**: refuses a window that is not an interval (``ends_at <= starts_at``) and one whose
+  bounds are at or before the Unix epoch - zero is what an unset time reads as, not a request for
+  "now". Windows may overlap and may lie wholly in the past. The stored row is read back before
+  success is reported, and the declaration is exempt from the retention pruning its own arrival
+  triggers, so a window answered as stored is there afterwards.
+- **End**: for a window still RUNNING at the given instant (zero means the fault manager's own
+  wall clock), moves ``ends_at`` there and sets ``ended_early``. A window that has not STARTED by
+  then is cancelled instead - removed, with ``cancelled`` set on the copy returned - because it
+  marked nothing and an inverted interval would contradict the message. Refused for an unknown id
+  and for a window that has already ended, backdated instants included. The structured ``outcome``
+  distinguishes the four cases so a caller maps them onto answers without reading prose.
 - **List**: newest declaration first; ``active_only`` keeps the windows containing ``now``.
 - **Returns**: the stored ``PlannedStop`` in every success case.
 

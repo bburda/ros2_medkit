@@ -2793,7 +2793,15 @@ drops a window that is still running.
 What makes a fault expected
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A fault is expected when its ``first_occurred`` lies in ``[from, to]``, inclusive at both ends.
+A fault is expected when its ``first_occurred`` lies in ``[from, to]``, inclusive at both ends and
+compared at **millisecond** resolution: both sides are floored to the millisecond before the
+comparison, so a fault reported anywhere inside the millisecond a window opens or closes is inside
+the window. That is the resolution of the whole API - the parser rounds an ISO 8601 fraction down
+to it, a ``GET`` returns exactly what the ``POST`` sent - because an operator declares a stop at
+minute or second precision while ``first_occurred`` crosses the wire as a double resolving to about
+a quarter of a microsecond, and a boundary defined more finely than the data can express is one
+nobody can rely on.
+
 ``first_occurred`` is the start of the fault's **current cycle**, not its first report ever: it
 is reset when a FAILED event raises a CLEARED fault again. A code that failed during a
 changeover and failed again after it was acknowledged is therefore expected for the first cycle
@@ -2826,8 +2834,8 @@ window logic.
      - One window
    * - ``DELETE /api/v1/x-medkit-planned-stops/{planned_stop_id}``
      - operator
-     - End a window early. ``200`` with the ended window, not ``204``: the caller has to be told
-       where ``to`` landed
+     - End a window early, or cancel one that has not started. ``200`` with the window, not
+       ``204``: the caller has to be told where ``to`` landed, or that the window is gone
 
 Declaring a window
 ~~~~~~~~~~~~~~~~~~
@@ -2847,34 +2855,54 @@ Declaring a window
      "reason": "line changeover",
      "declared_by": "shift_lead",
      "declared_at": "2026-09-06T17:58:12.004Z",
-     "ended_early": false
+     "ended_early": false,
+     "cancelled": false
    }
 
 Request fields:
 
 - ``from`` (optional) - ISO 8601 in UTC (``Z`` or ``+00:00``). Omit it for a stop that starts
-  now. A window wholly in the past is accepted and marks the faults it covers: a stop is a fact
-  about the plant, not about when someone typed it in.
+  now: the gateway fills in its own clock, and an explicit instant always reaches the fault
+  manager. A window wholly in the past is accepted and marks the faults it covers: a stop is a
+  fact about the plant, not about when someone typed it in.
 - ``to`` (required) - ISO 8601 in UTC, strictly after ``from``. There is no maximum duration.
-- ``reason`` (required) - carried verbatim on every fault the window marks.
+- ``reason`` (required) - why the plant is stopping. It is **not** carried on the faults the
+  window marks: a marked fault carries ``planned_stop_id``, and that id resolves to this window
+  and its reason through ``GET /api/v1/x-medkit-planned-stops/{id}``.
 - ``declared_by`` (optional) - defaults to the authenticated client id, or ``anonymous`` when
   authentication is off.
 
-Windows may overlap. Refusals are all ``400``: ``to`` at or before ``from``, a time that is not
+Windows may overlap. Refusals are ``400`` for: ``to`` at or before ``from``, a time that is not
 ISO 8601 in UTC (a real offset such as ``+02:00`` is refused rather than converted), and an
-instant outside ``1970-01-01T00:00:00Z`` to ``2038-01-19T03:14:07Z``, which is the range a
-``builtin_interfaces/Time`` can carry.
+instant outside the representable range. That range is **after** ``1970-01-01T00:00:00Z`` and no
+later than ``2038-01-19T03:14:07Z``, the upper bound being what a ``builtin_interfaces/Time``
+carries. The epoch itself is excluded on purpose: zero is what an unset time reads as, and a
+sentinel that is also a legal value cannot tell a caller who meant the epoch from one who filled
+in nothing.
 
-Ending a window early
-~~~~~~~~~~~~~~~~~~~~~
+A ``409`` means the request was well formed and the store could not take it - the configured
+``planned_stop.max_windows`` had no room. Raise the bound, or end a window, and retry.
+
+Ending or cancelling a window
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: bash
 
    curl -X DELETE http://localhost:8080/api/v1/x-medkit-planned-stops/1788716982473405798-1
 
-``to`` moves to the moment of the request and ``ended_early`` becomes true. Faults whose cycle
-started before that instant stay expected; faults raised after it do not. A window whose end
-has already passed answers ``400`` with vendor code ``x-medkit-planned-stop-ended`` - when a
+One route, two things, and the answer says which happened.
+
+A window that is **running** is cut short: ``to`` moves to the moment of the request and
+``ended_early`` becomes true. Faults whose cycle started before that instant stay expected; faults
+raised after it do not.
+
+A window that has **not started** is cancelled: it is removed, and the ``200`` carries the window
+as it was with ``cancelled: true`` and ``ended_early`` still false. It marked nothing, and storing
+a ``to`` before its own ``from`` would contradict what the window claims to be. A ``GET`` on that
+id afterwards answers ``404``.
+
+A window that has **already ended**, early or on its own, answers ``400`` with vendor code
+``x-medkit-planned-stop-ended``. A backdated request cannot walk its end backwards either: when a
 stop actually finished is not something a later request gets to rewrite. An unknown id answers
 ``404``.
 
@@ -2898,16 +2926,23 @@ tally beside them:
      "x-medkit": {"count": 1, "expected_count": 1}
    }
 
-``planned_stop_id`` is present only when ``expected`` is true. ``expected_count`` counts the
-items this gateway derived a flag for; items merged from an aggregated peer carry the peer's
-own flag and are not recounted.
+``planned_stop_id`` is present only when ``expected`` is true, and the window's ``reason`` is not
+carried beside it - resolve the id. ``expected_count`` counts the list that was actually served:
+items this gateway flagged plus items an aggregated peer flagged, after filtering.
 
 Both fault lists take ``?expected=true|false|all``. Omitting it means ``all``: the flag is extra
-information about a fault, never a reason to hide it by default.
+information about a fault, never a reason to hide it by default. On an aggregating gateway the
+query goes to the peers with the request, and their items are filtered again on the way in using
+the flag the **peer** derived from its own windows - never re-derived here. An item from a peer
+that sent no flag satisfies neither ``true`` nor ``false``, because this gateway cannot claim
+either.
 
 The ``/faults/stream`` frames carry the same pair inside their ``x-medkit`` object, alongside
-the ``entity_type`` / ``entity_id`` hint. ``expected`` is sent as an explicit ``false`` rather
-than omitted, so a consumer can tell "not expected" from "this gateway could not say".
+the ``entity_type`` / ``entity_id`` hint. ``expected`` is sent as an explicit ``false`` for a
+fault no window covers - but only once the gateway has actually read the declared windows. While
+it never has (no fault manager, or none reachable since start) the frame carries **no**
+``expected`` key at all: a consumer must not read an outage of the fault manager as "nothing is
+expected", which is exactly what an operator watching a stop would act on.
 
 Fault Triggers (threshold rules)
 --------------------------------

@@ -217,9 +217,10 @@ ros2 service call /fault_manager/end_planned_stop ros2_medkit_msgs/srv/EndPlanne
 
 Behaviour worth knowing before relying on it:
 
-- A fault belongs to a window when its `first_occurred` lies in `[starts_at, ends_at]`, inclusive at both ends. `first_occurred` is the start of the current **cycle**, so a code that fails inside a window and fails again after it was cleared is expected for the first cycle and unexpected for the second.
+- A fault belongs to a window when its `first_occurred` lies in `[starts_at, ends_at]`, inclusive at both ends and compared at millisecond resolution. `first_occurred` is the start of the current **cycle**, so a code that fails inside a window and fails again after it was cleared is expected for the first cycle and unexpected for the second.
 - Windows may overlap, and may be declared **after** the stop they describe: a stop is a fact about the plant, not about when someone typed it in.
-- Ending a window early moves `ends_at` to that instant. Faults raised before it stay expected; faults raised after it do not. A window whose end has already passed cannot be ended again.
+- Both bounds must be after the Unix epoch. Zero is what an unset `builtin_interfaces/Time` reads as, so it cannot also mean "now" - a caller who wants the current instant sends it.
+- Ending a window that is running moves `ends_at` to that instant. Faults raised before it stay expected; faults raised after it do not. A window that has not started yet is **cancelled** instead: removed, with `cancelled` set on the answer. A window that has already ended cannot be ended again, and a backdated `at` cannot move its end earlier.
 - Windows are stored in the `planned_stops` table and survive a restart. A database written by an earlier build gains the table on first open.
 - Retention is by count (`planned_stop.max_windows`), never by age, and never drops a running window.
 
