@@ -527,6 +527,48 @@ TEST_F(FaultAuditLogTest, AnchorTriggersRejectOutOfBandWrites) {
   EXPECT_TRUE(reopened.verify().ok);
 }
 
+// A planned-stop transition belongs to the installation, not to a fault: it
+// carries no fault code, and the chain has to survive that.
+TEST_F(FaultAuditLogTest, PlannedStopTransitionsChainWithNoFaultCode) {
+  FaultAuditLog log(path_);
+
+  AuditEvent started;
+  started.fault_code = "";
+  started.transition = ros2_medkit_fault_manager::kTransitionPlannedStopStarted;
+  started.status = "ACTIVE";
+  started.source_id = "shift_lead";
+  started.description = "line 3 quarterly maintenance";
+  started.occurred_at_ns = 1000;
+  EXPECT_EQ(log.append(started), 1);
+
+  AuditEvent ended;
+  ended.fault_code = "";
+  ended.transition = ros2_medkit_fault_manager::kTransitionPlannedStopEnded;
+  ended.status = "INACTIVE";
+  ended.source_id = "shift_lead";
+  ended.description = "line 3 back up";
+  ended.occurred_at_ns = 2000;
+  EXPECT_EQ(log.append(ended), 2);
+
+  EXPECT_TRUE(log.verify().ok);
+
+  const auto records = log.read();
+  ASSERT_EQ(records.size(), 2u);
+  EXPECT_EQ(records[0].event.transition, "planned_stop_started");
+  EXPECT_EQ(records[0].event.fault_code, "");
+  EXPECT_EQ(records[0].event.source_id, "shift_lead");
+  EXPECT_EQ(records[0].event.description, "line 3 quarterly maintenance");
+  EXPECT_EQ(records[1].event.transition, "planned_stop_ended");
+  EXPECT_EQ(records[1].event.status, "INACTIVE");
+  EXPECT_EQ(records[1].prev_hash, records[0].record_hash);
+
+  // The declaration is part of the hashed record, not a side note: rewriting the
+  // reason without recomputing the chain has to be detectable.
+  raw_exec(path_, std::string(kDropTriggers) + "UPDATE audit_log SET description = 'unplanned outage' WHERE seq = 1;");
+  FaultAuditLog reopened(path_);
+  EXPECT_FALSE(reopened.verify().ok);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
