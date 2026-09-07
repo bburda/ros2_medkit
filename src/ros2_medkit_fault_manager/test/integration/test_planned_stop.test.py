@@ -297,7 +297,8 @@ class TestPlannedStop(unittest.TestCase):
 
     @classmethod
     def _event_types(cls, fault_code):
-        """Every event type published for this code, as a set.
+        """
+        Return every event type published for this code, as a set.
 
         Counting one type cannot see a leak of another: a stop that announced an
         UPDATE it should have withheld passes a CONFIRMED-only assertion.
@@ -411,8 +412,15 @@ class TestPlannedStop(unittest.TestCase):
             f'no snapshot was captured for the muted fault {code}')
         self.assertIn(CAPTURE_TOPIC, captured)
 
+        # Re-report the marked fault while the stop still stands. This is the path
+        # that produces EVENT_UPDATED, and it is the only way an assertion about
+        # "nothing was announced" can see an update leaking out.
+        self._report(code)
+        self._wait_until(lambda: self._get_fault(code).fault.occurrence_count >= 1,
+                         f'{code} left the store')
+
         # Nothing at all was announced while the stop stood - not the confirmation,
-        # and not an update either.
+        # and not the update either.
         self.assertEqual(set(), self._event_types(code))
 
         withdrawal = self._set_stop(False, reason='line 3 back up', declared_by='shift_lead')

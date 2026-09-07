@@ -312,6 +312,13 @@ declarer and produces an audit record, none of which a parameter can do; and it 
 not a new HTTP route because the gateway already exposes a node's services as SOVD
 operations on its App entity.
 
+One cost falls on every deployment, correlation or not: the engine is now always
+constructed, so the ``correlation.cleanup_interval_sec`` timer (5 s by default)
+runs on every fault manager. With no rules loaded a tick walks two empty
+containers - ``pending_root_causes_`` and ``pending_clusters_`` - and returns. The
+alternative, building the engine lazily when a stop is first declared, would put a
+second construction path under the service handler for no measurable saving.
+
 Rosbag Black-Box Recording
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
