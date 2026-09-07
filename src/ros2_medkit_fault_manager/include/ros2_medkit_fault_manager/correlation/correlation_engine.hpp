@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -87,10 +88,22 @@ struct ClusterData {
 /// - Whether they should be muted (symptoms of a root cause)
 /// - Whether they are root causes that should collect symptoms
 /// - Whether they form part of an auto-detected cluster
+/// - Whether a planned stop is in force, which mutes every fault whose cycle
+///   starts while it is on
 ///
 /// Thread-safe: all public methods can be called from multiple threads.
 class CorrelationEngine {
  public:
+  /// Pseudo root cause recorded against a fault the planned stop muted. It is
+  /// not a fault code any reporter can raise; it names the declaration as the
+  /// reason the fault is not being announced.
+  static constexpr const char * kPlannedStopRootCause = "PLANNED_STOP";
+
+  /// Rule id recorded against a fault the planned stop muted. The switch is not
+  /// a configured rule, so it carries a fixed id of its own and a consumer of
+  /// `muted_faults` can tell an operator's declaration from a correlation rule.
+  static constexpr const char * kPlannedStopRuleId = "planned_stop";
+
   /// Create correlation engine from configuration
   /// @param config Correlation configuration (must be enabled and valid)
   explicit CorrelationEngine(const CorrelationConfig & config);
@@ -131,7 +144,27 @@ class CorrelationEngine {
   /// Called periodically to remove old state
   void cleanup_expired();
 
+  /// Declare a planned stop. From here every fault reported through
+  /// process_fault is muted unless a rule already mutes it, and stays muted
+  /// until the stop ends or the fault is cleared. Idempotent.
+  void begin_planned_stop();
+
+  /// Withdraw the planned stop and release the faults it alone was muting.
+  /// A fault a rule has since claimed keeps that rule's mute and is NOT
+  /// returned; nor is one that was cleared while the stop was on.
+  /// @return the fault codes this call unmuted, so the caller can announce the
+  ///         confirmations that were never published
+  std::vector<std::string> end_planned_stop();
+
+  /// Whether a planned stop is currently declared.
+  bool planned_stop_active() const;
+
  private:
+  /// The correlation half of process_fault: rules, clusters and their muting,
+  /// with no planned-stop involvement. Caller holds mutex_.
+  ProcessFaultResult correlate(const std::string & fault_code, const std::string & severity,
+                               std::chrono::steady_clock::time_point timestamp);
+
   /// Check if fault matches a root cause pattern in any hierarchical rule
   /// @return Rule ID if matched, empty optional otherwise
   std::optional<std::string> try_as_root_cause(const std::string & fault_code);
@@ -186,6 +219,14 @@ class CorrelationEngine {
 
   /// Counter for cluster ID generation
   uint64_t cluster_counter_{0};
+
+  /// Whether an operator has declared a planned stop.
+  bool planned_stop_active_{false};
+
+  /// Fault codes muted BY the planned stop and by nothing else. A code leaves
+  /// this set the moment a rule claims it or it is cleared, which is what makes
+  /// the switch-off release exactly the faults it is still holding down.
+  std::set<std::string> planned_stop_muted_;
 
   mutable std::mutex mutex_;
 };

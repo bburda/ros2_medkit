@@ -377,6 +377,18 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
         handle_list_faults_for_entity(request, response);
       });
 
+  set_planned_stop_srv_ = create_service<ros2_medkit_msgs::srv::SetPlannedStop>(
+      "~/set_planned_stop", [this](const std::shared_ptr<ros2_medkit_msgs::srv::SetPlannedStop::Request> & request,
+                                   const std::shared_ptr<ros2_medkit_msgs::srv::SetPlannedStop::Response> & response) {
+        handle_set_planned_stop(request, response);
+      });
+
+  get_planned_stop_srv_ = create_service<ros2_medkit_msgs::srv::GetPlannedStop>(
+      "~/get_planned_stop", [this](const std::shared_ptr<ros2_medkit_msgs::srv::GetPlannedStop::Request> & request,
+                                   const std::shared_ptr<ros2_medkit_msgs::srv::GetPlannedStop::Response> & response) {
+        handle_get_planned_stop(request, response);
+      });
+
   // Initialize snapshot capture
   auto snapshot_config = create_snapshot_config();
   if (snapshot_config.enabled) {
@@ -427,21 +439,29 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
         });
   }
 
-  // Initialize correlation engine (nullptr if disabled or not configured)
+  // Correlation engine: rules when configured, and in every case the planned-stop mute
   correlation_engine_ = create_correlation_engine();
 
-  // Create correlation cleanup timer if correlation is enabled
-  if (correlation_engine_) {
-    auto cleanup_interval_sec = declare_parameter<double>("correlation.cleanup_interval_sec", 5.0);
-    if (!(std::isfinite(cleanup_interval_sec) && cleanup_interval_sec > 0.0)) {
-      RCLCPP_WARN(get_logger(), "correlation.cleanup_interval_sec must be positive, got %.2f. Using default 5.0s",
-                  cleanup_interval_sec);
-      cleanup_interval_sec = 5.0;
-    }
-    auto cleanup_interval_ms = static_cast<int64_t>(cleanup_interval_sec * 1000);
-    correlation_cleanup_timer_ = create_wall_timer(std::chrono::milliseconds(cleanup_interval_ms), [this]() {
-      correlation_engine_->cleanup_expired();
-    });
+  auto cleanup_interval_sec = declare_parameter<double>("correlation.cleanup_interval_sec", 5.0);
+  if (!(std::isfinite(cleanup_interval_sec) && cleanup_interval_sec > 0.0)) {
+    RCLCPP_WARN(get_logger(), "correlation.cleanup_interval_sec must be positive, got %.2f. Using default 5.0s",
+                cleanup_interval_sec);
+    cleanup_interval_sec = 5.0;
+  }
+  auto cleanup_interval_ms = static_cast<int64_t>(cleanup_interval_sec * 1000);
+  correlation_cleanup_timer_ = create_wall_timer(std::chrono::milliseconds(cleanup_interval_ms), [this]() {
+    correlation_engine_->cleanup_expired();
+  });
+
+  // A planned stop outlives the process that declared it: a weekend stop must not
+  // end because the box rebooted. Faults muted before the restart are not restored -
+  // muting is per fault cycle and those cycles are over as far as this process is
+  // concerned - but every fault reported from here is muted again.
+  planned_stop_ = storage_->get_planned_stop();
+  if (planned_stop_.active) {
+    correlation_engine_->begin_planned_stop();
+    RCLCPP_INFO(get_logger(), "Planned stop is in force (reason='%s', declared_by='%s'): new faults are marked muted",
+                planned_stop_.reason.c_str(), planned_stop_.declared_by.c_str());
   }
 
   // Create auto-confirmation timer if enabled
@@ -657,6 +677,14 @@ void FaultManagerNode::audit_transition(const char * transition, const ros2_medk
   event.description = fault.description;
   event.occurred_at_ns = occurred_at_ns;
 
+  append_audit_event(event);
+}
+
+void FaultManagerNode::append_audit_event(const AuditEvent & event) {
+  if (!audit_log_) {
+    return;
+  }
+
   try {
     audit_log_->append(event);
   } catch (const std::exception & e) {
@@ -670,7 +698,7 @@ void FaultManagerNode::audit_transition(const char * transition, const ros2_medk
     audit_healthy_.store(false, std::memory_order_relaxed);
     const uint64_t dropped = audit_dropped_writes_.load(std::memory_order_relaxed);
     RCLCPP_ERROR(get_logger(), "Failed to append audit record for '%s' (%s): %s [audit dropped_writes=%" PRIu64 "]",
-                 fault.fault_code.c_str(), transition, e.what(), dropped);
+                 event.fault_code.c_str(), event.transition.c_str(), e.what(), dropped);
     if (audit_fail_closed_) {
       // Explicit fail-FAST: surface the broken audit to the caller so a
       // compliance-strict deployment learns the chain is now incomplete and an
@@ -681,10 +709,24 @@ void FaultManagerNode::audit_transition(const char * transition, const ros2_medk
                    "audit_log.fail_closed is set: audit append failed for '%s' (%s); the audit chain is now "
                    "incomplete and requires operator action. The already-committed fault-state change is NOT "
                    "rolled back (the fault store is a separate database).",
-                   fault.fault_code.c_str(), transition);
+                   event.fault_code.c_str(), event.transition.c_str());
       throw;
     }
   }
+}
+
+void FaultManagerNode::audit_planned_stop(const char * transition, const PlannedStopState & state,
+                                          int64_t occurred_at_ns) {
+  AuditEvent event;
+  // Empty: the transition is about the installation, not about one fault.
+  event.fault_code = "";
+  event.transition = transition;
+  event.status = state.active ? "ACTIVE" : "INACTIVE";
+  event.source_id = state.declared_by;
+  event.description = state.reason;
+  event.occurred_at_ns = occurred_at_ns;
+
+  append_audit_event(event);
 }
 
 void FaultManagerNode::capture_on_confirm(const std::string & fault_code) {
@@ -1073,6 +1115,79 @@ void FaultManagerNode::handle_clear_fault(
   }
 }
 
+void FaultManagerNode::handle_set_planned_stop(
+    const std::shared_ptr<ros2_medkit_msgs::srv::SetPlannedStop::Request> & request,
+    const std::shared_ptr<ros2_medkit_msgs::srv::SetPlannedStop::Response> & response) {
+  response->was_active = planned_stop_.active;
+  response->success = true;
+
+  if (request->active == planned_stop_.active) {
+    // Asking for the state the switch is already in is not an error and is not a
+    // transition: nothing changes and the audit chain records nothing, so a client
+    // that retries a call cannot manufacture evidence of a stop that never started.
+    response->message = planned_stop_.active ? "Planned stop already in force" : "No planned stop in force";
+    return;
+  }
+
+  const int64_t transition_at_ns = get_wall_clock_time().nanoseconds();
+
+  if (request->active) {
+    planned_stop_.active = true;
+    planned_stop_.reason = request->reason;
+    planned_stop_.declared_by = request->declared_by;
+    planned_stop_.since_ns = transition_at_ns;
+
+    correlation_engine_->begin_planned_stop();
+    storage_->set_planned_stop(planned_stop_);
+    audit_planned_stop(kTransitionPlannedStopStarted, planned_stop_, transition_at_ns);
+
+    response->message = "Planned stop declared";
+    RCLCPP_INFO(get_logger(), "Planned stop declared by '%s': %s", planned_stop_.declared_by.c_str(),
+                planned_stop_.reason.c_str());
+    return;
+  }
+
+  const auto unmuted = correlation_engine_->end_planned_stop();
+
+  // The switch-off is the moment those faults become news. A CONFIRMED one was
+  // never announced - the confirmation happened behind the mute - so publish it
+  // now, once, or the alarm standing on the controller is invisible to every
+  // consumer of the stream. PREFAILED has nothing to announce yet, and a HEALED
+  // one already published its end.
+  size_t announced = 0;
+  for (const auto & fault_code : unmuted) {
+    auto fault = storage_->get_fault(fault_code);
+    if (fault && fault->status == ros2_medkit_msgs::msg::Fault::STATUS_CONFIRMED) {
+      publish_fault_event(ros2_medkit_msgs::msg::FaultEvent::EVENT_CONFIRMED, *fault);
+      ++announced;
+    }
+  }
+
+  // The withdrawal carries its own reason and declarer into the audit record; the
+  // stored declaration goes back to "no stop", which is what GetPlannedStop then
+  // reports.
+  PlannedStopState ended;
+  ended.reason = request->reason;
+  ended.declared_by = request->declared_by;
+  audit_planned_stop(kTransitionPlannedStopEnded, ended, transition_at_ns);
+
+  planned_stop_ = PlannedStopState{};
+  storage_->set_planned_stop(planned_stop_);
+
+  response->message = "Planned stop withdrawn";
+  RCLCPP_INFO(get_logger(), "Planned stop withdrawn by '%s': unmuted %zu fault(s), announced %zu confirmation(s)",
+              request->declared_by.c_str(), unmuted.size(), announced);
+}
+
+void FaultManagerNode::handle_get_planned_stop(
+    const std::shared_ptr<ros2_medkit_msgs::srv::GetPlannedStop::Request> & /*request*/,
+    const std::shared_ptr<ros2_medkit_msgs::srv::GetPlannedStop::Response> & response) {
+  response->active = planned_stop_.active;
+  response->reason = planned_stop_.reason;
+  response->declared_by = planned_stop_.declared_by;
+  response->since = rclcpp::Time(planned_stop_.since_ns, RCL_SYSTEM_TIME);
+}
+
 bool FaultManagerNode::is_valid_severity(uint8_t severity) {
   return severity <= ros2_medkit_msgs::msg::Fault::SEVERITY_CRITICAL;
 }
@@ -1365,17 +1480,30 @@ void FaultManagerNode::load_snapshot_config_from_yaml(const std::string & config
 }
 
 std::unique_ptr<correlation::CorrelationEngine> FaultManagerNode::create_correlation_engine() {
+  auto config = load_correlation_config();
+  if (config) {
+    RCLCPP_INFO(get_logger(), "Correlation engine enabled (default_window=%ums, patterns=%zu, rules=%zu)",
+                config->default_window_ms, config->patterns.size(), config->rules.size());
+    return std::make_unique<correlation::CorrelationEngine>(*config);
+  }
+
+  // No rules, but still an engine: the planned stop is a mute source an operator
+  // declares at runtime and it needs no configuration to exist.
+  return std::make_unique<correlation::CorrelationEngine>(correlation::CorrelationConfig{});
+}
+
+std::optional<correlation::CorrelationConfig> FaultManagerNode::load_correlation_config() {
   // Get correlation config file path from parameter
   auto config_file = declare_parameter<std::string>("correlation.config_file", "");
 
   if (config_file.empty()) {
-    RCLCPP_DEBUG(get_logger(), "Correlation disabled: no config_file specified");
-    return nullptr;
+    RCLCPP_DEBUG(get_logger(), "Correlation rules disabled: no config_file specified");
+    return std::nullopt;
   }
 
   if (!std::filesystem::exists(config_file)) {
     RCLCPP_ERROR(get_logger(), "Correlation config file not found: %s", config_file.c_str());
-    return nullptr;
+    return std::nullopt;
   }
 
   try {
@@ -1384,7 +1512,7 @@ std::unique_ptr<correlation::CorrelationEngine> FaultManagerNode::create_correla
 
     if (!config.enabled) {
       RCLCPP_INFO(get_logger(), "Correlation explicitly disabled in config");
-      return nullptr;
+      return std::nullopt;
     }
 
     // Validate the config
@@ -1396,17 +1524,14 @@ std::unique_ptr<correlation::CorrelationEngine> FaultManagerNode::create_correla
       for (const auto & error : validation.errors) {
         RCLCPP_ERROR(get_logger(), "Correlation config error: %s", error.c_str());
       }
-      return nullptr;
+      return std::nullopt;
     }
 
-    RCLCPP_INFO(get_logger(), "Correlation engine enabled (default_window=%ums, patterns=%zu, rules=%zu)",
-                config.default_window_ms, config.patterns.size(), config.rules.size());
-
-    return std::make_unique<correlation::CorrelationEngine>(config);
+    return config;
 
   } catch (const std::exception & e) {
     RCLCPP_ERROR(get_logger(), "Failed to load correlation config: %s", e.what());
-    return nullptr;
+    return std::nullopt;
   }
 }
 

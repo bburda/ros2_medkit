@@ -875,4 +875,14 @@ std::vector<std::string> InMemoryFaultStorage::reclassify_healed_as_cleared() {
   return reclassified;
 }
 
+void InMemoryFaultStorage::set_planned_stop(const PlannedStopState & state) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  planned_stop_ = state;
+}
+
+PlannedStopState InMemoryFaultStorage::get_planned_stop() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return planned_stop_;
+}
+
 }  // namespace ros2_medkit_fault_manager

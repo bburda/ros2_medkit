@@ -67,6 +67,13 @@ constexpr const char * kTransitionHealed = "healed";
 /// its own start and stop.
 constexpr const char * kTransitionLoggingActivated = "logging_activated";
 constexpr const char * kTransitionLoggingDeactivated = "logging_deactivated";
+/// Planned-stop lifecycle: an operator declared, or withdrew, a deliberate stop
+/// of the plant. Like the logging markers these describe the installation rather
+/// than one fault, so they carry an empty fault_code and are appended
+/// independently of the per-fault transition filter. The reason travels in
+/// `description` and the declarer in `source_id`.
+constexpr const char * kTransitionPlannedStopStarted = "planned_stop_started";
+constexpr const char * kTransitionPlannedStopEnded = "planned_stop_ended";
 // NOTE: there is deliberately no "ack" kind. The open fault_manager has no
 // acknowledge action separate from clearing: ~/clear_fault IS the acknowledge,
 // and it is recorded as kTransitionCleared (clear == ack). A separate "ack" kind

@@ -195,6 +195,18 @@ struct RosbagFileInfo {
   int64_t created_at_ns{0};  ///< Timestamp when bag was created
 };
 
+/// The operator's planned-stop declaration, as the store holds it.
+///
+/// One declaration per fault manager, not one per fault: it says the plant is
+/// deliberately down, which is a fact about the installation. It is persisted so
+/// a stop declared on Friday is still in force after a Saturday reboot.
+struct PlannedStopState {
+  bool active{false};
+  std::string reason;       ///< Why the plant is stopped; empty while none is declared
+  std::string declared_by;  ///< Who declared it; empty while none is declared
+  int64_t since_ns{0};      ///< Wall-clock time of the declaration; 0 while none is declared
+};
+
 /// Abstract interface for fault storage backends
 class FaultStorage {
  public:
@@ -454,6 +466,15 @@ class FaultStorage {
     return {};
   }
 
+  /// Replace the planned-stop declaration. Writing a default-constructed state
+  /// withdraws it. A backend keeps exactly one declaration, so this overwrites
+  /// rather than appends.
+  virtual void set_planned_stop(const PlannedStopState & state) = 0;
+
+  /// The planned-stop declaration this store holds. A store that has never been
+  /// given one answers with a default-constructed (inactive) state.
+  virtual PlannedStopState get_planned_stop() const = 0;
+
  protected:
   FaultStorage() = default;
   FaultStorage(const FaultStorage &) = default;
@@ -520,6 +541,9 @@ class InMemoryFaultStorage : public FaultStorage {
   std::vector<ros2_medkit_msgs::msg::Fault> get_all_faults() const override;
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
+  void set_planned_stop(const PlannedStopState & state) override;
+  PlannedStopState get_planned_stop() const override;
+
  private:
   /// Update fault status based on debounce counter and given config
   void update_status(FaultState & state, const DebounceConfig & config);
@@ -564,6 +588,10 @@ class InMemoryFaultStorage : public FaultStorage {
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
   bool retain_snapshots_on_clear_{false};
   size_t max_near_misses_per_fault_{0};  ///< 0 = unlimited
+  /// Held for the life of the process only. This backend has no file behind it,
+  /// so a restart starts with no declaration - which is why a deployment that
+  /// needs the stop to outlive a reboot runs on the SQLite backend.
+  PlannedStopState planned_stop_;
 };
 
 }  // namespace ros2_medkit_fault_manager

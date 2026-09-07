@@ -28,6 +28,30 @@ ProcessFaultResult CorrelationEngine::process_fault(const std::string & fault_co
                                                     std::chrono::steady_clock::time_point timestamp) {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  ProcessFaultResult result = correlate(fault_code, severity, timestamp);
+
+  if (result.should_mute) {
+    // A rule is now the reason this fault is quiet. Hand it over: ending the
+    // planned stop must not release a fault a rule is still holding down.
+    planned_stop_muted_.erase(fault_code);
+    return result;
+  }
+
+  if (planned_stop_active_) {
+    MutedFaultData muted;
+    muted.fault_code = fault_code;
+    muted.root_cause_code = kPlannedStopRootCause;
+    muted.rule_id = kPlannedStopRuleId;
+    muted_faults_[fault_code] = muted;
+    planned_stop_muted_.insert(fault_code);
+    result.should_mute = true;
+  }
+
+  return result;
+}
+
+ProcessFaultResult CorrelationEngine::correlate(const std::string & fault_code, const std::string & severity,
+                                                std::chrono::steady_clock::time_point timestamp) {
   ProcessFaultResult result;
 
   // First, clean up expired entries
@@ -121,6 +145,7 @@ ProcessClearResult CorrelationEngine::process_clear(const std::string & fault_co
     // Clean up muted faults
     for (const auto & symptom_code : it->second) {
       muted_faults_.erase(symptom_code);
+      planned_stop_muted_.erase(symptom_code);
     }
 
     // Remove from root_to_symptoms
@@ -229,8 +254,38 @@ ProcessClearResult CorrelationEngine::process_clear(const std::string & fault_co
 
   // Remove from muted faults if it was a symptom
   muted_faults_.erase(fault_code);
+  // A cleared fault has nothing left to announce, so the planned stop must not
+  // hand it back at switch-off.
+  planned_stop_muted_.erase(fault_code);
 
   return result;
+}
+
+void CorrelationEngine::begin_planned_stop() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  planned_stop_active_ = true;
+}
+
+std::vector<std::string> CorrelationEngine::end_planned_stop() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  planned_stop_active_ = false;
+
+  std::vector<std::string> unmuted;
+  unmuted.reserve(planned_stop_muted_.size());
+  for (const auto & fault_code : planned_stop_muted_) {
+    if (muted_faults_.erase(fault_code) > 0) {
+      unmuted.push_back(fault_code);
+    }
+  }
+  planned_stop_muted_.clear();
+
+  return unmuted;
+}
+
+bool CorrelationEngine::planned_stop_active() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return planned_stop_active_;
 }
 
 std::vector<MutedFaultData> CorrelationEngine::get_muted_faults() const {

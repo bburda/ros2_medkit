@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
+#include "ros2_medkit_fault_manager/fault_storage.hpp"
 #include "ros2_medkit_fault_manager/sqlite_fault_storage.hpp"
 #include "ros2_medkit_msgs/msg/fault.hpp"
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
@@ -2389,6 +2390,120 @@ TEST_F(SqliteFaultStorageTest, SnapshotsDroppedByHealedReclassificationByDefault
   ASSERT_EQ(storage_->reclassify_healed_as_cleared().size(), 1u);
 
   EXPECT_TRUE(storage_->get_snapshots("SNAPSHOT_DROP_TEST").empty());
+}
+
+// ============================================================================
+// Planned-stop declaration (survives a restart)
+// ============================================================================
+
+TEST_F(SqliteFaultStorageTest, PlannedStopDefaultsToInactive) {
+  const auto state = storage_->get_planned_stop();
+  EXPECT_FALSE(state.active);
+  EXPECT_TRUE(state.reason.empty());
+  EXPECT_TRUE(state.declared_by.empty());
+  EXPECT_EQ(0, state.since_ns);
+}
+
+TEST_F(SqliteFaultStorageTest, PlannedStopRoundTripsThroughAReopen) {
+  ros2_medkit_fault_manager::PlannedStopState declared;
+  declared.active = true;
+  declared.reason = "line 3 quarterly maintenance";
+  declared.declared_by = "shift_lead";
+  declared.since_ns = 1757000000000000000;
+  storage_->set_planned_stop(declared);
+
+  // Reopening the same file is what a restart of the fault manager does.
+  storage_.reset();
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  const auto reopened = storage_->get_planned_stop();
+  EXPECT_TRUE(reopened.active);
+  EXPECT_EQ("line 3 quarterly maintenance", reopened.reason);
+  EXPECT_EQ("shift_lead", reopened.declared_by);
+  EXPECT_EQ(1757000000000000000, reopened.since_ns);
+}
+
+TEST_F(SqliteFaultStorageTest, PlannedStopKeepsOneRowAcrossRepeatedWrites) {
+  ros2_medkit_fault_manager::PlannedStopState first;
+  first.active = true;
+  first.reason = "first";
+  first.declared_by = "a";
+  first.since_ns = 111;
+  storage_->set_planned_stop(first);
+
+  ros2_medkit_fault_manager::PlannedStopState second;
+  second.active = true;
+  second.reason = "second";
+  second.declared_by = "b";
+  second.since_ns = 222;
+  storage_->set_planned_stop(second);
+
+  storage_.reset();
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  const auto state = storage_->get_planned_stop();
+  EXPECT_EQ("second", state.reason);
+  EXPECT_EQ("b", state.declared_by);
+  EXPECT_EQ(222, state.since_ns);
+}
+
+TEST_F(SqliteFaultStorageTest, WithdrawnPlannedStopIsWhatAReopenSees) {
+  ros2_medkit_fault_manager::PlannedStopState declared;
+  declared.active = true;
+  declared.reason = "maintenance";
+  declared.declared_by = "shift_lead";
+  declared.since_ns = 999;
+  storage_->set_planned_stop(declared);
+  storage_->set_planned_stop(ros2_medkit_fault_manager::PlannedStopState{});
+
+  storage_.reset();
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  const auto state = storage_->get_planned_stop();
+  EXPECT_FALSE(state.active);
+  EXPECT_TRUE(state.reason.empty());
+  EXPECT_TRUE(state.declared_by.empty());
+  EXPECT_EQ(0, state.since_ns);
+}
+
+TEST_F(SqliteFaultStorageTest, PlannedStopCarriesAKilobyteReason) {
+  const std::string long_reason(1024, 'r');
+  ros2_medkit_fault_manager::PlannedStopState declared;
+  declared.active = true;
+  declared.reason = long_reason;
+  declared.since_ns = 7;
+  storage_->set_planned_stop(declared);
+
+  storage_.reset();
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  const auto state = storage_->get_planned_stop();
+  EXPECT_TRUE(state.active);
+  EXPECT_EQ(long_reason, state.reason);
+  EXPECT_TRUE(state.declared_by.empty());
+}
+
+TEST(InMemoryFaultStorageTest, PlannedStopRoundTripsInMemory) {
+  ros2_medkit_fault_manager::InMemoryFaultStorage storage;
+
+  EXPECT_FALSE(storage.get_planned_stop().active);
+
+  ros2_medkit_fault_manager::PlannedStopState declared;
+  declared.active = true;
+  declared.reason = "cell 7 changeover";
+  declared.declared_by = "maintenance";
+  declared.since_ns = 42;
+  storage.set_planned_stop(declared);
+
+  const auto state = storage.get_planned_stop();
+  EXPECT_TRUE(state.active);
+  EXPECT_EQ("cell 7 changeover", state.reason);
+  EXPECT_EQ("maintenance", state.declared_by);
+  EXPECT_EQ(42, state.since_ns);
+
+  storage.set_planned_stop(ros2_medkit_fault_manager::PlannedStopState{});
+  EXPECT_FALSE(storage.get_planned_stop().active);
+  EXPECT_TRUE(storage.get_planned_stop().reason.empty());
 }
 
 int main(int argc, char ** argv) {

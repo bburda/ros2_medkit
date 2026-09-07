@@ -316,6 +316,25 @@ void SqliteFaultStorage::initialize_schema() {
     }
   }
 
+  // Create planned_stop table: the operator's declaration that the plant is
+  // deliberately down. A fault manager holds exactly one, so the table is pinned
+  // to a single row by a constant primary key and written with INSERT OR REPLACE.
+  const char * create_planned_stop_table_sql = R"(
+    CREATE TABLE IF NOT EXISTS planned_stop (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      active INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      declared_by TEXT NOT NULL,
+      since_ns INTEGER NOT NULL
+    );
+  )";
+
+  if (sqlite3_exec(db_, create_planned_stop_table_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = err_msg ? err_msg : "Unknown error";
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create planned_stop table: " + error);
+  }
+
   // Create rosbag_files table. One row = one LINK (a fault claiming a recording):
   // several faults of a burst link to one bag, and one fault links to several bags
   // over time. Bytes belong to file_path, not to the row.
@@ -1283,6 +1302,39 @@ void SqliteFaultStorage::store_freeze_frame(const FreezeFrameData & frame) {
   if (stmt.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to store freeze frame: ") + sqlite3_errmsg(db_));
   }
+}
+
+void SqliteFaultStorage::set_planned_stop(const PlannedStopState & state) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  SqliteStatement stmt(db_,
+                       "INSERT OR REPLACE INTO planned_stop (id, active, reason, declared_by, since_ns) "
+                       "VALUES (1, ?, ?, ?, ?)");
+  stmt.bind_int(1, state.active ? 1 : 0);
+  stmt.bind_text(2, state.reason);
+  stmt.bind_text(3, state.declared_by);
+  stmt.bind_int64(4, state.since_ns);
+
+  if (stmt.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to store planned stop: ") + sqlite3_errmsg(db_));
+  }
+}
+
+PlannedStopState SqliteFaultStorage::get_planned_stop() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  SqliteStatement stmt(db_, "SELECT active, reason, declared_by, since_ns FROM planned_stop WHERE id = 1");
+
+  PlannedStopState state;
+  if (stmt.step() != SQLITE_ROW) {
+    return state;  // never declared: the default is "no stop"
+  }
+
+  state.active = stmt.column_int(0) != 0;
+  state.reason = stmt.column_text(1);
+  state.declared_by = stmt.column_text(2);
+  state.since_ns = stmt.column_int64(3);
+  return state;
 }
 
 std::optional<FreezeFrameData> SqliteFaultStorage::get_freeze_frame(const std::string & fault_code) const {

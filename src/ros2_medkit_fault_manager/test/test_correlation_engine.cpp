@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -760,6 +761,182 @@ TEST_F(CorrelationEngineTest, CleanupExpiredRemovesFaultToClusterEntries) {
   auto clusters = engine.get_clusters();
   ASSERT_EQ(1u, clusters.size());
   EXPECT_EQ(3u, clusters[0].fault_codes.size());
+}
+
+// ============================================================================
+// Planned stop: a second, operator-driven mute source
+// ============================================================================
+
+TEST_F(CorrelationEngineTest, PlannedStopMutesAnUncorrelatedFault) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  EXPECT_FALSE(engine.planned_stop_active());
+  auto before = engine.process_fault("PUMP_SEAL_LEAK", "ERROR");
+  EXPECT_FALSE(before.should_mute);
+  EXPECT_FALSE(engine.is_muted("PUMP_SEAL_LEAK"));
+
+  engine.begin_planned_stop();
+  EXPECT_TRUE(engine.planned_stop_active());
+
+  auto during = engine.process_fault("VALVE_STUCK", "ERROR");
+  EXPECT_TRUE(during.should_mute);
+  EXPECT_TRUE(engine.is_muted("VALVE_STUCK"));
+  EXPECT_EQ(1u, engine.get_muted_count());
+
+  auto muted = engine.get_muted_faults();
+  ASSERT_EQ(1u, muted.size());
+  EXPECT_EQ("VALVE_STUCK", muted[0].fault_code);
+  EXPECT_EQ(CorrelationEngine::kPlannedStopRootCause, muted[0].root_cause_code);
+  EXPECT_EQ(CorrelationEngine::kPlannedStopRuleId, muted[0].rule_id);
+}
+
+TEST_F(CorrelationEngineTest, PlannedStopIsIdempotentAndSurvivesRepeatedReports) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  engine.begin_planned_stop();
+  engine.begin_planned_stop();
+  EXPECT_TRUE(engine.planned_stop_active());
+
+  engine.process_fault("VALVE_STUCK", "ERROR");
+  engine.process_fault("VALVE_STUCK", "ERROR");
+  EXPECT_EQ(1u, engine.get_muted_count());
+}
+
+TEST_F(CorrelationEngineTest, EndingPlannedStopUnmutesWhatItMuted) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  engine.begin_planned_stop();
+  engine.process_fault("VALVE_STUCK", "ERROR");
+  engine.process_fault("PUMP_SEAL_LEAK", "WARNING");
+  EXPECT_EQ(2u, engine.get_muted_count());
+
+  auto unmuted = engine.end_planned_stop();
+  EXPECT_FALSE(engine.planned_stop_active());
+  std::sort(unmuted.begin(), unmuted.end());
+  ASSERT_EQ(2u, unmuted.size());
+  EXPECT_EQ("PUMP_SEAL_LEAK", unmuted[0]);
+  EXPECT_EQ("VALVE_STUCK", unmuted[1]);
+  EXPECT_EQ(0u, engine.get_muted_count());
+  EXPECT_FALSE(engine.is_muted("VALVE_STUCK"));
+  EXPECT_FALSE(engine.is_muted("PUMP_SEAL_LEAK"));
+}
+
+TEST_F(CorrelationEngineTest, EndingPlannedStopWithNothingMutedReturnsNothing) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  engine.begin_planned_stop();
+  auto unmuted = engine.end_planned_stop();
+  EXPECT_TRUE(unmuted.empty());
+
+  // Ending a stop that is already off changes nothing either.
+  EXPECT_TRUE(engine.end_planned_stop().empty());
+  EXPECT_FALSE(engine.planned_stop_active());
+}
+
+TEST_F(CorrelationEngineTest, AFaultReportedAfterTheStopEndsIsNotMuted) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  engine.begin_planned_stop();
+  engine.end_planned_stop();
+
+  auto result = engine.process_fault("VALVE_STUCK", "ERROR");
+  EXPECT_FALSE(result.should_mute);
+  EXPECT_FALSE(engine.is_muted("VALVE_STUCK"));
+}
+
+TEST_F(CorrelationEngineTest, EndingPlannedStopLeavesARuleMutedSymptomMuted) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+
+  // ESTOP_001 is a root cause: muted by the stop, but not a symptom.
+  engine.process_fault("ESTOP_001", "CRITICAL", t0);
+  // MOTOR_COMM_FL matches the rule's symptom pattern inside the window, so the
+  // RULE mutes it - the stop is not the reason it is muted.
+  auto symptom = engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 10ms);
+  EXPECT_TRUE(symptom.should_mute);
+  EXPECT_EQ("estop_cascade", symptom.rule_id);
+
+  auto unmuted = engine.end_planned_stop();
+  EXPECT_EQ(1u, unmuted.size());
+  EXPECT_EQ("ESTOP_001", unmuted[0]);
+
+  // The rule still holds the symptom down.
+  EXPECT_TRUE(engine.is_muted("MOTOR_COMM_FL"));
+  auto muted = engine.get_muted_faults();
+  ASSERT_EQ(1u, muted.size());
+  EXPECT_EQ("MOTOR_COMM_FL", muted[0].fault_code);
+  EXPECT_EQ("estop_cascade", muted[0].rule_id);
+}
+
+TEST_F(CorrelationEngineTest, ARuleTakingOverAStopMutedFaultKeepsItMuted) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+
+  // Muted by the stop first: no root cause is pending yet.
+  auto first = engine.process_fault("MOTOR_COMM_FL", "ERROR", t0);
+  EXPECT_TRUE(first.should_mute);
+  EXPECT_EQ(CorrelationEngine::kPlannedStopRuleId, engine.get_muted_faults()[0].rule_id);
+
+  // The root cause arrives, then the same code is reported again and the rule
+  // claims it.
+  engine.process_fault("ESTOP_001", "CRITICAL", t0 + 10ms);
+  auto second = engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 20ms);
+  EXPECT_TRUE(second.should_mute);
+  EXPECT_EQ("estop_cascade", second.rule_id);
+
+  auto unmuted = engine.end_planned_stop();
+  EXPECT_EQ(1u, unmuted.size());
+  EXPECT_EQ("ESTOP_001", unmuted[0]);
+  EXPECT_TRUE(engine.is_muted("MOTOR_COMM_FL"));
+}
+
+TEST_F(CorrelationEngineTest, ClearingDuringAStopTakesTheFaultOutOfTheMute) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  engine.begin_planned_stop();
+  engine.process_fault("VALVE_STUCK", "ERROR");
+  EXPECT_TRUE(engine.is_muted("VALVE_STUCK"));
+
+  engine.process_clear("VALVE_STUCK");
+  EXPECT_FALSE(engine.is_muted("VALVE_STUCK"));
+  EXPECT_EQ(0u, engine.get_muted_count());
+
+  // Nothing survives to be unmuted, so the switch-off announces nothing.
+  EXPECT_TRUE(engine.end_planned_stop().empty());
+}
+
+TEST_F(CorrelationEngineTest, ClearingARootCauseDuringAStopDropsItsStopMutedSymptoms) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+  engine.process_fault("ESTOP_001", "CRITICAL", t0);
+  engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 10ms);
+
+  auto cleared = engine.process_clear("ESTOP_001");
+  ASSERT_EQ(1u, cleared.auto_cleared_codes.size());
+  EXPECT_EQ("MOTOR_COMM_FL", cleared.auto_cleared_codes[0]);
+  EXPECT_FALSE(engine.is_muted("MOTOR_COMM_FL"));
+
+  // Both codes left the mute with the clear; the switch-off has nothing to say.
+  EXPECT_TRUE(engine.end_planned_stop().empty());
+}
+
+TEST_F(CorrelationEngineTest, PlannedStopMutesWithoutAnyRulesConfigured) {
+  CorrelationEngine engine{CorrelationConfig{}};
+
+  engine.begin_planned_stop();
+  auto result = engine.process_fault("VALVE_STUCK", "ERROR");
+  EXPECT_TRUE(result.should_mute);
+  EXPECT_TRUE(engine.is_muted("VALVE_STUCK"));
+
+  auto unmuted = engine.end_planned_stop();
+  ASSERT_EQ(1u, unmuted.size());
+  EXPECT_EQ("VALVE_STUCK", unmuted[0]);
 }
 
 int main(int argc, char ** argv) {
