@@ -65,15 +65,47 @@ The fault manager uses AUTOSAR DEM-style debounce filtering to prevent fault fla
      - When true, PASSED events can heal confirmed faults.
    * - ``healing_threshold``
      - ``3``
-     - Number of PASSED events to transition from CONFIRMED to HEALED.
+     - Counter value at which a fault heals, not a number of events. Healing costs
+       ``healing_threshold`` minus the counter the fault confirmed at, so with the
+       default ``-1`` it takes four PASSED events.
    * - ``auto_confirm_after_sec``
      - ``0.0``
      - Auto-confirm prefailed faults after this duration. Set to 0 to disable.
 
 .. tip::
 
-   For immediate fault confirmation (no debounce), set ``confirmation_threshold: 0``.
+   For immediate fault confirmation (no debounce), set ``confirmation_threshold: -1``,
+   which is also the default. ``0`` is rejected: the threshold must be strictly
+   negative, and the node falls back to ``-1`` with a warning.
    Faults with ``SEVERITY_CRITICAL`` always bypass debounce regardless of this setting.
+
+.. important::
+
+   The counter only moves when an event arrives, so ``confirmation_threshold`` and
+   ``healing_threshold`` are tunable only for a reporter that keeps sending events while a
+   condition holds. Confirmation needs repeated FAILED; healing needs repeated PASSED.
+
+   A reporter that sends one FAILED when a condition appears and one clear when it goes away
+   never sends the second event. ``confirmation_threshold: -3`` then leaves the fault in
+   PREFAILED, and the default fault list returns CONFIRMED only, so the fault is never seen.
+   Healing has the same shape: it needs ``healing_threshold - confirmation_threshold``
+   consecutive PASSED events counted from where the fault confirmed, and only one is sent.
+
+   For such a reporter, leave the confirmation threshold alone and make healing reachable:
+
+   .. code-block:: yaml
+
+      fault_manager:
+        ros__parameters:
+          confirmation_threshold: -1    # the default; the single FAILED confirms
+          healing_enabled: true
+          healing_threshold: 0          # heal on the single PASSED
+
+   ``auto_confirm_after_sec`` promotes a fault that stayed PREFAILED for that long and looks
+   like it would allow a deeper threshold. It does not: HEALED is latched, leaving that latch
+   costs ``healing_threshold - confirmation_threshold`` FAILED events, and a one-event reporter
+   sends one. The second occurrence of a fault code would then never confirm again. Filter
+   noisy samples in the reporter instead, where the samples are.
 
 Near-Miss Retention
 ~~~~~~~~~~~~~~~~~~~
@@ -570,7 +602,7 @@ by default: with it off there is no table, no file and no write cost.
      - Turn the audit log on.
    * - ``audit_log.transitions``
      - ``"all"``
-     - Which transitions are recorded: ``all`` (occurred, confirmed, cleared) or
+     - Which transitions are recorded: ``all`` (occurred, confirmed, healed, cleared) or
        ``confirmed_only``. Any other value falls back to ``all`` with a warning.
    * - ``audit_log.retention_max_records``
      - ``0``
@@ -633,11 +665,13 @@ Complete Example
        storage_type: "sqlite"
        database_path: "/var/lib/ros2_medkit/faults.db"
 
-       # Debounce (require 3 FAILED events to confirm)
+       # Debounce for a reporter that repeats its events while a condition holds:
+       # three FAILED events confirm, and four PASSED events heal from there.
+       # For a reporter that sends one event per transition, use -1 with
+       # healing_threshold 0 instead - see the note under Debounce Settings.
        confirmation_threshold: -3
        healing_enabled: true
        healing_threshold: 3
-       auto_confirm_after_sec: 30.0
 
        # Per-entity debounce overrides
        entity_thresholds:

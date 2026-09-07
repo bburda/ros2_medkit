@@ -50,7 +50,8 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 ## Features
 
 - **Multi-source aggregation**: Same `fault_code` from different sources creates a single fault
-- **Occurrence tracking**: Counts total reports and tracks all reporting sources
+- **Occurrence tracking**: Counts outages, not reports - the count starts at one and rises only
+  when a cleared fault is raised again - and tracks all reporting sources
 - **Severity escalation**: Fault severity is updated if a higher severity is reported
 - **Persistent storage**: SQLite backend ensures faults survive node restarts
 - **Debounce filtering** (optional): AUTOSAR DEM-style counter-based fault confirmation with per-entity threshold overrides
@@ -286,6 +287,8 @@ For systems that need to filter transient faults, enable debounce filtering by s
 ### Configuration
 
 ```bash
+# For a reporter that repeats its events while a condition holds.
+# See "Choosing the right lever for your reporter" below before copying this.
 ros2 run ros2_medkit_fault_manager fault_manager_node --ros-args \
   -p confirmation_threshold:=-3 \
   -p healing_enabled:=true \
@@ -304,7 +307,9 @@ The fault manager uses an AUTOSAR DEM-style debounce model:
 The counter is always clamped to `[confirmation_threshold, healing_threshold]`, so a long run of
 one-sided events cannot push it out to the integer limits and delay the opposite transition.
 `confirmation_threshold < 0 <= healing_threshold` is required (`healing_threshold = 0` heals on a
-single PASSED event); invalid thresholds fall back to safe defaults with a warning.
+single PASSED event). A positive confirmation threshold or a negative healing threshold is
+sign-flipped with a warning, so `5` becomes `-5`; a confirmation threshold of `0` is then
+rejected and falls back to `-1`.
 
 `CONFIRMED` and `HEALED` are **latched** (hysteresis): once reached, the status holds until the
 counter reaches the opposite threshold, so a single opposite-direction event cannot flip it. As a
@@ -312,6 +317,40 @@ result a fault that becomes active again can take up to `healing_threshold - con
 events to return to the default (CONFIRMED-only) list. During that window `last_occurred` still
 reflects the activity; `occurrence_count` does not, because it counts the edge that started the
 occurrence, not every report within it.
+
+### Choosing the right lever for your reporter
+
+The counter only moves when an event arrives, so the count-based settings above work only for a
+reporter that keeps sending FAILED while the condition is still there. A reporter that samples a
+value on a timer and reports on every sample is of that kind.
+
+Many reporters do not work that way. They send one FAILED when the condition appears and one clear
+when it goes away, and nothing in between. For such a reporter the second FAILED never arrives, so
+`confirmation_threshold: -3` means the fault stays PREFAILED and never confirms. The default fault
+list returns CONFIRMED only, so the fault is invisible. Healing has the same problem in reverse:
+`healing_threshold: 3` needs four consecutive PASSED events after a fault confirmed at `-1`, and
+only one PASSED is ever sent, so the fault stays CONFIRMED until someone calls `~/clear_fault`.
+
+Pick by how your reporter behaves:
+
+| Reporter repeats FAILED while the condition holds | Reporter sends one event per transition |
+|---|---|
+| `confirmation_threshold: -N` confirms on the Nth FAILED, so it rides out N-1 noisy samples | `confirmation_threshold` cannot filter here; see below |
+| `healing_threshold: N` needs `N - confirmation_threshold` clean samples | `healing_threshold: 0` heals on the single PASSED |
+
+For the second column, `auto_confirm_after_sec` looks like it fills the gap: it promotes a fault
+that has stayed PREFAILED for that long, without changing the counter. Pairing it with
+`confirmation_threshold: -2` does keep a single FAILED out of CONFIRMED. It also has a trap. HEALED
+is latched, and leaving that latch costs `healing_threshold - confirmation_threshold` FAILED
+events, which at `-2` is two. A reporter that sends one means the SECOND occurrence of a fault code
+never confirms again, and `occurrence_count` does not move either. Prefer leaving
+`confirmation_threshold` at `-1` for such a reporter, and filter noisy samples in the reporter
+itself, where the samples are.
+
+Two things ignore the counter. `SEVERITY_CRITICAL` confirms at once unless
+`critical_immediate_confirm` is turned off in the debounce config, and that field is not exposed as
+a ROS parameter. `auto_confirm_after_sec` promotes on elapsed time since the last FAILED, which is
+not the same as observing that the condition is still there.
 
 ### Fault Lifecycle with Debounce
 
@@ -334,7 +373,7 @@ PREFAILED -----> CONFIRMED -----> HEALED (retained)
 
 | Status | Description |
 |--------|-------------|
-| `PREFAILED` | Debounce counter < 0, not yet confirmed |
+| `PREFAILED` | Not yet confirmed. Usually a negative counter, but a fault that returns to 0 keeps the status it had |
 | `CONFIRMED` | Fault is active and verified |
 | `HEALED` | Resolved via PASSED events (if healing enabled) |
 | `CLEARED` | Manually acknowledged via `~/clear_fault` |
@@ -518,9 +557,10 @@ names automatically via the `fault_manager.namespace` parameter:
 
 ```yaml
 # gateway_params.yaml
-fault_manager:
-  namespace: "robot1"          # -> /robot1/fault_manager/list_faults
-  service_timeout_sec: 5.0
+ros2_medkit_gateway:
+  ros__parameters:
+    fault_manager.namespace: "robot1"      # -> /robot1/fault_manager/list_faults
+    fault_manager.service_timeout_sec: 5.0
 ```
 
 Launch the fault manager in a namespace:

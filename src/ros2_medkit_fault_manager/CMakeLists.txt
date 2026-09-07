@@ -198,6 +198,19 @@ if(BUILD_TESTING)
   medkit_add_launch_test(test_entity_thresholds_integration test/integration/test_entity_thresholds_integration.test.py
     TIMEOUT 60 LABELS "integration")
 
+  # Drives healing with the event counts a one-event-per-transition reporter
+  # actually sends: one FAILED per raise, one PASSED per clear. Parametrized over
+  # healing_threshold, so the node launches twice, and one case holds a settled
+  # fault for a quiet period - hence the timeout.
+  medkit_add_launch_test(test_debounce_and_healing test/integration/test_debounce_and_healing.test.py
+    TIMEOUT 120 LABELS "integration")
+
+  # Time-based confirmation has to reach the event stream, not just the store:
+  # the SSE feed and the trigger subscribers key off the published event, and
+  # black-box capture is enqueued alongside it.
+  medkit_add_launch_test(test_auto_confirm_visibility test/integration/test_auto_confirm_visibility.test.py
+    TIMEOUT 120 LABELS "integration")
+
   # Planned-stop windows over SQLite: each case spawns its own fault_manager so it
   # can pick a retention bound, and one of them kills the node and brings it back.
   medkit_add_launch_test(test_planned_stops_integration test/integration/test_planned_stops.test.py

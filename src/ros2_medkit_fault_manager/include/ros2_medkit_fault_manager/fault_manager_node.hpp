@@ -191,6 +191,12 @@ class FaultManagerNode : public rclcpp::Node {
   void publish_fault_event(const std::string & event_type, const ros2_medkit_msgs::msg::Fault & fault,
                            const std::vector<std::string> & auto_cleared_codes = {});
 
+  /// Enqueue snapshot + rosbag capture for a fault that has just confirmed.
+  /// Shared by the report path and the time-based confirmation timer so a
+  /// confirmation produces the same evidence whichever one produced it.
+  /// @param fault_code Code of the fault that reached CONFIRMED
+  void capture_on_confirm(const std::string & fault_code);
+
   /// Validate severity value
   static bool is_valid_severity(uint8_t severity);
 

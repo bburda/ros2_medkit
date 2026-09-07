@@ -115,6 +115,11 @@ class CorrelationEngine {
   /// Get count of muted faults
   uint32_t get_muted_count() const;
 
+  /// Whether a fault code is currently muted as a symptom.
+  /// @param fault_code Code to test
+  /// @return True while the code is suppressed by a root cause
+  bool is_muted(const std::string & fault_code) const;
+
   /// Get all active clusters
   /// @return List of cluster data
   std::vector<ClusterData> get_clusters() const;

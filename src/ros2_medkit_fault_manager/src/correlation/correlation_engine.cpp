@@ -251,6 +251,11 @@ uint32_t CorrelationEngine::get_muted_count() const {
   return static_cast<uint32_t>(muted_faults_.size());
 }
 
+bool CorrelationEngine::is_muted(const std::string & fault_code) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return muted_faults_.find(fault_code) != muted_faults_.end();
+}
+
 std::vector<ClusterData> CorrelationEngine::get_clusters() const {
   std::lock_guard<std::mutex> lock(mutex_);
 

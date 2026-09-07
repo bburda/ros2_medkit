@@ -15,8 +15,13 @@ fault_manager:
 
     # Heal on recovery so an action SUCCEEDED clears its fault (CONFIRMED -> HEALED).
     # Note: log faults have no recovery signal, so LOG_* faults do not auto-clear.
+    #
+    # 0, not the parameter default of 3: healing costs healing_threshold minus the
+    # counter the fault confirmed at, and the action bridge sends exactly one PASSED
+    # per recovery. Any higher value leaves the fault CONFIRMED after the action
+    # recovers, which is the opposite of what this preset is for.
     healing_enabled: true
-    healing_threshold: 3
+    healing_threshold: 0
 
     # Black-box rosbag capture: a crash-safe, entity-scoped ring buffer flushed on
     # fault confirmation. Produces a non-empty bag on the happy path.
