@@ -157,6 +157,22 @@ jobs:
             -f src/ros2_medkit_plugins/ros2_medkit_opcua/docker/Dockerfile.gateway \
             -t gateway-opcua .
 
+      - name: Inspect the plugin object inside the built image
+        # The image is what ships, and Dockerfile.gateway builds it with
+        # BUILD_TESTING=OFF, so the inspection ctest does not exist inside the
+        # container. Pull the object out and run the same check on the runner:
+        # without this the image is only proven by its behaviour, and a
+        # build-arg or Dockerfile drift that shipped the wrong variant would be
+        # caught by the integration assertions rather than by the inspection.
+        run: |
+          cid=$(docker create gateway-opcua)
+          docker cp "$cid:$(docker run --rm --entrypoint sh gateway-opcua -c \
+            "find /root/ws/install -name libros2_medkit_opcua_plugin.so | head -1")" \
+            ./plugin-from-image.so
+          docker rm -v "$cid" >/dev/null
+          python3 src/ros2_medkit_plugins/ros2_medkit_opcua/test/inspect_build_variant.py \
+            ./plugin-from-image.so --expect ${{ matrix.variant }}
+
       - name: Start OpenPLC
         timeout-minutes: 3
         run: |
@@ -276,6 +292,18 @@ jobs:
         env:
           MEDKIT_OPCUA_VARIANT: ${{ matrix.variant }}
         run: bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/run_alarm_tests.sh
+
+      - name: Inspect the plugin object inside the built image
+        # Same reason as the OpenPLC job. This suite builds its own image, so
+        # the step runs after it; the tag is the one run_alarm_tests.sh builds.
+        run: |
+          cid=$(docker create gateway-opcua:alarm-test)
+          docker cp "$cid:$(docker run --rm --entrypoint sh gateway-opcua:alarm-test -c \
+            "find /root/ws/install -name libros2_medkit_opcua_plugin.so | head -1")" \
+            ./plugin-from-image.so
+          docker rm -v "$cid" >/dev/null
+          python3 src/ros2_medkit_plugins/ros2_medkit_opcua/test/inspect_build_variant.py \
+            ./plugin-from-image.so --expect ${{ matrix.variant }}
 
       - name: Dump container logs on failure
         if: failure()

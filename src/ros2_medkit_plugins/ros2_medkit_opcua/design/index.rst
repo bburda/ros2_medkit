@@ -104,7 +104,7 @@ Four of the five protocol plugins cannot write to their device at all. OPC UA ca
 and config-less discovery would mark a point writable straight from the server's
 ``CurrentWrite`` bit. A plant asking "can this box change a controller" cannot be
 answered by a configuration value, because a configuration value can be changed
-without rebuilding, reviewing or shipping anything. So the answer is carried by the
+without rebuilding or shipping anything. So the answer is carried by the
 binary.
 
 ``MEDKIT_OPCUA_READ_ONLY`` is a CMake cache option, default ``ON``. With it on:
@@ -113,12 +113,12 @@ binary.
   templates it reaches, the vendor route handler
   ``OpcuaPlugin::handle_plc_operations`` and the value-coercion helper are all
   outside ``#if`` and are never compiled.
-- The link then removes what the compiler alone could not. ``-fvisibility=hidden``
-  covers the sources compiled into the module but not the static archives it
-  links, so open62541's own ``UA_Client_write*`` primitives used to sit in the
-  object *and* in its dynamic symbol table: no route reached them, but a caller
-  holding the ``.so`` could ``dlsym`` one and drive a controller with it.
-  ``-Wl,--exclude-libs,ALL`` takes the archives out of the export table, and
+- The link removes what the compiler alone cannot. ``-fvisibility=hidden`` covers
+  the sources compiled into the module but not the static archives it links, so
+  without further flags open62541's own ``UA_Client_write*`` primitives sit in the
+  object *and* in its dynamic symbol table, where a caller holding the ``.so``
+  can ``dlsym`` one and drive a controller with it even though no route reaches
+  it. ``-Wl,--exclude-libs,ALL`` takes the archives out of the export table, and
   ``-ffunction-sections -fdata-sections`` plus ``-Wl,--gc-sections`` then let the
   linker drop them from the object entirely, because nothing references them once
   the C++ write path is gone. The read-only object exports the six plugin entry
@@ -131,21 +131,41 @@ binary.
   local, unexported code. Setting them here makes the property independent of
   ``CMAKE_BUILD_TYPE``, and ``test_opcua_build_variant`` asserts the absence of
   that whole family so the difference cannot come back unnoticed.
-- What is left of open62541 inside the object is the generic service dispatcher
-  the read path needs and the generated type descriptors the ``UA_TYPES`` table
-  pins. They are data and dispatch, not a write path: nothing exports them and no
-  function in the object composes a Write request from them. The claim the package
-  makes is therefore the exact one - no code able to issue a Write, and no export
-  to reach the library through - not a sweeping "no OPC-UA symbols at all".
+- What is left of open62541 inside the object is one shared transport, not a
+  write path. open62541 is a single static library, so removing the write code
+  does not remove what it shared with the read code: the generic dispatcher
+  ``__UA_Client_Service`` (used by read, browse and ConditionRefresh), the binary
+  encoders (23 ``*_encodeBinary`` symbols), and the generated ``UA_TYPES``
+  descriptors, which the table references as a whole so the linker cannot drop
+  individual entries. Measured on the read-only object, those descriptors include
+  ``WriteRequest``, ``WriteValue``, ``WriteResponse``, ``AddNodes``,
+  ``DeleteNodes``, ``AddReferences``, ``SetMonitoringMode``,
+  ``SetPublishingMode`` and ``TransferSubscriptions``; ``HistoryUpdate`` is
+  absent.
+
+  Descriptors are data. What makes them unreachable is that no function in the
+  object composes any of those requests, none of these symbols is exported, and a
+  read-only build registers three GET routes - no route, node-map key or config
+  key supplies a NodeId, a method id or an attribute id. So the claim the package
+  makes is the exact one: every C++ path that composes a Write or a condition
+  method call is absent, and no OPC UA symbol is exported. Not "no OPC UA
+  machinery at all", which would be false.
+
+- Subscription and monitored-item creation stay in both variants. They change
+  server-side session state, which is not controller data, and the read path
+  cannot receive values or alarms without them.
 - ``NodeMap::load`` forces ``writable`` to false and warns once when the file asked
   otherwise; ``AutoBrowser`` does not compile the ``infer_writable`` inference, so
   the server's ``CurrentWrite`` bit is never read.
 - No entity registers the ``x-plc-operations`` capability, ``list_operations``
   emits no ``set_<name>`` entry, and ``get_routes`` does not register the write
   route.
-- ``write_data`` and the value-write half of ``execute_operation`` return 403 as
+- ``write_data`` and the value-write half of ``execute_operation`` return 501 as
   their first statement, before any node lookup, with a message naming the build
-  property. They stay declared because the gateway reaches the plugin through the
+  property. SOVD spells "the entity does not support this" as 501 (fault
+  deletion, data lists, subscriptions and triggers all use it); 403 is defined
+  once, for a valid token with insufficient permissions, which is the one reading
+  that is wrong here - no credential reaches a path that is not in the binary. They stay declared because the gateway reaches the plugin through the
   ``DataProvider`` / ``OperationProvider`` interfaces; the refusal reaches a client
   as SOVD vendor code ``x-medkit-plugin-error``, which is the code the gateway
   assigns to every plugin provider error.

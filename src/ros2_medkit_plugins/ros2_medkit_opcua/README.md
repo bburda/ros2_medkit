@@ -11,8 +11,9 @@ Follows the same plugin pattern as `ros2_medkit_graph_provider`: implements `Gat
   discovers them automatically by browsing the live address space
   (`auto_browse`, see below) - zero node-map config required
 - Exposes PLC values as the `x-plc-data` vendor collection
-- Ships read-only by default: the shipped binary contains no controller write
-  path at all (see [Read-only and write-capable builds](#read-only-and-write-capable-builds))
+- Ships read-only by default: the shipped binary contains no compiled path that
+  writes a value or acknowledges a condition, and exports nothing from the OPC UA
+  stack (see [Read-only and write-capable builds](#read-only-and-write-capable-builds))
 - In a write-capable build, allows writing setpoints via `x-plc-operations` with
   type-aware coercion and range validation
 - Reports the connection state and poll metrics via `x-plc-status`
@@ -120,27 +121,43 @@ colcon build --packages-select ros2_medkit_opcua \
 
 In the default read-only build:
 
-- `OpcuaClient::write_value`, the vendor route handler, and the open62541pp
-  Write service functions and templates they reach are **not compiled**. On top
-  of that the plugin links with `-Wl,--exclude-libs,ALL` and `-Wl,--gc-sections`
-  (over `-ffunction-sections -fdata-sections`), which drops open62541's own
-  `UA_Client_write*` primitives from the object as well - nothing references
-  them once the C++ write path is gone. So `libros2_medkit_opcua_plugin.so`
-  contains **no code that can issue an OPC-UA Write**, and its dynamic symbol
-  table exports the six plugin entry points and nothing from the OPC-UA stack,
-  so `dlsym` has no handle on any of it either.
+- **What is absent from the object**, each name asserted by `nm` in
+  `test_opcua_build_variant`:
+  - every C++ function that composes an OPC UA Write - `OpcuaClient::write_value`,
+    the vendor route handler `OpcuaPlugin::handle_plc_operations`, the value
+    coercion they share, and the `open62541pp` templates and service functions
+    they reach (`Node<Client>::writeValueScalar`, `Node<Client>::writeValue`,
+    `services::write`, `services::writeAttribute<Client>`);
+  - the entry point that issues a Part 9 condition method,
+    `OpcuaClient::call_condition_method`;
+  - open62541's own `UA_Client_write*` / `UA_Server_write*` primitives, dropped
+    by `-Wl,--exclude-libs,ALL` and `-Wl,--gc-sections` over
+    `-ffunction-sections -fdata-sections` because nothing references them once
+    the C++ write path is gone;
+  - every OPC UA symbol in the dynamic symbol table. The module exports the six
+    plugin entry points and C++ vague-linkage symbols, and nothing matching
+    `UA_*` or `opcua::*`, so `dlsym` reaches none of the machinery below.
 
-  Precisely, because a claim of this kind should be exact rather than sweeping:
-  what does remain inside the object is open62541's generic service dispatcher,
-  which the read path needs, and the generated type descriptors for the Write
-  request and response messages, which the library's `UA_TYPES` table keeps
-  alive whatever the linker does. Neither is exported, neither is reachable from
-  any route, and no function in the object composes a Write request out of them.
+- **What remains inside the object, and why no route reaches it.** open62541 is
+  one static library, so removing the write path does not remove the transport
+  it shared. Still present: the generic request dispatcher
+  `__UA_Client_Service`, which the read, browse and ConditionRefresh paths all
+  use; the binary encoders (23 `*_encodeBinary` symbols), which serialize every
+  message type including the ones below; and the generated `UA_TYPES`
+  descriptors, which the table references as a whole so the linker cannot drop
+  individual entries - among them `WriteRequest`, `WriteValue`, `WriteResponse`,
+  `AddNodes`, `DeleteNodes`, `AddReferences`, `SetMonitoringMode`,
+  `SetPublishingMode` and `TransferSubscriptions` (`HistoryUpdate`: absent).
+  Descriptors are data, not a code path: no function in the object builds any of
+  those requests, none of these symbols is exported, and the plugin registers
+  three GET routes in a read-only build, so nothing in the REST contract
+  supplies a NodeId, a method id or an attribute id to reach them.
 
-  `test_opcua_build_variant` asserts all of this against the built object with
-  `nm`, in both variants: absent write symbols and an OPC-UA-free export table
-  in the read-only build, present write symbols in the write-capable one, and
-  the six entry points exported in both.
+- Two OPC UA calls that do change server-side state are deliberately **kept** in
+  both variants, because they change no controller data: `ConditionRefresh`,
+  which asks the server to replay conditions it already holds, and subscription
+  and monitored-item creation, which the read path needs to receive values and
+  alarms at all.
 - No data point is ever `writable`. A node-map entry that says `writable: true`
   is ignored with one startup warning naming the build property, and the
   address-space walk never consults the server's `CurrentWrite` bit whatever
@@ -157,9 +174,12 @@ In the default read-only build:
   stays in both variants: it asks the server to replay conditions it already
   holds and changes nothing.
 - `PUT /{type}/{id}/data/{name}` and
-  `POST /{type}/{id}/operations/{name}/executions` answer **403** before any
+  `POST /{type}/{id}/operations/{name}/executions` answer **501** before any
   node lookup, condition lookup or client call, with vendor code
-  `x-medkit-plugin-error` and a message naming `MEDKIT_OPCUA_READ_ONLY`.
+  `x-medkit-plugin-error` and a message naming `MEDKIT_OPCUA_READ_ONLY`. 501 is
+  the status SOVD uses for an operation the entity does not support; 403 is
+  reserved for a valid token with insufficient permissions, and no credential
+  reaches a write path that is not in the binary.
 
 A write-capable build restores everything above; nothing else differs.
 
@@ -494,10 +514,12 @@ plugins.opcua.auto_browse.enabled: true
 plugins.opcua.auto_browse.infer_writable: true   # write-capable builds only
 ```
 
-`infer_writable` is accepted only in this ROS-param form - the node-map YAML's
-`auto_browse:` block does not parse it. It defaults to `true` and has no effect
-in a read-only build, which logs one warning at startup and leaves every
-discovered point read-only.
+`infer_writable` is accepted in both forms - the node-map YAML's `auto_browse:`
+block and the ROS param above. It defaults to `true`, and in a read-only build
+it has no effect: every discovered point stays read-only. Setting it explicitly
+there logs one startup warning naming the setting, so it can be found and
+removed; leaving the key alone logs nothing, because the default is not a
+request anybody made.
 
 The JSON/ROS-param form takes precedence over whatever the node-map YAML's
 `auto_browse:` block set, mirroring how environment variables override the
