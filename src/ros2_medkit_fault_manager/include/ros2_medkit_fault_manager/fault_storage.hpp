@@ -202,9 +202,12 @@ struct RosbagFileInfo {
 /// a stop declared on Friday is still in force after a Saturday reboot.
 struct PlannedStopState {
   bool active{false};
-  std::string reason;       ///< Why the plant is stopped; empty while none is declared
-  std::string declared_by;  ///< Who declared it; empty while none is declared
-  int64_t since_ns{0};      ///< Wall-clock time of the declaration; 0 while none is declared
+  std::string reason;       ///< Why the plant is stopped; retained after the withdrawal
+  std::string declared_by;  ///< Who declared it; retained after the withdrawal
+  int64_t since_ns{0};      ///< Wall-clock time of the declaration; 0 when none was ever made
+  /// Wall-clock time the declaration was withdrawn; 0 while one is in force. The
+  /// row outlives the stop so the reason stays readable after the plant is back up.
+  int64_t ended_at_ns{0};
 };
 
 /// Abstract interface for fault storage backends

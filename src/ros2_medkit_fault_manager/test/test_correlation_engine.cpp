@@ -76,6 +76,30 @@ correlation:
     return parse_config_string(yaml);
   }
 
+  /// A hierarchical rule and an auto-cluster rule side by side. The cluster path
+  /// sets should_mute without ever writing muted_faults_, which is the case the
+  /// planned stop has to survive.
+  CorrelationConfig create_cluster_config() {
+    const std::string yaml = R"(
+correlation:
+  enabled: true
+  patterns:
+    valve_errors:
+      codes: ["VALVE_*"]
+  rules:
+    - id: valve_storm
+      name: "Valve Storm"
+      mode: auto_cluster
+      match:
+        - pattern: valve_errors
+      min_count: 2
+      window_ms: 60000
+      show_as_single: true
+      representative: first
+)";
+    return parse_config_string(yaml);
+  }
+
   CorrelationConfig create_mixed_config() {
     const std::string yaml = R"(
 correlation:
@@ -937,6 +961,173 @@ TEST_F(CorrelationEngineTest, PlannedStopMutesWithoutAnyRulesConfigured) {
   auto unmuted = engine.end_planned_stop();
   ASSERT_EQ(1u, unmuted.size());
   EXPECT_EQ("VALVE_STUCK", unmuted[0]);
+}
+
+// ============================================================================
+// Planned stop: only a cycle that STARTS inside it is marked
+// ============================================================================
+
+TEST_F(CorrelationEngineTest, AStillActiveReReportIsNotTakenByTheStop) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  // The fault's cycle started before the stop was declared.
+  engine.process_fault("PUMP_SEAL_LEAK", "ERROR", std::chrono::steady_clock::now(), /*cycle_started=*/true);
+  EXPECT_FALSE(engine.is_muted("PUMP_SEAL_LEAK"));
+
+  engine.begin_planned_stop();
+
+  // A level-triggered reporter keeps sending FAILED while the condition holds.
+  auto result = engine.process_fault("PUMP_SEAL_LEAK", "ERROR", std::chrono::steady_clock::now(),
+                                     /*cycle_started=*/false);
+  EXPECT_FALSE(result.should_mute);
+  EXPECT_FALSE(engine.is_muted("PUMP_SEAL_LEAK"));
+  EXPECT_TRUE(engine.end_planned_stop().empty()) << "the stop released a fault it never muted";
+}
+
+TEST_F(CorrelationEngineTest, ACycleStartingInsideTheStopIsTakenByIt) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  engine.begin_planned_stop();
+  auto result = engine.process_fault("PUMP_SEAL_LEAK", "ERROR", std::chrono::steady_clock::now(),
+                                     /*cycle_started=*/true);
+  EXPECT_TRUE(result.should_mute);
+  EXPECT_TRUE(engine.is_muted("PUMP_SEAL_LEAK"));
+
+  auto unmuted = engine.end_planned_stop();
+  ASSERT_EQ(1u, unmuted.size());
+  EXPECT_EQ("PUMP_SEAL_LEAK", unmuted[0]);
+}
+
+TEST_F(CorrelationEngineTest, AStillActiveReReportDoesNotReleaseAStopMute) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  engine.begin_planned_stop();
+  engine.process_fault("VALVE_STUCK", "ERROR", std::chrono::steady_clock::now(), /*cycle_started=*/true);
+  ASSERT_TRUE(engine.is_muted("VALVE_STUCK"));
+
+  // The same condition is reported again while it holds. Nothing about the mute
+  // changes: the cycle is the one the stop already took.
+  auto again = engine.process_fault("VALVE_STUCK", "ERROR", std::chrono::steady_clock::now(),
+                                    /*cycle_started=*/false);
+  EXPECT_TRUE(again.should_mute);
+  EXPECT_TRUE(engine.is_muted("VALVE_STUCK"));
+
+  auto unmuted = engine.end_planned_stop();
+  ASSERT_EQ(1u, unmuted.size());
+  EXPECT_EQ("VALVE_STUCK", unmuted[0]);
+}
+
+// ============================================================================
+// Planned stop: exactly one mute owner per fault
+// ============================================================================
+
+TEST_F(CorrelationEngineTest, TheStopNeverOverwritesARuleMute) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.process_fault("ESTOP_001", "CRITICAL", t0);
+  auto symptom = engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 10ms);
+  ASSERT_TRUE(symptom.should_mute);
+  ASSERT_EQ("estop_cascade", engine.get_muted_faults()[0].rule_id);
+
+  // The correlation window closes, then a stop is declared and the same code
+  // starts a new cycle. The rule still owns the mute; the stop must not take it.
+  engine.begin_planned_stop();
+  engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 5000ms, /*cycle_started=*/true);
+
+  auto muted = engine.get_muted_faults();
+  ASSERT_EQ(1u, muted.size());
+  EXPECT_EQ("estop_cascade", muted[0].rule_id) << "the stop overwrote a rule's mute";
+
+  EXPECT_TRUE(engine.end_planned_stop().empty());
+  EXPECT_TRUE(engine.is_muted("MOTOR_COMM_FL"));
+}
+
+TEST_F(CorrelationEngineTest, AClusterMuteLeavesTheStopHoldingItsOwnEntry) {
+  CorrelationEngine engine(create_cluster_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+
+  // First of the burst: the cluster is still below min_count, so the stop mutes it.
+  auto first = engine.process_fault("VALVE_A", "ERROR", t0, /*cycle_started=*/true);
+  EXPECT_TRUE(first.should_mute);
+
+  // Second reaches min_count. The cluster mutes it as a non-representative, but
+  // the cluster path writes nothing to the mute map, so the stop stays its owner.
+  auto second = engine.process_fault("VALVE_B", "ERROR", t0 + 10ms, /*cycle_started=*/true);
+  EXPECT_TRUE(second.should_mute);
+  EXPECT_FALSE(second.cluster_id.empty());
+
+  auto muted = engine.get_muted_faults();
+  ASSERT_EQ(2u, muted.size());
+  for (const auto & entry : muted) {
+    EXPECT_EQ(CorrelationEngine::kPlannedStopRuleId, entry.rule_id);
+  }
+
+  auto unmuted = engine.end_planned_stop();
+  std::sort(unmuted.begin(), unmuted.end());
+  ASSERT_EQ(2u, unmuted.size()) << "a cluster-claimed fault was orphaned in the mute map";
+  EXPECT_EQ("VALVE_A", unmuted[0]);
+  EXPECT_EQ("VALVE_B", unmuted[1]);
+  EXPECT_EQ(0u, engine.get_muted_count());
+}
+
+// ============================================================================
+// Planned stop: dropping and restoring one fault's mute
+// ============================================================================
+
+TEST_F(CorrelationEngineTest, DroppingAStopMuteReleasesOnlyWhatTheStopOwns) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+  engine.process_fault("VALVE_STUCK", "ERROR", t0, /*cycle_started=*/true);
+  engine.process_fault("ESTOP_001", "CRITICAL", t0 + 10ms, /*cycle_started=*/true);
+  engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 20ms, /*cycle_started=*/true);
+  // get_muted_faults() is ordered by fault code, so look the entry up rather than
+  // taking a position in the list.
+  auto rule_id_of = [&engine](const std::string & code) {
+    for (const auto & entry : engine.get_muted_faults()) {
+      if (entry.fault_code == code) {
+        return entry.rule_id;
+      }
+    }
+    return std::string{"<not muted>"};
+  };
+  ASSERT_EQ("estop_cascade", rule_id_of("MOTOR_COMM_FL"));
+
+  engine.drop_planned_stop_mute("VALVE_STUCK");
+  EXPECT_FALSE(engine.is_muted("VALVE_STUCK"));
+
+  // A rule's mute is not the stop's to drop.
+  engine.drop_planned_stop_mute("MOTOR_COMM_FL");
+  EXPECT_TRUE(engine.is_muted("MOTOR_COMM_FL"));
+
+  auto unmuted = engine.end_planned_stop();
+  ASSERT_EQ(1u, unmuted.size());
+  EXPECT_EQ("ESTOP_001", unmuted[0]);
+}
+
+TEST_F(CorrelationEngineTest, ARestoredStopMuteBehavesLikeOneTakenLive) {
+  CorrelationEngine engine{CorrelationConfig{}};
+
+  // What a restart does: the declaration is read back, then the faults whose
+  // cycles started inside it are marked again before anything is served.
+  engine.begin_planned_stop();
+  engine.restore_planned_stop_mute("VALVE_STUCK");
+  engine.restore_planned_stop_mute("PUMP_SEAL_LEAK");
+
+  EXPECT_TRUE(engine.is_muted("VALVE_STUCK"));
+  EXPECT_EQ(2u, engine.get_muted_count());
+  const auto muted = engine.get_muted_faults();
+  EXPECT_EQ(CorrelationEngine::kPlannedStopRootCause, muted[0].root_cause_code);
+
+  auto unmuted = engine.end_planned_stop();
+  std::sort(unmuted.begin(), unmuted.end());
+  ASSERT_EQ(2u, unmuted.size());
+  EXPECT_EQ("PUMP_SEAL_LEAK", unmuted[0]);
+  EXPECT_EQ("VALVE_STUCK", unmuted[1]);
 }
 
 int main(int argc, char ** argv) {

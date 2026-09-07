@@ -24,6 +24,7 @@ Runs on SQLite, the shipped default and the only backend with a file behind it.
 import os
 import signal
 import tempfile
+import threading
 import time
 import unittest
 
@@ -33,7 +34,8 @@ import launch_ros.actions
 import launch_testing.actions
 import rclpy
 from rclpy.node import Node
-from ros2_medkit_msgs.msg import Fault
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from ros2_medkit_msgs.msg import Fault, FaultEvent
 from ros2_medkit_msgs.srv import GetFault, GetPlannedStop, ListFaults, ReportFault, SetPlannedStop
 
 STORAGE_DIR = tempfile.mkdtemp(prefix='planned_stop_restart_')
@@ -42,6 +44,7 @@ DATABASE_PATH = os.path.join(STORAGE_DIR, 'faults.db')
 REASON = 'weekend shutdown, cell 4'
 DECLARED_BY = 'plant_manager'
 BEFORE_CODE = 'PS_RESTART_BEFORE'
+SECOND_BEFORE_CODE = 'PS_RESTART_BEFORE_TWO'
 AFTER_CODE = 'PS_RESTART_AFTER'
 
 
@@ -108,12 +111,31 @@ class TestPlannedStopSurvivesRestart(unittest.TestCase):
         os.environ['ROS_LOCALHOST_ONLY'] = '1'
         rclpy.init()
         cls.node = Node('test_planned_stop_restart_client')
+
+        # The subscription outlives the manager it listens to and rematches the
+        # replacement's publisher, which is what lets one test span the restart.
+        cls._events = []
+        cls._events_lock = threading.Lock()
+        cls._event_sub = cls.node.create_subscription(
+            FaultEvent, '/fault_manager/events', cls._on_event,
+            QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                       history=HistoryPolicy.KEEP_LAST, depth=200))
         cls._connect()
 
     @classmethod
     def tearDownClass(cls):
         cls.node.destroy_node()
         rclpy.shutdown()
+
+    @classmethod
+    def _on_event(cls, msg):
+        with cls._events_lock:
+            cls._events.append((msg.event_type, msg.fault.fault_code))
+
+    def _count_events(self, fault_code, event_type):
+        with self._events_lock:
+            return sum(1 for kind, code in self._events
+                       if code == fault_code and kind == event_type)
 
     @classmethod
     def _connect(cls, timeout_sec=30.0):
@@ -140,6 +162,20 @@ class TestPlannedStopSurvivesRestart(unittest.TestCase):
         rclpy.spin_until_future_complete(self.node, future, timeout_sec=timeout_sec)
         self.assertIsNotNone(future.result(), 'service call timed out')
         return future.result()
+
+    def _spin_for(self, seconds):
+        """Pump the executor so published events reach the subscription."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+
+    def _wait_until(self, predicate, message, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+        raise AssertionError(message)
 
     def _report(self, fault_code):
         request = ReportFault.Request()
@@ -189,7 +225,13 @@ class TestPlannedStopSurvivesRestart(unittest.TestCase):
         self.assertEqual(REASON, before.reason)
 
         self._report(BEFORE_CODE)
-        self.assertIn(BEFORE_CODE, self._muted_codes())
+        self._report(SECOND_BEFORE_CODE)
+        muted_before = self._muted_codes()
+        self.assertIn(BEFORE_CODE, muted_before)
+        self.assertIn(SECOND_BEFORE_CODE, muted_before)
+        for code in (BEFORE_CODE, SECOND_BEFORE_CODE):
+            self.assertEqual(0, self._count_events(code, FaultEvent.EVENT_CONFIRMED),
+                             'a fault the stop marked was announced anyway')
 
         original_pid = fault_manager_node.process_details['pid']
         os.kill(original_pid, signal.SIGTERM)
@@ -223,11 +265,38 @@ class TestPlannedStopSurvivesRestart(unittest.TestCase):
         self.assertEqual('planned_stop', muted[AFTER_CODE].rule_id)
         self.assertNotIn(AFTER_CODE, self._confirmed_codes())
 
+        # The mute set lived in the process that is gone, so the manager rebuilds it
+        # from the store: the faults marked before the restart are still marked.
+        muted_after_restart = self._muted_codes()
+        for code in (BEFORE_CODE, SECOND_BEFORE_CODE):
+            self.assertIn(code, muted_after_restart,
+                          f'{code} was silently released by the restart, so its '
+                          'confirmation could never be announced')
+            self.assertEqual('planned_stop', muted_after_restart[code].rule_id)
+            self.assertNotIn(code, self._confirmed_codes())
+
         withdrawn = self._set_stop(False, reason='plant back up', declared_by=DECLARED_BY)
         self.assertTrue(withdrawn.success)
         self.assertTrue(withdrawn.was_active)
-        self.assertFalse(self._get_stop().active)
+        final_state = self._get_stop()
+        self.assertFalse(final_state.active)
+        self.assertEqual(REASON, final_state.reason)
+        self.assertGreater(final_state.ended_at.sec, 0)
         self.assertIn(AFTER_CODE, self._confirmed_codes())
+
+        # Every fault the stop was holding - across the restart - is released and
+        # announced exactly once.
+        for code in (BEFORE_CODE, SECOND_BEFORE_CODE, AFTER_CODE):
+            self._wait_until(
+                lambda code=code: self._count_events(code, FaultEvent.EVENT_CONFIRMED) == 1,
+                f'{code} was never announced at the switch-off')
+            self.assertIn(code, self._confirmed_codes())
+
+        # A second frame arriving late would still be a double announcement.
+        self._spin_for(3.0)
+        for code in (BEFORE_CODE, SECOND_BEFORE_CODE, AFTER_CODE):
+            self.assertEqual(1, self._count_events(code, FaultEvent.EVENT_CONFIRMED),
+                             f'{code} was announced more than once')
 
 
 @launch_testing.post_shutdown_test()

@@ -460,8 +460,10 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   planned_stop_ = storage_->get_planned_stop();
   if (planned_stop_.active) {
     correlation_engine_->begin_planned_stop();
-    RCLCPP_INFO(get_logger(), "Planned stop is in force (reason='%s', declared_by='%s'): new faults are marked muted",
-                planned_stop_.reason.c_str(), planned_stop_.declared_by.c_str());
+    const size_t restored = restore_planned_stop_mutes();
+    RCLCPP_INFO(get_logger(),
+                "Planned stop is in force (reason='%s', declared_by='%s'): %zu fault(s) re-marked, new faults marked",
+                planned_stop_.reason.c_str(), planned_stop_.declared_by.c_str(), restored);
   }
 
   // Create auto-confirmation timer if enabled
@@ -528,7 +530,7 @@ FaultManagerNode::~FaultManagerNode() {
   if (audit_log_) {
     try {
       AuditEvent marker;
-      marker.fault_code = "__audit__";
+      marker.fault_code = kAuditMarkerFaultCode;
       marker.transition = kTransitionLoggingDeactivated;
       marker.status = "INACTIVE";
       marker.source_id = "fault_manager";
@@ -641,7 +643,7 @@ std::unique_ptr<FaultAuditLog> FaultManagerNode::create_audit_log() {
     // Appended directly, so it is recorded even in confirmed_only mode.
     // Best-effort: a failure here does not abort startup.
     AuditEvent marker;
-    marker.fault_code = "__audit__";
+    marker.fault_code = kAuditMarkerFaultCode;
     marker.transition = kTransitionLoggingActivated;
     marker.status = "ACTIVE";
     marker.source_id = "fault_manager";
@@ -716,14 +718,18 @@ void FaultManagerNode::append_audit_event(const AuditEvent & event) {
 }
 
 void FaultManagerNode::audit_planned_stop(const char * transition, const PlannedStopState & state,
+                                          const std::string & reason, const std::string & declared_by,
                                           int64_t occurred_at_ns) {
   AuditEvent event;
-  // Empty: the transition is about the installation, not about one fault.
-  event.fault_code = "";
+  // The same sentinel the log's own lifecycle markers use: this transition is
+  // about the installation, not about one fault.
+  event.fault_code = kAuditMarkerFaultCode;
   event.transition = transition;
   event.status = state.active ? "ACTIVE" : "INACTIVE";
-  event.source_id = state.declared_by;
-  event.description = state.reason;
+  // The reason and the declarer of THIS transition: who withdrew a stop, and why,
+  // is not who declared it.
+  event.source_id = declared_by;
+  event.description = reason;
   event.occurred_at_ns = occurred_at_ns;
 
   append_audit_event(event);
@@ -867,8 +873,13 @@ void FaultManagerNode::handle_report_fault(
     // Only process FAILED events with correlation
     bool should_mute = false;
     if (correlation_engine_ && request->event_type == ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED) {
+      // is_new is the cycle boundary the planned stop needs: a new fault, or one
+      // raised again after being cleared. Reporters are level-triggered, so
+      // without it a condition that was already up - and already announced -
+      // would be swallowed by a stop declared after it started.
       auto correlation_result =
-          correlation_engine_->process_fault(request->fault_code, correlation::severity_to_string(request->severity));
+          correlation_engine_->process_fault(request->fault_code, correlation::severity_to_string(request->severity),
+                                             std::chrono::steady_clock::now(), is_new);
 
       should_mute = correlation_result.should_mute;
 
@@ -1053,9 +1064,15 @@ void FaultManagerNode::handle_clear_fault(
   // correlated symptom fault codes. Per-entity DELETE routes set it to true
   // so they cannot reach across entity boundaries via the correlation graph.
   std::vector<std::string> auto_cleared_codes;
-  if (correlation_engine_ && !request->skip_correlation_auto_clear) {
+  if (!request->skip_correlation_auto_clear) {
     auto clear_result = correlation_engine_->process_clear(request->fault_code);
     auto_cleared_codes = clear_result.auto_cleared_codes;
+  } else {
+    // Scoped per-entity acknowledgement: the correlation graph is deliberately not
+    // walked, because it reaches across entity boundaries. The planned stop is not
+    // a graph - it is this one fault's mute - so it is released either way, or an
+    // acknowledged fault would stay counted as muted until the stop ended.
+    correlation_engine_->drop_planned_stop_mute(request->fault_code);
   }
 
   bool cleared = storage_->clear_fault(request->fault_code);
@@ -1131,15 +1148,40 @@ void FaultManagerNode::handle_set_planned_stop(
 
   const int64_t transition_at_ns = get_wall_clock_time().nanoseconds();
 
+  // What the declaration becomes. A withdrawal keeps the reason, the declarer and
+  // the start time of the stop it ends, and stamps when it ended, so an operator
+  // can still read why the plant was quiet once it is back up.
+  PlannedStopState next = planned_stop_;
   if (request->active) {
-    planned_stop_.active = true;
-    planned_stop_.reason = request->reason;
-    planned_stop_.declared_by = request->declared_by;
-    planned_stop_.since_ns = transition_at_ns;
+    next.active = true;
+    next.reason = request->reason;
+    next.declared_by = request->declared_by;
+    next.since_ns = transition_at_ns;
+    next.ended_at_ns = 0;
+  } else {
+    next.active = false;
+    next.ended_at_ns = transition_at_ns;
+  }
 
+  // The store goes first, and a store that refuses the write ends the request
+  // here: nothing is muted, unmuted, announced or audited on a declaration the
+  // manager could not record, and a restart cannot come back believing in it.
+  try {
+    storage_->set_planned_stop(next);
+  } catch (const std::exception & e) {
+    response->success = false;
+    response->message = std::string("Failed to record the planned stop: ") + e.what();
+    RCLCPP_ERROR(get_logger(), "Planned stop %s rejected: %s", request->active ? "declaration" : "withdrawal",
+                 e.what());
+    return;
+  }
+
+  planned_stop_ = next;
+
+  if (request->active) {
     correlation_engine_->begin_planned_stop();
-    storage_->set_planned_stop(planned_stop_);
-    audit_planned_stop(kTransitionPlannedStopStarted, planned_stop_, transition_at_ns);
+    audit_planned_stop(kTransitionPlannedStopStarted, planned_stop_, request->reason, request->declared_by,
+                       transition_at_ns);
 
     response->message = "Planned stop declared";
     RCLCPP_INFO(get_logger(), "Planned stop declared by '%s': %s", planned_stop_.declared_by.c_str(),
@@ -1164,15 +1206,9 @@ void FaultManagerNode::handle_set_planned_stop(
   }
 
   // The withdrawal carries its own reason and declarer into the audit record; the
-  // stored declaration goes back to "no stop", which is what GetPlannedStop then
-  // reports.
-  PlannedStopState ended;
-  ended.reason = request->reason;
-  ended.declared_by = request->declared_by;
-  audit_planned_stop(kTransitionPlannedStopEnded, ended, transition_at_ns);
-
-  planned_stop_ = PlannedStopState{};
-  storage_->set_planned_stop(planned_stop_);
+  // stored declaration keeps the ones that started the stop.
+  audit_planned_stop(kTransitionPlannedStopEnded, planned_stop_, request->reason, request->declared_by,
+                     transition_at_ns);
 
   response->message = "Planned stop withdrawn";
   RCLCPP_INFO(get_logger(), "Planned stop withdrawn by '%s': unmuted %zu fault(s), announced %zu confirmation(s)",
@@ -1186,6 +1222,7 @@ void FaultManagerNode::handle_get_planned_stop(
   response->reason = planned_stop_.reason;
   response->declared_by = planned_stop_.declared_by;
   response->since = rclcpp::Time(planned_stop_.since_ns, RCL_SYSTEM_TIME);
+  response->ended_at = rclcpp::Time(planned_stop_.ended_at_ns, RCL_SYSTEM_TIME);
 }
 
 bool FaultManagerNode::is_valid_severity(uint8_t severity) {
@@ -1477,6 +1514,27 @@ void FaultManagerNode::load_snapshot_config_from_yaml(const std::string & config
   } catch (const YAML::Exception & e) {
     RCLCPP_ERROR(get_logger(), "Failed to parse snapshot config file %s: %s", config_file.c_str(), e.what());
   }
+}
+
+size_t FaultManagerNode::restore_planned_stop_mutes() {
+  // The mute set lives in the engine, so a restart loses it while the declaration
+  // itself survives in the store. Without this, a reboot inside a weekend stop
+  // makes every fault the stop was holding silently visible, and the switch-off
+  // then announces none of them - the confirmations they never published are lost
+  // for good. Rebuild it from what the store knows: a fault whose cycle started at
+  // or after the declaration and that is not over.
+  size_t restored = 0;
+  for (const auto & fault : storage_->get_all_faults()) {
+    if (fault.status == ros2_medkit_msgs::msg::Fault::STATUS_CLEARED) {
+      continue;  // acknowledged: nothing left to hold down or announce
+    }
+    if (rclcpp::Time(fault.first_occurred).nanoseconds() < planned_stop_.since_ns) {
+      continue;  // its cycle started before the stop, so the stop never marked it
+    }
+    correlation_engine_->restore_planned_stop_mute(fault.fault_code);
+    ++restored;
+  }
+  return restored;
 }
 
 std::unique_ptr<correlation::CorrelationEngine> FaultManagerNode::create_correlation_engine() {

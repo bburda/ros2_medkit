@@ -48,6 +48,12 @@ SOURCE_ID = '/powertrain/engine/temp_sensor'
 MUTED_CODE = 'GW_PS_MUTED'
 SECOND_CODE = 'GW_PS_MUTED_TWO'
 AFTER_CODE = 'GW_PS_AFTER'
+ALREADY_UP_CODE = 'GW_PS_ALREADY_UP'
+
+# How long to keep watching after the counts are right. The publish path is one
+# service call plus a topic hop plus the SSE writer, so a second frame that the
+# assertion could otherwise race arrives well inside this.
+SETTLE_SEC = 4.0
 
 SET_STOP = '/apps/fault_manager/operations/set_planned_stop/executions'
 GET_STOP = '/apps/fault_manager/operations/get_planned_stop/executions'
@@ -299,9 +305,21 @@ class TestPlannedStopSwitch(GatewayTestCase):
             and self._count_confirmed(SECOND_CODE) == 1,
             'the stream did not carry exactly one confirmation per released fault')
 
+        # Reaching one is not the claim: staying at one is. A duplicate frame
+        # published a moment later would satisfy the poll above and never be seen.
+        time.sleep(SETTLE_SEC)
+        self.assertEqual(1, self._count_confirmed(MUTED_CODE),
+                         'a second confirmation arrived after the first')
+        self.assertEqual(1, self._count_confirmed(SECOND_CODE),
+                         'a second confirmation arrived after the first')
+
+        # The declaration stays readable after the plant is back up, with the time
+        # it ended, so "why was line 3 quiet?" is answerable over the same route.
         state = self._get_stop()
         self.assertFalse(state['active'])
-        self.assertEqual('', state['reason'])
+        self.assertEqual('line 3 maintenance', state['reason'])
+        self.assertEqual('shift_lead', state['declared_by'])
+        self.assertGreater(state['ended_at']['sec'], 0)
 
     def test_a_fault_raised_after_the_stop_is_announced_at_once(self):
         """A fault raised once the stop is over is announced immediately.
@@ -315,7 +333,40 @@ class TestPlannedStopSwitch(GatewayTestCase):
 
         self._wait_until(lambda: self._count_confirmed(AFTER_CODE) == 1,
                          'a fault raised after the stop ended was not announced')
+        time.sleep(SETTLE_SEC)
+        self.assertEqual(1, self._count_confirmed(AFTER_CODE))
         self.assertIn(AFTER_CODE, self._faults()[1])
+
+    def test_a_fault_already_up_when_the_stop_begins_stays_visible(self):
+        """A standing alarm is not hidden, and not announced twice.
+
+        @verifies REQ_INTEROP_012
+        """
+        self._report(ALREADY_UP_CODE)
+        self._wait_until(lambda: self._count_confirmed(ALREADY_UP_CODE) == 1,
+                         'the fault was never announced before the stop')
+        self.assertIn(ALREADY_UP_CODE, self._faults()[1])
+
+        self._set_stop(True, reason='line 3 maintenance', declared_by='shift_lead')
+
+        # The reporter keeps sending FAILED while the condition holds.
+        for _ in range(3):
+            self._report(ALREADY_UP_CODE)
+
+        data, visible = self._faults(include_muted=True)
+        muted_codes = {entry['fault_code']
+                       for entry in data['x-medkit'].get('muted_faults', [])}
+        self.assertNotIn(ALREADY_UP_CODE, muted_codes,
+                         'the stop took over a cycle that started before it')
+        self.assertIn(ALREADY_UP_CODE, self._faults()[1],
+                      'a standing alarm vanished from GET /faults when the stop began')
+
+        self._set_stop(False, reason='line 3 back up', declared_by='shift_lead')
+
+        time.sleep(SETTLE_SEC)
+        self.assertEqual(
+            1, self._count_confirmed(ALREADY_UP_CODE),
+            'the switch-off announced a confirmation the operator had already seen')
 
 
 @launch_testing.post_shutdown_test()

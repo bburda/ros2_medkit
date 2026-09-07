@@ -14,15 +14,25 @@
 #
 # SetPlannedStop.srv - Declare, or withdraw, a planned stop on the FaultManager.
 #
-# While a planned stop is on, every fault whose cycle starts is reported, debounced,
+# While a planned stop is on, a fault whose cycle STARTS is reported, debounced,
 # confirmed, captured and audited exactly as it would be otherwise, and is MARKED as
 # muted rather than dropped: it is absent from the default ListFaults response, counted
-# in `muted_count`, listed under `muted_faults` when `include_muted` is set, and no
-# FaultEvent is published for it. Withdrawing the stop unmutes every fault it muted that
-# is still active, and republishes an EVENT_CONFIRMED for each one that is CONFIRMED,
-# because that confirmation was never announced.
+# in `muted_count`, and listed under `muted_faults` when `include_muted` is set. A cycle
+# that started BEFORE the stop is untouched: it stays in the fault list, because its
+# confirmation has already been announced, and reporters re-send FAILED for as long as
+# the condition holds.
 #
-# The declaration survives a restart of the fault manager.
+# A marked fault is published exactly as a rule-muted symptom is: its EVENT_CONFIRMED
+# and EVENT_UPDATED are withheld, while an EVENT_CLEARED - the fault healing, or being
+# acknowledged - is published as usual. Withdrawing the stop unmutes every fault it
+# muted that is still active, and publishes one EVENT_CONFIRMED for each that is
+# CONFIRMED, because that confirmation was never announced.
+#
+# The declaration survives a restart of the fault manager, and so does the marking of
+# the faults whose cycles started inside it.
+#
+# Both transitions are recorded in the fault audit log when `audit_log.enabled` is set
+# (it is off by default).
 
 # Request fields
 

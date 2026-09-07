@@ -15,6 +15,12 @@
 # GetPlannedStop.srv - Read the FaultManager's planned-stop declaration.
 #
 # The request carries no fields: the switch is a single declaration per fault manager.
+# (rosidl gives an empty request one `structure_needs_at_least_one_member` byte, which
+# is why introspecting clients see a single phantom parameter here.)
+#
+# The response describes the declaration in force, or - once it has been withdrawn -
+# the last one there was, so "why was line 3 quiet on Friday?" is answerable after
+# the plant is back up without reading the audit database.
 
 ---
 # Response fields
@@ -22,11 +28,17 @@
 # Whether a planned stop is currently declared.
 bool active
 
-# The reason given when the stop was declared. Empty while no stop is declared.
+# The reason given when the stop was declared. Retained after the withdrawal;
+# empty only while no stop has ever been declared.
 string reason
 
-# Who declared the stop. Empty while no stop is declared.
+# Who declared the stop. Retained after the withdrawal; empty only while no stop
+# has ever been declared.
 string declared_by
 
-# When the stop was declared, wall clock. Zero while no stop is declared.
+# When the stop was declared, wall clock. Zero while no stop has ever been declared.
 builtin_interfaces/Time since
+
+# When the stop was withdrawn, wall clock. Zero while one is in force, and while
+# no stop has ever been declared.
+builtin_interfaces/Time ended_at

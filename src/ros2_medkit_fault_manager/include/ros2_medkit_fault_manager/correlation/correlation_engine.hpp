@@ -112,9 +112,17 @@ class CorrelationEngine {
   /// @param fault_code The fault code
   /// @param severity The fault severity (for representative selection)
   /// @param timestamp When the fault occurred
+  /// @param cycle_started Whether this report STARTED a fault cycle (a new fault,
+  ///        or one raised again after being cleared) as opposed to a repeat of a
+  ///        condition that is already up. Only a cycle that starts while a planned
+  ///        stop is declared is marked by it: reporters are level-triggered and
+  ///        re-send FAILED for as long as the condition holds, so muting on any
+  ///        report would swallow a fault that was announced before the stop began.
+  ///        Correlation rules are unaffected and match on every report.
   /// @return Processing result indicating whether to mute, correlations, etc.
   ProcessFaultResult process_fault(const std::string & fault_code, const std::string & severity,
-                                   std::chrono::steady_clock::time_point timestamp = std::chrono::steady_clock::now());
+                                   std::chrono::steady_clock::time_point timestamp = std::chrono::steady_clock::now(),
+                                   bool cycle_started = true);
 
   /// Process a fault being cleared
   /// @param fault_code The fault code being cleared
@@ -158,6 +166,19 @@ class CorrelationEngine {
 
   /// Whether a planned stop is currently declared.
   bool planned_stop_active() const;
+
+  /// Release one fault from the planned stop's mute, if the stop is what is
+  /// muting it. A rule's mute is left alone. Called when a fault is acknowledged
+  /// on a path that does not run the correlation clear (a scoped per-entity
+  /// DELETE), so an acknowledged fault never stays counted as muted.
+  void drop_planned_stop_mute(const std::string & fault_code);
+
+  /// Register a fault as muted by the planned stop without a report driving it.
+  /// This is how a restart re-marks the faults whose cycles started inside a stop
+  /// that is still declared: their mute lived in the process that is gone, and
+  /// without it the switch-off would neither release nor announce them. A fault a
+  /// rule is already muting is left to that rule.
+  void restore_planned_stop_mute(const std::string & fault_code);
 
  private:
   /// The correlation half of process_fault: rules, clusters and their muting,

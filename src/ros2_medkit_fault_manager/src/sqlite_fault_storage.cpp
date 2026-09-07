@@ -325,7 +325,8 @@ void SqliteFaultStorage::initialize_schema() {
       active INTEGER NOT NULL,
       reason TEXT NOT NULL,
       declared_by TEXT NOT NULL,
-      since_ns INTEGER NOT NULL
+      since_ns INTEGER NOT NULL,
+      ended_at_ns INTEGER NOT NULL DEFAULT 0
     );
   )";
 
@@ -333,6 +334,28 @@ void SqliteFaultStorage::initialize_schema() {
     std::string error = err_msg ? err_msg : "Unknown error";
     sqlite3_free(err_msg);
     throw std::runtime_error("Failed to create planned_stop table: " + error);
+  }
+
+  // Migration: the row outlives the stop now, so it records when the stop ended.
+  // A database written before that reads as "never withdrawn", which is what a
+  // row with no end time means.
+  {
+    bool has_ended_at = false;
+    SqliteStatement info(db_, "PRAGMA table_info(planned_stop)");
+    while (info.step() == SQLITE_ROW) {
+      if (info.column_text(1) == "ended_at_ns") {
+        has_ended_at = true;
+        break;
+      }
+    }
+    if (!has_ended_at) {
+      if (sqlite3_exec(db_, "ALTER TABLE planned_stop ADD COLUMN ended_at_ns INTEGER NOT NULL DEFAULT 0", nullptr,
+                       nullptr, &err_msg) != SQLITE_OK) {
+        std::string error = err_msg ? err_msg : "Unknown error";
+        sqlite3_free(err_msg);
+        throw std::runtime_error("Failed to add ended_at_ns column: " + error);
+      }
+    }
   }
 
   // Create rosbag_files table. One row = one LINK (a fault claiming a recording):
@@ -1308,12 +1331,13 @@ void SqliteFaultStorage::set_planned_stop(const PlannedStopState & state) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   SqliteStatement stmt(db_,
-                       "INSERT OR REPLACE INTO planned_stop (id, active, reason, declared_by, since_ns) "
-                       "VALUES (1, ?, ?, ?, ?)");
+                       "INSERT OR REPLACE INTO planned_stop (id, active, reason, declared_by, since_ns, ended_at_ns) "
+                       "VALUES (1, ?, ?, ?, ?, ?)");
   stmt.bind_int(1, state.active ? 1 : 0);
   stmt.bind_text(2, state.reason);
   stmt.bind_text(3, state.declared_by);
   stmt.bind_int64(4, state.since_ns);
+  stmt.bind_int64(5, state.ended_at_ns);
 
   if (stmt.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to store planned stop: ") + sqlite3_errmsg(db_));
@@ -1323,7 +1347,7 @@ void SqliteFaultStorage::set_planned_stop(const PlannedStopState & state) {
 PlannedStopState SqliteFaultStorage::get_planned_stop() const {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  SqliteStatement stmt(db_, "SELECT active, reason, declared_by, since_ns FROM planned_stop WHERE id = 1");
+  SqliteStatement stmt(db_, "SELECT active, reason, declared_by, since_ns, ended_at_ns FROM planned_stop WHERE id = 1");
 
   PlannedStopState state;
   if (stmt.step() != SQLITE_ROW) {
@@ -1334,6 +1358,7 @@ PlannedStopState SqliteFaultStorage::get_planned_stop() const {
   state.reason = stmt.column_text(1);
   state.declared_by = stmt.column_text(2);
   state.since_ns = stmt.column_int64(3);
+  state.ended_at_ns = stmt.column_int64(4);
   return state;
 }
 

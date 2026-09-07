@@ -60,13 +60,28 @@ ros2 service call /fault_manager/set_planned_stop ros2_medkit_msgs/srv/SetPlanne
 ros2 service call /fault_manager/get_planned_stop ros2_medkit_msgs/srv/GetPlannedStop "{}"
 ```
 
-**Marked, never dropped.** While the stop stands, a fault whose cycle starts goes
-through report, debounce, confirmation, snapshot and rosbag capture and the audit
-log exactly as it would otherwise. What changes is only how it is *shown*: it is
-registered as muted with `rule_id: planned_stop` and the pseudo root cause
+**Marked, never dropped.** While the stop stands, a fault whose cycle *starts*
+goes through report, debounce, confirmation, snapshot and rosbag capture and the
+audit log exactly as it would otherwise. What changes is only how it is *shown*:
+it is registered as muted with `rule_id: planned_stop` and the pseudo root cause
 `PLANNED_STOP`, so it is absent from the default `~/list_faults` response,
-counted in `muted_count`, listed under `muted_faults` when `include_muted` is
-set, and never published on `~/events`.
+counted in `muted_count`, and listed under `muted_faults` when `include_muted` is
+set.
+
+**Only a cycle that starts inside the stop.** A fault that was already up when the
+stop was declared keeps its place in the fault list. Reporters are level-triggered
+- `FaultReporter::report()` is called for as long as the condition holds, not once
+per transition - so marking on any report would take a standing alarm off the list
+and then announce it a second time at the switch-off. The cycle boundary is the
+same one `~/report_fault` already computes: a new fault, or one raised again after
+being cleared.
+
+**Published exactly like a rule-muted symptom.** `EVENT_CONFIRMED` and
+`EVENT_UPDATED` are withheld while the fault is marked. `EVENT_CLEARED` is not: a
+fault that heals past the healing threshold, or that is acknowledged, publishes it
+as any muted fault does. Consumers therefore see the end of a fault whose start
+they never heard - that is the existing muting contract, not something the switch
+changes.
 
 **Withdrawing releases the survivors.** Every fault the stop alone was muting and
 that is still active is unmuted, and each one that is CONFIRMED publishes a single
@@ -80,21 +95,28 @@ that rule, and withdrawing the stop does not release it. A fault the stop muted
 that a rule later claims likewise stays muted after the withdrawal: two
 independent reasons to be quiet, and one of them going away is not both.
 
-**Both transitions are audited** as `planned_stop_started` and
-`planned_stop_ended`, carrying the reason in `description` and the declarer in
-`source_id`, with an empty `fault_code` because the transition is about the
-installation rather than one fault. They are recorded whatever
-`audit_log.transitions` says, like the log's own activation markers. A request
-asking for the state the switch is already in succeeds, changes nothing and
-records nothing, so a retried call cannot manufacture evidence of a stop that
-never started.
+**Both transitions are audited** - when the audit log is on. `audit_log.enabled`
+is `false` by default, and with it off the switch writes no audit row at all. With
+it on, each transition appends `planned_stop_started` / `planned_stop_ended`
+carrying that transition's own reason in `description` and its declarer in
+`source_id`, under the `__audit__` fault code the log's own lifecycle markers use,
+because the transition is about the installation rather than one fault. They are
+recorded whatever `audit_log.transitions` says. A request asking for the state the
+switch is already in succeeds, changes nothing and records nothing, so a retried
+call cannot manufacture evidence of a stop that never started. A request the store
+cannot record answers `success: false` with the reason, and changes nothing.
+
+**The declaration outlives the stop.** `~/get_planned_stop` keeps serving the
+reason, the declarer and the start time after the withdrawal, with `ended_at`
+stamped, so "why was line 3 quiet on Friday?" is answerable once the plant is back
+up without reading the audit database.
 
 **The declaration survives a restart** when the SQLite backend is in use: it is a
-row in the fault store, so a stop declared on Friday still mutes on Monday. The
-in-memory backend has no file behind it and starts every process with no
-declaration. Faults muted *before* a restart are not restored - their mute lived
-in the process that is gone - so a restart inside a stop makes those visible
-again while every fault reported after it is muted afresh.
+row in the fault store, so a stop declared on Friday still mutes on Monday. On
+startup the manager also re-marks every stored fault that is not CLEARED and whose
+cycle started at or after the declaration, so the switch-off after a reboot still
+releases them and announces their confirmations. The in-memory backend has no file
+behind it and starts every process with no declaration.
 
 **Over SOVD.** The gateway maps a node's services to operations on its App entity,
 so an operator reaches the switch without any new route:
@@ -122,7 +144,7 @@ entity to address.
 - **Near-miss series**: Appends one entry per FAILED report that moved the debounce counter without confirming, bounded per fault code and retained when the fault is cleared
 - **Freeze-frame retention**: One compact JSON freeze-frame per fault code, retained across `clear_fault` (see below)
 - **Planned stop**: An operator declares the plant deliberately down, and faults raised while it stands are marked rather than announced (see below)
-- **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear
+- **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear. The correlation *engine* is always constructed, because the planned stop needs no configuration; without a `correlation.config_file` it carries no rules, correlates nothing, and its cleanup timer (`correlation.cleanup_interval_sec`, default 5 s) walks two empty containers
 - **Tamper-evident audit log** (optional): Append-only, hash-chained record of fault state transitions for verifiable history
 
 ## Parameters

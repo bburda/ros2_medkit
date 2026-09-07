@@ -193,8 +193,9 @@ Declares, withdraws and reads the planned stop.
 
 - **One declaration per manager**: the stop is a fact about the installation, not about a fault
 - **Idempotent**: a request for the state the switch is already in succeeds, changes nothing and writes no audit record; ``was_active`` tells the caller which of the two happened
-- **Audited**: each real transition appends ``planned_stop_started`` / ``planned_stop_ended`` with the reason and the declarer
-- **Persisted**: stored in the fault store, so the declaration outlives the process (SQLite backend)
+- **Store first**: the declaration is written before anything is muted, unmuted, announced or audited, and a store that refuses the write ends the request with ``success=false`` - a stop the manager could not record must not be one a restart comes back believing in
+- **Audited**: when ``audit_log.enabled`` is set (off by default), each real transition appends ``planned_stop_started`` / ``planned_stop_ended`` under the ``__audit__`` fault code, with that transition's own reason and declarer
+- **Persisted**: stored in the fault store, so the declaration outlives the process (SQLite backend), and ``~/get_planned_stop`` keeps serving it after the withdrawal with ``ended_at`` stamped
 - **Returns**: ``success``, a message, and the state the switch was in before the call
 
 Design Decisions
@@ -262,23 +263,49 @@ Planned Stop as a Second Mute Source
 
 Maintenance produces faults that are real, correctly detected, and not news. The
 planned stop marks them instead of dropping them: while it stands, a fault whose
-cycle starts is registered in the correlation engine as muted with
+cycle *starts* is registered in the correlation engine as muted with
 ``rule_id = "planned_stop"`` and the pseudo root cause ``PLANNED_STOP``, and
 everything else about it - debounce, confirmation, snapshot and rosbag capture,
 the audit records - happens exactly as it would otherwise. Dropping the report
-instead was rejected because the bridges send one FAILED per transition: a fault
-that outlived the stop would never be raised again.
+instead was rejected because a fault that outlived the stop would then never be
+raised again: reporters are level-triggered, so nothing re-announces a condition
+whose report was thrown away.
 
-The engine keeps the codes the stop muted in a set of its own, separate from the
-mute map, and that set is what makes the two sources compose. A code leaves it the
-moment a rule claims the mute, so withdrawing the stop cannot release a symptom a
-rule is still holding down; and it leaves on ``process_clear``, so a fault
-acknowledged inside the stop is not handed back at the withdrawal.
+**Only a cycle that starts inside the stop.** That same level-triggered shape is
+why the mark is gated on the cycle boundary rather than on the report.
+``ros2_medkit_diagnostic_bridge`` sends one FAILED per incoming
+``DiagnosticArray`` - typically 1 Hz for as long as the condition holds - and
+``FaultReporter::report()`` is documented to be called the same way. Marking on any
+report would take a fault that was confirmed and announced *before* the stop off
+the fault list within a second of the declaration, and announce it a second time at
+the switch-off. The boundary is ``report_fault_event``'s own ``is_new``: a new
+fault, or one raised again after being cleared.
+
+**One mute, one owner.** The engine keeps the codes the stop muted in a set of its
+own, separate from the mute map, and that set is what makes the two sources
+compose. A code leaves it where a rule *registers* its mute (``try_as_symptom``),
+not merely where a rule reports ``should_mute``: the auto-cluster path sets that
+flag without ever writing the mute map, so treating the flag as a hand-over would
+leave the planned stop's entry in the map owned by nobody - muted for good,
+released by nothing. In the other direction the stop never overwrites an entry a
+rule already holds. A code also leaves the set when the fault is acknowledged, on
+both acknowledgement paths: the correlation clear, and the scoped per-entity clear
+that deliberately skips it.
+
+**The mark survives a restart.** The set itself does not - it lives in the process
+- so on startup, with a declaration still in force, the manager re-registers it for
+every stored fault that is not CLEARED and whose ``first_occurred`` is at or after
+the declaration. Without that, a reboot inside a weekend stop would make the
+survivors silently visible and the switch-off would announce none of them: their
+confirmations, suppressed before the reboot, would be lost for good.
 
 Withdrawing releases the rest and publishes ``EVENT_CONFIRMED`` once for each
 released fault that is CONFIRMED. That republication is the point of marking
 rather than dropping: the confirmation happened behind the mute, no consumer of
 the event stream ever heard it, and the condition still stands on the machine.
+What is withheld is exactly what a rule-muted symptom withholds - ``EVENT_CONFIRMED``
+and ``EVENT_UPDATED`` - while ``EVENT_CLEARED`` is published as usual, so a fault
+that heals or is acknowledged inside the stop still reports its end.
 
 The switch is a service rather than a parameter because it carries a reason and a
 declarer and produces an audit record, none of which a parameter can do; and it is

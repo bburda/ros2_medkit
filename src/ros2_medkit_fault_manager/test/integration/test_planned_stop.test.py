@@ -64,14 +64,18 @@ CONFIRMATION_THRESHOLD = -2
 SOURCE_ID = '/test_node'
 CAPTURE_TOPIC = '/test/temperature'
 
-# A rule that mutes MOTOR_PS_* while ESTOP_PS_001 stands. Its window is long
-# enough that no test can lose the correlation to its own pacing.
+# Two rules. The hierarchical one mutes MOTOR_PS_* while ESTOP_PS_001 stands; the
+# auto-cluster one claims VALVE_PS_* faults without ever writing them into the mute
+# map, which is the case a planned stop's own entry has to survive. Both windows are
+# long enough that no test can lose the correlation to its own pacing.
 CORRELATION_RULES = """
 correlation:
   enabled: true
   patterns:
     ps_motor_errors:
       codes: ["MOTOR_PS_*"]
+    ps_valve_errors:
+      codes: ["VALVE_PS_*"]
   rules:
     - id: ps_estop_cascade
       name: "E-Stop Cascade"
@@ -83,6 +87,15 @@ correlation:
       window_ms: 60000
       mute_symptoms: true
       auto_clear_with_root: true
+    - id: ps_valve_storm
+      name: "Valve Storm"
+      mode: auto_cluster
+      match:
+        - pattern: ps_valve_errors
+      min_count: 2
+      window_ms: 60000
+      show_as_single: true
+      representative: first
 """
 
 
@@ -282,6 +295,16 @@ class TestPlannedStop(unittest.TestCase):
             return sum(1 for kind, code, _ in cls._events
                        if code == fault_code and kind == event_type)
 
+    @classmethod
+    def _event_types(cls, fault_code):
+        """Every event type published for this code, as a set.
+
+        Counting one type cannot see a leak of another: a stop that announced an
+        UPDATE it should have withheld passes a CONFIRMED-only assertion.
+        """
+        with cls._events_lock:
+            return {kind for kind, code, _ in cls._events if code == fault_code}
+
     def _set_stop(self, active, *, reason='', declared_by=''):
         request = SetPlannedStop.Request()
         request.active = active
@@ -388,8 +411,9 @@ class TestPlannedStop(unittest.TestCase):
             f'no snapshot was captured for the muted fault {code}')
         self.assertIn(CAPTURE_TOPIC, captured)
 
-        # Nothing was announced while the stop stood.
-        self.assertEqual(0, self._count_events(code, FaultEvent.EVENT_CONFIRMED))
+        # Nothing at all was announced while the stop stood - not the confirmation,
+        # and not an update either.
+        self.assertEqual(set(), self._event_types(code))
 
         withdrawal = self._set_stop(False, reason='line 3 back up', declared_by='shift_lead')
         self.assertTrue(withdrawal.success)
@@ -401,6 +425,8 @@ class TestPlannedStop(unittest.TestCase):
         self.assertEqual(
             1, self._count_events(code, FaultEvent.EVENT_CONFIRMED),
             'the confirmation held back by the stop must be announced exactly once')
+        self.assertEqual({FaultEvent.EVENT_CONFIRMED}, self._event_types(code),
+                         'the switch-off announces the confirmation and nothing else')
 
     def test_a_fault_cleared_during_a_stop_never_reaches_the_default_list(self):
         code = 'PS_CLEARED_INSIDE'
@@ -427,12 +453,19 @@ class TestPlannedStop(unittest.TestCase):
         self.assertIn('confirmed', transitions)
         self.assertIn('cleared', transitions)
 
+        # The acknowledgement is published, as it is for any muted fault; the
+        # confirmation behind the mute is not. Assert the whole set, so an
+        # announcement of any other kind is a failure rather than an unchecked
+        # extra frame.
+        self.assertEqual({FaultEvent.EVENT_CLEARED}, self._event_types(code))
+        self.assertEqual(1, self._count_events(code, FaultEvent.EVENT_CLEARED))
+
         self._set_stop(False, reason='done', declared_by='maintenance')
 
         self.assertNotIn(code, self._codes_in_default_list())
         self.assertEqual(
-            0, self._count_events(code, FaultEvent.EVENT_CONFIRMED),
-            'a fault that was acknowledged inside the stop has nothing to announce')
+            {FaultEvent.EVENT_CLEARED}, self._event_types(code),
+            'a fault that was acknowledged inside the stop has nothing left to announce')
 
     def test_repeating_a_request_changes_nothing_and_records_nothing(self):
         started_before = len(self._audit_rows('planned_stop_started'))
@@ -449,7 +482,7 @@ class TestPlannedStop(unittest.TestCase):
         started = self._audit_rows('planned_stop_started')
         self.assertEqual(started_before + 1, len(started),
                          'declaring a stop that is already in force must write no audit record')
-        self.assertEqual('', started[-1][0])
+        self.assertEqual('__audit__', started[-1][0])
         self.assertEqual('ACTIVE', started[-1][2])
         self.assertEqual('plant_manager', started[-1][3])
         self.assertEqual('weekend shutdown', started[-1][4])
@@ -471,15 +504,18 @@ class TestPlannedStop(unittest.TestCase):
         ended = self._audit_rows('planned_stop_ended')
         self.assertEqual(ended_before + 1, len(ended),
                          'withdrawing a stop that is not in force must write no audit record')
-        self.assertEqual('', ended[-1][0])
+        self.assertEqual('__audit__', ended[-1][0])
         self.assertEqual('INACTIVE', ended[-1][2])
         self.assertEqual('plant_manager', ended[-1][3])
         self.assertEqual('restart', ended[-1][4])
 
         state = self._get_stop()
         self.assertFalse(state.active)
-        self.assertEqual('', state.reason)
-        self.assertEqual('', state.declared_by)
+        # The declaration outlives the stop: the repeat did not overwrite it, and
+        # the withdrawal did not erase it.
+        self.assertEqual('weekend shutdown', state.reason)
+        self.assertEqual('plant_manager', state.declared_by)
+        self.assertGreater(state.ended_at.sec, 0)
 
     def test_the_reason_and_declarer_may_be_empty_or_long(self):
         empty = self._set_stop(True, reason='', declared_by='')
@@ -560,6 +596,132 @@ class TestPlannedStop(unittest.TestCase):
                          'the confirmation after the stop ended was never announced')
         self.assertEqual('CONFIRMED', self._get_fault(code).fault.status)
         self.assertIn(code, self._codes_in_default_list())
+
+    def test_a_fault_already_up_when_the_stop_begins_stays_visible(self):
+        """A cycle that started before the stop is not the stop's to hide."""
+        code = 'PS_ALREADY_UP'
+
+        # Confirmed and announced with no stop in force.
+        self._confirm(code)
+        self._wait_until(lambda: self._count_events(code, FaultEvent.EVENT_CONFIRMED) == 1,
+                         f'{code} was never announced before the stop')
+        self.assertIn(code, self._codes_in_default_list())
+
+        self._set_stop(True, reason='line 3 maintenance', declared_by='shift_lead')
+
+        # A level-triggered reporter keeps sending FAILED while the condition
+        # holds. None of those reports starts a cycle.
+        for _ in range(3):
+            self._report(code)
+
+        self.assertIsNone(self._muted_entry(code),
+                          'the stop took over a fault whose cycle started before it')
+        self.assertIn(code, self._codes_in_default_list(),
+                      'a standing alarm left the fault list when the stop was declared')
+
+        self._set_stop(False, reason='line 3 back up', declared_by='shift_lead')
+
+        self.assertEqual(
+            1, self._count_events(code, FaultEvent.EVENT_CONFIRMED),
+            'the switch-off announced a confirmation that had already been announced')
+
+    def test_a_fault_raised_again_after_a_clear_during_the_stop_is_marked(self):
+        """Re-raising a cleared fault starts a new cycle, and the stop takes it."""
+        code = 'PS_RERAISED'
+
+        self._confirm(code)
+        self._wait_until(lambda: self._get_fault(code).success, f'{code} never reached the store')
+        self.assertTrue(self._clear(code).success)
+
+        self._set_stop(True, reason='changeover', declared_by='maintenance')
+        self._confirm(code)
+
+        muted = self._wait_until(lambda: self._muted_entry(code),
+                                 f'the re-raised {code} was not marked by the stop')
+        self.assertEqual('planned_stop', muted.rule_id)
+        self.assertNotIn(code, self._codes_in_default_list())
+
+        before = self._count_events(code, FaultEvent.EVENT_CONFIRMED)
+        self._set_stop(False, reason='done', declared_by='maintenance')
+        self._wait_until(
+            lambda: self._count_events(code, FaultEvent.EVENT_CONFIRMED) == before + 1,
+            'the new cycle the stop held back was never announced')
+
+    def test_a_scoped_acknowledgement_still_releases_the_stops_mute(self):
+        """A clear that skips the correlation cascade still drops the stop's mute."""
+        code = 'PS_SCOPED_ACK'
+
+        self._set_stop(True, reason='cell 7 changeover', declared_by='maintenance')
+        self._confirm(code)
+        self._wait_until(lambda: self._muted_entry(code), f'{code} was not marked by the stop')
+        before_count = self._list().muted_count
+
+        # The shape every per-entity DELETE takes: acknowledge this fault only,
+        # without walking the correlation graph into other entities.
+        request = ClearFault.Request()
+        request.fault_code = code
+        request.skip_correlation_auto_clear = True
+        self.assertTrue(self._call(self.clear_client, request).success)
+
+        self.assertIsNone(self._muted_entry(code),
+                          'an acknowledged fault stayed listed as muted by the stop')
+        self.assertLess(self._list().muted_count, before_count,
+                        'muted_count still counts a fault that was acknowledged')
+
+        self._set_stop(False, reason='done', declared_by='maintenance')
+        self.assertEqual(0, self._count_events(code, FaultEvent.EVENT_CONFIRMED))
+
+    def test_a_cluster_rule_does_not_orphan_the_stops_mute(self):
+        """A cluster claims the mute without owning it, so the stop still releases."""
+        first = 'VALVE_PS_A'
+        second = 'VALVE_PS_B'
+
+        self._set_stop(True, reason='valve bank swap', declared_by='maintenance')
+        self._confirm(first)
+        self._confirm(second)
+
+        entries = self._wait_until(
+            lambda: [self._muted_entry(first), self._muted_entry(second)]
+            if self._muted_entry(first) and self._muted_entry(second) else None,
+            'the clustered faults were not marked by the stop')
+        for entry in entries:
+            self.assertEqual('planned_stop', entry.rule_id,
+                             'the cluster took an entry it never writes')
+
+        visible = self._codes_in_default_list()
+        self.assertNotIn(first, visible)
+        self.assertNotIn(second, visible)
+
+        self._set_stop(False, reason='swap done', declared_by='maintenance')
+
+        self._wait_until(
+            lambda: all(code in self._codes_in_default_list() for code in (first, second)),
+            'a fault a cluster rule claimed was orphaned in the mute map')
+        for code in (first, second):
+            self.assertIsNone(self._muted_entry(code))
+            self.assertEqual(1, self._count_events(code, FaultEvent.EVENT_CONFIRMED))
+
+    def test_the_last_declaration_is_readable_after_the_withdrawal(self):
+        """The reason survives the withdrawal, with the time the stop ended."""
+        self._set_stop(True, reason='line 3 quarterly maintenance', declared_by='shift_lead')
+        during = self._get_stop()
+        self.assertTrue(during.active)
+        self.assertEqual(0, during.ended_at.sec)
+
+        self._set_stop(False, reason='plant back up', declared_by='night_shift')
+
+        after = self._get_stop()
+        self.assertFalse(after.active)
+        self.assertEqual('line 3 quarterly maintenance', after.reason)
+        self.assertEqual('shift_lead', after.declared_by)
+        self.assertEqual(during.since.sec, after.since.sec)
+        self.assertGreater(after.ended_at.sec, 0)
+
+        # The withdrawal's own reason and declarer are in the audit row, not in the
+        # declaration.
+        ended = self._audit_rows('planned_stop_ended')[-1]
+        self.assertEqual('night_shift', ended[3])
+        self.assertEqual('plant back up', ended[4])
 
     def test_the_switch_does_not_release_a_rule_muted_symptom(self):
         root = 'ESTOP_PS_001'

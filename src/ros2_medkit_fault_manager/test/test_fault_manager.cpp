@@ -38,9 +38,11 @@
 #include "ros2_medkit_msgs/msg/snapshot.hpp"
 #include "ros2_medkit_msgs/srv/clear_fault.hpp"
 #include "ros2_medkit_msgs/srv/get_fault.hpp"
+#include "ros2_medkit_msgs/srv/get_planned_stop.hpp"
 #include "ros2_medkit_msgs/srv/get_snapshots.hpp"
 #include "ros2_medkit_msgs/srv/list_faults_for_entity.hpp"
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
+#include "ros2_medkit_msgs/srv/set_planned_stop.hpp"
 
 using ros2_medkit_fault_manager::clamp_debounce_counter;
 using ros2_medkit_fault_manager::compute_debounce_status;
@@ -2987,6 +2989,198 @@ TEST_F(SnapshotReadPathTest, FreezeFrameStaysVisibleBehindRetainedSnapshots) {
     }
   }
   EXPECT_TRUE(frame_served) << "retained snapshots must not hide the most recent freeze-frame";
+}
+
+namespace {
+
+/// A store whose planned-stop write always fails, standing in for a disk that has
+/// gone read-only under a running manager. Everything else behaves normally.
+class PlannedStopFailingStorage : public ros2_medkit_fault_manager::InMemoryFaultStorage {
+ public:
+  void set_planned_stop(const ros2_medkit_fault_manager::PlannedStopState & /*state*/) override {
+    throw std::runtime_error("planned_stop table is read-only");
+  }
+};
+
+}  // namespace
+
+/// The switch driven over its real services, against a node in this process.
+class PlannedStopServiceTest : public ::testing::Test {
+ protected:
+  static inline std::atomic<int> test_counter_{0};
+
+  void SetUp() override {
+    const std::string ns = "/test_planned_stop_" + std::to_string(test_counter_.fetch_add(1));
+
+    rclcpp::NodeOptions fm_options;
+    fm_options.parameter_overrides({
+        rclcpp::Parameter("storage_type", "memory"),
+        rclcpp::Parameter("confirmation_threshold", -1),
+    });
+    fm_options.arguments({"--ros-args", "-r", "__ns:=" + ns});
+    fault_manager_ = std::make_shared<FaultManagerNode>(fm_options);
+
+    rclcpp::NodeOptions test_options;
+    test_options.arguments({"--ros-args", "-r", "__ns:=" + ns});
+    test_node_ = std::make_shared<rclcpp::Node>("planned_stop_test_client", test_options);
+
+    set_client_ =
+        test_node_->create_client<ros2_medkit_msgs::srv::SetPlannedStop>(ns + "/fault_manager/set_planned_stop");
+    get_client_ =
+        test_node_->create_client<ros2_medkit_msgs::srv::GetPlannedStop>(ns + "/fault_manager/get_planned_stop");
+    ASSERT_TRUE(set_client_->wait_for_service(std::chrono::seconds(5)));
+    ASSERT_TRUE(get_client_->wait_for_service(std::chrono::seconds(5)));
+  }
+
+  void TearDown() override {
+    set_client_.reset();
+    get_client_.reset();
+    test_node_.reset();
+    fault_manager_.reset();
+  }
+
+  template <typename FutureT>
+  bool spin_until_future_ready(FutureT & future, std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < timeout) {
+      rclcpp::spin_some(fault_manager_);
+      rclcpp::spin_some(test_node_);
+      if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+  }
+
+  ros2_medkit_msgs::srv::SetPlannedStop::Response set_stop(bool active, const std::string & reason,
+                                                           const std::string & declared_by) {
+    auto request = std::make_shared<ros2_medkit_msgs::srv::SetPlannedStop::Request>();
+    request->active = active;
+    request->reason = reason;
+    request->declared_by = declared_by;
+    auto future = set_client_->async_send_request(request);
+    EXPECT_TRUE(spin_until_future_ready(future));
+    return *future.get();
+  }
+
+  ros2_medkit_msgs::srv::GetPlannedStop::Response get_stop() {
+    auto request = std::make_shared<ros2_medkit_msgs::srv::GetPlannedStop::Request>();
+    auto future = get_client_->async_send_request(request);
+    EXPECT_TRUE(spin_until_future_ready(future));
+    return *future.get();
+  }
+
+  std::shared_ptr<FaultManagerNode> fault_manager_;
+  std::shared_ptr<rclcpp::Node> test_node_;
+  rclcpp::Client<ros2_medkit_msgs::srv::SetPlannedStop>::SharedPtr set_client_;
+  rclcpp::Client<ros2_medkit_msgs::srv::GetPlannedStop>::SharedPtr get_client_;
+};
+
+// A store that cannot record the declaration must not leave the caller believing
+// a stop is in force, and must not take the process down with it.
+TEST_F(PlannedStopServiceTest, AStoreThatRejectsTheWriteIsReportedNotThrown) {
+  fault_manager_->set_storage_for_test(std::make_unique<PlannedStopFailingStorage>());
+
+  const auto response = set_stop(true, "line 3 maintenance", "shift_lead");
+  EXPECT_FALSE(response.success);
+  EXPECT_FALSE(response.message.empty());
+  EXPECT_FALSE(response.was_active);
+
+  // The switch is where it was, and the node is still answering.
+  const auto state = get_stop();
+  EXPECT_FALSE(state.active);
+  EXPECT_TRUE(state.reason.empty());
+}
+
+// "Why was line 3 quiet on Friday?" has to be answerable after the plant is back
+// up, without reading a raw audit database.
+TEST_F(PlannedStopServiceTest, TheLastDeclarationIsReadableAfterTheWithdrawal) {
+  const auto before_any = get_stop();
+  EXPECT_FALSE(before_any.active);
+  EXPECT_EQ(0, before_any.since.sec);
+  EXPECT_EQ(0, before_any.ended_at.sec);
+
+  ASSERT_TRUE(set_stop(true, "line 3 quarterly maintenance", "shift_lead").success);
+  const auto during = get_stop();
+  ASSERT_TRUE(during.active);
+  EXPECT_EQ("line 3 quarterly maintenance", during.reason);
+  EXPECT_GT(during.since.sec, 0);
+  EXPECT_EQ(0, during.ended_at.sec) << "a stop that is still in force has not ended";
+
+  ASSERT_TRUE(set_stop(false, "plant back up", "shift_lead").success);
+
+  const auto after = get_stop();
+  EXPECT_FALSE(after.active);
+  EXPECT_EQ("line 3 quarterly maintenance", after.reason) << "the declaration that started the stop";
+  EXPECT_EQ("shift_lead", after.declared_by);
+  EXPECT_EQ(during.since.sec, after.since.sec);
+  EXPECT_GT(after.ended_at.sec, 0) << "the withdrawal has to be readable too";
+}
+
+// The audit rows for the switch describe the installation, so they carry the same
+// sentinel fault code the log's own lifecycle markers use.
+TEST(PlannedStopAuditTest, TransitionsUseTheInstallationSentinelFaultCode) {
+  const std::string audit_path = make_temp_audit_path("test_audit_planned_stop_");
+  {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides({
+        {"storage_type", "memory"},
+        {"audit_log.enabled", true},
+        {"audit_log.database_path", audit_path},
+    });
+    options.arguments({"--ros-args", "-r", "__ns:=/test_planned_stop_audit"});
+    auto node = std::make_shared<FaultManagerNode>(options);
+
+    auto client_node = std::make_shared<rclcpp::Node>(
+        "planned_stop_audit_client",
+        rclcpp::NodeOptions().arguments({"--ros-args", "-r", "__ns:=/test_planned_stop_audit"}));
+    auto client = client_node->create_client<ros2_medkit_msgs::srv::SetPlannedStop>(
+        "/test_planned_stop_audit/fault_manager/set_planned_stop");
+    ASSERT_TRUE(client->wait_for_service(std::chrono::seconds(5)));
+
+    auto call = [&](bool active, const std::string & reason) {
+      auto request = std::make_shared<ros2_medkit_msgs::srv::SetPlannedStop::Request>();
+      request->active = active;
+      request->reason = reason;
+      request->declared_by = "shift_lead";
+      auto future = client->async_send_request(request);
+      auto start = std::chrono::steady_clock::now();
+      while (std::chrono::steady_clock::now() - start < std::chrono::seconds(3)) {
+        rclcpp::spin_some(node);
+        rclcpp::spin_some(client_node);
+        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      ASSERT_EQ(future.wait_for(std::chrono::milliseconds(0)), std::future_status::ready);
+      ASSERT_TRUE(future.get()->success);
+    };
+    call(true, "maintenance");
+    call(false, "back up");
+
+    const auto * log = node->get_audit_log_for_test();
+    ASSERT_NE(log, nullptr);
+    bool saw_started = false;
+    bool saw_ended = false;
+    for (const auto & record : log->read()) {
+      if (record.event.transition == ros2_medkit_fault_manager::kTransitionPlannedStopStarted) {
+        saw_started = true;
+        EXPECT_EQ("__audit__", record.event.fault_code);
+        EXPECT_EQ("maintenance", record.event.description);
+        EXPECT_EQ("shift_lead", record.event.source_id);
+      } else if (record.event.transition == ros2_medkit_fault_manager::kTransitionPlannedStopEnded) {
+        saw_ended = true;
+        EXPECT_EQ("__audit__", record.event.fault_code);
+        EXPECT_EQ("back up", record.event.description);
+      }
+    }
+    EXPECT_TRUE(saw_started);
+    EXPECT_TRUE(saw_ended);
+    EXPECT_TRUE(log->verify().ok);
+  }
+  remove_audit_files(audit_path);
 }
 
 int main(int argc, char ** argv) {

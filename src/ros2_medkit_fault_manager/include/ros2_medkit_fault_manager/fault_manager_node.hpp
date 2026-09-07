@@ -72,6 +72,12 @@ class FaultManagerNode : public rclcpp::Node {
     return *storage_;
   }
 
+  /// Replace the storage backend (for testing only). The failure paths of a store
+  /// that rejects a write are otherwise reachable only on a broken disk.
+  void set_storage_for_test(std::unique_ptr<FaultStorage> storage) {
+    storage_ = std::move(storage);
+  }
+
   /// Get the tamper-evident audit log (nullptr when disabled), for testing only.
   const FaultAuditLog * get_audit_log_for_test() const {
     return audit_log_.get();
@@ -175,6 +181,12 @@ class FaultManagerNode : public rclcpp::Node {
   /// @param config SnapshotConfig to populate with loaded values
   void load_snapshot_config_from_yaml(const std::string & config_file, SnapshotConfig & config);
 
+  /// Re-register the planned stop's mute for every stored fault whose cycle started
+  /// inside the declaration currently in force and that is not CLEARED. Runs at
+  /// startup, before the node serves anything.
+  /// @return how many faults were re-marked
+  size_t restore_planned_stop_mutes();
+
   /// Build the correlation engine.
   ///
   /// Never null. The engine also owns the planned-stop mute, which an operator can
@@ -233,7 +245,11 @@ class FaultManagerNode : public rclcpp::Node {
   /// says, for the same reason the logging markers are: the switch describes the
   /// installation, and the evidence chain has to show when the plant was
   /// declared stopped.
-  void audit_planned_stop(const char * transition, const PlannedStopState & state, int64_t occurred_at_ns);
+  /// @param state The declaration as it stands after the transition (for its status)
+  /// @param reason Why THIS transition was made
+  /// @param declared_by Who made it
+  void audit_planned_stop(const char * transition, const PlannedStopState & state, const std::string & reason,
+                          const std::string & declared_by, int64_t occurred_at_ns);
 
   std::string storage_type_;
   std::string database_path_;

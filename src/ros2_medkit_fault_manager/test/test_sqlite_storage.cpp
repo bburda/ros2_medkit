@@ -2466,6 +2466,58 @@ TEST_F(SqliteFaultStorageTest, WithdrawnPlannedStopIsWhatAReopenSees) {
   EXPECT_EQ(0, state.since_ns);
 }
 
+TEST_F(SqliteFaultStorageTest, AWithdrawnDeclarationKeepsItsReasonAndItsEndTime) {
+  ros2_medkit_fault_manager::PlannedStopState declared;
+  declared.active = true;
+  declared.reason = "line 3 quarterly maintenance";
+  declared.declared_by = "shift_lead";
+  declared.since_ns = 1757000000000000000;
+  storage_->set_planned_stop(declared);
+
+  // What a withdrawal writes: the declaration survives it, stamped with its end.
+  auto withdrawn = declared;
+  withdrawn.active = false;
+  withdrawn.ended_at_ns = 1757000009000000000;
+  storage_->set_planned_stop(withdrawn);
+
+  storage_.reset();
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  const auto state = storage_->get_planned_stop();
+  EXPECT_FALSE(state.active);
+  EXPECT_EQ("line 3 quarterly maintenance", state.reason);
+  EXPECT_EQ("shift_lead", state.declared_by);
+  EXPECT_EQ(1757000000000000000, state.since_ns);
+  EXPECT_EQ(1757000009000000000, state.ended_at_ns);
+}
+
+TEST_F(SqliteFaultStorageTest, ADatabaseWrittenBeforeTheEndTimeExistedStillOpens) {
+  // A row written by a build that had no ended_at_ns column reads as one that was
+  // never withdrawn, which is what a missing end time means.
+  storage_.reset();
+  {
+    sqlite3 * raw = nullptr;
+    ASSERT_EQ(sqlite3_open(temp_db_path_.string().c_str(), &raw), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(raw, "DROP TABLE IF EXISTS planned_stop", nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(raw,
+                           "CREATE TABLE planned_stop (id INTEGER PRIMARY KEY CHECK (id = 1), active INTEGER NOT NULL,"
+                           " reason TEXT NOT NULL, declared_by TEXT NOT NULL, since_ns INTEGER NOT NULL);"
+                           "INSERT INTO planned_stop (id, active, reason, declared_by, since_ns)"
+                           " VALUES (1, 1, 'legacy stop', 'shift_lead', 42);",
+                           nullptr, nullptr, nullptr),
+              SQLITE_OK);
+    sqlite3_close(raw);
+  }
+
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  const auto state = storage_->get_planned_stop();
+  EXPECT_TRUE(state.active);
+  EXPECT_EQ("legacy stop", state.reason);
+  EXPECT_EQ(42, state.since_ns);
+  EXPECT_EQ(0, state.ended_at_ns);
+}
+
 TEST_F(SqliteFaultStorageTest, PlannedStopCarriesAKilobyteReason) {
   const std::string long_reason(1024, 'r');
   ros2_medkit_fault_manager::PlannedStopState declared;

@@ -54,6 +54,12 @@ struct AuditEvent {
   int64_t occurred_at_ns{0};  ///< wall-clock timestamp of the transition
 };
 
+/// Fault code carried by records that describe the INSTALLATION rather than one
+/// fault - the log's own activation markers and the planned-stop transitions. One
+/// sentinel for all of them, so a reader filtering them out has a single value to
+/// filter on.
+constexpr const char * kAuditMarkerFaultCode = "__audit__";
+
 /// Canonical transition kinds. Stored verbatim, so they are part of the hash.
 constexpr const char * kTransitionOccurred = "occurred";
 constexpr const char * kTransitionConfirmed = "confirmed";

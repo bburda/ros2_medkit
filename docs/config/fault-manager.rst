@@ -608,7 +608,10 @@ Fault correlation identifies root causes and filters symptom faults.
      - Path to YAML file defining correlation rules.
    * - ``correlation.cleanup_interval_sec``
      - ``5.0``
-     - Interval for running correlation cleanup tasks.
+     - Interval for running correlation cleanup tasks. The correlation engine is
+       constructed on every fault manager, configured rules or not, because the
+       planned-stop switch needs none - so this timer runs everywhere. With no
+       rules loaded each tick walks two empty containers and returns.
 
 .. seealso::
 
@@ -644,18 +647,30 @@ Two configuration choices decide how much the switch can do:
        ends it.
    * - ``audit_log.enabled``
      - ``false``
-     - When on, each transition is recorded as ``planned_stop_started`` /
-       ``planned_stop_ended``, with the reason and the declarer. Recorded even
-       under ``audit_log.transitions: confirmed_only``.
+     - **Off by default, so a stock manager records no audit row for the switch
+       at all.** When on, each transition is recorded as ``planned_stop_started``
+       / ``planned_stop_ended`` under the ``__audit__`` fault code, with that
+       transition's own reason and declarer. Recorded even under
+       ``audit_log.transitions: confirmed_only``.
 
-While the stop stands, a fault whose cycle starts is reported, debounced,
+While the stop stands, a fault whose cycle *starts* is reported, debounced,
 confirmed, captured and audited unchanged, and is marked as muted rather than
-dropped: absent from the default fault list, counted in ``muted_count``, listed
-under ``muted_faults`` with ``rule_id: planned_stop`` when muted entries are
-requested, and never published on ``~/events``. Withdrawing the stop releases
-every fault it alone was muting and publishes one confirmation event for each of
-those that is CONFIRMED. Correlation rules are unaffected: a symptom a rule mutes
-stays muted when the stop is withdrawn.
+dropped: absent from the default fault list, counted in ``muted_count``, and
+listed under ``muted_faults`` with ``rule_id: planned_stop`` when muted entries
+are requested. A fault that was already up when the stop was declared is left
+alone - its confirmation has already been announced, and reporters re-send FAILED
+for as long as the condition holds.
+
+A marked fault is published exactly as a rule-muted symptom is: ``EVENT_CONFIRMED``
+and ``EVENT_UPDATED`` are withheld, while ``EVENT_CLEARED`` - the fault healing, or
+being acknowledged - is published as usual. Withdrawing the stop releases every
+fault it alone was muting and publishes one confirmation event for each of those
+that is CONFIRMED. Correlation rules are unaffected: a symptom a rule mutes stays
+muted when the stop is withdrawn, and the stop never takes a mute a rule owns.
+
+``~/get_planned_stop`` keeps serving the declaration after the withdrawal, with
+``ended_at`` stamped, so the reason stays readable once the plant is back up. A
+request the store cannot record answers ``success: false`` and changes nothing.
 
 Over HTTP the switch is an operation on the fault manager's App entity
 (``POST /apps/fault_manager/operations/set_planned_stop/executions``), which
