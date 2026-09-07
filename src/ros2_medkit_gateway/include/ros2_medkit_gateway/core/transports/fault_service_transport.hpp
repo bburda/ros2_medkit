@@ -107,6 +107,14 @@ class FaultServiceTransport {
   virtual bool wait_for_services(std::chrono::duration<double> timeout) = 0;
 
   virtual bool is_available() const = 0;
+
+  /// Whether the planned-stop services are ready, specifically.
+  ///
+  /// Separate from is_available(), which gates only the four core fault
+  /// services: a fault manager from before planned stops answers those and has
+  /// no `~/list_planned_stops`, and asking it anyway cost a full service timeout
+  /// on the fault-list path, once per back-off window, for nothing.
+  virtual bool planned_stops_available() const = 0;
 };
 
 }  // namespace ros2_medkit_gateway

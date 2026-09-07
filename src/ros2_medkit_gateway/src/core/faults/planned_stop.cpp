@@ -159,8 +159,18 @@ std::optional<int64_t> parse_iso8601_utc_ns(const std::string & text) {
   // stored. Refusing here leaves the representable-instant guard downstream
   // looking at a real value rather than at wreckage.
   constexpr int64_t kMaxSecondsInInt64Ns = std::numeric_limits<int64_t>::max() / kNsPerSecond;
+  constexpr int64_t kFractionHeadroomNs = std::numeric_limits<int64_t>::max() % kNsPerSecond;
   const auto seconds_i64 = static_cast<int64_t>(seconds);
   if (seconds_i64 > kMaxSecondsInInt64Ns || seconds_i64 < -kMaxSecondsInInt64Ns) {
+    return std::nullopt;
+  }
+  // At the maximal second the fraction is what can still overflow: bounding the
+  // seconds alone and adding the fraction afterwards made
+  // "2262-04-11T23:47:16.9Z" undefined behaviour on a route that promises 400.
+  if (seconds_i64 == kMaxSecondsInInt64Ns && fraction_ns > kFractionHeadroomNs) {
+    return std::nullopt;
+  }
+  if (seconds_i64 == -kMaxSecondsInInt64Ns && fraction_ns > kFractionHeadroomNs) {
     return std::nullopt;
   }
   // timegm normalises, so a day that does not exist in that month (31 April)
@@ -175,11 +185,18 @@ std::optional<int64_t> parse_iso8601_utc_ns(const std::string & text) {
   return floor_to_ms_ns(seconds_i64 * kNsPerSecond + fraction_ns);
 }
 
-int64_t seconds_to_ns(double seconds) {
-  if (!std::isfinite(seconds)) {
-    return 0;
+std::optional<int64_t> seconds_to_ns(double seconds) {
+  // Positive form: every comparison against NaN is false, so "outside the range"
+  // written as a pair of ORs would let NaN through into llround, which is
+  // undefined. The bound is in MILLISECONDS because that is the unit the result
+  // is expressed in, and it leaves llround far inside its own range.
+  constexpr double kMaxMs = 9.0e15;
+  const double milliseconds = seconds * 1000.0;
+  const bool usable = std::isfinite(milliseconds) && milliseconds >= -kMaxMs && milliseconds <= kMaxMs;
+  if (!usable) {
+    return std::nullopt;
   }
-  return static_cast<int64_t>(std::llround(seconds * static_cast<double>(kNsPerSecond)));
+  return std::llround(milliseconds) * kNsPerMillisecond;
 }
 
 const PlannedStopWindow * window_for_fault(const std::vector<PlannedStopWindow> & windows,
@@ -191,11 +208,35 @@ const PlannedStopWindow * window_for_fault(const std::vector<PlannedStopWindow> 
   if (it == fault_json.end() || !it->is_number()) {
     return nullptr;
   }
-  const double first_occurred_sec = it->get<double>();
-  if (!std::isfinite(first_occurred_sec)) {
+  const auto first_occurred_ns = seconds_to_ns(it->get<double>());
+  if (!first_occurred_ns) {
     return nullptr;
   }
-  return find_covering_window(windows, seconds_to_ns(first_occurred_sec));
+  return find_covering_window(windows, *first_occurred_ns);
+}
+
+int64_t count_expected_items(const nlohmann::json & items) {
+  if (!items.is_array()) {
+    return 0;
+  }
+  std::set<std::string> seen;
+  for (const auto & item : items) {
+    if (!item.is_object()) {
+      continue;
+    }
+    const auto extension = item.find("x-medkit");
+    if (extension == item.end() || !extension->is_object()) {
+      continue;
+    }
+    const auto flag = extension->find("expected");
+    if (flag == extension->end() || !flag->is_boolean() || !flag->get<bool>()) {
+      continue;
+    }
+    const auto code = item.find("fault_code");
+    seen.insert(code != item.end() && code->is_string() ? code->get<std::string>()
+                                                        : std::string("<unnamed>") + std::to_string(seen.size()));
+  }
+  return static_cast<int64_t>(seen.size());
 }
 
 void set_expected_count(nlohmann::json & collection, int64_t count) {
@@ -209,11 +250,16 @@ void set_expected_count(nlohmann::json & collection, int64_t count) {
   extension["expected_count"] = count;
 }
 
-bool annotate_fault_with_planned_stop(nlohmann::json & fault_json, const std::vector<PlannedStopWindow> & windows) {
+std::optional<bool> annotate_fault_with_planned_stop(nlohmann::json & fault_json,
+                                                     const PlannedStopKnowledge & knowledge) {
   if (!fault_json.is_object()) {
-    return false;
+    return std::nullopt;
   }
-  const auto * covering = window_for_fault(windows, fault_json);
+  if (!knowledge.known) {
+    // Silence, not `false`. See PlannedStopKnowledge.
+    return std::nullopt;
+  }
+  const auto * covering = window_for_fault(knowledge.windows, fault_json);
 
   // Merge rather than assign: an item may already carry vendor keys, and the
   // flag is an addition to them, not a replacement.
@@ -237,6 +283,7 @@ void PlannedStopCache::store(std::vector<PlannedStopWindow> windows) {
   ever_stored_ = true;
   last_refresh_failed_ = false;
   attempted_at_ = std::chrono::steady_clock::now();
+  stored_at_ = attempted_at_;
 }
 
 void PlannedStopCache::note_failed_refresh() {
@@ -246,9 +293,12 @@ void PlannedStopCache::note_failed_refresh() {
   attempted_at_ = std::chrono::steady_clock::now();
 }
 
-bool PlannedStopCache::has_knowledge() const {
+bool PlannedStopCache::has_knowledge(std::chrono::steady_clock::duration max_age) const {
   const std::lock_guard<std::mutex> lock(mutex_);
-  return ever_stored_;
+  if (!ever_stored_) {
+    return false;
+  }
+  return std::chrono::steady_clock::now() - stored_at_ < max_age;
 }
 
 bool PlannedStopCache::last_refresh_failed() const {

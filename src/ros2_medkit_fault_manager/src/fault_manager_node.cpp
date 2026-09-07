@@ -1758,11 +1758,24 @@ void FaultManagerNode::handle_declare_planned_stop(
 
   window.id = std::to_string(now_ns) + "-" + std::to_string(planned_stop_seq_.fetch_add(1) + 1);
 
-  if (!storage_->declare_planned_stop(window)) {
-    response->success = false;
-    response->outcome = Response::OUTCOME_DUPLICATE_ID;
-    response->message = "a planned stop with id '" + window.id + "' already exists";
-    return;
+  switch (storage_->declare_planned_stop(window)) {
+    case DeclarePlannedStopOutcome::DuplicateId:
+      response->success = false;
+      response->outcome = Response::OUTCOME_DUPLICATE_ID;
+      response->message = "a planned stop with id '" + window.id + "' already exists";
+      return;
+    case DeclarePlannedStopOutcome::CapFull:
+      response->success = false;
+      response->outcome = Response::OUTCOME_NOT_RETAINED;
+      response->message = "planned_stop.max_windows is full of windows that have not ended; end one or raise the bound";
+      RCLCPP_WARN(get_logger(),
+                  "Planned stop refused: all %zu retained windows have yet to end. Raise "
+                  "planned_stop.max_windows or end one.",
+                  static_cast<size_t>(storage_->list_planned_stops().size()));
+      return;
+    case DeclarePlannedStopOutcome::Stored:
+    default:
+      break;
   }
 
   // Read back rather than assume. The declaration is exempt from the pruning it
@@ -1849,7 +1862,11 @@ void FaultManagerNode::handle_list_planned_stops(
   const int64_t now_ns = requested_now == 0 ? get_wall_clock_ns() : requested_now;
 
   for (const auto & window : storage_->list_planned_stops()) {
-    if (request->active_only && !window.covers(now_ns)) {
+    // "Active" is "has not ended", the same notion retention and the end guards
+    // use. Filtering on covers(now) instead hid exactly the windows that are
+    // unprunable - the ones that have not started - so an operator could not
+    // enumerate what was holding the bound.
+    if (request->active_only && !window.active_at(now_ns)) {
       continue;
     }
     response->stops.push_back(window_to_msg(window));

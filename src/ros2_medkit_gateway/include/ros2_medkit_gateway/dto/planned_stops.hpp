@@ -145,8 +145,10 @@ struct PlannedStopListQuery {
 template <>
 inline constexpr auto dto_fields<PlannedStopListQuery> = std::make_tuple(
     field("active", &PlannedStopListQuery::active, Presence::kOptional,
-          "Return only the windows containing this instant. Omitted or false returns every declared window, "
-          "ended ones included - they are the reason older faults read as expected."));
+          "Return only the windows that have NOT ENDED: running and not-yet-started alike. That is the same "
+          "notion retention uses, so this lists exactly the windows holding the `planned_stop.max_windows` "
+          "bound. Omitted or false returns every declared window, ended ones included - they are the reason "
+          "older faults read as expected."));
 
 // =============================================================================
 // Collection<PlannedStop> - named "PlannedStopList"

@@ -205,6 +205,13 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   }
   sse_fault_handler_ = std::make_unique<handlers::SSEFaultHandler>(*handler_ctx_, sse_client_tracker_,
                                                                    std::chrono::seconds(keepalive_used));
+  // Built after the SSE handler on purpose: /health reports its received-event
+  // counter, and the handler does not exist when HealthHandlers is constructed.
+  if (health_handlers_) {
+    health_handlers_->set_sse_event_counter([this]() -> uint64_t {
+      return sse_fault_handler_ ? sse_fault_handler_->events_received() : 0;
+    });
+  }
   bulkdata_handlers_ = std::make_unique<handlers::BulkDataHandlers>(*handler_ctx_);
   // Validated as int64 before narrowing: narrowing first wraps a value above
   // INT_MAX into a small positive one that passes the check, so 4294967300
@@ -2267,9 +2274,11 @@ void RESTServer::setup_routes() {
       .body_example(nlohmann::json{
           {"from", "2026-09-06T18:00:00Z"}, {"to", "2026-09-06T22:00:00Z"}, {"reason", "line changeover"}})
       .success_description("Planned stop declared")
+      // 409 when the bound on retained windows is full of windows that have not
+      // ended: the request was well formed and the store could not take it.
       // 503 when the fault manager cannot be reached - the windows are stored
       // there, so there is nowhere else to put the declaration.
-      .errors({503})
+      .errors({409, 503})
       .operation_id("declarePlannedStop");
 
   reg.get<dto::Collection<dto::PlannedStop>>(

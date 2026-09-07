@@ -96,28 +96,41 @@ PlannedStopResult FaultManager::list_planned_stops(bool active_only) {
   return transport_->list_planned_stops(active_only);
 }
 
-std::vector<faults::PlannedStopWindow> FaultManager::planned_stop_windows(bool force_refresh) {
+void FaultManager::refresh_planned_stop_windows(bool force) {
   const auto ttl = planned_stop_cache_.last_refresh_failed() ? kPlannedStopFailureBackoff : kPlannedStopCacheTtl;
-  if (force_refresh || planned_stop_cache_.is_stale(ttl)) {
-    // Checked before the call, not instead of it: list_planned_stops blocks for
-    // the transport's whole timeout when the services are absent, and this read
-    // sits on the fault-stream formatting path.
-    auto fetched =
-        transport_->is_available() ? transport_->list_planned_stops(/*active_only=*/false) : PlannedStopResult{};
-    if (fetched.success) {
-      planned_stop_cache_.store(std::move(fetched.stops));
-    } else {
-      // Keep what is known - a fault that briefly loses its flag reads as a
-      // surprise, and a surprise is the one thing an expected fault must not
-      // look like - but stop asking for a while.
-      planned_stop_cache_.note_failed_refresh();
-    }
+  if (!force && !planned_stop_cache_.is_stale(ttl)) {
+    return;
   }
-  return planned_stop_cache_.snapshot();
+
+  // Both readiness checks before the call, not instead of it. is_available()
+  // covers the four core services; planned_stops_available() covers the one this
+  // actually reads, because a fault manager from before planned stops answers
+  // the first four and has no ~/list_planned_stops - asking it anyway cost a
+  // full service timeout on the fault-list path for nothing.
+  const bool worth_asking = transport_->is_available() && transport_->planned_stops_available();
+  auto fetched = worth_asking ? transport_->list_planned_stops(/*active_only=*/false) : PlannedStopResult{};
+  if (fetched.success) {
+    planned_stop_cache_.store(std::move(fetched.stops));
+  } else {
+    // Keep what is known for a little longer - a fault that briefly loses its
+    // flag reads as a surprise - but stop asking for a while, and let the
+    // knowledge age out if nothing renews it.
+    planned_stop_cache_.note_failed_refresh();
+  }
 }
 
-bool FaultManager::planned_stops_known() const {
-  return planned_stop_cache_.has_knowledge();
+faults::PlannedStopKnowledge FaultManager::planned_stop_snapshot() const {
+  faults::PlannedStopKnowledge knowledge;
+  knowledge.known = planned_stop_cache_.has_knowledge(kPlannedStopKnowledgeMaxAge);
+  if (knowledge.known) {
+    knowledge.windows = planned_stop_cache_.snapshot();
+  }
+  return knowledge;
+}
+
+faults::PlannedStopKnowledge FaultManager::planned_stop_windows(bool force_refresh) {
+  refresh_planned_stop_windows(force_refresh);
+  return planned_stop_snapshot();
 }
 
 void FaultManager::invalidate_planned_stop_cache() {

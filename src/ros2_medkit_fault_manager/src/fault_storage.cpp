@@ -879,19 +879,29 @@ std::vector<std::string> InMemoryFaultStorage::reclassify_healed_as_cleared() {
 // Planned-stop windows
 // ---------------------------------------------------------------------------
 
-bool InMemoryFaultStorage::declare_planned_stop(const PlannedStopWindow & window) {
+DeclarePlannedStopOutcome InMemoryFaultStorage::declare_planned_stop(const PlannedStopWindow & window) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   const bool exists = std::any_of(planned_stops_.begin(), planned_stops_.end(), [&window](const PlannedStopWindow & w) {
     return w.id == window.id;
   });
   if (exists) {
-    return false;
+    return DeclarePlannedStopOutcome::DuplicateId;
+  }
+
+  // Room first, then the insert. The row cannot be evicted by its own
+  // declaration this way, and the bound stays hard: if pruning the ended windows
+  // does not free a slot, every stored window has yet to end and there is
+  // nowhere to put this one.
+  if (max_planned_stops_ > 0) {
+    prune_planned_stops_locked(window.declared_at_ns, max_planned_stops_ - 1);
+    if (planned_stops_.size() >= max_planned_stops_) {
+      return DeclarePlannedStopOutcome::CapFull;
+    }
   }
 
   planned_stops_.push_back(window);
-  prune_planned_stops_locked(window.declared_at_ns, window.id);
-  return true;
+  return DeclarePlannedStopOutcome::Stored;
 }
 
 EndPlannedStopResult InMemoryFaultStorage::end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) {
@@ -917,7 +927,10 @@ EndPlannedStopResult InMemoryFaultStorage::end_planned_stop(const std::string & 
     planned_stops_.erase(it);
     return EndPlannedStopResult{EndPlannedStopOutcome::Cancelled, cancelled};
   }
-  if (at_ns < it->starts_at_ns || at_ns > now_ns) {
+  // Strictly after the start: ending AT the start would store
+  // ends_at == starts_at, which is not an interval and which the message
+  // promises can never happen.
+  if (at_ns <= it->starts_at_ns || at_ns > now_ns) {
     return EndPlannedStopResult{EndPlannedStopOutcome::InvalidAt, *it};
   }
 
@@ -956,19 +969,22 @@ std::vector<PlannedStopWindow> InMemoryFaultStorage::list_planned_stops() const 
 size_t InMemoryFaultStorage::set_max_planned_stops(size_t max_count, int64_t now_ns) {
   std::lock_guard<std::mutex> lock(mutex_);
   max_planned_stops_ = max_count;
-  return prune_planned_stops_locked(now_ns);
+  return prune_planned_stops_locked(now_ns, max_count);
 }
 
-size_t InMemoryFaultStorage::prune_planned_stops_locked(int64_t now_ns, const std::string & exempt_id) {
-  if (max_planned_stops_ == 0 || planned_stops_.size() <= max_planned_stops_) {
+size_t InMemoryFaultStorage::prune_planned_stops_locked(int64_t now_ns, size_t target) {
+  if (max_planned_stops_ == 0 || planned_stops_.size() <= target) {
     return 0;
   }
 
   // Prune candidates: windows that have already ended, oldest declaration first.
+  // A window that has not ended is never a candidate - it must not vanish under
+  // the operator who declared it - which is why a table with nothing but those
+  // in it refuses new declarations instead of growing.
   std::vector<size_t> candidates;
   candidates.reserve(planned_stops_.size());
   for (size_t i = 0; i < planned_stops_.size(); ++i) {
-    if (!planned_stops_[i].active_at(now_ns) && planned_stops_[i].id != exempt_id) {
+    if (!planned_stops_[i].active_at(now_ns)) {
       candidates.push_back(i);
     }
   }
@@ -979,7 +995,7 @@ size_t InMemoryFaultStorage::prune_planned_stops_locked(int64_t now_ns, const st
     return planned_stops_[a].id < planned_stops_[b].id;
   });
 
-  const size_t over = planned_stops_.size() - max_planned_stops_;
+  const size_t over = planned_stops_.size() - target;
   const size_t to_drop = std::min(over, candidates.size());
   if (to_drop == 0) {
     return 0;

@@ -462,6 +462,7 @@ std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint6
 
     // First, send any buffered events the client missed (for reconnection)
     {
+      refresh_planned_stops();
       std::vector<std::pair<uint64_t, std::string>> pending;
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -486,20 +487,31 @@ std::function<bool(httplib::DataSink &)> SSEFaultHandler::make_stream_loop(uint6
 
       std::vector<std::pair<uint64_t, std::string>> pending;
       bool keepalive_due = false;
+      bool woke = false;
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
 
         // Predicate form: an event enqueued between the last flush and this
         // wait already spent its notify_all while nobody was waiting; a plain
         // wait_for would sleep the full keepalive interval on top of it.
-        const bool woke = queue_cv_.wait_for(lock, timeout, [this, &last_event_id, relay_peers] {
+        woke = queue_cv_.wait_for(lock, timeout, [this, &last_event_id, relay_peers] {
           return shutdown_flag_.load() || has_pending_locked(last_event_id, relay_peers);
         });
 
         if (shutdown_flag_.load()) {
           return false;  // Handler is shutting down
         }
+      }
 
+      // Between the wait and the formatting, and outside the lock on both
+      // counts. Before the wait it would be too early - a window declared while
+      // this loop slept would not be in the snapshot the woken event is
+      // formatted from - and under the lock it would be a blocking service call
+      // on the mutex the subscription callback needs to enqueue.
+      refresh_planned_stops();
+
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
         pending = collect_pending();
         keepalive_due = !woke && pending.empty();
       }
@@ -639,6 +651,12 @@ uint64_t SSEFaultHandler::events_received() const {
   return next_event_id_.load(std::memory_order_relaxed) - 1;
 }
 
+void SSEFaultHandler::refresh_planned_stops() const {
+  if (auto * fault_mgr = ctx_.node()->get_fault_manager(); fault_mgr != nullptr) {
+    fault_mgr->refresh_planned_stop_windows();
+  }
+}
+
 std::string SSEFaultHandler::format_sse_event(const QueuedEvent & queued) const {
   const auto sanitized_event_type = sanitize_sse_event_type(queued.event.event_type);
 
@@ -693,12 +711,16 @@ std::string SSEFaultHandler::format_sse_event(const QueuedEvent & queued) const 
   // frame carries no `expected` key at all. Sending `false` there would tell a
   // consumer that nothing was expected, which is exactly what an operator
   // watching a stop would act on, and the gateway does not know that.
+  //
+  // Read from the cache ONLY. This runs under `queue_mutex_` (collect_pending
+  // holds it), and the subscription callback takes the same mutex to enqueue, so
+  // a service call here stalls the gateway's executor thread and every other
+  // client behind one client's formatting pass. The refresh happens on the
+  // stream's own thread, before the lock - see refresh_planned_stop_windows.
   if (auto * fault_mgr = ctx_.node()->get_fault_manager(); fault_mgr != nullptr) {
-    // Read first: this call is what populates the cache, so asking whether the
-    // gateway knows anything before it would answer "no" for ever.
-    const auto windows = fault_mgr->planned_stop_windows();
-    if (fault_mgr->planned_stops_known()) {
-      const auto * covering = faults::window_for_fault(windows, json_event["fault"]);
+    const auto knowledge = fault_mgr->planned_stop_snapshot();
+    if (knowledge.known) {
+      const auto * covering = faults::window_for_fault(knowledge.windows, json_event["fault"]);
       if (!json_event["x-medkit"].is_object()) {
         json_event["x-medkit"] = nlohmann::json::object();
       }

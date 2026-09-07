@@ -2787,20 +2787,31 @@ fault manager consults a window. The flag is there so a reader can tell an expec
 a surprise, and the evidence chain still describes the plant that existed.
 
 The windows live in the fault manager, next to the faults they describe, and survive a
-restart. Retention is bounded by count (``planned_stop.max_windows``), never by age, and never
-drops a window that is still running.
+restart. Retention is bounded by count (``planned_stop.max_windows``), never by age. The bound is
+hard: ended windows are pruned oldest-first to make room, and when every retained window has yet
+to end a new declaration is refused with ``409`` rather than the table growing. A window that has
+not ended is never dropped to make room for anything.
 
 What makes a fault expected
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A fault is expected when its ``first_occurred`` lies in ``[from, to]``, inclusive at both ends and
-compared at **millisecond** resolution: both sides are floored to the millisecond before the
-comparison, so a fault reported anywhere inside the millisecond a window opens or closes is inside
-the window. That is the resolution of the whole API - the parser rounds an ISO 8601 fraction down
-to it, a ``GET`` returns exactly what the ``POST`` sent - because an operator declares a stop at
-minute or second precision while ``first_occurred`` crosses the wire as a double resolving to about
-a quarter of a microsecond, and a boundary defined more finely than the data can express is one
-nobody can rely on.
+A fault is expected when its ``first_occurred`` lies in ``[from, to]`` at **millisecond**
+resolution. That qualifier is the whole of it, so exactly what it means:
+
+- The window's bounds are floored to their millisecond. A window declared through the REST route
+  has millisecond bounds already (the parser rounds an ISO 8601 fraction down, and a ``GET``
+  returns what the ``POST`` sent). One declared through the ROS service with finer bounds opens at
+  the START of ``from``'s millisecond - up to 999999 ns before the instant asked for - and closes
+  at the start of ``to``'s.
+- The fault's own instant is rounded to the NEAREST millisecond. A fault within half a millisecond
+  of a bound therefore lands on that bound: one 400 us after ``to`` is still expected, one 600 us
+  after it is not.
+
+"Closed at both ends" is exact at that resolution and only at that resolution. The resolution is a
+millisecond because an operator declares a stop at minute or second precision, while
+``first_occurred`` crosses the wire as a double whose resolution at today's epoch is about a
+quarter of a microsecond - a boundary defined more finely than the data can express is one nobody
+can rely on.
 
 ``first_occurred`` is the start of the fault's **current cycle**, not its first report ever: it
 is reset when a FAILED event raises a CLEARED fault again. A code that failed during a
@@ -2827,8 +2838,9 @@ window logic.
      - Declare a window. ``201`` with the stored window and a ``Location`` header
    * - ``GET /api/v1/x-medkit-planned-stops``
      - viewer
-     - List windows, newest declaration first. ``?active=true`` keeps only the ones containing
-       now
+     - List windows, newest declaration first. ``?active=true`` keeps the ones that have NOT
+       ENDED - running and not-yet-started alike, which is the same notion retention uses, so it
+       lists exactly the windows holding the bound
    * - ``GET /api/v1/x-medkit-planned-stops/{planned_stop_id}``
      - viewer
      - One window
@@ -2880,8 +2892,10 @@ carries. The epoch itself is excluded on purpose: zero is what an unset time rea
 sentinel that is also a legal value cannot tell a caller who meant the epoch from one who filled
 in nothing.
 
-A ``409`` means the request was well formed and the store could not take it - the configured
-``planned_stop.max_windows`` had no room. Raise the bound, or end a window, and retry.
+A ``409`` means the request was well formed and the store could not take it: every retained window
+has yet to end, so ``planned_stop.max_windows`` has no room. Ended windows are pruned to make
+space automatically - a window that is still running, or has yet to start, never is. End one, or
+raise the bound, and retry.
 
 Ending or cancelling a window
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2930,8 +2944,20 @@ tally beside them:
    }
 
 ``planned_stop_id`` is present only when ``expected`` is true, and the window's ``reason`` is not
-carried beside it - resolve the id. ``expected_count`` counts the list that was actually served:
-items this gateway flagged plus items an aggregated peer flagged, after filtering.
+carried beside it - resolve the id.
+
+``expected_count`` counts **distinct fault codes** in the served list that were flagged expected -
+after the peer merge and after the filter. Distinct, because an aggregating gateway serves a code
+raised on two gateways as two items, and counting both would report two stops' worth of expected
+faults where the plant had one. An item that carries no ``expected`` key at all - one relayed from
+a peer running a gateway that predates this flag - is counted by neither side: its flag is unknown,
+and unknown is not false. Such an item is served only under ``expected=all``.
+
+``count`` beside it is the length of ``items`` in THIS response: after the merge and after the
+``status`` and ``expected`` filters. It is not the fault manager's own total, and it changed
+meaning in the release that added planned stops - it was the fault manager's count before. The
+``muted_count`` and ``cluster_count`` next to it are still the local unfiltered numbers, so a
+filtered request can answer ``count: 1`` beside ``muted_count: 7``.
 
 Both fault lists take ``?expected=true|false|all``. Omitting it means ``all``: the flag is extra
 information about a fault, never a reason to hide it by default. On an aggregating gateway the
@@ -2941,11 +2967,23 @@ that sent no flag satisfies neither ``true`` nor ``false``, because this gateway
 either.
 
 The ``/faults/stream`` frames carry the same pair inside their ``x-medkit`` object, alongside
-the ``entity_type`` / ``entity_id`` hint. ``expected`` is sent as an explicit ``false`` for a
-fault no window covers - but only once the gateway has actually read the declared windows. While
-it never has (no fault manager, or none reachable since start) the frame carries **no**
-``expected`` key at all: a consumer must not read an outage of the fault manager as "nothing is
-expected", which is exactly what an operator watching a stop would act on.
+the ``entity_type`` / ``entity_id`` hint.
+
+``expected`` is sent as an explicit ``false`` for a fault no window covers - but only while the
+gateway can actually read the declared windows. When it cannot, **no surface says anything**: the
+frames carry no ``expected`` key, the fault-list items carry none either, and the list omits
+``expected_count`` altogether. A consumer must not read an outage of the fault manager as "nothing
+is expected", which is exactly what an operator watching a stop would act on.
+
+Two states produce that silence. One is a fault manager that is unreachable, or one from a release
+that has no planned-stop service - the gateway checks that service's readiness before calling it,
+so this costs no timeout on the fault list. The other is knowledge that has gone stale: a window
+set the gateway read successfully is reported for a few seconds past its last successful re-read
+and no longer, so replacing the fault manager under a running gateway makes the flag go quiet
+rather than leaving it naming a window that no longer exists.
+
+A request that filters on a flag the gateway cannot derive - ``?expected=true`` or
+``?expected=false`` in that state - returns no items rather than half a set nobody knows.
 
 Fault Triggers (threshold rules)
 --------------------------------

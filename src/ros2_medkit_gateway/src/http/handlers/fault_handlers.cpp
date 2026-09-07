@@ -234,16 +234,26 @@ std::optional<bool> peer_item_expected_flag(const json & item) {
   return flag->get<bool>();
 }
 
-bool peer_item_is_expected(const json & item) {
-  return peer_item_expected_flag(item).value_or(false);
-}
-
 /// Mark each item with the planned-stop flag, drop what the filter excludes, and
 /// report how many of the survivors were expected.
 ///
 /// Runs on the LOCAL items only, before any peer merge: a peer's gateway derives
 /// its own flag from its own fault manager's windows, and this gateway has no
 /// business re-deciding it from windows the peer never saw.
+/// True when no item in @p items carries an `expected` key at all - so no count
+/// can be stated about them. A list of items from an older peer looks like this.
+bool peer_flags_unknown_only(const json & items) {
+  if (!items.is_array()) {
+    return true;
+  }
+  for (const auto & item : items) {
+    if (peer_item_expected_flag(item).has_value()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Whether a peer's item survives the `expected` filter. An item whose flag the
 /// peer did not send is dropped by BOTH `true` and `false`: this gateway cannot
 /// claim it was expected, and it cannot claim it was not either.
@@ -258,29 +268,43 @@ bool keep_peer_item(const json & item, ExpectedFilter filter) {
   return filter == ExpectedFilter::OnlyExpected ? *flag : !*flag;
 }
 
-int64_t apply_planned_stops(json & items, FaultManager & fault_mgr, ExpectedFilter filter) {
+/// Mark each item, drop what the filter excludes, and report whether the flag
+/// could be derived at all.
+///
+/// Nothing when this gateway has no window knowledge: no item carries an
+/// `expected` key then, and the collection carries no `expected_count` either.
+/// "The fault manager could not be read" and "no window covers this" are
+/// different answers, and only one of them is a fact - the rule is the same on
+/// every surface, list and stream alike.
+///
+/// When the flag cannot be derived the filter cannot be honoured either, so
+/// `expected=true` and `expected=false` both keep nothing rather than claiming
+/// a half of a set nobody knows.
+std::optional<bool> apply_planned_stops(json & items, FaultManager & fault_mgr, ExpectedFilter filter) {
   if (!items.is_array()) {
-    return 0;
+    return std::nullopt;
   }
-  const auto windows = fault_mgr.planned_stop_windows();
+  const auto knowledge = fault_mgr.planned_stop_windows();
+  if (!knowledge.known) {
+    if (filter != ExpectedFilter::All) {
+      items = json::array();
+    }
+    return std::nullopt;
+  }
 
   json kept = json::array();
-  int64_t expected_count = 0;
   for (auto & item : items) {
-    const bool expected = faults::annotate_fault_with_planned_stop(item, windows);
+    const bool expected = faults::annotate_fault_with_planned_stop(item, knowledge).value_or(false);
     if (filter == ExpectedFilter::OnlyExpected && !expected) {
       continue;
     }
     if (filter == ExpectedFilter::OnlyUnexpected && expected) {
       continue;
     }
-    if (expected) {
-      ++expected_count;
-    }
     kept.push_back(item);
   }
   items = std::move(kept);
-  return expected_count;
+  return true;
 }
 
 /// Wrap a built JSON list payload in a typed FaultListResult envelope.
@@ -374,10 +398,9 @@ json FaultHandlers::merge_entity_freeze_frames(json env_data,
 // The transport adapter performs ros2_medkit_msgs -> JSON translation; the
 // handler post-processes the intermediate snapshot shape (freeze_frame parse,
 // rosbag bulk_data_uri) using the entity_path it has at request time.
-dto::FaultDetail
-FaultHandlers::build_sovd_fault_response(const json & fault_json, const json & env_data_json,
-                                         const std::string & entity_path,
-                                         const std::vector<faults::PlannedStopWindow> & planned_stops) {
+dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_json, const json & env_data_json,
+                                                          const std::string & entity_path,
+                                                          const faults::PlannedStopKnowledge & planned_stops) {
   const std::string fault_code = fault_json.value("fault_code", "");
   const std::string status = fault_json.value("status", "");
   const uint8_t severity = fault_json.value("severity", static_cast<uint8_t>(0));
@@ -513,11 +536,13 @@ FaultHandlers::build_sovd_fault_response(const json & fault_json, const json & e
   }
   xm.severity_label = severity_to_label(severity);
   xm.status_raw = status;
-  if (const auto * covering = faults::window_for_fault(planned_stops, fault_json)) {
-    xm.expected = true;
-    xm.planned_stop_id = covering->id;
-  } else {
-    xm.expected = false;
+  if (planned_stops.known) {
+    if (const auto * covering = faults::window_for_fault(planned_stops.windows, fault_json)) {
+      xm.expected = true;
+      xm.planned_stop_id = covering->id;
+    } else {
+      xm.expected = false;
+    }
   }
   detail.x_medkit = std::move(xm);
 
@@ -554,7 +579,7 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
 
     // Format: items array at top level
     json response = {{"items", result.data["faults"]}};
-    int64_t expected_count_total = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
+    const bool flag_known = apply_planned_stops(response["items"], *fault_mgr, expected_filter).has_value();
 
     // x-medkit extension for ros2_medkit-specific fields (typed DTO)
     dto::FaultListXMedkit xm;
@@ -594,9 +619,6 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
           if (!keep_peer_item(item, expected_filter)) {
             continue;
           }
-          if (peer_item_is_expected(item)) {
-            ++expected_count_total;
-          }
           response["items"].push_back(item);
         }
       }
@@ -607,10 +629,19 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
       }
     }
 
-    // Counted after the merge, so the numbers describe the list that was
-    // actually served rather than the local half of it.
+    // Both numbers describe the list that was actually SERVED - after the peer
+    // merge and after the filter - not the fault manager's own totals.
+    // `muted_count` and `cluster_count` beside them are still the local
+    // unfiltered numbers the fault manager reported.
     xm.count = static_cast<int64_t>(response["items"].size());
-    xm.expected_count = expected_count_total;
+    // Counted over the merged list, by distinct fault code: an aggregating
+    // gateway serves a code raised on two gateways twice, and counting both
+    // would report two stops' worth of expected faults where the plant had one.
+    // Omitted entirely when the flag could not be derived - a count of zero
+    // would read as "nothing was expected".
+    if (flag_known || !peer_flags_unknown_only(response["items"])) {
+      xm.expected_count = faults::count_expected_items(response["items"]);
+    }
 
     response["x-medkit"] = dto::JsonWriter<dto::FaultListXMedkit>::write(xm);
     return wrap_list_result(std::move(response));
@@ -663,13 +694,22 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
             return tl::make_unexpected(plugin_filter.error());
           }
           if (result->content.is_object() && result->content.contains("items")) {
-            const int64_t plugin_expected =
-                apply_planned_stops(result->content["items"], *ctx_.node()->get_fault_manager(), *plugin_filter);
-            // set_expected_count CREATES the extension. Writing through
-            // `content["x-medkit"]["expected_count"]` behind an is_object()
-            // guard left a plugin that sends no vendor extension answering
-            // `"x-medkit": null` - neither the count nor the absence of one.
-            faults::set_expected_count(result->content, plugin_expected);
+            const bool plugin_flag_known =
+                apply_planned_stops(result->content["items"], *ctx_.node()->get_fault_manager(), *plugin_filter)
+                    .has_value();
+            if (plugin_flag_known) {
+              // set_expected_count CREATES the extension. Writing through
+              // `content["x-medkit"]["expected_count"]` behind an is_object()
+              // guard left a plugin that sends no vendor extension answering
+              // `"x-medkit": null` - neither the count nor the absence of one.
+              faults::set_expected_count(result->content, faults::count_expected_items(result->content["items"]));
+            }
+            // A plugin's own `count`, if it sent one, described the list before
+            // the filter ran. Bring it back in line with what is served rather
+            // than leaving a collection that says five and carries one.
+            if (result->content["x-medkit"].is_object() && result->content["x-medkit"].contains("count")) {
+              result->content["x-medkit"]["count"] = static_cast<int64_t>(result->content["items"].size());
+            }
           }
           return std::move(*result);
         } catch (const std::exception & e) {
@@ -737,12 +777,14 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
 
       json filtered_faults = faults::filter_faults_by_sources(result.data["faults"], source_fqns);
       json response = {{"items", filtered_faults}};
-      const int64_t expected_count = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
+      const bool flag_known = apply_planned_stops(response["items"], *fault_mgr, expected_filter).has_value();
 
       // x-medkit extension (typed DTO)
       dto::FaultListAggXMedkit xm;
       xm.entity_id = entity_id;
-      xm.expected_count = expected_count;
+      if (flag_known) {
+        xm.expected_count = faults::count_expected_items(response["items"]);
+      }
       const bool is_function = entity_info.type == EntityType::FUNCTION;
       xm.aggregation_level = is_function ? "function" : "component";
       xm.aggregated = true;
@@ -786,11 +828,13 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
 
       json filtered_faults = faults::filter_faults_by_sources(result.data["faults"], app_fqns);
       json response = {{"items", filtered_faults}};
-      const int64_t expected_count = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
+      const bool flag_known = apply_planned_stops(response["items"], *fault_mgr, expected_filter).has_value();
 
       dto::FaultListAggXMedkit xm;
       xm.entity_id = entity_id;
-      xm.expected_count = expected_count;
+      if (flag_known) {
+        xm.expected_count = faults::count_expected_items(response["items"]);
+      }
       xm.aggregation_level = "area";
       xm.aggregated = true;
       xm.component_count = static_cast<int64_t>(cache.get_components_for_area(entity_id).size());
@@ -827,12 +871,14 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
 
     json filtered_faults = faults::filter_faults_by_sources(result.data["faults"], app_fqns);
     json response = {{"items", filtered_faults}};
-    const int64_t expected_count = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
+    const bool flag_known = apply_planned_stops(response["items"], *fault_mgr, expected_filter).has_value();
 
     // x-medkit extension for ros2_medkit-specific fields (typed DTO)
     dto::FaultListXMedkit xm;
     xm.entity_id = entity_id;
-    xm.expected_count = expected_count;
+    if (flag_known) {
+      xm.expected_count = faults::count_expected_items(response["items"]);
+    }
     xm.source_id = entity_info.namespace_path;
 
     if (result.data.contains("muted_faults")) {

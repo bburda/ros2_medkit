@@ -149,8 +149,14 @@ http::Result<dto::Health> HealthHandlers::get_health(const http::TypedRequest & 
     // by the aggregator's fault-stream relay rather than by anyone an operator
     // can see. A 503 on /faults/stream is otherwise unexplainable from outside.
     if (sse_tracker_) {
-      response.x_medkit_sse =
-          json{{"connected_clients", sse_tracker_->connected_clients()}, {"max_clients", sse_tracker_->max_clients()}};
+      json sse{{"connected_clients", sse_tracker_->connected_clients()}, {"max_clients", sse_tracker_->max_clients()}};
+      if (sse_events_received_) {
+        // Fault events accepted from the fault manager since start. A counter
+        // that stops moving while faults are being reported says the thread
+        // that accepts them is blocked, which nothing else on /health can show.
+        sse["events_received"] = sse_events_received_();
+      }
+      response.x_medkit_sse = std::move(sse);
     }
 
     // Add peer status when aggregation is active

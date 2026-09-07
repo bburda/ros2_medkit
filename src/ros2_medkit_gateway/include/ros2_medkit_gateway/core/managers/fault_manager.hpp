@@ -107,6 +107,18 @@ class FaultManager {
   /// The declared windows, straight from the fault manager.
   PlannedStopResult list_planned_stops(bool active_only = false);
 
+  /// Refresh the window cache if it is due. Makes at most one fault-manager RPC
+  /// and must therefore be called with NO lock held: it is the blocking half,
+  /// split out from the read so a caller can pay it on its own thread before
+  /// touching anything shared. The SSE stream loop calls it before it takes the
+  /// queue mutex - a service call under that mutex stalls the executor thread
+  /// and every other client behind one client's formatting pass.
+  void refresh_planned_stop_windows(bool force = false);
+
+  /// What is known right now: no RPC, no blocking, no refresh. Safe under a
+  /// lock.
+  faults::PlannedStopKnowledge planned_stop_snapshot() const;
+
   /// The windows to derive `expected` from, served from a cache the read path
   /// refreshes at most once per kPlannedStopCacheTtl.
   ///
@@ -117,13 +129,7 @@ class FaultManager {
   /// transport's timeout on every single event of the fault stream, which stalls
   /// the stream rather than degrading it. Callers that must see their own write
   /// pass force_refresh, or call invalidate_planned_stop_cache() first.
-  std::vector<faults::PlannedStopWindow> planned_stop_windows(bool force_refresh = false);
-
-  /// Whether this gateway has ever read the declared windows. False means it
-  /// does not KNOW, which is not the same as knowing that none are declared: the
-  /// event stream omits the flag entirely in that case, because a consumer must
-  /// not read an unreachable fault manager as "nothing is expected".
-  bool planned_stops_known() const;
+  faults::PlannedStopKnowledge planned_stop_windows(bool force_refresh = false);
 
   /// Ask the next planned_stop_windows() to re-read. Called after this gateway
   /// writes a window so an operator never watches their own declaration take
@@ -141,6 +147,13 @@ class FaultManager {
   /// and paying it every couple of seconds on a busy stream is a worse outage
   /// than a flag that lags.
   static constexpr std::chrono::seconds kPlannedStopFailureBackoff{30};
+
+  /// How old a successfully read window set may be and still be reported. A
+  /// small multiple of the refresh period: long enough that a set being re-read
+  /// normally never blinks, short enough that one nothing can refresh - a fault
+  /// manager replaced, or one without the service - goes quiet within seconds
+  /// instead of being served for the life of the process.
+  static constexpr std::chrono::seconds kPlannedStopKnowledgeMaxAge{3 * kPlannedStopCacheTtl.count()};
 
   /// Check if fault manager services are available.
   bool is_available() const;

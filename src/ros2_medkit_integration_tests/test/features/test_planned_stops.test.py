@@ -108,9 +108,11 @@ class TestPlannedStops(GatewayTestCase):
         except AssertionError:
             return
         for window in active.get('items', []):
-            requests.delete(
+            response = requests.delete(
                 f'{self.BASE_URL}{PLANNED_STOPS}/{window["id"]}', timeout=10
             )
+            if response.status_code == 200 and response.json().get('ended_early'):
+                self._wait_until_past(self._epoch(response.json()['to']))
 
     # --- driving the real fault pipeline -----------------------------------
 
@@ -176,6 +178,52 @@ class TestPlannedStops(GatewayTestCase):
             f'POST {PLANNED_STOPS} {body} -> {response.status_code}: {response.text}'
         )
         return response.json()
+
+    @staticmethod
+    def _epoch(iso_instant):
+        """ISO 8601 in UTC, as the API renders it, back to epoch seconds."""
+        whole = calendar.timegm(time.strptime(iso_instant[:19], '%Y-%m-%dT%H:%M:%S'))
+        fraction = 0.0
+        if len(iso_instant) > 20 and iso_instant[19] == '.':
+            fraction = float('0' + iso_instant[19:-1])
+        return whole + fraction
+
+    def _end_window(self, window_id, expected_status=200):
+        """End a window and wait until the clock is provably past its new end.
+
+        The boundary is a millisecond wide and closed, so a fault raised in the
+        same millisecond the window ended is still inside it. Reporting
+        immediately after the DELETE is therefore a race with the machine's
+        speed, not a test of anything - and it is the race that made this file
+        fail on one distro and pass on four.
+        """
+        response = requests.delete(
+            f'{self.BASE_URL}{PLANNED_STOPS}/{window_id}', timeout=10
+        )
+        self.assertEqual(response.status_code, expected_status, response.text)
+        if response.status_code != 200:
+            return response
+        # Only an early END moves `to` to now and needs the clock to move past
+        # it. A CANCELLED window is gone and its `to` is still in the future -
+        # waiting for that would be waiting for the window nobody kept.
+        if response.json().get('ended_early'):
+            self._wait_until_past(self._epoch(response.json()['to']))
+        return response
+
+    @staticmethod
+    def _wait_until_past(epoch_instant, margin=0.05):
+        """Block until the local clock is `margin` seconds past `epoch_instant`.
+
+        The gateway, the fault manager and this process share one wall clock, so
+        this is the same instant all three compare against.
+        """
+        deadline = time.monotonic() + 5.0
+        while time.time() <= epoch_instant + margin and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert time.time() > epoch_instant + margin, (
+            f'clock never reached {epoch_instant} + {margin}s; the instant is not one '
+            'a window can have ended at'
+        )
 
     @staticmethod
     def _iso(offset_sec):
@@ -330,10 +378,7 @@ class TestPlannedStops(GatewayTestCase):
 
             # End the window, then raise the second fault: same stream, same
             # gateway, opposite answer.
-            ended = requests.delete(
-                f'{self.BASE_URL}{PLANNED_STOPS}/{window["id"]}', timeout=10
-            )
-            self.assertEqual(ended.status_code, 200, ended.text)
+            ended = self._end_window(window['id'])
             self.assertTrue(ended.json()['ended_early'])
 
             self._report('PS_STREAM_OUTSIDE')
@@ -368,10 +413,7 @@ class TestPlannedStops(GatewayTestCase):
         before = self._wait_for_fault_in_list('PS_BEFORE_EARLY_END')
         self.assertTrue(before['x-medkit']['expected'])
 
-        ended = requests.delete(
-            f'{self.BASE_URL}{PLANNED_STOPS}/{window["id"]}', timeout=10
-        )
-        self.assertEqual(ended.status_code, 200, ended.text)
+        ended = self._end_window(window['id'])
         self.assertTrue(ended.json()['ended_early'])
         self.assertLess(ended.json()['to'], window['to'])
 
@@ -446,7 +488,10 @@ class TestPlannedStops(GatewayTestCase):
         self.assertEqual(first['occurrence_count'], 1)
 
         self._clear('PS_CYCLE')
-        requests.delete(f'{self.BASE_URL}{PLANNED_STOPS}/{window["id"]}', timeout=10)
+        # _end_window blocks until the clock is provably past the new `to`, so
+        # the second cycle cannot start inside the window's closing millisecond.
+        ended = self._end_window(window['id'])
+        window_end = self._epoch(ended.json()['to'])
 
         # Cycle two, with no window open.
         self._report('PS_CYCLE')
@@ -454,6 +499,11 @@ class TestPlannedStops(GatewayTestCase):
         while time.monotonic() < deadline:
             item = self._find(self.get_json('/faults?status=all'), 'PS_CYCLE')
             if item is not None and item.get('occurrence_count') == 2:
+                self.assertGreater(
+                    item['first_occurred'], window_end,
+                    'the re-raise must be dated after the window ended, or the case '
+                    'is not about the second cycle at all'
+                )
                 self.assertFalse(
                     item['x-medkit']['expected'],
                     'the second cycle started outside every window'

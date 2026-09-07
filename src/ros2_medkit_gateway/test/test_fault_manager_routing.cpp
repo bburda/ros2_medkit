@@ -181,6 +181,10 @@ class MockFaultServiceTransport : public FaultServiceTransport {
     return wait_result_;
   }
 
+  bool planned_stops_available() const override {
+    return planned_stops_ready_;
+  }
+
   bool is_available() const override {
     ++availability_calls_;
     return is_available_;
@@ -261,6 +265,7 @@ class MockFaultServiceTransport : public FaultServiceTransport {
   bool last_active_only_{false};
   std::vector<faults::PlannedStopWindow> planned_stops_;
   bool planned_stop_success_{true};
+  bool planned_stops_ready_{true};
   std::string planned_stop_error_;
   FaultFailure planned_stop_failure_{FaultFailure::Declined};
   int declare_calls_{0};

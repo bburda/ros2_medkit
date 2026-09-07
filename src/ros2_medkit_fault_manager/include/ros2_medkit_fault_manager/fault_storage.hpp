@@ -238,6 +238,13 @@ struct PlannedStopWindow {
   }
 };
 
+/// Why a declaration was or was not stored.
+enum class DeclarePlannedStopOutcome : uint8_t {
+  Stored,       ///< The window is in the table
+  DuplicateId,  ///< A window with that id already exists; the stored one is untouched
+  CapFull       ///< The bound is reached and every stored window has yet to end
+};
+
 /// Why an end-early request did or did not change a window. The three cases carry
 /// different HTTP answers (200 / 404 / 400), so they are distinguished
 /// structurally rather than by inspecting a message string.
@@ -536,14 +543,19 @@ class FaultStorage {
   /// so a HEALED row left by a previous (healing-enabled) run does not behave inconsistently under
   /// the latch. Default is a no-op (in-memory storage starts empty).
   /// @return fault codes of the reclassified faults, so the caller can audit each transition
-  /// Store a planned-stop window. Returns false when a window with that id
-  /// already exists; the stored one is left untouched. Applies the retention
-  /// bound afterwards using the new window's declared_at_ns as "now", with the
-  /// window just declared EXEMPT: a declaration that is reported as stored has
-  /// to still be there afterwards, and without the exemption a cap already
-  /// filled by an unprunable (running) window made the new row the only
-  /// candidate for its own eviction.
-  virtual bool declare_planned_stop(const PlannedStopWindow & window) = 0;
+  /// Store a planned-stop window.
+  ///
+  /// Room is made FIRST, by pruning windows that have already ended at the new
+  /// window's declared_at_ns, oldest declaration first. If the bound is still
+  /// reached afterwards - every stored window has yet to end - the declaration is
+  /// REFUSED and nothing is stored. The bound is hard: a window that has not
+  /// ended can never be pruned, so without a refusal a caller could grow the
+  /// table without limit by declaring windows that start tomorrow, and
+  /// `planned_stop.max_windows` would bound nothing.
+  ///
+  /// Pruning before inserting is also what makes "reported as stored" true: the
+  /// row cannot be evicted by its own declaration, because it is not there yet.
+  virtual DeclarePlannedStopOutcome declare_planned_stop(const PlannedStopWindow & window) = 0;
 
   /// Stop a window.
   ///
@@ -574,13 +586,12 @@ class FaultStorage {
   /// Bound the number of stored windows and apply the bound now. Returns how
   /// many stored windows the bound dropped.
   ///
-  /// The bound counts windows that are NO LONGER ACTIVE at @p now_ns. Those are
-  /// the only candidates, oldest declaration first; an active window is always
-  /// kept and is never dropped to make room for anything, not even for the
-  /// declaration that triggered the prune. The whole table is therefore bounded
-  /// by @p max_count PLUS the number of active windows - a live window must not
-  /// vanish under the operator who declared it, and that is worth a table a few
-  /// rows over its nominal bound.
+  /// Only windows that have already ENDED at @p now_ns are pruned, oldest
+  /// declaration first: a window that has not ended must not vanish under the
+  /// operator who declared it. A table loaded from disk can therefore still sit
+  /// above a bound that was lowered between runs, until those windows end; a new
+  /// DECLARATION in that state is refused rather than admitted (see
+  /// declare_planned_stop), which is what keeps the bound hard going forward.
   virtual size_t set_max_planned_stops(size_t max_count, int64_t now_ns) = 0;
 
   virtual std::vector<std::string> reclassify_healed_as_cleared() {
@@ -653,7 +664,7 @@ class InMemoryFaultStorage : public FaultStorage {
   std::vector<ros2_medkit_msgs::msg::Fault> get_all_faults() const override;
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
-  bool declare_planned_stop(const PlannedStopWindow & window) override;
+  DeclarePlannedStopOutcome declare_planned_stop(const PlannedStopWindow & window) override;
   EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) override;
   std::optional<PlannedStopWindow> get_planned_stop(const std::string & id) const override;
   std::vector<PlannedStopWindow> list_planned_stops() const override;
@@ -675,10 +686,9 @@ class InMemoryFaultStorage : public FaultStorage {
   /// Whether any row at all still references @p file_path. Caller holds mutex_.
   bool path_referenced(const std::string & file_path) const;
 
-  /// Drop ended windows, oldest declaration first, until at most
-  /// max_planned_stops_ remain. Returns how many went. @p exempt_id is never
-  /// dropped. Caller holds mutex_.
-  size_t prune_planned_stops_locked(int64_t now_ns, const std::string & exempt_id = {});
+  /// Drop ended windows, oldest declaration first, until at most @p target
+  /// remain. Returns how many went. Caller holds mutex_.
+  size_t prune_planned_stops_locked(int64_t now_ns, size_t target);
 
   mutable std::mutex mutex_;
   std::map<std::string, FaultState> faults_;

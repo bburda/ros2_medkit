@@ -91,6 +91,20 @@ SKIPPED_BY_DESIGN = {
     ('post', '/updates'),
 }
 
+# Parameterless write operations the sweep DOES call. The blanket rule above -
+# "a POST or DELETE on a parameterless path acts on real state" - is not true of
+# every such route: a POST whose body is required and invalid is refused before
+# anything is created, so the error branch is reachable without touching gateway
+# state. Listed as a literal for the same reason SKIPPED_BY_DESIGN is: deriving
+# it by shape would silently start poking a future write route that does change
+# state on an empty body.
+#
+# Each entry is called once with `{}`, which is a valid JSON document and an
+# invalid body for every route that takes one.
+PROBED_PARAMETERLESS_WRITES = {
+    ('post', '/x-medkit-planned-stops'),
+}
+
 # Floor on the number of `make_error` sites a run must reach. The fixture
 # reaches 39 of the 281 sites in the tree; the floor sits below that so
 # ordinary churn in the handlers does not need this number edited, while a
@@ -233,9 +247,12 @@ class TestOpenApiErrorCoverage(GatewayTestCase):
         for path, item in TestOpenApiErrorCoverage._spec['paths'].items():
             params = path_params(path)
             if not params:
-                # Nothing to poison here, so only the read-only verb is safe:
-                # a POST or DELETE on a parameterless path acts on real state
-                # (`DELETE /faults` clears them, `POST /updates` starts one).
+                # Nothing to poison here, so the read-only verb is always safe:
+                # a POST or DELETE on a parameterless path usually acts on real
+                # state (`DELETE /faults` clears them, `POST /updates` starts
+                # one). The exceptions are listed in
+                # PROBED_PARAMETERLESS_WRITES, where an invalid body is refused
+                # before anything changes.
                 if 'get' in item:
                     try:
                         resp = requests.get(
@@ -244,6 +261,18 @@ class TestOpenApiErrorCoverage(GatewayTestCase):
                         swept += 1
                     except requests.exceptions.RequestException as exc:
                         print(f'sweep: GET {path} raised {exc}')
+                for method in sorted(item):
+                    if method not in HTTP_METHODS:
+                        continue
+                    if (method, path) not in PROBED_PARAMETERLESS_WRITES:
+                        continue
+                    try:
+                        resp = requests.request(
+                            method, f'{cls.BASE_URL}{path}', json={}, timeout=10, stream=True)
+                        resp.close()
+                        swept += 1
+                    except requests.exceptions.RequestException as exc:
+                        print(f'sweep: {method.upper()} {path} raised {exc}')
                 continue
             substitutions = [[ABSENT_ID], [INVALID_ID]]
             collection = path.strip('/').split('/')[0]
@@ -391,6 +420,22 @@ class TestOpenApiErrorCoverage(GatewayTestCase):
                 f'{method} {path} has a path parameter, so the sweep can reach it')
             self.assertNotEqual(
                 method, 'get', f'{method} {path} is read-only, so the sweep can reach it')
+        # The probe list is the mirror of the pin: every entry must be a
+        # documented, parameterless, non-GET operation the sweep DID reach.
+        # Without this an entry could sit here excusing nothing while the route
+        # it names went unreached.
+        self.assertEqual(
+            sorted(PROBED_PARAMETERLESS_WRITES & SKIPPED_BY_DESIGN), [],
+            'an operation cannot be both probed and skipped by design')
+        for method, path in sorted(PROBED_PARAMETERLESS_WRITES):
+            self.assertIn((method, path), documented, f'{method} {path} is not documented')
+            self.assertFalse(
+                path_params(path),
+                f'{method} {path} has a path parameter, so the ordinary sweep already reaches it')
+            self.assertNotEqual(method, 'get', f'{method} {path} is read-only')
+            self.assertIn(
+                (method, path), observed,
+                f'{method} {path} is listed as probed but the sweep never reached it')
         self.assertEqual(
             sorted(documented - observed), sorted(SKIPPED_BY_DESIGN),
             'unreached operations differ from the pinned set')

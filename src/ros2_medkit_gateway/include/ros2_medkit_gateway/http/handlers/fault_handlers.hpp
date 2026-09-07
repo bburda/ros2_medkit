@@ -146,17 +146,19 @@ class FaultHandlers {
    * @param fault_json Per-fault JSON (as produced by the transport adapter).
    * @param env_data_json Environment-data JSON (as produced by the transport).
    * @param entity_path Entity path used to construct rosbag bulk_data_uri.
-   * @param planned_stops Declared planned-stop windows, used to derive
-   *        `x-medkit.expected`. Pass an empty vector and the flag reads false,
-   *        which is the honest answer for a gateway with no windows; the detail
-   *        and the list derive it from the same data so a UI that opens a fault
-   *        it just saw flagged does not find the flag gone.
+   * @param planned_stops What this gateway knows about the declared windows,
+   *        used to derive `x-medkit.expected`. Knowledge that is not `known`
+   *        leaves the flag OFF the response entirely, exactly as the list and
+   *        the stream do - the detail and the list derive it from the same data
+   *        so a UI that opens a fault it just saw flagged does not find the flag
+   *        gone, and neither of them turns an unreadable fault manager into
+   *        "nothing was expected".
    * @return SOVD-compliant FaultDetail DTO
    */
   static dto::FaultDetail build_sovd_fault_response(const nlohmann::json & fault_json,
                                                     const nlohmann::json & env_data_json,
                                                     const std::string & entity_path,
-                                                    const std::vector<faults::PlannedStopWindow> & planned_stops);
+                                                    const faults::PlannedStopKnowledge & planned_stops);
 
   /**
    * @brief Scope check used by per-entity fault routes.

@@ -74,7 +74,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 | `auto_confirm_after_sec` | double | `0.0` | Auto-confirm PREFAILED faults after timeout (0 = disabled) |
 | `entity_thresholds.config_file` | string | `""` | Path to YAML file with per-entity debounce threshold overrides |
 | `near_miss.max_per_fault` | int | `200` | Near-miss entries retained per fault code, oldest evicted first (0 = unlimited) |
-| `planned_stop.max_windows` | int | `100` | Bound on the retained planned-stop windows that are **no longer active**, oldest declaration dropped first. An active window is always kept and never dropped to make room, so the table holds at most this many plus the number of running windows. Clamped to `[1, 10000]` |
+| `planned_stop.max_windows` | int | `100` | **Hard** bound on stored planned-stop windows. A declaration prunes the oldest **ended** windows to make room; when every stored window has yet to end the declaration is refused instead. Clamped to `[1, 10000]` |
 
 ### Snapshot Parameters
 
@@ -211,7 +211,8 @@ NOW=$(date +%s)
 ros2 service call /fault_manager/declare_planned_stop ros2_medkit_msgs/srv/DeclarePlannedStop \
   "{starts_at: {sec: $NOW, nanosec: 0}, ends_at: {sec: $((NOW + 14400)), nanosec: 0}, reason: 'line changeover', declared_by: 'shift_lead'}"
 
-# List the windows that contain this instant. `now: 0` here means "the fault
+# List the windows that have NOT ENDED - running and not-yet-started alike, the
+# same notion retention uses. `now: 0` here means "the fault
 # manager's own wall clock", which is a request-time reference rather than a
 # window bound - the clock the fault timestamps come from is the one to compare
 # against.
@@ -237,9 +238,9 @@ Behaviour worth knowing before relying on it:
 - A fault belongs to a window when its `first_occurred` lies in `[starts_at, ends_at]`, inclusive at both ends and compared at millisecond resolution. `first_occurred` is the start of the current **cycle**, so a code that fails inside a window and fails again after it was cleared is expected for the first cycle and unexpected for the second.
 - Windows may overlap, and may be declared **after** the stop they describe: a stop is a fact about the plant, not about when someone typed it in.
 - Both bounds must be after the Unix epoch. Zero is what an unset `builtin_interfaces/Time` reads as, so it cannot also mean "now" - a caller who wants the current instant sends it.
-- Whether a window is **finished**, **not started** or **running** is decided against the fault manager's own wall clock, never against the `at` a caller supplies. A running window is cut short at `at`, which may only fall in `[starts_at, now]`; a window that has not started is **cancelled** (removed, with `cancelled` set on the answer); a window that has already finished, early or on its own, cannot be touched again, backdated instants included.
+- Whether a window is **finished**, **not started** or **running** is decided against the fault manager's own wall clock, never against the `at` a caller supplies. A running window is cut short at `at`, which must fall in `(starts_at, now]` - strictly after the start, because ending at the start would store a zero-length window; a window that has not started is **cancelled** (removed, with `cancelled` set on the answer); a window that has already finished, early or on its own, cannot be touched again, backdated instants included.
 - Windows are stored in the `planned_stops` table and survive a restart. A database written by an earlier build gains the table on first open.
-- Retention is by count (`planned_stop.max_windows`), never by age. The bound counts windows that are **no longer active**: an active window is always kept and is never dropped to make room, so the table holds at most `max_windows` plus however many windows are currently running.
+- Retention is by count (`planned_stop.max_windows`), never by age, and the bound is **hard**. A declaration prunes the oldest **ended** windows to make room for itself; when every stored window has yet to end there is no room to make and the declaration is refused (`OUTCOME_NOT_RETAINED`, `409` over REST). A window that has not ended is never dropped to make room. `~/list_planned_stops` with `active_only` lists exactly those unprunable windows.
 
 ## Advanced: Tamper-Evident Audit Log
 

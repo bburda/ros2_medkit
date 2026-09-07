@@ -186,13 +186,15 @@ database written by an earlier build gains the table on first open.
      - Description
    * - ``planned_stop.max_windows``
      - ``100``
-     - Bound on the retained windows that are **no longer active**. Bounded by count, not by age:
-       a window that has ended is still the reason a fault from last month reads as expected. When
-       the bound is reached the **oldest ended** windows are dropped first. An active window is
-       always kept and is never dropped to make room - not even for the declaration that triggered
-       the prune - so the stored count is at most this value **plus the number of windows still
-       running**. Values outside ``[1, 10000]`` are clamped and the clamp is logged at startup.
-       Lowering the bound deletes stored declarations on the next start, which is also logged.
+     - **Hard** bound on stored windows. Bounded by count, not by age: a window that has ended is
+       still the reason a fault from last month reads as expected. A declaration prunes the
+       **oldest ended** windows to make room for itself; when every stored window has yet to end
+       there is no room to make, and the declaration is refused (``409`` over REST) rather than the
+       table growing. A window that has not ended is never dropped to make room, which is why the
+       refusal exists at all. ``ListPlannedStops`` with ``active_only`` lists exactly those
+       unprunable windows. Values outside ``[1, 10000]`` are clamped and the clamp is logged at
+       startup. Lowering the bound deletes stored declarations on the next start, which is also
+       logged; a table loaded above a lowered bound stays above it until those windows end.
 
 Per-Entity Thresholds
 ~~~~~~~~~~~~~~~~~~~~~

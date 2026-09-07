@@ -164,7 +164,9 @@ struct Health {
   std::optional<nlohmann::json> x_medkit_data_provider;          // wire key: "x-medkit-data-provider"
   std::optional<nlohmann::json> x_medkit_subscription_executor;  // wire key: "x-medkit-subscription-executor"
   std::optional<nlohmann::json> x_medkit_entity_cache;           // wire key: "x-medkit-entity-cache"
-  /// How much of `sse.max_clients` is in use. Wire key: "x-medkit-sse".
+  /// How much of `sse.max_clients` is in use, plus `events_received`: fault
+  /// events the gateway has accepted from the fault manager since start. Wire
+  /// key: "x-medkit-sse".
   ///
   /// The cap is small - two by default - and an aggregating gateway now
   /// consumes one slot on each of its peers for as long as somebody is

@@ -107,8 +107,10 @@ inline constexpr auto dto_fields<FaultListItem> = std::make_tuple(
     field("reporting_sources", &FaultListItem::reporting_sources),
     field_enum("severity_label", &FaultListItem::severity_label, kFaultSeverityLabelValues),
     field("x-medkit", &FaultListItem::x_medkit,
-          "Vendor extension carrying `expected` and `planned_stop_id` for this fault. Absent when the gateway "
-          "could not read the planned-stop windows, which is not the same as the fault being unexpected."));
+          "Vendor extension carrying `expected` and `planned_stop_id` for this fault. The `expected` key is "
+          "absent - on every item, and with it the collection's `expected_count` - when the gateway cannot "
+          "read the planned-stop windows, which is not the same as the fault being unexpected. That is the "
+          "same rule the fault stream follows."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultListItem> = "FaultListItem";
@@ -222,17 +224,27 @@ struct FaultListXMedkit {
 
 template <>
 inline constexpr auto dto_fields<FaultListXMedkit> = std::make_tuple(
-    field("count", &FaultListXMedkit::count), field("muted_count", &FaultListXMedkit::muted_count),
-    field("cluster_count", &FaultListXMedkit::cluster_count), field("entity_id", &FaultListXMedkit::entity_id),
-    field("source_id", &FaultListXMedkit::source_id), field("muted_faults", &FaultListXMedkit::muted_faults),
-    field("clusters", &FaultListXMedkit::clusters), field("partial", &FaultListXMedkit::partial),
-    field("failed_peers", &FaultListXMedkit::failed_peers), field("peer_failures", &FaultListXMedkit::peer_failures),
+    field("count", &FaultListXMedkit::count,
+          "How many items this response carries - the length of `items` after any peer merge and after the "
+          "`status` and `expected` filters. Note this is the SERVED list, not the fault manager's own total: "
+          "`muted_count` and `cluster_count` beside it are still the local unfiltered numbers the fault "
+          "manager reported, so a filtered request can answer `count: 1` next to `muted_count: 7`."),
+    field("muted_count", &FaultListXMedkit::muted_count), field("cluster_count", &FaultListXMedkit::cluster_count),
+    field("entity_id", &FaultListXMedkit::entity_id), field("source_id", &FaultListXMedkit::source_id),
+    field("muted_faults", &FaultListXMedkit::muted_faults), field("clusters", &FaultListXMedkit::clusters),
+    field("partial", &FaultListXMedkit::partial), field("failed_peers", &FaultListXMedkit::failed_peers),
+    field("peer_failures", &FaultListXMedkit::peer_failures),
     field("peer_dropped_items", &FaultListXMedkit::peer_dropped_items),
     field("expected_count", &FaultListXMedkit::expected_count,
-          "How many of the returned items started their current cycle inside a planned-stop window. Counts the "
-          "list that was actually served: items this gateway flagged, plus items an aggregated peer flagged "
-          "that survived the `expected` filter. A peer's items are counted on the flag the PEER derived from "
-          "its own windows; this gateway never re-derives them."));
+          "How many DISTINCT fault codes in the served list started their current cycle inside a planned-stop "
+          "window. Counted after the peer merge and after the `expected` filter, over the items actually "
+          "returned; a peer's item is counted on the flag the PEER derived from its own windows, never "
+          "re-derived here. Distinct, because an aggregating gateway serves a code raised on two gateways as "
+          "two items and counting both would report two stops' worth of expected faults where the plant had "
+          "one. An item carrying no `expected` key is counted by neither side - its flag is unknown, and "
+          "unknown is not false - and such an item is served only under `expected=all`. **Absent entirely** "
+          "when this gateway cannot read the planned-stop windows: a count of zero would read as \"nothing "
+          "was expected\"."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultListXMedkit> = "FaultListXMedkit";

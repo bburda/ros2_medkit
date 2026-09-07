@@ -165,6 +165,10 @@ class FakeFaultTransport : public ros2_medkit_gateway::FaultServiceTransport {
     return true;
   }
 
+  bool planned_stops_available() const override {
+    return true;
+  }
+
   // Unused by these tests - return benign failures.
   ros2_medkit_gateway::FaultResult report_fault(const std::string & /*fault_code*/, uint8_t /*severity*/,
                                                 const std::string & /*description*/,

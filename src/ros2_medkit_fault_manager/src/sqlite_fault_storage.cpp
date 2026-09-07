@@ -1917,14 +1917,33 @@ constexpr const char * kPlannedStopColumns =
 
 }  // namespace
 
-bool SqliteFaultStorage::declare_planned_stop(const PlannedStopWindow & window) {
+size_t SqliteFaultStorage::planned_stop_count_locked() const {
+  SqliteStatement count(db_, "SELECT COUNT(*) FROM planned_stops");
+  if (count.step() != SQLITE_ROW) {
+    return 0;
+  }
+  return static_cast<size_t>(std::max<int64_t>(0, count.column_int64(0)));
+}
+
+DeclarePlannedStopOutcome SqliteFaultStorage::declare_planned_stop(const PlannedStopWindow & window) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   {
     SqliteStatement exists(db_, "SELECT 1 FROM planned_stops WHERE id = ?");
     exists.bind_text(1, window.id);
     if (exists.step() == SQLITE_ROW) {
-      return false;
+      return DeclarePlannedStopOutcome::DuplicateId;
+    }
+  }
+
+  // Room first, then the insert. The row cannot be evicted by its own
+  // declaration this way, and the bound stays hard: if pruning the ended windows
+  // does not free a slot, every stored window has yet to end and there is
+  // nowhere to put this one.
+  if (max_planned_stops_ > 0) {
+    prune_planned_stops_locked(window.declared_at_ns, max_planned_stops_ - 1);
+    if (planned_stop_count_locked() >= max_planned_stops_) {
+      return DeclarePlannedStopOutcome::CapFull;
     }
   }
 
@@ -1943,8 +1962,7 @@ bool SqliteFaultStorage::declare_planned_stop(const PlannedStopWindow & window) 
     throw std::runtime_error(std::string("Failed to insert planned stop: ") + sqlite3_errmsg(db_));
   }
 
-  prune_planned_stops_locked(window.declared_at_ns, window.id);
-  return true;
+  return DeclarePlannedStopOutcome::Stored;
 }
 
 EndPlannedStopResult SqliteFaultStorage::end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) {
@@ -1977,7 +1995,10 @@ EndPlannedStopResult SqliteFaultStorage::end_planned_stop(const std::string & id
     current.cancelled = true;
     return EndPlannedStopResult{EndPlannedStopOutcome::Cancelled, current};
   }
-  if (at_ns < current.starts_at_ns || at_ns > now_ns) {
+  // Strictly after the start: ending AT the start would store
+  // ends_at == starts_at, which is not an interval and which the message
+  // promises can never happen.
+  if (at_ns <= current.starts_at_ns || at_ns > now_ns) {
     return EndPlannedStopResult{EndPlannedStopOutcome::InvalidAt, current};
   }
 
@@ -2025,40 +2046,29 @@ std::vector<PlannedStopWindow> SqliteFaultStorage::list_planned_stops() const {
 size_t SqliteFaultStorage::set_max_planned_stops(size_t max_count, int64_t now_ns) {
   std::lock_guard<std::mutex> lock(mutex_);
   max_planned_stops_ = max_count;
-  return prune_planned_stops_locked(now_ns);
+  return prune_planned_stops_locked(now_ns, max_count);
 }
 
-size_t SqliteFaultStorage::prune_planned_stops_locked(int64_t now_ns, const std::string & exempt_id) {
+size_t SqliteFaultStorage::prune_planned_stops_locked(int64_t now_ns, size_t target) {
   if (max_planned_stops_ == 0) {
     return 0;
   }
 
-  size_t total = 0;
-  {
-    SqliteStatement count(db_, "SELECT COUNT(*) FROM planned_stops");
-    if (count.step() == SQLITE_ROW) {
-      total = static_cast<size_t>(std::max<int64_t>(0, count.column_int64(0)));
-    }
-  }
-  if (total <= max_planned_stops_) {
+  const size_t total = planned_stop_count_locked();
+  if (total <= target) {
     return 0;
   }
 
-  const size_t over = total - max_planned_stops_;
-  if (over > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-    return 0;
-  }
-
-  // Only windows whose end has passed are candidates; a running window is never
-  // pruned, so the row count can stay above the bound while many are live.
+  // Only windows whose end has passed are candidates; one that has not ended is
+  // never pruned, which is why a table full of those refuses new declarations
+  // rather than growing past the bound.
   SqliteStatement del(db_,
                       "DELETE FROM planned_stops WHERE id IN ("
-                      "  SELECT id FROM planned_stops WHERE ends_at_ns <= ? AND id != ?"
+                      "  SELECT id FROM planned_stops WHERE ends_at_ns <= ?"
                       "  ORDER BY declared_at_ns ASC, id ASC LIMIT ?"
                       ")");
   del.bind_int64(1, now_ns);
-  del.bind_text(2, exempt_id);
-  del.bind_int64(3, static_cast<int64_t>(over));
+  del.bind_int64(2, static_cast<int64_t>(total - target));
   if (del.step() != SQLITE_DONE) {
     throw std::runtime_error(std::string("Failed to prune planned stops: ") + sqlite3_errmsg(db_));
   }

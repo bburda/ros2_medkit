@@ -20,6 +20,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ros2_medkit_gateway {
@@ -27,7 +28,8 @@ namespace faults {
 
 /// The resolution the planned-stop API works at, end to end: the parser rounds
 /// down to it, storage keeps that value, responses return it unchanged (so a GET
-/// equals the POST that made it), and the covering test floors both sides to it.
+/// equals the POST that made it), the covering test floors the window's bounds
+/// to it, and a fault's own instant is rounded to the NEAREST one.
 ///
 /// One millisecond rather than one nanosecond because an operator declares a
 /// stop at minute or second precision, and the REST fault item carries
@@ -67,10 +69,18 @@ struct PlannedStopWindow {
   /// window a list or a read returns.
   bool cancelled{false};
 
-  /// Whether @p when_ns falls inside the window. CLOSED at both ends, and
-  /// compared at MILLISECOND resolution on both sides (see kNsPerMillisecond):
-  /// a fault reported anywhere inside the millisecond a window opens or closes
-  /// is inside the window.
+  /// Whether @p when_ns falls inside the window, at MILLISECOND resolution.
+  ///
+  /// Both bounds are floored to their millisecond and the interval is closed on
+  /// those, so the covered set is `[floor_ms(from), floor_ms(to)]` counted in
+  /// milliseconds. "Closed at both ends" is exact only at that resolution: a
+  /// window declared with sub-millisecond bounds through the ROS service opens
+  /// at the START of `from`'s millisecond, up to 999999 ns before the instant
+  /// asked for.
+  ///
+  /// The fault's own instant is rounded to the NEAREST millisecond before it
+  /// gets here (seconds_to_ns), so an instant within half a millisecond of a
+  /// bound lands on that bound.
   bool covers(int64_t when_ns) const {
     const int64_t when_ms = floor_to_ms_ns(when_ns);
     return when_ms >= floor_to_ms_ns(from_ns) && when_ms <= floor_to_ms_ns(to_ns);
@@ -100,8 +110,19 @@ const PlannedStopWindow * find_covering_window(const std::vector<PlannedStopWind
 std::optional<int64_t> parse_iso8601_utc_ns(const std::string & text);
 
 /// Seconds-with-a-fraction (how a fault carries first_occurred on the wire) into
-/// nanoseconds since the Unix epoch.
-int64_t seconds_to_ns(double seconds);
+/// nanoseconds since the Unix epoch, ROUNDED TO THE NEAREST MILLISECOND.
+///
+/// Nearest, not floored: the double came from an exact nanosecond instant and
+/// carries an error far below a millisecond, so rounding recovers the instant
+/// that was meant. Flooring the nanoseconds first does not - at second
+/// 1788724271, 375 of the 1000 exact-millisecond instants land just under their
+/// own millisecond as a double and would floor to the previous one, which makes
+/// the closed boundary this API promises false for a third of the instants a
+/// fault can carry.
+///
+/// Nothing when @p seconds is not a usable instant: not finite, or so large that
+/// the conversion would be undefined rather than merely wrong.
+std::optional<int64_t> seconds_to_ns(double seconds);
 
 /// The range of instants a window can actually be stored at.
 ///
@@ -125,6 +146,17 @@ inline bool is_representable_instant(int64_t ns) {
   return ns >= kMinRepresentableNs && ns <= kMaxRepresentableNs;
 }
 
+/// What this gateway knows about the declared windows at one instant.
+///
+/// `known` false is "this gateway has not been able to read them", which is NOT
+/// "no window is declared". Every surface that reports the flag has to tell the
+/// two apart: a consumer must not read an unreachable fault manager as "nothing
+/// is expected", and that is as true of `GET /faults` as it is of the stream.
+struct PlannedStopKnowledge {
+  bool known{false};
+  std::vector<PlannedStopWindow> windows;
+};
+
 /// Which window covers the fault carried in @p fault_json, or nullptr.
 ///
 /// Reads `first_occurred` - seconds since the Unix epoch, the shape
@@ -135,9 +167,19 @@ inline bool is_representable_instant(int64_t ns) {
 ///
 /// A fault carrying no usable `first_occurred` is never expected: the gateway
 /// cannot place a cycle it cannot date, and marking it anyway would put the flag
-/// on faults nobody planned for.
+/// on faults nobody planned for. "Usable" includes being in range - a plugin's
+/// fault list is JSON this gateway did not write, and rounding an absurd double
+/// into a nanosecond count is undefined behaviour, not a big number.
 const PlannedStopWindow * window_for_fault(const std::vector<PlannedStopWindow> & windows,
                                            const nlohmann::json & fault_json);
+
+/// How many DISTINCT fault codes in @p items say they were expected.
+///
+/// Distinct, because an aggregating gateway serves a code raised on two
+/// gateways as two items and counting both would say two stops' worth of
+/// expected faults where the plant had one. An item carrying no `expected` key
+/// is counted by neither side: its flag is unknown, and unknown is not false.
+int64_t count_expected_items(const nlohmann::json & items);
 
 /// Write `expected_count` into a fault collection's `x-medkit` object, creating
 /// that object when the emitter did not send one.
@@ -149,9 +191,14 @@ const PlannedStopWindow * window_for_fault(const std::vector<PlannedStopWindow> 
 void set_expected_count(nlohmann::json & collection, int64_t count);
 
 /// Attach `expected` - and `planned_stop_id` when it is true - to the fault's own
-/// `x-medkit` object, preserving anything already there. Returns whether the
-/// fault was expected, so a caller can keep a count without deriving twice.
-bool annotate_fault_with_planned_stop(nlohmann::json & fault_json, const std::vector<PlannedStopWindow> & windows);
+/// `x-medkit` object, preserving anything already there.
+///
+/// Returns whether the fault was expected, so a caller can keep a count without
+/// deriving twice, or nothing when @p knowledge says the windows are unknown. In
+/// that case the item is left EXACTLY as it was: no key is written, because the
+/// honest answer is silence rather than `false`.
+std::optional<bool> annotate_fault_with_planned_stop(nlohmann::json & fault_json,
+                                                     const PlannedStopKnowledge & knowledge);
 
 /// The windows this gateway last read from the fault manager.
 ///
@@ -191,12 +238,19 @@ class PlannedStopCache {
   /// event stream must not stall waiting to find out.
   bool last_refresh_failed() const;
 
-  /// Whether a window set has ever been read successfully. False is "this
-  /// gateway does not know", which is NOT the same as "no windows are declared"
-  /// - an empty successful read is knowledge, an outage is not. The event stream
-  /// omits the flag entirely in the first case, because a consumer must not read
-  /// an unreachable fault manager as "nothing is expected".
-  bool has_knowledge() const;
+  /// Whether a window set was read successfully within @p max_age.
+  ///
+  /// False is "this gateway does not know", which is NOT the same as "no windows
+  /// are declared" - an empty successful read is knowledge, an outage is not.
+  /// Every surface that reports the flag omits it entirely in the first case.
+  ///
+  /// Knowledge EXPIRES. Without that, a gateway that read a window set once
+  /// served it for the life of the process: replace the fault manager and
+  /// `GET /x-medkit-planned-stops` answers 503 while `GET /faults` keeps naming
+  /// a window that exists nowhere, indefinitely and with no way to tell. The
+  /// bound is a small multiple of the refresh period, so a set that is merely
+  /// being re-read never blinks, and one nothing can refresh goes quiet.
+  bool has_knowledge(std::chrono::steady_clock::duration max_age) const;
 
   /// Whether the last refresh attempt - successful or not - is older than
   /// @p ttl. True before the first one.
@@ -214,6 +268,7 @@ class PlannedStopCache {
   bool ever_stored_{false};
   bool last_refresh_failed_{false};
   std::chrono::steady_clock::time_point attempted_at_{};
+  std::chrono::steady_clock::time_point stored_at_{};
 };
 
 }  // namespace faults

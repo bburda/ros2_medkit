@@ -189,8 +189,16 @@ inline FaultStatusFilter parse_fault_status_param(const std::optional<std::strin
  *         or "1970-01-01T00:00:00.000Z" on conversion failure
  */
 inline std::string format_timestamp_ns(int64_t ns) {
+  // Floor division, not C's truncation towards zero. For an instant before the
+  // epoch the remainder is negative, and "%03d" of -500 prints "-500", which
+  // renders 1969-12-31T23:59:59 as "...59.-500Z" - not a timestamp any reader
+  // can parse, and worse than a wrong one because it still looks like data.
   auto seconds = ns / 1'000'000'000;
   auto nanos = ns % 1'000'000'000;
+  if (nanos < 0) {
+    nanos += 1'000'000'000;
+    --seconds;
+  }
 
   std::time_t time = static_cast<std::time_t>(seconds);
   std::tm tm_buf{};

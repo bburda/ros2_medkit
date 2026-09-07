@@ -35,6 +35,7 @@
 #include "ros2_medkit_fault_manager/time_utils.hpp"
 
 using ros2_medkit_fault_manager::clamp_planned_stop_windows;
+using ros2_medkit_fault_manager::DeclarePlannedStopOutcome;
 using ros2_medkit_fault_manager::EndPlannedStopOutcome;
 using ros2_medkit_fault_manager::FaultStorage;
 using ros2_medkit_fault_manager::InMemoryFaultStorage;
@@ -104,7 +105,7 @@ TEST_P(PlannedStopStorageTest, DeclareStoresEveryFieldVerbatim) {
   auto w = make_window("w1", 10 * kSec, 20 * kSec, 5 * kSec);
   w.reason = "weekend maintenance";
   w.declared_by = "line_lead";
-  ASSERT_TRUE(storage_->declare_planned_stop(w));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored, storage_->declare_planned_stop(w));
 
   auto stored = storage_->get_planned_stop("w1");
   ASSERT_TRUE(stored.has_value());
@@ -118,8 +119,10 @@ TEST_P(PlannedStopStorageTest, DeclareStoresEveryFieldVerbatim) {
 }
 
 TEST_P(PlannedStopStorageTest, DeclareRefusesADuplicateId) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w1", 10 * kSec, 20 * kSec, 5 * kSec)));
-  EXPECT_FALSE(storage_->declare_planned_stop(make_window("w1", 30 * kSec, 40 * kSec, 25 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w1", 10 * kSec, 20 * kSec, 5 * kSec)));
+  EXPECT_EQ(DeclarePlannedStopOutcome::DuplicateId,
+            storage_->declare_planned_stop(make_window("w1", 30 * kSec, 40 * kSec, 25 * kSec)));
 
   auto stored = storage_->get_planned_stop("w1");
   ASSERT_TRUE(stored.has_value());
@@ -131,8 +134,10 @@ TEST_P(PlannedStopStorageTest, GetUnknownIdIsEmpty) {
 }
 
 TEST_P(PlannedStopStorageTest, ListReturnsNewestDeclarationFirst) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("older", 10 * kSec, 20 * kSec, 1 * kSec)));
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("newer", 30 * kSec, 40 * kSec, 2 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("older", 10 * kSec, 20 * kSec, 1 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("newer", 30 * kSec, 40 * kSec, 2 * kSec)));
 
   auto all = storage_->list_planned_stops();
   ASSERT_EQ(all.size(), 2u);
@@ -152,7 +157,8 @@ TEST_P(PlannedStopStorageTest, CoversIsClosedAtBothEnds) {
 }
 
 TEST_P(PlannedStopStorageTest, EndEarlyMovesEndsAtAndFlagsIt) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w1", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w1", 10 * kSec, 100 * kSec, 5 * kSec)));
 
   auto result = storage_->end_planned_stop("w1", 30 * kSec, 50 * kSec);
   ASSERT_EQ(result.outcome, EndPlannedStopOutcome::Ended);
@@ -167,7 +173,8 @@ TEST_P(PlannedStopStorageTest, EndEarlyMovesEndsAtAndFlagsIt) {
 }
 
 TEST_P(PlannedStopStorageTest, EndEarlyKeepsCoveringWhatCameBeforeTheEnd) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w1", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w1", 10 * kSec, 100 * kSec, 5 * kSec)));
   ASSERT_EQ(storage_->end_planned_stop("w1", 30 * kSec, 50 * kSec).outcome, EndPlannedStopOutcome::Ended);
 
   auto stored = storage_->get_planned_stop("w1");
@@ -184,7 +191,8 @@ TEST_P(PlannedStopStorageTest, EndEarlyKeepsCoveringWhatCameBeforeTheEnd) {
 
 TEST_P(PlannedStopStorageTest, AWindowThatHasNotStartedIsCancelledNotEnded) {
   const int64_t now = 60 * kSec;
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("future", 100 * kSec, 200 * kSec, 50 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("future", 100 * kSec, 200 * kSec, 50 * kSec)));
 
   auto result = storage_->end_planned_stop("future", now, now);
   ASSERT_EQ(result.outcome, EndPlannedStopOutcome::Cancelled);
@@ -198,7 +206,8 @@ TEST_P(PlannedStopStorageTest, AWindowThatHasNotStartedIsCancelledNotEnded) {
 
 TEST_P(PlannedStopStorageTest, ANotStartedWindowIsCancelledWhateverAtSays) {
   const int64_t now = 60 * kSec;
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("future", 100 * kSec, 200 * kSec, 50 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("future", 100 * kSec, 200 * kSec, 50 * kSec)));
 
   // `at` inside the window's own span, which under the old rule would have made
   // it an "end". The window has not started at NOW, so it is a cancellation.
@@ -212,14 +221,23 @@ TEST_P(PlannedStopStorageTest, NoStoredWindowEverHasAnEndAtOrBeforeItsStart) {
   // can move ends_at is driven here, and the invariant is asserted over the
   // whole store afterwards.
   const int64_t now = 50 * kSec;
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("running", 10 * kSec, 100 * kSec, 5 * kSec)));
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("future", 100 * kSec, 200 * kSec, 5 * kSec)));
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("past", 1 * kSec, 2 * kSec, 1 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("running", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("future", 100 * kSec, 200 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("past", 1 * kSec, 2 * kSec, 1 * kSec)));
 
   storage_->end_planned_stop("running", 30 * kSec, now);  // ends early
   storage_->end_planned_stop("future", now, now);         // cancels
   storage_->end_planned_stop("past", 1 * kSec + 1, now);  // refused: already over
   storage_->end_planned_stop("running", 15 * kSec, now);  // refused: already ended
+
+  // The input that used to store ends_at == starts_at: an `at` exactly on the
+  // start of a window that is running.
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("at_its_start", 20 * kSec, 90 * kSec, 5 * kSec)));
+  EXPECT_EQ(storage_->end_planned_stop("at_its_start", 20 * kSec, now).outcome, EndPlannedStopOutcome::InvalidAt);
 
   for (const auto & window : storage_->list_planned_stops()) {
     EXPECT_GT(window.ends_at_ns, window.starts_at_ns) << "window " << window.id;
@@ -229,7 +247,8 @@ TEST_P(PlannedStopStorageTest, NoStoredWindowEverHasAnEndAtOrBeforeItsStart) {
 // The reported case: a window that finished on its own, re-ended with a
 // backdated instant that still fell inside its original span.
 TEST_P(PlannedStopStorageTest, ANaturallyFinishedWindowIsImmutable) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w", 10 * kSec, 20 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w", 10 * kSec, 20 * kSec, 5 * kSec)));
   const int64_t now = 40 * kSec;  // the window ran out ten seconds ago
 
   auto backdated = storage_->end_planned_stop("w", 15 * kSec, now);
@@ -242,7 +261,8 @@ TEST_P(PlannedStopStorageTest, ANaturallyFinishedWindowIsImmutable) {
 }
 
 TEST_P(PlannedStopStorageTest, AFinishedWindowIsNotCancelledByAnAtBeforeItsStart) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w", 10 * kSec, 20 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w", 10 * kSec, 20 * kSec, 5 * kSec)));
   const int64_t now = 40 * kSec;
 
   // Under the old rule this took the cancel branch and DELETED a window that had
@@ -253,7 +273,8 @@ TEST_P(PlannedStopStorageTest, AFinishedWindowIsNotCancelledByAnAtBeforeItsStart
 }
 
 TEST_P(PlannedStopStorageTest, ABackdatedEndCannotMoveAnEndThatAlreadyPassed) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
   ASSERT_EQ(storage_->end_planned_stop("w", 50 * kSec, 50 * kSec).outcome, EndPlannedStopOutcome::Ended);
 
   auto backdated = storage_->end_planned_stop("w", 20 * kSec, 60 * kSec);
@@ -267,7 +288,8 @@ TEST_P(PlannedStopStorageTest, ABackdatedEndCannotMoveAnEndThatAlreadyPassed) {
 // `at` only REFINES the end instant of a window that is running now. Outside
 // [starts_at, now] it is not an instant the window could have ended at.
 TEST_P(PlannedStopStorageTest, AtBeforeTheStartOfARunningWindowIsRefused) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
 
   auto result = storage_->end_planned_stop("w", 5 * kSec, 50 * kSec);
   EXPECT_EQ(result.outcome, EndPlannedStopOutcome::InvalidAt);
@@ -279,7 +301,8 @@ TEST_P(PlannedStopStorageTest, AtBeforeTheStartOfARunningWindowIsRefused) {
 }
 
 TEST_P(PlannedStopStorageTest, AtInTheFutureOfARunningWindowIsRefused) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
 
   // 60 s has not happened yet at now = 50 s; a stop cannot end in the future.
   auto result = storage_->end_planned_stop("w", 60 * kSec, 50 * kSec);
@@ -288,18 +311,26 @@ TEST_P(PlannedStopStorageTest, AtInTheFutureOfARunningWindowIsRefused) {
 }
 
 TEST_P(PlannedStopStorageTest, AtWithinTheRunningSpanEndsTheWindowThere) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w", 10 * kSec, 100 * kSec, 5 * kSec)));
 
   auto result = storage_->end_planned_stop("w", 30 * kSec, 50 * kSec);
   ASSERT_EQ(result.outcome, EndPlannedStopOutcome::Ended);
   EXPECT_EQ(result.window.ends_at_ns, 30 * kSec);
   EXPECT_TRUE(result.window.ended_early);
 
-  // Both ends of the legal range are legal.
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("at_start", 10 * kSec, 100 * kSec, 5 * kSec)));
-  EXPECT_EQ(storage_->end_planned_stop("at_start", 10 * kSec, 50 * kSec).outcome, EndPlannedStopOutcome::Ended);
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("at_now", 10 * kSec, 100 * kSec, 5 * kSec)));
+  // `now` is a legal end. The START is not: ending there would store
+  // ends_at == starts_at, which the message says can never happen.
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("at_now", 10 * kSec, 100 * kSec, 5 * kSec)));
   EXPECT_EQ(storage_->end_planned_stop("at_now", 50 * kSec, 50 * kSec).outcome, EndPlannedStopOutcome::Ended);
+
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("at_start", 10 * kSec, 100 * kSec, 5 * kSec)));
+  EXPECT_EQ(storage_->end_planned_stop("at_start", 10 * kSec, 50 * kSec).outcome, EndPlannedStopOutcome::InvalidAt)
+      << "a window cannot end at the instant it started - that is a zero-length window";
+  EXPECT_EQ(storage_->end_planned_stop("at_start", 10 * kSec + 1, 50 * kSec).outcome, EndPlannedStopOutcome::Ended)
+      << "one nanosecond after the start is an interval, however short";
 }
 
 TEST_P(PlannedStopStorageTest, EndUnknownIdIsNotFound) {
@@ -308,7 +339,8 @@ TEST_P(PlannedStopStorageTest, EndUnknownIdIsNotFound) {
 }
 
 TEST_P(PlannedStopStorageTest, EndingATwiceEndedWindowIsRefused) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w1", 10 * kSec, 100 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w1", 10 * kSec, 100 * kSec, 5 * kSec)));
   ASSERT_EQ(storage_->end_planned_stop("w1", 30 * kSec, 50 * kSec).outcome, EndPlannedStopOutcome::Ended);
 
   auto again = storage_->end_planned_stop("w1", 50 * kSec, 60 * kSec);
@@ -320,7 +352,8 @@ TEST_P(PlannedStopStorageTest, EndingATwiceEndedWindowIsRefused) {
 }
 
 TEST_P(PlannedStopStorageTest, EndingAWindowThatAlreadyExpiredIsRefused) {
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("w1", 10 * kSec, 20 * kSec, 5 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("w1", 10 * kSec, 20 * kSec, 5 * kSec)));
 
   // 40s is past the declared end: the window closed on its own.
   auto result = storage_->end_planned_stop("w1", 40 * kSec, 40 * kSec);
@@ -341,23 +374,15 @@ TEST_P(PlannedStopStorageTest, RetentionPrunesOldestEndedAndKeepsTheActiveOne) {
   // cap + 5 declarations: the first cap + 4 have already ended, the last is live.
   for (int i = 0; i < static_cast<int>(cap) + 4; ++i) {
     const int64_t declared = static_cast<int64_t>(i + 1) * kSec;
-    ASSERT_TRUE(
+    ASSERT_EQ(
+        DeclarePlannedStopOutcome::Stored,
         storage_->declare_planned_stop(make_window("ended_" + std::to_string(i), declared, declared + kSec, declared)));
   }
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("active", now - kSec, now + 100 * kSec, now)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("active", now - kSec, now + 100 * kSec, now)));
 
   auto all = storage_->list_planned_stops();
-  // The cap bounds windows that are no longer active. An active window is always
-  // kept and is never dropped to make room, so the bound on the whole table is
-  // the cap PLUS however many windows are still running.
-  size_t active = 0;
-  for (const auto & w : all) {
-    if (w.active_at(now)) {
-      ++active;
-    }
-  }
-  EXPECT_LE(all.size(), cap + active) << "stored count must be at most the cap plus the active windows";
-  EXPECT_LE(all.size() - active, cap) << "and the ended ones alone must fit the cap";
+  EXPECT_LE(all.size(), cap) << "the cap is a hard bound on stored windows";
 
   bool has_active = false;
   for (const auto & w : all) {
@@ -370,55 +395,87 @@ TEST_P(PlannedStopStorageTest, RetentionPrunesOldestEndedAndKeepsTheActiveOne) {
   EXPECT_FALSE(storage_->get_planned_stop("ended_1").has_value());
 }
 
-TEST_P(PlannedStopStorageTest, RetentionNeverPrunesAnActiveWindowEvenPastTheCap) {
+// A window that has not ended is never pruned - not even to make room. Under the
+// hard bound that means the DECLARATION is refused, rather than a live window
+// vanishing under the operator who declared it.
+TEST_P(PlannedStopStorageTest, AnActiveWindowIsNeverPrunedToMakeRoom) {
   const size_t cap = 2;
   const int64_t now = 1000 * kSec;
   storage_->set_max_planned_stops(cap, now);
 
-  for (int i = 0; i < 5; ++i) {
-    const int64_t declared = now + static_cast<int64_t>(i) * kSec;
-    ASSERT_TRUE(storage_->declare_planned_stop(
-        make_window("live_" + std::to_string(i), now - kSec, now + 500 * kSec, declared)));
+  for (size_t i = 0; i < cap; ++i) {
+    const int64_t declared = now + static_cast<int64_t>(i);
+    ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+              storage_->declare_planned_stop(
+                  make_window("live_" + std::to_string(i), now - kSec, now + 500 * kSec, declared)));
   }
 
+  EXPECT_EQ(storage_->declare_planned_stop(make_window("refused", now - kSec, now + 500 * kSec, now + 9)),
+            DeclarePlannedStopOutcome::CapFull);
   auto all = storage_->list_planned_stops();
-  EXPECT_EQ(all.size(), 5u) << "five live windows must all survive a cap of two";
+  EXPECT_EQ(all.size(), cap) << "the bound holds and no live window was sacrificed for it";
+  for (const auto & w : all) {
+    EXPECT_TRUE(w.active_at(now)) << "window " << w.id << " should still be running";
+  }
+}
+
+TEST_P(PlannedStopStorageTest, ADeclarationIsRefusedWhenTheCapIsFullOfLiveWindows) {
+  const int64_t now = 1000 * kSec;
+  storage_->set_max_planned_stops(1, now);
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("live", now - kSec, now + 500 * kSec, now - kSec)));
+
+  EXPECT_EQ(storage_->declare_planned_stop(make_window("refused", 1 * kSec, 2 * kSec, now)),
+            DeclarePlannedStopOutcome::CapFull);
+  EXPECT_FALSE(storage_->get_planned_stop("refused").has_value()) << "a refused declaration must not be stored at all";
+  EXPECT_EQ(storage_->list_planned_stops().size(), 1u) << "the bound is hard";
+
+  ASSERT_EQ(storage_->end_planned_stop("live", now, now).outcome, EndPlannedStopOutcome::Ended);
+  EXPECT_EQ(storage_->declare_planned_stop(make_window("accepted", 1 * kSec, 2 * kSec, now + kSec)),
+            DeclarePlannedStopOutcome::Stored);
+  EXPECT_EQ(storage_->list_planned_stops().size(), 1u) << "and the ended one made room by going";
+}
+
+TEST_P(PlannedStopStorageTest, FutureWindowsCannotGrowTheTablePastTheCap) {
+  const int64_t now = 1000 * kSec;
+  const size_t cap = 3;
+  storage_->set_max_planned_stops(cap, now);
+
+  for (size_t i = 0; i < cap; ++i) {
+    ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+              storage_->declare_planned_stop(make_window("future_" + std::to_string(i), now + 100 * kSec,
+                                                         now + 200 * kSec, now + static_cast<int64_t>(i))));
+  }
+  EXPECT_EQ(storage_->declare_planned_stop(make_window("one_too_many", now + 100 * kSec, now + 200 * kSec, now + 9)),
+            DeclarePlannedStopOutcome::CapFull);
+  EXPECT_EQ(storage_->list_planned_stops().size(), cap);
+}
+
+TEST_P(PlannedStopStorageTest, ADeclarationPrunesEndedWindowsToMakeRoomForItself) {
+  const int64_t now = 1000 * kSec;
+  storage_->set_max_planned_stops(2, now);
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("old", 1 * kSec, 2 * kSec, 1 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("newer", 3 * kSec, 4 * kSec, 3 * kSec)));
+
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("newest", 5 * kSec, 6 * kSec, 5 * kSec)));
+  EXPECT_TRUE(storage_->get_planned_stop("newest").has_value())
+      << "a declaration reported as stored must be there afterwards";
+  EXPECT_FALSE(storage_->get_planned_stop("old").has_value()) << "the oldest ended window made room";
+  EXPECT_EQ(storage_->list_planned_stops().size(), 2u);
 }
 
 // CONFIG SWEEP at the storage boundary: a cap of one keeps exactly the newest.
-// The window being declared is exempt from the pruning its own declaration
-// triggers. Without that, a cap already filled by a window that cannot be pruned
-// (a live one) made the NEW row the only candidate: it was inserted, deleted,
-// and reported as stored.
-TEST_P(PlannedStopStorageTest, ADeclarationSurvivesThePruningItTriggers) {
-  const int64_t now = 1000 * kSec;
-  storage_->set_max_planned_stops(1, now);
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("live", now - kSec, now + 500 * kSec, now - kSec)));
-
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("just_declared", 1 * kSec, 2 * kSec, now)));
-  EXPECT_TRUE(storage_->get_planned_stop("just_declared").has_value())
-      << "a declaration reported as stored must be there afterwards";
-  EXPECT_TRUE(storage_->get_planned_stop("live").has_value()) << "and a running window is still never pruned";
-
-  // Two rows against a cap of one, and that is the documented bound: one active
-  // window plus one ended one. The cap counts what is no longer active.
-  auto all = storage_->list_planned_stops();
-  ASSERT_EQ(all.size(), 2u);
-  size_t ended = 0;
-  for (const auto & w : all) {
-    if (!w.active_at(now)) {
-      ++ended;
-    }
-  }
-  EXPECT_EQ(ended, 1u) << "the ended half of the table must fit the cap exactly";
-}
-
 TEST_P(PlannedStopStorageTest, RetentionOfOneKeepsOnlyTheNewestEndedWindow) {
   const int64_t now = 1000 * kSec;
   storage_->set_max_planned_stops(1, now);
 
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("first", 1 * kSec, 2 * kSec, 1 * kSec)));
-  ASSERT_TRUE(storage_->declare_planned_stop(make_window("second", 3 * kSec, 4 * kSec, 3 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("first", 1 * kSec, 2 * kSec, 1 * kSec)));
+  ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+            storage_->declare_planned_stop(make_window("second", 3 * kSec, 4 * kSec, 3 * kSec)));
 
   auto all = storage_->list_planned_stops();
   ASSERT_EQ(all.size(), 1u);
@@ -432,8 +489,8 @@ TEST_P(PlannedStopStorageTest, LoweringTheBoundEvictsStoredWindowsImmediately) {
   storage_->set_max_planned_stops(10, now);
   for (int i = 0; i < 6; ++i) {
     const int64_t declared = static_cast<int64_t>(i + 1) * kSec;
-    ASSERT_TRUE(
-        storage_->declare_planned_stop(make_window("w" + std::to_string(i), declared, declared + kSec, declared)));
+    ASSERT_EQ(DeclarePlannedStopOutcome::Stored, storage_->declare_planned_stop(make_window(
+                                                     "w" + std::to_string(i), declared, declared + kSec, declared)));
   }
   ASSERT_EQ(storage_->list_planned_stops().size(), 6u);
 
@@ -465,7 +522,8 @@ class SqlitePlannedStopTest : public ::testing::Test {
 TEST_F(SqlitePlannedStopTest, WindowsSurviveCloseAndReopen) {
   {
     SqliteFaultStorage storage(db_path_.string());
-    ASSERT_TRUE(storage.declare_planned_stop(make_window("survivor", 10 * kSec, 900 * kSec, 5 * kSec)));
+    ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+              storage.declare_planned_stop(make_window("survivor", 10 * kSec, 900 * kSec, 5 * kSec)));
     ASSERT_EQ(storage.end_planned_stop("survivor", 500 * kSec, 500 * kSec).outcome, EndPlannedStopOutcome::Ended);
   }
 
@@ -485,7 +543,8 @@ TEST_F(SqlitePlannedStopTest, WindowsSurviveCloseAndReopen) {
 TEST_F(SqlitePlannedStopTest, OpeningADatabaseWithoutThePlannedStopsTableAddsIt) {
   {
     SqliteFaultStorage storage(db_path_.string());
-    ASSERT_TRUE(storage.declare_planned_stop(make_window("pre", 1 * kSec, 2 * kSec, 1 * kSec)));
+    ASSERT_EQ(DeclarePlannedStopOutcome::Stored,
+              storage.declare_planned_stop(make_window("pre", 1 * kSec, 2 * kSec, 1 * kSec)));
   }
   {
     sqlite3 * raw = nullptr;
@@ -496,7 +555,8 @@ TEST_F(SqlitePlannedStopTest, OpeningADatabaseWithoutThePlannedStopsTableAddsIt)
 
   SqliteFaultStorage reopened(db_path_.string());
   EXPECT_TRUE(reopened.list_planned_stops().empty());
-  EXPECT_TRUE(reopened.declare_planned_stop(make_window("post", 3 * kSec, 4 * kSec, 3 * kSec)));
+  EXPECT_EQ(DeclarePlannedStopOutcome::Stored,
+            reopened.declare_planned_stop(make_window("post", 3 * kSec, 4 * kSec, 3 * kSec)));
   EXPECT_TRUE(reopened.get_planned_stop("post").has_value());
 }
 

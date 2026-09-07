@@ -14,7 +14,10 @@
 
 # ListPlannedStops.srv - list the declared planned-stop windows.
 
-# When true, return only the windows containing 'now'
+# When true, return only the windows that have NOT ENDED at 'now' - the ones
+# still running and the ones that have yet to start. That is the same notion
+# retention uses, so this lists exactly the windows that cannot be pruned and
+# are therefore holding the planned_stop.max_windows bound.
 bool active_only
 
 # The instant 'active_only' is evaluated against (wall clock, UTC). Zero means

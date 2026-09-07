@@ -34,7 +34,11 @@
 
 /// No planned-stop windows declared: every fault in these cases is a surprise,
 /// which is what a gateway with an empty planned_stops table serves.
-static const std::vector<ros2_medkit_gateway::faults::PlannedStopWindow> kNoPlannedStops;
+/// No planned-stop windows declared, and the gateway KNOWS that: every fault in
+/// these cases is a surprise, which is what a gateway with an empty
+/// planned_stops table serves. `known` false would mean something else - see
+/// PlannedStopKnowledge - and would leave the flag off the response entirely.
+static const ros2_medkit_gateway::faults::PlannedStopKnowledge kNoPlannedStops{true, {}};
 
 using json = nlohmann::json;
 using namespace std::chrono_literals;

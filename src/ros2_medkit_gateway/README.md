@@ -1011,10 +1011,11 @@ curl "http://localhost:8080/api/v1/faults?status=all&expected=false"   # what br
 
 Each item carries `x-medkit.expected`, and `x-medkit.planned_stop_id` when it is true; the
 list's own `x-medkit.expected_count` is the tally, counted after any peer merge. The same pair
-rides every `GET /api/v1/faults/stream` frame - except while the gateway has never managed to
-read the declared windows, when the frame carries no `expected` key rather than claiming the
-fault was unexpected. See "Planned Stops" in `docs/api/rest.rst` for how a window is declared,
-what makes a fault fall inside one, and why the comparison is at millisecond resolution.
+rides every `GET /api/v1/faults/stream` frame - except while the gateway cannot read the declared
+windows, when no surface says anything: no `expected` key on the frames, none on the list items,
+and no `expected_count` on the list. See "Planned Stops" in `docs/api/rest.rst` for how a window is
+declared, what makes a fault fall inside one, and exactly what "millisecond resolution" means at
+the boundary.
 
 **Response (200 OK):**
 ```json

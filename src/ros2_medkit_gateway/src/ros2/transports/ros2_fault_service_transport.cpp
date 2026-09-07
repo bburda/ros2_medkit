@@ -167,6 +167,12 @@ bool Ros2FaultServiceTransport::wait_for_services(std::chrono::duration<double> 
          list_faults_client_->wait_for_service(remaining()) && clear_fault_client_->wait_for_service(remaining());
 }
 
+bool Ros2FaultServiceTransport::planned_stops_available() const {
+  // The derivation reads through list_planned_stops, so that is the client whose
+  // readiness decides whether asking is worth a timeout.
+  return list_planned_stops_client_ && list_planned_stops_client_->service_is_ready();
+}
+
 bool Ros2FaultServiceTransport::is_available() const {
   return report_fault_client_->service_is_ready() && get_fault_client_->service_is_ready() &&
          list_faults_client_->service_is_ready() && clear_fault_client_->service_is_ready();

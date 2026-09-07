@@ -383,19 +383,9 @@ class TestPlannedStops(PlannedStopFixture):
         self.assertTrue(live.success, live.message)
 
         listed = self._list_stops()
-        # The bound counts windows that are no longer active; an active one is
-        # always kept and is never dropped to make room. So the table holds at
-        # most the cap plus however many are still running.
-        active = sum(
-            1 for stop in listed.stops if to_float(stop.ends_at) > time.time()
-        )
         self.assertLessEqual(
-            len(listed.stops), self.RETENTION_CAP + active,
-            'stored count must be at most the cap plus the active windows',
-        )
-        self.assertLessEqual(
-            len(listed.stops) - active, self.RETENTION_CAP,
-            'the ended windows alone must fit the configured bound',
+            len(listed.stops), self.RETENTION_CAP,
+            'the configured bound is a hard bound on stored windows',
         )
 
         surviving = [stop.id for stop in listed.stops]
@@ -459,24 +449,72 @@ class TestPlannedStops(PlannedStopFixture):
         self.assertIn('epoch', response.message)
         self.assertEqual(len(self._list_stops().stops), 0)
 
-    def test_a_declaration_reported_as_stored_is_there_afterwards(self):
-        """A cap filled by a window that cannot be pruned must not eat the new one."""
+    def test_a_full_bound_refuses_rather_than_growing(self):
+        """R20: the bound is hard, and a live window is never sacrificed for it."""
         self._start_manager({'planned_stop.max_windows': 1})
 
         now = time.time()
         live = self._declare(now - 10.0, now + 3600.0, reason='running')
         self.assertTrue(live.success, live.message)
 
-        ended = self._declare(now - 500.0, now - 400.0, reason='already over')
-        self.assertTrue(ended.success, ended.message)
-        self.assertEqual(ended.outcome, DeclarePlannedStop.Response.OUTCOME_STORED)
+        refused = self._declare(now - 500.0, now - 400.0, reason='no room')
+        self.assertFalse(refused.success, 'the bound is full of windows that have not ended')
+        self.assertEqual(refused.outcome, DeclarePlannedStop.Response.OUTCOME_NOT_RETAINED)
+        self.assertIn('max_windows', refused.message)
+
+        ids = [stop.id for stop in self._list_stops().stops]
+        self.assertEqual(ids, [live.stop.id], 'nothing was stored and nothing was dropped')
+
+        # End the live one and the next declaration fits.
+        request = EndPlannedStop.Request()
+        request.id = live.stop.id
+        request.at = Time()
+        self.assertTrue(
+            self._call(self._client(EndPlannedStop, 'end_planned_stop'), request).success
+        )
+        accepted = self._declare(now - 500.0, now - 400.0, reason='room now')
+        self.assertTrue(accepted.success, accepted.message)
+        self.assertEqual(accepted.outcome, DeclarePlannedStop.Response.OUTCOME_STORED)
+
+    def test_a_declaration_reported_as_stored_is_there_afterwards(self):
+        """Room is made before the insert, so a stored window cannot be evicted by it."""
+        self._start_manager({'planned_stop.max_windows': 2})
+
+        now = time.time()
+        older = self._declare(now - 900.0, now - 800.0, reason='oldest')
+        self.assertTrue(older.success, older.message)
+        newer = self._declare(now - 700.0, now - 600.0, reason='newer')
+        self.assertTrue(newer.success, newer.message)
+
+        newest = self._declare(now - 500.0, now - 400.0, reason='newest')
+        self.assertTrue(newest.success, newest.message)
+        self.assertEqual(newest.outcome, DeclarePlannedStop.Response.OUTCOME_STORED)
 
         ids = [stop.id for stop in self._list_stops().stops]
         self.assertIn(
-            ended.stop.id, ids,
+            newest.stop.id, ids,
             'the declaration answered success and then was not there'
         )
-        self.assertIn(live.stop.id, ids, 'and a running window is still never pruned')
+        self.assertNotIn(older.stop.id, ids, 'the oldest ended window made room')
+
+    def test_active_only_lists_the_windows_that_have_not_ended(self):
+        """`active_only` is "not ended", which is what holds the retention bound."""
+        self._start_manager()
+
+        now = time.time()
+        running = self._declare(now - 100.0, now + 3600.0, reason='running')
+        future = self._declare(now + 3600.0, now + 7200.0, reason='not started yet')
+        past = self._declare(now - 900.0, now - 800.0, reason='over')
+        for response in (running, future, past):
+            self.assertTrue(response.success, response.message)
+
+        active_ids = [stop.id for stop in self._list_stops(active_only=True).stops]
+        self.assertIn(running.stop.id, active_ids)
+        self.assertIn(
+            future.stop.id, active_ids,
+            'a window that has not started is unprunable, so an operator must be able to see it'
+        )
+        self.assertNotIn(past.stop.id, active_ids)
 
     def test_a_window_that_never_started_is_cancelled(self):
         """R12: it marked nothing, so it is removed rather than inverted."""

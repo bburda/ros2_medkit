@@ -21,18 +21,21 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
 #include "ros2_medkit_gateway/core/faults/planned_stop.hpp"
+#include "ros2_medkit_gateway/core/http/http_utils.hpp"
 
 using ros2_medkit_gateway::faults::annotate_fault_with_planned_stop;
 using ros2_medkit_gateway::faults::find_covering_window;
 using ros2_medkit_gateway::faults::floor_to_ms_ns;
 using ros2_medkit_gateway::faults::parse_iso8601_utc_ns;
 using ros2_medkit_gateway::faults::PlannedStopCache;
+using ros2_medkit_gateway::faults::PlannedStopKnowledge;
 using ros2_medkit_gateway::faults::PlannedStopWindow;
 using ros2_medkit_gateway::faults::seconds_to_ns;
 using ros2_medkit_gateway::faults::window_for_fault;
@@ -180,6 +183,23 @@ TEST(PlannedStopTimeParsing, RefusesAYearWhoseNanosecondCountCannotBeCounted) {
   EXPECT_GT(*in_2100, ros2_medkit_gateway::faults::kMaxRepresentableNs);
 }
 
+TEST(PlannedStopTimeParsing, TheOverflowBoundIncludesTheFraction) {
+  // 2262-04-11T23:47:16Z is exactly INT64_MAX / 1e9 seconds. Bounding the
+  // seconds alone and adding the fraction afterwards overflowed int64 - undefined
+  // behaviour on a route whose contract is a 400.
+  const auto last_second = parse_iso8601_utc_ns("2262-04-11T23:47:16Z");
+  ASSERT_TRUE(last_second.has_value());
+
+  const auto last_ms = parse_iso8601_utc_ns("2262-04-11T23:47:16.854Z");
+  ASSERT_TRUE(last_ms.has_value()) << "the last representable millisecond must still parse";
+  EXPECT_EQ(*last_ms, 9223372036854000000LL);
+
+  for (const char * past_the_end :
+       {"2262-04-11T23:47:16.855Z", "2262-04-11T23:47:16.9Z", "2262-04-11T23:47:16.999999999Z"}) {
+    EXPECT_FALSE(parse_iso8601_utc_ns(past_the_end).has_value()) << "accepted: " << past_the_end;
+  }
+}
+
 TEST(PlannedStopTimeParsing, RefusesAnInstantAtOrBeforeTheEpoch) {
   // The epoch is not a sentinel for "now" anywhere in this API, so it cannot be
   // a legal window bound either.
@@ -228,7 +248,7 @@ TEST(PlannedStopAnnotation, MarksAFaultWhoseCycleStartedInsideAWindow) {
   const std::vector<PlannedStopWindow> windows{window("w", 10 * kSec, 20 * kSec)};
   nlohmann::json fault{{"fault_code", "MOTOR_STALL"}, {"first_occurred", 15.0}, {"status", "CONFIRMED"}};
 
-  EXPECT_TRUE(annotate_fault_with_planned_stop(fault, windows));
+  EXPECT_TRUE(annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{true, windows}).value_or(false));
   EXPECT_TRUE(fault["x-medkit"]["expected"].get<bool>());
   EXPECT_EQ(fault["x-medkit"]["planned_stop_id"].get<std::string>(), "w");
 }
@@ -237,7 +257,7 @@ TEST(PlannedStopAnnotation, LeavesAFaultOutsideEveryWindowUnexpectedAndUnattribu
   const std::vector<PlannedStopWindow> windows{window("w", 10 * kSec, 20 * kSec)};
   nlohmann::json fault{{"fault_code", "MOTOR_STALL"}, {"first_occurred", 25.0}};
 
-  EXPECT_FALSE(annotate_fault_with_planned_stop(fault, windows));
+  EXPECT_FALSE(annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{true, windows}).value_or(false));
   EXPECT_FALSE(fault["x-medkit"]["expected"].get<bool>());
   EXPECT_FALSE(fault["x-medkit"].contains("planned_stop_id"))
       << "naming a window that does not cover the fault would be worse than naming none";
@@ -247,7 +267,7 @@ TEST(PlannedStopAnnotation, KeepsVendorKeysTheItemAlreadyCarried) {
   const std::vector<PlannedStopWindow> windows{window("w", 10 * kSec, 20 * kSec)};
   nlohmann::json fault{{"first_occurred", 15.0}, {"x-medkit", {{"captured_at", "2026-09-06T00:00:00.000Z"}}}};
 
-  ASSERT_TRUE(annotate_fault_with_planned_stop(fault, windows));
+  ASSERT_TRUE(annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{true, windows}).value_or(false));
   EXPECT_EQ(fault["x-medkit"]["captured_at"].get<std::string>(), "2026-09-06T00:00:00.000Z");
   EXPECT_TRUE(fault["x-medkit"]["expected"].get<bool>());
 }
@@ -256,7 +276,7 @@ TEST(PlannedStopAnnotation, ReAnnotatingClearsAStaleAttribution) {
   const std::vector<PlannedStopWindow> windows{window("w", 10 * kSec, 20 * kSec)};
   nlohmann::json fault{{"first_occurred", 25.0}, {"x-medkit", {{"expected", true}, {"planned_stop_id", "gone"}}}};
 
-  EXPECT_FALSE(annotate_fault_with_planned_stop(fault, windows));
+  EXPECT_FALSE(annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{true, windows}).value_or(false));
   EXPECT_FALSE(fault["x-medkit"]["expected"].get<bool>());
   EXPECT_FALSE(fault["x-medkit"].contains("planned_stop_id"))
       << "a window that no longer covers the fault must not stay named on it";
@@ -266,21 +286,21 @@ TEST(PlannedStopAnnotation, AFaultThatCannotBeDatedIsNeverExpected) {
   const std::vector<PlannedStopWindow> windows{window("w", 0, 4'000'000'000LL * kSec)};
 
   nlohmann::json missing{{"fault_code", "NO_TIME"}};
-  EXPECT_FALSE(annotate_fault_with_planned_stop(missing, windows));
+  EXPECT_FALSE(annotate_fault_with_planned_stop(missing, PlannedStopKnowledge{true, windows}).value_or(false));
   EXPECT_FALSE(missing["x-medkit"]["expected"].get<bool>());
 
   nlohmann::json wrong_type{{"first_occurred", "not a number"}};
-  EXPECT_FALSE(annotate_fault_with_planned_stop(wrong_type, windows));
+  EXPECT_FALSE(annotate_fault_with_planned_stop(wrong_type, PlannedStopKnowledge{true, windows}).value_or(false));
 
   nlohmann::json null_value{{"first_occurred", nullptr}};
-  EXPECT_FALSE(annotate_fault_with_planned_stop(null_value, windows));
+  EXPECT_FALSE(annotate_fault_with_planned_stop(null_value, PlannedStopKnowledge{true, windows}).value_or(false));
 }
 
 TEST(PlannedStopAnnotation, ANonObjectItemIsLeftAlone) {
   const std::vector<PlannedStopWindow> windows{window("w", 10 * kSec, 20 * kSec)};
   nlohmann::json not_an_object = nlohmann::json::array({1, 2, 3});
 
-  EXPECT_FALSE(annotate_fault_with_planned_stop(not_an_object, windows));
+  EXPECT_FALSE(annotate_fault_with_planned_stop(not_an_object, PlannedStopKnowledge{true, windows}).value_or(false));
   EXPECT_TRUE(not_an_object.is_array()) << "a malformed peer item must pass through, not be rewritten";
 }
 
@@ -346,15 +366,58 @@ TEST(PlannedStopCoverage, TheBoundaryIsAMillisecondWide) {
       << "the millisecond before the start is outside it, whole";
 }
 
-TEST(PlannedStopAnnotation, TheFaultSideOfTheComparisonIsFlooredTheSameWay) {
+TEST(PlannedStopAnnotation, TheFaultSideRoundsToTheNearestMillisecond) {
   const std::vector<PlannedStopWindow> windows{window("w", 10 * kSec, 20 * kSec)};
 
-  // first_occurred arrives as a double. 20.0009 s lands inside the closing
-  // millisecond of the window; 20.0011 s does not.
-  nlohmann::json inside{{"first_occurred", 20.0009}};
-  nlohmann::json outside{{"first_occurred", 20.0011}};
-  EXPECT_TRUE(annotate_fault_with_planned_stop(inside, windows));
-  EXPECT_FALSE(annotate_fault_with_planned_stop(outside, windows));
+  // first_occurred arrives as a double and is rounded to the nearest
+  // millisecond, so the bleed past a bound is half a millisecond, not a whole
+  // one. 20.0004 s rounds onto the closing millisecond; 20.0006 s rounds past it.
+  nlohmann::json inside{{"first_occurred", 20.0004}};
+  nlohmann::json outside{{"first_occurred", 20.0006}};
+  EXPECT_TRUE(annotate_fault_with_planned_stop(inside, PlannedStopKnowledge{true, windows}).value_or(false));
+  EXPECT_FALSE(annotate_fault_with_planned_stop(outside, PlannedStopKnowledge{true, windows}).value_or(false));
+
+  // And symmetrically below the opening bound.
+  nlohmann::json just_before{{"first_occurred", 9.9994}};
+  nlohmann::json on_the_edge{{"first_occurred", 9.9996}};
+  EXPECT_FALSE(annotate_fault_with_planned_stop(just_before, PlannedStopKnowledge{true, windows}).value_or(false));
+  EXPECT_TRUE(annotate_fault_with_planned_stop(on_the_edge, PlannedStopKnowledge{true, windows}).value_or(false));
+}
+
+// The unit boundary cases above use 10/15/20 s, where the seconds-as-a-double
+// round trip happens to be exact. At a real epoch it is not: 1788724271.001 is
+// stored as 1788724271000999936, and flooring THAT to a millisecond lands on the
+// previous one. The sweep below is the instrument the round-figure cases could
+// not be.
+TEST(PlannedStopCoverage, TheBoundaryIsExactAtARealEpoch) {
+  constexpr int64_t kEpochSec = 1788724271;
+  constexpr int64_t kMs = 1'000'000;
+  const int64_t from_ns = kEpochSec * kSec + 250 * kMs;
+  const int64_t to_ns = kEpochSec * kSec + 750 * kMs;
+  const std::vector<PlannedStopWindow> windows{window("w", from_ns, to_ns)};
+
+  for (int64_t ms = 0; ms < 1000; ++ms) {
+    // Exactly how a fault arrives: an exact nanosecond instant turned into
+    // seconds-as-a-double by fault_to_json, then read back here.
+    const double first_occurred = static_cast<double>(kEpochSec) + static_cast<double>(ms) / 1000.0;
+    nlohmann::json fault{{"first_occurred", first_occurred}};
+    const bool expected = annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{true, windows}).value_or(false);
+    const bool should_be = ms >= 250 && ms <= 750;
+    EXPECT_EQ(expected, should_be) << "millisecond offset " << ms << " of second " << kEpochSec;
+  }
+}
+
+TEST(PlannedStopCoverage, AFaultThatCannotBeDatedSafelyIsNeverExpected) {
+  const std::vector<PlannedStopWindow> windows{window("w", 0, 4'000'000'000LL * kSec)};
+
+  // Finite, but far outside any instant a nanosecond count can hold. Rounding it
+  // is undefined behaviour, so it has to be refused before the conversion.
+  for (double absurd : {1e20, -1e20, 1e300, -1e300}) {
+    nlohmann::json fault{{"first_occurred", absurd}};
+    EXPECT_FALSE(annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{true, windows}).value_or(false))
+        << "first_occurred " << absurd;
+    EXPECT_FALSE(fault["x-medkit"].contains("planned_stop_id"));
+  }
 }
 
 // --- what a builtin_interfaces/Time can carry --------------------------------
@@ -419,6 +482,54 @@ TEST(PlannedStopExpectedCount, LeavesANonObjectCollectionAlone) {
   EXPECT_TRUE(not_a_collection.is_array());
 }
 
+// R13 is not a stream rule: when the window set is unknown, NO surface may say
+// `expected`. "This gateway could not read the windows" and "no window covers
+// this fault" are different answers, and only one of them is a fact.
+TEST(PlannedStopAnnotation, AnUnknownWindowSetWritesNoFlagAtAll) {
+  nlohmann::json fault{{"fault_code", "MOTOR_STALL"}, {"first_occurred", 15.0}};
+
+  const auto expected = annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{});
+  EXPECT_FALSE(expected.has_value()) << "unknown, not false";
+  EXPECT_FALSE(fault.contains("x-medkit") && fault["x-medkit"].contains("expected"))
+      << "an unreachable fault manager must not read as 'nothing was expected'";
+  EXPECT_FALSE(fault.contains("x-medkit") && fault["x-medkit"].contains("planned_stop_id"));
+}
+
+TEST(PlannedStopAnnotation, AnUnknownWindowSetLeavesAnExistingExtensionAlone) {
+  nlohmann::json fault{{"first_occurred", 15.0}, {"x-medkit", {{"captured_at", "2026-09-06T00:00:00.000Z"}}}};
+
+  EXPECT_FALSE(annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{}).has_value());
+  EXPECT_EQ(fault["x-medkit"]["captured_at"].get<std::string>(), "2026-09-06T00:00:00.000Z");
+  EXPECT_FALSE(fault["x-medkit"].contains("expected"));
+}
+
+TEST(PlannedStopAnnotation, AKnownButEmptyWindowSetSaysFalse) {
+  nlohmann::json fault{{"first_occurred", 15.0}};
+
+  const auto expected = annotate_fault_with_planned_stop(fault, PlannedStopKnowledge{true, {}});
+  ASSERT_TRUE(expected.has_value()) << "an empty answer IS an answer";
+  EXPECT_FALSE(*expected);
+  EXPECT_FALSE(fault["x-medkit"]["expected"].get<bool>());
+}
+
+// --- formatting an instant back out ------------------------------------------
+
+TEST(PlannedStopFormatting, ANegativeInstantNeverProducesAMalformedFraction) {
+  // A row written by an earlier build could hold one. printf("%03d", -500) emits
+  // "-500", which turns 1969-12-31T23:59:59 into "...59.-500Z" - not a timestamp
+  // any reader can parse, and worse than a wrong one because it looks like data.
+  for (int64_t ns : {int64_t{-1}, int64_t{-1'500'000'000}, int64_t{-999'999'999}}) {
+    const std::string formatted = ros2_medkit_gateway::format_timestamp_ns(ns);
+    EXPECT_EQ(formatted.find(".-"), std::string::npos) << ns << " -> " << formatted;
+    EXPECT_EQ(formatted.size(), 24u) << ns << " -> " << formatted;
+    EXPECT_EQ(formatted.back(), 'Z');
+  }
+  // -1 ns is one nanosecond before the epoch: the last millisecond of 1969.
+  EXPECT_EQ(ros2_medkit_gateway::format_timestamp_ns(-1), "1969-12-31T23:59:59.999Z");
+  EXPECT_EQ(ros2_medkit_gateway::format_timestamp_ns(-1'500'000'000), "1969-12-31T23:59:58.500Z");
+  EXPECT_EQ(ros2_medkit_gateway::format_timestamp_ns(0), "1970-01-01T00:00:00.000Z");
+}
+
 // --- the cache the event path reads -----------------------------------------
 
 TEST(PlannedStopCacheTest, StartsEmptyAndDueForARefresh) {
@@ -474,19 +585,66 @@ TEST(PlannedStopCacheTest, ASuccessfulRefreshClearsTheFailureFlag) {
 // an outage of the fault manager as "nothing is expected".
 TEST(PlannedStopCacheTest, KnowsWhetherItHasEverSeenAWindowSet) {
   PlannedStopCache cache;
-  EXPECT_FALSE(cache.has_knowledge()) << "nothing has been read yet";
+  EXPECT_FALSE(cache.has_knowledge(std::chrono::seconds(60))) << "nothing has been read yet";
 
   cache.note_failed_refresh();
-  EXPECT_FALSE(cache.has_knowledge()) << "a read that got no answer taught it nothing";
+  EXPECT_FALSE(cache.has_knowledge(std::chrono::seconds(60))) << "a read that got no answer taught it nothing";
 
   cache.store({});
-  EXPECT_TRUE(cache.has_knowledge()) << "an empty answer IS an answer: no windows are declared";
+  EXPECT_TRUE(cache.has_knowledge(std::chrono::seconds(60))) << "an empty answer IS an answer: no windows are declared";
 
   cache.note_failed_refresh();
-  EXPECT_TRUE(cache.has_knowledge()) << "a later outage does not unlearn what was read";
+  EXPECT_TRUE(cache.has_knowledge(std::chrono::seconds(60))) << "a later outage does not unlearn what was read";
 
   cache.invalidate();
-  EXPECT_TRUE(cache.has_knowledge()) << "invalidate asks for a re-read; it does not forget";
+  EXPECT_TRUE(cache.has_knowledge(std::chrono::seconds(60))) << "invalidate asks for a re-read; it does not forget";
+}
+
+// R22: knowledge expires. A gateway that read a window set once used to serve it
+// for the life of the process - replace the fault manager and one endpoint says
+// it cannot name the windows while another keeps naming one that is gone.
+TEST(PlannedStopCacheTest, KnowledgeGoesQuietOnceItIsTooOldToTrust) {
+  PlannedStopCache cache;
+  cache.store({window("w", 10 * kSec, 20 * kSec)});
+
+  EXPECT_TRUE(cache.has_knowledge(std::chrono::seconds(60))) << "just read";
+  EXPECT_FALSE(cache.has_knowledge(std::chrono::nanoseconds(0))) << "a zero budget means nothing is fresh enough";
+
+  // A failed refresh does not renew it: only a successful read does.
+  cache.note_failed_refresh();
+  EXPECT_FALSE(cache.has_knowledge(std::chrono::nanoseconds(0)));
+  EXPECT_TRUE(cache.has_knowledge(std::chrono::seconds(60)))
+      << "and it does not blank the set the moment one read fails either";
+
+  cache.store({window("w2", 30 * kSec, 40 * kSec)});
+  EXPECT_TRUE(cache.has_knowledge(std::chrono::seconds(60)));
+  ASSERT_EQ(cache.snapshot().size(), 1u);
+  EXPECT_EQ(cache.snapshot()[0].id, "w2");
+}
+
+TEST(PlannedStopExpectedCount, CountsDistinctExpectedCodesOnly) {
+  // An aggregating gateway serves a code raised on two gateways twice; the plant
+  // still had one stop's worth of it.
+  const nlohmann::json items = nlohmann::json::array({
+      {{"fault_code", "SHARED"}, {"x-medkit", {{"expected", true}}}},
+      {{"fault_code", "SHARED"}, {"x-medkit", {{"expected", true}}}},
+      {{"fault_code", "LOCAL"}, {"x-medkit", {{"expected", true}}}},
+      {{"fault_code", "PLAIN"}, {"x-medkit", {{"expected", false}}}},
+      {{"fault_code", "UNKNOWN_FLAG"}},
+      {{"fault_code", "EMPTY_EXT"}, {"x-medkit", nlohmann::json::object()}},
+  });
+  EXPECT_EQ(ros2_medkit_gateway::faults::count_expected_items(items), 2);
+}
+
+TEST(PlannedStopExpectedCount, AnItemWithNoFlagIsCountedByNeitherSide) {
+  const nlohmann::json unknown_only = nlohmann::json::array({
+      {{"fault_code", "A"}},
+      {{"fault_code", "B"}, {"x-medkit", {{"entity_id", "app"}}}},
+  });
+  EXPECT_EQ(ros2_medkit_gateway::faults::count_expected_items(unknown_only), 0)
+      << "unknown is not expected, and it is not unexpected either";
+  EXPECT_EQ(ros2_medkit_gateway::faults::count_expected_items(nlohmann::json::array()), 0);
+  EXPECT_EQ(ros2_medkit_gateway::faults::count_expected_items(nlohmann::json::object()), 0);
 }
 
 TEST(PlannedStopCacheTest, InvalidateForcesTheNextReadToRefresh) {

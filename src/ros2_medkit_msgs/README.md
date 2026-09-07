@@ -173,11 +173,13 @@ Declare a window during which faults are expected. Windows may overlap and may l
 | `success` | bool | True when the window was stored |
 | `message` | string | Why the declaration was refused; empty on success |
 | `stop` | PlannedStop | The stored window, including its assigned id |
-| `outcome` | uint8 | `OUTCOME_STORED`, `OUTCOME_INVALID_INTERVAL`, `OUTCOME_INVALID_INSTANT`, `OUTCOME_DUPLICATE_ID` or `OUTCOME_NOT_RETAINED`. A caller maps a refusal onto its own answer from this, never from the message prose |
+| `outcome` | uint8 | `OUTCOME_STORED`, `OUTCOME_INVALID_INTERVAL`, `OUTCOME_INVALID_INSTANT`, `OUTCOME_DUPLICATE_ID` or `OUTCOME_NOT_RETAINED` (the retention bound is full of windows that have not ended). A caller maps a refusal onto its own answer from this, never from the message prose |
 
 ### EndPlannedStop.srv
 
-Stop a window. A window still **running** at the given instant is cut short: `ends_at` moves there and `ended_early` becomes true, so faults whose cycle started before it stay expected and faults raised after it do not. A window that has **not started** by then is cancelled - removed, with `cancelled` set on the copy returned - because it marked nothing and storing `ends_at <= starts_at` would contradict the message's own promise. A window that has **already ended** cannot be ended again, and a backdated instant cannot walk its end backwards.
+Stop a window. Whether it is **finished**, **not started** or **running** is decided against the fault manager's own wall clock, never against the `at` sent.
+
+A window still running is cut short: `ends_at` moves to `at` and `ended_early` becomes true, so faults whose cycle started before it stay expected and faults raised after it do not. `at` must fall in `(starts_at, now]` - strictly after the start, because ending at the start would store a zero-length window - and is refused outside that range rather than clamped. A window that has not started is cancelled: removed, with `cancelled` set on the copy returned, because it marked nothing and storing `ends_at <= starts_at` would contradict the message's own promise. A window that has already finished cannot be touched again, backdated instants included.
 
 **Request:**
 | Field | Type | Description |
@@ -191,14 +193,14 @@ Stop a window. A window still **running** at the given instant is cut short: `en
 | `success` | bool | True when the window was ended or cancelled |
 | `message` | string | Why the request was refused |
 | `stop` | PlannedStop | The window after the request: cut short, or as it was for a cancellation |
-| `outcome` | uint8 | `OUTCOME_ENDED`, `OUTCOME_CANCELLED`, `OUTCOME_NOT_FOUND` or `OUTCOME_ALREADY_ENDED` |
+| `outcome` | uint8 | `OUTCOME_ENDED`, `OUTCOME_CANCELLED`, `OUTCOME_NOT_FOUND`, `OUTCOME_ALREADY_ENDED` or `OUTCOME_INVALID_AT` |
 
 ### ListPlannedStops.srv
 
 **Request:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `active_only` | bool | When true, return only the windows containing `now` |
+| `active_only` | bool | When true, return only the windows that have NOT ENDED at `now` - running and not-yet-started alike, the same notion retention uses |
 | `now` | builtin_interfaces/Time | The instant `active_only` is evaluated against; zero means the fault manager's own wall clock |
 
 **Response:**

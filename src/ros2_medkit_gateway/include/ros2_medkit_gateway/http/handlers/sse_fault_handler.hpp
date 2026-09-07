@@ -278,6 +278,14 @@ class SSEFaultHandler {
   /// path through the replay buffer.
   void enqueue(QueuedEvent queued);
 
+  /// Bring the planned-stop window cache up to date if it is due.
+  ///
+  /// Called from the streaming loop with NO lock held. The blocking half of the
+  /// derivation lives here on purpose: `format_sse_event` runs under
+  /// `queue_mutex_`, which the subscription callback takes to enqueue, so a
+  /// service call there stalls the executor and every other client.
+  void refresh_planned_stops() const;
+
   /// Format a fault event as SSE message.
   ///
   /// Not static any more: the frame carries `x-medkit.expected`, which is

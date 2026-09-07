@@ -95,7 +95,7 @@ class SqliteFaultStorage : public FaultStorage {
   std::vector<ros2_medkit_msgs::msg::Fault> get_all_faults() const override;
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
-  bool declare_planned_stop(const PlannedStopWindow & window) override;
+  DeclarePlannedStopOutcome declare_planned_stop(const PlannedStopWindow & window) override;
   EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) override;
   std::optional<PlannedStopWindow> get_planned_stop(const std::string & id) const override;
   std::vector<PlannedStopWindow> list_planned_stops() const override;
@@ -133,10 +133,12 @@ class SqliteFaultStorage : public FaultStorage {
   /// Whether any fault at all still references @p file_path. Caller holds mutex_.
   bool path_referenced(const std::string & file_path) const;
 
-  /// Delete ended windows, oldest declaration first, until at most
-  /// max_planned_stops_ rows remain. Returns how many rows went. @p exempt_id is
-  /// never deleted. Caller holds mutex_.
-  size_t prune_planned_stops_locked(int64_t now_ns, const std::string & exempt_id = {});
+  /// Delete ended windows, oldest declaration first, until at most @p target
+  /// rows remain. Returns how many rows went. Caller holds mutex_.
+  size_t prune_planned_stops_locked(int64_t now_ns, size_t target);
+
+  /// Number of stored windows. Caller holds mutex_.
+  size_t planned_stop_count_locked() const;
 
   /// store_rosbag_file body without taking mutex_. Caller holds mutex_ and
   /// unlinks the returned replaced-bag path once the row change is durable.

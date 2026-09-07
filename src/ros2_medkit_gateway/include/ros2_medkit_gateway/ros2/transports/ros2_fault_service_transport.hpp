@@ -95,6 +95,8 @@ class Ros2FaultServiceTransport : public FaultServiceTransport {
 
   bool is_available() const override;
 
+  bool planned_stops_available() const override;
+
  private:
   rclcpp::Node * node_;
 

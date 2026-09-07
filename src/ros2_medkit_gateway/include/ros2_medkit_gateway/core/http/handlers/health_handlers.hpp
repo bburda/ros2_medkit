@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <utility>
 
@@ -58,6 +59,16 @@ class HealthHandlers {
     : ctx_(ctx), route_registry_(route_registry), sse_tracker_(std::move(sse_tracker)) {
   }
 
+  /// Where /health reads the fault stream's received-event counter from.
+  ///
+  /// Set after construction because the SSE handler is built later than this
+  /// one. It counts events the gateway ACCEPTED from the fault manager, which
+  /// is the only thing that distinguishes "no faults are happening" from "the
+  /// thread that takes them is stuck".
+  void set_sse_event_counter(std::function<uint64_t()> counter) {
+    sse_events_received_ = std::move(counter);
+  }
+
   /// GET /health - Health check endpoint
   http::Result<dto::Health> get_health(const http::TypedRequest & req);
 
@@ -71,6 +82,7 @@ class HealthHandlers {
   HandlerContext & ctx_;
   const openapi::RouteRegistry * route_registry_{nullptr};
   std::shared_ptr<const SSEClientTracker> sse_tracker_;
+  std::function<uint64_t()> sse_events_received_;
 };
 
 }  // namespace handlers
