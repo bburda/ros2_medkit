@@ -107,10 +107,14 @@ class PlannedStopFixture(unittest.TestCase):
     def setUp(self):
         self.proc = None
         self.manager_name = ''
+        self._clients = {}
         self.db_path = os.path.join(self.workdir, f'{self.id().rsplit(".", 1)[-1][:40]}.db')
 
     def tearDown(self):
         self._stop_manager()
+        for client in self._clients.values():
+            self.node.destroy_client(client)
+        self._clients = {}
 
     # --- process control ---------------------------------------------------
 
@@ -155,7 +159,20 @@ class PlannedStopFixture(unittest.TestCase):
     # --- service plumbing --------------------------------------------------
 
     def _client(self, srv_type, name, timeout=30.0):
-        client = self.node.create_client(srv_type, f'/{self.manager_name}/{name}')
+        """
+        Keep one client per (manager, service) and reuse it for the test.
+
+        Creating a fresh client for every call churns the DDS graph: each one
+        discovers the service again, and under the load of the whole integration
+        suite one of them eventually costs more than the call budget. The keys
+        carry the manager's node name, which is unique per START, so a restart
+        gets fresh clients without any cache invalidation.
+        """
+        key = (self.manager_name, name)
+        client = self._clients.get(key)
+        if client is None:
+            client = self.node.create_client(srv_type, f'/{self.manager_name}/{name}')
+            self._clients[key] = client
         self.assertTrue(
             client.wait_for_service(timeout_sec=timeout),
             f'{name} service never appeared on {self.manager_name}',
