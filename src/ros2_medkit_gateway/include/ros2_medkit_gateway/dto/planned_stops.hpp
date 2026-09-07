@@ -57,7 +57,9 @@ inline constexpr auto dto_fields<PlannedStop> = std::make_tuple(
           "resolution."),
     field("to", &PlannedStop::to,
           "When the window closes, ISO 8601 in UTC, to the millisecond. Always strictly after `from`."),
-    field("reason", &PlannedStop::reason, "Why the plant is stopping, as the operator wrote it."),
+    field("reason", &PlannedStop::reason,
+          "Why the plant is stopping, as the operator wrote it. Read here, on the window: a fault the window "
+          "marks carries only `planned_stop_id`."),
     field("declared_by", &PlannedStop::declared_by,
           "The authenticated client that declared the window, or `anonymous` when the declaration arrived "
           "without authentication."),
@@ -111,8 +113,9 @@ inline constexpr auto dto_fields<PlannedStopCreateRequest> = std::make_tuple(
           "with 400, as is a `to` before `from`. There is no maximum duration, but the instant must lie in the "
           "same range as `from`, and it is recorded to the millisecond."),
     field("reason", &PlannedStopCreateRequest::reason,
-          "Why the plant is stopping. Carried verbatim on every fault the window marks, so write what an "
-          "engineer reading the fault next month needs.",
+          "Why the plant is stopping. NOT carried on the faults the window marks - a marked fault carries the "
+          "window's id and nothing else from it - so write what an engineer who follows that id back to "
+          "`GET /x-medkit-planned-stops/{id}` next month needs.",
           FieldConstraints{{}, {}, /*max_length=*/512U, {}, {}}),
     field("declared_by", &PlannedStopCreateRequest::declared_by,
           "Who is declaring the stop. Omit it and the gateway fills in the authenticated client id, or "

@@ -217,6 +217,10 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   // Planned-stop retention. Bounded by COUNT rather than by age: a window that
   // has ended is still the reason a fault from last month reads as expected, so
   // it cannot be dropped for being old, only for being one of too many.
+  //
+  // The bound counts windows that are NO LONGER ACTIVE. An active window is
+  // always kept and is never dropped to make room, so the table holds at most
+  // this many plus however many windows are currently running.
   // declare_parameter<int64_t> deliberately: <int> narrows silently, so a value
   // above INT_MAX would wrap back into the legal band and pass the range check.
   bool planned_stop_bound_clamped = false;
@@ -1749,6 +1753,7 @@ void FaultManagerNode::handle_end_planned_stop(
     const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Request> & request,
     const std::shared_ptr<ros2_medkit_msgs::srv::EndPlannedStop::Response> & response) {
   using Response = ros2_medkit_msgs::srv::EndPlannedStop::Response;
+  const int64_t now_ns = get_wall_clock_ns();
   const int64_t requested_at = time_msg_to_ns(request->at);
 
   // Zero here means "the fault manager's own wall clock", and unlike a window
@@ -1757,13 +1762,15 @@ void FaultManagerNode::handle_end_planned_stop(
   // fault timestamps come from. A negative instant is still refused.
   if (requested_at < 0) {
     response->success = false;
-    response->outcome = Response::OUTCOME_NOT_FOUND;
+    response->outcome = Response::OUTCOME_INVALID_AT;
     response->message = "at must not be before the Unix epoch";
     return;
   }
-  const int64_t at_ns = requested_at == 0 ? get_wall_clock_ns() : requested_at;
+  const int64_t at_ns = requested_at == 0 ? now_ns : requested_at;
 
-  const auto result = storage_->end_planned_stop(request->id, at_ns);
+  // now_ns decides which situation the window is in; at_ns only refines where a
+  // running one ends.
+  const auto result = storage_->end_planned_stop(request->id, at_ns, now_ns);
   switch (result.outcome) {
     case EndPlannedStopOutcome::Ended:
       response->success = true;
@@ -1781,6 +1788,12 @@ void FaultManagerNode::handle_end_planned_stop(
       response->success = false;
       response->outcome = Response::OUTCOME_ALREADY_ENDED;
       response->message = "planned stop '" + request->id + "' has already ended";
+      response->stop = window_to_msg(result.window);
+      return;
+    case EndPlannedStopOutcome::InvalidAt:
+      response->success = false;
+      response->outcome = Response::OUTCOME_INVALID_AT;
+      response->message = "at must lie between the window's start and now";
       response->stop = window_to_msg(result.window);
       return;
     case EndPlannedStopOutcome::NotFound:

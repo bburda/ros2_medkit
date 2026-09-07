@@ -14,18 +14,27 @@
 
 # EndPlannedStop.srv - stop a planned-stop window.
 #
-# A window still running at the given instant is CUT SHORT: ends_at moves there
-# and ended_early is set. Faults whose cycle started before that instant stay
-# expected; faults raised after it do not. A window that has not STARTED by then
-# is CANCELLED - removed, with cancelled set on the copy returned - because it
-# marked nothing. A window that has already ended cannot be ended again, and a
-# backdated instant cannot walk its end backwards.
+# A window still running NOW is CUT SHORT: ends_at moves to `at` and ended_early
+# is set. Faults whose cycle started before that instant stay expected; faults
+# raised after it do not. A window that has not STARTED yet is CANCELLED -
+# removed, with cancelled set on the copy returned - because it marked nothing.
+# A window that has already finished, early or on its own, cannot be touched
+# again: when a stop finished is not something a later request gets to rewrite.
+#
+# "Finished", "not started" and "running" are all judged against the fault
+# manager's wall clock. `at` only picks where inside [starts_at, now] a running
+# window ends, and is refused outside that range rather than clamped.
 
 # Identifier of the window to end
 string id
 
-# Instant the window should end at (wall clock, UTC). Zero means "now", which
-# is what an operator pressing stop means.
+# Instant the window should end at (wall clock, UTC). Zero means "now", which is
+# what an operator pressing stop means.
+#
+# This only REFINES the end of a window that is running: it must lie in
+# [starts_at, now]. Which of the three situations the window is in - finished,
+# not started, running - is decided against the fault manager's own clock, never
+# against this field.
 builtin_interfaces/Time at
 ---
 # True when the window was ended
@@ -46,3 +55,4 @@ uint8 OUTCOME_ENDED = 0
 uint8 OUTCOME_CANCELLED = 1
 uint8 OUTCOME_NOT_FOUND = 2
 uint8 OUTCOME_ALREADY_ENDED = 3
+uint8 OUTCOME_INVALID_AT = 4

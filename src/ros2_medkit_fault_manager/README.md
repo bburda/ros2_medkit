@@ -73,7 +73,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 | `auto_confirm_after_sec` | double | `0.0` | Auto-confirm PREFAILED faults after timeout (0 = disabled) |
 | `entity_thresholds.config_file` | string | `""` | Path to YAML file with per-entity debounce threshold overrides |
 | `near_miss.max_per_fault` | int | `200` | Near-miss entries retained per fault code, oldest evicted first (0 = unlimited) |
-| `planned_stop.max_windows` | int | `100` | Declared planned-stop windows retained, oldest **ended** one dropped first; a running window is never dropped. Clamped to `[1, 10000]` |
+| `planned_stop.max_windows` | int | `100` | Bound on the retained planned-stop windows that are **no longer active**, oldest declaration dropped first. An active window is always kept and never dropped to make room, so the table holds at most this many plus the number of running windows. Clamped to `[1, 10000]` |
 
 ### Snapshot Parameters
 
@@ -201,18 +201,34 @@ A **planned stop** is a window of wall-clock time during which faults are expect
 
 Declaring a window changes nothing about how faults are handled. A fault whose cycle starts inside one is confirmed, healed, cleared, captured and audited exactly as any other fault. The window only lets a reader tell an expected fault from a surprise - the gateway derives that flag and serves it as `x-medkit.expected` on the fault list and the event stream.
 
-```bash
-# Declare a four-hour changeover starting now (a zero start means "now")
-ros2 service call /fault_manager/declare_planned_stop ros2_medkit_msgs/srv/DeclarePlannedStop \
-  "{starts_at: {sec: 0, nanosec: 0}, ends_at: {sec: 1788800000, nanosec: 0}, reason: 'line changeover', declared_by: 'shift_lead'}"
+The service takes explicit instants. Zero is what an **unset** `builtin_interfaces/Time` reads as, so it is not a stand-in for "now" on either bound - a caller who wants the current instant sends it:
 
-# List the windows that contain this instant
+```bash
+# Declare a four-hour changeover. Both bounds are explicit; `date +%s` is the
+# shortest way to say "now" from a shell.
+NOW=$(date +%s)
+ros2 service call /fault_manager/declare_planned_stop ros2_medkit_msgs/srv/DeclarePlannedStop \
+  "{starts_at: {sec: $NOW, nanosec: 0}, ends_at: {sec: $((NOW + 14400)), nanosec: 0}, reason: 'line changeover', declared_by: 'shift_lead'}"
+
+# List the windows that contain this instant. `now: 0` here means "the fault
+# manager's own wall clock", which is a request-time reference rather than a
+# window bound - the clock the fault timestamps come from is the one to compare
+# against.
 ros2 service call /fault_manager/list_planned_stops ros2_medkit_msgs/srv/ListPlannedStops \
   "{active_only: true, now: {sec: 0, nanosec: 0}}"
 
-# Cut a window short
+# Cut a window short. `at: 0` means the fault manager's clock, for the same
+# reason; an explicit instant may only refine where a RUNNING window ends.
 ros2 service call /fault_manager/end_planned_stop ros2_medkit_msgs/srv/EndPlannedStop \
   "{id: '1788716982473405798-1', at: {sec: 0, nanosec: 0}}"
+```
+
+Over REST the same window is one call, and there **omitting** `from` is how you say "now" - the gateway fills in its own clock and always sends an explicit instant:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/x-medkit-planned-stops \
+  -H 'Content-Type: application/json' \
+  -d '{"to": "2026-09-06T22:00:00Z", "reason": "line changeover"}'
 ```
 
 Behaviour worth knowing before relying on it:
@@ -220,9 +236,9 @@ Behaviour worth knowing before relying on it:
 - A fault belongs to a window when its `first_occurred` lies in `[starts_at, ends_at]`, inclusive at both ends and compared at millisecond resolution. `first_occurred` is the start of the current **cycle**, so a code that fails inside a window and fails again after it was cleared is expected for the first cycle and unexpected for the second.
 - Windows may overlap, and may be declared **after** the stop they describe: a stop is a fact about the plant, not about when someone typed it in.
 - Both bounds must be after the Unix epoch. Zero is what an unset `builtin_interfaces/Time` reads as, so it cannot also mean "now" - a caller who wants the current instant sends it.
-- Ending a window that is running moves `ends_at` to that instant. Faults raised before it stay expected; faults raised after it do not. A window that has not started yet is **cancelled** instead: removed, with `cancelled` set on the answer. A window that has already ended cannot be ended again, and a backdated `at` cannot move its end earlier.
+- Whether a window is **finished**, **not started** or **running** is decided against the fault manager's own wall clock, never against the `at` a caller supplies. A running window is cut short at `at`, which may only fall in `[starts_at, now]`; a window that has not started is **cancelled** (removed, with `cancelled` set on the answer); a window that has already finished, early or on its own, cannot be touched again, backdated instants included.
 - Windows are stored in the `planned_stops` table and survive a restart. A database written by an earlier build gains the table on first open.
-- Retention is by count (`planned_stop.max_windows`), never by age, and never drops a running window.
+- Retention is by count (`planned_stop.max_windows`), never by age. The bound counts windows that are **no longer active**: an active window is always kept and is never dropped to make room, so the table holds at most `max_windows` plus however many windows are currently running.
 
 ## Advanced: Tamper-Evident Audit Log
 

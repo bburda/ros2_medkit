@@ -96,7 +96,7 @@ class SqliteFaultStorage : public FaultStorage {
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
   bool declare_planned_stop(const PlannedStopWindow & window) override;
-  EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns) override;
+  EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) override;
   std::optional<PlannedStopWindow> get_planned_stop(const std::string & id) const override;
   std::vector<PlannedStopWindow> list_planned_stops() const override;
   size_t set_max_planned_stops(size_t max_count, int64_t now_ns) override;

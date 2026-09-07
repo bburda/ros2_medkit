@@ -2901,10 +2901,13 @@ as it was with ``cancelled: true`` and ``ended_early`` still false. It marked no
 a ``to`` before its own ``from`` would contradict what the window claims to be. A ``GET`` on that
 id afterwards answers ``404``.
 
-A window that has **already ended**, early or on its own, answers ``400`` with vendor code
-``x-medkit-planned-stop-ended``. A backdated request cannot walk its end backwards either: when a
-stop actually finished is not something a later request gets to rewrite. An unknown id answers
-``404``.
+A window that has **already finished**, early or on its own, answers ``400`` with vendor code
+``x-medkit-planned-stop-ended``. An unknown id answers ``404``.
+
+Which of the three situations a window is in is decided against the fault manager's own wall
+clock, never against an instant the caller supplies: a backdated request cannot walk a finished
+window's end backwards, and it cannot cancel one either. When a stop actually finished is not
+something a later request gets to rewrite.
 
 Reading the flag
 ~~~~~~~~~~~~~~~~

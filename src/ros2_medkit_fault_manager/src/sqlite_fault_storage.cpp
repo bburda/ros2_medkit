@@ -1947,7 +1947,7 @@ bool SqliteFaultStorage::declare_planned_stop(const PlannedStopWindow & window) 
   return true;
 }
 
-EndPlannedStopResult SqliteFaultStorage::end_planned_stop(const std::string & id, int64_t at_ns) {
+EndPlannedStopResult SqliteFaultStorage::end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   PlannedStopWindow current;
@@ -1961,7 +1961,13 @@ EndPlannedStopResult SqliteFaultStorage::end_planned_stop(const std::string & id
     current = read_planned_stop_row(stmt);
   }
 
-  if (at_ns < current.starts_at_ns) {
+  // Every branch below tests now_ns, never at_ns. See the contract on
+  // FaultStorage::end_planned_stop for why: judging on the supplied instant let
+  // the caller choose which of the three situations the window was in.
+  if (!current.active_at(now_ns)) {
+    return EndPlannedStopResult{EndPlannedStopOutcome::AlreadyEnded, current};
+  }
+  if (current.starts_at_ns > now_ns) {
     // It never started: cancelled, not ended early.
     SqliteStatement remove(db_, "DELETE FROM planned_stops WHERE id = ?");
     remove.bind_text(1, id);
@@ -1971,8 +1977,8 @@ EndPlannedStopResult SqliteFaultStorage::end_planned_stop(const std::string & id
     current.cancelled = true;
     return EndPlannedStopResult{EndPlannedStopOutcome::Cancelled, current};
   }
-  if (current.ended_early || !current.active_at(at_ns)) {
-    return EndPlannedStopResult{EndPlannedStopOutcome::AlreadyEnded, current};
+  if (at_ns < current.starts_at_ns || at_ns > now_ns) {
+    return EndPlannedStopResult{EndPlannedStopOutcome::InvalidAt, current};
   }
 
   SqliteStatement update(db_, "UPDATE planned_stops SET ends_at_ns = ?, ended_early = 1 WHERE id = ?");

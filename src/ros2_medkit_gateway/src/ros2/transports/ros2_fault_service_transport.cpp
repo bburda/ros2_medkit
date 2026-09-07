@@ -596,8 +596,21 @@ PlannedStopResult Ros2FaultServiceTransport::end_planned_stop(const std::string 
   if (!response->success) {
     result.error_message = response->message;
     using Response = ros2_medkit_msgs::srv::EndPlannedStop::Response;
-    result.refusal = response->outcome == Response::OUTCOME_ALREADY_ENDED ? PlannedStopRefusal::AlreadyEnded
-                                                                          : PlannedStopRefusal::NotFound;
+    switch (response->outcome) {
+      case Response::OUTCOME_ALREADY_ENDED:
+        result.refusal = PlannedStopRefusal::AlreadyEnded;
+        break;
+      case Response::OUTCOME_INVALID_AT:
+        // Not reachable from REST - DELETE always asks the fault manager for its
+        // own clock, and "now" is always inside a running window's legal range -
+        // but a wrong instant is a bad request, not a missing window, and
+        // mislabelling it 404 would send a caller looking for the wrong thing.
+        result.refusal = PlannedStopRefusal::InvalidRequest;
+        break;
+      default:
+        result.refusal = PlannedStopRefusal::NotFound;
+        break;
+    }
     return result;
   }
   result.stops.push_back(window_from_msg(response->stop));

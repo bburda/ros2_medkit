@@ -196,12 +196,16 @@ Declare, cut short and list the windows of wall-clock time during which faults a
   "now". Windows may overlap and may lie wholly in the past. The stored row is read back before
   success is reported, and the declaration is exempt from the retention pruning its own arrival
   triggers, so a window answered as stored is there afterwards.
-- **End**: for a window still RUNNING at the given instant (zero means the fault manager's own
-  wall clock), moves ``ends_at`` there and sets ``ended_early``. A window that has not STARTED by
-  then is cancelled instead - removed, with ``cancelled`` set on the copy returned - because it
-  marked nothing and an inverted interval would contradict the message. Refused for an unknown id
-  and for a window that has already ended, backdated instants included. The structured ``outcome``
-  distinguishes the four cases so a caller maps them onto answers without reading prose.
+- **End**: whether a window is FINISHED, NOT STARTED or RUNNING is decided against the fault
+  manager's own wall clock, never against the ``at`` the caller sends. A running window is cut
+  short at ``at`` - which may only fall in ``[starts_at, now]``, and is refused outside it rather
+  than clamped - moving ``ends_at`` there and setting ``ended_early``. A window that has not
+  started is cancelled instead: removed, with ``cancelled`` set on the copy returned, because it
+  marked nothing and an inverted interval would contradict the message. A finished window is
+  immutable. Judging on ``at`` let the caller pick the answer: a backdated instant inside the
+  original span re-ended a window that had run out, and one before the start deleted it. The
+  structured ``outcome`` distinguishes the five cases so a caller maps them onto answers without
+  reading prose.
 - **List**: newest declaration first; ``active_only`` keeps the windows containing ``now``.
 - **Returns**: the stored ``PlannedStop`` in every success case.
 
@@ -287,9 +291,12 @@ is expected for the first cycle and unexpected for the second, which is what an 
 
 Windows are bounded by count rather than by age (``planned_stop.max_windows``). A window that has
 ended is still the reason a fault from last month reads as expected, so it cannot be dropped for
-being old - only for being one of too many. Retention prunes ended windows, oldest declaration
-first, and **never** a window that is still running: a live window vanishing under the operator who
-declared it would be the one failure mode with no recovery.
+being old - only for being one of too many. The bound counts windows that are no longer ACTIVE:
+retention prunes those, oldest declaration first, and **never** a window that is still running, not
+even to make room for the declaration that triggered the prune. The stored count is therefore at
+most the bound plus the number of active windows. A live window vanishing under the operator who
+declared it would be the one failure mode with no recovery, and a table a few rows over its nominal
+bound is the price.
 
 Rosbag Black-Box Recording
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

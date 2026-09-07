@@ -366,9 +366,19 @@ class TestPlannedStops(PlannedStopFixture):
         self.assertTrue(live.success, live.message)
 
         listed = self._list_stops()
+        # The bound counts windows that are no longer active; an active one is
+        # always kept and is never dropped to make room. So the table holds at
+        # most the cap plus however many are still running.
+        active = sum(
+            1 for stop in listed.stops if to_float(stop.ends_at) > time.time()
+        )
         self.assertLessEqual(
-            len(listed.stops), self.RETENTION_CAP,
-            'the stored count must never exceed the configured bound while ended windows remain',
+            len(listed.stops), self.RETENTION_CAP + active,
+            'stored count must be at most the cap plus the active windows',
+        )
+        self.assertLessEqual(
+            len(listed.stops) - active, self.RETENTION_CAP,
+            'the ended windows alone must fit the configured bound',
         )
 
         surviving = [stop.id for stop in listed.stops]
@@ -499,6 +509,88 @@ class TestPlannedStops(PlannedStopFixture):
             stop for stop in self._list_stops().stops if stop.id == window.stop.id
         )
         self.assertAlmostEqual(to_float(stored.ends_at), settled_end, places=6)
+
+    def test_a_finished_window_cannot_be_re_ended_by_a_backdated_at(self):
+        """R15: which situation a window is in is judged against the manager's clock."""
+        self._start_manager()
+
+        now = time.time()
+        # Declared and finished in the past. Its end is a fact now.
+        window = self._declare(now - 600.0, now - 300.0, reason='already over')
+        self.assertTrue(window.success, window.message)
+        original_end = to_float(window.stop.ends_at)
+
+        # An instant INSIDE the original span, which the old rule read as "still
+        # running at that instant" and accepted.
+        backdated = EndPlannedStop.Request()
+        backdated.id = window.stop.id
+        backdated.at = to_time(now - 450.0)
+        response = self._call(self._client(EndPlannedStop, 'end_planned_stop'), backdated)
+
+        self.assertFalse(response.success, 'a finished window is immutable')
+        self.assertEqual(response.outcome, EndPlannedStop.Response.OUTCOME_ALREADY_ENDED)
+
+        stored = next(
+            stop for stop in self._list_stops().stops if stop.id == window.stop.id
+        )
+        self.assertAlmostEqual(to_float(stored.ends_at), original_end, places=6)
+        self.assertFalse(stored.ended_early)
+
+    def test_a_finished_window_is_not_cancelled_by_an_at_before_its_start(self):
+        """The cancel branch must test the clock, not the instant it was handed."""
+        self._start_manager()
+
+        now = time.time()
+        window = self._declare(now - 600.0, now - 300.0, reason='already over')
+        self.assertTrue(window.success, window.message)
+
+        request = EndPlannedStop.Request()
+        request.id = window.stop.id
+        request.at = to_time(now - 900.0)  # before the window even started
+        response = self._call(self._client(EndPlannedStop, 'end_planned_stop'), request)
+
+        self.assertFalse(response.success)
+        self.assertEqual(response.outcome, EndPlannedStop.Response.OUTCOME_ALREADY_ENDED)
+        self.assertIn(
+            window.stop.id, [stop.id for stop in self._list_stops().stops],
+            'a finished window must not be deleted by a request that cannot touch it'
+        )
+
+    def test_at_outside_the_running_span_is_refused(self):
+        """`at` may only refine where a RUNNING window ends."""
+        self._start_manager()
+
+        now = time.time()
+        window = self._declare(now - 300.0, now + 300.0, reason='running')
+        self.assertTrue(window.success, window.message)
+
+        too_early = EndPlannedStop.Request()
+        too_early.id = window.stop.id
+        too_early.at = to_time(now - 600.0)
+        response = self._call(self._client(EndPlannedStop, 'end_planned_stop'), too_early)
+        self.assertFalse(response.success)
+        self.assertEqual(response.outcome, EndPlannedStop.Response.OUTCOME_INVALID_AT)
+
+        too_late = EndPlannedStop.Request()
+        too_late.id = window.stop.id
+        too_late.at = to_time(now + 200.0)  # has not happened yet
+        response = self._call(self._client(EndPlannedStop, 'end_planned_stop'), too_late)
+        self.assertFalse(response.success)
+        self.assertEqual(response.outcome, EndPlannedStop.Response.OUTCOME_INVALID_AT)
+
+        stored = next(
+            stop for stop in self._list_stops().stops if stop.id == window.stop.id
+        )
+        self.assertFalse(stored.ended_early, 'a refused request must not have moved anything')
+
+        # And an instant inside the running span is accepted.
+        legal = EndPlannedStop.Request()
+        legal.id = window.stop.id
+        legal.at = to_time(now - 10.0)
+        response = self._call(self._client(EndPlannedStop, 'end_planned_stop'), legal)
+        self.assertTrue(response.success, response.message)
+        self.assertEqual(response.outcome, EndPlannedStop.Response.OUTCOME_ENDED)
+        self.assertAlmostEqual(to_float(response.stop.ends_at), now - 10.0, places=3)
 
     def test_a_window_that_is_not_an_interval_is_refused(self):
         self._start_manager()

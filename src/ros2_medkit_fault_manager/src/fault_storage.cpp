@@ -894,7 +894,7 @@ bool InMemoryFaultStorage::declare_planned_stop(const PlannedStopWindow & window
   return true;
 }
 
-EndPlannedStopResult InMemoryFaultStorage::end_planned_stop(const std::string & id, int64_t at_ns) {
+EndPlannedStopResult InMemoryFaultStorage::end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   auto it = std::find_if(planned_stops_.begin(), planned_stops_.end(), [&id](const PlannedStopWindow & w) {
@@ -903,15 +903,22 @@ EndPlannedStopResult InMemoryFaultStorage::end_planned_stop(const std::string & 
   if (it == planned_stops_.end()) {
     return EndPlannedStopResult{EndPlannedStopOutcome::NotFound, {}};
   }
-  if (at_ns < it->starts_at_ns) {
+
+  // Every branch below tests now_ns, never at_ns. See the contract on
+  // FaultStorage::end_planned_stop for why: judging on the supplied instant let
+  // the caller choose which of the three situations the window was in.
+  if (!it->active_at(now_ns)) {
+    return EndPlannedStopResult{EndPlannedStopOutcome::AlreadyEnded, *it};
+  }
+  if (it->starts_at_ns > now_ns) {
     // It never started: cancelled, not ended early.
     PlannedStopWindow cancelled = *it;
     cancelled.cancelled = true;
     planned_stops_.erase(it);
     return EndPlannedStopResult{EndPlannedStopOutcome::Cancelled, cancelled};
   }
-  if (it->ended_early || !it->active_at(at_ns)) {
-    return EndPlannedStopResult{EndPlannedStopOutcome::AlreadyEnded, *it};
+  if (at_ns < it->starts_at_ns || at_ns > now_ns) {
+    return EndPlannedStopResult{EndPlannedStopOutcome::InvalidAt, *it};
   }
 
   it->ends_at_ns = at_ns;

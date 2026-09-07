@@ -230,8 +230,9 @@ inline constexpr auto dto_fields<FaultListXMedkit> = std::make_tuple(
     field("peer_dropped_items", &FaultListXMedkit::peer_dropped_items),
     field("expected_count", &FaultListXMedkit::expected_count,
           "How many of the returned items started their current cycle inside a planned-stop window. Counts the "
-          "items this gateway derived a flag for; items merged from a peer carry the peer's own flag and are "
-          "not recounted here."));
+          "list that was actually served: items this gateway flagged, plus items an aggregated peer flagged "
+          "that survived the `expected` filter. A peer's items are counted on the flag the PEER derived from "
+          "its own windows; this gateway never re-derives them."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultListXMedkit> = "FaultListXMedkit";

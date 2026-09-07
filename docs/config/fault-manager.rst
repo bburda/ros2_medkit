@@ -154,12 +154,13 @@ database written by an earlier build gains the table on first open.
      - Description
    * - ``planned_stop.max_windows``
      - ``100``
-     - Declared windows retained. Bounded by **count**, not by age: a window that has ended is
-       still the reason a fault from last month reads as expected. When the bound is reached the
-       **oldest ended** windows are dropped first; a window that is still running is never dropped,
-       so the stored count can exceed the bound while more than that many windows are live. Values
-       outside ``[1, 10000]`` are clamped and the clamp is logged at startup. Lowering the bound
-       deletes stored declarations on the next start, which is also logged.
+     - Bound on the retained windows that are **no longer active**. Bounded by count, not by age:
+       a window that has ended is still the reason a fault from last month reads as expected. When
+       the bound is reached the **oldest ended** windows are dropped first. An active window is
+       always kept and is never dropped to make room - not even for the declaration that triggered
+       the prune - so the stored count is at most this value **plus the number of windows still
+       running**. Values outside ``[1, 10000]`` are clamped and the clamp is logged at startup.
+       Lowering the bound deletes stored declarations on the next start, which is also logged.
 
 Per-Entity Thresholds
 ~~~~~~~~~~~~~~~~~~~~~

@@ -242,14 +242,15 @@ struct PlannedStopWindow {
 /// different HTTP answers (200 / 404 / 400), so they are distinguished
 /// structurally rather than by inspecting a message string.
 enum class EndPlannedStopOutcome : uint8_t {
-  Ended,        ///< The window was running and now ends at the requested instant
-  Cancelled,    ///< The window had not started yet, so it was removed instead
-  NotFound,     ///< No window with that id
-  AlreadyEnded  ///< The window had already ended, early or on its own; it is not moved again
+  Ended,         ///< The window was running and now ends at the requested instant
+  Cancelled,     ///< The window had not started yet, so it was removed instead
+  NotFound,      ///< No window with that id
+  AlreadyEnded,  ///< The window had already finished, early or on its own; it is not moved again
+  InvalidAt      ///< The window is running, but the requested instant is not one it could end at
 };
 
-/// Result of an end-early request. `window` is the window as stored afterwards
-/// and is meaningful only when `outcome` is Ended.
+/// Result of an end request. `window` is the window as stored afterwards for
+/// Ended, as it was for Cancelled, and as it stands untouched for the refusals.
 struct EndPlannedStopResult {
   EndPlannedStopOutcome outcome{EndPlannedStopOutcome::NotFound};
   PlannedStopWindow window;
@@ -544,17 +545,25 @@ class FaultStorage {
   /// candidate for its own eviction.
   virtual bool declare_planned_stop(const PlannedStopWindow & window) = 0;
 
-  /// Stop a window at @p at_ns.
+  /// Stop a window.
   ///
-  /// Three answers, because there are three situations. A window still running
-  /// at that instant is CUT SHORT: ends_at_ns moves there and ended_early is
-  /// set. A window that has not STARTED by then is CANCELLED - removed, with
-  /// `cancelled` set on the returned copy - because it marked nothing and
-  /// storing ends_at <= starts_at would contradict the message's own promise.
-  /// A window that has already ended, early or on its own, is refused: when a
-  /// stop actually finished is not something a later request gets to rewrite,
-  /// backdated `at` included.
-  virtual EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns) = 0;
+  /// Which of the three situations a window is in is decided against @p now_ns -
+  /// the caller's wall clock - and NEVER against @p at_ns. Judging on the
+  /// supplied instant let the caller pick the answer: a backdated `at` inside the
+  /// original span re-ended a window that had already finished on its own, and
+  /// one before the start deleted a finished window outright.
+  ///
+  /// - Already finished at @p now_ns (`ends_at_ns <= now_ns`), early or on its
+  ///   own: refused. When a stop finished is not something a later request gets
+  ///   to rewrite.
+  /// - Not started at @p now_ns (`starts_at_ns > now_ns`): CANCELLED - removed,
+  ///   with `cancelled` set on the returned copy. It marked nothing, and storing
+  ///   ends_at <= starts_at would contradict the message's own promise.
+  /// - Running: CUT SHORT at @p at_ns, which may only REFINE the end instant
+  ///   within `[starts_at_ns, now_ns]`. Outside that it is not an instant the
+  ///   window could have ended at, and the request is refused rather than
+  ///   clamped - a silently moved end is a wrong record, not a corrected one.
+  virtual EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) = 0;
 
   /// One window by id, or nothing when no window carries that id.
   virtual std::optional<PlannedStopWindow> get_planned_stop(const std::string & id) const = 0;
@@ -565,11 +574,13 @@ class FaultStorage {
   /// Bound the number of stored windows and apply the bound now. Returns how
   /// many stored windows the bound dropped.
   ///
-  /// Only windows that have already ended at @p now_ns are candidates, oldest
-  /// declaration first; a window still running is never pruned. The stored count
-  /// can therefore exceed @p max_count while more than that many windows are
-  /// live, which is deliberate - a live window must not vanish under the
-  /// operator who declared it.
+  /// The bound counts windows that are NO LONGER ACTIVE at @p now_ns. Those are
+  /// the only candidates, oldest declaration first; an active window is always
+  /// kept and is never dropped to make room for anything, not even for the
+  /// declaration that triggered the prune. The whole table is therefore bounded
+  /// by @p max_count PLUS the number of active windows - a live window must not
+  /// vanish under the operator who declared it, and that is worth a table a few
+  /// rows over its nominal bound.
   virtual size_t set_max_planned_stops(size_t max_count, int64_t now_ns) = 0;
 
   virtual std::vector<std::string> reclassify_healed_as_cleared() {
@@ -643,7 +654,7 @@ class InMemoryFaultStorage : public FaultStorage {
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
   bool declare_planned_stop(const PlannedStopWindow & window) override;
-  EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns) override;
+  EndPlannedStopResult end_planned_stop(const std::string & id, int64_t at_ns, int64_t now_ns) override;
   std::optional<PlannedStopWindow> get_planned_stop(const std::string & id) const override;
   std::vector<PlannedStopWindow> list_planned_stops() const override;
   size_t set_max_planned_stops(size_t max_count, int64_t now_ns) override;
