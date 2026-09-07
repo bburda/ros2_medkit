@@ -70,18 +70,18 @@ import tempfile
 # gone" in both builds and prove nothing.
 #
 # open62541's own primitives - __UA_Client_writeAttribute and the rest of the
-# UA_Client_write* family - are absent from BOTH objects and therefore cannot
-# discriminate either. They used to be present, and exported, in both: nothing
-# in the plugin referenced them (open62541pp reaches the Write service through
-# services::write, not through them), but the whole archive member was linked in
-# and -fvisibility=hidden does not reach a static archive, so dlsym could call
-# one and drive a controller the REST contract never exposed.
-# -Wl,--exclude-libs,ALL plus -ffunction-sections/-fdata-sections and
-# -Wl,--gc-sections removed them from the object outright. EXPORT_DENY below is
-# what keeps that true: what remains of open62541 in a read-only object - the
-# generic __UA_Client_Service dispatcher the read path needs, and the generated
-# type descriptors the UA_TYPES table pins - is unreachable precisely because
-# the module exports none of it.
+# UA_Client_write* family - are absent from BOTH objects, so they discriminate
+# nothing between variants and are not markers. Nothing in the plugin references
+# them (open62541pp reaches the Write service through services::write), and the
+# link drops them: -Wl,--exclude-libs,ALL keeps a static archive's globals out of
+# the module's dynamic symbol table, which -fvisibility=hidden does not reach,
+# and -ffunction-sections/-fdata-sections with -Wl,--gc-sections then discard the
+# unreferenced sections. WRITE_PRIMITIVES below asserts their absence as an
+# invariant, because an object that carries them is one where the archive member
+# was pulled back in. EXPORT_DENY covers the rest: what remains of open62541 in a
+# read-only object - the generic __UA_Client_Service dispatcher the read path
+# needs, and the generated type descriptors the UA_TYPES table pins - is
+# unreachable because the module exports none of it.
 WRITE_MARKERS = (
     'ros2_medkit_gateway::OpcuaClient::write_value(',
     'ros2_medkit_gateway::OpcuaPlugin::handle_plc_operations(',
@@ -226,11 +226,11 @@ def check_object(plugin, expect, report):
     return failures
 
 
-# The reviewer's reproducer, kept as a test of the test: a module that exports
-# __UA_Client_writeAttribute next to the six entry points. It is what a version
-# script, or an -fvisibility slip on the vendored library, produces, and the
-# prefix match this check used to do waved it through - the leading underscores
-# meant it did not start with "UA_". The object is otherwise a plausible plugin
+# A test of the export rule: a module that exports __UA_Client_writeAttribute
+# next to the six entry points, which is what a version script or an -fvisibility
+# slip on the vendored library produces. The leading underscores are the point -
+# a rule that matched the prefix "UA_" would let this spelling through and hand
+# dlsym a working write primitive. The object is otherwise a plausible plugin
 # (the read markers and entry points are there), so a rejection can only come
 # from the export rule under test.
 SELF_CHECK_SOURCE = r"""
@@ -292,9 +292,9 @@ def self_check():
         if WRITE_PRIMITIVES.search(name):
             problems.append(f'WRITE_PRIMITIVES wrongly matches {name}')
 
-    # And the same rule end to end, on a real object built the way the reviewer
-    # built one. A compiler is present wherever this test runs, because the
-    # package it inspects was just compiled.
+    # And the same rule end to end, on a real linked object rather than on names
+    # alone. A compiler is present wherever this test runs, because the package
+    # it inspects was just compiled.
     workdir = Path(tempfile.mkdtemp(prefix='opcua_self_check_'))
     try:
         obj, reason = build_self_check_object(workdir)

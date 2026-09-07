@@ -265,8 +265,9 @@ if(BUILD_TESTING)
   # A test of that test: it links an object exporting
   # __UA_Client_writeAttribute alongside the plugin entry points - what a
   # version script or a visibility slip on the vendored library produces - and
-  # requires the export rule to reject it. The rule used to be a prefix match on
-  # "UA_", which that spelling walks straight past.
+  # requires the export rule to reject it. The leading underscores are what makes
+  # it worth asserting: a rule matching the prefix "UA_" lets that spelling
+  # through.
   add_test(NAME test_opcua_build_variant_self_check
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/test/inspect_build_variant.py"
