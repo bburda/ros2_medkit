@@ -12,7 +12,13 @@
 FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt-get update fetches package indexes from the distribution mirrors, a
+# network read that a reset connection fails outright and that runs before
+# anything of ours is built. Three attempts, five seconds apart; each
+# attempt's own error text goes to stderr, so the last failure is what a
+# reader sees.
+RUN retry() { n=1; while :; do "$@" && return 0; [ "$n" -ge 3 ] && return 1; echo "attempt $n of 3 failed: $*" >&2; n=$((n+1)); sleep 5; done; }; \
+    retry apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git python3 ca-certificates libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -51,7 +57,9 @@ RUN g++ -O2 -std=c++17 -w \
         -lssl -lcrypto -lpthread -o /opt/test_alarm_server
 
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Same retry as above, same reason.
+RUN retry() { n=1; while :; do "$@" && return 0; [ "$n" -ge 3 ] && return 1; echo "attempt $n of 3 failed: $*" >&2; n=$((n+1)); sleep 5; done; }; \
+    retry apt-get update && apt-get install -y --no-install-recommends \
         libstdc++6 ca-certificates libssl3 openssl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /opt/test_alarm_server /usr/local/bin/test_alarm_server

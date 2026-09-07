@@ -4,7 +4,13 @@
 
 FROM debian:bookworm-slim AS matiec-builder
 
-RUN apt-get update && apt-get install -y \
+# apt-get update fetches package indexes from the distribution mirrors, a
+# network read that a reset connection fails outright and that runs before
+# anything of ours is built. Three attempts, five seconds apart; each
+# attempt's own error text goes to stderr, so the last failure is what a
+# reader sees.
+RUN retry() { n=1; while :; do "$@" && return 0; [ "$n" -ge 3 ] && return 1; echo "attempt $n of 3 failed: $*" >&2; n=$((n+1)); sleep 5; done; }; \
+    retry apt-get update && apt-get install -y \
     git build-essential flex bison autoconf automake \
     && rm -rf /var/lib/apt/lists/*
 
@@ -19,7 +25,9 @@ WORKDIR /openplc
 
 # Pin to specific commit for reproducible builds
 ENV OPENPLC_COMMIT=8a22c81ed6ddaba13225caec4a3ff15fd2c92909
-RUN apt-get update && apt-get install -y git ca-certificates curl jq && \
+# Same retry as above, same reason.
+RUN retry() { n=1; while :; do "$@" && return 0; [ "$n" -ge 3 ] && return 1; echo "attempt $n of 3 failed: $*" >&2; n=$((n+1)); sleep 5; done; }; \
+    retry apt-get update && apt-get install -y git ca-certificates curl jq && \
     git clone https://github.com/Autonomy-Logic/openplc-runtime.git /openplc && \
     cd /openplc && git checkout ${OPENPLC_COMMIT} && \
     rm -rf /var/lib/apt/lists/*
