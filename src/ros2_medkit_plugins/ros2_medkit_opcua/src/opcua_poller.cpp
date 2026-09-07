@@ -1142,9 +1142,27 @@ bool OpcuaPoller::comms_lost_should_raise(bool enabled, bool already_raised,
   return (now - down_since) >= debounce;
 }
 
+std::optional<std::string>
+OpcuaPoller::adopt_rediscovered_endpoint(const std::string & current,
+                                         const std::function<std::optional<std::string>()> & rediscover) {
+  if (!rediscover) {
+    return std::nullopt;
+  }
+  const std::optional<std::string> found = rediscover();
+  if (!found || found->empty() || *found == current) {
+    return std::nullopt;
+  }
+  return found;
+}
+
+std::chrono::milliseconds OpcuaPoller::next_reconnect_wait(std::chrono::milliseconds current,
+                                                           std::chrono::milliseconds max_wait) {
+  return std::min(current * 2, max_wait);
+}
+
 void OpcuaPoller::emit_comms_lost(bool active) {
   ros2_medkit::fault_detection::FaultSignal signal;
-  signal.fault_code = "PLC_COMMS_LOST";
+  signal.fault_code = kCommsLostFaultCode;
   signal.severity = config_.comms_lost_severity;
   signal.message = active ? ("OPC-UA connection lost to " + client_.endpoint_url())
                           : ("OPC-UA connection restored to " + client_.endpoint_url());
@@ -1157,7 +1175,6 @@ void OpcuaPoller::emit_comms_lost(bool active) {
 
 void OpcuaPoller::poll_loop() {
   auto reconnect_wait = config_.reconnect_interval;
-  constexpr auto max_reconnect_wait = std::chrono::milliseconds(60000);
 
   while (running_.load()) {
     // Handle reconnection
@@ -1173,15 +1190,32 @@ void OpcuaPoller::poll_loop() {
         comms_down_since_ = std::chrono::steady_clock::now();
       }
 
-      // Attempt reconnect with original config (preserves timeout, etc.)
-      if (client_.connect(client_.current_config())) {
+      // Reconnect with the original config (preserves timeout, security, ...).
+      // The endpoint is the one exception: when a rediscovery callback is bound
+      // and offers a different server, adopt it for this attempt. connect()
+      // stores the config it is given, so current_config() carries the adopted
+      // endpoint from here on and every later retry targets the new server.
+      OpcuaClientConfig reconnect_config = client_.current_config();
+      if (auto adopted = adopt_rediscovered_endpoint(reconnect_config.endpoint_url, config_.rediscover_endpoint)) {
+        reconnect_config.endpoint_url = *adopted;
+        // A freshly discovered server deserves a prompt attempt: without this
+        // reset the backoff (up to 60 s) would keep the newly found PLC waiting
+        // for as long as the old dead endpoint had earned.
+        reconnect_wait = config_.reconnect_interval;
+      }
+
+      if (client_.connect(reconnect_config)) {
         reconnect_wait = config_.reconnect_interval;  // reset on success
-        // Issue #496: connection restored - clear the comms-lost fault if it
-        // was raised, then reset the debounce timer.
-        if (comms_lost_raised_) {
+        // Issue #496: connection restored - clear the comms-lost fault. Sent on
+        // EVERY successful reconnect, not only when this process raised it: the
+        // fault manager keys faults by fault_code and persists them, so a fault
+        // raised before a restart is standing in the store with nothing in
+        // memory to remember it. The clear is fire-and-forget and the store
+        // answers "not found" harmlessly when there is nothing to clear.
+        if (config_.comms_lost_fault_enabled) {
           emit_comms_lost(/*active=*/false);
-          comms_lost_raised_ = false;
         }
+        comms_lost_raised_ = false;
         comms_down_since_.reset();
         if (config_.prefer_subscriptions) {
           setup_subscriptions();
@@ -1214,14 +1248,16 @@ void OpcuaPoller::poll_loop() {
             comms_lost_raised_ = true;
           }
         }
-        // Exponential backoff capped at 60s. condition_variable so stop() wakes immediately.
+        // Exponential backoff, capped at config_.max_reconnect_interval (60 s by
+        // default, the rescan cadence while the reconnect arm also rescans).
+        // condition_variable so stop() wakes immediately.
         {
           std::unique_lock<std::mutex> lock(stop_mutex_);
           stop_cv_.wait_for(lock, reconnect_wait, [this] {
             return !running_.load();
           });
         }
-        reconnect_wait = std::min(reconnect_wait * 2, max_reconnect_wait);
+        reconnect_wait = next_reconnect_wait(reconnect_wait, config_.max_reconnect_interval);
         continue;
       }
     }

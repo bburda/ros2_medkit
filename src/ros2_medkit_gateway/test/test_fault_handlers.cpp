@@ -142,6 +142,54 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponsePropagatesCaptureOrigin) {
   EXPECT_EQ(snap["x-medkit"]["capture_origin"], "startup");
 }
 
+TEST_F(FaultHandlersTest, BuildSovdFaultResponseServesEntityFrameSource) {
+  // A plugin-captured entity frame reaches the wire with an empty topic and
+  // message_type (the values are not a ROS message) plus x-medkit.source
+  // naming the capture path that read them.
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "PLC_ALARM";
+
+  json env_data = {{"snapshots", json::array({{{"type", "freeze_frame"},
+                                               {"snapshot_type", "freeze_frame"},
+                                               {"name", "plc_app"},
+                                               {"data", R"({"tank_level": 87.5})"},
+                                               {"topic", ""},
+                                               {"message_type", ""},
+                                               {"captured_at_ns", 1234},
+                                               {"source", "plugin_x_plc_data_route"}}})}};
+
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_data, "/apps/plc_app"));
+
+  auto & snap = response["environment_data"]["snapshots"][0];
+  EXPECT_EQ(snap["x-medkit"]["source"], "plugin_x_plc_data_route");
+  EXPECT_EQ(snap["x-medkit"]["topic"], "");
+  EXPECT_EQ(snap["x-medkit"]["message_type"], "");
+}
+
+TEST_F(FaultHandlersTest, BuildSovdFaultResponseOmitsSourceWhenTheSnapshotHasNone) {
+  // Absence control for the test above, on the same harness: a topic-captured
+  // freeze frame (the fault_manager's own) carries no source, and none is
+  // invented for it.
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "TEMP_FAULT";
+
+  ros2_medkit_msgs::msg::EnvironmentData env_data;
+  ros2_medkit_msgs::msg::Snapshot freeze_frame;
+  freeze_frame.type = "freeze_frame";
+  freeze_frame.name = "temperature";
+  freeze_frame.data = R"({"temperature": 85.5})";
+  freeze_frame.topic = "/motor/temperature";
+  freeze_frame.message_type = "sensor_msgs/msg/Temperature";
+  env_data.snapshots.push_back(freeze_frame);
+
+  auto response =
+      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/motor"));
+
+  auto & snap = response["environment_data"]["snapshots"][0];
+  EXPECT_FALSE(snap["x-medkit"].contains("source"));
+  EXPECT_EQ(snap["x-medkit"]["topic"], "/motor/temperature");
+}
+
 // Conversion layer must emit an explicit "snapshot_type" discriminator so
 // downstream consumers (handler, SSE, MCP) can dispatch on a single key
 // regardless of which optional payload fields are present.

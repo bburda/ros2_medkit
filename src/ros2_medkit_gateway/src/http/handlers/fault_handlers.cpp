@@ -263,6 +263,13 @@ json FaultHandlers::merge_entity_freeze_frames(json env_data,
     snap["topic"] = "";  // entity data values, not a ROS topic
     snap["message_type"] = "";
     snap["captured_at_ns"] = frame.captured_at_ns;
+    // Capture provenance. topic/message_type stay empty because these values
+    // are not a ROS message, which leaves "source" as the only field naming
+    // where the numbers came from - so carry it whenever the capture named a
+    // path.
+    if (!frame.source.empty()) {
+      snap["source"] = frame.source;
+    }
     if (frame.startup_catchup) {
       // Values were read at gateway start, not when the fault confirmed;
       // absent marker = captured on the confirm edge.
@@ -344,6 +351,12 @@ dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_jso
           snap["x-medkit"]["capture_origin"] = s["capture_origin"];
         }
         // Entity-frame provenance (merge_entity_freeze_frames), only when known.
+        // "source" names the capture path (a plugin DataProvider or the
+        // plugin's x-plc-data route). A consumer reads it instead of the
+        // empty topic/message_type an entity frame necessarily carries.
+        if (s.contains("source") && s["source"].is_string()) {
+          snap["x-medkit"]["source"] = s["source"];
+        }
         if (s.contains("connected") && s["connected"].is_boolean()) {
           snap["x-medkit"]["connected"] = s["connected"];
         }

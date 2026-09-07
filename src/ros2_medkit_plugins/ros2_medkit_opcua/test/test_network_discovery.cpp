@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <set>
 #include <string>
@@ -106,7 +107,32 @@ TEST(ParseDiscoveryConfig, DefaultsDisabled) {
   ASSERT_EQ(cfg.ports.size(), 1u);
   EXPECT_EQ(cfg.ports[0], 4840);
   EXPECT_TRUE(cfg.anonymous_none_only);
-  EXPECT_EQ(cfg.interval_s, 0);
+  // Unset, NOT 0: an absent key means "no cadence stated" (the caller takes its
+  // built-in default), while an explicit 0 means "never re-scan".
+  EXPECT_FALSE(cfg.interval_s.has_value());
+}
+
+TEST(ParseDiscoveryConfig, ExplicitZeroIntervalIsKeptAsAnExplicitZero) {
+  std::vector<std::string> warnings;
+  const auto cfg = parse_discovery_config(nlohmann::json{{"interval_s", 0}}, [&](const std::string & m) {
+    warnings.push_back(m);
+  });
+  ASSERT_TRUE(cfg.interval_s.has_value());
+  EXPECT_EQ(*cfg.interval_s, 0);
+  EXPECT_TRUE(warnings.empty());
+}
+
+TEST(ParseDiscoveryConfig, NegativeIntervalWarnsAndLeavesTheCadenceUnset) {
+  std::vector<std::string> warnings;
+  const auto cfg = parse_discovery_config(nlohmann::json{{"interval_s", -5}}, [&](const std::string & m) {
+    warnings.push_back(m);
+  });
+  EXPECT_FALSE(cfg.interval_s.has_value());
+  ASSERT_EQ(warnings.size(), 1u);
+  EXPECT_NE(warnings[0].find("interval_s"), std::string::npos);
+  // The warning must not tell the operator the kept default is one-shot: an
+  // unset interval re-scans on the built-in cadence, only an explicit 0 stops.
+  EXPECT_EQ(warnings[0].find("0 = one-shot"), std::string::npos) << warnings[0];
 }
 
 TEST(ParseDiscoveryConfig, ReadsAllKnownKeys) {
@@ -133,7 +159,8 @@ TEST(ParseDiscoveryConfig, ReadsAllKnownKeys) {
   EXPECT_EQ(cfg.connect_timeout_ms, 300);
   EXPECT_EQ(cfg.scan_concurrency, 64);
   EXPECT_EQ(cfg.identify_timeout_ms, 2000);
-  EXPECT_EQ(cfg.interval_s, 900);
+  ASSERT_TRUE(cfg.interval_s.has_value());
+  EXPECT_EQ(*cfg.interval_s, 900);
   EXPECT_FALSE(cfg.anonymous_none_only);
   EXPECT_TRUE(warnings.empty());
 }
@@ -375,6 +402,91 @@ TEST(NetworkDiscoveryRun, IdentifyFailureRecordedAsLead) {
   ASSERT_EQ(eps.size(), 1u);
   EXPECT_EQ(eps[0].identify_error, "BadTimeout");
   EXPECT_EQ(NetworkDiscovery::select_auto_endpoint(eps, true), nullptr);
+}
+
+// --------------------------------------------------------------------------- //
+// run(cancelled): a shutdown must not wait out a whole sweep
+// --------------------------------------------------------------------------- //
+TEST(NetworkDiscoveryRun, CancelStopsTheSweepInsteadOfProbingEveryHost) {
+  // A /24 is 254 probes and a legal /16 is 65k, and the caller runs them on the
+  // poll thread a shutdown has to join. With scan_concurrency 1 the sweep is
+  // sequential, so the probe count is exactly what the cancel predicate allowed.
+  std::atomic<int> probes{0};
+  std::atomic<bool> stop{false};
+  auto scan = [&probes, &stop](const std::string &, uint16_t, int) {
+    if (probes.fetch_add(1) + 1 >= 5) {
+      stop.store(true);  // the shutdown flag flipping mid-sweep
+    }
+    return false;
+  };
+  OpcuaDiscoveryConfig cfg;
+  cfg.enabled = true;
+  cfg.subnets = {"192.168.1.0/24"};
+  cfg.ports = {4840};
+  cfg.scan_concurrency = 1;
+
+  NetworkDiscovery disc(cfg, scan, make_identify({}));
+  const auto eps = disc.run([&stop]() {
+    return stop.load();
+  });
+
+  EXPECT_TRUE(eps.empty());
+  // One in-flight probe per worker may still complete after the flag flips.
+  EXPECT_GE(probes.load(), 5);
+  EXPECT_LE(probes.load(), 6) << "the sweep kept probing after it was cancelled";
+}
+
+TEST(NetworkDiscoveryRun, WithoutCancellationEveryHostIsStillProbed) {
+  // Positive control for the test above on the same harness: the identical
+  // sweep with no cancel predicate visits all 254 hosts, so a low probe count
+  // there is the cancellation and not a broken fake.
+  std::atomic<int> probes{0};
+  auto scan = [&probes](const std::string &, uint16_t, int) {
+    probes.fetch_add(1);
+    return false;
+  };
+  OpcuaDiscoveryConfig cfg;
+  cfg.enabled = true;
+  cfg.subnets = {"192.168.1.0/24"};
+  cfg.ports = {4840};
+  cfg.scan_concurrency = 1;
+
+  NetworkDiscovery disc(cfg, scan, make_identify({}));
+  const auto eps = disc.run();
+  EXPECT_TRUE(eps.empty());
+  EXPECT_EQ(probes.load(), 254);
+}
+
+TEST(NetworkDiscoveryRun, CancelBetweenSweepAndIdentifySkipsTheIdentifyRoundTrips) {
+  // The identify phase is a separate batch, and each GetEndpoints blocks for up
+  // to identify_timeout_ms. A cancel that arrives once the sweep is done must
+  // not still pay for one round-trip per hit.
+  std::atomic<bool> stop{false};
+  auto scan = [&stop](const std::string & ip, uint16_t, int) {
+    const bool hit = ip == "192.168.1.10" || ip == "192.168.1.11";
+    if (ip == "192.168.1.254") {
+      stop.store(true);  // sweep finished, shutdown requested
+    }
+    return hit;
+  };
+  std::atomic<int> identifies{0};
+  auto identify = [&identifies](const std::string &, int) {
+    identifies.fetch_add(1);
+    return IdentifyResult{};
+  };
+
+  OpcuaDiscoveryConfig cfg;
+  cfg.enabled = true;
+  cfg.subnets = {"192.168.1.0/24"};
+  cfg.ports = {4840};
+  cfg.scan_concurrency = 1;
+
+  NetworkDiscovery disc(cfg, scan, identify);
+  const auto eps = disc.run([&stop]() {
+    return stop.load();
+  });
+  EXPECT_TRUE(eps.empty());
+  EXPECT_EQ(identifies.load(), 0);
 }
 
 // --------------------------------------------------------------------------- //

@@ -573,6 +573,15 @@ TEST_F(EntityFreezeFrameCaptureTest, DisconnectedEntityWithLastKnownValuesIsCapt
   ASSERT_TRUE(frames[0].connected.has_value());
   EXPECT_FALSE(*frames[0].connected);
   EXPECT_EQ(frames[0].source_timestamp, 1234567890);
+  // Which path read the values. This capture had no DataProvider and went
+  // through the route fallback, so the frame must name that path. The
+  // DataProvider flavour of the same case asserts the other constant, which is
+  // what stops the two from being swapped at their call sites unnoticed.
+  EXPECT_EQ(frames[0].source, EntityFreezeFrameCapture::kSourceXPlcDataRoute);
+  // The wire value itself, not just the symbol: swapping what the two constants
+  // hold is an API break for every consumer of x-medkit.source, and comparing
+  // symbol against symbol would not see it.
+  EXPECT_EQ(frames[0].source, "plugin_x_plc_data_route");
 }
 
 /// @verifies REQ_INTEROP_088
@@ -642,6 +651,11 @@ TEST_F(EntityFreezeFrameCaptureTest, DisconnectedDataProviderWithLastKnownValues
   ASSERT_TRUE(frames[0].connected.has_value());
   EXPECT_FALSE(*frames[0].connected);
   EXPECT_TRUE(frames[0].source_timestamp.is_null());  // provider content has no timestamp field
+  // The provider path names itself, and the route path (same case, above) names
+  // the other constant: the pair is what makes a swap of the two call sites
+  // visible. The literal pins the wire value the API reference documents.
+  EXPECT_EQ(frames[0].source, EntityFreezeFrameCapture::kSourceDataProvider);
+  EXPECT_EQ(frames[0].source, "plugin_data_provider");
 }
 
 /// @verifies REQ_INTEROP_088
@@ -785,6 +799,40 @@ TEST(MergeEntityFreezeFrames, AppendsWhenNoConfiguredFreezeFrame) {
   EXPECT_EQ(json::parse(snap["data"].get<std::string>())["temperature"], 42.5);
   EXPECT_EQ(snap["captured_at_ns"], 1234);
   EXPECT_FALSE(snap.contains("capture_origin"));  // confirm-edge frames carry no marker
+}
+
+TEST(MergeEntityFreezeFrames, CarriesCapturePathAsSource) {
+  // An entity frame has no ROS topic, so topic/message_type are necessarily
+  // empty, so "source" is the only field left saying where they came from.
+  json env_data = {{"snapshots", json::array()}};
+  EntityFreezeFrameCapture::Frame frame;
+  frame.entity_id = "plc_app";
+  frame.values = {{"temperature", 42.5}};
+  frame.captured_at_ns = 1234;
+  frame.source = EntityFreezeFrameCapture::kSourceXPlcDataRoute;
+
+  auto merged = FaultHandlers::merge_entity_freeze_frames(env_data, {frame});
+  ASSERT_EQ(merged["snapshots"].size(), 1u);
+  const auto & snap = merged["snapshots"][0];
+  EXPECT_EQ(snap["source"], EntityFreezeFrameCapture::kSourceXPlcDataRoute);
+  EXPECT_EQ(snap["topic"], "");
+  EXPECT_EQ(snap["message_type"], "");
+}
+
+TEST(MergeEntityFreezeFrames, OmitsSourceForAFrameThatNamesNoPath) {
+  // A merge-helper contract, not a control for the capture tests: both capture
+  // paths always name themselves (asserted from real captures in
+  // Disconnected{Entity,DataProvider}WithLastKnownValuesIsCaptured), so this
+  // frame is one only a caller can build. The helper must then leave the key
+  // out rather than invent a provenance the wire consumer would trust.
+  json env_data = {{"snapshots", json::array()}};
+  EntityFreezeFrameCapture::Frame frame;
+  frame.entity_id = "plc_app";
+  frame.values = {{"temperature", 42.5}};
+
+  auto merged = FaultHandlers::merge_entity_freeze_frames(env_data, {frame});
+  ASSERT_EQ(merged["snapshots"].size(), 1u);
+  EXPECT_FALSE(merged["snapshots"][0].contains("source"));
 }
 
 TEST(MergeEntityFreezeFrames, StartupCatchUpFrameCarriesCaptureOrigin) {

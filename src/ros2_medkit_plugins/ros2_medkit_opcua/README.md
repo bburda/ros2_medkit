@@ -548,7 +548,7 @@ ros2_medkit_gateway:
 | `subscription_interval_ms` | `500` | Publishing interval for OPC-UA subscriptions when `prefer_subscriptions: true` |
 | `condition_replay_strategy` | `auto` | Active-condition replay on reconnect: `method`, `read`, `auto`, `off` (see below) |
 | `require_confirm_for_clear` | `true` | Require both Acknowledge AND Confirm before a native alarm auto-clears. Set `false` for Confirm-less servers (e.g. Siemens S7-1500) so alarms clear on Acknowledge alone (see below) |
-| `comms_lost_fault_enabled` | `true` | Raise a component-scoped `PLC_COMMS_LOST` fault when the connection stays down (issue #496) |
+| `comms_lost_fault_enabled` | `true` | Raise a component-scoped `PLC_COMMS_LOST` fault when the connection stays down, and clear it on every successful connect (issue #496) |
 | `comms_lost_debounce_ms` | `5000` | Continuous down time before `PLC_COMMS_LOST` is raised (debounces reconnect blips; clamped to [0, 3600000] ms) |
 | `comms_lost_severity` | `ERROR` | SOVD severity bucket for the `PLC_COMMS_LOST` fault |
 | `discovery.enabled` | `false` | Opt-in read-only PLC network discovery (auto endpoint). See below |
@@ -604,12 +604,18 @@ plugins.opcua.discovery:
   connect_timeout_ms: 600      # per-port TCP connect timeout
   scan_concurrency: 100        # bounded, polite concurrent connect count
   identify_timeout_ms: 6000    # per GetEndpoints identify
-  interval_s: 0                # 0 = one-shot at startup (periodic re-scan: TODO)
+  # re-scan cadence while disconnected. Omit the key for the built-in 30 s,
+  # or set it to 0 to keep discovery on but never re-scan (start-up scan only).
+  interval_s: 30
   anonymous_none_only: true    # only auto-connect None/Anonymous servers
 ```
 
 Environment overrides (Docker / appliance): `OPCUA_DISCOVERY_ENABLED`,
 `OPCUA_DISCOVERY_SUBNETS` (comma-separated CIDRs), `OPCUA_DISCOVERY_INTERVAL_S`.
+Leaving `interval_s` (and `OPCUA_DISCOVERY_INTERVAL_S`) unset means "no cadence
+stated" and takes the 30 s default. An explicit `0` is honoured as written and
+turns the recurring sweep off. A negative value is refused with a warning and
+leaves the cadence unset.
 
 How it works:
 1. Bounded concurrent TCP connect sweep of the configured ports across the
@@ -625,24 +631,52 @@ How it works:
    auto-selects the best None/Anonymous data server (deterministic, lowest
    ip:port) and connects to the **scanned ip:port** - not the advertised
    EndpointUrl, which a server may report as a non-resolvable hostname.
+5. While no session is established, the reconnect loop scans again every
+   `interval_s` (default 30 s), measured from the END of the previous sweep, and
+   adopts a newly found server for its next connect attempt, logging the swap at
+   INFO. The re-scan is consulted once per reconnect attempt, and those are
+   spaced by an exponential backoff, so the backoff ceiling is capped at
+   `interval_s` while discovery is re-scanning - otherwise the real cadence
+   would be `max(interval_s, backoff)` rather than the stated one. This covers
+   the common race where the gateway and the PLC boot together: the startup scan
+   finds nothing because the PLC is still coming up, and without a re-scan the
+   plugin would retry the fallback endpoint until someone restarted it.
+6. On the first session after such an adoption, a config-less deployment (no
+   node map) re-derives the SOVD component identity from the device itself, so
+   the component stops being served under the provisional `opcua-<host>` name it
+   got when nothing answered. The change is logged at INFO.
+
+Re-scanning stops as soon as a session is up, and never starts at all when an
+`endpoint_url` is configured.
 
 Safety / OT posture:
 - Everything is read-only: TCP connect + `GetEndpoints` only. No writes, no
   subscriptions, no second long-lived session.
+- The scan is NOT one-shot: while the plugin has no session it repeats every
+  `interval_s` (default 30 s) for as long as it stays disconnected. Set
+  `interval_s: 0` (or `OPCUA_DISCOVERY_INTERVAL_S=0`) to keep discovery on with
+  the start-up scan only, or `enabled: false` to switch it off entirely.
+- A sweep is cancellable, so a stop does not have to wait out a subnet the size
+  of a /16. The start-up sweep runs while the gateway node is still being
+  constructed, so what ends it is `SIGINT` / `SIGTERM`, which the plugin sees
+  through `rclcpp::ok()`. A re-scan sweep runs on the poll thread and is ended
+  by either that or the plugin's own `shutdown()`.
 - An explicitly configured `endpoint_url` (or `OPCUA_ENDPOINT_URL`) always wins;
   discovery then does nothing, so it never opens a second session on a PLC the
   plugin already polls.
-- Secured-only servers (no None/Anonymous endpoint) are surfaced in the startup
-  log as leads requiring operator credentials - never auto-connected or probed.
+- Secured-only servers (no None/Anonymous endpoint) are surfaced in the log as
+  leads requiring operator credentials - never auto-connected or probed. A
+  re-scan whose outcome has not changed reports at DEBUG instead of repeating
+  the whole report, so a recurring sweep does not bury the rest of the log.
 - The scan is bounded (short connect timeout, capped concurrency) and CIDRs
   wider than /16 are rejected to prevent an accidental broad sweep.
 
 Note on passive discovery: a stock Siemens S7-1500 neither multicast-announces
 (mDNS `_opcua-tcp._tcp`) nor registers with an OPC-UA LDS, so passive sources
 find nothing there; the active scan is what discovers it. Passive mDNS / LDS
-`FindServers` sources (useful on Kepware / Prosys / GDS estates) and periodic
-re-scan + multi-endpoint registration are planned follow-ups; this iteration
-delivers the active-scan core and single "auto endpoint" mode.
+`FindServers` sources (useful on Kepware / Prosys / GDS estates) and
+multi-endpoint registration are planned follow-ups. This iteration delivers the
+active-scan core and a single "auto endpoint" mode.
 
 ### Active-condition replay on reconnect (issue #389/#478)
 
@@ -693,6 +727,20 @@ Set `require_confirm_for_clear: false` (or `OPCUA_REQUIRE_CONFIRM_FOR_CLEAR=0`)
 so the alarm clears on `Acknowledge` alone. The default (`true`) is unchanged
 and spec-strict; the relaxed path still requires acknowledgement and needs
 real-S7-1500 validation.
+
+### Connection loss and `PLC_COMMS_LOST` (issue #496)
+
+When the OPC-UA connection stays down for `comms_lost_debounce_ms` continuously,
+the plugin raises one component-scoped `PLC_COMMS_LOST` fault (a shorter blip
+during a normal reconnect does not flap it).
+
+The fault is cleared on **every** successful connect, both the initial one and
+every later reconnect, whether or not this process was the one that raised it.
+The fault manager keys faults by fault code and persists them, so a fault raised
+before a gateway restart is still standing while the new process has no memory
+of it. Clearing only what the running process remembered left exactly that fault
+CONFIRMED for good. The clear is fire-and-forget, so a clear for a fault that is
+not there is harmless.
 
 Node map entries also support an optional `ros2_topic` field to override the auto-generated ROS 2 topic name for the PLC value bridge:
 
@@ -825,6 +873,16 @@ bash scripts/run_integration_tests.sh
 
 # Stop
 bash scripts/stop.sh
+```
+
+A separate scenario covers the config-less discovery start-up race, which the
+suite above cannot see because it pins `OPCUA_ENDPOINT_URL` and so
+short-circuits discovery. It starts the gateway before any server, with
+discovery on and no endpoint configured, then brings a server up and asserts
+the gateway adopts it without a restart:
+
+```bash
+bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/run_discovery_race_test.sh
 ```
 
 ### Test Coverage

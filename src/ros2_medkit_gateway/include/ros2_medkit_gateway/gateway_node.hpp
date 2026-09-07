@@ -498,6 +498,27 @@ class GatewayNode : public rclcpp::Node {
 };
 
 /**
+ * @brief Is this node FQN the gateway's own, rather than a diagnosable peer?
+ *
+ * True for the gateway node itself and for the helper nodes it creates inside
+ * its own process: the subscription executor's `<fqn>_sub`, the fault-service
+ * transport's `<fqn>_fault_clients`, and the lifecycle reader's
+ * `<fqn>_lifecycle_state_reader`. None of these begins with '_', so the ROS 2
+ * hidden-node convention does not cover them and the gateway would otherwise
+ * count them as peers and list them as diagnosable Apps - reporting on itself.
+ *
+ * A fault_manager node sharing the process is NOT ours: it is a separate,
+ * diagnosable component and stays visible.
+ *
+ * Exact matches only. A prefix test would also claim a genuine peer named
+ * `<fqn>_monitor` or `<fqn>2`, and dropping a real node is the worse error.
+ *
+ * @param node_fqn Fully qualified node name to test ("/ns/node")
+ * @param self_fqn The gateway node's own FQN. An empty value matches nothing
+ */
+bool is_own_gateway_node(const std::string & node_fqn, const std::string & self_fqn);
+
+/**
  * @brief Filter ROS 2 internal nodes from an app list
  *
  * Removes apps whose base name begins with '_' (ROS 2 internal node convention).
@@ -505,11 +526,18 @@ class GatewayNode : public rclcpp::Node {
  * before checking for the underscore prefix, using the routing table for precise
  * prefix detection.
  *
+ * Also removes local apps bound to one of the gateway's own nodes
+ * (is_own_gateway_node), which the underscore rule cannot see. The test is on
+ * the bound node FQN, and only for apps with no routing-table entry: a peer's
+ * helper nodes are the peer's business and are left to the peer's own filter.
+ *
  * @param apps App vector to filter in place
  * @param peer_routing_table Maps entity_id -> peer_name for remote entities
+ * @param self_fqn The gateway node's own FQN. Empty disables the self check
  * @return Number of apps removed
  */
 size_t filter_internal_node_apps(std::vector<App> & apps,
-                                 const std::unordered_map<std::string, std::string> & peer_routing_table);
+                                 const std::unordered_map<std::string, std::string> & peer_routing_table,
+                                 const std::string & self_fqn);
 
 }  // namespace ros2_medkit_gateway
