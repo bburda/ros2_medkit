@@ -308,7 +308,7 @@ TEST_F(OpcuaPluginTest, ReadDataNotFound) {
 #if MEDKIT_OPCUA_READ_ONLY
 // A read-only build refuses every write before it looks anything up, so the
 // point being writable, read-only or absent, and the body being well formed or
-// not, all reach the same answer: 403 and a message naming the build property.
+// not, all reach the same answer: 501 and a message naming the build property.
 TEST_F(OpcuaPluginTest, WriteDataRefusedOnAReadOnlyBuild) {
   const std::vector<std::string> resources{"level", "pressure", "nonexistent"};
   const std::vector<nlohmann::json> bodies{nlohmann::json{{"value", 5.0}}, nlohmann::json{{"not_value", 42}},
@@ -318,7 +318,7 @@ TEST_F(OpcuaPluginTest, WriteDataRefusedOnAReadOnlyBuild) {
       auto result = plugin_.write_data("tank", resource, body);
       ASSERT_FALSE(result.has_value()) << resource << " / " << body.dump();
       EXPECT_EQ(result.error().code, DataProviderError::ReadOnly);
-      EXPECT_EQ(result.error().http_status, 403);
+      EXPECT_EQ(result.error().http_status, 501);
       EXPECT_NE(result.error().message.find("MEDKIT_OPCUA_READ_ONLY"), std::string::npos)
           << "the refusal must name the build property, got: " << result.error().message;
     }
@@ -331,7 +331,7 @@ TEST_F(OpcuaPluginTest, WriteDataRefusedOnAReadOnlyBuild) {
 TEST_F(OpcuaPluginTest, WriteDataRefusedForUnknownEntityOnAReadOnlyBuild) {
   auto result = plugin_.write_data("nonexistent", "level", nlohmann::json{{"value", 5.0}});
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().http_status, 403);
+  EXPECT_EQ(result.error().http_status, 501);
 }
 #else
 TEST_F(OpcuaPluginTest, WriteDataReadOnly) {
@@ -426,7 +426,7 @@ TEST_F(OpcuaPluginTest, ExecuteOperationRefusedOnAReadOnlyBuild) {
       auto result = plugin_.execute_operation("tank", op, params);
       ASSERT_FALSE(result.has_value()) << op << " / " << params.dump();
       EXPECT_EQ(result.error().code, OperationProviderError::Rejected);
-      EXPECT_EQ(result.error().http_status, 403);
+      EXPECT_EQ(result.error().http_status, 501);
       EXPECT_NE(result.error().message.find("MEDKIT_OPCUA_READ_ONLY"), std::string::npos)
           << "the refusal must name the build property, got: " << result.error().message;
     }
@@ -447,6 +447,30 @@ TEST_F(OpcuaPluginTest, ExecuteOperationReadOnly) {
   EXPECT_EQ(result.error().code, OperationProviderError::Rejected);
 }
 #endif
+
+// -- infer_writable: an explicit request is distinguishable from the default --
+
+TEST(OpcuaPluginAutoBrowseConfig, InferWritableSourceRecordsTheParameterSpelling) {
+  OpcuaPlugin plugin;
+  nlohmann::json config;
+  config["endpoint_url"] = "opc.tcp://nonexistent:4840";
+  config["auto_browse"] = nlohmann::json{{"enabled", true}, {"infer_writable", true}};
+  plugin.configure(config);
+  EXPECT_EQ(plugin.auto_browse_config_for_test().infer_writable_source, "plugins.opcua.auto_browse.infer_writable");
+}
+
+TEST(OpcuaPluginAutoBrowseConfig, InferWritableSourceStaysEmptyWhenTheParameterIsAbsent) {
+  OpcuaPlugin plugin;
+  nlohmann::json config;
+  config["endpoint_url"] = "opc.tcp://nonexistent:4840";
+  config["auto_browse"] = nlohmann::json{{"enabled", true}};
+  plugin.configure(config);
+  // Enabled, and infer_writable still defaults to true - but nobody asked, so a
+  // read-only build has nothing to warn about.
+  EXPECT_TRUE(plugin.auto_browse_config_for_test().enabled);
+  EXPECT_TRUE(plugin.auto_browse_config_for_test().infer_writable);
+  EXPECT_TRUE(plugin.auto_browse_config_for_test().infer_writable_source.empty());
+}
 
 // -- Condition operations (acknowledge / confirm) per build variant --------
 //
@@ -511,7 +535,7 @@ TEST_F(OpcuaPluginEventAlarmsTest, ConditionOperationsRefusedOnAReadOnlyBuild) {
     auto result = plugin_.execute_operation("tank", op, nlohmann::json{{"fault_code", "PLC_OVERPRESSURE"}});
     ASSERT_FALSE(result.has_value()) << op;
     EXPECT_EQ(result.error().code, OperationProviderError::Rejected);
-    EXPECT_EQ(result.error().http_status, 403);
+    EXPECT_EQ(result.error().http_status, 501);
     EXPECT_NE(result.error().message.find("MEDKIT_OPCUA_READ_ONLY"), std::string::npos)
         << "the refusal must name the build property, got: " << result.error().message;
   }

@@ -25,6 +25,9 @@
 set -euo pipefail
 
 VARIANT="${MEDKIT_OPCUA_VARIANT:-read-only}"
+# SOVD spells "the entity does not support this" as 501; 403 is reserved for a
+# valid token with insufficient permissions, which no credential can fix here.
+REFUSAL_STATUS=501
 if [[ "${VARIANT}" == "read-only" ]]; then
   READ_ONLY=ON
 elif [[ "${VARIANT}" == "write-capable" ]]; then
@@ -200,8 +203,8 @@ sovd_post_op_refused() {
   local code
   code=$(curl -s -o /tmp/alarm_test_resp.json -w '%{http_code}' \
               -X POST -H 'Content-Type: application/json' -d "${body}" "${url}")
-  if [[ "${code}" != "403" ]]; then
-    echo "ASSERT FAILED: POST ${op} expected HTTP 403, got ${code}" >&2
+  if [[ "${code}" != "${REFUSAL_STATUS}" ]]; then
+    echo "ASSERT FAILED: POST ${op} expected HTTP ${REFUSAL_STATUS}, got ${code}" >&2
     cat /tmp/alarm_test_resp.json >&2 || true
     return 1
   fi
@@ -215,7 +218,7 @@ sovd_post_op_refused() {
     cat /tmp/alarm_test_resp.json >&2 || true
     return 1
   fi
-  echo "  OK POST ${op} refused 403 x-medkit-plugin-error naming MEDKIT_OPCUA_READ_ONLY"
+  echo "  OK POST ${op} refused ${REFUSAL_STATUS} x-medkit-plugin-error naming MEDKIT_OPCUA_READ_ONLY"
 }
 
 # What the tree advertises: a read-only image must not offer an operation it

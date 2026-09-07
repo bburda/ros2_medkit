@@ -74,7 +74,7 @@ namespace ros2_medkit_gateway {
 /// setting. ``MEDKIT_OPCUA_READ_ONLY`` defaults to ON: the OPC-UA write path is
 /// then absent from the object, no data point is ever marked writable, neither
 /// the x-plc-operations capability nor its POST route is registered, and
-/// write_data / the value-write half of execute_operation refuse with 403
+/// write_data / the value-write half of execute_operation refuse with 501
 /// before reaching the client. ``-DMEDKIT_OPCUA_READ_ONLY=OFF`` builds the
 /// write-capable plugin.
 class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
@@ -122,6 +122,13 @@ class OpcuaPlugin : public ros2_medkit_gateway::GatewayPlugin,
   // True for any entity_defs() entry (mirrors list_operations' own lookup),
   // false for the Component itself, which has no entity_defs entry.
   bool has_operations(const std::string & entity_id) const override;
+
+  /// The address-space walk configuration after configure() has merged the
+  /// node map and the ROS parameters. Read by tests that need to see which
+  /// source supplied a setting, which no REST response exposes.
+  const AutoBrowseConfig & auto_browse_config_for_test() const {
+    return node_map_.auto_browse_config();
+  }
 
   // -- FaultProvider interface --
   tl::expected<dto::FaultListResult, FaultProviderErrorInfo> list_faults(const std::string & entity_id) override;

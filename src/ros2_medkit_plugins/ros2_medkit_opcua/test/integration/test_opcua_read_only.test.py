@@ -67,6 +67,9 @@ COMPONENT = 'read_only_runtime'
 # (primitives.cpp maps every x-medkit-* code into error_code "vendor-specific"
 # plus this vendor_code). The build property is named in the message.
 PLUGIN_VENDOR_CODE = 'x-medkit-plugin-error'
+# SOVD spells "the entity does not support this" as 501; 403 is reserved for a
+# valid token with insufficient permissions, which no credential can fix here.
+REFUSAL_STATUS = 501
 BUILD_PROPERTY = 'MEDKIT_OPCUA_READ_ONLY'
 
 failures = []
@@ -256,8 +259,8 @@ def item_by_name(payload, name):
 
 
 def refusal_is_the_build(status, payload, what):
-    """Assert one HTTP answer is the read-only build's 403 refusal, naming the build."""
-    ok = check(status == 403, f'{what}: 403 (got {status})')
+    """Assert one HTTP answer is the read-only build's refusal, naming the build."""
+    ok = check(status == REFUSAL_STATUS, f'{what}: {REFUSAL_STATUS} (got {status})')
     if not isinstance(payload, dict):
         check(False, f'{what}: JSON error body (got {payload!r})')
         return
@@ -496,6 +499,15 @@ def run_auto_browse_leg(workdir, env, plugin, server_bin, server, server_port,
         expected = (not read_only) and infer_writable != 'false'
         check(writable is expected,
               f'{label}: auto-browsed StatusWord reports writable={expected} (got {writable!r})')
+
+        # The startup warning belongs to a key someone set, not to the default.
+        # infer_writable defaults to true, so warning on the value would warn on
+        # every auto_browse deployment; the log must name the setting when it is
+        # written and say nothing when it is not.
+        warned = wait_log(log, 'plugins.opcua.auto_browse.infer_writable is ignored', deadline=3)
+        want_warning = read_only and infer_writable == 'true'
+        check(warned is want_warning,
+              f'{label}: startup warning about the ignored setting: {want_warning} (got {warned})')
 
         if rebrowse:
             # CHANGE: the plugin re-walks the address space on a fresh session

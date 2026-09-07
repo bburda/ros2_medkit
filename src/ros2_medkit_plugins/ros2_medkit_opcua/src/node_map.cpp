@@ -380,9 +380,14 @@ bool NodeMap::load(const std::string & yaml_path) {
         auto_browse_config_.read_initial_values =
             parse_bool(ab["read_initial_values"], auto_browse_config_.read_initial_values,
                        "auto_browse.read_initial_values", "auto_browse");
+        if (ab["infer_writable"]) {
+          auto_browse_config_.infer_writable = parse_bool(ab["infer_writable"], auto_browse_config_.infer_writable,
+                                                          "auto_browse.infer_writable", "auto_browse");
+          auto_browse_config_.infer_writable_source = "the node map's auto_browse.infer_writable";
+        }
         warn_unknown_keys(ab, "auto_browse",
                           {"enabled", "root_nodes", "max_depth", "max_nodes", "namespace_allow", "namespace_deny",
-                           "read_initial_values"});
+                           "read_initial_values", "infer_writable"});
       } else {
         try {
           auto_browse_config_.enabled = ab.as<bool>();

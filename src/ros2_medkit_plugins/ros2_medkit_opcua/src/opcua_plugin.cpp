@@ -102,6 +102,13 @@ UserAuthMode require_user_auth_mode(const std::string & value) {
 constexpr const char * kReadOnlyBuildRefusal =
     "This OPC UA plugin was built read-only (MEDKIT_OPCUA_READ_ONLY=ON) and contains no controller write path; "
     "rebuild with -DMEDKIT_OPCUA_READ_ONLY=OFF for a write-capable plugin";
+
+/// SOVD reserves 403 for a valid token with insufficient permissions, which is
+/// the one thing this is not: no credential and no role reaches a write path
+/// that is not in the binary. 501 is the status the SOVD catalogue uses for an
+/// operation the entity does not support (fault deletion, data lists,
+/// subscriptions and triggers all spell it that way), and that is what this is.
+constexpr int kReadOnlyBuildStatus = 501;
 #else
 /// Parse a JSON "value" field, coerce to the node's declared data_type, and
 /// validate against the optional min/max range. Shared by handle_plc_operations,
@@ -525,6 +532,7 @@ void OpcuaPlugin::configure(const nlohmann::json & config) {
       if (ab.contains("infer_writable")) {
         if (ab["infer_writable"].is_boolean()) {
           ab_cfg.infer_writable = ab["infer_writable"].get<bool>();
+          ab_cfg.infer_writable_source = "plugins.opcua.auto_browse.infer_writable";
         } else {
           warn("plugins.opcua.auto_browse.infer_writable must be a boolean - keeping current value");
         }
@@ -593,15 +601,16 @@ void OpcuaPlugin::set_context(PluginContext & context) {
   log_security_profile();
 
 #if MEDKIT_OPCUA_READ_ONLY
-  // One line, once, when the operator asked the address-space walk to take its
-  // writability from the server's CurrentWrite bit. The inference is not in
-  // this binary, so the setting has no effect and saying so at startup beats
-  // leaving someone to wonder why every discovered point reads back read-only.
-  if (node_map_.auto_browse_config().enabled && node_map_.auto_browse_config().infer_writable) {
-    log_warn(
-        "auto_browse infer_writable is ignored: this plugin was built with MEDKIT_OPCUA_READ_ONLY=ON and carries "
-        "no write path, so every discovered data point stays read-only. Rebuild with "
-        "-DMEDKIT_OPCUA_READ_ONLY=OFF for a write-capable plugin.");
+  // One line, once, and only when someone asked for the inference: the setting
+  // defaults to true, so warning on the default would tell every auto_browse
+  // deployment about a key nobody wrote. An explicit request is different - it
+  // has no effect here, and the message names the setting so it can be found.
+  const auto & ab_cfg = node_map_.auto_browse_config();
+  if (ab_cfg.enabled && ab_cfg.infer_writable && !ab_cfg.infer_writable_source.empty()) {
+    log_warn(ab_cfg.infer_writable_source +
+             " is ignored: this plugin was built with MEDKIT_OPCUA_READ_ONLY=ON and carries no write path, so "
+             "every discovered data point stays read-only. Rebuild with -DMEDKIT_OPCUA_READ_ONLY=OFF for a "
+             "write-capable plugin.");
   }
 #endif
 
@@ -1709,13 +1718,13 @@ tl::expected<dto::DataWriteResult, DataProviderErrorInfo> OpcuaPlugin::write_dat
                                                                                   const nlohmann::json & value) {
 #if MEDKIT_OPCUA_READ_ONLY
   // First statement in the function: the refusal precedes every lookup, so no
-  // request reaches the OPC-UA client, and 403 says the server understood the
-  // request and will not carry it out. The gateway renders provider errors as
+  // request reaches the OPC-UA client. The gateway renders provider errors as
   // the x-medkit-plugin-error vendor code with this message verbatim.
   (void)entity_id;
   (void)resource_name;
   (void)value;
-  return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::ReadOnly, kReadOnlyBuildRefusal, 403});
+  return tl::make_unexpected(
+      DataProviderErrorInfo{DataProviderError::ReadOnly, kReadOnlyBuildRefusal, kReadOnlyBuildStatus});
 #else
   if (!ctx_ || !poller_) {
     return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::Internal, "plugin not initialized", 503});
@@ -1858,7 +1867,7 @@ OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string 
   // operation id directly.
   if (operation_name == "acknowledge_fault" || operation_name == "confirm_fault") {
     return tl::make_unexpected(
-        OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, 403});
+        OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, kReadOnlyBuildStatus});
   }
 #else
   // Issue #386: acknowledge_fault and confirm_fault dispatch to OPC-UA
@@ -1955,7 +1964,8 @@ OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string 
   // build marks no point writable, so list_operations emits no set_* entry -
   // and a request aimed straight at one is refused before any node lookup or
   // client call.
-  return tl::make_unexpected(OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, 403});
+  return tl::make_unexpected(
+      OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, kReadOnlyBuildStatus});
 #else
   std::string data_name;
   if (operation_name.substr(0, 4) == "set_") {
