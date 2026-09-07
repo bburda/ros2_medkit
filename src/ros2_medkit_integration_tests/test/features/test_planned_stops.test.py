@@ -518,6 +518,72 @@ class TestPlannedStops(GatewayTestCase):
         )
         self.assertEqual(response.status_code, 400, response.text)
 
+    def test_10b_the_epoch_is_not_a_stand_in_for_now(self):
+        """R14: zero is what an unset time reads as, so it cannot also be legal."""
+        self._declare({'from': '1970-01-01T00:00:00Z', 'to': self._iso(600), 'reason': 'epoch'},
+                      expected_status=400)
+
+        response = requests.post(
+            f'{self.BASE_URL}{PLANNED_STOPS}',
+            json={'from': '1970-01-01T00:00:00Z', 'to': self._iso(600), 'reason': 'epoch'},
+            timeout=10,
+        )
+        self.assertEqual(response.json()['parameters']['parameter'], 'from')
+        self.assertIn('1970-01-01T00:00:00Z', response.json()['message'])
+
+    def test_10c_a_year_past_the_nanosecond_count_is_refused_not_wrapped(self):
+        """A year past 2262 used to wrap back INTO the accepted range."""
+        for far in ('2262-04-12T00:00:00Z', '2555-01-01T00:00:00Z', '2600-01-01T00:00:00Z',
+                    '9999-12-31T23:59:59Z'):
+            self._declare({'to': far, 'reason': 'far future'}, expected_status=400)
+
+        # The last representable instant is accepted; one second past it is not.
+        edge = self._declare({'to': '2038-01-19T03:14:07Z', 'reason': 'the very edge'})
+        self.assertTrue(edge['to'].startswith('2038-01-19T03:14:07'))
+        self._declare({'to': '2038-01-19T03:14:08Z', 'reason': 'one second too far'},
+                      expected_status=400)
+
+        # Nothing wrapped: no window in the store starts before this decade.
+        for window in self.get_json(PLANNED_STOPS)['items']:
+            self.assertGreater(window['from'], '2020-01-01', f'window {window["id"]} wrapped')
+
+    def test_10d_times_are_carried_to_the_millisecond_and_come_back_unchanged(self):
+        """R11: what a GET returns is what the POST sent, floored to the ms."""
+        window = self._declare({
+            'from': '2030-03-04T05:06:07.123456789Z',
+            'to': '2030-03-04T06:06:07.987654321Z',
+            'reason': 'sub-millisecond input',
+        })
+        self.assertEqual(window['from'], '2030-03-04T05:06:07.123Z')
+        self.assertEqual(window['to'], '2030-03-04T06:06:07.987Z')
+
+        fetched = self.get_json(f'{PLANNED_STOPS}/{window["id"]}')
+        self.assertEqual(fetched['from'], window['from'], 'a GET must equal the POST that made it')
+        self.assertEqual(fetched['to'], window['to'])
+
+    def test_10e_a_window_that_never_started_is_cancelled_not_ended(self):
+        """R12: it marked nothing, so DELETE removes it instead of inverting it."""
+        window = self._declare({
+            'from': self._iso(3600), 'to': self._iso(7200), 'reason': 'next shift',
+        })
+        self.assertFalse(window['cancelled'])
+
+        response = requests.delete(
+            f'{self.BASE_URL}{PLANNED_STOPS}/{window["id"]}', timeout=10
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body['cancelled'], 'a window stopped before it started is cancelled')
+        self.assertFalse(body['ended_early'], 'it never ran, so it did not end early')
+        self.assertGreater(body['to'], body['from'], 'the interval must never come back inverted')
+
+        gone = requests.get(f'{self.BASE_URL}{PLANNED_STOPS}/{window["id"]}', timeout=10)
+        self.assertEqual(gone.status_code, 404, 'a cancelled window is gone, not stored')
+
+        self.assertNotIn(
+            window['id'], [w['id'] for w in self.get_json(PLANNED_STOPS)['items']]
+        )
+
     def test_11_an_absent_from_means_now(self):
         before = time.time()
         window = self._declare({'to': self._iso(3600), 'reason': 'starts now'})
@@ -526,6 +592,7 @@ class TestPlannedStops(GatewayTestCase):
         started = calendar.timegm(
             time.strptime(window['from'][:19], '%Y-%m-%dT%H:%M:%S')
         )
+        self.assertNotEqual(started, 0, 'an omitted from must be filled with now, never the epoch')
         # Two seconds of slack: the gateway stamps the window from the fault
         # manager's clock, and the assertion is that it is "now", not that the
         # two machines agree to the millisecond.

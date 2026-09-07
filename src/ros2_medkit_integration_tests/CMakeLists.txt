@@ -275,7 +275,8 @@ if(BUILD_TESTING)
   set(_TWO_GATEWAY_TESTS
     test_peer_recovery
     test_triggers_restore_before_discovery
-    test_aggregator_fault_stream)
+    test_aggregator_fault_stream
+    test_planned_stops_aggregation)
   set(_TWO_GATEWAY_DOMAINS 2)
 
   # Tests whose polling budgets do not fit the glob's default timeout. Keyed by
