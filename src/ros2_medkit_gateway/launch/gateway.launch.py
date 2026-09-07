@@ -27,6 +27,27 @@ from launch_ros.actions import Node
 CORS_DEFAULT = 'http://localhost:3000,http://localhost:5173'
 
 
+def parse_security_flag(name, raw):
+    """
+    Return True/False for a security launch argument, or raise on anything else.
+
+    An allowlist for true with everything else meaning false is the wrong shape
+    here: ``tls_enabled:=on`` and ``tls_enabled:=ture`` would both mean "serve
+    plain HTTP", and the override is still written, so the typo beats a config
+    file that had TLS on. For a flag whose two values are "encrypted" and "not",
+    an unrecognised spelling has to stop the launch rather than pick one.
+    """
+    value = raw.strip().lower()
+    if value in ('true', '1', 'yes', 'on'):
+        return True
+    if value in ('false', '0', 'no', 'off'):
+        return False
+    raise RuntimeError(
+        f'{name}:={raw!r} is not a boolean. Use true or false. '
+        f'Leaving {name} unset lets the config file decide.'
+    )
+
+
 def cors_override(cors_arg, config_file, default_config):
     """
     Return the ``cors.allowed_origins`` entry for the final overrides, or {}.
@@ -173,9 +194,9 @@ def generate_launch_description():
         # matters because this launch file is included by others and is used
         # with config_file: re-asserting a default here would silently override
         # a value someone put in their own file on purpose.
-        tls_arg = LaunchConfiguration('tls_enabled').perform(context).strip().lower()
+        tls_arg = LaunchConfiguration('tls_enabled').perform(context).strip()
         if tls_arg:
-            tls_enabled = tls_arg in ('true', '1', 'yes')
+            tls_enabled = parse_security_flag('tls_enabled', tls_arg)
             param_overrides['server.tls.enabled'] = tls_enabled
         elif os.environ.get('MEDKIT_TLS_DISABLED') == '1':
             # The container image serves plain HTTP behind whatever terminates
@@ -209,9 +230,9 @@ def generate_launch_description():
         # image work - its entrypoint generates a per-container credential and
         # exports it, and `ros2 launch` inside that container has no other way
         # to receive it.
-        auth_arg = LaunchConfiguration('auth_enabled').perform(context).strip().lower()
+        auth_arg = LaunchConfiguration('auth_enabled').perform(context).strip()
         if auth_arg:
-            auth_enabled = auth_arg in ('true', '1', 'yes')
+            auth_enabled = parse_security_flag('auth_enabled', auth_arg)
             param_overrides['auth.enabled'] = auth_enabled
         elif os.environ.get('MEDKIT_AUTH_DISABLED') == '1':
             auth_enabled = False

@@ -35,11 +35,32 @@ export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 #
 # Supply MEDKIT_JWT_SECRET and MEDKIT_CLIENTS to pin your own, or
 # MEDKIT_AUTH_DISABLED=1 to run open on a host nothing else can reach.
+
+# The params file the node will actually read, if any. `docker run` can replace
+# the default CMD, so this cannot be assumed: an operator who mounts their own
+# file has already decided the auth configuration, and generating a credential
+# on top of it would override the one their clients hold.
+PARAMS_FILE=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--params-file" ]; then PARAMS_FILE="$arg"; fi
+  prev="$arg"
+done
+
+# True when that file names its own signing secret, which is the marker that
+# the operator brought their own credentials rather than wanting generated ones.
+operator_supplied_auth() {
+  [ -n "$PARAMS_FILE" ] && [ -r "$PARAMS_FILE" ] && grep -qE '^[[:space:]]*jwt_secret[[:space:]]*:' "$PARAMS_FILE"
+}
+
 AUTH_ARGS=()
 if [ "${MEDKIT_AUTH_DISABLED:-0}" = "1" ]; then
   AUTH_ARGS+=(-p auth.enabled:=false)
   echo "ros2_medkit: MEDKIT_AUTH_DISABLED=1 - starting WITHOUT authentication." >&2
   echo "             Every route is readable by anyone who can reach this port." >&2
+elif operator_supplied_auth; then
+  echo "ros2_medkit: ${PARAMS_FILE} carries its own auth.jwt_secret - using it as-is," >&2
+  echo "             generating nothing and overriding nothing." >&2
 else
   if [ -z "${MEDKIT_JWT_SECRET:-}" ]; then
     # Per container, and not persisted: a restart issues a new one, which is
@@ -61,6 +82,19 @@ else
     echo "  Set MEDKIT_JWT_SECRET and MEDKIT_CLIENTS to pin your own." >&2
     echo "=============================================================" >&2
   fi
+  # Asserted here, not left to the params file. `docker run <img> --ros-args -p
+  # server.port:=9090` REPLACES the default CMD, so the params file is never
+  # loaded, and the node's compiled-in default for auth.enabled is false - the
+  # image would print an admin credential and then serve every route to anyone.
+  # Saying it on the command line means the image is closed however it is
+  # started, and it is a no-op when the params file is loaded and agrees.
+  AUTH_ARGS+=(-p auth.enabled:=true)
+  if [ -z "$PARAMS_FILE" ]; then
+    # Same reasoning one level down: with no params file the compiled-in
+    # require_auth_for is "write", which leaves every read open. A file, even a
+    # mounted one, is the operator's statement about this and is left alone.
+    AUTH_ARGS+=(-p auth.require_auth_for:=all)
+  fi
   AUTH_ARGS+=(-p "auth.jwt_secret:=${MEDKIT_JWT_SECRET}")
   [ -n "${MEDKIT_CLIENTS:-}" ] && AUTH_ARGS+=(-p "auth.clients:=[${MEDKIT_CLIENTS}]")
 fi
@@ -69,7 +103,14 @@ fi
 # AUTH_ARGS. gateway.launch.py falls back to these variables.
 export MEDKIT_JWT_SECRET MEDKIT_CLIENTS MEDKIT_AUTH_DISABLED
 # The image serves plain HTTP; see gateway_docker_params.yaml for why.
-export MEDKIT_TLS_DISABLED=1
+#
+# Only when the operator has not brought a config of their own. This is the
+# image's DEFAULT, not a policy: `docker run <img> ros2 launch ...
+# gateway.launch.py config_file:=/mnt/secure.yaml` with TLS on in that file must
+# get TLS, and an unconditional export here silently served it plaintext.
+if [ -z "$PARAMS_FILE" ] && ! printf '%s\n' "$@" | grep -q '^config_file:='; then
+  export MEDKIT_TLS_DISABLED=1
+fi
 
 # Dispatch on the first argument:
 #   - empty, or starts with "-" (the default CMD "--ros-args --params-file ..."

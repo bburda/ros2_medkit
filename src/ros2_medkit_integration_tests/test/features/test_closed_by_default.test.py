@@ -53,6 +53,8 @@ CLOSED_ROOT = f'http://127.0.0.1:{CLOSED_PORT}'
 CORS_BASE_URL = f'http://127.0.0.1:{CORS_PORT}{API_BASE_PATH}'
 RL_PORT = get_test_port(2)
 RL_BASE_URL = f'http://127.0.0.1:{RL_PORT}{API_BASE_PATH}'
+PUBLIC_PORT = get_test_port(3)
+PUBLIC_BASE_URL = f'http://127.0.0.1:{PUBLIC_PORT}{API_BASE_PATH}'
 ALLOWED_ORIGIN = 'https://ui.example'
 
 # At least 32 characters, or the gateway refuses to start under HS256.
@@ -120,28 +122,45 @@ def generate_test_description():
         },
     )
 
+    # The opt-in half. `auth.public_routes` is empty on every gateway above, so
+    # without this one nothing here would exercise the knob an operator uses to
+    # take a route outside authentication, and "empty by default" would be
+    # indistinguishable from "the setting does nothing".
+    public_route_gateway = create_gateway_node(
+        port=PUBLIC_PORT,
+        name='gateway_with_public_route',
+        extra_params={
+            'server.host': '127.0.0.1',
+            'auth.enabled': True,
+            'auth.require_auth_for': 'all',
+            'auth.issuer': 'ros2_medkit_gateway',
+            'auth.jwt_secret': JWT_SECRET,
+            'auth.clients': [f'{CLIENT_ID}:{CLIENT_SECRET}:admin'],
+            'auth.public_routes': ['GET /api/v1/health'],
+        },
+    )
+
     return launch.LaunchDescription([
         gateway_node,
         cors_gateway,
         rl_gateway,
+        public_route_gateway,
         launch_testing.actions.ReadyToTest(),
     ]), {'gateway_node': gateway_node, 'cors_gateway': cors_gateway,
-         'rl_gateway': rl_gateway}
+         'rl_gateway': rl_gateway, 'public_route_gateway': public_route_gateway}
 
 
 def _is_exempt(method, path):
     """Routes that are deliberately reachable without a credential.
 
-    GET /health - a container supervisor and an upstream load balancer probe
-    it to decide whether this process is alive, and neither holds a
-    credential; requiring one turns a healthy gateway into a restart loop. The
-    body is a fixed status document: no entity names, no topics, no data.
+    /auth/* alone, and only because authentication cannot bootstrap through a
+    door that already demands the credential it exists to hand out.
 
-    /auth/* - token issuance. Authentication cannot bootstrap through a door
-    that already demands the credential it exists to hand out.
+    Health is NOT here. `auth.public_routes` is empty as shipped, so a probe
+    that wants an uncredentialed answer is a decision an operator makes and
+    writes down; TestConfiguredPublicRoute below covers that path.
     """
-    if method == 'GET' and path == f'{API_BASE_PATH}/health':
-        return True
+    del method  # the one exemption is path-shaped: every method under /auth/
     return path.startswith(f'{API_BASE_PATH}/auth/')
 
 
@@ -262,117 +281,162 @@ class TestClosedByDefault(GatewayTestCase):
                 resp = requests.get(f'{CLOSED_BASE_URL}{path}', timeout=15)
                 self.assertIn(resp.status_code, (401, 403))
 
-    def test_05_the_exempt_health_route_still_answers(self):
-        """The mirror of the sweeps.
+    def test_05_health_refuses_like_everything_else(self):
+        """Health is not special. It is closed until somebody opens it.
 
-        Without this, a gateway that refused EVERYTHING would pass every test
-        above while being uniformly broken - the container supervisor could
-        not tell it was alive, and it would restart forever.
+        The route a hardening change is most tempted to leave open, pinned so
+        the temptation shows up as a red test. `auth.public_routes` is the way
+        to open it, and TestConfiguredPublicRoute holds that end.
         """
         resp = requests.get(f'{CLOSED_BASE_URL}/health', timeout=15)
-        self.assertEqual(resp.status_code, 200, 'health must stay probe-able')
-
-    def test_06_anonymous_health_is_liveness_and_nothing_else(self):
-        """The exemption rests on the body saying nothing, so check the body.
-
-        An allowlist, not a denylist. Listing the fields known to leak today
-        would pass the day a new section is added, and the whole reason this
-        route is public is that a probe needs no more than "am I alive".
-        """
-        body = requests.get(f'{CLOSED_BASE_URL}/health', timeout=15).json()
-        # warnings and its schema version are always serialised - they are part
-        # of the /health contract whether or not anything produced one - so the
-        # allowlist includes them and the assertion below covers the content.
-        self.assertEqual(
-            set(body), {'status', 'timestamp', 'warnings', 'warning_schema_version'},
-            f'an anonymous /health returned more than liveness: {body}'
-        )
-        self.assertEqual(body['status'], 'healthy')
-        # The array is the leak vector: a linking warning reads like
-        # "App 'engine_ecu' cannot bind to '/nav/controller'", naming an entity
-        # and a ROS node FQN. Empty is the only safe value for a caller that
-        # presented nothing.
-        self.assertEqual(
-            body['warnings'], [],
-            f'an anonymous /health carried warning text: {body["warnings"]}'
+        self.assertIn(
+            resp.status_code, (401, 403),
+            f'GET /health answered {resp.status_code} with no credential and an '
+            'empty auth.public_routes'
         )
 
-    def test_06b_the_full_health_document_names_entities(self):
-        """The reason test_06 matters, pinned so it cannot be argued away.
+    def test_06_the_full_health_document_names_entities(self):
+        """Why the anonymous body has to be cut down when a route is opened.
 
         With a credential the same route returns discovery state and entity
         cache counts. That is a legitimate operator surface, and it is exactly
         what an anonymous caller must not receive - so if this ever stops being
-        true, the narrowing above has become pointless and should be revisited
-        rather than left as dead weight.
+        true, the narrowing in TestConfiguredPublicRoute has become pointless
+        and should be revisited rather than left as dead weight.
         """
         body = requests.get(
             f'{CLOSED_BASE_URL}/health', headers=self.auth, timeout=15
         ).json()
         self.assertIn('discovery', body)
         self.assertIn('x-medkit-entity-cache', body)
-        self.assertGreater(
-            len(set(body)), 2,
-            'the authenticated /health is now as bare as the anonymous one'
+        self.assertNotIn(
+            'x-medkit-reduced', body,
+            'an authenticated caller was served the cut-down body'
         )
-
-    def test_06c_a_forged_credential_gets_the_bare_body(self):
-        """A token this gateway never issued is an anonymous caller."""
-        body = requests.get(
-            f'{CLOSED_BASE_URL}/health',
-            headers={'Authorization': 'Bearer not.a.real.token'},
-            timeout=15,
-        ).json()
-        self.assertEqual(
-            set(body), {'status', 'timestamp', 'warnings', 'warning_schema_version'},
-            f'a forged credential unlocked the full health document: {body}'
-        )
-        self.assertEqual(body['warnings'], [])
 
     def test_07_a_valid_credential_gets_through(self):
         """Otherwise the sweeps above would pass on a gateway that serves nobody."""
         resp = requests.get(f'{CLOSED_BASE_URL}/areas', headers=self.auth, timeout=15)
         self.assertEqual(resp.status_code, 200)
 
-    def test_08_head_on_health_is_not_a_way_in(self):
-        """The exemption is GET-only, deliberately.
 
-        Widening it to "any method on /health" is the natural next edit and it
-        would be wrong, so the narrowness is pinned here.
-        """
-        # HEAD first, and separately, because it is the method that matters and
-        # the one an earlier version of this test left out despite its name.
-        # cpp-httplib dispatches HEAD into the GET handler table, so if the
-        # exemption stopped checking the method, HEAD would return the status
-        # document to an anonymous caller. The others have no handler at all on
-        # this path, so they answer 404 either way and cannot show the
-        # difference on their own.
-        head = requests.head(f'{CLOSED_BASE_URL}/health', timeout=15)
-        self.assertIn(
-            head.status_code, (401, 403),
-            f'HEAD /health answered {head.status_code} to an anonymous caller'
+class TestConfiguredPublicRoute(GatewayTestCase):
+    """`auth.public_routes` opens exactly what it names, and nothing near it.
+
+    The gateway under this class runs `require_auth_for: all` with one entry,
+    `GET /api/v1/health`. Everything here is about the edge of that entry: a
+    setting that opened the route it names AND its neighbours would pass a test
+    that only checked the route it names.
+    """
+
+    BASE_URL = PUBLIC_BASE_URL
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        token = requests.post(
+            f'{PUBLIC_BASE_URL}/auth/authorize',
+            json={
+                'grant_type': 'client_credentials',
+                'client_id': CLIENT_ID,
+                'client_secret': CLIENT_SECRET,
+            },
+            timeout=15,
+        ).json()['access_token']
+        cls.auth = {'Authorization': f'Bearer {token}'}
+
+    def test_01_the_named_route_answers_without_a_credential(self):
+        """The knob does something. Without this the rest proves only refusal."""
+        resp = requests.get(f'{PUBLIC_BASE_URL}/health', timeout=15)
+        self.assertEqual(
+            resp.status_code, 200,
+            'auth.public_routes named GET /api/v1/health and it still refused'
         )
 
-        for method in ('POST', 'PUT', 'DELETE', 'PATCH'):
-            with self.subTest(method=method):
-                resp = requests.request(
-                    method, f'{CLOSED_BASE_URL}/health', json={}, timeout=15
+    def test_02_the_route_next_door_is_untouched(self):
+        """An entry opens one route, not the surface around it.
+
+        The failure this catches is a prefix or wildcard match creeping into
+        the comparison: `/health` opening `/healthz`, or worse, one entry
+        opening every GET.
+        """
+        for path in ('/', '/areas', '/components', '/apps', '/version-info'):
+            with self.subTest(path=path):
+                resp = requests.get(f'{PUBLIC_BASE_URL}{path}', timeout=15)
+                self.assertIn(
+                    resp.status_code, (401, 403),
+                    f'{path} answered {resp.status_code} on a gateway whose only '
+                    'public route is GET /api/v1/health'
                 )
-                self.assertNotEqual(
-                    resp.status_code, 200,
-                    f'{method} /health answered 200 to an anonymous caller'
-                )
+
+    def test_03_the_method_is_part_of_the_entry(self):
+        """An entry names a method, and the method is part of the match.
+
+        cpp-httplib dispatches HEAD into the GET handler table, so a comparison
+        that dropped the method would hand the status document to an anonymous
+        HEAD. The write methods have no handler here and answer the same either
+        way, so HEAD is the one that can show the difference.
+        """
+        head = requests.head(f'{PUBLIC_BASE_URL}/health', timeout=15)
+        self.assertIn(
+            head.status_code, (401, 403),
+            f'HEAD /health answered {head.status_code} for an entry that named GET'
+        )
+
+    def test_04_the_anonymous_body_is_liveness_and_says_so(self):
+        """Opening the route must not publish the entity inventory.
+
+        An allowlist, not a denylist: listing the fields known to leak today
+        would pass the day a new section is added, and a probe needs no more
+        than "am I alive".
+        """
+        body = requests.get(f'{PUBLIC_BASE_URL}/health', timeout=15).json()
+        self.assertEqual(
+            set(body),
+            {'status', 'timestamp', 'warnings', 'warning_schema_version',
+             'x-medkit-reduced'},
+            f'an anonymous /health returned more than liveness: {body}'
+        )
+        self.assertEqual(body['status'], 'healthy')
+        # The array is the leak vector: a linking warning reads like
+        # "App 'engine_ecu' cannot bind to '/nav/controller'", naming an entity
+        # and a ROS node FQN.
+        self.assertEqual(body['warnings'], [])
+        # And the empty array must not read as "nothing is wrong". A monitor
+        # that cannot tell withheld from clean would clear a real warning.
+        self.assertIs(
+            body['x-medkit-reduced'], True,
+            'the cut-down body did not say it was cut down, so an empty '
+            'warnings array reads as a clean bill of health'
+        )
+
+    def test_05_a_credential_still_gets_the_whole_document(self):
+        """Opening a route for probes must not cost the operator surface."""
+        body = requests.get(
+            f'{PUBLIC_BASE_URL}/health', headers=self.auth, timeout=15
+        ).json()
+        self.assertIn('discovery', body)
+        self.assertNotIn('x-medkit-reduced', body)
+
+    def test_06_a_forged_credential_is_an_anonymous_caller(self):
+        """A token this gateway never issued must not unlock the full body."""
+        body = requests.get(
+            f'{PUBLIC_BASE_URL}/health',
+            headers={'Authorization': 'Bearer not.a.real.token'},
+            timeout=15,
+        ).json()
+        self.assertIs(body.get('x-medkit-reduced'), True, body)
+        self.assertNotIn('discovery', body)
 
 
 class TestNothingAnswersBeforeAuth(GatewayTestCase):
     """What the CORS preflight may and may not do without a credential.
 
-    Preflight is answered anonymously on purpose, and it is the third named
-    exemption after GET /health and /auth/*. A browser never puts Authorization
-    on a preflight - asking permission before sending the real request is the
-    whole point of the mechanism - so demanding one would not harden anything,
-    it would make browser clients impossible. An earlier version of this branch
-    did exactly that, and the control below is what caught it.
+    Preflight is answered anonymously on purpose, and it is the second named
+    exemption after /auth/*. A browser never puts Authorization on a preflight
+    - asking permission before sending the real request is the whole point of
+    the mechanism - so demanding one would not harden anything, it would make
+    browser clients impossible. The control below is what pins that.
 
     What must hold instead: the preflight discloses only CORS policy, and the
     REAL request that follows is still refused without a credential.

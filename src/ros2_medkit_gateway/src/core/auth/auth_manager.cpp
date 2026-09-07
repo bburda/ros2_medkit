@@ -89,8 +89,11 @@ AuthManager::AuthManager(const AuthConfig & config) : config_(config) {
     clients_[client.client_id] = client;
   }
 
-  // Create auth requirement policy from config
-  auth_policy_ = AuthRequirementPolicyFactory::create(config_.require_auth_for);
+  // Create auth requirement policy from config. `require_auth_for` decides the
+  // baseline; `public_routes` then lifts the credential requirement from the
+  // routes an operator named, and from nothing else.
+  auth_policy_ =
+      AuthRequirementPolicyFactory::create(config_.require_auth_for, parse_public_routes(config_.public_routes));
 }
 
 tl::expected<TokenResponse, AuthErrorResponse> AuthManager::authenticate(const std::string & client_id,
@@ -402,9 +405,21 @@ size_t AuthManager::cleanup_expired_locked() {
   auto now = std::chrono::system_clock::now();
   auto now_ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
+  // A record outlives its own expiry by one access-token lifetime.
+  //
+  // validate_token() rejects an access token whose refresh record is gone, so
+  // dropping the record the instant it expires cuts short every access token
+  // minted from it. The last one can be issued a second before the refresh
+  // token expires and is then promised a full token_expiry_seconds; sweeping
+  // on expires_at alone would refuse it about a minute later, with most of its
+  // life left. Keeping the record until nothing issued from it can still be
+  // valid costs one extra lifetime of memory per client and removes the whole
+  // race.
+  const int64_t grace = static_cast<int64_t>(config_.token_expiry_seconds);
+
   size_t count = 0;
   for (auto it = refresh_tokens_.begin(); it != refresh_tokens_.end();) {
-    if (it->second.expires_at < now_ts) {
+    if (it->second.expires_at + grace < now_ts) {
       it = refresh_tokens_.erase(it);
       ++count;
     } else {

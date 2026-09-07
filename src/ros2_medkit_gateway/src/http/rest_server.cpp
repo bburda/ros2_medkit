@@ -328,8 +328,7 @@ void RESTServer::setup_pre_routing_handler() {
       // It is safe because a preflight discloses nothing about the system: the
       // response is the CORS policy for an origin the operator configured, with
       // no body, and the real request that follows is authenticated normally.
-      // Treat this as a third named exemption alongside GET /health and
-      // /auth/*, not as an oversight.
+      // Treat this as a named exemption alongside /auth/, not as an oversight.
       // A real preflight carries Access-Control-Request-Method; the browser
       // sends it to ask whether the method it is about to use is allowed.
       // Requiring it keeps the exemption to the case that genuinely cannot
@@ -347,13 +346,39 @@ void RESTServer::setup_pre_routing_handler() {
       }
     }
 
-    // 3. Authentication, before the rate limiter.
+    // 3. Rate limiting is METERED here and ANSWERED after authentication.
     //
-    // This half of the order was wrong. The limiter also returns Handled, so an
-    // anonymous caller who exhausted the allowance used to get 429 from a
-    // protected route instead of 401 - an answer, and a small disclosure of
-    // limiter state, without any credential.
+    // Both halves matter and they pull in opposite directions. Metering after
+    // authentication means a request refused for a bad credential never spends
+    // any allowance, so an anonymous caller can hammer a protected route for
+    // free and pay only for the signature verification each attempt costs the
+    // gateway - which under RS256 is not cheap. Answering before
+    // authentication means an anonymous caller who exhausted the allowance
+    // gets 429 from a protected route instead of 401: an answer, and a small
+    // disclosure of limiter state, without any credential.
+    //
+    // So: consume the allowance for every request, and decide what to say
+    // about it once we know whether the caller had a credential.
+    bool rate_limited = false;
+    RateLimitResult rl_result;
+    if (rate_limiter_ && rate_limiter_->is_enabled() && req.method != "OPTIONS") {
+      rl_result = rate_limiter_->check(req.remote_addr, req.path);
+      RateLimiter::apply_headers(rl_result, res);
+      rate_limited = !rl_result.allowed;
+    }
+
+    // 4. Authentication.
     if (auth_middleware_ && auth_middleware_->is_enabled()) {
+      // With the allowance gone, a request that presents no credential at all
+      // on a route that needs one is refused without verifying anything. This
+      // is the shape an anonymous flood takes, and it is the case where the
+      // verification is pure waste - the answer is 401 either way.
+      const bool needs_credential = auth_manager_ && auth_manager_->requires_authentication(req.method, req.path);
+      if (rate_limited && needs_credential && !req.has_header("Authorization")) {
+        res.status = 401;
+        return handled(req, res);
+      }
+
       auto auth_request = AuthMiddleware::from_httplib_request(req);
       auto result = auth_middleware_->process(auth_request);
 
@@ -363,14 +388,12 @@ void RESTServer::setup_pre_routing_handler() {
       }
     }
 
-    // 4. Rate limiting check. If rejected, return Handled (CORS headers already set)
-    if (rate_limiter_ && rate_limiter_->is_enabled() && req.method != "OPTIONS") {
-      auto rl_result = rate_limiter_->check(req.remote_addr, req.path);
-      RateLimiter::apply_headers(rl_result, res);
-      if (!rl_result.allowed) {
-        RateLimiter::apply_rejection(rl_result, res);
-        return handled(req, res);
-      }
+    // 5. Now the limiter may speak. The caller reached this line with a
+    // credential this gateway accepts, or on a route that needs none, so 429
+    // tells them something they are entitled to know.
+    if (rate_limited) {
+      RateLimiter::apply_rejection(rl_result, res);
+      return handled(req, res);
     }
 
     return httplib::Server::HandlerResponse::Unhandled;

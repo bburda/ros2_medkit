@@ -93,7 +93,15 @@ class GatewayTestCase(unittest.TestCase):
 
     @classmethod
     def _wait_for_gateway_health(cls):
-        """Poll GET /health until the gateway responds with 200.
+        """Poll GET /health until the gateway answers at all.
+
+        A refusal counts as up. What this waits for is a process that is
+        listening and speaking HTTP, and a 401 proves both: the request was
+        received, routed and decided on. Requiring 200 would instead make this
+        wait for a specific auth configuration, and under the shipped defaults
+        - ``require_auth_for: all`` with an empty ``auth.public_routes`` -
+        that 200 never arrives, so every test class using this helper would
+        time out against a perfectly healthy gateway.
 
         Uses ``time.monotonic()`` for a reliable, monotonic clock.
 
@@ -108,7 +116,7 @@ class GatewayTestCase(unittest.TestCase):
         while time.monotonic() < deadline:
             try:
                 response = requests.get(f'{cls.BASE_URL}/health', timeout=2)
-                if response.status_code == 200:
+                if response.status_code in (200, 401, 403):
                     return
             except requests.exceptions.RequestException:
                 pass

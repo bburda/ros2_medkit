@@ -529,6 +529,62 @@ TEST(AuthManagerRequirementTest, RequireAuthForAll) {
   EXPECT_FALSE(manager.requires_authentication("POST", "/api/v1/auth/authorize"));
 }
 
+// An access token keeps its promised lifetime after its refresh token expires.
+//
+// validate_token() refuses an access token whose refresh record is gone, which
+// is what makes a revocation survive. The cost is that the sweep decides how
+// long an access token really lives: sweeping on the refresh token's own
+// expiry would cut short the last access token minted from it, which was
+// promised a full token_expiry_seconds a moment earlier. This is the test that
+// fails if the grace period is removed.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerRequirementTest, AccessTokenOutlivesItsExpiredRefreshRecord) {
+  // The two expiries are equal, which is the tightest the builder allows
+  // (refresh must be >= access). That is also the worst case: refresh_access_token
+  // reuses the refresh token's jti rather than rotating it, so the access token
+  // it mints is promised token_expiry_seconds from NOW while the record still
+  // dies at its original expiry. Every refresh therefore produces an access
+  // token that outlives its own record.
+  // Three seconds, not one. Two constraints set these numbers.
+  //
+  // Expiries are whole seconds, so the sweep's comparison only moves at second
+  // boundaries: with a one-second expiry and a 1.3 s wait, `expires_at < now`
+  // is still false through integer truncation, and the test would pass with or
+  // without the grace period - measuring nothing.
+  //
+  // And the waits are wall-clock on a machine running the rest of the suite, so
+  // each one has to sit well clear of the boundary it is about rather than just
+  // past it. The record expires at t+3 and is swept after t+6; the checks are
+  // at t+4 and t+9, leaving 2 s and 3 s of slack for a late wake-up.
+  AuthConfig config = AuthConfigBuilder()
+                          .with_enabled(true)
+                          .with_jwt_secret("test_secret_key_min_32_chars_life_")
+                          .with_token_expiry(3)
+                          .with_refresh_token_expiry(3)
+                          .with_require_auth_for(AuthRequirement::ALL)
+                          .build();
+  config.clients.push_back({"c", "s", UserRole::ADMIN, true});
+
+  AuthManager manager(config);
+  ASSERT_TRUE(manager.authenticate("c", "s").has_value());
+  ASSERT_EQ(manager.refresh_token_count(), 1u);
+
+  // t+4s: past the record's own expiry (t+3), inside the one access-token
+  // lifetime it is held for (to t+6). Sweeping here is what cut an access token
+  // short.
+  std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+  manager.cleanup_expired_tokens();
+  EXPECT_EQ(manager.refresh_token_count(), 1u)
+      << "the record was dropped at its own expiry, so any access token minted "
+         "from it in its last moments is refused with most of its life left";
+
+  // t+9s: past the grace too. It does not live forever, or a revocation would
+  // be honoured out of a map that only ever grows.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+  manager.cleanup_expired_tokens();
+  EXPECT_EQ(manager.refresh_token_count(), 0u) << "the record outlived even its grace period";
+}
+
 // Test none auth requirement mode
 TEST(AuthManagerRequirementTest, RequireAuthForNone) {
   AuthConfig config = AuthConfigBuilder()
@@ -715,8 +771,11 @@ TEST(AuthManagerTokenLifetimeTest, RepeatedLoginsDoNotGrowTheStoreWithoutBound) 
   }
   EXPECT_EQ(manager.refresh_token_count(), 5U) << "records should accumulate while they are live";
 
-  // Past the refresh expiry, the next authorisation must clear them out.
-  std::this_thread::sleep_for(std::chrono::seconds(2));
+  // Past the refresh expiry AND the access-token lifetime a record is held for
+  // beyond it, the next authorisation must clear them out. Records expire at
+  // t+1 and are swept after t+2, so this waits to t+4: far enough clear of the
+  // boundary that a late wake-up on a loaded machine cannot land short of it.
+  std::this_thread::sleep_for(std::chrono::milliseconds(4000));
   ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
 
   EXPECT_EQ(manager.refresh_token_count(), 1U)
@@ -1257,33 +1316,107 @@ TEST_F(AuthRequirementPolicyTest, AllAuthPolicyAlwaysRequiresAuth) {
   EXPECT_TRUE(policy.requires_authentication("DELETE", "/api/v1/admin/users"));
 }
 
-// The health probe is the one route the ALL policy lets through, and its
-// narrowness is the whole reason it is safe. Widening it to "any method on
-// /health", or to any path merely CONTAINING /health, is the natural next edit
-// and would open a hole, so the boundary is pinned here.
+// Health is NOT special to the ALL policy. It is closed like everything else
+// until an operator names it in auth.public_routes, and this is the test that
+// fails if somebody hardcodes the exemption back in.
 // @verifies REQ_INTEROP_086
-TEST_F(AuthRequirementPolicyTest, AllAuthPolicyExemptsOnlyGetHealth) {
+TEST_F(AuthRequirementPolicyTest, AllAuthPolicyDoesNotExemptHealth) {
   AllAuthRequirementPolicy policy;
 
-  // Exempt: a container supervisor and a load balancer probe this with no
-  // credential, and requiring one turns a healthy gateway into a restart loop.
-  EXPECT_FALSE(policy.requires_authentication("GET", "/api/v1/health"));
-
-  // Only GET. A write to the health path is not a liveness probe.
-  EXPECT_TRUE(policy.requires_authentication("POST", "/api/v1/health"));
-  EXPECT_TRUE(policy.requires_authentication("PUT", "/api/v1/health"));
-  EXPECT_TRUE(policy.requires_authentication("DELETE", "/api/v1/health"));
-  EXPECT_TRUE(policy.requires_authentication("PATCH", "/api/v1/health"));
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/health"));
   EXPECT_TRUE(policy.requires_authentication("HEAD", "/api/v1/health"));
+}
+
+// An entry of auth.public_routes opens the route it names and nothing beside
+// it. Widening the comparison to a prefix, or dropping the method, is the
+// natural next edit and would open a hole, so the boundary is pinned here.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, PublicRouteExemptionOpensOnlyWhatItNames) {
+  auto policy = AuthRequirementPolicyFactory::create(AuthRequirement::ALL, {{"GET", "/api/v1/health"}});
+
+  // The route the operator named.
+  EXPECT_FALSE(policy->requires_authentication("GET", "/api/v1/health"));
+
+  // Only GET. A write to the health path is not a liveness probe, and
+  // cpp-httplib dispatches HEAD into the GET handler table, so dropping the
+  // method check would hand the status document to an anonymous HEAD.
+  EXPECT_TRUE(policy->requires_authentication("POST", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("PUT", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("DELETE", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("PATCH", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("HEAD", "/api/v1/health"));
 
   // Only that exact path. A prefix or suffix match would hand an attacker a
   // trivial bypass: append or prepend the magic word and walk in.
-  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/health/detail"));
-  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/healthz"));
-  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/components/health"));
-  EXPECT_TRUE(policy.requires_authentication("GET", "/health"));
-  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/health?x=1"));
-  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v2/health"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/health/detail"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/healthz"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/components/health"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/health"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/health?x=1"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v2/health"));
+
+  // And the rest of the surface is untouched by the entry.
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/areas"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/"));
+}
+
+// The layer only ever removes a requirement. Wrapping must not make a gateway
+// stricter than the policy underneath, or an operator who adds a probe route
+// would silently close the reads that `write` leaves open.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, PublicRouteExemptionNeverAddsARequirement) {
+  auto policy = AuthRequirementPolicyFactory::create(AuthRequirement::WRITE, {{"POST", "/api/v1/health"}});
+
+  EXPECT_FALSE(policy->requires_authentication("GET", "/api/v1/areas"));
+  EXPECT_FALSE(policy->requires_authentication("POST", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("POST", "/api/v1/areas"));
+}
+
+// An empty list must leave the policy exactly as it was, or "closed by
+// default" would depend on the wrapper behaving itself.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, EmptyPublicRoutesChangesNothing) {
+  auto policy = AuthRequirementPolicyFactory::create(AuthRequirement::ALL, {});
+
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/areas"));
+  EXPECT_FALSE(policy->requires_authentication("POST", "/api/v1/auth/authorize"));
+}
+
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, PublicRouteEntryParsing) {
+  auto ok = parse_public_route("GET /api/v1/health");
+  ASSERT_TRUE(ok.has_value());
+  EXPECT_EQ(ok->method, "GET");
+  EXPECT_EQ(ok->path, "/api/v1/health");
+
+  // Case and surrounding whitespace are the operator's typing, not a decision.
+  auto lower = parse_public_route("  get /api/v1/health  ");
+  ASSERT_TRUE(lower.has_value());
+  EXPECT_EQ(lower->method, "GET");
+  EXPECT_EQ(lower->path, "/api/v1/health");
+
+  // Everything below must be refused rather than half-understood. A wildcard
+  // accepted and then matched literally would read as "this opens the subtree"
+  // and open nothing, which is the worst of both.
+  EXPECT_FALSE(parse_public_route("/api/v1/health").has_value());
+  EXPECT_FALSE(parse_public_route("GET").has_value());
+  EXPECT_FALSE(parse_public_route("").has_value());
+  EXPECT_FALSE(parse_public_route("   ").has_value());
+  EXPECT_FALSE(parse_public_route("FETCH /api/v1/health").has_value());
+  EXPECT_FALSE(parse_public_route("GET api/v1/health").has_value());
+  EXPECT_FALSE(parse_public_route("GET /api/v1/*").has_value());
+  EXPECT_FALSE(parse_public_route("GET /api/v1/health extra").has_value());
+}
+
+// A malformed entry must not quietly open something. Dropping it keeps the
+// route protected; GatewayNode refuses to start so the typo is not silent.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, MalformedPublicRoutesAreDropped) {
+  auto routes = parse_public_routes({"GET /api/v1/health", "nonsense", "GET /api/v1/*"});
+
+  ASSERT_EQ(routes.size(), 1u);
+  EXPECT_EQ(routes[0].path, "/api/v1/health");
 }
 
 // @verifies REQ_INTEROP_086

@@ -415,9 +415,35 @@ ros2_medkit_gateway:
       # authentication switched on, and the reads are where the disclosure is:
       # the entity tree names the machines, the fault history is the
       # maintenance record. Both are readable by anyone who can reach the port.
-      # GET /health and /auth/* stay public under "all" - see
-      # AllAuthRequirementPolicy, which documents why each one has to be.
+      # Only /auth/* stays public under "all", because authentication cannot
+      # bootstrap through a door that demands the credential it hands out.
       require_auth_for: "all"
+
+      # Routes answered with no credential at all, on top of whatever
+      # require_auth_for decides. Each entry is "METHOD /path", matched
+      # exactly: no wildcards, so this list is the whole public surface and a
+      # reviewer can read it as such.
+      #
+      # Empty as shipped. Add an entry when something that cannot hold a
+      # credential has to reach a route - a container supervisor or a load
+      # balancer probing health is the case this exists for:
+      #
+      #   public_routes: ["GET /api/v1/health"]
+      #
+      # A liveness probe usually needs no entry: a 401 already proves the
+      # process is up and answering HTTP. Prefer teaching the probe to accept
+      # it over opening the route. When the route is opened, the body an
+      # anonymous caller gets is narrowed to liveness - no entity names, no
+      # counts - so the probe works and the disclosure does not follow.
+      #
+      # Every entry is logged at WARN on startup, once per route.
+      #
+      # Left absent rather than written as `public_routes: []`. An empty YAML
+      # sequence carries no type, so rclcpp cannot tell a string array from any
+      # other and the node dies at startup with "No parameter value set". The
+      # declared default is already empty, so absence and `[]` mean the same
+      # thing - one of them just starts.
+      # public_routes: ["GET /api/v1/health"]
 
       # JWT issuer claim
       # Default: "ros2_medkit_gateway"

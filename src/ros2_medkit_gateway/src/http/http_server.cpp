@@ -49,6 +49,20 @@ HttpServerManager::HttpServerManager(const TlsConfig & tls_config, std::size_t t
           " (key configured: " + (tls_config_.key_file.empty() ? "no" : "yes") + ")");
     }
 
+    // The constructor above ignores what SSL_CTX_load_verify_locations returned,
+    // so `is_valid()` is true for a ca_file that exists but is unreadable or is
+    // not PEM. The gateway would then start, log "REQUIRED (mutual TLS)", and
+    // reject every client at the handshake with no trust store to check them
+    // against - an outage that reads as a client problem. Load it again and
+    // look at the answer this time; loading the same file twice is a no-op
+    // beyond re-adding the same certificates to the store.
+    if (!tls_config_.ca_file.empty() &&
+        SSL_CTX_load_verify_locations(ssl_server_->ssl_context(), tls_config_.ca_file.c_str(), nullptr) != 1) {
+      throw std::runtime_error(
+          "Mutual TLS is configured but the client CA bundle could not be loaded: " + tls_config_.ca_file +
+          ". The file must be readable by the gateway and contain PEM certificates.");
+    }
+
     // Configure additional TLS settings
     configure_tls();
     apply_thread_pool(*ssl_server_);

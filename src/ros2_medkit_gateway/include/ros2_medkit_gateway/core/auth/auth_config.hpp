@@ -91,6 +91,15 @@ struct AuthConfig {
   // Pre-configured clients (for development/testing)
   std::vector<ClientCredentials> clients;
 
+  /// Routes answered with no credential, each written "METHOD /path".
+  ///
+  /// Empty by default, so `require_auth_for` alone decides and the gateway is
+  /// closed as shipped. An operator adds an entry when something that cannot
+  /// hold a credential has to reach a route - a container supervisor probing
+  /// `GET /api/v1/health` is the case this exists for. Matching is exact and
+  /// there are no wildcards, so the list reads as the whole public surface.
+  std::vector<std::string> public_routes;
+
   /// Permission entries for the routes the `RouteRegistry` does not hold.
   ///
   /// The gateway's own routes derive their entries from their registration
@@ -119,6 +128,7 @@ class AuthConfigBuilder {
   AuthConfigBuilder & with_refresh_token_expiry(int seconds);
   AuthConfigBuilder & with_require_auth_for(AuthRequirement requirement);
   AuthConfigBuilder & with_issuer(const std::string & issuer);
+  AuthConfigBuilder & with_public_routes(const std::vector<std::string> & public_routes);
   AuthConfigBuilder & add_client(const std::string & client_id, const std::string & client_secret, UserRole role);
   AuthConfig build();
 

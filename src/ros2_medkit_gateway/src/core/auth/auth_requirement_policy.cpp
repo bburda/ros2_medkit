@@ -15,7 +15,12 @@
 #include "ros2_medkit_gateway/core/auth/auth_requirement_policy.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <memory>
 #include <regex>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace ros2_medkit_gateway {
 
@@ -168,8 +173,101 @@ std::unique_ptr<IAuthRequirementPolicy> AuthRequirementPolicyFactory::create(con
     return std::make_unique<NoAuthRequirementPolicy>();
   }
 
-  // Use the require_auth_for setting from config
-  return create(config.require_auth_for);
+  return create(config.require_auth_for, parse_public_routes(config.public_routes));
+}
+
+std::vector<PublicRoute> parse_public_routes(const std::vector<std::string> & entries) {
+  std::vector<PublicRoute> routes;
+  routes.reserve(entries.size());
+  for (const auto & entry : entries) {
+    auto parsed = parse_public_route(entry);
+    if (parsed.has_value()) {
+      routes.push_back(*parsed);
+    }
+  }
+  return routes;
+}
+
+std::unique_ptr<IAuthRequirementPolicy>
+AuthRequirementPolicyFactory::create(AuthRequirement requirement, const std::vector<PublicRoute> & public_routes) {
+  auto policy = create(requirement);
+  if (public_routes.empty()) {
+    return policy;
+  }
+  return std::make_unique<PublicRouteExemptionPolicy>(std::move(policy), public_routes);
+}
+
+tl::expected<PublicRoute, std::string> parse_public_route(const std::string & entry) {
+  auto is_space = [](unsigned char c) {
+    return std::isspace(c) != 0;
+  };
+  auto begin = std::find_if_not(entry.begin(), entry.end(), is_space);
+  auto end = std::find_if_not(entry.rbegin(), entry.rend(), is_space).base();
+  const std::string trimmed = (begin < end) ? std::string(begin, end) : std::string();
+
+  if (trimmed.empty()) {
+    return tl::unexpected<std::string>("entry is empty");
+  }
+
+  const size_t space = trimmed.find(' ');
+  if (space == std::string::npos) {
+    return tl::unexpected<std::string>("expected \"METHOD /path\", e.g. \"GET /api/v1/health\"");
+  }
+
+  PublicRoute route;
+  route.method = trimmed.substr(0, space);
+  route.path = trimmed.substr(space + 1);
+
+  // The path is compared against what cpp-httplib hands the middleware, which
+  // is a single token. A second space means two paths or a stray argument, and
+  // either way the entry does not describe one route.
+  if (route.path.find(' ') != std::string::npos) {
+    return tl::unexpected<std::string>("path contains a space: \"" + route.path + "\"");
+  }
+
+  std::transform(route.method.begin(), route.method.end(), route.method.begin(), [](unsigned char c) {
+    return static_cast<char>(std::toupper(c));
+  });
+
+  static const std::vector<std::string> kMethods = {"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"};
+  if (std::find(kMethods.begin(), kMethods.end(), route.method) == kMethods.end()) {
+    return tl::unexpected<std::string>("unknown HTTP method \"" + route.method + "\"");
+  }
+
+  if (route.path.empty() || route.path.front() != '/') {
+    return tl::unexpected<std::string>("path must start with \"/\": \"" + route.path + "\"");
+  }
+
+  // Wildcards are refused rather than ignored. Accepting the character and
+  // then matching it literally would read as "this opens the subtree" and
+  // silently open nothing; refusing says so while the operator is watching.
+  if (route.path.find('*') != std::string::npos) {
+    return tl::unexpected<std::string>("wildcards are not supported; name each route exactly: \"" + route.path + "\"");
+  }
+
+  return route;
+}
+
+PublicRouteExemptionPolicy::PublicRouteExemptionPolicy(std::unique_ptr<IAuthRequirementPolicy> inner,
+                                                       std::vector<PublicRoute> public_routes)
+  : inner_(std::move(inner)), public_routes_(std::move(public_routes)) {
+}
+
+bool PublicRouteExemptionPolicy::requires_authentication(const std::string & method, const std::string & path) const {
+  for (const auto & route : public_routes_) {
+    if (route.method == method && route.path == path) {
+      return false;
+    }
+  }
+  return inner_->requires_authentication(method, path);
+}
+
+std::string PublicRouteExemptionPolicy::description() const {
+  std::string desc = inner_->description() + "; public_routes:";
+  for (const auto & route : public_routes_) {
+    desc += " " + route.method + " " + route.path;
+  }
+  return desc;
 }
 
 }  // namespace ros2_medkit_gateway

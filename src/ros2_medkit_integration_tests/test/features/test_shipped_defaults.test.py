@@ -158,15 +158,24 @@ class TestShippedDefaults(unittest.TestCase):
                 resp = requests.get(f'{BASE_URL}{path}', timeout=15)
                 self.assertIn(resp.status_code, (401, 403))
 
-    def test_03_health_stays_reachable(self):
-        """The exemption has to survive in the shipped file too.
+    def test_03_health_refuses_in_the_shipped_file_too(self):
+        """The shipped file opens nothing, health included.
 
-        Without it a container supervisor cannot probe the gateway and every
-        deployment restart-loops, so this is as much a part of the shipped
-        posture as the refusals above.
+        `auth.public_routes` is absent from the shipped config, so the file
+        that goes out in the package and the image leaves no route reachable
+        without a credential. An operator who wants a probe route adds the
+        entry themselves - that path is covered in test_closed_by_default.
+
+        Pinned here separately from the sweep above because health is the route
+        a hardening change is most tempted to leave open, and a shipped file
+        that quietly did so would still pass every other test in this class.
         """
         resp = requests.get(f'{BASE_URL}/health', timeout=15)
-        self.assertEqual(resp.status_code, 200)
+        self.assertIn(
+            resp.status_code, (401, 403),
+            f'the shipped config answered GET /health with {resp.status_code} '
+            'to a caller holding no credential'
+        )
 
     def test_04_a_configured_client_still_works(self):
         """The mirror: a gateway that refused everyone would pass the rest."""
@@ -183,6 +192,17 @@ class TestShippedDefaults(unittest.TestCase):
             text = handle.read()
         self.assertIn('require_auth_for: "all"', text)
         self.assertIn('enabled: true', text)
+        # And no route is opened by the file itself. An uncommented entry here
+        # would be a public route shipped to every deployment, which is exactly
+        # what this branch exists to stop. The commented example does not count.
+        live_public_routes = [
+            line for line in text.splitlines()
+            if line.strip().startswith('public_routes:')
+        ]
+        self.assertEqual(
+            live_public_routes, [],
+            f'the shipped config declares public routes: {live_public_routes}'
+        )
 
 
 @launch_testing.post_shutdown_test()
