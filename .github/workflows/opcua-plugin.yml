@@ -55,7 +55,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y git
 
       - name: Checkout repository
@@ -82,10 +82,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y ros-${{ matrix.ros_distro }}-test-msgs libyaml-cpp-dev libssl-dev
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           # Skip nav2_msgs (vda5050_agent declares it; not available on all
           # distros) and the linter rosdep keys. Linters only run in the Jazzy
           # quality job, so we don't need them installed here. The upstream
@@ -242,7 +242,7 @@ jobs:
 
       - name: Install jq + asyncua (smoke test prerequisite)
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get install -y jq python3-pip
           pip3 install --break-system-packages asyncua
 
@@ -276,7 +276,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y git
 
       - name: Checkout repository
@@ -303,12 +303,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           # openssl: cert generation. libssl-dev: encryption backend for both
           # the plugin's open62541pp and the fixture's static open62541.
           apt-get install -y ros-jazzy-test-msgs libyaml-cpp-dev libssl-dev openssl
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y \
             --skip-keys='nav2_msgs ament_cmake_clang_format ament_cmake_clang_tidy'
 

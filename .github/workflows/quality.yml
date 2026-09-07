@@ -26,7 +26,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y git
 
       - name: Checkout repository
@@ -49,10 +49,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y clang-format ccache
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Cache ccache
@@ -113,7 +113,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y git
 
       - name: Checkout repository
@@ -160,10 +160,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Build (compile database only, no clang-tidy)
@@ -265,7 +265,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y git
 
       - name: Checkout repository
@@ -292,10 +292,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Redirect heavy build output to /mnt
@@ -419,7 +419,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y git
 
       - name: Checkout repository
@@ -446,10 +446,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Redirect heavy build output to /mnt
@@ -566,7 +566,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y git
 
       - name: Checkout repository
@@ -598,10 +598,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get update
+          apt-get -o Acquire::Retries=3 update
           apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Redirect heavy build output to /mnt
