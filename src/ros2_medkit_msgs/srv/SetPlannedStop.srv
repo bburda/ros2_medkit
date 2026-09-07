@@ -1,0 +1,50 @@
+# Copyright 2026 bburda
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SetPlannedStop.srv - Declare, or withdraw, a planned stop on the FaultManager.
+#
+# While a planned stop is on, every fault whose cycle starts is reported, debounced,
+# confirmed, captured and audited exactly as it would be otherwise, and is MARKED as
+# muted rather than dropped: it is absent from the default ListFaults response, counted
+# in `muted_count`, listed under `muted_faults` when `include_muted` is set, and no
+# FaultEvent is published for it. Withdrawing the stop unmutes every fault it muted that
+# is still active, and republishes an EVENT_CONFIRMED for each one that is CONFIRMED,
+# because that confirmation was never announced.
+#
+# The declaration survives a restart of the fault manager.
+
+# Request fields
+
+# True declares a planned stop, false withdraws it.
+bool active
+
+# Why the plant is stopped ("line 3 quarterly maintenance"). Recorded in the audit log
+# with the transition and served back by GetPlannedStop while the stop is on.
+string reason
+
+# Who declared the transition. Recorded in the audit log as the transition's source.
+string declared_by
+---
+# Response fields
+
+# True when the request was applied. A request that asks for the state the switch is
+# already in succeeds and changes nothing (no audit record is written for it).
+bool success
+
+# Status message or error description.
+string message
+
+# The state of the switch BEFORE this request, so a caller can tell "I turned it on"
+# from "it was already on".
+bool was_active

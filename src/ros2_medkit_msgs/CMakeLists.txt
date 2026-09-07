@@ -40,6 +40,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetRosbag.srv"
   "srv/ListRosbags.srv"
   "srv/ListFaultsForEntity.srv"
+  "srv/SetPlannedStop.srv"
+  "srv/GetPlannedStop.srv"
   "srv/ListEntities.srv"
   "srv/GetEntityData.srv"
   "srv/GetCapabilities.srv"
