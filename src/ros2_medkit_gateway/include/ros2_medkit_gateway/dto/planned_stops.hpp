@@ -44,6 +44,7 @@ struct PlannedStop {
   std::string declared_by;
   std::string declared_at;
   bool ended_early{false};
+  bool cancelled{false};
 };
 
 template <>
@@ -51,9 +52,11 @@ inline constexpr auto dto_fields<PlannedStop> = std::make_tuple(
     field("id", &PlannedStop::id,
           "Identifier assigned by the fault manager. Unique within one fault manager, not across a fleet."),
     field("from", &PlannedStop::from,
-          "When the window opens, ISO 8601 in UTC. A fault whose current cycle started at or after this instant "
-          "and at or before `to` is reported as expected."),
-    field("to", &PlannedStop::to, "When the window closes, ISO 8601 in UTC. Always strictly after `from`."),
+          "When the window opens, ISO 8601 in UTC, to the millisecond. A fault whose current cycle started at "
+          "or after this instant and at or before `to` is reported as expected, compared at millisecond "
+          "resolution."),
+    field("to", &PlannedStop::to,
+          "When the window closes, ISO 8601 in UTC, to the millisecond. Always strictly after `from`."),
     field("reason", &PlannedStop::reason, "Why the plant is stopping, as the operator wrote it."),
     field("declared_by", &PlannedStop::declared_by,
           "The authenticated client that declared the window, or `anonymous` when the declaration arrived "
@@ -62,7 +65,11 @@ inline constexpr auto dto_fields<PlannedStop> = std::make_tuple(
           "When the declaration was recorded, ISO 8601 in UTC. Later than `to` for a window declared after the "
           "stop it describes, which is allowed."),
     field("ended_early", &PlannedStop::ended_early,
-          "True when an operator cut the window short, which moved `to` to the moment of that request."));
+          "True when an operator cut the window short, which moved `to` to the moment of that request."),
+    field("cancelled", &PlannedStop::cancelled,
+          "True on the window returned by a DELETE that arrived before the window had STARTED: it marked "
+          "nothing, so it was removed rather than shortened, and `ended_early` stays false. Never true on a "
+          "window a list or a GET returns - a cancelled window is gone."));
 
 template <>
 inline constexpr std::string_view dto_name<PlannedStop> = "PlannedStop";
@@ -95,11 +102,14 @@ template <>
 inline constexpr auto dto_fields<PlannedStopCreateRequest> = std::make_tuple(
     field("from", &PlannedStopCreateRequest::from,
           "When the window opens, ISO 8601 in UTC (`Z` or `+00:00`; a real offset is rejected). Omit it for a "
-          "stop that starts now. A window wholly in the past is accepted and marks the faults it covers - a "
-          "stop is a fact about the plant, not about when someone typed it in."),
+          "stop that starts now - the gateway fills in its own clock. A window wholly in the past is accepted "
+          "and marks the faults it covers: a stop is a fact about the plant, not about when someone typed it "
+          "in. The instant must be after the Unix epoch and no later than 2038-01-19T03:14:07Z, and it is "
+          "recorded to the millisecond."),
     field("to", &PlannedStopCreateRequest::to,
           "When the window closes, ISO 8601 in UTC. Must be strictly after `from`; equal instants are rejected "
-          "with 400, as is a `to` before `from`. There is no maximum duration."),
+          "with 400, as is a `to` before `from`. There is no maximum duration, but the instant must lie in the "
+          "same range as `from`, and it is recorded to the millisecond."),
     field("reason", &PlannedStopCreateRequest::reason,
           "Why the plant is stopping. Carried verbatim on every fault the window marks, so write what an "
           "engineer reading the fault next month needs.",

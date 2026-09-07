@@ -15,6 +15,7 @@
 #include "ros2_medkit_gateway/http/handlers/planned_stop_handlers.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,13 +36,33 @@ namespace {
 /// Map a transport failure onto an HTTP answer. Only a transport that got no
 /// answer at all yields 503; a fault manager that answered and declined is
 /// healthy and the request was at fault.
-ErrorInfo transport_error(const PlannedStopResult & result, const std::string & what) {
+///
+/// Which refusal it was comes from the service's structured outcome, never from
+/// its message: the refusals map onto three different statuses, and reading
+/// prose to pick one turns a rewording into an outage.
+ErrorInfo transport_error(const PlannedStopResult & result, const std::string & what, json params = json::object()) {
+  params["operation"] = what;
   if (result.failure == FaultFailure::Unavailable) {
-    return make_error(503, ERR_SERVICE_UNAVAILABLE, "Fault manager unavailable",
-                      json{{"details", result.error_message}, {"operation", what}});
+    params["details"] = result.error_message;
+    return make_error(503, ERR_SERVICE_UNAVAILABLE, "Fault manager unavailable", std::move(params));
   }
-  return make_error(400, ERR_INVALID_REQUEST, result.error_message.empty() ? what : result.error_message,
-                    json{{"operation", what}});
+  const std::string message = result.error_message.empty() ? what : result.error_message;
+  switch (result.refusal) {
+    case PlannedStopRefusal::NotFound:
+      return make_error(404, ERR_RESOURCE_NOT_FOUND, "Planned stop not found", std::move(params));
+    case PlannedStopRefusal::AlreadyEnded:
+      return make_error(400, ERR_X_MEDKIT_PLANNED_STOP_ENDED,
+                        "Planned stop has already ended and cannot be ended again", std::move(params));
+    case PlannedStopRefusal::DuplicateId:
+    case PlannedStopRefusal::NotRetained:
+      // 409, not 400: the request was well formed and the store could not take
+      // it. Raise planned_stop.max_windows, or end a window, and retry.
+      return make_error(409, ERR_PRECONDITION_NOT_FULFILLED, message, std::move(params));
+    case PlannedStopRefusal::InvalidRequest:
+    case PlannedStopRefusal::None:
+    default:
+      return make_error(400, ERR_INVALID_REQUEST, message, std::move(params));
+  }
 }
 
 }  // namespace
@@ -55,6 +76,7 @@ dto::PlannedStop PlannedStopHandlers::to_dto(const faults::PlannedStopWindow & w
   out.declared_by = window.declared_by;
   out.declared_at = format_timestamp_ns(window.declared_at_ns);
   out.ended_early = window.ended_early;
+  out.cancelled = window.cancelled;
   return out;
 }
 
@@ -83,11 +105,13 @@ std::string PlannedStopHandlers::resolve_declared_by(const http::TypedRequest & 
 http::Result<std::pair<http::Created<dto::PlannedStop>, http::ResponseAttachments>>
 PlannedStopHandlers::declare_stop(const http::TypedRequest & req, dto::PlannedStopCreateRequest body) {
   try {
-    // A zero start is the transport's way of saying "the fault manager's own
-    // wall clock". That is the right default here too: the fault timestamps the
-    // window will be compared against come from that clock, so filling in the
-    // gateway's would put the difference between the two into the window.
-    int64_t from_ns = 0;
+    // An omitted `from` is filled in HERE, with this gateway's own clock, and an
+    // explicit instant always goes on the wire. Sending zero and letting the
+    // service read it as "now" made the epoch - a legal instant an operator can
+    // ask for - indistinguishable from a field nobody set.
+    int64_t from_ns = faults::floor_to_ms_ns(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
     if (body.from.has_value() && !body.from->empty()) {
       const auto parsed = faults::parse_iso8601_utc_ns(*body.from);
       if (!parsed) {
@@ -97,8 +121,8 @@ PlannedStopHandlers::declare_stop(const http::TypedRequest & req, dto::PlannedSt
       from_ns = *parsed;
       if (!faults::is_representable_instant(from_ns)) {
         return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER,
-                                         "from is outside the range a planned stop can be stored at "
-                                         "(1970-01-01T00:00:00Z to 2038-01-19T03:14:07Z)",
+                                         "from must be after 1970-01-01T00:00:00Z and no later than "
+                                         "2038-01-19T03:14:07Z",
                                          json{{"parameter", "from"}, {"value", *body.from}}));
       }
     }
@@ -110,17 +134,17 @@ PlannedStopHandlers::declare_stop(const http::TypedRequest & req, dto::PlannedSt
     }
     if (!faults::is_representable_instant(*to_ns)) {
       return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER,
-                                       "to is outside the range a planned stop can be stored at "
-                                       "(1970-01-01T00:00:00Z to 2038-01-19T03:14:07Z)",
+                                       "to must be after 1970-01-01T00:00:00Z and no later than "
+                                       "2038-01-19T03:14:07Z",
                                        json{{"parameter", "to"}, {"value", body.to}}));
     }
     // Checked here as well as in the fault manager so a caller who spelled the
     // window wrong is told which field, rather than being handed the service's
-    // prose. from_ns == 0 means "now", which no client-supplied instant can be,
-    // so the comparison is skipped for it.
-    if (from_ns != 0 && *to_ns <= from_ns) {
-      return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER, "to must be strictly after from",
-                                       json{{"parameter", "to"}, {"from", *body.from}, {"to", body.to}}));
+    // prose.
+    if (*to_ns <= from_ns) {
+      return tl::unexpected(
+          make_error(400, ERR_INVALID_PARAMETER, "to must be strictly after from",
+                     json{{"parameter", "to"}, {"from", format_timestamp_ns(from_ns)}, {"to", body.to}}));
     }
 
     auto fault_mgr = ctx_.node()->get_fault_manager();
@@ -199,29 +223,12 @@ http::Result<dto::PlannedStop> PlannedStopHandlers::end_stop(const http::TypedRe
     auto fault_mgr = ctx_.node()->get_fault_manager();
     auto result = fault_mgr->end_planned_stop(*id);
     if (result.success && !result.stops.empty()) {
+      // Cut short, or cancelled outright when the window had not started yet.
+      // Both are 200 with the window; `cancelled` says which happened, and a
+      // cancelled window is gone, so a GET on this id now answers 404.
       return to_dto(result.stops.front());
     }
-    if (result.failure == FaultFailure::Unavailable) {
-      return tl::unexpected(transport_error(result, "end planned stop"));
-    }
-
-    // The fault manager refused. Which answer that is - "no such window" or
-    // "that window has already ended" - is decided by looking the id up rather
-    // than by reading the refusal's prose, which the fault manager is free to
-    // reword. A window that disappeared between the two calls reads as 404,
-    // which is what it now is.
-    auto listed = fault_mgr->list_planned_stops(/*active_only=*/false);
-    const bool exists = listed.success && std::any_of(listed.stops.begin(), listed.stops.end(),
-                                                      [&id](const faults::PlannedStopWindow & window) {
-                                                        return window.id == *id;
-                                                      });
-    if (!exists) {
-      return tl::unexpected(
-          make_error(404, ERR_RESOURCE_NOT_FOUND, "Planned stop not found", json{{"planned_stop_id", *id}}));
-    }
-    return tl::unexpected(make_error(400, ERR_X_MEDKIT_PLANNED_STOP_ENDED,
-                                     "Planned stop has already ended and cannot be ended again",
-                                     json{{"planned_stop_id", *id}, {"details", result.error_message}}));
+    return tl::unexpected(transport_error(result, "end planned stop", json{{"planned_stop_id", *id}}));
   } catch (const std::exception & e) {
     return tl::unexpected(
         make_error(500, ERR_INTERNAL_ERROR, "Failed to end planned stop", json{{"details", e.what()}}));

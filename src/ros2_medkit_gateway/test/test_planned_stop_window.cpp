@@ -383,6 +383,42 @@ TEST(PlannedStopRepresentableInstant, AcceptsTheWholeInt32SecondRange) {
   EXPECT_FALSE(is_representable_instant(*before_the_epoch));
 }
 
+// --- the collection-level tally ---------------------------------------------
+
+TEST(PlannedStopExpectedCount, CreatesTheExtensionWhenTheEmitterDidNot) {
+  // A plugin's fault list need not carry an `x-medkit` object at all. Writing
+  // through `collection["x-medkit"]["expected_count"]` without creating it left
+  // the collection answering `"x-medkit": null`, which is neither the count nor
+  // the absence of one.
+  nlohmann::json collection{{"items", nlohmann::json::array()}};
+  ros2_medkit_gateway::faults::set_expected_count(collection, 3);
+
+  ASSERT_TRUE(collection["x-medkit"].is_object()) << "x-medkit must be an object, never null";
+  EXPECT_EQ(collection["x-medkit"]["expected_count"].get<int64_t>(), 3);
+}
+
+TEST(PlannedStopExpectedCount, KeepsWhatTheExtensionAlreadyCarried) {
+  nlohmann::json collection{{"items", nlohmann::json::array()}, {"x-medkit", {{"count", 7}}}};
+  ros2_medkit_gateway::faults::set_expected_count(collection, 2);
+
+  EXPECT_EQ(collection["x-medkit"]["count"].get<int64_t>(), 7);
+  EXPECT_EQ(collection["x-medkit"]["expected_count"].get<int64_t>(), 2);
+}
+
+TEST(PlannedStopExpectedCount, ReplacesANullExtensionRatherThanWritingThroughIt) {
+  nlohmann::json collection{{"items", nlohmann::json::array()}, {"x-medkit", nullptr}};
+  ros2_medkit_gateway::faults::set_expected_count(collection, 0);
+
+  ASSERT_TRUE(collection["x-medkit"].is_object());
+  EXPECT_EQ(collection["x-medkit"]["expected_count"].get<int64_t>(), 0);
+}
+
+TEST(PlannedStopExpectedCount, LeavesANonObjectCollectionAlone) {
+  nlohmann::json not_a_collection = nlohmann::json::array({1, 2});
+  ros2_medkit_gateway::faults::set_expected_count(not_a_collection, 1);
+  EXPECT_TRUE(not_a_collection.is_array());
+}
+
 // --- the cache the event path reads -----------------------------------------
 
 TEST(PlannedStopCacheTest, StartsEmptyAndDueForARefresh) {
@@ -432,6 +468,25 @@ TEST(PlannedStopCacheTest, ASuccessfulRefreshClearsTheFailureFlag) {
 
   cache.store({window("w", 10 * kSec, 20 * kSec)});
   EXPECT_FALSE(cache.last_refresh_failed());
+}
+
+// R13: on the event stream, "unknown" is not "false". A consumer must not read
+// an outage of the fault manager as "nothing is expected".
+TEST(PlannedStopCacheTest, KnowsWhetherItHasEverSeenAWindowSet) {
+  PlannedStopCache cache;
+  EXPECT_FALSE(cache.has_knowledge()) << "nothing has been read yet";
+
+  cache.note_failed_refresh();
+  EXPECT_FALSE(cache.has_knowledge()) << "a read that got no answer taught it nothing";
+
+  cache.store({});
+  EXPECT_TRUE(cache.has_knowledge()) << "an empty answer IS an answer: no windows are declared";
+
+  cache.note_failed_refresh();
+  EXPECT_TRUE(cache.has_knowledge()) << "a later outage does not unlearn what was read";
+
+  cache.invalidate();
+  EXPECT_TRUE(cache.has_knowledge()) << "invalidate asks for a re-read; it does not forget";
 }
 
 TEST(PlannedStopCacheTest, InvalidateForcesTheNextReadToRefresh) {

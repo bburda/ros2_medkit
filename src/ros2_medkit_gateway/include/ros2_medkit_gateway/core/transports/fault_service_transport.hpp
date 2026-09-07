@@ -30,6 +30,20 @@ namespace ros2_medkit_gateway {
 /// package. The transport wraps `rclcpp::Client<ros2_medkit_msgs::srv::*>`,
 /// converts message types to JSON internally, and returns the neutral
 /// FaultResult / FaultWithEnvJsonResult structs already filled.
+/// Why the fault manager refused a planned-stop request, when it refused one.
+///
+/// Structural, not textual: the five refusals map onto three different HTTP
+/// answers, and the fault manager is free to reword its messages. Reading the
+/// prose to decide a status is how a rewording becomes an outage.
+enum class PlannedStopRefusal : uint8_t {
+  None,            ///< Not a refusal
+  InvalidRequest,  ///< The interval or an instant was not one the API accepts
+  DuplicateId,     ///< A window with that id already exists
+  NotRetained,     ///< Accepted but not kept: the configured bound had no room
+  NotFound,        ///< No window with that id
+  AlreadyEnded     ///< The window had already ended; its end is not rewritable
+};
+
 /// Outcome of a planned-stop operation. `stops` carries the single stored window
 /// for a declare or an end, and every window for a list; it stays empty on any
 /// failure.
@@ -42,6 +56,7 @@ struct PlannedStopResult {
   std::vector<faults::PlannedStopWindow> stops;
   std::string error_message;
   FaultFailure failure{FaultFailure::Declined};
+  PlannedStopRefusal refusal{PlannedStopRefusal::None};
 };
 
 class FaultServiceTransport {

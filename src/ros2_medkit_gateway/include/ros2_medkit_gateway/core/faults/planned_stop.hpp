@@ -57,7 +57,15 @@ struct PlannedStopWindow {
   std::string reason;
   std::string declared_by;
   int64_t declared_at_ns{0};
+
+  /// True when an operator cut the window short, which moved to_ns to the moment
+  /// of that request.
   bool ended_early{false};
+
+  /// True on the window returned by a cancellation - one stopped before it ever
+  /// started, and therefore removed rather than shortened. Never true on a
+  /// window a list or a read returns.
+  bool cancelled{false};
 
   /// Whether @p when_ns falls inside the window. CLOSED at both ends, and
   /// compared at MILLISECOND resolution on both sides (see kNsPerMillisecond):
@@ -131,6 +139,15 @@ inline bool is_representable_instant(int64_t ns) {
 const PlannedStopWindow * window_for_fault(const std::vector<PlannedStopWindow> & windows,
                                            const nlohmann::json & fault_json);
 
+/// Write `expected_count` into a fault collection's `x-medkit` object, creating
+/// that object when the emitter did not send one.
+///
+/// A plugin's fault list need not carry a vendor extension at all, and writing
+/// through `collection["x-medkit"]["expected_count"]` while only guarding on
+/// `is_object()` left the collection answering `"x-medkit": null` - neither the
+/// count nor the absence of one. A non-object collection is left alone.
+void set_expected_count(nlohmann::json & collection, int64_t count);
+
 /// Attach `expected` - and `planned_stop_id` when it is true - to the fault's own
 /// `x-medkit` object, preserving anything already there. Returns whether the
 /// fault was expected, so a caller can keep a count without deriving twice.
@@ -174,6 +191,13 @@ class PlannedStopCache {
   /// event stream must not stall waiting to find out.
   bool last_refresh_failed() const;
 
+  /// Whether a window set has ever been read successfully. False is "this
+  /// gateway does not know", which is NOT the same as "no windows are declared"
+  /// - an empty successful read is knowledge, an outage is not. The event stream
+  /// omits the flag entirely in the first case, because a consumer must not read
+  /// an unreachable fault manager as "nothing is expected".
+  bool has_knowledge() const;
+
   /// Whether the last refresh attempt - successful or not - is older than
   /// @p ttl. True before the first one.
   bool is_stale(std::chrono::steady_clock::duration ttl) const;
@@ -187,6 +211,7 @@ class PlannedStopCache {
   mutable std::mutex mutex_;
   std::vector<PlannedStopWindow> windows_;
   bool ever_attempted_{false};
+  bool ever_stored_{false};
   bool last_refresh_failed_{false};
   std::chrono::steady_clock::time_point attempted_at_{};
 };

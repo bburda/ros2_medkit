@@ -198,6 +198,17 @@ const PlannedStopWindow * window_for_fault(const std::vector<PlannedStopWindow> 
   return find_covering_window(windows, seconds_to_ns(first_occurred_sec));
 }
 
+void set_expected_count(nlohmann::json & collection, int64_t count) {
+  if (!collection.is_object()) {
+    return;
+  }
+  nlohmann::json & extension = collection["x-medkit"];
+  if (!extension.is_object()) {
+    extension = nlohmann::json::object();
+  }
+  extension["expected_count"] = count;
+}
+
 bool annotate_fault_with_planned_stop(nlohmann::json & fault_json, const std::vector<PlannedStopWindow> & windows) {
   if (!fault_json.is_object()) {
     return false;
@@ -223,6 +234,7 @@ void PlannedStopCache::store(std::vector<PlannedStopWindow> windows) {
   const std::lock_guard<std::mutex> lock(mutex_);
   windows_ = std::move(windows);
   ever_attempted_ = true;
+  ever_stored_ = true;
   last_refresh_failed_ = false;
   attempted_at_ = std::chrono::steady_clock::now();
 }
@@ -232,6 +244,11 @@ void PlannedStopCache::note_failed_refresh() {
   ever_attempted_ = true;
   last_refresh_failed_ = true;
   attempted_at_ = std::chrono::steady_clock::now();
+}
+
+bool PlannedStopCache::has_knowledge() const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return ever_stored_;
 }
 
 bool PlannedStopCache::last_refresh_failed() const {

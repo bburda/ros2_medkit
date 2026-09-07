@@ -684,20 +684,28 @@ std::string SSEFaultHandler::format_sse_event(const QueuedEvent & queued) const 
   }
 
   // Planned-stop flag. Emitted on every event, entity or no entity, so a stream
-  // consumer sees the same truth as a reader of `GET /faults` - and emitted as
-  // an explicit `false` rather than by omission, because "not expected" and "the
-  // gateway could not tell" are different things to react to. The x-medkit
-  // object is created here when the entity did not resolve, which is why the
-  // two fields it may otherwise carry are optional in the frame's schema.
+  // consumer sees the same truth as a reader of `GET /faults`. The x-medkit
+  // object is created here when the entity did not resolve, which is why the two
+  // fields it may otherwise carry are optional in the frame's schema.
+  //
+  // "Unknown" is NOT "false". While this gateway has never managed to read the
+  // declared windows - no fault manager, or none reachable since start - the
+  // frame carries no `expected` key at all. Sending `false` there would tell a
+  // consumer that nothing was expected, which is exactly what an operator
+  // watching a stop would act on, and the gateway does not know that.
   if (auto * fault_mgr = ctx_.node()->get_fault_manager(); fault_mgr != nullptr) {
+    // Read first: this call is what populates the cache, so asking whether the
+    // gateway knows anything before it would answer "no" for ever.
     const auto windows = fault_mgr->planned_stop_windows();
-    const auto * covering = faults::window_for_fault(windows, json_event["fault"]);
-    if (!json_event["x-medkit"].is_object()) {
-      json_event["x-medkit"] = nlohmann::json::object();
-    }
-    json_event["x-medkit"]["expected"] = covering != nullptr;
-    if (covering != nullptr) {
-      json_event["x-medkit"]["planned_stop_id"] = covering->id;
+    if (fault_mgr->planned_stops_known()) {
+      const auto * covering = faults::window_for_fault(windows, json_event["fault"]);
+      if (!json_event["x-medkit"].is_object()) {
+        json_event["x-medkit"] = nlohmann::json::object();
+      }
+      json_event["x-medkit"]["expected"] = covering != nullptr;
+      if (covering != nullptr) {
+        json_event["x-medkit"]["planned_stop_id"] = covering->id;
+      }
     }
   }
 

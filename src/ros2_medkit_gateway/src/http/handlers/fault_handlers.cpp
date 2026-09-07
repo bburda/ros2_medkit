@@ -217,12 +217,47 @@ tl::expected<ExpectedFilter, ErrorInfo> read_expected_filter(const std::optional
       make_error(400, ERR_INVALID_PARAMETER, "expected must be one of: true, false, all", std::move(params)));
 }
 
+/// Whether a peer's item says it was expected. Reads the flag the PEER derived;
+/// an item that carries none says nothing either way.
+std::optional<bool> peer_item_expected_flag(const json & item) {
+  if (!item.is_object()) {
+    return std::nullopt;
+  }
+  const auto ext = item.find("x-medkit");
+  if (ext == item.end() || !ext->is_object()) {
+    return std::nullopt;
+  }
+  const auto flag = ext->find("expected");
+  if (flag == ext->end() || !flag->is_boolean()) {
+    return std::nullopt;
+  }
+  return flag->get<bool>();
+}
+
+bool peer_item_is_expected(const json & item) {
+  return peer_item_expected_flag(item).value_or(false);
+}
+
 /// Mark each item with the planned-stop flag, drop what the filter excludes, and
 /// report how many of the survivors were expected.
 ///
 /// Runs on the LOCAL items only, before any peer merge: a peer's gateway derives
 /// its own flag from its own fault manager's windows, and this gateway has no
 /// business re-deciding it from windows the peer never saw.
+/// Whether a peer's item survives the `expected` filter. An item whose flag the
+/// peer did not send is dropped by BOTH `true` and `false`: this gateway cannot
+/// claim it was expected, and it cannot claim it was not either.
+bool keep_peer_item(const json & item, ExpectedFilter filter) {
+  if (filter == ExpectedFilter::All) {
+    return true;
+  }
+  const auto flag = peer_item_expected_flag(item);
+  if (!flag.has_value()) {
+    return false;
+  }
+  return filter == ExpectedFilter::OnlyExpected ? *flag : !*flag;
+}
+
 int64_t apply_planned_stops(json & items, FaultManager & fault_mgr, ExpectedFilter filter) {
   if (!items.is_array()) {
     return 0;
@@ -519,12 +554,10 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
 
     // Format: items array at top level
     json response = {{"items", result.data["faults"]}};
-    const int64_t expected_count = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
+    int64_t expected_count_total = apply_planned_stops(response["items"], *fault_mgr, expected_filter);
 
     // x-medkit extension for ros2_medkit-specific fields (typed DTO)
     dto::FaultListXMedkit xm;
-    xm.count = static_cast<int64_t>(response["items"].size());
-    xm.expected_count = expected_count;
     xm.muted_count = result.data.value("muted_count", static_cast<int64_t>(0));
     xm.cluster_count = result.data.value("cluster_count", static_cast<int64_t>(0));
 
@@ -546,9 +579,24 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
       const auto & raw_req = req.raw_for_framework();
 #pragma GCC diagnostic pop
-      auto fan_result = agg->fan_out_get(raw_req.path, raw_req.get_header_value("Authorization"));
+      // build_fan_out_path, not raw path: `?expected=` and `?status=` are the
+      // client's question, and a peer answering a different question is not an
+      // answer. Forwarding `raw_req.path` dropped the query outright, so
+      // `?expected=true` came back carrying the peer's unexpected faults.
+      auto fan_result = agg->fan_out_get(build_fan_out_path(raw_req), raw_req.get_header_value("Authorization"));
       if (fan_result.merged_items.is_array()) {
         for (const auto & item : fan_result.merged_items) {
+          // Filtered again here, on the flag the PEER derived from ITS OWN
+          // windows - this gateway has no business re-deriving it, and an older
+          // peer that ignored the parameter must not put items through. An item
+          // with no flag is not known to satisfy either side of the filter, so
+          // it is dropped by both.
+          if (!keep_peer_item(item, expected_filter)) {
+            continue;
+          }
+          if (peer_item_is_expected(item)) {
+            ++expected_count_total;
+          }
           response["items"].push_back(item);
         }
       }
@@ -558,6 +606,11 @@ http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::Ty
         xm.peer_failures = fan_result.peer_failures;
       }
     }
+
+    // Counted after the merge, so the numbers describe the list that was
+    // actually served rather than the local half of it.
+    xm.count = static_cast<int64_t>(response["items"].size());
+    xm.expected_count = expected_count_total;
 
     response["x-medkit"] = dto::JsonWriter<dto::FaultListXMedkit>::write(xm);
     return wrap_list_result(std::move(response));
@@ -612,9 +665,11 @@ http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedR
           if (result->content.is_object() && result->content.contains("items")) {
             const int64_t plugin_expected =
                 apply_planned_stops(result->content["items"], *ctx_.node()->get_fault_manager(), *plugin_filter);
-            if (result->content["x-medkit"].is_object()) {
-              result->content["x-medkit"]["expected_count"] = plugin_expected;
-            }
+            // set_expected_count CREATES the extension. Writing through
+            // `content["x-medkit"]["expected_count"]` behind an is_object()
+            // guard left a plugin that sends no vendor extension answering
+            // `"x-medkit": null` - neither the count nor the absence of one.
+            faults::set_expected_count(result->content, plugin_expected);
           }
           return std::move(*result);
         } catch (const std::exception & e) {

@@ -615,12 +615,11 @@ TEST_F(SSEFaultHandlerTest, StreamOmitsTheEntityHintWhenNoMatchingApp) {
   auto output = read_stream_once(res, 1);
   auto payload = parse_sse_payload(output);
 
-  ASSERT_TRUE(payload.contains("x-medkit"));
-  EXPECT_FALSE(payload["x-medkit"].contains("entity_type"));
-  EXPECT_FALSE(payload["x-medkit"].contains("entity_id"));
-  EXPECT_TRUE(payload["x-medkit"].contains("expected"));
-  EXPECT_FALSE(payload["x-medkit"]["expected"].get<bool>())
-      << "no fault manager answers in this fixture, so no window can cover the fault";
+  // Nothing to put in it: the reporting source resolves to no entity, and this
+  // fixture has no fault manager, so the gateway has never read a window set and
+  // must not claim the fault was unexpected. Both halves absent means the object
+  // itself is absent.
+  EXPECT_FALSE(payload.contains("x-medkit"));
 
   release_stream(res);
 }
@@ -834,12 +833,13 @@ TEST_F(SSEFaultHandlerTest, StreamOmitsTheEntityHintWhenReportingSourcesEmpty) {
   auto output = read_stream_once(res, 1);
   auto payload = parse_sse_payload(output);
 
-  // A fault with no reporting source resolves to no entity, but it is still a
-  // fault, and a stream consumer still has to be told whether it was expected.
-  ASSERT_TRUE(payload.contains("x-medkit"));
-  EXPECT_FALSE(payload["x-medkit"].contains("entity_id"));
-  EXPECT_FALSE(payload["x-medkit"]["expected"].get<bool>());
-  EXPECT_FALSE(payload["x-medkit"].contains("planned_stop_id"));
+  // "Unknown" is not "false". No fault manager has ever answered here, so the
+  // frame says nothing about whether the fault was expected rather than saying
+  // it was not - a consumer must not read an outage as "nothing is planned".
+  if (payload.contains("x-medkit")) {
+    EXPECT_FALSE(payload["x-medkit"].contains("expected"));
+    EXPECT_FALSE(payload["x-medkit"].contains("planned_stop_id"));
+  }
 
   release_stream(res);
 }

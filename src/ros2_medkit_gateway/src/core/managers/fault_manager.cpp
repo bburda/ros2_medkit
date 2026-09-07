@@ -116,6 +116,10 @@ std::vector<faults::PlannedStopWindow> FaultManager::planned_stop_windows(bool f
   return planned_stop_cache_.snapshot();
 }
 
+bool FaultManager::planned_stops_known() const {
+  return planned_stop_cache_.has_knowledge();
+}
+
 void FaultManager::invalidate_planned_stop_cache() {
   planned_stop_cache_.invalidate();
 }

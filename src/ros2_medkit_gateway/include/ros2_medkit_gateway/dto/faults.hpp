@@ -65,7 +65,8 @@ inline constexpr auto dto_fields<FaultXMedkit> = std::make_tuple(
           "healed, cleared, captured and audited exactly as any other."),
     field("planned_stop_id", &FaultXMedkit::planned_stop_id,
           "Which window made it expected - the earliest-starting one covering the fault when several overlap. "
-          "Present only when `expected` is true; read it back with `GET /x-medkit-planned-stops/{id}`."));
+          "Present only when `expected` is true. The window's `reason` is NOT carried on the fault: resolve "
+          "the id with `GET /x-medkit-planned-stops/{id}`, which also answers who declared it and when."));
 
 template <>
 inline constexpr std::string_view dto_name<FaultXMedkit> = "FaultXMedkit";

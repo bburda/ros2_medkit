@@ -527,6 +527,7 @@ faults::PlannedStopWindow window_from_msg(const ros2_medkit_msgs::msg::PlannedSt
   w.declared_by = msg.declared_by;
   w.declared_at_ns = time_msg_to_ns(msg.declared_at);
   w.ended_early = msg.ended_early;
+  w.cancelled = msg.cancelled;
   return w;
 }
 
@@ -536,6 +537,8 @@ PlannedStopResult Ros2FaultServiceTransport::declare_planned_stop(const faults::
   PlannedStopResult result;
 
   auto request = std::make_shared<ros2_medkit_msgs::srv::DeclarePlannedStop::Request>();
+  // Always an explicit instant: the service refuses zero, and the caller has
+  // already filled in "now" when the body omitted a start.
   request->starts_at = ns_to_time_msg(window.from_ns);
   request->ends_at = ns_to_time_msg(window.to_ns);
   request->reason = window.reason;
@@ -552,6 +555,18 @@ PlannedStopResult Ros2FaultServiceTransport::declare_planned_stop(const faults::
   result.success = response->success;
   if (!response->success) {
     result.error_message = response->message;
+    using Response = ros2_medkit_msgs::srv::DeclarePlannedStop::Response;
+    switch (response->outcome) {
+      case Response::OUTCOME_DUPLICATE_ID:
+        result.refusal = PlannedStopRefusal::DuplicateId;
+        break;
+      case Response::OUTCOME_NOT_RETAINED:
+        result.refusal = PlannedStopRefusal::NotRetained;
+        break;
+      default:
+        result.refusal = PlannedStopRefusal::InvalidRequest;
+        break;
+    }
     return result;
   }
   result.stops.push_back(window_from_msg(response->stop));
@@ -580,6 +595,9 @@ PlannedStopResult Ros2FaultServiceTransport::end_planned_stop(const std::string 
   result.success = response->success;
   if (!response->success) {
     result.error_message = response->message;
+    using Response = ros2_medkit_msgs::srv::EndPlannedStop::Response;
+    result.refusal = response->outcome == Response::OUTCOME_ALREADY_ENDED ? PlannedStopRefusal::AlreadyEnded
+                                                                          : PlannedStopRefusal::NotFound;
     return result;
   }
   result.stops.push_back(window_from_msg(response->stop));

@@ -119,6 +119,12 @@ class FaultManager {
   /// pass force_refresh, or call invalidate_planned_stop_cache() first.
   std::vector<faults::PlannedStopWindow> planned_stop_windows(bool force_refresh = false);
 
+  /// Whether this gateway has ever read the declared windows. False means it
+  /// does not KNOW, which is not the same as knowing that none are declared: the
+  /// event stream omits the flag entirely in that case, because a consumer must
+  /// not read an unreachable fault manager as "nothing is expected".
+  bool planned_stops_known() const;
+
   /// Ask the next planned_stop_windows() to re-read. Called after this gateway
   /// writes a window so an operator never watches their own declaration take
   /// effect a cache lifetime late.
