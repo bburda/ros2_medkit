@@ -55,7 +55,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get -o Acquire::Retries=3 update
+          apt-get update
           apt-get install -y git
 
       - name: Checkout repository
@@ -82,7 +82,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get -o Acquire::Retries=3 update
+          apt-get update
           apt-get install -y ros-${{ matrix.ros_distro }}-test-msgs libyaml-cpp-dev libssl-dev
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
           for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
@@ -242,7 +242,7 @@ jobs:
 
       - name: Install jq + asyncua (smoke test prerequisite)
         run: |
-          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get update
           sudo apt-get install -y jq python3-pip
           pip3 install --break-system-packages asyncua
 
@@ -276,7 +276,7 @@ jobs:
     steps:
       - name: Install Git
         run: |
-          apt-get -o Acquire::Retries=3 update
+          apt-get update
           apt-get install -y git
 
       - name: Checkout repository
@@ -303,7 +303,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get -o Acquire::Retries=3 update
+          apt-get update
           # openssl: cert generation. libssl-dev: encryption backend for both
           # the plugin's open62541pp and the fixture's static open62541.
           apt-get install -y ros-jazzy-test-msgs libyaml-cpp-dev libssl-dev openssl
