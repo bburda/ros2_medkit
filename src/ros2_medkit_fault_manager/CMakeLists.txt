@@ -219,6 +219,12 @@ if(BUILD_TESTING)
   medkit_add_launch_test(test_planned_stop_restart test/integration/test_planned_stop_restart.test.py
     TIMEOUT 180 LABELS "integration")
 
+  # A switch-off killed between the declaration write and the flag clearing: the
+  # store is left as that crash leaves it and the replacement process has to
+  # finish the release. Its respawn delay is what the timeout is sized for.
+  medkit_add_launch_test(test_planned_stop_interrupted_release
+    test/integration/test_planned_stop_interrupted_release.test.py TIMEOUT 180 LABELS "integration")
+
   # auto_confirm_after_sec confirms from a timer rather than a report, so the
   # mute has to be honoured on that path too. Its own launch, because every other
   # planned-stop case would then race a timer that confirms behind its back.

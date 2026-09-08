@@ -76,6 +76,32 @@ correlation:
     return parse_config_string(yaml);
   }
 
+  /// The same hierarchical rule, but acknowledging the root cause does NOT clear
+  /// the symptoms. That is what makes the symptom outlive the rule's mute and
+  /// fall back to whatever else was holding it.
+  CorrelationConfig create_hierarchical_no_autoclear_config() {
+    const std::string yaml = R"(
+correlation:
+  enabled: true
+  default_window_ms: 500
+  patterns:
+    motor_errors:
+      codes: ["MOTOR_COMM_*", "MOTOR_TIMEOUT_*"]
+  rules:
+    - id: estop_cascade
+      name: "E-Stop Cascade"
+      mode: hierarchical
+      root_cause:
+        codes: ["ESTOP_001"]
+      symptoms:
+        - pattern: motor_errors
+      window_ms: 1000
+      mute_symptoms: true
+      auto_clear_with_root: false
+)";
+    return parse_config_string(yaml);
+  }
+
   /// A hierarchical rule and an auto-cluster rule side by side. The cluster path
   /// sets should_mute without ever writing muted_faults_, which is the case the
   /// planned stop has to survive.
@@ -1021,7 +1047,7 @@ TEST_F(CorrelationEngineTest, AStillActiveReReportDoesNotReleaseAStopMute) {
 // Planned stop: exactly one mute owner per fault
 // ============================================================================
 
-TEST_F(CorrelationEngineTest, TheStopNeverOverwritesARuleMute) {
+TEST_F(CorrelationEngineTest, ARuleMuteOverlaysTheStopsWithoutReplacingOwnership) {
   CorrelationEngine engine(create_hierarchical_config());
 
   auto t0 = std::chrono::steady_clock::now();
@@ -1077,7 +1103,7 @@ TEST_F(CorrelationEngineTest, AClusterMuteLeavesTheStopHoldingItsOwnEntry) {
 // Planned stop: dropping and restoring one fault's mute
 // ============================================================================
 
-TEST_F(CorrelationEngineTest, DroppingAStopMuteReleasesOnlyWhatTheStopOwns) {
+TEST_F(CorrelationEngineTest, ReleasingOneFaultTakesOnlyTheStopsOwnMute) {
   CorrelationEngine engine(create_hierarchical_config());
 
   auto t0 = std::chrono::steady_clock::now();
@@ -1097,11 +1123,11 @@ TEST_F(CorrelationEngineTest, DroppingAStopMuteReleasesOnlyWhatTheStopOwns) {
   };
   ASSERT_EQ("estop_cascade", rule_id_of("MOTOR_COMM_FL"));
 
-  engine.drop_planned_stop_mute("VALVE_STUCK");
+  engine.release_planned_stop_ownership("VALVE_STUCK");
   EXPECT_FALSE(engine.is_muted("VALVE_STUCK"));
 
   // A rule's mute is not the stop's to drop.
-  engine.drop_planned_stop_mute("MOTOR_COMM_FL");
+  engine.release_planned_stop_ownership("MOTOR_COMM_FL");
   EXPECT_TRUE(engine.is_muted("MOTOR_COMM_FL"));
 
   auto unmuted = engine.end_planned_stop();
@@ -1109,14 +1135,14 @@ TEST_F(CorrelationEngineTest, DroppingAStopMuteReleasesOnlyWhatTheStopOwns) {
   EXPECT_EQ("ESTOP_001", unmuted[0]);
 }
 
-TEST_F(CorrelationEngineTest, ARestoredStopMuteBehavesLikeOneTakenLive) {
+TEST_F(CorrelationEngineTest, RestoredOwnershipBehavesLikeOwnershipTakenLive) {
   CorrelationEngine engine{CorrelationConfig{}};
 
   // What a restart does: the declaration is read back, then the faults whose
   // cycles started inside it are marked again before anything is served.
   engine.begin_planned_stop();
-  engine.restore_planned_stop_mute("VALVE_STUCK");
-  engine.restore_planned_stop_mute("PUMP_SEAL_LEAK");
+  engine.restore_planned_stop_ownership("VALVE_STUCK");
+  engine.restore_planned_stop_ownership("PUMP_SEAL_LEAK");
 
   EXPECT_TRUE(engine.is_muted("VALVE_STUCK"));
   EXPECT_EQ(2u, engine.get_muted_count());
@@ -1128,6 +1154,144 @@ TEST_F(CorrelationEngineTest, ARestoredStopMuteBehavesLikeOneTakenLive) {
   ASSERT_EQ(2u, unmuted.size());
   EXPECT_EQ("PUMP_SEAL_LEAK", unmuted[0]);
   EXPECT_EQ("VALVE_STUCK", unmuted[1]);
+}
+
+// ============================================================================
+// Ownership is the truth; the mute map is derived from it
+// ============================================================================
+
+TEST_F(CorrelationEngineTest, AnOwnedFaultReturnsToTheStopsMuteWhenARuleReleasesIt) {
+  // auto_clear_with_root is off here on purpose: the symptom stays up when the
+  // root cause is acknowledged, so the rule's mute ends while the fault does not.
+  CorrelationEngine engine(create_hierarchical_no_autoclear_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+
+  // Both cycles start inside the stop, so the stop owns both. The rule then
+  // overlays the symptom's mute.
+  engine.process_fault("ESTOP_001", "CRITICAL", t0, /*cycle_started=*/true);
+  auto symptom = engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 10ms, /*cycle_started=*/true);
+  EXPECT_TRUE(symptom.should_mute);
+  auto rule_id_of = [&engine](const std::string & code) {
+    for (const auto & entry : engine.get_muted_faults()) {
+      if (entry.fault_code == code) {
+        return entry.rule_id;
+      }
+    }
+    return std::string{"<not muted>"};
+  };
+  EXPECT_EQ("estop_cascade", rule_id_of("MOTOR_COMM_FL"));
+
+  // Acknowledging the root cause takes the rule's mute away. The stop still owns
+  // the symptom's cycle, so it goes back to being the stop's.
+  engine.process_clear("ESTOP_001");
+
+  EXPECT_TRUE(engine.is_muted("MOTOR_COMM_FL")) << "the symptom fell out of the stop when the rule let go";
+  EXPECT_EQ(CorrelationEngine::kPlannedStopRuleId, rule_id_of("MOTOR_COMM_FL"));
+
+  auto unmuted = engine.end_planned_stop();
+  ASSERT_EQ(1u, unmuted.size());
+  EXPECT_EQ("MOTOR_COMM_FL", unmuted[0]);
+}
+
+TEST_F(CorrelationEngineTest, ARuleThatStopsMatchingLeavesTheFaultMuted) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+  engine.process_fault("ESTOP_001", "CRITICAL", t0, /*cycle_started=*/true);
+  engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 10ms, /*cycle_started=*/true);
+
+  // The correlation window closes and the pending root cause expires. A repeat
+  // report of the still-active symptom matches no rule any more - and must still
+  // report itself as muted, or the manager announces an update for a fault the
+  // list is hiding.
+  engine.cleanup_expired();
+  auto repeat = engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 5000ms, /*cycle_started=*/false);
+  EXPECT_TRUE(repeat.should_mute) << "a repeat report of a muted fault reported itself unmuted";
+  EXPECT_TRUE(engine.is_muted("MOTOR_COMM_FL"));
+}
+
+TEST_F(CorrelationEngineTest, AClusterMemberStaysMutedWhenTheClusterWindowExpires) {
+  CorrelationEngine engine(create_cluster_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+  engine.process_fault("VALVE_A", "ERROR", t0, /*cycle_started=*/true);
+  engine.process_fault("VALVE_B", "ERROR", t0 + 10ms, /*cycle_started=*/true);
+  ASSERT_TRUE(engine.is_muted("VALVE_B"));
+
+  // The cluster's window closes; the stop still owns both cycles.
+  engine.cleanup_expired();
+  auto repeat = engine.process_fault("VALVE_B", "ERROR", t0 + 120000ms, /*cycle_started=*/false);
+  EXPECT_TRUE(repeat.should_mute);
+  EXPECT_TRUE(engine.is_muted("VALVE_B"));
+
+  auto unmuted = engine.end_planned_stop();
+  std::sort(unmuted.begin(), unmuted.end());
+  ASSERT_EQ(2u, unmuted.size());
+}
+
+TEST_F(CorrelationEngineTest, OwnershipSurvivesARuleOverlayAndIsReadableBack) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+  engine.process_fault("ESTOP_001", "CRITICAL", t0, /*cycle_started=*/true);
+  engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 10ms, /*cycle_started=*/true);
+
+  auto owned = engine.planned_stop_owned_codes();
+  std::sort(owned.begin(), owned.end());
+  ASSERT_EQ(2u, owned.size()) << "a rule overlay took the stop's ownership away";
+  EXPECT_EQ("ESTOP_001", owned[0]);
+  EXPECT_EQ("MOTOR_COMM_FL", owned[1]);
+}
+
+TEST_F(CorrelationEngineTest, AFaultWhoseCycleStartedBeforeTheStopIsNeverOwned) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.process_fault("ESTOP_001", "CRITICAL", t0);
+  engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 10ms);
+
+  engine.begin_planned_stop();
+  engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 20ms, /*cycle_started=*/false);
+
+  EXPECT_TRUE(engine.planned_stop_owned_codes().empty());
+  EXPECT_TRUE(engine.end_planned_stop().empty());
+  EXPECT_TRUE(engine.is_muted("MOTOR_COMM_FL")) << "the rule's mute was collateral damage";
+}
+
+TEST_F(CorrelationEngineTest, ClearingAnOwnedFaultEndsTheStopsOwnershipOfIt) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  engine.begin_planned_stop();
+  engine.process_fault("VALVE_STUCK", "ERROR", std::chrono::steady_clock::now(), /*cycle_started=*/true);
+  ASSERT_EQ(1u, engine.planned_stop_owned_codes().size());
+
+  engine.process_clear("VALVE_STUCK");
+  EXPECT_TRUE(engine.planned_stop_owned_codes().empty());
+  EXPECT_FALSE(engine.is_muted("VALVE_STUCK"));
+  EXPECT_TRUE(engine.end_planned_stop().empty());
+}
+
+TEST_F(CorrelationEngineTest, AutoClearedSymptomsLeaveTheStopsOwnership) {
+  CorrelationEngine engine(create_hierarchical_config());
+
+  auto t0 = std::chrono::steady_clock::now();
+  engine.begin_planned_stop();
+  engine.process_fault("ESTOP_001", "CRITICAL", t0, /*cycle_started=*/true);
+  engine.process_fault("MOTOR_COMM_FL", "ERROR", t0 + 10ms, /*cycle_started=*/true);
+
+  auto cleared = engine.process_clear("ESTOP_001");
+  ASSERT_EQ(1u, cleared.auto_cleared_codes.size());
+  EXPECT_EQ("MOTOR_COMM_FL", cleared.auto_cleared_codes[0]);
+
+  // Both cycles ended with the acknowledgement, so neither is the stop's any more.
+  EXPECT_TRUE(engine.planned_stop_owned_codes().empty());
+  EXPECT_FALSE(engine.is_muted("MOTOR_COMM_FL"));
+  EXPECT_TRUE(engine.end_planned_stop().empty());
 }
 
 int main(int argc, char ** argv) {

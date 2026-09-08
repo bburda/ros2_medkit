@@ -3002,12 +3002,28 @@ class PlannedStopFailingStorage : public ros2_medkit_fault_manager::InMemoryFaul
   }
 };
 
+/// Reaches the node's protected storage-injecting constructor. The backend is in
+/// place before anything borrows it, so nothing is left dangling.
+class NodeWithInjectedStorage : public FaultManagerNode {
+ public:
+  NodeWithInjectedStorage(const rclcpp::NodeOptions & options,
+                          std::unique_ptr<ros2_medkit_fault_manager::FaultStorage> storage)
+    : FaultManagerNode(options, std::move(storage)) {
+  }
+};
+
 }  // namespace
 
 /// The switch driven over its real services, against a node in this process.
 class PlannedStopServiceTest : public ::testing::Test {
  protected:
   static inline std::atomic<int> test_counter_{0};
+
+  /// Overridden by the failure-path fixture to hand the node a store that refuses
+  /// to record the declaration.
+  virtual std::unique_ptr<ros2_medkit_fault_manager::FaultStorage> make_storage() {
+    return nullptr;
+  }
 
   void SetUp() override {
     const std::string ns = "/test_planned_stop_" + std::to_string(test_counter_.fetch_add(1));
@@ -3018,7 +3034,9 @@ class PlannedStopServiceTest : public ::testing::Test {
         rclcpp::Parameter("confirmation_threshold", -1),
     });
     fm_options.arguments({"--ros-args", "-r", "__ns:=" + ns});
-    fault_manager_ = std::make_shared<FaultManagerNode>(fm_options);
+    auto storage = make_storage();
+    fault_manager_ = storage ? std::make_shared<NodeWithInjectedStorage>(fm_options, std::move(storage))
+                             : std::make_shared<FaultManagerNode>(fm_options);
 
     rclcpp::NodeOptions test_options;
     test_options.arguments({"--ros-args", "-r", "__ns:=" + ns});
@@ -3077,11 +3095,17 @@ class PlannedStopServiceTest : public ::testing::Test {
   rclcpp::Client<ros2_medkit_msgs::srv::GetPlannedStop>::SharedPtr get_client_;
 };
 
+/// The same fixture, with a store that refuses to record the declaration.
+class PlannedStopFailingStoreTest : public PlannedStopServiceTest {
+ protected:
+  std::unique_ptr<ros2_medkit_fault_manager::FaultStorage> make_storage() override {
+    return std::make_unique<PlannedStopFailingStorage>();
+  }
+};
+
 // A store that cannot record the declaration must not leave the caller believing
 // a stop is in force, and must not take the process down with it.
-TEST_F(PlannedStopServiceTest, AStoreThatRejectsTheWriteIsReportedNotThrown) {
-  fault_manager_->set_storage_for_test(std::make_unique<PlannedStopFailingStorage>());
-
+TEST_F(PlannedStopFailingStoreTest, AStoreThatRejectsTheWriteIsReportedNotThrown) {
   const auto response = set_stop(true, "line 3 maintenance", "shift_lead");
   EXPECT_FALSE(response.success);
   EXPECT_FALSE(response.message.empty());

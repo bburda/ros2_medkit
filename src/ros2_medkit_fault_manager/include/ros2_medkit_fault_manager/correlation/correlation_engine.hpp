@@ -67,6 +67,11 @@ struct MutedFaultData {
   std::string root_cause_code;
   std::string rule_id;
   uint32_t delay_ms{0};
+  /// Whether the planned stop wrote this entry, as opposed to a correlation rule.
+  /// Not part of the ListFaults wire shape: it is how the engine tells its own
+  /// entry from a rule's overlay without matching on the rule id, which an
+  /// operator's configuration could collide with.
+  bool by_planned_stop{false};
 };
 
 /// Information about an active cluster (for ListFaults response)
@@ -167,24 +172,36 @@ class CorrelationEngine {
   /// Whether a planned stop is currently declared.
   bool planned_stop_active() const;
 
-  /// Release one fault from the planned stop's mute, if the stop is what is
-  /// muting it. A rule's mute is left alone. Called when a fault is acknowledged
-  /// on a path that does not run the correlation clear (a scoped per-entity
-  /// DELETE), so an acknowledged fault never stays counted as muted.
-  void drop_planned_stop_mute(const std::string & fault_code);
+  /// End the planned stop's ownership of one fault cycle, and take its mute with
+  /// it. A rule's overlay is left alone. Called when a fault is acknowledged on a
+  /// path that does not run the correlation clear (a scoped per-entity DELETE),
+  /// so an acknowledged fault never stays counted as muted.
+  void release_planned_stop_ownership(const std::string & fault_code);
 
-  /// Register a fault as muted by the planned stop without a report driving it.
-  /// This is how a restart re-marks the faults whose cycles started inside a stop
-  /// that is still declared: their mute lived in the process that is gone, and
-  /// without it the switch-off would neither release nor announce them. A fault a
-  /// rule is already muting is left to that rule.
-  void restore_planned_stop_mute(const std::string & fault_code);
+  /// Record that the planned stop owns a fault cycle, without a report driving it.
+  /// This is how a restart rebuilds the mute from the flags the store kept: the
+  /// engine's own record lived in the process that is gone, and without it the
+  /// switch-off would neither release nor announce those faults.
+  void restore_planned_stop_ownership(const std::string & fault_code);
+
+  /// Every fault cycle the planned stop currently owns, including those a rule's
+  /// mute is overlaying.
+  std::vector<std::string> planned_stop_owned_codes() const;
 
  private:
   /// The correlation half of process_fault: rules, clusters and their muting,
   /// with no planned-stop involvement. Caller holds mutex_.
   ProcessFaultResult correlate(const std::string & fault_code, const std::string & severity,
                                std::chrono::steady_clock::time_point timestamp);
+
+  /// Put back the planned stop's mute for every fault it owns that has no entry
+  /// left - a rule's overlay ended (its root cause was acknowledged, its window
+  /// closed) and the fault is the stop's again. Ownership is the truth; this is
+  /// what keeps the mute map derived from it. Caller holds mutex_.
+  void reassert_planned_stop_mutes();
+
+  /// Write the planned stop's mute entry for one owned fault. Caller holds mutex_.
+  void mute_as_planned_stop(const std::string & fault_code);
 
   /// Check if fault matches a root cause pattern in any hierarchical rule
   /// @return Rule ID if matched, empty optional otherwise
@@ -244,10 +261,12 @@ class CorrelationEngine {
   /// Whether an operator has declared a planned stop.
   bool planned_stop_active_{false};
 
-  /// Fault codes muted BY the planned stop and by nothing else. A code leaves
-  /// this set the moment a rule claims it or it is cleared, which is what makes
-  /// the switch-off release exactly the faults it is still holding down.
-  std::set<std::string> planned_stop_muted_;
+  /// Fault cycles the planned stop OWNS: they started while it was declared. This
+  /// is the runtime mirror of the flag the fault store keeps, and it is the truth
+  /// the mute map is derived from - a rule's mute overlays an owned fault without
+  /// taking it, and when the overlay ends the fault is the stop's again. A code
+  /// leaves the set when the fault is acknowledged or the stop is withdrawn.
+  std::set<std::string> planned_stop_owned_;
 
   mutable std::mutex mutex_;
 };

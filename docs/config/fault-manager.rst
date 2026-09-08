@@ -611,7 +611,9 @@ Fault correlation identifies root causes and filters symptom faults.
      - Interval for running correlation cleanup tasks. The correlation engine is
        constructed on every fault manager, configured rules or not, because the
        planned-stop switch needs none - so this timer runs everywhere. With no
-       rules loaded each tick walks two empty containers and returns.
+       rules loaded a tick takes the engine's mutex, walks two empty containers and
+       re-asserts an empty ownership set: measured at ~190 ns per call, so ~2.3 us
+       of CPU per minute at the 5 s default.
 
 .. seealso::
 
@@ -642,9 +644,11 @@ Two configuration choices decide how much the switch can do:
      - Effect on the planned stop
    * - ``storage_type``
      - ``sqlite``
-     - The declaration is stored beside the faults, so it survives a restart.
-       With ``memory`` it lives only for the process, and a restart inside a stop
-       ends it.
+     - The declaration, and the per-fault ownership flags behind it, are stored
+       beside the faults, so both survive a restart. With ``memory`` they live only
+       for the process, and a restart inside a stop ends it. A correlation rule's
+       mute is not persisted on either backend, so a rule-muted fault comes back
+       unmuted after a restart unless the stop owns it.
    * - ``audit_log.enabled``
      - ``false``
      - **Off by default, so a stock manager records no audit row for the switch
@@ -653,20 +657,26 @@ Two configuration choices decide how much the switch can do:
        transition's own reason and declarer. Recorded even under
        ``audit_log.transitions: confirmed_only``.
 
-While the stop stands, a fault whose cycle *starts* is reported, debounced,
-confirmed, captured and audited unchanged, and is marked as muted rather than
-dropped: absent from the default fault list, counted in ``muted_count``, and
-listed under ``muted_faults`` with ``rule_id: planned_stop`` when muted entries
-are requested. A fault that was already up when the stop was declared is left
-alone - its confirmation has already been announced, and reporters re-send FAILED
-for as long as the condition holds.
+While the stop stands, it owns every fault cycle that *starts*: a new fault, one
+raised again after being cleared, or one that fails again after healing. An owned
+fault is reported, debounced, confirmed, captured and audited unchanged, and is
+marked as muted rather than dropped: absent from the default fault list, counted in
+``muted_count``, and listed under ``muted_faults`` with ``rule_id: planned_stop``
+when muted entries are requested. A fault that was already up when the stop was
+declared is left alone - its confirmation has already been announced, and reporters
+re-send FAILED for as long as the condition holds.
 
-A marked fault is published exactly as a rule-muted symptom is: ``EVENT_CONFIRMED``
-and ``EVENT_UPDATED`` are withheld, while ``EVENT_CLEARED`` - the fault healing, or
-being acknowledged - is published as usual. Withdrawing the stop releases every
-fault it alone was muting and publishes one confirmation event for each of those
-that is CONFIRMED. Correlation rules are unaffected: a symptom a rule mutes stays
-muted when the stop is withdrawn, and the stop never takes a mute a rule owns.
+Ownership is a flag on the fault row, so it survives a restart and is what the
+switch-off releases. The mute is derived from it: a correlation rule muting an owned
+fault overlays the stop rather than taking the fault from it, the withdrawal leaves
+a rule-held fault alone, and when the rule lets go - root cause acknowledged, window
+closed, cluster expired - the fault is muted by the stop again.
+
+A muted fault is published exactly as a rule-muted symptom is: ``EVENT_CONFIRMED``
+and ``EVENT_UPDATED`` are withheld whichever kind of report produced them, while
+``EVENT_CLEARED`` - the fault healing, or being acknowledged - is published as
+usual. Withdrawing the stop releases every fault it owns and publishes one
+confirmation event for each of those that is CONFIRMED.
 
 ``~/get_planned_stop`` keeps serving the declaration after the withdrawal, with
 ``ended_at`` stamped, so the reason stays readable once the plant is back up. A

@@ -98,6 +98,12 @@ struct FaultState {
   std::string status;
   std::set<std::string> reporting_sources;
 
+  /// Whether the planned stop owns this fault cycle: it started while a stop was
+  /// declared. Persisted, because the declaration outlives the process and the
+  /// switch-off has to know which faults it is releasing. Cleared when the fault
+  /// is acknowledged and when the stop is withdrawn.
+  bool planned_stop_owned{false};
+
   // Debounce state (internal, not exposed in Fault.msg)
   int32_t debounce_counter{0};      ///< FAILED decrements (-1), PASSED increments (+1)
   rclcpp::Time last_failed_time{};  ///< Timestamp of last FAILED event
@@ -478,6 +484,22 @@ class FaultStorage {
   /// given one answers with a default-constructed (inactive) state.
   virtual PlannedStopState get_planned_stop() const = 0;
 
+  /// Record, or withdraw, the planned stop's ownership of one fault cycle.
+  /// A code with no stored fault is ignored.
+  virtual void set_planned_stop_owned(const std::string & fault_code, bool owned) = 0;
+
+  /// Every fault the planned stop currently owns. This is what a restart reads to
+  /// rebuild the mute, and what a switch-off releases - not a time comparison
+  /// against the declaration, which cannot survive a clock step and cannot tell a
+  /// rule's mute from the stop's.
+  virtual std::vector<std::string> get_planned_stop_owned() const = 0;
+
+  /// Drop every ownership flag. Called once the switch-off has announced what it
+  /// released, so a crash before this point leaves the flags for the next startup
+  /// to finish.
+  /// @return how many faults were released
+  virtual size_t clear_planned_stop_owned() = 0;
+
  protected:
   FaultStorage() = default;
   FaultStorage(const FaultStorage &) = default;
@@ -546,6 +568,9 @@ class InMemoryFaultStorage : public FaultStorage {
 
   void set_planned_stop(const PlannedStopState & state) override;
   PlannedStopState get_planned_stop() const override;
+  void set_planned_stop_owned(const std::string & fault_code, bool owned) override;
+  std::vector<std::string> get_planned_stop_owned() const override;
+  size_t clear_planned_stop_owned() override;
 
  private:
   /// Update fault status based on debounce counter and given config

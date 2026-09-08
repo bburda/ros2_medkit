@@ -164,7 +164,8 @@ void SqliteFaultStorage::initialize_schema() {
       debounce_counter INTEGER NOT NULL DEFAULT 0,
       last_failed_ns INTEGER NOT NULL DEFAULT 0,
       last_passed_ns INTEGER NOT NULL DEFAULT 0,
-      confirmed_at_ns INTEGER NOT NULL DEFAULT 0
+      confirmed_at_ns INTEGER NOT NULL DEFAULT 0,
+      planned_stop_owned INTEGER NOT NULL DEFAULT 0
     );
   )";
 
@@ -193,6 +194,29 @@ void SqliteFaultStorage::initialize_schema() {
         std::string error = err_msg ? err_msg : "Unknown error";
         sqlite3_free(err_msg);
         throw std::runtime_error("Failed to add confirmed_at_ns column: " + error);
+      }
+    }
+  }
+
+  // Migration: the planned stop records which fault CYCLES it owns, so the flag
+  // lives with the fault rather than being inferred from timestamps. Rows written
+  // before it arrive unowned, which is what a database that predates the switch
+  // means.
+  {
+    bool has_owned = false;
+    SqliteStatement info(db_, "PRAGMA table_info(faults)");
+    while (info.step() == SQLITE_ROW) {
+      if (info.column_text(1) == "planned_stop_owned") {
+        has_owned = true;
+        break;
+      }
+    }
+    if (!has_owned) {
+      if (sqlite3_exec(db_, "ALTER TABLE faults ADD COLUMN planned_stop_owned INTEGER NOT NULL DEFAULT 0", nullptr,
+                       nullptr, &err_msg) != SQLITE_OK) {
+        std::string error = err_msg ? err_msg : "Unknown error";
+        sqlite3_free(err_msg);
+        throw std::runtime_error("Failed to add planned_stop_owned column: " + error);
       }
     }
   }
@@ -1048,7 +1072,9 @@ bool SqliteFaultStorage::clear_fault(const std::string & fault_code) {
     }
   }
 
-  SqliteStatement stmt(db_, "UPDATE faults SET status = ? WHERE fault_code = ?");
+  // An acknowledged cycle is over, so the planned stop no longer owns it: it has
+  // nothing left to release or to announce for this fault.
+  SqliteStatement stmt(db_, "UPDATE faults SET status = ?, planned_stop_owned = 0 WHERE fault_code = ?");
   stmt.bind_text(1, ros2_medkit_msgs::msg::Fault::STATUS_CLEARED);
   stmt.bind_text(2, fault_code);
 
@@ -1091,7 +1117,7 @@ std::vector<std::string> SqliteFaultStorage::reclassify_healed_as_cleared() {
     }
   }
 
-  SqliteStatement stmt(db_, "UPDATE faults SET status = ? WHERE status = ?");
+  SqliteStatement stmt(db_, "UPDATE faults SET status = ?, planned_stop_owned = 0 WHERE status = ?");
   stmt.bind_text(1, ros2_medkit_msgs::msg::Fault::STATUS_CLEARED);
   stmt.bind_text(2, ros2_medkit_msgs::msg::Fault::STATUS_HEALED);
   if (stmt.step() != SQLITE_DONE) {
@@ -1360,6 +1386,40 @@ PlannedStopState SqliteFaultStorage::get_planned_stop() const {
   state.since_ns = stmt.column_int64(3);
   state.ended_at_ns = stmt.column_int64(4);
   return state;
+}
+
+void SqliteFaultStorage::set_planned_stop_owned(const std::string & fault_code, bool owned) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  SqliteStatement stmt(db_, "UPDATE faults SET planned_stop_owned = ? WHERE fault_code = ?");
+  stmt.bind_int(1, owned ? 1 : 0);
+  stmt.bind_text(2, fault_code);
+
+  if (stmt.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to record planned-stop ownership: ") + sqlite3_errmsg(db_));
+  }
+}
+
+std::vector<std::string> SqliteFaultStorage::get_planned_stop_owned() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  SqliteStatement stmt(db_, "SELECT fault_code FROM faults WHERE planned_stop_owned != 0");
+
+  std::vector<std::string> owned;
+  while (stmt.step() == SQLITE_ROW) {
+    owned.push_back(stmt.column_text(0));
+  }
+  return owned;
+}
+
+size_t SqliteFaultStorage::clear_planned_stop_owned() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  SqliteStatement stmt(db_, "UPDATE faults SET planned_stop_owned = 0 WHERE planned_stop_owned != 0");
+  if (stmt.step() != SQLITE_DONE) {
+    throw std::runtime_error(std::string("Failed to release planned-stop ownership: ") + sqlite3_errmsg(db_));
+  }
+  return static_cast<size_t>(sqlite3_changes(db_));
 }
 
 std::optional<FreezeFrameData> SqliteFaultStorage::get_freeze_frame(const std::string & fault_code) const {

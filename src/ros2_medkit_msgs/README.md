@@ -156,17 +156,19 @@ Declare, or withdraw, a planned stop on the FaultManager.
 | `message` | string | Status or error message |
 | `was_active` | bool | The state of the switch before this request |
 
-While a planned stop is on, a fault whose cycle *starts* is reported, debounced,
-confirmed, captured and audited unchanged, and is marked as muted: absent from the default
-`ListFaults` response, counted in `muted_count`, and listed under `muted_faults` with
-`rule_id = "planned_stop"` when `include_muted` is set. A cycle that started *before* the
-stop is untouched - reporters re-send FAILED for as long as a condition holds, and that
-fault's confirmation has already been announced.
+While a planned stop is on, it owns every fault cycle that *starts* - a new fault, one
+raised again after being cleared, or one that fails again after healing. An owned fault is
+reported, debounced, confirmed, captured and audited unchanged, and is marked as muted:
+absent from the default `ListFaults` response, counted in `muted_count`, and listed under
+`muted_faults` with `rule_id = "planned_stop"` when `include_muted` is set. A cycle that
+started *before* the stop is untouched - reporters re-send FAILED for as long as a
+condition holds, and that fault's confirmation has already been announced.
 
 Publication matches a rule-muted symptom exactly: `EVENT_CONFIRMED` and `EVENT_UPDATED`
-are withheld, `EVENT_CLEARED` is published as usual. Withdrawing the stop unmutes every
-fault it alone was muting and publishes one `EVENT_CONFIRMED` for each of those that is
-CONFIRMED. A request asking for the state the switch is already in succeeds, changes
+are withheld whichever kind of report produced them, `EVENT_CLEARED` is published as
+usual. Withdrawing the stop releases every fault it owns and publishes one
+`EVENT_CONFIRMED` for each of those that is CONFIRMED. A correlation rule muting an owned
+fault overlays the stop rather than taking the fault from it. A request asking for the state the switch is already in succeeds, changes
 nothing, and writes no audit record; a request the store cannot record answers
 `success: false` and changes nothing. Audit records exist only when `audit_log.enabled`
 is set, which it is not by default.

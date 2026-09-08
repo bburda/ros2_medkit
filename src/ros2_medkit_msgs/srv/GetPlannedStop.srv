@@ -28,12 +28,12 @@
 # Whether a planned stop is currently declared.
 bool active
 
-# The reason given when the stop was declared. Retained after the withdrawal;
-# empty only while no stop has ever been declared.
+# The reason given when the stop was declared, verbatim - nothing validates or
+# fills it in, so it is empty when the declaration left it empty, and when no stop
+# has ever been declared. Retained after the withdrawal.
 string reason
 
-# Who declared the stop. Retained after the withdrawal; empty only while no stop
-# has ever been declared.
+# Who declared the stop, on the same terms as `reason`.
 string declared_by
 
 # When the stop was declared, wall clock. Zero while no stop has ever been declared.

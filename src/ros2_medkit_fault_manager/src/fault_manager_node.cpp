@@ -115,7 +115,11 @@ std::string validate_recording_id(const std::string & recording_id) {
 
 }  // namespace
 
-FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("fault_manager", options) {
+FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : FaultManagerNode(options, nullptr) {
+}
+
+FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options, std::unique_ptr<FaultStorage> storage)
+  : Node("fault_manager", options), storage_override_(std::move(storage)) {
   // Declare and get parameters
   storage_type_ = declare_parameter<std::string>("storage_type", "sqlite");
   database_path_ = declare_parameter<std::string>("database_path", "/var/lib/ros2_medkit/faults.db");
@@ -458,12 +462,44 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options) : Node("
   // muting is per fault cycle and those cycles are over as far as this process is
   // concerned - but every fault reported from here is muted again.
   planned_stop_ = storage_->get_planned_stop();
+  const auto owned_at_startup = storage_->get_planned_stop_owned();
   if (planned_stop_.active) {
     correlation_engine_->begin_planned_stop();
-    const size_t restored = restore_planned_stop_mutes();
+    for (const auto & fault_code : owned_at_startup) {
+      correlation_engine_->restore_planned_stop_ownership(fault_code);
+    }
     RCLCPP_INFO(get_logger(),
                 "Planned stop is in force (reason='%s', declared_by='%s'): %zu fault(s) re-marked, new faults marked",
-                planned_stop_.reason.c_str(), planned_stop_.declared_by.c_str(), restored);
+                planned_stop_.reason.c_str(), planned_stop_.declared_by.c_str(), owned_at_startup.size());
+  } else if (!owned_at_startup.empty()) {
+    // Faults owned by a declaration that is already withdrawn: the previous
+    // process died between writing the withdrawal and finishing the release, so
+    // these confirmations were suppressed and never announced. Finish the job.
+    //
+    // Not here, though: this publisher was created moments ago in this same
+    // constructor, and the events topic is volatile, so anything published before
+    // a subscriber has matched it reaches nobody and is gone for good. Wait for a
+    // listener - and give up waiting after kInterruptedReleaseDeadline, because a
+    // manager nobody is listening to must still finish the release rather than
+    // carry the flags forever.
+    RCLCPP_WARN(get_logger(),
+                "%zu fault(s) are still owned by a planned stop that was already withdrawn - a previous run did not "
+                "finish releasing them. Announcing them once a consumer is listening.",
+                owned_at_startup.size());
+    const auto give_up_at = std::chrono::steady_clock::now() + kInterruptedReleaseDeadline;
+    interrupted_release_timer_ =
+        create_wall_timer(kInterruptedReleasePollInterval, [this, owned_at_startup, give_up_at]() {
+          const bool listener = event_publisher_->get_subscription_count() > 0;
+          if (!listener && std::chrono::steady_clock::now() < give_up_at) {
+            return;
+          }
+          interrupted_release_timer_->cancel();
+          const size_t announced = announce_released(owned_at_startup);
+          storage_->clear_planned_stop_owned();
+          RCLCPP_INFO(get_logger(),
+                      "Finished an interrupted planned-stop release: announced %zu confirmation(s) to %zu listener(s)",
+                      announced, event_publisher_->get_subscription_count());
+        });
   }
 
   // Create auto-confirmation timer if enabled
@@ -544,6 +580,11 @@ FaultManagerNode::~FaultManagerNode() {
 }
 
 std::unique_ptr<FaultStorage> FaultManagerNode::create_storage() {
+  if (storage_override_) {
+    RCLCPP_INFO(get_logger(), "Using a caller-supplied fault storage backend");
+    return std::move(storage_override_);
+  }
+
   if (storage_type_ == "memory") {
     RCLCPP_INFO(get_logger(), "Using in-memory fault storage");
     return std::make_unique<InMemoryFaultStorage>();
@@ -872,16 +913,27 @@ void FaultManagerNode::handle_report_fault(
     // Process through correlation engine (if enabled)
     // Only process FAILED events with correlation
     bool should_mute = false;
-    if (correlation_engine_ && request->event_type == ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED) {
-      // is_new is the cycle boundary the planned stop needs: a new fault, or one
-      // raised again after being cleared. Reporters are level-triggered, so
-      // without it a condition that was already up - and already announced -
-      // would be swallowed by a stop declared after it started.
+    if (request->event_type == ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED) {
+      // The cycle boundary the planned stop needs. `is_new` covers a new fault and
+      // one raised again after being cleared; a re-fail out of HEALED is the third
+      // case, because the manager publishes EVENT_CLEARED at the heal, so the
+      // confirmation that follows is a fresh announcement. Reporters are
+      // level-triggered, so without this boundary a condition that was already up
+      // - and already announced - would be swallowed by a stop declared after it
+      // started. occurrence_count keeps its own, narrower definition.
+      const bool cycle_started = is_new || status_before == ros2_medkit_msgs::msg::Fault::STATUS_HEALED;
+
       auto correlation_result =
           correlation_engine_->process_fault(request->fault_code, correlation::severity_to_string(request->severity),
-                                             std::chrono::steady_clock::now(), is_new);
+                                             std::chrono::steady_clock::now(), cycle_started);
 
       should_mute = correlation_result.should_mute;
+
+      // Ownership is persisted, not inferred: the switch-off, and a restart, both
+      // read it back from the store rather than comparing timestamps.
+      if (planned_stop_.active && cycle_started) {
+        storage_->set_planned_stop_owned(request->fault_code, true);
+      }
 
       if (correlation_result.is_root_cause) {
         RCLCPP_DEBUG(get_logger(), "Fault %s identified as root cause (rule=%s)", request->fault_code.c_str(),
@@ -899,6 +951,11 @@ void FaultManagerNode::handle_report_fault(
                        correlation_result.cluster_id.c_str(), correlation_result.retroactive_mute_codes.size());
         }
       }
+    } else {
+      // A PASSED report can still produce an event - the fault stays CONFIRMED and
+      // its data is updated - and a muted fault must not announce that either. The
+      // mute is a property of the fault, not of the report that happened to arrive.
+      should_mute = correlation_engine_->is_muted(request->fault_code);
     }
 
     // Determine event type based on status transition
@@ -1072,7 +1129,7 @@ void FaultManagerNode::handle_clear_fault(
     // walked, because it reaches across entity boundaries. The planned stop is not
     // a graph - it is this one fault's mute - so it is released either way, or an
     // acknowledged fault would stay counted as muted until the stop ended.
-    correlation_engine_->drop_planned_stop_mute(request->fault_code);
+    correlation_engine_->release_planned_stop_ownership(request->fault_code);
   }
 
   bool cleared = storage_->clear_fault(request->fault_code);
@@ -1196,14 +1253,13 @@ void FaultManagerNode::handle_set_planned_stop(
   // now, once, or the alarm standing on the controller is invisible to every
   // consumer of the stream. PREFAILED has nothing to announce yet, and a HEALED
   // one already published its end.
-  size_t announced = 0;
-  for (const auto & fault_code : unmuted) {
-    auto fault = storage_->get_fault(fault_code);
-    if (fault && fault->status == ros2_medkit_msgs::msg::Fault::STATUS_CONFIRMED) {
-      publish_fault_event(ros2_medkit_msgs::msg::FaultEvent::EVENT_CONFIRMED, *fault);
-      ++announced;
-    }
-  }
+  const size_t announced = announce_released(unmuted);
+
+  // The flags go LAST. A crash between the declaration write and this point
+  // leaves owned faults behind an ENDED declaration, which the next startup
+  // recognises and finishes - announcing what this loop did not get to. Clearing
+  // first would turn a crash into permanent silence for those faults.
+  storage_->clear_planned_stop_owned();
 
   // The withdrawal carries its own reason and declarer into the audit record; the
   // stored declaration keeps the ones that started the stop.
@@ -1516,25 +1572,20 @@ void FaultManagerNode::load_snapshot_config_from_yaml(const std::string & config
   }
 }
 
-size_t FaultManagerNode::restore_planned_stop_mutes() {
-  // The mute set lives in the engine, so a restart loses it while the declaration
-  // itself survives in the store. Without this, a reboot inside a weekend stop
-  // makes every fault the stop was holding silently visible, and the switch-off
-  // then announces none of them - the confirmations they never published are lost
-  // for good. Rebuild it from what the store knows: a fault whose cycle started at
-  // or after the declaration and that is not over.
-  size_t restored = 0;
-  for (const auto & fault : storage_->get_all_faults()) {
-    if (fault.status == ros2_medkit_msgs::msg::Fault::STATUS_CLEARED) {
-      continue;  // acknowledged: nothing left to hold down or announce
+size_t FaultManagerNode::announce_released(const std::vector<std::string> & fault_codes) {
+  // A released fault that is CONFIRMED was never announced - the confirmation
+  // happened behind the mute - so it is announced now, once, or the alarm standing
+  // on the controller is invisible to every consumer of the stream. PREFAILED has
+  // nothing to announce yet, and a HEALED one already published its end.
+  size_t announced = 0;
+  for (const auto & fault_code : fault_codes) {
+    auto fault = storage_->get_fault(fault_code);
+    if (fault && fault->status == ros2_medkit_msgs::msg::Fault::STATUS_CONFIRMED) {
+      publish_fault_event(ros2_medkit_msgs::msg::FaultEvent::EVENT_CONFIRMED, *fault);
+      ++announced;
     }
-    if (rclcpp::Time(fault.first_occurred).nanoseconds() < planned_stop_.since_ns) {
-      continue;  // its cycle started before the stop, so the stop never marked it
-    }
-    correlation_engine_->restore_planned_stop_mute(fault.fault_code);
-    ++restored;
   }
-  return restored;
+  return announced;
 }
 
 std::unique_ptr<correlation::CorrelationEngine> FaultManagerNode::create_correlation_engine() {

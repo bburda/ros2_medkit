@@ -318,17 +318,20 @@ Declare, withdraw and read a planned stop on the fault manager.
    builtin_interfaces/Time since     # when it was declared
    builtin_interfaces/Time ended_at  # when it was withdrawn; zero while one is in force
 
-While a planned stop is on, a fault whose cycle *starts* is reported, debounced,
-confirmed, captured and audited unchanged, and is marked as muted: absent from
-the default ``ListFaults`` response, counted in ``muted_count``, and listed under
-``muted_faults`` with ``rule_id: planned_stop`` when ``include_muted`` is set. A
-cycle that started before the stop is untouched.
+While a planned stop is on, it owns every fault cycle that *starts* - a new fault,
+one raised again after being cleared, or one that fails again after healing. An
+owned fault is reported, debounced, confirmed, captured and audited unchanged, and
+is marked as muted: absent from the default ``ListFaults`` response, counted in
+``muted_count``, and listed under ``muted_faults`` with ``rule_id: planned_stop``
+when ``include_muted`` is set. A cycle that started before the stop is untouched.
 
 Publication matches a rule-muted symptom exactly: ``EVENT_CONFIRMED`` and
-``EVENT_UPDATED`` are withheld, ``EVENT_CLEARED`` is published as usual.
-Withdrawing the stop releases every fault it alone was muting and publishes one
-``EVENT_CONFIRMED`` per released fault that is CONFIRMED. The audit records exist
-only when ``audit_log.enabled`` is set, which it is not by default.
+``EVENT_UPDATED`` are withheld whichever kind of report produced them,
+``EVENT_CLEARED`` is published as usual. Withdrawing the stop releases every fault
+it owns and publishes one ``EVENT_CONFIRMED`` per released fault that is CONFIRMED;
+a fault a correlation rule is muting stays muted and is not announced, and returns
+to the stop's mute if the rule lets go while the stop is still on. The audit records
+exist only when ``audit_log.enabled`` is set, which it is not by default.
 
 See :doc:`/config/fault-manager` for the configuration that decides whether the
 declaration survives a restart and whether the transitions are audited.

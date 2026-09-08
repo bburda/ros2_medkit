@@ -29,43 +29,25 @@ ProcessFaultResult CorrelationEngine::process_fault(const std::string & fault_co
                                                     bool cycle_started) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // Correlation runs on every report. Handing a mute over to a rule happens where
-  // the rule registers it (try_as_symptom), not here: the auto-cluster path
-  // reports should_mute without ever writing muted_faults_, so treating
-  // should_mute as "a rule owns this now" would orphan the planned stop's entry -
-  // muted for good, released by nothing.
+  // Correlation runs on every report and may write its own mute entry for this
+  // code. That entry OVERLAYS the planned stop rather than replacing it: ownership
+  // is a fact about which cycle the fault is in, not about who is currently
+  // holding it quiet.
   ProcessFaultResult result = correlate(fault_code, severity, timestamp);
 
-  if (!planned_stop_active_) {
-    return result;
+  if (planned_stop_active_ && cycle_started) {
+    planned_stop_owned_.insert(fault_code);
   }
 
-  if (planned_stop_muted_.count(fault_code) > 0) {
-    // Already the stop's. A repeat report neither re-registers it nor lets it go.
-    result.should_mute = true;
-    return result;
+  if (planned_stop_owned_.count(fault_code) > 0 && muted_faults_.count(fault_code) == 0) {
+    mute_as_planned_stop(fault_code);
   }
 
-  if (!cycle_started) {
-    // The condition was already up when the stop was declared. Its confirmation
-    // has been announced; hiding it now would take a standing alarm off the list
-    // and announce it a second time at the switch-off.
-    return result;
-  }
-
-  if (muted_faults_.count(fault_code) > 0) {
-    // A rule is muting this code. One mute, one owner: the stop does not take it
-    // over and, at the switch-off, does not release it.
-    return result;
-  }
-
-  MutedFaultData muted;
-  muted.fault_code = fault_code;
-  muted.root_cause_code = kPlannedStopRootCause;
-  muted.rule_id = kPlannedStopRuleId;
-  muted_faults_[fault_code] = muted;
-  planned_stop_muted_.insert(fault_code);
-  result.should_mute = true;
+  // Derived, not remembered: a fault stays reported as muted for as long as an
+  // entry exists, whatever this particular report matched. Without this a repeat
+  // report of a fault whose rule stopped matching announces an update for a fault
+  // the list is hiding.
+  result.should_mute = result.should_mute || muted_faults_.count(fault_code) > 0;
 
   return result;
 }
@@ -162,10 +144,11 @@ ProcessClearResult CorrelationEngine::process_clear(const std::string & fault_co
       }
     }
 
-    // Clean up muted faults
+    // The rule's overlay on each symptom goes with the root cause. A symptom the
+    // stop owns is re-muted by reassert_planned_stop_mutes() below; one that is
+    // auto-cleared has its cycle ended, so its ownership goes too.
     for (const auto & symptom_code : it->second) {
       muted_faults_.erase(symptom_code);
-      planned_stop_muted_.erase(symptom_code);
     }
 
     // Remove from root_to_symptoms
@@ -276,7 +259,14 @@ ProcessClearResult CorrelationEngine::process_clear(const std::string & fault_co
   muted_faults_.erase(fault_code);
   // A cleared fault has nothing left to announce, so the planned stop must not
   // hand it back at switch-off.
-  planned_stop_muted_.erase(fault_code);
+  planned_stop_owned_.erase(fault_code);
+  for (const auto & auto_cleared : result.auto_cleared_codes) {
+    muted_faults_.erase(auto_cleared);
+    planned_stop_owned_.erase(auto_cleared);
+  }
+
+  // A symptom that was NOT auto-cleared is still up, and the stop may own it.
+  reassert_planned_stop_mutes();
 
   return result;
 }
@@ -291,16 +281,20 @@ std::vector<std::string> CorrelationEngine::end_planned_stop() {
 
   planned_stop_active_ = false;
 
-  std::vector<std::string> unmuted;
-  unmuted.reserve(planned_stop_muted_.size());
-  for (const auto & fault_code : planned_stop_muted_) {
-    if (muted_faults_.erase(fault_code) > 0) {
-      unmuted.push_back(fault_code);
+  std::vector<std::string> released;
+  released.reserve(planned_stop_owned_.size());
+  for (const auto & fault_code : planned_stop_owned_) {
+    auto it = muted_faults_.find(fault_code);
+    // A rule's overlay is not the stop's to lift: that fault stays muted, and
+    // stays unannounced, for as long as the rule holds it.
+    if (it != muted_faults_.end() && it->second.by_planned_stop) {
+      muted_faults_.erase(it);
+      released.push_back(fault_code);
     }
   }
-  planned_stop_muted_.clear();
+  planned_stop_owned_.clear();
 
-  return unmuted;
+  return released;
 }
 
 bool CorrelationEngine::planned_stop_active() const {
@@ -308,27 +302,47 @@ bool CorrelationEngine::planned_stop_active() const {
   return planned_stop_active_;
 }
 
-void CorrelationEngine::drop_planned_stop_mute(const std::string & fault_code) {
+void CorrelationEngine::release_planned_stop_ownership(const std::string & fault_code) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  if (planned_stop_muted_.erase(fault_code) > 0) {
-    muted_faults_.erase(fault_code);
+  if (planned_stop_owned_.erase(fault_code) == 0) {
+    return;
+  }
+  auto it = muted_faults_.find(fault_code);
+  if (it != muted_faults_.end() && it->second.by_planned_stop) {
+    muted_faults_.erase(it);
   }
 }
 
-void CorrelationEngine::restore_planned_stop_mute(const std::string & fault_code) {
+void CorrelationEngine::restore_planned_stop_ownership(const std::string & fault_code) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  if (muted_faults_.count(fault_code) > 0) {
-    return;  // a rule is already muting it; one mute, one owner
+  planned_stop_owned_.insert(fault_code);
+  if (muted_faults_.count(fault_code) == 0) {
+    mute_as_planned_stop(fault_code);
   }
+}
 
+std::vector<std::string> CorrelationEngine::planned_stop_owned_codes() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return {planned_stop_owned_.begin(), planned_stop_owned_.end()};
+}
+
+void CorrelationEngine::mute_as_planned_stop(const std::string & fault_code) {
   MutedFaultData muted;
   muted.fault_code = fault_code;
   muted.root_cause_code = kPlannedStopRootCause;
   muted.rule_id = kPlannedStopRuleId;
+  muted.by_planned_stop = true;
   muted_faults_[fault_code] = muted;
-  planned_stop_muted_.insert(fault_code);
+}
+
+void CorrelationEngine::reassert_planned_stop_mutes() {
+  for (const auto & fault_code : planned_stop_owned_) {
+    if (muted_faults_.count(fault_code) == 0) {
+      mute_as_planned_stop(fault_code);
+    }
+  }
 }
 
 std::vector<MutedFaultData> CorrelationEngine::get_muted_faults() const {
@@ -413,8 +427,10 @@ void CorrelationEngine::cleanup_expired() {
       pending_clusters_.erase(it);
     }
   }
-}
 
+  // Whatever a rule just stopped holding, the stop still owns.
+  reassert_planned_stop_mutes();
+}
 std::optional<std::string> CorrelationEngine::try_as_root_cause(const std::string & fault_code) {
   for (const auto & rule : config_.rules) {
     if (rule.mode != CorrelationMode::HIERARCHICAL) {
@@ -481,10 +497,10 @@ std::optional<ProcessFaultResult> CorrelationEngine::try_as_symptom(const std::s
         muted.root_cause_code = prc.fault_code;
         muted.rule_id = rule.id;
         muted.delay_ms = result.delay_ms;
+        // Overlays whatever was there, the planned stop's entry included. The
+        // stop keeps its ownership, so when this rule lets go the fault is muted
+        // by the stop again rather than falling out of it.
         muted_faults_[fault_code] = muted;
-        // The rule is the owner from here. Ending a planned stop must not release
-        // a fault a root cause is still holding down.
-        planned_stop_muted_.erase(fault_code);
       }
 
       return result;

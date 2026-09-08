@@ -16,6 +16,7 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -2516,6 +2517,101 @@ TEST_F(SqliteFaultStorageTest, ADatabaseWrittenBeforeTheEndTimeExistedStillOpens
   EXPECT_EQ("legacy stop", state.reason);
   EXPECT_EQ(42, state.since_ns);
   EXPECT_EQ(0, state.ended_at_ns);
+}
+
+// ============================================================================
+// Planned-stop ownership: one persisted flag per fault
+// ============================================================================
+
+namespace {
+
+/// Drive a fault to CONFIRMED with the immediate-confirmation default.
+void raise(ros2_medkit_fault_manager::FaultStorage & storage, const std::string & code) {
+  rclcpp::Clock clock;
+  storage.report_fault_event(code, ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "owned test", "/src",
+                             clock.now(), default_config());
+}
+
+}  // namespace
+
+TEST_F(SqliteFaultStorageTest, PlannedStopOwnershipRoundTripsThroughAReopen) {
+  raise(*storage_, "OWNED_ONE");
+  raise(*storage_, "OWNED_TWO");
+  raise(*storage_, "NOT_OWNED");
+
+  EXPECT_TRUE(storage_->get_planned_stop_owned().empty());
+
+  storage_->set_planned_stop_owned("OWNED_ONE", true);
+  storage_->set_planned_stop_owned("OWNED_TWO", true);
+
+  storage_.reset();
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  auto owned = storage_->get_planned_stop_owned();
+  std::sort(owned.begin(), owned.end());
+  ASSERT_EQ(2u, owned.size());
+  EXPECT_EQ("OWNED_ONE", owned[0]);
+  EXPECT_EQ("OWNED_TWO", owned[1]);
+}
+
+TEST_F(SqliteFaultStorageTest, AcknowledgingAFaultEndsTheStopsOwnershipOfIt) {
+  raise(*storage_, "OWNED_CLEARED");
+  storage_->set_planned_stop_owned("OWNED_CLEARED", true);
+  ASSERT_EQ(1u, storage_->get_planned_stop_owned().size());
+
+  ASSERT_TRUE(storage_->clear_fault("OWNED_CLEARED"));
+
+  EXPECT_TRUE(storage_->get_planned_stop_owned().empty())
+      << "an acknowledged fault is over, so the stop has nothing left to own";
+}
+
+TEST_F(SqliteFaultStorageTest, ClearingOwnershipDropsEveryFlagAndReportsHowMany) {
+  raise(*storage_, "OWNED_A");
+  raise(*storage_, "OWNED_B");
+  storage_->set_planned_stop_owned("OWNED_A", true);
+  storage_->set_planned_stop_owned("OWNED_B", true);
+
+  EXPECT_EQ(2u, storage_->clear_planned_stop_owned());
+  EXPECT_TRUE(storage_->get_planned_stop_owned().empty());
+  EXPECT_EQ(0u, storage_->clear_planned_stop_owned());
+}
+
+TEST_F(SqliteFaultStorageTest, ADatabaseWrittenBeforeOwnershipExistedStillOpens) {
+  raise(*storage_, "LEGACY_FAULT");
+  storage_.reset();
+  {
+    sqlite3 * raw = nullptr;
+    ASSERT_EQ(sqlite3_open(temp_db_path_.string().c_str(), &raw), SQLITE_OK);
+    // What a database from before the column looks like.
+    ASSERT_EQ(sqlite3_exec(raw, "ALTER TABLE faults DROP COLUMN planned_stop_owned", nullptr, nullptr, nullptr),
+              SQLITE_OK);
+    sqlite3_close(raw);
+  }
+
+  storage_ = std::make_unique<SqliteFaultStorage>(temp_db_path_.string());
+
+  EXPECT_TRUE(storage_->get_planned_stop_owned().empty());
+  EXPECT_TRUE(storage_->contains("LEGACY_FAULT"));
+  storage_->set_planned_stop_owned("LEGACY_FAULT", true);
+  EXPECT_EQ(1u, storage_->get_planned_stop_owned().size());
+}
+
+TEST(InMemoryFaultStorageTest, PlannedStopOwnershipIsTrackedPerFault) {
+  ros2_medkit_fault_manager::InMemoryFaultStorage storage;
+  raise(storage, "OWNED_ONE");
+  raise(storage, "NOT_OWNED");
+
+  storage.set_planned_stop_owned("OWNED_ONE", true);
+  auto owned = storage.get_planned_stop_owned();
+  ASSERT_EQ(1u, owned.size());
+  EXPECT_EQ("OWNED_ONE", owned[0]);
+
+  ASSERT_TRUE(storage.clear_fault("OWNED_ONE"));
+  EXPECT_TRUE(storage.get_planned_stop_owned().empty());
+
+  storage.set_planned_stop_owned("NOT_OWNED", true);
+  EXPECT_EQ(1u, storage.clear_planned_stop_owned());
+  EXPECT_TRUE(storage.get_planned_stop_owned().empty());
 }
 
 TEST_F(SqliteFaultStorageTest, PlannedStopCarriesAKilobyteReason) {

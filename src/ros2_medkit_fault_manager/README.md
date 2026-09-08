@@ -60,28 +60,38 @@ ros2 service call /fault_manager/set_planned_stop ros2_medkit_msgs/srv/SetPlanne
 ros2 service call /fault_manager/get_planned_stop ros2_medkit_msgs/srv/GetPlannedStop "{}"
 ```
 
-**Marked, never dropped.** While the stop stands, a fault whose cycle *starts*
-goes through report, debounce, confirmation, snapshot and rosbag capture and the
-audit log exactly as it would otherwise. What changes is only how it is *shown*:
-it is registered as muted with `rule_id: planned_stop` and the pseudo root cause
-`PLANNED_STOP`, so it is absent from the default `~/list_faults` response,
-counted in `muted_count`, and listed under `muted_faults` when `include_muted` is
-set.
+**Marked, never dropped.** While the stop stands, it *owns* every fault cycle that
+starts. An owned fault goes through report, debounce, confirmation, snapshot and
+rosbag capture and the audit log exactly as it would otherwise. What changes is
+only how it is *shown*: it is registered as muted with `rule_id: planned_stop` and
+the pseudo root cause `PLANNED_STOP`, so it is absent from the default
+`~/list_faults` response, counted in `muted_count`, and listed under
+`muted_faults` when `include_muted` is set.
+
+**Ownership is the truth, and it is persisted.** The flag lives on the fault row in
+the store, not in the process, so a restart reads back exactly which cycles the
+stop owns - no timestamp comparison, which a clock step would break and which
+cannot tell a rule's mute from the stop's. The mute is derived from ownership: an
+owned fault is muted unless a rule's mute overlays it, and when that overlay ends
+the fault is muted by the stop again.
 
 **Only a cycle that starts inside the stop.** A fault that was already up when the
 stop was declared keeps its place in the fault list. Reporters are level-triggered
 - `FaultReporter::report()` is called for as long as the condition holds, not once
 per transition - so marking on any report would take a standing alarm off the list
-and then announce it a second time at the switch-off. The cycle boundary is the
-same one `~/report_fault` already computes: a new fault, or one raised again after
-being cleared.
+and then announce it a second time at the switch-off. A cycle starts on a new
+fault, on one raised again after being cleared, and on one that fails again after
+healing (the heal published the fault's end, so the next confirmation is fresh
+news). `occurrence_count` keeps its own, narrower definition and counts the first
+two only.
 
 **Published exactly like a rule-muted symptom.** `EVENT_CONFIRMED` and
-`EVENT_UPDATED` are withheld while the fault is marked. `EVENT_CLEARED` is not: a
-fault that heals past the healing threshold, or that is acknowledged, publishes it
-as any muted fault does. Consumers therefore see the end of a fault whose start
-they never heard - that is the existing muting contract, not something the switch
-changes.
+`EVENT_UPDATED` are withheld while the fault is muted, whichever kind of report
+produced them - a PASSED that leaves the fault CONFIRMED announces nothing either.
+`EVENT_CLEARED` is not withheld: a fault that heals past the healing threshold, or
+that is acknowledged, publishes it as any muted fault does. Consumers therefore see
+the end of a fault whose start they never heard - that is the existing muting
+contract, not something the switch changes.
 
 **Withdrawing releases the survivors.** Every fault the stop alone was muting and
 that is still active is unmuted, and each one that is CONFIRMED publishes a single
@@ -90,10 +100,13 @@ announced, while the condition it reports still stands on the machine. A fault
 still short of confirmation announces nothing (there is nothing yet to announce),
 and one acknowledged during the stop announces nothing either.
 
-**Correlation rules and the stop compose.** A fault a rule mutes stays muted by
-that rule, and withdrawing the stop does not release it. A fault the stop muted
-that a rule later claims likewise stays muted after the withdrawal: two
-independent reasons to be quiet, and one of them going away is not both.
+**Correlation rules and the stop compose.** A rule's mute is an *overlay* on an
+owned fault, not a transfer: while the rule holds it, the withdrawal leaves it
+alone, and when the rule lets go - its root cause acknowledged, its window closed,
+its cluster expired - the fault goes back to being muted by the stop. A fault whose
+cycle started before the stop is not owned at all, so the stop neither hides it nor
+releases it. This holds for cluster rules as well as hierarchical ones, even though
+the cluster path never writes a mute entry of its own.
 
 **Both transitions are audited** - when the audit log is on. `audit_log.enabled`
 is `false` by default, and with it off the switch writes no audit row at all. With
@@ -113,10 +126,18 @@ up without reading the audit database.
 
 **The declaration survives a restart** when the SQLite backend is in use: it is a
 row in the fault store, so a stop declared on Friday still mutes on Monday. On
-startup the manager also re-marks every stored fault that is not CLEARED and whose
-cycle started at or after the declaration, so the switch-off after a reboot still
-releases them and announces their confirmations. The in-memory backend has no file
-behind it and starts every process with no declaration.
+startup the manager reads the ownership flags back, so the switch-off after a
+reboot releases exactly the cycles the stop owned and announces their
+confirmations. A *rule's* mute is not persisted anywhere, so a fault a correlation
+rule was muting before a restart comes back unmuted unless the stop owns it - a
+pre-existing property of correlation, not of the switch. The in-memory backend has
+no file behind it and starts every process with no declaration and no ownership.
+
+**A switch-off interrupted by a crash is finished at startup.** The withdrawal
+writes the declaration first, announces the confirmations it was holding back, and
+drops the ownership flags last. A process that dies in between leaves faults owned
+by a declaration that is already over; the next startup recognises exactly that,
+announces them once a consumer is listening, and clears the flags.
 
 **Over SOVD.** The gateway maps a node's services to operations on its App entity,
 so an operator reaches the switch without any new route:

@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "ros2_medkit_fault_manager/capture_thread_pool.hpp"
@@ -72,12 +73,6 @@ class FaultManagerNode : public rclcpp::Node {
     return *storage_;
   }
 
-  /// Replace the storage backend (for testing only). The failure paths of a store
-  /// that rejects a write are otherwise reachable only on a broken disk.
-  void set_storage_for_test(std::unique_ptr<FaultStorage> storage) {
-    storage_ = std::move(storage);
-  }
-
   /// Get the tamper-evident audit log (nullptr when disabled), for testing only.
   const FaultAuditLog * get_audit_log_for_test() const {
     return audit_log_.get();
@@ -127,6 +122,17 @@ class FaultManagerNode : public rclcpp::Node {
   /// @param entity_id Entity ID to match (exact match or as suffix of FQN)
   /// @return true if entity_id matches any source
   static bool matches_entity(const std::vector<std::string> & reporting_sources, const std::string & entity_id);
+
+ protected:
+  /// Construct with a storage backend the caller supplies instead of the one the
+  /// parameters describe.
+  ///
+  /// The backend is handed over BEFORE the node builds anything that borrows it -
+  /// snapshot and rosbag capture hold a raw `FaultStorage *` - so this cannot leave
+  /// a dangling pointer the way swapping the store at runtime would. Protected
+  /// rather than public because the only callers are tests driving the failure
+  /// paths of a store that rejects a write, which a healthy disk never produces.
+  FaultManagerNode(const rclcpp::NodeOptions & options, std::unique_ptr<FaultStorage> storage);
 
  private:
   /// Create storage backend based on configuration
@@ -181,11 +187,11 @@ class FaultManagerNode : public rclcpp::Node {
   /// @param config SnapshotConfig to populate with loaded values
   void load_snapshot_config_from_yaml(const std::string & config_file, SnapshotConfig & config);
 
-  /// Re-register the planned stop's mute for every stored fault whose cycle started
-  /// inside the declaration currently in force and that is not CLEARED. Runs at
-  /// startup, before the node serves anything.
-  /// @return how many faults were re-marked
-  size_t restore_planned_stop_mutes();
+  /// Publish EVENT_CONFIRMED for each of these faults that is CONFIRMED, which is
+  /// what releasing a fault from the planned stop means to a consumer of the
+  /// stream.
+  /// @return how many confirmations were announced
+  size_t announce_released(const std::vector<std::string> & fault_codes);
 
   /// Build the correlation engine.
   ///
@@ -251,6 +257,10 @@ class FaultManagerNode : public rclcpp::Node {
   void audit_planned_stop(const char * transition, const PlannedStopState & state, const std::string & reason,
                           const std::string & declared_by, int64_t occurred_at_ns);
 
+  /// Handed to create_storage() when a caller supplied a backend. Empty in every
+  /// normal construction, and moved from exactly once.
+  std::unique_ptr<FaultStorage> storage_override_;
+
   std::string storage_type_;
   std::string database_path_;
   int32_t confirmation_threshold_{-1};
@@ -288,6 +298,20 @@ class FaultManagerNode : public rclcpp::Node {
   rclcpp::Service<ros2_medkit_msgs::srv::SetPlannedStop>::SharedPtr set_planned_stop_srv_;
   rclcpp::Service<ros2_medkit_msgs::srv::GetPlannedStop>::SharedPtr get_planned_stop_srv_;
   rclcpp::TimerBase::SharedPtr auto_confirm_timer_;
+
+  /// How often startup checks whether anyone is listening before finishing an
+  /// interrupted planned-stop release.
+  static constexpr std::chrono::milliseconds kInterruptedReleasePollInterval{200};
+
+  /// How long that check waits for a listener before announcing anyway. The events
+  /// topic is volatile, so an announcement made before a subscriber has matched is
+  /// lost for good - but a manager nobody subscribes to still has to finish the
+  /// release rather than carry the ownership flags for ever.
+  static constexpr std::chrono::seconds kInterruptedReleaseDeadline{15};
+
+  /// One-shot: finishes a release a previous process did not complete (nullptr
+  /// when there was nothing left over).
+  rclcpp::TimerBase::SharedPtr interrupted_release_timer_;
 
   /// Timer for periodic cleanup of expired correlation data
   rclcpp::TimerBase::SharedPtr correlation_cleanup_timer_;

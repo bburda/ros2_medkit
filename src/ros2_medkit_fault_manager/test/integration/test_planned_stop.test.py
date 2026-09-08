@@ -76,17 +76,29 @@ correlation:
       codes: ["MOTOR_PS_*"]
     ps_valve_errors:
       codes: ["VALVE_PS_*"]
+    ps_pump_errors:
+      codes: ["PUMP_PS_*"]
   rules:
     - id: ps_estop_cascade
       name: "E-Stop Cascade"
       mode: hierarchical
       root_cause:
-        codes: ["ESTOP_PS_001"]
+        codes: ["ESTOP_PS_*"]
       symptoms:
         - pattern: ps_motor_errors
       window_ms: 60000
       mute_symptoms: true
       auto_clear_with_root: true
+    - id: ps_estop_noclear
+      name: "E-Stop Cascade, symptoms left up"
+      mode: hierarchical
+      root_cause:
+        codes: ["ESTOP_NOCLEAR_001"]
+      symptoms:
+        - pattern: ps_pump_errors
+      window_ms: 60000
+      mute_symptoms: true
+      auto_clear_with_root: false
     - id: ps_valve_storm
       name: "Valve Storm"
       mode: auto_cluster
@@ -136,6 +148,10 @@ def generate_test_description():
             'storage_type': 'sqlite',
             'database_path': DATABASE_PATH,
             'confirmation_threshold': CONFIRMATION_THRESHOLD,
+            # A single PASSED heals, which is what makes the HEALED -> re-fail
+            # cycle boundary reachable from a test.
+            'healing_enabled': True,
+            'healing_threshold': 0,
             'audit_log.enabled': True,
             'audit_log.database_path': AUDIT_PATH,
             'correlation.config_file': CORRELATION_PATH,
@@ -730,6 +746,104 @@ class TestPlannedStop(unittest.TestCase):
         ended = self._audit_rows('planned_stop_ended')[-1]
         self.assertEqual('night_shift', ended[3])
         self.assertEqual('plant back up', ended[4])
+
+    def test_a_healed_fault_that_fails_again_inside_the_stop_is_owned(self):
+        """A heal ends the cycle, so the next failure starts one the stop owns."""
+        code = 'PS_HEALED_REFAIL'
+
+        self._confirm(code)
+        self._wait_until(lambda: self._count_events(code, FaultEvent.EVENT_CONFIRMED) == 1,
+                         f'{code} was never announced before the stop')
+        # The debounce counter sits at the confirmation threshold, so it takes that
+        # many PASSED reports to climb back to the healing threshold of 0.
+        for _ in range(abs(CONFIRMATION_THRESHOLD)):
+            self._report(code, event_type=ReportFault.Request.EVENT_PASSED)
+        self._wait_until(lambda: self._get_fault(code).fault.status == 'HEALED',
+                         f'{code} never healed')
+
+        self._set_stop(True, reason='bench work', declared_by='tech')
+
+        # The condition returns. That is a new cycle by the manager's own model,
+        # and the stop owns it.
+        self._confirm(code)
+        muted = self._wait_until(lambda: self._muted_entry(code),
+                                 f'the re-failed {code} was not marked by the stop')
+        self.assertEqual('planned_stop', muted.rule_id)
+        self.assertNotIn(code, self._codes_in_default_list())
+        self.assertEqual(1, self._count_events(code, FaultEvent.EVENT_CONFIRMED),
+                         'the re-failure was announced despite the stop')
+
+        self._set_stop(False, reason='bench work over', declared_by='tech')
+        self._wait_until(lambda: self._count_events(code, FaultEvent.EVENT_CONFIRMED) == 2,
+                         'the confirmation the stop held back was never announced')
+
+    def test_a_passed_report_announces_nothing_for_a_marked_fault(self):
+        """Muting gates the PASSED path too, not only the FAILED one."""
+        code = 'PS_PASSED_QUIET'
+
+        self._set_stop(True, reason='changeover', declared_by='maintenance')
+        self._confirm(code)
+        self._wait_until(lambda: self._muted_entry(code), f'{code} was not marked by the stop')
+
+        # A PASSED that does not heal leaves the fault CONFIRMED with fresh data -
+        # the update path. Nothing about it may reach the stream.
+        self._report(code, event_type=ReportFault.Request.EVENT_PASSED)
+        self._wait_until(lambda: self._get_fault(code).success, f'{code} left the store')
+        self.assertEqual(set(), self._event_types(code),
+                         'a PASSED report announced an update for a marked fault')
+
+        self._set_stop(False, reason='done', declared_by='maintenance')
+
+    def test_a_rule_muted_symptom_announces_nothing_on_a_passed_report(self):
+        """
+        Apply the same gate to a fault a correlation rule is muting.
+
+        Its own root cause code: a root shared with another case would already be
+        CONFIRMED there, and a cycle that started outside this test's stop is not
+        the stop's to own.
+        """
+        root = 'ESTOP_PS_PASSED'
+        symptom = 'MOTOR_PS_PASSED'
+
+        self._confirm(root)
+        self._confirm(symptom)
+        muted = self._wait_until(lambda: self._muted_entry(symptom),
+                                 f'{symptom} was not muted by the rule')
+        self.assertEqual('ps_estop_cascade', muted.rule_id)
+
+        self._report(symptom, event_type=ReportFault.Request.EVENT_PASSED)
+        self._wait_until(lambda: self._get_fault(symptom).success, f'{symptom} left the store')
+        self.assertEqual(set(), self._event_types(symptom),
+                         'a PASSED report announced an update for a rule-muted fault')
+
+    def test_a_symptom_returns_to_the_stop_when_its_root_cause_is_acknowledged(self):
+        """A rule's mute is an overlay; ownership outlives it."""
+        root = 'ESTOP_NOCLEAR_001'
+        symptom = 'PUMP_PS_SYMPTOM'
+
+        self._set_stop(True, reason='cell 7 changeover', declared_by='maintenance')
+        self._confirm(root)
+        self._confirm(symptom)
+
+        muted = self._wait_until(lambda: self._muted_entry(symptom),
+                                 f'{symptom} was not muted at all')
+        self.assertEqual('ps_estop_noclear', muted.rule_id,
+                         'the rule, not the stop, holds the mute while the root cause stands')
+
+        # Acknowledging the root cause ends the rule's mute. This rule does not
+        # auto-clear its symptoms, so the symptom is still up - and still the
+        # stop's.
+        self.assertTrue(self._clear(root).success)
+
+        still_muted = self._wait_until(lambda: self._muted_entry(symptom),
+                                       'the symptom fell out of the stop when the rule let go')
+        self.assertEqual('planned_stop', still_muted.rule_id)
+        self.assertNotIn(symptom, self._codes_in_default_list())
+        self.assertEqual(set(), self._event_types(symptom))
+
+        self._set_stop(False, reason='done', declared_by='maintenance')
+        self._wait_until(lambda: self._count_events(symptom, FaultEvent.EVENT_CONFIRMED) == 1,
+                         'the symptom the stop had owned all along was never announced')
 
     def test_the_switch_does_not_release_a_rule_muted_symptom(self):
         root = 'ESTOP_PS_001'

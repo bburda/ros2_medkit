@@ -278,26 +278,49 @@ why the mark is gated on the cycle boundary rather than on the report.
 ``FaultReporter::report()`` is documented to be called the same way. Marking on any
 report would take a fault that was confirmed and announced *before* the stop off
 the fault list within a second of the declaration, and announce it a second time at
-the switch-off. The boundary is ``report_fault_event``'s own ``is_new``: a new
-fault, or one raised again after being cleared.
+the switch-off. The boundary is ``report_fault_event``'s own ``is_new`` - a new fault, or one
+raised again after being cleared - plus a re-fail out of HEALED, because the manager
+publishes ``EVENT_CLEARED`` at the heal and the confirmation that follows is
+therefore fresh news. ``occurrence_count`` keeps its own, narrower definition.
 
-**One mute, one owner.** The engine keeps the codes the stop muted in a set of its
-own, separate from the mute map, and that set is what makes the two sources
-compose. A code leaves it where a rule *registers* its mute (``try_as_symptom``),
-not merely where a rule reports ``should_mute``: the auto-cluster path sets that
-flag without ever writing the mute map, so treating the flag as a hand-over would
-leave the planned stop's entry in the map owned by nobody - muted for good,
-released by nothing. In the other direction the stop never overwrites an entry a
-rule already holds. A code also leaves the set when the fault is acknowledged, on
-both acknowledgement paths: the correlation clear, and the scoped per-entity clear
-that deliberately skips it.
+**Ownership is the fact; the mute is derived from it.** The stop owns a fault
+CYCLE, and that ownership is a flag on the fault row in the store - not a set in the
+process, and not a timestamp comparison. Everything else follows: an owned fault is
+muted unless a rule's mute overlays it, and the moment the overlay ends the engine
+re-asserts the stop's mute (``reassert_planned_stop_mutes``, called from
+``process_clear`` and from ``cleanup_expired``). A rule therefore borrows a fault
+rather than taking it, which is what makes the two features compose in both
+directions: the withdrawal leaves a rule-held fault muted, and a rule that lets go
+mid-stop hands the fault back instead of dropping it out of the stop for good.
 
-**The mark survives a restart.** The set itself does not - it lives in the process
-- so on startup, with a declaration still in force, the manager re-registers it for
-every stored fault that is not CLEARED and whose ``first_occurred`` is at or after
-the declaration. Without that, a reboot inside a weekend stop would make the
+Deriving the mute also fixes what ``should_mute`` means. A repeat report of a fault
+whose rule has stopped matching produces no correlation result at all, so the report
+path used to treat it as unmuted and announce an update for a fault the list was
+hiding. ``process_fault`` now answers with the state of the mute map, not with what
+this particular report matched, and the PASSED path asks the same question rather
+than defaulting to "not muted".
+
+Ownership ends in exactly three places: the fault is acknowledged (both
+acknowledgement paths - the correlation clear and the scoped per-entity clear that
+skips it - and the store clears the flag with the CLEARED status), the fault is
+auto-cleared with its root cause, or the stop is withdrawn.
+
+**The mark survives a restart** because the flags do. Startup reads them back and
+re-registers the mute. Without that, a reboot inside a weekend stop would make the
 survivors silently visible and the switch-off would announce none of them: their
-confirmations, suppressed before the reboot, would be lost for good.
+confirmations, suppressed before the reboot, would be lost for good. A correlation
+rule's mute is not persisted anywhere, so a rule-muted fault comes back unmuted
+after a restart unless the stop owns its cycle - a pre-existing property of
+correlation rather than something the switch introduces.
+
+**A withdrawal is ordered so a crash cannot swallow an announcement.** The
+declaration is written first (so a store that refuses the write changes nothing, and
+a restart never re-arms a stop the operator withdrew), the confirmations are
+announced next, and the ownership flags are cleared last. A process that dies in
+between leaves faults owned by a declaration that is already over, which is a state
+the next startup recognises: it announces them - once a subscriber has matched the
+events publisher, because that topic is volatile - and clears the flags. Clearing
+first would have turned a crash into permanent silence.
 
 Withdrawing releases the rest and publishes ``EVENT_CONFIRMED`` once for each
 released fault that is CONFIRMED. That republication is the point of marking
@@ -314,10 +337,13 @@ operations on its App entity.
 
 One cost falls on every deployment, correlation or not: the engine is now always
 constructed, so the ``correlation.cleanup_interval_sec`` timer (5 s by default)
-runs on every fault manager. With no rules loaded a tick walks two empty
-containers - ``pending_root_causes_`` and ``pending_clusters_`` - and returns. The
-alternative, building the engine lazily when a stop is first declared, would put a
-second construction path under the service handler for no measurable saving.
+runs on every fault manager. With no rules loaded a tick takes the engine's mutex,
+walks two empty containers - ``pending_root_causes_`` and ``pending_clusters_`` -
+and re-asserts an empty ownership set. Measured at ~190 ns per call (1e6 calls on a
+rules-free engine, three runs: 191.2, 194.7, 190.3 ns), which at the default
+interval is ~2.3 us of CPU per minute. Building the engine lazily when a stop is
+first declared would put a second construction path under the service handler to
+save that.
 
 Rosbag Black-Box Recording
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -40,6 +40,30 @@ from ros2_medkit_msgs.srv import GetFault, GetPlannedStop, ListFaults, ReportFau
 
 STORAGE_DIR = tempfile.mkdtemp(prefix='planned_stop_restart_')
 DATABASE_PATH = os.path.join(STORAGE_DIR, 'faults.db')
+CORRELATION_PATH = os.path.join(STORAGE_DIR, 'correlation.yaml')
+
+# A rule whose mute is NOT persisted anywhere, so a restart is where the
+# difference between "the stop owns this cycle" and "a rule is muting it" shows.
+CORRELATION_RULES = """
+correlation:
+  enabled: true
+  patterns:
+    restart_motor_errors:
+      codes: ["MOTOR_RESTART_*"]
+  rules:
+    - id: restart_estop_cascade
+      mode: hierarchical
+      root_cause:
+        codes: ["ESTOP_RESTART_001"]
+      symptoms:
+        - pattern: restart_motor_errors
+      window_ms: 60000
+      mute_symptoms: true
+      auto_clear_with_root: false
+"""
+
+RULE_ROOT_CODE = 'ESTOP_RESTART_001'
+RULE_SYMPTOM_CODE = 'MOTOR_RESTART_LEFT'
 
 REASON = 'weekend shutdown, cell 4'
 DECLARED_BY = 'plant_manager'
@@ -69,6 +93,9 @@ def get_coverage_env():
 
 def generate_test_description():
     """Launch a fault manager that launch brings back after it is killed."""
+    with open(CORRELATION_PATH, 'w') as handle:
+        handle.write(CORRELATION_RULES)
+
     fault_manager_env = get_coverage_env()
     fault_manager_env['ROS_LOCALHOST_ONLY'] = '1'
 
@@ -82,6 +109,7 @@ def generate_test_description():
             'storage_type': 'sqlite',
             'database_path': DATABASE_PATH,
             'confirmation_threshold': -1,
+            'correlation.config_file': CORRELATION_PATH,
             'snapshots.enabled': False,
             'snapshots.rosbag.enabled': False,
         }],
@@ -216,6 +244,14 @@ class TestPlannedStopSurvivesRestart(unittest.TestCase):
         return {fault.fault_code for fault in self._call(self.list_client, request).faults}
 
     def test_a_stop_declared_before_a_restart_still_mutes_after_it(self, fault_manager_node):
+        # A rule-muted fault whose cycle starts BEFORE the stop. Its mute lives only
+        # in the engine, so the restart is where the stop could wrongly adopt it.
+        self._report(RULE_ROOT_CODE)
+        self._report(RULE_SYMPTOM_CODE)
+        self._wait_until(lambda: RULE_SYMPTOM_CODE in self._muted_codes(),
+                         f'{RULE_SYMPTOM_CODE} was never muted by the rule')
+        self.assertEqual('restart_estop_cascade', self._muted_codes()[RULE_SYMPTOM_CODE].rule_id)
+
         declared = self._set_stop(True, reason=REASON, declared_by=DECLARED_BY)
         self.assertTrue(declared.success)
         self.assertFalse(declared.was_active)
@@ -256,6 +292,18 @@ class TestPlannedStopSurvivesRestart(unittest.TestCase):
                          'the restart moved the time the stop started')
         self.assertEqual(before.since.nanosec, after.since.nanosec)
 
+        # Exactly what the stop owned comes back - nothing else. Asserted before
+        # anything new is reported, so a fault raised after the restart cannot
+        # stand in for one the restore was supposed to find.
+        restored = self._muted_codes()
+        self.assertEqual(
+            {BEFORE_CODE, SECOND_BEFORE_CODE}, set(restored),
+            'the restart restored something other than exactly the faults the stop owned')
+        # The rule's mute is not persisted, so it is gone after the restart - and the
+        # stop must not have adopted a cycle that started before it was declared.
+        self.assertNotIn(RULE_SYMPTOM_CODE, restored)
+        self.assertIn(RULE_SYMPTOM_CODE, self._confirmed_codes())
+
         # The declaration is not a museum piece: a fault reported after the
         # restart is muted by it.
         self._report(AFTER_CODE)
@@ -267,12 +315,11 @@ class TestPlannedStopSurvivesRestart(unittest.TestCase):
 
         # The mute set lived in the process that is gone, so the manager rebuilds it
         # from the store: the faults marked before the restart are still marked.
-        muted_after_restart = self._muted_codes()
         for code in (BEFORE_CODE, SECOND_BEFORE_CODE):
-            self.assertIn(code, muted_after_restart,
+            self.assertIn(code, restored,
                           f'{code} was silently released by the restart, so its '
                           'confirmation could never be announced')
-            self.assertEqual('planned_stop', muted_after_restart[code].rule_id)
+            self.assertEqual('planned_stop', restored[code].rule_id)
             self.assertNotIn(code, self._confirmed_codes())
 
         withdrawn = self._set_stop(False, reason='plant back up', declared_by=DECLARED_BY)
@@ -291,6 +338,10 @@ class TestPlannedStopSurvivesRestart(unittest.TestCase):
                 lambda code=code: self._count_events(code, FaultEvent.EVENT_CONFIRMED) == 1,
                 f'{code} was never announced at the switch-off')
             self.assertIn(code, self._confirmed_codes())
+
+        self.assertEqual(
+            0, self._count_events(RULE_SYMPTOM_CODE, FaultEvent.EVENT_CONFIRMED),
+            'the switch-off announced a fault the stop never owned')
 
         # A second frame arriving late would still be a double announcement.
         self._spin_for(3.0)
