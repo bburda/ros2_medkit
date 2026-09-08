@@ -15,7 +15,11 @@ name: Docker Publish (multi-arch, release)
 on:
     push:
         tags:
-            - 'v*'
+            # Release tags are bare semver; only the first release carried a
+            # `v`. Both shapes match, and neither matches the bloom
+            # `release/...` and `debian/...` tags, which start with a letter.
+            - '[0-9]*.[0-9]*.[0-9]*'
+            - 'v[0-9]*.[0-9]*.[0-9]*'
     workflow_dispatch:
 
 env:
@@ -133,14 +137,15 @@ jobs:
               uses: docker/metadata-action@v5
               with:
                   images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ros2_medkit-${{ matrix.ros_distro }}
+                  # `latest` belongs to docker-publish.yml, which moves it on
+                  # every push to main; without this the action's default
+                  # `latest=auto` would have a release take that tag over.
+                  flavor: latest=false
                   tags: |
-                      # version tag (v1.2.3 -> 1.2.3)
+                      # version tag (0.7.0 -> 0.7.0)
                       type=semver,pattern={{version}}
-                      # major.minor (v1.2.3 -> 1.2)
+                      # major.minor (0.7.0 -> 0.7)
                       type=semver,pattern={{major}}.{{minor}}
-                      # latest only on a stable release tag (vX.Y.Z with no
-                      # pre-release suffix); skips -rc/-alpha tags and dispatch
-                      type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
                       # sha for traceability
                       type=sha,prefix=sha-,format=short
 
