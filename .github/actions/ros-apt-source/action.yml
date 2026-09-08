@@ -49,7 +49,13 @@ runs:
         url="https://github.com/ros-infrastructure/ros-apt-source/releases/download/${version}/${deb}"
 
         echo "Installing ${deb} (ros-apt-source ${version}, ${codename})"
-        curl --fail --location --retry 5 --retry-delay 3 -o "/tmp/${deb}" "${url}"
+        # This download has no fallback: the version lookup above can fall back to
+        # a pin, but a 5xx on the release asset itself ends the job. The retry
+        # window is therefore minutes rather than seconds, so a short outage on
+        # the release host is waited out instead of failing every job that starts
+        # during it.
+        curl --fail --location --retry 8 --retry-delay 15 --retry-max-time 180 \
+          -o "/tmp/${deb}" "${url}"
         $SUDO dpkg -i "/tmp/${deb}"
         rm -f "/tmp/${deb}"
         $SUDO apt-get update
