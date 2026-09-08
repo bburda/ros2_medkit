@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,11 @@ struct MutedFaultData {
   std::string root_cause_code;
   std::string rule_id;
   uint32_t delay_ms{0};
+  /// Whether the planned stop wrote this entry, as opposed to a correlation rule.
+  /// Not part of the ListFaults wire shape: it is how the engine tells its own
+  /// entry from a rule's overlay without matching on the rule id, which an
+  /// operator's configuration could collide with.
+  bool by_planned_stop{false};
 };
 
 /// Information about an active cluster (for ListFaults response)
@@ -87,10 +93,22 @@ struct ClusterData {
 /// - Whether they should be muted (symptoms of a root cause)
 /// - Whether they are root causes that should collect symptoms
 /// - Whether they form part of an auto-detected cluster
+/// - Whether a planned stop is in force, which mutes every fault whose cycle
+///   starts while it is on
 ///
 /// Thread-safe: all public methods can be called from multiple threads.
 class CorrelationEngine {
  public:
+  /// Pseudo root cause recorded against a fault the planned stop muted. It is
+  /// not a fault code any reporter can raise; it names the declaration as the
+  /// reason the fault is not being announced.
+  static constexpr const char * kPlannedStopRootCause = "PLANNED_STOP";
+
+  /// Rule id recorded against a fault the planned stop muted. The switch is not
+  /// a configured rule, so it carries a fixed id of its own and a consumer of
+  /// `muted_faults` can tell an operator's declaration from a correlation rule.
+  static constexpr const char * kPlannedStopRuleId = "planned_stop";
+
   /// Create correlation engine from configuration
   /// @param config Correlation configuration (must be enabled and valid)
   explicit CorrelationEngine(const CorrelationConfig & config);
@@ -99,9 +117,17 @@ class CorrelationEngine {
   /// @param fault_code The fault code
   /// @param severity The fault severity (for representative selection)
   /// @param timestamp When the fault occurred
+  /// @param cycle_started Whether this report STARTED a fault cycle (a new fault,
+  ///        or one raised again after being cleared) as opposed to a repeat of a
+  ///        condition that is already up. Only a cycle that starts while a planned
+  ///        stop is declared is marked by it: reporters are level-triggered and
+  ///        re-send FAILED for as long as the condition holds, so muting on any
+  ///        report would swallow a fault that was announced before the stop began.
+  ///        Correlation rules are unaffected and match on every report.
   /// @return Processing result indicating whether to mute, correlations, etc.
   ProcessFaultResult process_fault(const std::string & fault_code, const std::string & severity,
-                                   std::chrono::steady_clock::time_point timestamp = std::chrono::steady_clock::now());
+                                   std::chrono::steady_clock::time_point timestamp = std::chrono::steady_clock::now(),
+                                   bool cycle_started = true);
 
   /// Process a fault being cleared
   /// @param fault_code The fault code being cleared
@@ -131,7 +157,52 @@ class CorrelationEngine {
   /// Called periodically to remove old state
   void cleanup_expired();
 
+  /// Declare a planned stop. From here every fault reported through
+  /// process_fault is muted unless a rule already mutes it, and stays muted
+  /// until the stop ends or the fault is cleared. Idempotent.
+  void begin_planned_stop();
+
+  /// Withdraw the planned stop and release the faults it alone was muting.
+  /// A fault a rule has since claimed keeps that rule's mute and is NOT
+  /// returned; nor is one that was cleared while the stop was on.
+  /// @return the fault codes this call unmuted, so the caller can announce the
+  ///         confirmations that were never published
+  std::vector<std::string> end_planned_stop();
+
+  /// Whether a planned stop is currently declared.
+  bool planned_stop_active() const;
+
+  /// End the planned stop's ownership of one fault cycle, and take its mute with
+  /// it. A rule's overlay is left alone. Called when a fault is acknowledged on a
+  /// path that does not run the correlation clear (a scoped per-entity DELETE),
+  /// so an acknowledged fault never stays counted as muted.
+  void release_planned_stop_ownership(const std::string & fault_code);
+
+  /// Record that the planned stop owns a fault cycle, without a report driving it.
+  /// This is how a restart rebuilds the mute from the flags the store kept: the
+  /// engine's own record lived in the process that is gone, and without it the
+  /// switch-off would neither release nor announce those faults.
+  void restore_planned_stop_ownership(const std::string & fault_code);
+
+  /// Every fault cycle the planned stop currently owns, including those a rule's
+  /// mute is overlaying.
+  std::vector<std::string> planned_stop_owned_codes() const;
+
  private:
+  /// The correlation half of process_fault: rules, clusters and their muting,
+  /// with no planned-stop involvement. Caller holds mutex_.
+  ProcessFaultResult correlate(const std::string & fault_code, const std::string & severity,
+                               std::chrono::steady_clock::time_point timestamp);
+
+  /// Put back the planned stop's mute for every fault it owns that has no entry
+  /// left - a rule's overlay ended (its root cause was acknowledged, its window
+  /// closed) and the fault is the stop's again. Ownership is the truth; this is
+  /// what keeps the mute map derived from it. Caller holds mutex_.
+  void reassert_planned_stop_mutes();
+
+  /// Write the planned stop's mute entry for one owned fault. Caller holds mutex_.
+  void mute_as_planned_stop(const std::string & fault_code);
+
   /// Check if fault matches a root cause pattern in any hierarchical rule
   /// @return Rule ID if matched, empty optional otherwise
   std::optional<std::string> try_as_root_cause(const std::string & fault_code);
@@ -186,6 +257,16 @@ class CorrelationEngine {
 
   /// Counter for cluster ID generation
   uint64_t cluster_counter_{0};
+
+  /// Whether an operator has declared a planned stop.
+  bool planned_stop_active_{false};
+
+  /// Fault cycles the planned stop OWNS: they started while it was declared. This
+  /// is the runtime mirror of the flag the fault store keeps, and it is the truth
+  /// the mute map is derived from - a rule's mute overlays an owned fault without
+  /// taking it, and when the overlay ends the fault is the stop's again. A code
+  /// leaves the set when the fault is acknowledged or the stop is withdrawn.
+  std::set<std::string> planned_stop_owned_;
 
   mutable std::mutex mutex_;
 };

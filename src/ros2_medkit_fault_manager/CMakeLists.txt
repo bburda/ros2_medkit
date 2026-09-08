@@ -208,6 +208,29 @@ if(BUILD_TESTING)
   medkit_add_launch_test(test_rosbag_entity_scope test/integration/test_rosbag_entity_scope.test.py TIMEOUT 120
     LABELS "integration")
 
+  # The planned-stop switch end to end: marking, counting, auditing, capture, and
+  # the release at switch-off. One case raises 200 faults inside a stop, so the
+  # budget is well above the 60s default.
+  medkit_add_launch_test(test_planned_stop test/integration/test_planned_stop.test.py TIMEOUT 240
+    LABELS "integration")
+
+  # Kills the manager and lets launch bring it back, so the declaration is read
+  # from the store by a process that never saw the request that made it.
+  medkit_add_launch_test(test_planned_stop_restart test/integration/test_planned_stop_restart.test.py
+    TIMEOUT 180 LABELS "integration")
+
+  # A switch-off killed between the declaration write and the flag clearing: the
+  # store is left as that crash leaves it and the replacement process has to
+  # finish the release. Its respawn delay is what the timeout is sized for.
+  medkit_add_launch_test(test_planned_stop_interrupted_release
+    test/integration/test_planned_stop_interrupted_release.test.py TIMEOUT 180 LABELS "integration")
+
+  # auto_confirm_after_sec confirms from a timer rather than a report, so the
+  # mute has to be honoured on that path too. Its own launch, because every other
+  # planned-stop case would then race a timer that confirms behind its back.
+  medkit_add_launch_test(test_planned_stop_auto_confirm
+    test/integration/test_planned_stop_auto_confirm.test.py TIMEOUT 120 LABELS "integration")
+
   # The only suite running above max_bags_per_fault=1: drives confirm / clear /
   # confirm on one code and asserts both recordings survive and stay separately
   # addressable. Six occurrences plus their post-roll windows, hence the timeout.

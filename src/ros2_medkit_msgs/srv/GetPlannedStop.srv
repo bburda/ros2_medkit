@@ -1,0 +1,44 @@
+# Copyright 2026 bburda
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# GetPlannedStop.srv - Read the FaultManager's planned-stop declaration.
+#
+# The request carries no fields: the switch is a single declaration per fault manager.
+# (rosidl gives an empty request one `structure_needs_at_least_one_member` byte, which
+# is why introspecting clients see a single phantom parameter here.)
+#
+# The response describes the declaration in force, or - once it has been withdrawn -
+# the last one there was, so "why was line 3 quiet on Friday?" is answerable after
+# the plant is back up without reading the audit database.
+
+---
+# Response fields
+
+# Whether a planned stop is currently declared.
+bool active
+
+# The reason given when the stop was declared, verbatim - nothing validates or
+# fills it in, so it is empty when the declaration left it empty, and when no stop
+# has ever been declared. Retained after the withdrawal.
+string reason
+
+# Who declared the stop, on the same terms as `reason`.
+string declared_by
+
+# When the stop was declared, wall clock. Zero while no stop has ever been declared.
+builtin_interfaces/Time since
+
+# When the stop was withdrawn, wall clock. Zero while one is in force, and while
+# no stop has ever been declared.
+builtin_interfaces/Time ended_at

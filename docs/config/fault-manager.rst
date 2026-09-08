@@ -608,11 +608,90 @@ Fault correlation identifies root causes and filters symptom faults.
      - Path to YAML file defining correlation rules.
    * - ``correlation.cleanup_interval_sec``
      - ``5.0``
-     - Interval for running correlation cleanup tasks.
+     - Interval for running correlation cleanup tasks. The correlation engine is
+       constructed on every fault manager, configured rules or not, because the
+       planned-stop switch needs none - so this timer runs everywhere. With no
+       rules loaded a tick takes the engine's mutex, walks two empty containers and
+       re-asserts an empty ownership set: measured at ~190 ns per call, so ~2.3 us
+       of CPU per minute at the 5 s default.
 
 .. seealso::
 
    :doc:`/tutorials/fault-correlation` for correlation rule syntax and examples.
+
+Planned Stop
+------------
+
+A planned stop is declared at runtime, not configured: an operator calls
+``~/set_planned_stop`` (or the matching SOVD operation on the ``fault_manager``
+entity) with a reason and a declarer, and calls it again with ``active: false``
+when the plant is back up. There is no parameter for it - a stop has a reason and
+an audit trail, and a parameter has neither.
+
+.. code-block:: bash
+
+   ros2 service call /fault_manager/set_planned_stop ros2_medkit_msgs/srv/SetPlannedStop \
+     "{active: true, reason: 'line 3 quarterly maintenance', declared_by: 'shift_lead'}"
+
+Two configuration choices decide how much the switch can do:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 15 50
+
+   * - Parameter
+     - Default
+     - Effect on the planned stop
+   * - ``storage_type``
+     - ``sqlite``
+     - The declaration, and the per-fault ownership flags behind it, are stored
+       beside the faults, so both survive a restart. With ``memory`` they live only
+       for the process, and a restart inside a stop ends it. A correlation rule's
+       mute is not persisted on either backend, so a rule-muted fault comes back
+       unmuted after a restart unless the stop owns it.
+   * - ``audit_log.enabled``
+     - ``false``
+     - **Off by default, so a stock manager records no audit row for the switch
+       at all.** When on, each transition is recorded as ``planned_stop_started``
+       / ``planned_stop_ended`` under the ``__audit__`` fault code, with that
+       transition's own reason and declarer. Recorded even under
+       ``audit_log.transitions: confirmed_only``.
+
+While the stop stands, it owns every fault cycle that *starts*: a new fault, one
+raised again after being cleared, or one that fails again after healing. An owned
+fault is reported, debounced, confirmed, captured and audited unchanged, and is
+marked as muted rather than dropped: absent from the default fault list, counted in
+``muted_count``, and listed under ``muted_faults`` with ``rule_id: planned_stop``
+when muted entries are requested. A fault that was already up when the stop was
+declared is left alone - its confirmation has already been announced, and reporters
+re-send FAILED for as long as the condition holds.
+
+Ownership is a flag on the fault row, so it survives a restart and is what the
+switch-off releases. The mute is derived from it: a correlation rule muting an owned
+fault overlays the stop rather than taking the fault from it, the withdrawal leaves
+a rule-held fault alone, and when the rule lets go - root cause acknowledged, window
+closed, cluster expired - the fault is muted by the stop again.
+
+A muted fault is published exactly as a rule-muted symptom is: ``EVENT_CONFIRMED``
+and ``EVENT_UPDATED`` are withheld whichever kind of report produced them, while
+``EVENT_CLEARED`` - the fault healing, or being acknowledged - is published as
+usual. Withdrawing the stop releases every fault it owns and publishes one
+confirmation event for each of those that is CONFIRMED.
+
+``~/get_planned_stop`` keeps serving the declaration after the withdrawal, with
+``ended_at`` stamped, so the reason stays readable once the plant is back up. A
+request the store cannot record answers ``success: false`` and changes nothing.
+
+Over HTTP the switch is an operation on the fault manager's App entity
+(``POST /apps/fault_manager/operations/set_planned_stop/executions``), which
+exists automatically in ``runtime_only`` discovery. Under ``hybrid`` or
+``manifest_only`` the fault manager must be declared in the manifest, or the
+entity is not there to address.
+
+.. seealso::
+
+   :doc:`/design/ros2_medkit_fault_manager/index` for how the switch composes
+   with correlation rules.
 
 Complete Example
 ----------------

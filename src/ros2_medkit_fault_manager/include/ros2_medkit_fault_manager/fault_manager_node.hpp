@@ -18,8 +18,10 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "ros2_medkit_fault_manager/capture_thread_pool.hpp"
@@ -32,12 +34,14 @@
 #include "ros2_medkit_msgs/msg/fault_event.hpp"
 #include "ros2_medkit_msgs/srv/clear_fault.hpp"
 #include "ros2_medkit_msgs/srv/get_fault.hpp"
+#include "ros2_medkit_msgs/srv/get_planned_stop.hpp"
 #include "ros2_medkit_msgs/srv/get_rosbag.hpp"
 #include "ros2_medkit_msgs/srv/get_snapshots.hpp"
 #include "ros2_medkit_msgs/srv/list_faults.hpp"
 #include "ros2_medkit_msgs/srv/list_faults_for_entity.hpp"
 #include "ros2_medkit_msgs/srv/list_rosbags.hpp"
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
+#include "ros2_medkit_msgs/srv/set_planned_stop.hpp"
 
 namespace ros2_medkit_fault_manager {
 
@@ -98,6 +102,12 @@ class FaultManagerNode : public rclcpp::Node {
     audit_transition(transition, fault, "test", 0);
   }
 
+  /// Test-only: register the planned stop's ownership of a fault in the engine,
+  /// the way startup does when it reads the flags back.
+  void restore_planned_stop_ownership_for_test(const std::string & fault_code) {
+    correlation_engine_->restore_planned_stop_ownership(fault_code);
+  }
+
   /// Get the storage type being used
   const std::string & get_storage_type() const {
     return storage_type_;
@@ -118,6 +128,17 @@ class FaultManagerNode : public rclcpp::Node {
   /// @param entity_id Entity ID to match (exact match or as suffix of FQN)
   /// @return true if entity_id matches any source
   static bool matches_entity(const std::vector<std::string> & reporting_sources, const std::string & entity_id);
+
+ protected:
+  /// Construct with a storage backend the caller supplies instead of the one the
+  /// parameters describe.
+  ///
+  /// The backend is handed over BEFORE the node builds anything that borrows it -
+  /// snapshot and rosbag capture hold a raw `FaultStorage *` - so this cannot leave
+  /// a dangling pointer the way swapping the store at runtime would. Protected
+  /// rather than public because the only callers are tests driving the failure
+  /// paths of a store that rejects a write, which a healthy disk never produces.
+  FaultManagerNode(const rclcpp::NodeOptions & options, std::unique_ptr<FaultStorage> storage);
 
  private:
   /// Create storage backend based on configuration
@@ -151,6 +172,14 @@ class FaultManagerNode : public rclcpp::Node {
   void handle_list_rosbags(const std::shared_ptr<ros2_medkit_msgs::srv::ListRosbags::Request> & request,
                            const std::shared_ptr<ros2_medkit_msgs::srv::ListRosbags::Response> & response);
 
+  /// Handle SetPlannedStop service request
+  void handle_set_planned_stop(const std::shared_ptr<ros2_medkit_msgs::srv::SetPlannedStop::Request> & request,
+                               const std::shared_ptr<ros2_medkit_msgs::srv::SetPlannedStop::Response> & response);
+
+  /// Handle GetPlannedStop service request
+  void handle_get_planned_stop(const std::shared_ptr<ros2_medkit_msgs::srv::GetPlannedStop::Request> & request,
+                               const std::shared_ptr<ros2_medkit_msgs::srv::GetPlannedStop::Response> & response);
+
   /// Handle ListFaultsForEntity service request
   void
   handle_list_faults_for_entity(const std::shared_ptr<ros2_medkit_msgs::srv::ListFaultsForEntity::Request> & request,
@@ -164,9 +193,30 @@ class FaultManagerNode : public rclcpp::Node {
   /// @param config SnapshotConfig to populate with loaded values
   void load_snapshot_config_from_yaml(const std::string & config_file, SnapshotConfig & config);
 
-  /// Initialize correlation engine from configuration file
-  /// @return CorrelationEngine instance if enabled and config is valid, nullptr otherwise
+  /// Finish a switch-off a previous process did not: announce the faults still
+  /// owned by a declaration that is already withdrawn, and drop exactly their
+  /// flags. Runs from the constructor, before this node has a service or a timer
+  /// that could declare a new stop underneath it.
+  void finish_interrupted_release();
+
+  /// Publish EVENT_CONFIRMED for each of these faults that is CONFIRMED, which is
+  /// what releasing a fault from the planned stop means to a consumer of the
+  /// stream.
+  /// @return how many confirmations were announced
+  size_t announce_released(const std::vector<std::string> & fault_codes);
+
+  /// Build the correlation engine.
+  ///
+  /// Never null. The engine also owns the planned-stop mute, which an operator can
+  /// declare on any fault manager, so it exists whether or not correlation rules are
+  /// configured; without a config file (or with one that fails to load) it simply
+  /// carries no rules and correlates nothing.
   std::unique_ptr<correlation::CorrelationEngine> create_correlation_engine();
+
+  /// Parse the correlation config file named by `correlation.config_file`.
+  /// @return the parsed config, or nullopt when correlation is not configured,
+  ///         explicitly disabled, or the file is missing or invalid
+  std::optional<correlation::CorrelationConfig> load_correlation_config();
 
   /// Publish a fault event to the events topic
   /// @param event_type One of FaultEvent::EVENT_CONFIRMED, EVENT_CLEARED, EVENT_UPDATED
@@ -203,6 +253,26 @@ class FaultManagerNode : public rclcpp::Node {
   void audit_transition(const char * transition, const ros2_medkit_msgs::msg::Fault & fault,
                         const std::string & source_id, int64_t occurred_at_ns);
 
+  /// Append one already-built record to the audit log, carrying the shared
+  /// failure handling (health signals, fail-closed rethrow). No-op when the log
+  /// is off. Bypasses the per-fault transition filter, so a caller that has
+  /// decided a record must be written gets it written.
+  void append_audit_event(const AuditEvent & event);
+
+  /// Record a planned-stop transition. Written whatever `audit_log.transitions`
+  /// says, for the same reason the logging markers are: the switch describes the
+  /// installation, and the evidence chain has to show when the plant was
+  /// declared stopped.
+  /// @param state The declaration as it stands after the transition (for its status)
+  /// @param reason Why THIS transition was made
+  /// @param declared_by Who made it
+  void audit_planned_stop(const char * transition, const PlannedStopState & state, const std::string & reason,
+                          const std::string & declared_by, int64_t occurred_at_ns);
+
+  /// Handed to create_storage() when a caller supplied a backend. Empty in every
+  /// normal construction, and moved from exactly once.
+  std::unique_ptr<FaultStorage> storage_override_;
+
   std::string storage_type_;
   std::string database_path_;
   int32_t confirmation_threshold_{-1};
@@ -237,6 +307,8 @@ class FaultManagerNode : public rclcpp::Node {
   rclcpp::Service<ros2_medkit_msgs::srv::GetRosbag>::SharedPtr get_rosbag_srv_;
   rclcpp::Service<ros2_medkit_msgs::srv::ListRosbags>::SharedPtr list_rosbags_srv_;
   rclcpp::Service<ros2_medkit_msgs::srv::ListFaultsForEntity>::SharedPtr list_faults_for_entity_srv_;
+  rclcpp::Service<ros2_medkit_msgs::srv::SetPlannedStop>::SharedPtr set_planned_stop_srv_;
+  rclcpp::Service<ros2_medkit_msgs::srv::GetPlannedStop>::SharedPtr get_planned_stop_srv_;
   rclcpp::TimerBase::SharedPtr auto_confirm_timer_;
 
   /// Timer for periodic cleanup of expired correlation data
@@ -253,8 +325,14 @@ class FaultManagerNode : public rclcpp::Node {
   /// shared_ptr to allow safe capture-by-value in the pool's capture jobs.
   std::shared_ptr<RosbagCapture> rosbag_capture_;
 
-  /// Correlation engine for fault correlation/muting (nullptr if disabled)
+  /// Correlation engine for fault correlation/muting. Always present: it also
+  /// holds the planned-stop mute, which needs no configuration.
   std::unique_ptr<correlation::CorrelationEngine> correlation_engine_;
+
+  /// The planned-stop declaration in force, mirrored from the store at startup and
+  /// written back on every transition. Only the service handlers touch it, and they
+  /// run on the node's single-threaded executor, so it needs no lock of its own.
+  PlannedStopState planned_stop_;
 
   /// Bounded pool that runs capture jobs off the service thread (issue #441).
   /// Declared after snapshot_capture_/rosbag_capture_ so it is destroyed first.

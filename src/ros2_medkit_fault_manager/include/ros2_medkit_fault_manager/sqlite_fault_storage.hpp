@@ -95,6 +95,13 @@ class SqliteFaultStorage : public FaultStorage {
   std::vector<ros2_medkit_msgs::msg::Fault> get_all_faults() const override;
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
+  void set_planned_stop(const PlannedStopState & state) override;
+  PlannedStopState get_planned_stop() const override;
+  void set_planned_stop_owned(const std::string & fault_code, bool owned) override;
+  std::vector<std::string> get_planned_stop_owned() const override;
+  size_t clear_planned_stop_owned() override;
+  size_t clear_planned_stop_owned(const std::vector<std::string> & fault_codes) override;
+
   /// Get the database path
   const std::string & db_path() const {
     return db_path_;

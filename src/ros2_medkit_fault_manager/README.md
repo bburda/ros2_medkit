@@ -43,6 +43,115 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 | `~/list_faults` | `ros2_medkit_msgs/srv/ListFaults` | Query faults with filtering |
 | `~/clear_fault` | `ros2_medkit_msgs/srv/ClearFault` | Clear/acknowledge a fault |
 | `~/get_snapshots` | `ros2_medkit_msgs/srv/GetSnapshots` | Get topic snapshots for a fault |
+| `~/set_planned_stop` | `ros2_medkit_msgs/srv/SetPlannedStop` | Declare or withdraw a planned stop |
+| `~/get_planned_stop` | `ros2_medkit_msgs/srv/GetPlannedStop` | Read the planned-stop declaration |
+
+## Planned Stop
+
+Maintenance produces faults that nobody wants paged: a robot on a bench raises
+`NODE_UNREACHABLE` for every peer it can no longer see, and the alarm reaches
+whoever is on call. The planned stop is the operator saying "this is us, not the
+plant".
+
+```bash
+ros2 service call /fault_manager/set_planned_stop ros2_medkit_msgs/srv/SetPlannedStop \
+  "{active: true, reason: 'line 3 quarterly maintenance', declared_by: 'shift_lead'}"
+
+ros2 service call /fault_manager/get_planned_stop ros2_medkit_msgs/srv/GetPlannedStop "{}"
+```
+
+**Marked, never dropped.** While the stop stands, it *owns* every fault cycle that
+starts. An owned fault goes through report, debounce, confirmation, snapshot and
+rosbag capture and the audit log exactly as it would otherwise. What changes is
+only how it is *shown*: it is registered as muted with `rule_id: planned_stop` and
+the pseudo root cause `PLANNED_STOP`, so it is absent from the default
+`~/list_faults` response, counted in `muted_count`, and listed under
+`muted_faults` when `include_muted` is set.
+
+**Ownership is the truth, and it is persisted.** The flag lives on the fault row in
+the store, not in the process, so a restart reads back exactly which cycles the
+stop owns - no timestamp comparison, which a clock step would break and which
+cannot tell a rule's mute from the stop's. The mute is derived from ownership: an
+owned fault is muted unless a rule's mute overlays it, and when that overlay ends
+the fault is muted by the stop again.
+
+**Only a cycle that starts inside the stop.** A fault that was already up when the
+stop was declared keeps its place in the fault list. Reporters are level-triggered
+- `FaultReporter::report()` is called for as long as the condition holds, not once
+per transition - so marking on any report would take a standing alarm off the list
+and then announce it a second time at the switch-off. A cycle starts on a new
+fault, on one raised again after being cleared, and on one that fails again after
+healing (the heal published the fault's end, so the next confirmation is fresh
+news). `occurrence_count` keeps its own, narrower definition and counts the first
+two only.
+
+**Published exactly like a rule-muted symptom.** `EVENT_CONFIRMED` and
+`EVENT_UPDATED` are withheld while the fault is muted, whichever kind of report
+produced them - a PASSED that leaves the fault CONFIRMED announces nothing either.
+`EVENT_CLEARED` is not withheld: a fault that heals past the healing threshold, or
+that is acknowledged, publishes it as any muted fault does. Consumers therefore see
+the end of a fault whose start they never heard - that is the existing muting
+contract, not something the switch changes.
+
+**Withdrawing releases the survivors.** Every fault the stop alone was muting and
+that is still active is unmuted, and each one that is CONFIRMED publishes a single
+`EVENT_CONFIRMED` - that confirmation happened behind the mute and was never
+announced, while the condition it reports still stands on the machine. A fault
+still short of confirmation announces nothing (there is nothing yet to announce),
+and one acknowledged during the stop announces nothing either.
+
+**Correlation rules and the stop compose.** A rule's mute is an *overlay* on an
+owned fault, not a transfer: while the rule holds it, the withdrawal leaves it
+alone, and when the rule lets go - its root cause acknowledged, its window closed,
+its cluster expired - the fault goes back to being muted by the stop. A fault whose
+cycle started before the stop is not owned at all, so the stop neither hides it nor
+releases it. This holds for cluster rules as well as hierarchical ones, even though
+the cluster path never writes a mute entry of its own.
+
+**Both transitions are audited** - when the audit log is on. `audit_log.enabled`
+is `false` by default, and with it off the switch writes no audit row at all. With
+it on, each transition appends `planned_stop_started` / `planned_stop_ended`
+carrying that transition's own reason in `description` and its declarer in
+`source_id`, under the `__audit__` fault code the log's own lifecycle markers use,
+because the transition is about the installation rather than one fault. They are
+recorded whatever `audit_log.transitions` says. A request asking for the state the
+switch is already in succeeds, changes nothing and records nothing, so a retried
+call cannot manufacture evidence of a stop that never started. A request the store
+cannot record answers `success: false` with the reason, and changes nothing.
+
+**The declaration outlives the stop.** `~/get_planned_stop` keeps serving the
+reason, the declarer and the start time after the withdrawal, with `ended_at`
+stamped, so "why was line 3 quiet on Friday?" is answerable once the plant is back
+up without reading the audit database.
+
+**The declaration survives a restart** when the SQLite backend is in use: it is a
+row in the fault store, so a stop declared on Friday still mutes on Monday. On
+startup the manager reads the ownership flags back, so the switch-off after a
+reboot releases exactly the cycles the stop owned and announces their
+confirmations. A *rule's* mute is not persisted anywhere, so a fault a correlation
+rule was muting before a restart comes back unmuted unless the stop owns it - a
+pre-existing property of correlation, not of the switch. The in-memory backend has
+no file behind it and starts every process with no declaration and no ownership.
+
+**A switch-off interrupted by a crash is finished at startup.** The withdrawal
+writes the declaration first, announces the confirmations it was holding back, and
+drops the ownership flags last. A process that dies in between leaves faults owned
+by a declaration that is already over; the next startup recognises exactly that,
+announces them once a consumer is listening, and clears the flags.
+
+**Over SOVD.** The gateway maps a node's services to operations on its App entity,
+so an operator reaches the switch without any new route:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/apps/fault_manager/operations/set_planned_stop/executions \
+  -H 'Content-Type: application/json' \
+  -d '{"parameters": {"active": true, "reason": "line 3 maintenance", "declared_by": "shift_lead"}}'
+```
+
+That works out of the box in `runtime_only` discovery, where every node is an
+App. In `hybrid` or `manifest_only` discovery the fault manager has to be
+declared in the manifest like any other entity, or there is no `fault_manager`
+entity to address.
 
 ## Features
 
@@ -55,7 +164,8 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 - **Snapshot capture**: Captures topic data when faults are confirmed for debugging (snapshots are deleted when fault is cleared)
 - **Near-miss series**: Appends one entry per FAILED report that moved the debounce counter without confirming, bounded per fault code and retained when the fault is cleared
 - **Freeze-frame retention**: One compact JSON freeze-frame per fault code, retained across `clear_fault` (see below)
-- **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear
+- **Planned stop**: An operator declares the plant deliberately down, and faults raised while it stands are marked rather than announced (see below)
+- **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear. The correlation *engine* is always constructed, because the planned stop needs no configuration; without a `correlation.config_file` it carries no rules, correlates nothing, and its cleanup timer (`correlation.cleanup_interval_sec`, default 5 s) walks two empty containers
 - **Tamper-evident audit log** (optional): Append-only, hash-chained record of fault state transitions for verifiable history
 
 ## Parameters

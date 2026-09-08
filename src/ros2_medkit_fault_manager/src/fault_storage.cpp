@@ -333,6 +333,9 @@ bool InMemoryFaultStorage::clear_fault(const std::string & fault_code) {
   }
 
   it->second.status = ros2_medkit_msgs::msg::Fault::STATUS_CLEARED;
+  // An acknowledged cycle is over, so the planned stop no longer owns it: it has
+  // nothing left to release or to announce for this fault.
+  it->second.planned_stop_owned = false;
   return true;
 }
 
@@ -856,6 +859,7 @@ std::vector<std::string> InMemoryFaultStorage::reclassify_healed_as_cleared() {
   for (auto & [code, state] : faults_) {
     if (state.status == ros2_medkit_msgs::msg::Fault::STATUS_HEALED) {
       state.status = ros2_medkit_msgs::msg::Fault::STATUS_CLEARED;
+      state.planned_stop_owned = false;  // CLEARED ends the cycle the stop owned
       reclassified.push_back(code);
     }
   }
@@ -873,6 +877,60 @@ std::vector<std::string> InMemoryFaultStorage::reclassify_healed_as_cleared() {
   }
 
   return reclassified;
+}
+
+void InMemoryFaultStorage::set_planned_stop_owned(const std::string & fault_code, bool owned) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = faults_.find(fault_code);
+  if (it != faults_.end()) {
+    it->second.planned_stop_owned = owned;
+  }
+}
+
+std::vector<std::string> InMemoryFaultStorage::get_planned_stop_owned() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::string> owned;
+  for (const auto & [code, state] : faults_) {
+    if (state.planned_stop_owned) {
+      owned.push_back(code);
+    }
+  }
+  return owned;
+}
+
+size_t InMemoryFaultStorage::clear_planned_stop_owned() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  size_t cleared = 0;
+  for (auto & [code, state] : faults_) {
+    if (state.planned_stop_owned) {
+      state.planned_stop_owned = false;
+      ++cleared;
+    }
+  }
+  return cleared;
+}
+
+size_t InMemoryFaultStorage::clear_planned_stop_owned(const std::vector<std::string> & fault_codes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  size_t cleared = 0;
+  for (const auto & fault_code : fault_codes) {
+    auto it = faults_.find(fault_code);
+    if (it != faults_.end() && it->second.planned_stop_owned) {
+      it->second.planned_stop_owned = false;
+      ++cleared;
+    }
+  }
+  return cleared;
+}
+
+void InMemoryFaultStorage::set_planned_stop(const PlannedStopState & state) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  planned_stop_ = state;
+}
+
+PlannedStopState InMemoryFaultStorage::get_planned_stop() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return planned_stop_;
 }
 
 }  // namespace ros2_medkit_fault_manager

@@ -186,6 +186,18 @@ Clears (acknowledges) a fault by setting its status to CLEARED.
 - **Idempotent**: Clearing an already-cleared fault succeeds
 - **Returns**: ``success=true`` if fault existed, ``success=false`` if not found
 
+~/set_planned_stop and ~/get_planned_stop
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Declares, withdraws and reads the planned stop.
+
+- **One declaration per manager**: the stop is a fact about the installation, not about a fault
+- **Idempotent**: a request for the state the switch is already in succeeds, changes nothing and writes no audit record; ``was_active`` tells the caller which of the two happened
+- **Store first**: the declaration is written before anything is muted, unmuted, announced or audited, and a store that refuses the write ends the request with ``success=false`` - a stop the manager could not record must not be one a restart comes back believing in
+- **Audited**: when ``audit_log.enabled`` is set (off by default), each real transition appends ``planned_stop_started`` / ``planned_stop_ended`` under the ``__audit__`` fault code, with that transition's own reason and declarer
+- **Persisted**: stored in the fault store, so the declaration outlives the process (SQLite backend), and ``~/get_planned_stop`` keeps serving it after the withdrawal with ``ended_at`` stamped
+- **Returns**: ``success``, a message, and the state the switch was in before the call
+
 Design Decisions
 ----------------
 
@@ -245,6 +257,103 @@ means heal on a single PASSED event); the node validates the
 merged per-entity config at startup, logs a warning, and falls back to safe defaults if not. When
 healing is disabled, any HEALED row left by a previous (healing-enabled) run is reclassified to
 CLEARED once at startup so it does not behave inconsistently under the latch.
+
+Planned Stop as a Second Mute Source
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Maintenance produces faults that are real, correctly detected, and not news. The
+planned stop marks them instead of dropping them: while it stands, a fault whose
+cycle *starts* is registered in the correlation engine as muted with
+``rule_id = "planned_stop"`` and the pseudo root cause ``PLANNED_STOP``, and
+everything else about it - debounce, confirmation, snapshot and rosbag capture,
+the audit records - happens exactly as it would otherwise. Dropping the report
+instead was rejected because a fault that outlived the stop would then never be
+raised again: reporters are level-triggered, so nothing re-announces a condition
+whose report was thrown away.
+
+**Only a cycle that starts inside the stop.** That same level-triggered shape is
+why the mark is gated on the cycle boundary rather than on the report.
+``ros2_medkit_diagnostic_bridge`` sends one FAILED per incoming
+``DiagnosticArray`` - typically 1 Hz for as long as the condition holds - and
+``FaultReporter::report()`` is documented to be called the same way. Marking on any
+report would take a fault that was confirmed and announced *before* the stop off
+the fault list within a second of the declaration, and announce it a second time at
+the switch-off. The boundary is ``report_fault_event``'s own ``is_new`` - a new fault, or one
+raised again after being cleared - plus a re-fail out of HEALED, because the manager
+publishes ``EVENT_CLEARED`` at the heal and the confirmation that follows is
+therefore fresh news. ``occurrence_count`` keeps its own, narrower definition.
+
+**Ownership is the fact; the mute is derived from it.** The stop owns a fault
+CYCLE, and that ownership is a flag on the fault row in the store - not a set in the
+process, and not a timestamp comparison. Everything else follows: an owned fault is
+muted unless a rule's mute overlays it, and the moment the overlay ends the engine
+re-asserts the stop's mute (``reassert_planned_stop_mutes``, called from
+``process_clear`` and from ``cleanup_expired``). A rule therefore borrows a fault
+rather than taking it, which is what makes the two features compose in both
+directions: the withdrawal leaves a rule-held fault muted, and a rule that lets go
+mid-stop hands the fault back instead of dropping it out of the stop for good.
+
+Deriving the mute also fixes what ``should_mute`` means. A repeat report of a fault
+whose rule has stopped matching produces no correlation result at all, so the report
+path used to treat it as unmuted and announce an update for a fault the list was
+hiding. ``process_fault`` now answers with the state of the mute map, not with what
+this particular report matched, and the PASSED path asks the same question rather
+than defaulting to "not muted".
+
+Ownership ends in exactly three places: the fault is acknowledged (both
+acknowledgement paths - the correlation clear and the scoped per-entity clear that
+skips it - and the store clears the flag with the CLEARED status), the fault is
+auto-cleared with its root cause, or the stop is withdrawn.
+
+**The mark survives a restart** because the flags do. Startup reads them back and
+re-registers the mute. Without that, a reboot inside a weekend stop would make the
+survivors silently visible and the switch-off would announce none of them: their
+confirmations, suppressed before the reboot, would be lost for good. A correlation
+rule's mute is not persisted anywhere, so a rule-muted fault comes back unmuted
+after a restart unless the stop owns its cycle - a pre-existing property of
+correlation rather than something the switch introduces.
+
+**A withdrawal is ordered so a crash cannot swallow an announcement.** The
+declaration is written first (so a store that refuses the write changes nothing, and
+a restart never re-arms a stop the operator withdrew), the confirmations are
+announced next, and the ownership flags are cleared last. A process that dies in
+between leaves faults owned by a declaration that is already over, which is a state
+the next startup recognises: it announces them and clears the flags of exactly
+those faults. Clearing first would have turned a crash into permanent silence.
+
+The recovery runs synchronously in the constructor, before the node has a service
+or a timer. Deferring it - waiting for a subscriber to match, say - opens a window
+in which an operator declares a NEW stop over the same services and new cycles
+become owned by it; the deferred work then announces a fault the new stop is
+holding and, if it clears ownership wholesale rather than the set it captured,
+drops that fault's flag too. Running early costs an announcement that may reach no
+subscriber, because nothing has matched a publisher that is milliseconds old and
+the events topic is volatile. That is the same accepted loss as every other
+publication made at startup, and the released faults are in the default fault list
+regardless.
+
+Withdrawing releases the rest and publishes ``EVENT_CONFIRMED`` once for each
+released fault that is CONFIRMED. That republication is the point of marking
+rather than dropping: the confirmation happened behind the mute, no consumer of
+the event stream ever heard it, and the condition still stands on the machine.
+What is withheld is exactly what a rule-muted symptom withholds - ``EVENT_CONFIRMED``
+and ``EVENT_UPDATED`` - while ``EVENT_CLEARED`` is published as usual, so a fault
+that heals or is acknowledged inside the stop still reports its end.
+
+The switch is a service rather than a parameter because it carries a reason and a
+declarer and produces an audit record, none of which a parameter can do; and it is
+not a new HTTP route because the gateway already exposes a node's services as SOVD
+operations on its App entity.
+
+One cost falls on every deployment, correlation or not: the engine is now always
+constructed, so the ``correlation.cleanup_interval_sec`` timer (5 s by default)
+runs on every fault manager. With no rules loaded a tick takes the engine's mutex,
+walks two empty containers - ``pending_root_causes_`` and ``pending_clusters_`` -
+and re-asserts an empty ownership set. Measured at ~190 ns per call (1e6 calls on a
+rules-free engine, three runs: 191.2, 194.7, 190.3 ns), which at the default
+interval is ~2.3 us of CPU per minute. Building the engine lazily when a stop is
+first declared would put a second construction path under the service handler to
+save that.
 
 Rosbag Black-Box Recording
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

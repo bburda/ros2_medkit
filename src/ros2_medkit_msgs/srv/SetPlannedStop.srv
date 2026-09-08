@@ -1,0 +1,67 @@
+# Copyright 2026 bburda
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SetPlannedStop.srv - Declare, or withdraw, a planned stop on the FaultManager.
+#
+# While a planned stop is on, it OWNS every fault cycle that STARTS - a new fault, one
+# raised again after being cleared, or one that failed again after healing. An owned
+# fault is reported, debounced, confirmed, captured and audited exactly as it would be
+# otherwise, and is MARKED as muted rather than dropped: absent from the default
+# ListFaults response, counted in `muted_count`, and listed under `muted_faults` when
+# `include_muted` is set. A cycle that started BEFORE the stop is untouched: it stays in
+# the fault list, because its confirmation has already been announced, and reporters
+# re-send FAILED for as long as the condition holds.
+#
+# A muted fault is published exactly as a rule-muted symptom is: its EVENT_CONFIRMED and
+# EVENT_UPDATED are withheld, whichever kind of report produced them, while an
+# EVENT_CLEARED - the fault healing, or being acknowledged - is published as usual.
+# Withdrawing the stop releases every fault it owns, and publishes one EVENT_CONFIRMED
+# for each that is CONFIRMED, because that confirmation was never announced.
+#
+# A correlation rule muting an owned fault OVERLAYS the stop rather than taking the
+# fault from it: while the rule holds the fault the withdrawal leaves it alone, and when
+# the rule lets go the fault is the stop's again.
+#
+# With `storage_type: sqlite` the declaration survives a restart of the fault manager,
+# and so does its ownership of the cycles that started inside it; the in-memory backend
+# keeps neither past the process.
+#
+# Both transitions are recorded in the fault audit log when `audit_log.enabled` is set
+# (it is off by default).
+
+# Request fields
+
+# True declares a planned stop, false withdraws it.
+bool active
+
+# Why the plant is stopped ("line 3 quarterly maintenance"). Recorded in the audit log
+# with the transition, and served back by GetPlannedStop - including after the stop has
+# been withdrawn, so the reason outlives it.
+string reason
+
+# Who declared the transition. Recorded in the audit log as the transition's source.
+string declared_by
+---
+# Response fields
+
+# True when the request was applied. A request that asks for the state the switch is
+# already in succeeds and changes nothing (no audit record is written for it).
+bool success
+
+# Status message or error description.
+string message
+
+# The state of the switch BEFORE this request, so a caller can tell "I turned it on"
+# from "it was already on".
+bool was_active

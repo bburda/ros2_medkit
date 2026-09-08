@@ -54,6 +54,12 @@ struct AuditEvent {
   int64_t occurred_at_ns{0};  ///< wall-clock timestamp of the transition
 };
 
+/// Fault code carried by records that describe the INSTALLATION rather than one
+/// fault - the log's own activation markers and the planned-stop transitions. One
+/// sentinel for all of them, so a reader filtering them out has a single value to
+/// filter on.
+constexpr const char * kAuditMarkerFaultCode = "__audit__";
+
 /// Canonical transition kinds. Stored verbatim, so they are part of the hash.
 constexpr const char * kTransitionOccurred = "occurred";
 constexpr const char * kTransitionConfirmed = "confirmed";
@@ -67,6 +73,14 @@ constexpr const char * kTransitionHealed = "healed";
 /// its own start and stop.
 constexpr const char * kTransitionLoggingActivated = "logging_activated";
 constexpr const char * kTransitionLoggingDeactivated = "logging_deactivated";
+/// Planned-stop lifecycle: an operator declared, or withdrew, a deliberate stop
+/// of the plant. Like the logging markers these describe the installation rather
+/// than one fault, so they carry kAuditMarkerFaultCode and are appended
+/// independently of the per-fault transition filter. The reason travels in
+/// `description` and the declarer in `source_id` - that transition's own reason
+/// and declarer, so a withdrawal records who ended the stop, not who began it.
+constexpr const char * kTransitionPlannedStopStarted = "planned_stop_started";
+constexpr const char * kTransitionPlannedStopEnded = "planned_stop_ended";
 // NOTE: there is deliberately no "ack" kind. The open fault_manager has no
 // acknowledge action separate from clearing: ~/clear_fault IS the acknowledge,
 // and it is recorded as kTransitionCleared (clear == ack). A separate "ack" kind

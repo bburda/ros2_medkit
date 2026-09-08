@@ -98,6 +98,12 @@ struct FaultState {
   std::string status;
   std::set<std::string> reporting_sources;
 
+  /// Whether the planned stop owns this fault cycle: it started while a stop was
+  /// declared. Persisted, because the declaration outlives the process and the
+  /// switch-off has to know which faults it is releasing. Cleared when the fault
+  /// is acknowledged and when the stop is withdrawn.
+  bool planned_stop_owned{false};
+
   // Debounce state (internal, not exposed in Fault.msg)
   int32_t debounce_counter{0};      ///< FAILED decrements (-1), PASSED increments (+1)
   rclcpp::Time last_failed_time{};  ///< Timestamp of last FAILED event
@@ -193,6 +199,21 @@ struct RosbagFileInfo {
   double duration_sec{0.0};  ///< Total duration of recorded data
   size_t size_bytes{0};      ///< File size in bytes
   int64_t created_at_ns{0};  ///< Timestamp when bag was created
+};
+
+/// The operator's planned-stop declaration, as the store holds it.
+///
+/// One declaration per fault manager, not one per fault: it says the plant is
+/// deliberately down, which is a fact about the installation. It is persisted so
+/// a stop declared on Friday is still in force after a Saturday reboot.
+struct PlannedStopState {
+  bool active{false};
+  std::string reason;       ///< Why the plant is stopped; retained after the withdrawal
+  std::string declared_by;  ///< Who declared it; retained after the withdrawal
+  int64_t since_ns{0};      ///< Wall-clock time of the declaration; 0 when none was ever made
+  /// Wall-clock time the declaration was withdrawn; 0 while one is in force. The
+  /// row outlives the stop so the reason stays readable after the plant is back up.
+  int64_t ended_at_ns{0};
 };
 
 /// Abstract interface for fault storage backends
@@ -454,6 +475,40 @@ class FaultStorage {
     return {};
   }
 
+  /// Replace the planned-stop declaration. Writing a default-constructed state
+  /// withdraws it. A backend keeps exactly one declaration, so this overwrites
+  /// rather than appends.
+  virtual void set_planned_stop(const PlannedStopState & state) = 0;
+
+  /// The planned-stop declaration this store holds. A store that has never been
+  /// given one answers with a default-constructed (inactive) state.
+  virtual PlannedStopState get_planned_stop() const = 0;
+
+  /// Record, or withdraw, the planned stop's ownership of one fault cycle.
+  /// A code with no stored fault is ignored.
+  virtual void set_planned_stop_owned(const std::string & fault_code, bool owned) = 0;
+
+  /// Every fault the planned stop currently owns. This is what a restart reads to
+  /// rebuild the mute, and what a switch-off releases - not a time comparison
+  /// against the declaration, which cannot survive a clock step and cannot tell a
+  /// rule's mute from the stop's.
+  virtual std::vector<std::string> get_planned_stop_owned() const = 0;
+
+  /// Drop every ownership flag. Called once the switch-off has announced what it
+  /// released, so a crash before this point leaves the flags for the next startup
+  /// to finish. Safe as an all-or-nothing sweep there: the withdrawal ends the
+  /// declaration that owns every flagged fault, and it runs to completion before
+  /// any other request is served.
+  /// @return how many faults were released
+  virtual size_t clear_planned_stop_owned() = 0;
+
+  /// Drop the ownership flags of exactly these faults, leaving every other one
+  /// alone. What a release captured is what it may clear: a fault flagged after
+  /// the capture belongs to a later declaration, and wiping it would take a fault
+  /// out of a stop that is still in force.
+  /// @return how many of them were owned
+  virtual size_t clear_planned_stop_owned(const std::vector<std::string> & fault_codes) = 0;
+
  protected:
   FaultStorage() = default;
   FaultStorage(const FaultStorage &) = default;
@@ -520,6 +575,13 @@ class InMemoryFaultStorage : public FaultStorage {
   std::vector<ros2_medkit_msgs::msg::Fault> get_all_faults() const override;
   std::vector<std::string> reclassify_healed_as_cleared() override;
 
+  void set_planned_stop(const PlannedStopState & state) override;
+  PlannedStopState get_planned_stop() const override;
+  void set_planned_stop_owned(const std::string & fault_code, bool owned) override;
+  std::vector<std::string> get_planned_stop_owned() const override;
+  size_t clear_planned_stop_owned() override;
+  size_t clear_planned_stop_owned(const std::vector<std::string> & fault_codes) override;
+
  private:
   /// Update fault status based on debounce counter and given config
   void update_status(FaultState & state, const DebounceConfig & config);
@@ -564,6 +626,10 @@ class InMemoryFaultStorage : public FaultStorage {
   size_t max_snapshots_per_fault_{0};  ///< 0 = unlimited
   bool retain_snapshots_on_clear_{false};
   size_t max_near_misses_per_fault_{0};  ///< 0 = unlimited
+  /// Held for the life of the process only. This backend has no file behind it,
+  /// so a restart starts with no declaration - which is why a deployment that
+  /// needs the stop to outlive a reboot runs on the SQLite backend.
+  PlannedStopState planned_stop_;
 };
 
 }  // namespace ros2_medkit_fault_manager
