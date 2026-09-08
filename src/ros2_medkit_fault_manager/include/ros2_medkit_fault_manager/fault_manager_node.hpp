@@ -102,6 +102,12 @@ class FaultManagerNode : public rclcpp::Node {
     audit_transition(transition, fault, "test", 0);
   }
 
+  /// Test-only: register the planned stop's ownership of a fault in the engine,
+  /// the way startup does when it reads the flags back.
+  void restore_planned_stop_ownership_for_test(const std::string & fault_code) {
+    correlation_engine_->restore_planned_stop_ownership(fault_code);
+  }
+
   /// Get the storage type being used
   const std::string & get_storage_type() const {
     return storage_type_;

@@ -3002,6 +3002,24 @@ class PlannedStopFailingStorage : public ros2_medkit_fault_manager::InMemoryFaul
   }
 };
 
+/// Records the order of the calls a switch-off makes, so the ordering that decides
+/// what a crash mid-release costs is testable without killing a process inside a
+/// sub-millisecond window.
+class ReleaseOrderRecordingStorage : public ros2_medkit_fault_manager::InMemoryFaultStorage {
+ public:
+  std::optional<ros2_medkit_msgs::msg::Fault> get_fault(const std::string & fault_code) const override {
+    calls.push_back("get_fault:" + fault_code);
+    return InMemoryFaultStorage::get_fault(fault_code);
+  }
+
+  size_t clear_planned_stop_owned() override {
+    calls.push_back("clear_owned");
+    return InMemoryFaultStorage::clear_planned_stop_owned();
+  }
+
+  mutable std::vector<std::string> calls;
+};
+
 /// Reaches the node's protected storage-injecting constructor. The backend is in
 /// place before anything borrows it, so nothing is left dangling.
 class NodeWithInjectedStorage : public FaultManagerNode {
@@ -3094,6 +3112,46 @@ class PlannedStopServiceTest : public ::testing::Test {
   rclcpp::Client<ros2_medkit_msgs::srv::SetPlannedStop>::SharedPtr set_client_;
   rclcpp::Client<ros2_medkit_msgs::srv::GetPlannedStop>::SharedPtr get_client_;
 };
+
+/// The same fixture, with a store that records the order of the release.
+class PlannedStopReleaseOrderTest : public PlannedStopServiceTest {
+ protected:
+  std::unique_ptr<ros2_medkit_fault_manager::FaultStorage> make_storage() override {
+    auto storage = std::make_unique<ReleaseOrderRecordingStorage>();
+    recorder_ = storage.get();
+    return storage;
+  }
+
+  ReleaseOrderRecordingStorage * recorder_{nullptr};
+};
+
+// The ownership flags are what a startup uses to finish a release its predecessor
+// did not. They must therefore outlive the announcement: cleared first, a crash
+// mid-loop would leave nothing for the next process to find, and the confirmations
+// suppressed during the stop would be lost for good.
+TEST_F(PlannedStopReleaseOrderTest, TheOwnershipFlagsAreClearedAfterTheAnnouncement) {
+  ASSERT_NE(recorder_, nullptr);
+  ASSERT_TRUE(set_stop(true, "line 3 maintenance", "shift_lead").success);
+
+  // A confirmed fault the stop owns, put in place directly: this test is about the
+  // order of the switch-off's own calls.
+  auto & storage = fault_manager_->get_storage_for_test();
+  storage.report_fault_event("ORDER_OWNED", ReportFault::Request::EVENT_FAILED, Fault::SEVERITY_ERROR, "order test",
+                             "/src", fault_manager_->now(), storage.get_debounce_config());
+  storage.set_planned_stop_owned("ORDER_OWNED", true);
+  fault_manager_->restore_planned_stop_ownership_for_test("ORDER_OWNED");
+
+  recorder_->calls.clear();
+  ASSERT_TRUE(set_stop(false, "plant back up", "shift_lead").success);
+
+  const auto & calls = recorder_->calls;
+  const auto read = std::find(calls.begin(), calls.end(), "get_fault:ORDER_OWNED");
+  const auto cleared = std::find(calls.begin(), calls.end(), "clear_owned");
+  ASSERT_NE(read, calls.end()) << "the switch-off never looked the released fault up";
+  ASSERT_NE(cleared, calls.end()) << "the switch-off never released the ownership flags";
+  EXPECT_LT(read - calls.begin(), cleared - calls.begin())
+      << "the flags were cleared before the announcement, so a crash in between would lose it";
+}
 
 /// The same fixture, with a store that refuses to record the declaration.
 class PlannedStopFailingStoreTest : public PlannedStopServiceTest {
