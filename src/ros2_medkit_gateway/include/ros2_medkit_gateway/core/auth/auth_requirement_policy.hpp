@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <tl/expected.hpp>
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -69,13 +71,17 @@ class NoAuthRequirementPolicy : public IAuthRequirementPolicy {
 /**
  * @brief Policy that always requires authentication
  *
- * Except for public endpoints (auth endpoints, health check)
+ * The only exception is anything under `/api/v1/auth/`. Authentication cannot
+ * bootstrap through a door that demands the credential it exists to hand out.
+ *
+ * Nothing else is public here, health probes included. An operator who needs
+ * a route answered without a credential names it in `auth.public_routes`,
+ * which layers over this policy - see PublicRouteExemptionPolicy.
  */
 class AllAuthRequirementPolicy : public IAuthRequirementPolicy {
  public:
   bool requires_authentication(const std::string & method, const std::string & path) const override {
     (void)method;
-    // Auth endpoints are always public (to allow login)
     return path.find("/api/v1/auth/") != 0;
   }
 
@@ -155,6 +161,62 @@ class ConfigurableAuthRequirementPolicy : public IAuthRequirementPolicy {
   bool use_requirements_map_;
 };
 
+/// One entry of `auth.public_routes`: a method and a path this gateway answers
+/// with no credential at all.
+struct PublicRoute {
+  std::string method;  ///< Upper-case HTTP method, e.g. "GET"
+  std::string path;    ///< Full request path, e.g. "/api/v1/health"
+
+  bool operator==(const PublicRoute & other) const {
+    return method == other.method && path == other.path;
+  }
+};
+
+/// Parses one `auth.public_routes` entry, written "METHOD /path".
+///
+/// Matching is exact and there are no wildcards, so an operator cannot open a
+/// subtree by accident: every route that stops requiring a credential is a
+/// line somebody wrote and a reviewer can read. `GET /api/v1/health` opens the
+/// health probe and nothing else, where `GET /api/v1/*` would have opened the
+/// whole read surface with one character.
+///
+/// @return the parsed route, or a message naming what is wrong with the entry.
+tl::expected<PublicRoute, std::string> parse_public_route(const std::string & entry);
+
+/// Parses a whole `auth.public_routes` list, dropping entries that do not
+/// parse. Dropping keeps the route protected, which is the safe reading of a
+/// malformed entry; GatewayNode validates the list first and refuses to start
+/// rather than let a typo silently protect a route the operator wanted open.
+std::vector<PublicRoute> parse_public_routes(const std::vector<std::string> & entries);
+
+/**
+ * @brief Layers an operator's `auth.public_routes` over another policy
+ *
+ * `require_auth_for` stays the primary axis; this only ever *removes* the
+ * credential requirement, never adds one, so wrapping cannot make a gateway
+ * stricter than the policy underneath and cannot be used to shadow it.
+ *
+ * The gateway ships with an empty list, which makes this a no-op: closed by
+ * default, and open exactly where somebody said so.
+ */
+class PublicRouteExemptionPolicy : public IAuthRequirementPolicy {
+ public:
+  PublicRouteExemptionPolicy(std::unique_ptr<IAuthRequirementPolicy> inner, std::vector<PublicRoute> public_routes);
+
+  bool requires_authentication(const std::string & method, const std::string & path) const override;
+
+  std::string description() const override;
+
+  /// The routes this layer exempts, in the order they were configured.
+  const std::vector<PublicRoute> & public_routes() const {
+    return public_routes_;
+  }
+
+ private:
+  std::unique_ptr<IAuthRequirementPolicy> inner_;
+  std::vector<PublicRoute> public_routes_;
+};
+
 /**
  * @brief Factory to create auth requirement policies from configuration
  */
@@ -173,6 +235,15 @@ class AuthRequirementPolicyFactory {
    * @return Policy implementation based on config.enabled and config.auth_requirements
    */
   static std::unique_ptr<IAuthRequirementPolicy> create(const AuthConfig & config);
+
+  /**
+   * @brief Create policy for a requirement level, exempting configured routes
+   * @param requirement The auth requirement level
+   * @param public_routes Entries of `auth.public_routes`, already parsed
+   * @return The requirement policy, wrapped only when the list is non-empty
+   */
+  static std::unique_ptr<IAuthRequirementPolicy> create(AuthRequirement requirement,
+                                                        const std::vector<PublicRoute> & public_routes);
 };
 
 }  // namespace ros2_medkit_gateway

@@ -82,7 +82,7 @@ Quick Example
 
    .. code-block:: bash
 
-      curl http://localhost:8080/api/v1/components/main-computer/scripts/script_1717123456_0/executions/exec_1717123500_0
+      curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components/main-computer/scripts/script_1717123456_0/executions/exec_1717123500_0
 
    Response when finished:
 

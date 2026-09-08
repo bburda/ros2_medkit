@@ -211,7 +211,7 @@ The Discovery Path
 
    .. code-block:: bash
 
-      curl http://localhost:8080/api/v1/functions | jq
+      curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/functions | jq
 
 2. **Read the Function's detail** and follow its capability href. A Function
    detail response carries an ``"x-medkit-graph"`` link exactly while this
@@ -220,7 +220,7 @@ The Discovery Path
 
    .. code-block:: bash
 
-      curl http://localhost:8080/api/v1/functions/engine-monitoring | jq '."x-medkit-graph"'
+      curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/functions/engine-monitoring | jq '."x-medkit-graph"'
       # "/api/v1/functions/engine-monitoring/x-medkit-graph"
 
 3. **GET the graph** at that href.
@@ -235,7 +235,7 @@ Function ``engine-monitoring`` hosting an ``engine-temp-sensor`` App (publishes
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/functions/engine-monitoring/x-medkit-graph | jq
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/functions/engine-monitoring/x-medkit-graph | jq
 
 .. code-block:: json
 

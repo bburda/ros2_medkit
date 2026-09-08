@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "ros2_medkit_gateway/core/aggregation/network_utils.hpp"
+#include "ros2_medkit_gateway/core/auth/auth_requirement_policy.hpp"
 #include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
 #include "ros2_medkit_gateway/core/discovery/refresh_debounce.hpp"
 #include "ros2_medkit_gateway/core/entity_validation.hpp"
@@ -173,6 +174,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   declare_parameter("auth.require_auth_for", "write");
   declare_parameter("auth.issuer", "ros2_medkit_gateway");
   declare_parameter("auth.clients", std::vector<std::string>{});
+  declare_parameter("auth.public_routes", std::vector<std::string>{});
 
   // OpenAPI documentation endpoints
   declare_parameter("docs.enabled", true);
@@ -435,7 +437,6 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
                         .with_key_file(get_parameter("server.tls.key_file").as_string())
                         .with_ca_file(get_parameter("server.tls.ca_file").as_string())
                         .with_min_version(get_parameter("server.tls.min_version").as_string())
-                        // TODO(future): Add .with_mutual_tls() when implemented
                         .build();
       // Note: HttpServerManager will log TLS configuration details
     } catch (const std::exception & e) {
@@ -496,10 +497,30 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
         }
       }
 
+      // Routes the operator has taken outside authentication. Validated here
+      // rather than where the policy is built, because a typo must stop the
+      // gateway while somebody is watching: silently dropping the entry would
+      // leave a route protected that the operator believes is reachable, and
+      // silently widening it would be worse.
+      auto public_routes = get_parameter("auth.public_routes").as_string_array();
+      for (const auto & entry : public_routes) {
+        auto parsed = parse_public_route(entry);
+        if (!parsed) {
+          throw std::invalid_argument("auth.public_routes entry \"" + entry + "\" is invalid: " + parsed.error());
+        }
+      }
+      auth_builder.with_public_routes(public_routes);
+
       auth_config_ = auth_builder.build();
       RCLCPP_INFO(get_logger(), "Authentication enabled - algorithm: %s, require_auth_for: %s",
                   algorithm_to_string(auth_config_.jwt_algorithm).c_str(),
                   get_parameter("auth.require_auth_for").as_string().c_str());
+      for (const auto & entry : public_routes) {
+        // One line per route, at WARN: every entry here is a hole somebody
+        // opened on purpose, and an operator reading the startup log should see
+        // the whole public surface without going to look for the config file.
+        RCLCPP_WARN(get_logger(), "auth.public_routes: %s is answered WITHOUT a credential", entry.c_str());
+      }
     } catch (const std::exception & e) {
       // Fail closed: authentication was explicitly requested but could not be
       // built (e.g. empty jwt_secret). Refuse to start rather than silently

@@ -58,11 +58,18 @@ Test the gateway:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/health
-   # {"status":"healthy","timestamp":...}
+   curl -i http://localhost:8080/api/v1/health
+   # HTTP/1.1 401 Unauthorized
+   # The image ships closed: every route needs a credential, health included.
+   # A 401 here is the gateway working - it received the request, routed it and
+   # refused it.
 
-   curl http://localhost:8080/api/v1/version-info
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/version-info
    # {"items":[{"version":"<gateway-version>","vendor_info":{"name":"ros2_medkit",...}}]}
+
+The container prints a generated ``client_id`` and ``client_secret`` on its
+first line of output; exchange them for ``$TOKEN`` at ``/api/v1/auth/authorize``.
+See :doc:`authentication`.
 
 Custom Configuration
 --------------------
@@ -156,7 +163,15 @@ Example ``docker-compose.yml`` with the gateway and web UI:
        environment:
          - ROS_DOMAIN_ID=42
        healthcheck:
-         test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+         # Any HTTP answer proves the process is up, 401 included. `curl -f`
+         # would exit non-zero on the refusal an authenticated gateway gives
+         # an uncredentialed probe, and report a healthy container as sick.
+         test:
+           - CMD-SHELL
+           - >-
+             code=$$(curl -s -o /dev/null -w '%{http_code}'
+             http://localhost:8080/api/v1/health) && case "$$code" in
+             200|401|403) exit 0 ;; *) exit 1 ;; esac
          interval: 10s
          timeout: 5s
          retries: 3
@@ -230,16 +245,36 @@ writes. Add your own UI origin(s):
 Health Checks
 -------------
 
-The gateway exposes a health endpoint at ``/api/v1/health``:
+The gateway exposes a health endpoint at ``/api/v1/health``. It needs a
+credential like every other route, so a probe should read the status code
+rather than insist on success:
 
 .. code-block:: yaml
 
    healthcheck:
-     test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+     # 401 means the gateway is up and refused an uncredentialed probe, which
+     # is exactly what a liveness check wants to know.
+     test:
+       - CMD-SHELL
+       - >-
+         code=$$(curl -s -o /dev/null -w '%{http_code}'
+         http://localhost:8080/api/v1/health) && case "$$code" in
+         200|401|403) exit 0 ;; *) exit 1 ;; esac
      interval: 10s
      timeout: 5s
      retries: 3
      start_period: 15s
+
+If a probe cannot be changed - a load balancer that only accepts 200, say -
+open the route explicitly instead:
+
+.. code-block:: yaml
+
+   auth:
+     public_routes: ["GET /api/v1/health"]
+
+An anonymous caller then gets liveness only, marked ``x-medkit-reduced``. See
+:doc:`/config/server` for what that setting does and does not open.
 
 Production Considerations
 -------------------------

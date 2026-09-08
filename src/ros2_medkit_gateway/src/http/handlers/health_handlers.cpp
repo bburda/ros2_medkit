@@ -17,6 +17,7 @@
 #include <chrono>
 
 #include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
+#include "ros2_medkit_gateway/core/auth/auth_middleware.hpp"
 #include "ros2_medkit_gateway/core/auth/auth_models.hpp"
 #include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
 #include "ros2_medkit_gateway/core/discovery/discovery_enums.hpp"
@@ -50,12 +51,54 @@ ErrorInfo make_internal_error(const char * where, const std::exception & e) {
 
 }  // namespace
 
+namespace {
+
+/// True when authentication is on and this request did not present a token
+/// this gateway accepts.
+///
+/// Reachable two ways: under `require_auth_for: write`, where every GET is
+/// open, and on a route an operator listed in `auth.public_routes`. In both an
+/// anonymous caller reaches this handler, and the full body is more than the
+/// probe asked for: the linking warnings name entities and ROS node FQNs, and
+/// the entity cache reports how many apps, areas and components this gateway
+/// sees. So an anonymous caller gets liveness and nothing else, flagged as cut
+/// down, and an authenticated one gets the whole document.
+bool is_anonymous(const HandlerContext & ctx, const http::TypedRequest & req) {
+  if (!ctx.auth_config().enabled) {
+    return false;  // Nothing is anonymous when nothing is authenticated.
+  }
+  auto * manager = ctx.auth_manager();
+  if (manager == nullptr) {
+    return true;  // Fail closed: cannot verify, so do not disclose.
+  }
+  auto header = req.header("Authorization");
+  if (!header) {
+    return true;
+  }
+  auto token = AuthMiddleware::extract_bearer_token(*header);
+  if (!token) {
+    return true;
+  }
+  return !manager->validate_token(*token).valid;
+}
+
+}  // namespace
+
 http::Result<dto::Health> HealthHandlers::get_health(const http::TypedRequest & req) {
-  (void)req;  // Unused parameter
   try {
     dto::Health response;
     response.status = "healthy";
     response.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+
+    // Liveness and nothing else for an anonymous caller. Returned before any
+    // of the sections below are built, so a section added later is private by
+    // default rather than public until someone remembers to think about it.
+    // The flag is what keeps the empty `warnings` below from reading as
+    // "nothing is wrong here" to a monitor that never presented a credential.
+    if (is_anonymous(ctx_, req)) {
+      response.x_medkit_reduced = true;
+      return response;
+    }
 
     // Operator-actionable warnings the gateway flags without taking itself
     // offline. Collected across every subsystem that can produce one, so the

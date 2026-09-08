@@ -1485,32 +1485,32 @@ Cross-Origin Resource Sharing (CORS) settings for browser-based clients. CORS is
 
 #### Authentication Configuration
 
-JWT-based authentication with Role-Based Access Control (RBAC). Authentication is **disabled by default** for backward compatibility.
+JWT-based authentication with Role-Based Access Control (RBAC). Authentication is **enabled by default** for backward compatibility.
 
 | Parameter                           | Type     | Default               | Description                                                                 |
 | ----------------------------------- | -------- | --------------------- | --------------------------------------------------------------------------- |
-| `auth.enabled`                      | bool     | `false`               | Enable/disable authentication. Set to `true` to require auth.              |
+| `auth.enabled`                      | bool     | `true`                | Enable/disable authentication. Set to `true` to require auth.              |
 | `auth.jwt_secret`                   | string   | (required if enabled) | Secret key for HS256 signing. Must be at least 32 characters.              |
 | `auth.jwt_algorithm`                | string   | `HS256`               | JWT signing algorithm: `HS256` (symmetric) or `RS256` (asymmetric).        |
 | `auth.token_expiry_seconds`         | int      | `3600`                | Access token lifetime in seconds (range: 60-86400).                        |
 | `auth.refresh_token_expiry_seconds` | int      | `86400`               | Refresh token lifetime in seconds (range: 300-604800).                     |
-| `auth.require_auth_for`             | string   | `write`               | Auth requirement: `none`, `write` (POST/PUT/DELETE only), or `all`.        |
+| `auth.require_auth_for`             | string   | `all`                 | Auth requirement: `none`, `write` (POST/PUT/DELETE only), or `all`.        |
 | `auth.issuer`                       | string   | `ros2_medkit_gateway` | JWT issuer claim for token validation.                                     |
 | `auth.clients`                      | string[] | `[]`                  | Client credentials in format `client_id:client_secret:role`.               |
 
 #### TLS/HTTPS Configuration
 
-TLS (Transport Layer Security) enables encrypted HTTPS communication. TLS is **disabled by default** for backward compatibility.
+TLS (Transport Layer Security) enables encrypted HTTPS communication. TLS is **enabled by default**; the gateway refuses to start without a certificate.
 
 | Parameter                    | Type   | Default | Description                                                                 |
 | ---------------------------- | ------ | ------- | --------------------------------------------------------------------------- |
-| `server.tls.enabled`         | bool   | `false` | Enable/disable TLS. When enabled, server uses HTTPS instead of HTTP.       |
+| `server.tls.enabled`         | bool   | `true`  | Enable/disable TLS. When enabled, server uses HTTPS instead of HTTP.       |
 | `server.tls.cert_file`       | string | (required if enabled) | Path to PEM-encoded certificate file.                         |
 | `server.tls.key_file`        | string | (required if enabled) | Path to PEM-encoded private key file.                         |
-| `server.tls.ca_file`         | string | `""`    | Optional CA certificate (reserved for future mutual TLS support).          |
+| `server.tls.ca_file`         | string | `""`    | CA that signs CLIENT certificates. Setting it enables mutual TLS and REQUIRES a client certificate from every caller. |
 | `server.tls.min_version`     | string | `"1.2"` | Minimum TLS version: `"1.2"` (compatible) or `"1.3"` (more secure).        |
 
-> **Note:** Mutual TLS (client certificate verification) is planned for a future release.
+> **Note:** Mutual TLS is available: set `server.tls.ca_file`.
 
 **Roles and Permissions:**
 
@@ -1581,7 +1581,7 @@ auth:
   jwt_algorithm: "HS256"
   token_expiry_seconds: 3600
   refresh_token_expiry_seconds: 86400
-  require_auth_for: "write"   # GET requests work without auth
+  require_auth_for: "all"     # every request needs a token, GET included
   issuer: "ros2_medkit_gateway"
   clients:
     - "admin:admin_secret:admin"

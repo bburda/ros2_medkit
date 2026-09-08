@@ -27,6 +27,27 @@ from launch_ros.actions import Node
 CORS_DEFAULT = 'http://localhost:3000,http://localhost:5173'
 
 
+def parse_security_flag(name, raw):
+    """
+    Return True/False for a security launch argument, or raise on anything else.
+
+    An allowlist for true with everything else meaning false is the wrong shape
+    here: ``tls_enabled:=on`` and ``tls_enabled:=ture`` would both mean "serve
+    plain HTTP", and the override is still written, so the typo beats a config
+    file that had TLS on. For a flag whose two values are "encrypted" and "not",
+    an unrecognised spelling has to stop the launch rather than pick one.
+    """
+    value = raw.strip().lower()
+    if value in ('true', '1', 'yes', 'on'):
+        return True
+    if value in ('false', '0', 'no', 'off'):
+        return False
+    raise RuntimeError(
+        f'{name}:={raw!r} is not a boolean. Use true or false. '
+        f'Leaving {name} unset lets the config file decide.'
+    )
+
+
 def cors_override(cors_arg, config_file, default_config):
     """
     Return the ``cors.allowed_origins`` entry for the final overrides, or {}.
@@ -94,6 +115,53 @@ def generate_launch_description():
             'controls the periodic forced refresh. Must match the default '
             'in config/gateway_params.yaml.'))
 
+    declare_jwt_secret_arg = DeclareLaunchArgument(
+        'jwt_secret', default_value='',
+        description=(
+            'HS256 signing secret, at least 32 characters. REQUIRED: the '
+            'shipped config has auth.enabled true, and the gateway refuses to '
+            'start without a secret. Pass one here, or point config_file at a '
+            'file that sets auth.jwt_secret and auth.clients. To run without '
+            'authentication - only ever on a host nothing else can reach - '
+            'pass auth_enabled:=false explicitly.'))
+
+    declare_auth_enabled_arg = DeclareLaunchArgument(
+        'auth_enabled', default_value='',
+        description=(
+            'Require a credential. On by default, matching the shipped '
+            'config. Turning it off makes the entity tree, the fault history '
+            'and every operation readable by anyone who can reach the port.'))
+
+    declare_clients_arg = DeclareLaunchArgument(
+        'auth_clients', default_value='',
+        description=(
+            'Comma-separated "client_id:client_secret:role" triples '
+            '(roles: viewer, operator, configurator, admin). Needed to obtain '
+            'a token from /auth/token.'))
+
+    declare_tls_enabled_arg = DeclareLaunchArgument(
+        'tls_enabled', default_value='',
+        description=(
+            'Serve HTTPS. On by default, matching the shipped config. Needs '
+            'cert_file and key_file; the gateway refuses to start with TLS on '
+            'and no certificate rather than fall back to plaintext. Pass '
+            'tls_enabled:=false to serve plain HTTP on a host nothing else '
+            'can reach.'))
+
+    declare_cert_file_arg = DeclareLaunchArgument(
+        'cert_file', default_value='',
+        description=(
+            'PEM certificate (or full chain) for HTTPS. REQUIRED while '
+            'tls_enabled is true. For a first run, generate a self-signed '
+            'pair with scripts/generate_dev_certs.sh - browsers will warn, '
+            'which is correct for a certificate nothing has vouched for.'))
+
+    declare_key_file_arg = DeclareLaunchArgument(
+        'key_file', default_value='',
+        description=(
+            'PEM private key matching cert_file. REQUIRED while tls_enabled '
+            'is true. Keep it chmod 600 and owned by the gateway user.'))
+
     declare_cors_arg = DeclareLaunchArgument(
         'cors_allowed_origins',
         default_value=CORS_DEFAULT,
@@ -120,6 +188,73 @@ def generate_launch_description():
         param_overrides.update(cors_override(
             LaunchConfiguration('cors_allowed_origins').perform(context),
             LaunchConfiguration('config_file').perform(context), default_config))
+
+        # Precedence: an explicit launch argument, then the environment, then
+        # whatever the config file says. Unset means "do not touch it", which
+        # matters because this launch file is included by others and is used
+        # with config_file: re-asserting a default here would silently override
+        # a value someone put in their own file on purpose.
+        tls_arg = LaunchConfiguration('tls_enabled').perform(context).strip()
+        if tls_arg:
+            tls_enabled = parse_security_flag('tls_enabled', tls_arg)
+            param_overrides['server.tls.enabled'] = tls_enabled
+        elif os.environ.get('MEDKIT_TLS_DISABLED') == '1':
+            # The container image serves plain HTTP behind whatever terminates
+            # TLS for it, and has no certificate of its own. An explicit
+            # tls_enabled:= above still wins over this.
+            tls_enabled = False
+            param_overrides['server.tls.enabled'] = False
+        else:
+            # Nothing said otherwise, so the shipped config decides. It has TLS
+            # on, and the warning below still applies to that case.
+            tls_enabled = True
+        cert_file = (LaunchConfiguration('cert_file').perform(context)
+                     or os.environ.get('MEDKIT_TLS_CERT_FILE', ''))
+        key_file = (LaunchConfiguration('key_file').perform(context)
+                    or os.environ.get('MEDKIT_TLS_KEY_FILE', ''))
+        if cert_file:
+            param_overrides['server.tls.cert_file'] = cert_file
+        if key_file:
+            param_overrides['server.tls.key_file'] = key_file
+        if tls_enabled and not (cert_file and key_file):
+            # The gateway would refuse to start a moment from now, naming the
+            # config file. Name the launch arguments instead, here, where they
+            # are the thing the reader can actually change.
+            print('[gateway.launch.py] TLS is enabled and cert_file/key_file were not both '
+                  'given. Pass cert_file:=<path> key_file:=<path>, set them in a config_file, '
+                  'or pass tls_enabled:=false to serve plain HTTP. '
+                  'scripts/generate_dev_certs.sh makes a self-signed pair for a first run.')
+
+        # Same precedence as TLS above: explicit argument, then environment,
+        # then the config file. The environment path is what makes the container
+        # image work - its entrypoint generates a per-container credential and
+        # exports it, and `ros2 launch` inside that container has no other way
+        # to receive it.
+        auth_arg = LaunchConfiguration('auth_enabled').perform(context).strip()
+        if auth_arg:
+            auth_enabled = parse_security_flag('auth_enabled', auth_arg)
+            param_overrides['auth.enabled'] = auth_enabled
+        elif os.environ.get('MEDKIT_AUTH_DISABLED') == '1':
+            auth_enabled = False
+            param_overrides['auth.enabled'] = False
+        else:
+            auth_enabled = True
+        jwt_secret = (LaunchConfiguration('jwt_secret').perform(context)
+                      or os.environ.get('MEDKIT_JWT_SECRET', ''))
+        clients = (LaunchConfiguration('auth_clients').perform(context)
+                   or os.environ.get('MEDKIT_CLIENTS', ''))
+        if jwt_secret:
+            param_overrides['auth.jwt_secret'] = jwt_secret
+        if clients:
+            param_overrides['auth.clients'] = [c for c in clients.split(',') if c]
+        if auth_enabled and not jwt_secret:
+            # The gateway would refuse to start a moment from now with a
+            # message about the config file. Say the actionable thing instead,
+            # here, where the launch argument that fixes it is in scope.
+            print('[gateway.launch.py] auth is enabled and no jwt_secret was given. '
+                  'Pass jwt_secret:=<at least 32 chars> and '
+                  'auth_clients:=<id>:<secret>:admin, set them in a config_file, '
+                  'or pass auth_enabled:=false to run without authentication.')
         return [Node(
             package='ros2_medkit_gateway',
             executable='gateway_node',
@@ -133,6 +268,12 @@ def generate_launch_description():
         declare_host_arg,
         declare_port_arg,
         declare_refresh_arg,
+        declare_auth_enabled_arg,
+        declare_jwt_secret_arg,
+        declare_clients_arg,
+        declare_tls_enabled_arg,
+        declare_cert_file_arg,
+        declare_key_file_arg,
         declare_cors_arg,
         OpaqueFunction(function=_launch_setup),
     ])

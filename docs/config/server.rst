@@ -116,7 +116,7 @@ TLS/HTTPS Configuration
      - Description
    * - ``server.tls.enabled``
      - bool
-     - ``false``
+     - ``true``
      - Enable HTTPS using OpenSSL.
    * - ``server.tls.cert_file``
      - string
@@ -857,7 +857,7 @@ default for local development.
      - Description
    * - ``auth.enabled``
      - bool
-     - ``false``
+     - ``true``
      - Enable/disable JWT authentication.
    * - ``auth.jwt_secret``
      - string
@@ -881,7 +881,7 @@ default for local development.
      - Refresh token validity period in seconds (24 hours). Must be >= ``token_expiry_seconds``.
    * - ``auth.require_auth_for``
      - string
-     - ``"write"``
+     - ``"all"``
      - When to require authentication: ``"none"`` (auth endpoints still available), ``"write"`` (POST/PUT/DELETE only), or ``"all"`` (every request).
    * - ``auth.issuer``
      - string
@@ -891,6 +891,10 @@ default for local development.
      - string[]
      - ``[]``
      - Pre-configured clients as ``"client_id:client_secret:role"`` strings.
+   * - ``auth.public_routes``
+     - string[]
+     - ``[]``
+     - Routes answered with no credential, each written ``"METHOD /path"``. Layers over ``require_auth_for`` and only ever removes a requirement. Matched exactly, no wildcards. Every entry is logged at ``WARN`` on startup, and a malformed entry stops the gateway.
 
 .. note::
 
@@ -921,6 +925,35 @@ Example:
          require_auth_for: "write"
          token_expiry_seconds: 3600
          clients: ["admin:REPLACE_WITH_STRONG_SECRET:admin", "viewer:REPLACE_WITH_STRONG_SECRET:viewer"]
+
+Opening a route to uncredentialed callers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Under ``require_auth_for: "all"`` the only routes answered without a credential
+are ``/api/v1/auth/*``, because authentication cannot bootstrap through a door
+that demands the credential it hands out. Health is not special and is refused
+like everything else.
+
+When something that cannot hold a credential has to reach a route, name it:
+
+.. code-block:: yaml
+
+   auth:
+     public_routes: ["GET /api/v1/health"]
+
+Matching is exact. ``GET /api/v1/health`` opens that method on that path and
+nothing else - not ``HEAD``, not ``/api/v1/healthz``, not the subtree. Wildcards
+are rejected rather than accepted and matched literally, and a malformed entry
+stops the gateway rather than being dropped silently.
+
+An anonymous caller on such a route gets a reduced body: ``GET /health`` answers
+with ``status`` and ``timestamp`` only, plus ``x-medkit-reduced: true`` so a
+monitor can tell a withheld answer from a clean one. A credential still returns
+the whole document.
+
+Most liveness probes need no entry at all. A ``401`` already proves the process
+is up and answering HTTP, so a probe that accepts ``200``, ``401`` and ``403``
+works against any auth configuration and leaves nothing open. Prefer that.
 
 See :doc:`/tutorials/authentication` for a complete setup tutorial.
 

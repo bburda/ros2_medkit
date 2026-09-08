@@ -529,6 +529,62 @@ TEST(AuthManagerRequirementTest, RequireAuthForAll) {
   EXPECT_FALSE(manager.requires_authentication("POST", "/api/v1/auth/authorize"));
 }
 
+// An access token keeps its promised lifetime after its refresh token expires.
+//
+// validate_token() refuses an access token whose refresh record is gone, which
+// is what makes a revocation survive. The cost is that the sweep decides how
+// long an access token really lives: sweeping on the refresh token's own
+// expiry would cut short the last access token minted from it, which was
+// promised a full token_expiry_seconds a moment earlier. This is the test that
+// fails if the grace period is removed.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerRequirementTest, AccessTokenOutlivesItsExpiredRefreshRecord) {
+  // The two expiries are equal, which is the tightest the builder allows
+  // (refresh must be >= access). That is also the worst case: refresh_access_token
+  // reuses the refresh token's jti rather than rotating it, so the access token
+  // it mints is promised token_expiry_seconds from NOW while the record still
+  // dies at its original expiry. Every refresh therefore produces an access
+  // token that outlives its own record.
+  // Three seconds, not one. Two constraints set these numbers.
+  //
+  // Expiries are whole seconds, so the sweep's comparison only moves at second
+  // boundaries: with a one-second expiry and a 1.3 s wait, `expires_at < now`
+  // is still false through integer truncation, and the test would pass with or
+  // without the grace period - measuring nothing.
+  //
+  // And the waits are wall-clock on a machine running the rest of the suite, so
+  // each one has to sit well clear of the boundary it is about rather than just
+  // past it. The record expires at t+3 and is swept after t+6; the checks are
+  // at t+4 and t+9, leaving 2 s and 3 s of slack for a late wake-up.
+  AuthConfig config = AuthConfigBuilder()
+                          .with_enabled(true)
+                          .with_jwt_secret("test_secret_key_min_32_chars_life_")
+                          .with_token_expiry(3)
+                          .with_refresh_token_expiry(3)
+                          .with_require_auth_for(AuthRequirement::ALL)
+                          .build();
+  config.clients.push_back({"c", "s", UserRole::ADMIN, true});
+
+  AuthManager manager(config);
+  ASSERT_TRUE(manager.authenticate("c", "s").has_value());
+  ASSERT_EQ(manager.refresh_token_count(), 1u);
+
+  // t+4s: past the record's own expiry (t+3), inside the one access-token
+  // lifetime it is held for (to t+6). Sweeping here is what cut an access token
+  // short.
+  std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+  manager.cleanup_expired_tokens();
+  EXPECT_EQ(manager.refresh_token_count(), 1u)
+      << "the record was dropped at its own expiry, so any access token minted "
+         "from it in its last moments is refused with most of its life left";
+
+  // t+9s: past the grace too. It does not live forever, or a revocation would
+  // be honoured out of a map that only ever grows.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+  manager.cleanup_expired_tokens();
+  EXPECT_EQ(manager.refresh_token_count(), 0u) << "the record outlived even its grace period";
+}
+
 // Test none auth requirement mode
 TEST(AuthManagerRequirementTest, RequireAuthForNone) {
   AuthConfig config = AuthConfigBuilder()
@@ -675,6 +731,136 @@ TEST_F(AuthManagerTest, CleanupExpiredTokens) {
   // Cleanup should remove expired tokens
   size_t cleaned = manager.cleanup_expired_tokens();
   EXPECT_GE(cleaned, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Refresh-record growth, constant-time secret comparison, and revocation.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A manager with a single admin client, parameterised on the two expiry
+/// values, so a test can put them at their endpoints rather than at one
+/// comfortable middle value.
+AuthManager make_manager(int access_expiry, int refresh_expiry) {
+  auto config = AuthConfigBuilder()
+                    .with_enabled(true)
+                    .with_jwt_secret("expiry_sweep_secret_key_at_least_32_chars_long")
+                    .with_require_auth_for(AuthRequirement::ALL)
+                    .with_token_expiry(access_expiry)
+                    .with_refresh_token_expiry(refresh_expiry)
+                    .add_client("svc", "svc_secret", UserRole::ADMIN)
+                    .build();
+  return AuthManager(config);
+}
+
+}  // namespace
+
+// The sweep exists but had no production caller, so the map grew by one record
+// per successful authorisation for the life of the process. What this asserts
+// is the COUNT, because a sweep that is never invoked returns the right answer
+// when a test calls it directly and still leaks in production.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerTokenLifetimeTest, RepeatedLoginsDoNotGrowTheStoreWithoutBound) {
+  // Refresh expiry at its minimum legal value: validate() requires
+  // refresh >= access, so this is the endpoint, not a convenient number.
+  auto manager = make_manager(1, 1);
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+  }
+  EXPECT_EQ(manager.refresh_token_count(), 5U) << "records should accumulate while they are live";
+
+  // Past the refresh expiry AND the access-token lifetime a record is held for
+  // beyond it, the next authorisation must clear them out. Records expire at
+  // t+1 and are swept after t+2, so this waits to t+4: far enough clear of the
+  // boundary that a late wake-up on a loaded machine cannot land short of it.
+  std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+  ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+
+  EXPECT_EQ(manager.refresh_token_count(), 1U)
+      << "the five expired records survived a later authorisation - the sweep is not running";
+}
+
+// The other endpoint. A long-lived refresh token must NOT be swept: an
+// over-eager sweep would log clients out mid-session, which is the opposite
+// failure and just as real.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerTokenLifetimeTest, LongLivedRecordsAreNotSweptEarly) {
+  auto manager = make_manager(1, 86400);
+
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+  }
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+
+  EXPECT_EQ(manager.refresh_token_count(), 5U) << "records well inside their expiry were discarded";
+}
+
+// Degenerate case: access and refresh expiry equal and both large.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerTokenLifetimeTest, EqualAccessAndRefreshExpiryKeepsRecords) {
+  auto manager = make_manager(3600, 3600);
+  ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+  ASSERT_TRUE(manager.authenticate("svc", "svc_secret").has_value());
+  EXPECT_EQ(manager.refresh_token_count(), 2U);
+}
+
+// A wrong secret must be refused whatever its shape. The interesting inputs
+// are the ones a short-circuiting comparison treats differently from a
+// constant-time one: a correct prefix, and a value that extends the real one.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerSecretComparisonTest, OnlyTheExactSecretAuthenticates) {
+  auto manager = make_manager(3600, 3600);
+
+  EXPECT_TRUE(manager.authenticate("svc", "svc_secret").has_value()) << "the real secret must work";
+
+  // The last two are the ones that matter. Everything before them differs in
+  // length, or in the first byte, so a comparison that checked the length and
+  // then only a prefix would satisfy the whole list. "svc_secreT" differs only
+  // in the FINAL byte: shorten the comparison loop by one and it is accepted
+  // while every other case here still fails correctly.
+  for (const auto & wrong :
+       {"", "s", "svc_secre", "svc_secret_", "svc_secretX", "SVC_SECRET", "xxxxxxxxxx", "svc_secreT", "Svc_secret"}) {
+    EXPECT_FALSE(manager.authenticate("svc", wrong).has_value()) << "secret \"" << wrong << "\" was accepted";
+  }
+}
+
+// An access token whose refresh record is gone is invalid, not "unchecked".
+// Records are in memory, so this is also what a gateway restart looks like to
+// a token issued before it: the deliberate consequence is that a restart makes
+// clients re-authenticate.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerRevocationTest, AnAccessTokenWithNoSurvivingRecordIsRejected) {
+  auto manager = make_manager(3600, 3600);
+  auto issued = manager.authenticate("svc", "svc_secret");
+  ASSERT_TRUE(issued.has_value());
+
+  EXPECT_TRUE(manager.validate_token(issued->access_token).valid)
+      << "the token must be valid while its record is present";
+
+  // Revoking drops or marks the record; either way the access token that names
+  // it must stop being accepted.
+  ASSERT_TRUE(issued->refresh_token.has_value());
+  ASSERT_TRUE(manager.revoke_refresh_token(issued->refresh_token.value()));
+  EXPECT_FALSE(manager.validate_token(issued->access_token).valid)
+      << "an access token whose refresh record was revoked was still accepted";
+}
+
+// A second manager standing in for the same gateway after a restart: same
+// secret and issuer, so the signature still verifies, but no records.
+// @verifies REQ_INTEROP_086
+TEST(AuthManagerRevocationTest, ARestartInvalidatesAccessTokensRatherThanTrustingThem) {
+  auto before = make_manager(3600, 3600);
+  auto issued = before.authenticate("svc", "svc_secret");
+  ASSERT_TRUE(issued.has_value());
+  ASSERT_TRUE(before.validate_token(issued->access_token).valid);
+
+  auto after_restart = make_manager(3600, 3600);
+  EXPECT_FALSE(after_restart.validate_token(issued->access_token).valid)
+      << "a token from before the restart was accepted although the gateway has no record of it - "
+         "a revoked token would come back to life this way";
 }
 
 // Test JwtClaims
@@ -1128,6 +1314,125 @@ TEST_F(AuthRequirementPolicyTest, AllAuthPolicyAlwaysRequiresAuth) {
   EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/components"));
   EXPECT_TRUE(policy.requires_authentication("POST", "/api/v1/components/engine/operations"));
   EXPECT_TRUE(policy.requires_authentication("DELETE", "/api/v1/admin/users"));
+}
+
+// Health is NOT special to the ALL policy. It is closed like everything else
+// until an operator names it in auth.public_routes, and this is the test that
+// fails if somebody hardcodes the exemption back in.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, AllAuthPolicyDoesNotExemptHealth) {
+  AllAuthRequirementPolicy policy;
+
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/health"));
+  EXPECT_TRUE(policy.requires_authentication("HEAD", "/api/v1/health"));
+}
+
+// An entry of auth.public_routes opens the route it names and nothing beside
+// it. Widening the comparison to a prefix, or dropping the method, is the
+// natural next edit and would open a hole, so the boundary is pinned here.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, PublicRouteExemptionOpensOnlyWhatItNames) {
+  auto policy = AuthRequirementPolicyFactory::create(AuthRequirement::ALL, {{"GET", "/api/v1/health"}});
+
+  // The route the operator named.
+  EXPECT_FALSE(policy->requires_authentication("GET", "/api/v1/health"));
+
+  // Only GET. A write to the health path is not a liveness probe, and
+  // cpp-httplib dispatches HEAD into the GET handler table, so dropping the
+  // method check would hand the status document to an anonymous HEAD.
+  EXPECT_TRUE(policy->requires_authentication("POST", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("PUT", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("DELETE", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("PATCH", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("HEAD", "/api/v1/health"));
+
+  // Only that exact path. A prefix or suffix match would hand an attacker a
+  // trivial bypass: append or prepend the magic word and walk in.
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/health/detail"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/healthz"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/components/health"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/health"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/health?x=1"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v2/health"));
+
+  // And the rest of the surface is untouched by the entry.
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/areas"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/"));
+}
+
+// The layer only ever removes a requirement. Wrapping must not make a gateway
+// stricter than the policy underneath, or an operator who adds a probe route
+// would silently close the reads that `write` leaves open.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, PublicRouteExemptionNeverAddsARequirement) {
+  auto policy = AuthRequirementPolicyFactory::create(AuthRequirement::WRITE, {{"POST", "/api/v1/health"}});
+
+  EXPECT_FALSE(policy->requires_authentication("GET", "/api/v1/areas"));
+  EXPECT_FALSE(policy->requires_authentication("POST", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("POST", "/api/v1/areas"));
+}
+
+// An empty list must leave the policy exactly as it was, or "closed by
+// default" would depend on the wrapper behaving itself.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, EmptyPublicRoutesChangesNothing) {
+  auto policy = AuthRequirementPolicyFactory::create(AuthRequirement::ALL, {});
+
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/health"));
+  EXPECT_TRUE(policy->requires_authentication("GET", "/api/v1/areas"));
+  EXPECT_FALSE(policy->requires_authentication("POST", "/api/v1/auth/authorize"));
+}
+
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, PublicRouteEntryParsing) {
+  auto ok = parse_public_route("GET /api/v1/health");
+  ASSERT_TRUE(ok.has_value());
+  EXPECT_EQ(ok->method, "GET");
+  EXPECT_EQ(ok->path, "/api/v1/health");
+
+  // Case and surrounding whitespace are the operator's typing, not a decision.
+  auto lower = parse_public_route("  get /api/v1/health  ");
+  ASSERT_TRUE(lower.has_value());
+  EXPECT_EQ(lower->method, "GET");
+  EXPECT_EQ(lower->path, "/api/v1/health");
+
+  // Everything below must be refused rather than half-understood. A wildcard
+  // accepted and then matched literally would read as "this opens the subtree"
+  // and open nothing, which is the worst of both.
+  EXPECT_FALSE(parse_public_route("/api/v1/health").has_value());
+  EXPECT_FALSE(parse_public_route("GET").has_value());
+  EXPECT_FALSE(parse_public_route("").has_value());
+  EXPECT_FALSE(parse_public_route("   ").has_value());
+  EXPECT_FALSE(parse_public_route("FETCH /api/v1/health").has_value());
+  EXPECT_FALSE(parse_public_route("GET api/v1/health").has_value());
+  EXPECT_FALSE(parse_public_route("GET /api/v1/*").has_value());
+  EXPECT_FALSE(parse_public_route("GET /api/v1/health extra").has_value());
+}
+
+// A malformed entry must not quietly open something. Dropping it keeps the
+// route protected; GatewayNode refuses to start so the typo is not silent.
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, MalformedPublicRoutesAreDropped) {
+  auto routes = parse_public_routes({"GET /api/v1/health", "nonsense", "GET /api/v1/*"});
+
+  ASSERT_EQ(routes.size(), 1u);
+  EXPECT_EQ(routes[0].path, "/api/v1/health");
+}
+
+// @verifies REQ_INTEROP_086
+TEST_F(AuthRequirementPolicyTest, AllAuthPolicyExemptsAuthEndpoints) {
+  AllAuthRequirementPolicy policy;
+
+  // Authentication cannot bootstrap through a door that already demands the
+  // credential it exists to hand out.
+  EXPECT_FALSE(policy.requires_authentication("POST", "/api/v1/auth/authorize"));
+  EXPECT_FALSE(policy.requires_authentication("POST", "/api/v1/auth/token"));
+  EXPECT_FALSE(policy.requires_authentication("POST", "/api/v1/auth/revoke"));
+
+  // The prefix must be anchored: a path that merely mentions auth later is
+  // not an auth endpoint.
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/components/auth/data"));
+  EXPECT_TRUE(policy.requires_authentication("GET", "/api/v1/authorization"));
 }
 
 // @verifies REQ_INTEROP_086

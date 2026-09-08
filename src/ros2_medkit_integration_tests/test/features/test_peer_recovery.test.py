@@ -825,9 +825,20 @@ class PeerRecoveryTest(unittest.TestCase):
             'test_04 must watch this URL fail before test_07 can claim it recovered',
         )
 
+        # Poll for the condition this test actually asserts, not merely for a
+        # 200. Recovery has two steps that finish at different times: the route
+        # comes back, and then a sample arrives on the re-created subscription.
+        # Between them the read answers 200 with status "metadata_only" and an
+        # empty body, so a poll that stops at the status code hands the
+        # assertions below a response taken from that window - and the wider
+        # the machine's load, the wider the window.
         def served():
             answer = self._aggregate_read_of_peer_topic()
-            return answer if answer.status_code == 200 else None
+            if answer.status_code != 200:
+                return None
+            if answer.json().get('x-medkit', {}).get('status') != 'data':
+                return None
+            return answer
 
         response = _poll(served, timeout=RECOVERY_TIMEOUT)
         self.assertIsNotNone(

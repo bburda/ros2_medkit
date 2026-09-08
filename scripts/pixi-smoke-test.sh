@@ -29,7 +29,12 @@ fi
 PORT="${GATEWAY_SMOKE_PORT:-8080}"
 TIMEOUT=30
 
-ros2 launch ros2_medkit_gateway gateway.launch.py server_port:="$PORT" &
+# The shipped config has TLS and authentication on, so a bare launch refuses to
+# start. This is a smoke test for "does the gateway come up and answer", not for
+# the security posture, so it runs the way a developer on a local machine would:
+# plain HTTP, no credential. test_shipped_defaults covers the shipped posture.
+ros2 launch ros2_medkit_gateway gateway.launch.py \
+  server_port:="$PORT" tls_enabled:=false auth_enabled:=false &
 GW_PID=$!
 
 # shellcheck disable=SC2317  # cleanup is invoked indirectly via trap

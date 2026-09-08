@@ -28,7 +28,7 @@ corner - and the only trace is a line buried in a log you would have to SSH in t
 Start ros2_medkit next to it (no changes to Nav2). The aborted goal becomes a fault:
 
 ```bash
-curl http://localhost:8080/api/v1/apps/bt_navigator/faults
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/bt_navigator/faults
 # → ACTION_NAVIGATE_TO_POSE_ABORTED  severity=ERROR  source=/bt_navigator  status=CONFIRMED
 #   + a black-box rosbag of the seconds around the failure
 ```
@@ -51,7 +51,7 @@ trajectory. Same story: the same action bridge surfaces the aborted move as a fa
 `move_group` entity, with the freeze-frame of what the arm was doing, without touching MoveIt.
 
 ```bash
-curl http://localhost:8080/api/v1/apps/move_group/faults
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/move_group/faults
 # → the aborted MoveGroup goal, as a structured fault with its snapshot
 ```
 
@@ -87,6 +87,8 @@ docker run --rm --network host --ipc host \
   ghcr.io/selfpatch/ros2_medkit-jazzy:latest \
   ros2 launch ros2_medkit_gateway bringup.launch.py
 # → REST API live at http://localhost:8080/api/v1/
+# The container prints a one-time client_secret on startup; use it to get a
+# token. Pass -e MEDKIT_AUTH_DISABLED=1 to run without authentication.
 ```
 
 Swap `jazzy` for `humble`/`lyrical`; the two `-e` flags forward your shell's `ROS_DOMAIN_ID` and
@@ -96,7 +98,23 @@ picks them up it is a plain apt install too:
 
 ```bash
 sudo apt install ros-jazzy-ros2-medkit-gateway   # or ros-humble- / ros-lyrical-
-ros2 launch ros2_medkit_gateway bringup.launch.py
+
+# The gateway ships closed: it requires a credential and refuses to start
+# without a signing secret. Supply one, and either a certificate or
+# tls_enabled:=false on a host nothing else can reach.
+ros2 launch ros2_medkit_gateway bringup.launch.py \
+  tls_enabled:=false \
+  jwt_secret:=change-me-to-at-least-32-characters-long \
+  auth_clients:=demo:demo-secret:admin
+```
+
+Every `curl` below then needs a token:
+
+```bash
+TOKEN=$(curl -s http://localhost:8080/api/v1/auth/authorize \
+  -H 'Content-Type: application/json' \
+  -d '{"grant_type":"client_credentials","client_id":"demo","client_secret":"demo-secret"}' \
+  | jq -r .access_token)
 ```
 
 > [!TIP]

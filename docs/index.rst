@@ -45,7 +45,13 @@ Quick Links
 Quick Reference
 ---------------
 
-Common commands for quick access:
+Common commands for quick access.
+
+.. note::
+
+   The gateway ships closed: every command below needs a credential, and
+   ``GET /api/v1/health`` is the only one that does not. See
+   :doc:`getting_started` for how to obtain ``$TOKEN``.
 
 .. code-block:: bash
 
@@ -53,28 +59,28 @@ Common commands for quick access:
    curl http://localhost:8080/api/v1/health
 
    # List all areas
-   curl http://localhost:8080/api/v1/areas
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/areas
 
    # List all components
-   curl http://localhost:8080/api/v1/components
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/components
 
    # List all apps
-   curl http://localhost:8080/api/v1/apps
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps
 
    # List all functions
-   curl http://localhost:8080/api/v1/functions
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/functions
 
    # Get data from an entity (area, component, app, or function)
-   curl http://localhost:8080/api/v1/{entity-type}/{entity-id}/data
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/{entity-type}/{entity-id}/data
 
    # List operations for  an entity (area, component, app, or function)
-   curl http://localhost:8080/api/v1/{entity-type}/{entity-id}/operations
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/{entity-type}/{entity-id}/operations
 
    # Get configurations (parameters)
-   curl http://localhost:8080/api/v1/{entity-type}/{entity-id}/configurations
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/{entity-type}/{entity-id}/configurations
 
    # List faults
-   curl http://localhost:8080/api/v1/faults
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/faults
 
 Community
 ---------

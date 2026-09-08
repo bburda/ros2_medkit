@@ -26,6 +26,30 @@
 
 namespace ros2_medkit_gateway {
 
+namespace {
+
+/// Compare two secrets without returning early on the first differing byte.
+///
+/// The lengths are compared too, and a length mismatch is reported. That does
+/// leak the length, which is acceptable: secrets here are operator-chosen and
+/// their length is not the secret. What must not leak is WHICH bytes matched,
+/// and the loop below always visits every byte of the expected value.
+bool constant_time_equals(const std::string & expected, const std::string & presented) {
+  // Fold the length difference into the result rather than returning, so both
+  // branches cost the same.
+  unsigned char diff = static_cast<unsigned char>(expected.size() != presented.size());
+  const std::size_t n = expected.size();
+  for (std::size_t i = 0; i < n; ++i) {
+    // Index the presented value modulo its own size so a shorter input cannot
+    // read out of bounds; the length check above already forced a mismatch.
+    const unsigned char p = presented.empty() ? 0U : static_cast<unsigned char>(presented[i % presented.size()]);
+    diff |= static_cast<unsigned char>(static_cast<unsigned char>(expected[i]) ^ p);
+  }
+  return diff == 0;
+}
+
+}  // namespace
+
 // Helper to read file contents
 static std::string read_file_contents(const std::string & path) {
   std::ifstream file(path);
@@ -65,8 +89,11 @@ AuthManager::AuthManager(const AuthConfig & config) : config_(config) {
     clients_[client.client_id] = client;
   }
 
-  // Create auth requirement policy from config
-  auth_policy_ = AuthRequirementPolicyFactory::create(config_.require_auth_for);
+  // Create auth requirement policy from config. `require_auth_for` decides the
+  // baseline; `public_routes` then lifts the credential requirement from the
+  // routes an operator named, and from nothing else.
+  auth_policy_ =
+      AuthRequirementPolicyFactory::create(config_.require_auth_for, parse_public_routes(config_.public_routes));
 }
 
 tl::expected<TokenResponse, AuthErrorResponse> AuthManager::authenticate(const std::string & client_id,
@@ -85,8 +112,15 @@ tl::expected<TokenResponse, AuthErrorResponse> AuthManager::authenticate(const s
     return tl::unexpected(AuthErrorResponse::invalid_client("Client is disabled"));
   }
 
-  // Verify secret
-  if (client.client_secret != client_secret) {
+  // Verify secret in constant time. A plain std::string comparison returns as
+  // soon as two bytes differ, so the time it takes to refuse leaks how many
+  // leading bytes were right, and a caller who can measure it can recover the
+  // secret one byte at a time. Every default deployment now needs a configured
+  // client, so this path is on the critical path for all of them.
+  //
+  // Secrets are still stored in plaintext in the configuration; making this
+  // comparison constant-time does not change that and is not meant to.
+  if (!constant_time_equals(client.client_secret, client_secret)) {
     return tl::unexpected(AuthErrorResponse::invalid_client("Invalid client_secret"));
   }
 
@@ -248,10 +282,27 @@ TokenValidationResult AuthManager::validate_token(const std::string & token, Tok
     return result;
   }
 
-  // Check if associated refresh token is revoked (for access tokens)
+  // An access token that names a refresh record is only valid while that
+  // record is present and not revoked.
+  //
+  // Absent counts as invalid, not as "nothing to check". Records live in
+  // memory, so after a restart the map is empty; treating absence as fine
+  // would make every revoked token work again until it expired on its own,
+  // which on the default one-hour expiry is a long time to keep honouring a
+  // credential somebody explicitly withdrew.
+  //
+  // The cost is deliberate and worth stating: a restart invalidates every
+  // access token, so clients re-authenticate after one. That is visible
+  // behaviour, and it is the trade this gateway makes elsewhere too - refusing
+  // is better than quietly allowing.
   if (claims.refresh_token_id.has_value()) {
     auto record = get_refresh_token(claims.refresh_token_id.value());
-    if (record.has_value() && record->revoked) {
+    if (!record.has_value()) {
+      result.valid = false;
+      result.error = "Associated refresh token is no longer known to this gateway";
+      return result;
+    }
+    if (record->revoked) {
       result.valid = false;
       result.error = "Associated refresh token has been revoked";
       return result;
@@ -350,23 +401,42 @@ bool AuthManager::revoke_refresh_token(const std::string & refresh_token) {
   return true;
 }
 
-size_t AuthManager::cleanup_expired_tokens() {
+size_t AuthManager::cleanup_expired_locked() {
   auto now = std::chrono::system_clock::now();
   auto now_ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
-  std::lock_guard<std::mutex> lock(refresh_tokens_mutex_);
-  size_t count = 0;
+  // A record outlives its own expiry by one access-token lifetime.
+  //
+  // validate_token() rejects an access token whose refresh record is gone, so
+  // dropping the record the instant it expires cuts short every access token
+  // minted from it. The last one can be issued a second before the refresh
+  // token expires and is then promised a full token_expiry_seconds; sweeping
+  // on expires_at alone would refuse it about a minute later, with most of its
+  // life left. Keeping the record until nothing issued from it can still be
+  // valid costs one extra lifetime of memory per client and removes the whole
+  // race.
+  const int64_t grace = static_cast<int64_t>(config_.token_expiry_seconds);
 
+  size_t count = 0;
   for (auto it = refresh_tokens_.begin(); it != refresh_tokens_.end();) {
-    if (it->second.expires_at < now_ts) {
+    if (it->second.expires_at + grace < now_ts) {
       it = refresh_tokens_.erase(it);
       ++count;
     } else {
       ++it;
     }
   }
-
   return count;
+}
+
+size_t AuthManager::refresh_token_count() const {
+  std::lock_guard<std::mutex> lock(refresh_tokens_mutex_);
+  return refresh_tokens_.size();
+}
+
+size_t AuthManager::cleanup_expired_tokens() {
+  std::lock_guard<std::mutex> lock(refresh_tokens_mutex_);
+  return cleanup_expired_locked();
 }
 
 bool AuthManager::register_client(const std::string & client_id, const std::string & client_secret, UserRole role) {
@@ -609,6 +679,19 @@ bool AuthManager::matches_path(const std::string & pattern, const std::string & 
 
 void AuthManager::store_refresh_token(const RefreshTokenRecord & record) {
   std::lock_guard<std::mutex> lock(refresh_tokens_mutex_);
+
+  // Sweep before inserting. Nothing else calls the sweep, so without this the
+  // map keeps one record per successful authorisation for the life of the
+  // process, and validate_token looks that map up on every authenticated
+  // request. Doing it here rather than on a timer keeps the bound a property
+  // of the data structure instead of a property of a thread that might not be
+  // running, and makes it observable in a test without waiting on wall clock.
+  //
+  // The cost is a scan per authorisation. The map only ever holds unexpired
+  // records, so it is sized by how many tokens are live at once, not by how
+  // many have ever been issued.
+  cleanup_expired_locked();
+
   refresh_tokens_[record.token_id] = record;
 }
 

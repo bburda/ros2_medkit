@@ -310,7 +310,7 @@ Querying Correlation Data
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/faults
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/faults
 
 Response always includes:
 

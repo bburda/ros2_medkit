@@ -87,6 +87,11 @@ AuthConfigBuilder & AuthConfigBuilder::with_issuer(const std::string & issuer) {
   return *this;
 }
 
+AuthConfigBuilder & AuthConfigBuilder::with_public_routes(const std::vector<std::string> & public_routes) {
+  config_.public_routes = public_routes;
+  return *this;
+}
+
 AuthConfigBuilder & AuthConfigBuilder::add_client(const std::string & client_id, const std::string & client_secret,
                                                   UserRole role) {
   ClientCredentials creds;

@@ -472,7 +472,7 @@ The ``x-medkit-topic-beacon`` vendor endpoint exposes current beacon state:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps/engine_temp_sensor/x-medkit-topic-beacon
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/apps/engine_temp_sensor/x-medkit-topic-beacon
 
 **Example Response:**
 
