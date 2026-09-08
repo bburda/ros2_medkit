@@ -34,13 +34,33 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
+            - name: Short commit sha
+              id: shortsha
+              run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
             - name: Build and push Docker image
               uses: docker/build-push-action@v6
               with:
                   context: .
                   push: true
                   build-args: ROS_DISTRO=${{ matrix.ros_distro }}
-                  tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ros2_medkit-${{ matrix.ros_distro }}:latest
+                  # Two tags, and the second one is the point. `:latest` moves
+                  # on every merge, so a user who pulls it has no way back to
+                  # the behaviour they had yesterday - and the defaults this
+                  # image ships are exactly the kind of thing that changes
+                  # under them. `sha-<short>` gives them something immutable to
+                  # pin. The release workflow publishes the semver tags; this
+                  # one runs on every push to main, where there is no version
+                  # number to use.
+                  #
+                  # Short form, to match the sha- tags the release workflow
+                  # already publishes (docker/metadata-action's
+                  # `type=sha,format=short`). Two spellings of the same idea in
+                  # one registry is how a user ends up unable to find the image
+                  # they pinned.
+                  tags: |
+                      ${{ env.REGISTRY }}/${{ github.repository_owner }}/ros2_medkit-${{ matrix.ros_distro }}:latest
+                      ${{ env.REGISTRY }}/${{ github.repository_owner }}/ros2_medkit-${{ matrix.ros_distro }}:sha-${{ steps.shortsha.outputs.value }}
                   cache-from: type=gha,scope=${{ matrix.ros_distro }}
                   # mode=min, not max: max exports every intermediate build
                   # stage, which for three distros held ~3.1 GB of the repo's
