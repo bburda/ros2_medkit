@@ -85,7 +85,7 @@ jobs:
           apt-get update
           apt-get install -y ros-${{ matrix.ros_distro }}-test-msgs libyaml-cpp-dev libssl-dev
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           # Skip nav2_msgs (vda5050_agent declares it; not available on all
           # distros) and the linter rosdep keys. Linters only run in the Jazzy
           # quality job, so we don't need them installed here. The upstream
@@ -308,7 +308,7 @@ jobs:
           # the plugin's open62541pp and the fixture's static open62541.
           apt-get install -y ros-jazzy-test-msgs libyaml-cpp-dev libssl-dev openssl
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y \
             --skip-keys='nav2_msgs ament_cmake_clang_format ament_cmake_clang_tidy'
 

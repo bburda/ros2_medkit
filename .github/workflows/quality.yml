@@ -52,7 +52,7 @@ jobs:
           apt-get update
           apt-get install -y clang-format ccache
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Cache ccache
@@ -146,7 +146,7 @@ jobs:
       - name: Install clang-tidy-cache (ctcache)
         run: |
           apt-get install -y python3-pip
-          pip3 install --break-system-packages git+https://github.com/matus-chochlik/ctcache.git@3880541496c7ce0d2e2830d2f525375078fe0b1f
+          for attempt in 1 2 3; do pip3 install --break-system-packages git+https://github.com/matus-chochlik/ctcache.git@3880541496c7ce0d2e2830d2f525375078fe0b1f && break; [ "$attempt" = 3 ] && exit 1; echo "ctcache install attempt $attempt failed, retrying" >&2; sleep 5; done
           printf '#!/bin/sh\nexec clang-tidy-cache /usr/bin/clang-tidy "$@"\n' > /usr/local/bin/ctcache-wrapper
           chmod +x /usr/local/bin/ctcache-wrapper
 
@@ -163,7 +163,7 @@ jobs:
           apt-get update
           apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Build (compile database only, no clang-tidy)
@@ -295,7 +295,7 @@ jobs:
           apt-get update
           apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Redirect heavy build output to /mnt
@@ -449,7 +449,7 @@ jobs:
           apt-get update
           apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Redirect heavy build output to /mnt
@@ -601,7 +601,7 @@ jobs:
           apt-get update
           apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Redirect heavy build output to /mnt

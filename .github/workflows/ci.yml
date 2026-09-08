@@ -74,7 +74,7 @@ jobs:
             apt-get install -y ros-humble-rmw-cyclonedds-cpp
           fi
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           # Linters (clang-tidy / clang-format) only run in the Jazzy quality
           # job (quality.yml). Multiple package.xml files still list them as
           # <test_depend>, so we skip the rosdep keys here to keep build-and-
@@ -238,7 +238,7 @@ jobs:
             apt-get install -y ros-${{ matrix.ros_distro }}-rmw-cyclonedds-cpp
           fi
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           # Same skip-keys as build-and-test: the linters run only in the Jazzy quality job.
           rosdep install --from-paths src --ignore-src -y \
             --skip-keys "ament_cmake_clang_tidy ament_cmake_clang_format"
@@ -371,7 +371,7 @@ jobs:
             ros-jazzy-test-msgs \
             ros-jazzy-rmw-cyclonedds-cpp
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -y
 
       - name: Build packages
@@ -536,7 +536,7 @@ jobs:
           # gpg is required by codecov/codecov-action@v5 dependency check
           apt-get install -y lcov ros-jazzy-test-msgs gpg
           source /opt/ros/jazzy/setup.bash
-          rosdep update
+          for attempt in 1 2 3; do rosdep update && break; [ "$attempt" = 3 ] && exit 1; echo "rosdep update attempt $attempt failed, retrying" >&2; sleep 5; done
           rosdep install --from-paths src --ignore-src -r -y
 
       - name: Build packages with coverage
