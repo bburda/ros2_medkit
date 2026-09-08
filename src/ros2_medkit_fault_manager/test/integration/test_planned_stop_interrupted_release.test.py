@@ -25,6 +25,13 @@ been announced by nobody.
 The kill is real (SIGTERM, launch respawns the node); the crash *point* is
 simulated by editing the store while the manager is down, which is exactly the
 state such a crash leaves behind.
+
+The recovery runs in the constructor, before this node has a service or a timer,
+so its announcement may reach no subscriber - nothing has matched a publisher that
+is milliseconds old. That loss is accepted, so the assertions here are on what
+survives it: the manager's own log line, the ownership flags being gone, and the
+released faults being back in the default fault list. What the recovery must NEVER
+do is announce or release a fault owned by a stop declared after it.
 """
 
 import os
@@ -43,12 +50,21 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from ros2_medkit_msgs.msg import Fault, FaultEvent
-from ros2_medkit_msgs.srv import GetPlannedStop, ListFaults, ReportFault, SetPlannedStop
+from ros2_medkit_msgs.srv import (
+    ClearFault,
+    GetPlannedStop,
+    ListFaults,
+    ReportFault,
+    SetPlannedStop,
+)
 
 STORAGE_DIR = tempfile.mkdtemp(prefix='planned_stop_interrupted_')
 DATABASE_PATH = os.path.join(STORAGE_DIR, 'faults.db')
 
 OWNED_CODES = ('PS_INTERRUPTED_ONE', 'PS_INTERRUPTED_TWO')
+# Re-raised under a NEW stop declared right after the recovery.
+REUSED_CODE = OWNED_CODES[0]
+NEW_STOP_CODE = 'PS_AFTER_RECOVERY'
 
 # Long enough that the test can edit the store between the kill and the
 # replacement opening it.
@@ -137,6 +153,7 @@ class TestInterruptedRelease(unittest.TestCase):
     @classmethod
     def _connect(cls, timeout_sec=40.0):
         cls.report_client = cls.node.create_client(ReportFault, '/fault_manager/report_fault')
+        cls.clear_client = cls.node.create_client(ClearFault, '/fault_manager/clear_fault')
         cls.list_client = cls.node.create_client(ListFaults, '/fault_manager/list_faults')
         cls.set_stop_client = cls.node.create_client(
             SetPlannedStop, '/fault_manager/set_planned_stop')
@@ -144,6 +161,7 @@ class TestInterruptedRelease(unittest.TestCase):
             GetPlannedStop, '/fault_manager/get_planned_stop')
         for client, name in (
             (cls.report_client, 'report_fault'),
+            (cls.clear_client, 'clear_fault'),
             (cls.list_client, 'list_faults'),
             (cls.set_stop_client, 'set_planned_stop'),
             (cls.get_stop_client, 'get_planned_stop'),
@@ -165,6 +183,22 @@ class TestInterruptedRelease(unittest.TestCase):
         request.description = 'interrupted release test fault'
         request.source_id = '/test_node'
         return self._call(self.report_client, request)
+
+    def _clear(self, fault_code):
+        request = ClearFault.Request()
+        request.fault_code = fault_code
+        request.skip_correlation_auto_clear = False
+        return self._call(self.clear_client, request)
+
+    def _muted_entries(self):
+        request = ListFaults.Request()
+        request.filter_by_severity = False
+        request.severity = 0
+        request.statuses = []
+        request.include_muted = True
+        request.include_clusters = False
+        response = self._call(self.list_client, request)
+        return {info.fault_code: info for info in response.muted_faults}
 
     def _set_stop(self, active, *, reason='', declared_by=''):
         request = SetPlannedStop.Request()
@@ -250,7 +284,7 @@ class TestInterruptedRelease(unittest.TestCase):
         return owned
 
     def test_startup_finishes_a_release_the_previous_process_did_not(
-            self, fault_manager_node):
+            self, fault_manager_node, proc_output):
         self.assertTrue(self._set_stop(True, reason='cell 4 rebuild',
                                        declared_by='plant_manager').success)
         for code in OWNED_CODES:
@@ -280,30 +314,78 @@ class TestInterruptedRelease(unittest.TestCase):
             'the fault manager was never restarted')
         self._connect()
 
-        # Startup sees flags behind a withdrawn declaration and finishes the job.
-        for code in OWNED_CODES:
-            self._wait_until(
-                lambda code=code: self._count_events(code, FaultEvent.EVENT_CONFIRMED) == 1,
-                f'{code} was never announced after the interrupted release')
+        # A stop declared right after the restart owns its own cycles. Declared
+        # FIRST, before this test waits for anything: a recovery that runs later
+        # than the constructor would be inside this window, which is exactly the
+        # window in which it can announce and unflag a fault the NEW stop holds.
+        self.assertTrue(self._set_stop(True, reason='second shutdown',
+                                       declared_by='night_shift').success)
 
-        self._spin_for(3.0)
-        for code in OWNED_CODES:
-            self.assertEqual(1, self._count_events(code, FaultEvent.EVENT_CONFIRMED),
-                             f'{code} was announced more than once')
-            self.assertIn(code, self._confirmed_codes())
+        # Whatever the recovery did or did not manage to announce, nothing more may
+        # be announced for this code while the new stop holds its new cycle.
+        announced_before = self._count_events(REUSED_CODE, FaultEvent.EVENT_CONFIRMED)
 
-        self.assertEqual(set(), set(OWNED_CODES) & self._muted_codes(),
-                         'the faults are still marked after the release was finished')
+        # A NEW cycle of a code the previous release captured: acknowledge it, then
+        # raise it again under the new declaration.
+        self.assertTrue(self._clear(REUSED_CODE).success)
+        self._report(REUSED_CODE)
+        self._report(NEW_STOP_CODE)
+        self._wait_until(
+            lambda: {REUSED_CODE, NEW_STOP_CODE} <= set(self._muted_entries()),
+            'the new stop did not take the cycles that started under it')
+
+        # Startup finishes the interrupted release, and says so itself - the one
+        # instrument a publication made before anyone has matched the publisher
+        # cannot take away.
+        expected = ('Finished an interrupted planned-stop release: '
+                    f'released {len(OWNED_CODES)} fault(s)')
+        proc_output.assertWaitFor(expected_output=expected, process='fault_manager_node-1',
+                                  timeout=40, stream='stderr')
+        self._spin_for(2.0)
+
+        # What the release captured is released: back in the default list, not
+        # marked, announced at most once.
+        for code in OWNED_CODES:
+            if code == REUSED_CODE:
+                continue  # it has since started a new cycle under the new stop
+            self.assertIn(code, self._confirmed_codes(),
+                          f'{code} did not come back to the default fault list')
+            self.assertNotIn(code, self._muted_codes(),
+                             f'{code} is still marked after the release was finished')
+            self.assertLessEqual(self._count_events(code, FaultEvent.EVENT_CONFIRMED), 1,
+                                 f'{code} was announced more than once')
+
+        # And what it did NOT capture is untouched: the new stop still holds both
+        # of its cycles, flags and all.
+        entries = self._muted_entries()
+        for code in (REUSED_CODE, NEW_STOP_CODE):
+            self.assertIn(code, entries,
+                          f'{code} was released by a recovery that never owned it')
+            self.assertEqual('planned_stop', entries[code].rule_id)
+            self.assertNotIn(code, self._confirmed_codes())
+        self.assertEqual(2, self._owned_flag_count(),
+                         'the recovery wiped ownership flags belonging to the new stop')
+        self.assertEqual(announced_before,
+                         self._count_events(REUSED_CODE, FaultEvent.EVENT_CONFIRMED),
+                         'the new cycle was announced while the new stop still stands')
+        self.assertEqual(0, self._count_events(NEW_STOP_CODE, FaultEvent.EVENT_CONFIRMED))
+
+        # The new stop still releases its own faults normally.
+        self.assertTrue(self._set_stop(False, reason='back up', declared_by='night_shift').success)
+        for code in (REUSED_CODE, NEW_STOP_CODE):
+            self._wait_until(lambda code=code: code in self._confirmed_codes(),
+                             f'{code} was not released by its own switch-off')
+        self.assertEqual(0, self._owned_flag_count())
         self.assertFalse(self._call(self.get_stop_client, GetPlannedStop.Request()).active)
 
-        # And the flags are gone, so a second restart announces nothing again.
+    @staticmethod
+    def _owned_flag_count():
         connection = sqlite3.connect(f'file:{DATABASE_PATH}?mode=ro', uri=True)
         try:
-            remaining = connection.execute(
+            return connection.execute(
                 'SELECT COUNT(*) FROM faults WHERE planned_stop_owned != 0').fetchone()[0]
         finally:
             connection.close()
-        self.assertEqual(0, remaining)
 
 
 @launch_testing.post_shutdown_test()

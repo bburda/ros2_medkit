@@ -2576,6 +2576,43 @@ TEST_F(SqliteFaultStorageTest, ClearingOwnershipDropsEveryFlagAndReportsHowMany)
   EXPECT_EQ(0u, storage_->clear_planned_stop_owned());
 }
 
+TEST_F(SqliteFaultStorageTest, ClearingNamedOwnershipLeavesEveryOtherFlagAlone) {
+  raise(*storage_, "OWNED_CAPTURED_A");
+  raise(*storage_, "OWNED_CAPTURED_B");
+  raise(*storage_, "OWNED_LATER");
+  for (const auto * code : {"OWNED_CAPTURED_A", "OWNED_CAPTURED_B", "OWNED_LATER"}) {
+    storage_->set_planned_stop_owned(code, true);
+  }
+
+  // A release finishes what it captured. Anything that became owned after that
+  // capture belongs to a different declaration and must survive.
+  EXPECT_EQ(2u, storage_->clear_planned_stop_owned({"OWNED_CAPTURED_A", "OWNED_CAPTURED_B"}));
+
+  auto owned = storage_->get_planned_stop_owned();
+  ASSERT_EQ(1u, owned.size());
+  EXPECT_EQ("OWNED_LATER", owned[0]);
+
+  // Idempotent, and a code that is not owned is not an error.
+  EXPECT_EQ(0u, storage_->clear_planned_stop_owned({"OWNED_CAPTURED_A", "NEVER_OWNED"}));
+  EXPECT_EQ(1u, storage_->get_planned_stop_owned().size());
+  EXPECT_EQ(0u, storage_->clear_planned_stop_owned({}));
+  EXPECT_EQ(1u, storage_->get_planned_stop_owned().size());
+}
+
+TEST(InMemoryFaultStorageTest, ClearingNamedOwnershipLeavesEveryOtherFlagAlone) {
+  ros2_medkit_fault_manager::InMemoryFaultStorage storage;
+  raise(storage, "OWNED_CAPTURED");
+  raise(storage, "OWNED_LATER");
+  storage.set_planned_stop_owned("OWNED_CAPTURED", true);
+  storage.set_planned_stop_owned("OWNED_LATER", true);
+
+  EXPECT_EQ(1u, storage.clear_planned_stop_owned({"OWNED_CAPTURED"}));
+
+  auto owned = storage.get_planned_stop_owned();
+  ASSERT_EQ(1u, owned.size());
+  EXPECT_EQ("OWNED_LATER", owned[0]);
+}
+
 TEST_F(SqliteFaultStorageTest, ADatabaseWrittenBeforeOwnershipExistedStillOpens) {
   raise(*storage_, "LEGACY_FAULT");
   storage_.reset();

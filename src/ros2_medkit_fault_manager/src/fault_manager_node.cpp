@@ -257,6 +257,11 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options, std::uni
   // Create event publisher for SSE streaming
   event_publisher_ = create_publisher<ros2_medkit_msgs::msg::FaultEvent>("~/events", rclcpp::QoS(100).reliable());
 
+  // A planned stop outlives the process that declared it, so the declaration and
+  // the cycles it owns are read back from the store rather than started fresh.
+  planned_stop_ = storage_->get_planned_stop();
+  finish_interrupted_release();
+
   // Build global debounce config
   global_config_.confirmation_threshold = confirmation_threshold_;
   global_config_.healing_enabled = healing_enabled_;
@@ -457,49 +462,18 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options, std::uni
     correlation_engine_->cleanup_expired();
   });
 
-  // A planned stop outlives the process that declared it: a weekend stop must not
-  // end because the box rebooted. Faults muted before the restart are not restored -
-  // muting is per fault cycle and those cycles are over as far as this process is
-  // concerned - but every fault reported from here is muted again.
-  planned_stop_ = storage_->get_planned_stop();
-  const auto owned_at_startup = storage_->get_planned_stop_owned();
+  // A weekend stop must not end because the box rebooted. The cycles it owns come
+  // back from the flags the store kept, so the switch-off still releases and
+  // announces exactly them.
   if (planned_stop_.active) {
     correlation_engine_->begin_planned_stop();
-    for (const auto & fault_code : owned_at_startup) {
+    const auto owned = storage_->get_planned_stop_owned();
+    for (const auto & fault_code : owned) {
       correlation_engine_->restore_planned_stop_ownership(fault_code);
     }
     RCLCPP_INFO(get_logger(),
                 "Planned stop is in force (reason='%s', declared_by='%s'): %zu fault(s) re-marked, new faults marked",
-                planned_stop_.reason.c_str(), planned_stop_.declared_by.c_str(), owned_at_startup.size());
-  } else if (!owned_at_startup.empty()) {
-    // Faults owned by a declaration that is already withdrawn: the previous
-    // process died between writing the withdrawal and finishing the release, so
-    // these confirmations were suppressed and never announced. Finish the job.
-    //
-    // Not here, though: this publisher was created moments ago in this same
-    // constructor, and the events topic is volatile, so anything published before
-    // a subscriber has matched it reaches nobody and is gone for good. Wait for a
-    // listener - and give up waiting after kInterruptedReleaseDeadline, because a
-    // manager nobody is listening to must still finish the release rather than
-    // carry the flags forever.
-    RCLCPP_WARN(get_logger(),
-                "%zu fault(s) are still owned by a planned stop that was already withdrawn - a previous run did not "
-                "finish releasing them. Announcing them once a consumer is listening.",
-                owned_at_startup.size());
-    const auto give_up_at = std::chrono::steady_clock::now() + kInterruptedReleaseDeadline;
-    interrupted_release_timer_ =
-        create_wall_timer(kInterruptedReleasePollInterval, [this, owned_at_startup, give_up_at]() {
-          const bool listener = event_publisher_->get_subscription_count() > 0;
-          if (!listener && std::chrono::steady_clock::now() < give_up_at) {
-            return;
-          }
-          interrupted_release_timer_->cancel();
-          const size_t announced = announce_released(owned_at_startup);
-          storage_->clear_planned_stop_owned();
-          RCLCPP_INFO(get_logger(),
-                      "Finished an interrupted planned-stop release: announced %zu confirmation(s) to %zu listener(s)",
-                      announced, event_publisher_->get_subscription_count());
-        });
+                planned_stop_.reason.c_str(), planned_stop_.declared_by.c_str(), owned.size());
   }
 
   // Create auto-confirmation timer if enabled
@@ -546,6 +520,40 @@ FaultManagerNode::FaultManagerNode(const rclcpp::NodeOptions & options, std::uni
                 storage_type_.c_str(), global_config_.confirmation_threshold,
                 global_config_.healing_enabled ? "enabled" : "disabled", global_config_.healing_threshold);
   }
+}
+
+void FaultManagerNode::finish_interrupted_release() {
+  if (planned_stop_.active) {
+    return;  // the declaration still stands; nothing was left half-released
+  }
+
+  const auto owned = storage_->get_planned_stop_owned();
+  if (owned.empty()) {
+    return;
+  }
+
+  // Faults owned by a declaration that is already withdrawn: the previous process
+  // died between writing the withdrawal and dropping the flags, so these
+  // confirmations were suppressed and announced by nobody. Finish the job.
+  //
+  // Synchronously, here, before this node has a service or a timer that could run:
+  // deferring it opens a window in which an operator declares a NEW stop and new
+  // cycles become owned by it, and the deferred work would then announce a fault
+  // the new stop is holding and drop its flag. A publication this early may reach
+  // no subscriber - the events topic is volatile and nothing has matched a
+  // publisher this young - and that is the same accepted loss as any other
+  // publication made at startup. The released faults are in the default fault list
+  // either way, which is where an operator looks after a restart.
+  RCLCPP_WARN(get_logger(),
+              "%zu fault(s) are still owned by a planned stop that was already withdrawn - a previous run did not "
+              "finish releasing them. Releasing them now.",
+              owned.size());
+  const size_t announced = announce_released(owned);
+  // Exactly what was captured above: a flag written after that capture belongs to
+  // a declaration this release knows nothing about.
+  const size_t released = storage_->clear_planned_stop_owned(owned);
+  RCLCPP_INFO(get_logger(), "Finished an interrupted planned-stop release: released %zu fault(s), announced %zu",
+              released, announced);
 }
 
 FaultManagerNode::~FaultManagerNode() {

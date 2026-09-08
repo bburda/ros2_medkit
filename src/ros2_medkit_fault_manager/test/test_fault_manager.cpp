@@ -3012,9 +3012,18 @@ class ReleaseOrderRecordingStorage : public ros2_medkit_fault_manager::InMemoryF
     return InMemoryFaultStorage::get_fault(fault_code);
   }
 
+  // The scoped overload is the one the release actually uses; both are recorded so
+  // neither can be hidden by overriding only one.
+  using InMemoryFaultStorage::clear_planned_stop_owned;
+
   size_t clear_planned_stop_owned() override {
     calls.push_back("clear_owned");
     return InMemoryFaultStorage::clear_planned_stop_owned();
+  }
+
+  size_t clear_planned_stop_owned(const std::vector<std::string> & fault_codes) override {
+    calls.push_back("clear_owned_scoped");
+    return InMemoryFaultStorage::clear_planned_stop_owned(fault_codes);
   }
 
   mutable std::vector<std::string> calls;

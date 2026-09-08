@@ -318,9 +318,19 @@ declaration is written first (so a store that refuses the write changes nothing,
 a restart never re-arms a stop the operator withdrew), the confirmations are
 announced next, and the ownership flags are cleared last. A process that dies in
 between leaves faults owned by a declaration that is already over, which is a state
-the next startup recognises: it announces them - once a subscriber has matched the
-events publisher, because that topic is volatile - and clears the flags. Clearing
-first would have turned a crash into permanent silence.
+the next startup recognises: it announces them and clears the flags of exactly
+those faults. Clearing first would have turned a crash into permanent silence.
+
+The recovery runs synchronously in the constructor, before the node has a service
+or a timer. Deferring it - waiting for a subscriber to match, say - opens a window
+in which an operator declares a NEW stop over the same services and new cycles
+become owned by it; the deferred work then announces a fault the new stop is
+holding and, if it clears ownership wholesale rather than the set it captured,
+drops that fault's flag too. Running early costs an announcement that may reach no
+subscriber, because nothing has matched a publisher that is milliseconds old and
+the events topic is volatile. That is the same accepted loss as every other
+publication made at startup, and the released faults are in the default fault list
+regardless.
 
 Withdrawing releases the rest and publishes ``EVENT_CONFIRMED`` once for each
 released fault that is CONFIRMED. That republication is the point of marking

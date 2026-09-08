@@ -1422,6 +1422,23 @@ size_t SqliteFaultStorage::clear_planned_stop_owned() {
   return static_cast<size_t>(sqlite3_changes(db_));
 }
 
+size_t SqliteFaultStorage::clear_planned_stop_owned(const std::vector<std::string> & fault_codes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  size_t cleared = 0;
+  SqliteStatement stmt(db_,
+                       "UPDATE faults SET planned_stop_owned = 0 WHERE fault_code = ? AND planned_stop_owned != 0");
+  for (const auto & fault_code : fault_codes) {
+    stmt.reset();
+    stmt.bind_text(1, fault_code);
+    if (stmt.step() != SQLITE_DONE) {
+      throw std::runtime_error(std::string("Failed to release planned-stop ownership: ") + sqlite3_errmsg(db_));
+    }
+    cleared += static_cast<size_t>(sqlite3_changes(db_));
+  }
+  return cleared;
+}
+
 std::optional<FreezeFrameData> SqliteFaultStorage::get_freeze_frame(const std::string & fault_code) const {
   std::lock_guard<std::mutex> lock(mutex_);
 

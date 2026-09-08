@@ -193,6 +193,12 @@ class FaultManagerNode : public rclcpp::Node {
   /// @param config SnapshotConfig to populate with loaded values
   void load_snapshot_config_from_yaml(const std::string & config_file, SnapshotConfig & config);
 
+  /// Finish a switch-off a previous process did not: announce the faults still
+  /// owned by a declaration that is already withdrawn, and drop exactly their
+  /// flags. Runs from the constructor, before this node has a service or a timer
+  /// that could declare a new stop underneath it.
+  void finish_interrupted_release();
+
   /// Publish EVENT_CONFIRMED for each of these faults that is CONFIRMED, which is
   /// what releasing a fault from the planned stop means to a consumer of the
   /// stream.
@@ -304,20 +310,6 @@ class FaultManagerNode : public rclcpp::Node {
   rclcpp::Service<ros2_medkit_msgs::srv::SetPlannedStop>::SharedPtr set_planned_stop_srv_;
   rclcpp::Service<ros2_medkit_msgs::srv::GetPlannedStop>::SharedPtr get_planned_stop_srv_;
   rclcpp::TimerBase::SharedPtr auto_confirm_timer_;
-
-  /// How often startup checks whether anyone is listening before finishing an
-  /// interrupted planned-stop release.
-  static constexpr std::chrono::milliseconds kInterruptedReleasePollInterval{200};
-
-  /// How long that check waits for a listener before announcing anyway. The events
-  /// topic is volatile, so an announcement made before a subscriber has matched is
-  /// lost for good - but a manager nobody subscribes to still has to finish the
-  /// release rather than carry the ownership flags for ever.
-  static constexpr std::chrono::seconds kInterruptedReleaseDeadline{15};
-
-  /// One-shot: finishes a release a previous process did not complete (nullptr
-  /// when there was nothing left over).
-  rclcpp::TimerBase::SharedPtr interrupted_release_timer_;
 
   /// Timer for periodic cleanup of expired correlation data
   rclcpp::TimerBase::SharedPtr correlation_cleanup_timer_;

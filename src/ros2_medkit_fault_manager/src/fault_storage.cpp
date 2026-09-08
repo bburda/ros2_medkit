@@ -910,6 +910,19 @@ size_t InMemoryFaultStorage::clear_planned_stop_owned() {
   return cleared;
 }
 
+size_t InMemoryFaultStorage::clear_planned_stop_owned(const std::vector<std::string> & fault_codes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  size_t cleared = 0;
+  for (const auto & fault_code : fault_codes) {
+    auto it = faults_.find(fault_code);
+    if (it != faults_.end() && it->second.planned_stop_owned) {
+      it->second.planned_stop_owned = false;
+      ++cleared;
+    }
+  }
+  return cleared;
+}
+
 void InMemoryFaultStorage::set_planned_stop(const PlannedStopState & state) {
   std::lock_guard<std::mutex> lock(mutex_);
   planned_stop_ = state;

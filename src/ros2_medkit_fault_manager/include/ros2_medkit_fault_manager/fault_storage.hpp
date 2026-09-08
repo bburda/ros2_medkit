@@ -496,9 +496,18 @@ class FaultStorage {
 
   /// Drop every ownership flag. Called once the switch-off has announced what it
   /// released, so a crash before this point leaves the flags for the next startup
-  /// to finish.
+  /// to finish. Safe as an all-or-nothing sweep there: the withdrawal ends the
+  /// declaration that owns every flagged fault, and it runs to completion before
+  /// any other request is served.
   /// @return how many faults were released
   virtual size_t clear_planned_stop_owned() = 0;
+
+  /// Drop the ownership flags of exactly these faults, leaving every other one
+  /// alone. What a release captured is what it may clear: a fault flagged after
+  /// the capture belongs to a later declaration, and wiping it would take a fault
+  /// out of a stop that is still in force.
+  /// @return how many of them were owned
+  virtual size_t clear_planned_stop_owned(const std::vector<std::string> & fault_codes) = 0;
 
  protected:
   FaultStorage() = default;
@@ -571,6 +580,7 @@ class InMemoryFaultStorage : public FaultStorage {
   void set_planned_stop_owned(const std::string & fault_code, bool owned) override;
   std::vector<std::string> get_planned_stop_owned() const override;
   size_t clear_planned_stop_owned() override;
+  size_t clear_planned_stop_owned(const std::vector<std::string> & fault_codes) override;
 
  private:
   /// Update fault status based on debounce counter and given config

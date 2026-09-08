@@ -100,6 +100,7 @@ class SqliteFaultStorage : public FaultStorage {
   void set_planned_stop_owned(const std::string & fault_code, bool owned) override;
   std::vector<std::string> get_planned_stop_owned() const override;
   size_t clear_planned_stop_owned() override;
+  size_t clear_planned_stop_owned(const std::vector<std::string> & fault_codes) override;
 
   /// Get the database path
   const std::string & db_path() const {
