@@ -825,15 +825,26 @@ class PeerRecoveryTest(unittest.TestCase):
             'test_04 must watch this URL fail before test_07 can claim it recovered',
         )
 
+        # A 200 is not yet an answer here. The member re-subscribes when its
+        # peer comes back, and until its first sample arrives the read is a
+        # well-formed 'metadata_only' body with no payload - the same state
+        # case 1 waits through on the healthy peer. The budget below is what
+        # covers the gap; reading once and calling the empty body a failure
+        # makes the case race the publisher.
         def served():
             answer = self._aggregate_read_of_peer_topic()
-            return answer if answer.status_code == 200 else None
+            if answer.status_code != 200:
+                return None
+            payload = answer.json()
+            if payload.get('x-medkit', {}).get('status') != 'data' or not payload.get('data'):
+                return None
+            return answer
 
         response = _poll(served, timeout=RECOVERY_TIMEOUT)
         self.assertIsNotNone(
             response,
-            f'a read of {PEER_DECLARED_APP} never recovered after its peer came back; '
-            f'last answer was {self._aggregate_read_of_peer_topic().text}',
+            f"a read of {PEER_DECLARED_APP} never carried the member's sample after "
+            f'its peer came back; last answer was {self._aggregate_read_of_peer_topic().text}',
         )
 
         body = response.json()
